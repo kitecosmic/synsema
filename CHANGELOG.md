@@ -49,6 +49,13 @@ Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the rele
   names loaded from `.env` from a child's environment, so a program with `exec` but without
   `env`/`secret` cannot read them with `printenv`. The pseudo-terminal path skipped that step: a
   child started with `pty: true` saw, for example, `ANTHROPIC_API_KEY`. It is removed there too.
+- **`@synsema/wasm` with labels on now refuses private data at the host's hooks.** The embedded
+  engine turned labels on but registered no sinks: `print` redacted, while `fetch`/`http_*` to
+  your `http` hook, `state_set`/`remember` to your `kv` and a branch on a private value went out
+  with the data in clear (natively the same programs gave `label_violation`). The wasm now uses the
+  same sink list as the native engine, and a test fails if a new wasm builtin is left
+  unclassified. The JS package also forwarded nothing: `labels`, `result` and `input` (with
+  `sources`) are now passed through and typed.
 
 **New.**
 - **`tcp_write(conn, data)` and `pipe_write(end, data)`** take what fits right now and return how
@@ -73,6 +80,24 @@ Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the rele
   when the name is not a builtin and is not defined or used as a value anywhere in the file, so it
   gives no false positives (run over 2325 `.syn` files: only deliberate cases). A warning does not
   change the exit code.
+
+- **`@synsema/wasm` for untrusted code in a server.**
+  - `maxSteps` and `maxMemoryMb` per call: the engine measures them (deterministic steps, the
+    module's real memory) and ends the run with `ok: false` and an error that says so, not a trap.
+    Costs nothing when not set; with limits on, 3–11 % on interpreter-bound code.
+  - `timeoutMs` in the async API: past it the call fails with a clear error and its Worker is
+    replaced, so the server's thread never blocks.
+  - Concurrent async calls queue instead of failing with "one call at a time per instance", and
+    `Synsema.load(src, { workers: n })` spreads them over n Workers.
+  - After a trap, the sync API recreates the instance by itself (before, the next call asked for
+    `await syn.ready()`).
+  - `Synsema.loadNode()` loads the `synsema.wasm` that ships in the package, so it works in Next.js
+    routes and Server Actions without resolving paths. The README's
+    `new URL("@synsema/wasm/synsema.wasm", import.meta.url)` never resolved a package name and is
+    replaced.
+  - `state_merge` and `state_cas` exist in wasm too. With the host's `kv` they are atomic only if it
+    offers `kv.cas(ns, key, expected, value)` (new, optional); without it they say so instead of
+    risking lost writes. Without a host `kv`, the state belongs to the instance and is atomic.
 
 **Deprecated.**
 - **The positional form of `fetch(url, method, headers, body, timeout)` goes away in v1.** Write

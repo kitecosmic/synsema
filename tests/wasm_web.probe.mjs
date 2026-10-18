@@ -301,5 +301,142 @@ print("slept")`;
   check("check(): valida la declaración de memoria sin ejecutar", !c.ok && c.errors[0].includes("Multiple memory declarations"), c);
 }
 
+// 9. v0.6.45 (D1) — etiquetas por la API: `labels` + `input.sources`. Un valor privado (o una rama
+//    que dependió de uno) no llega al hook `http` ni al `kv` del host; uno público sí. Antes el
+//    paquete no reenviaba `labels` y el motor, aunque las encendiera, no registraba sumideros.
+{
+  const seen = { http: [], kv: [] };
+  const host = {
+    http(req) {
+      seen.http.push(`${req.method} ${req.url} ${typeof req.body === "string" ? req.body : req.body ? new TextDecoder().decode(req.body) : ""}`);
+      return { status: 200, headers: [["content-type", "application/json"]], body: "{}" };
+    },
+    kv: {
+      get: () => null,
+      set: (ns, k, v) => { seen.kv.push(`${ns}/${k}=${v}`); },
+      delete: () => {},
+      list: () => [],
+    },
+  };
+  const input = { var: "input", value: { tarjeta: "4111-1111", nombre: "Ana" }, sources: { tarjeta: ["cliente"] } };
+  const run = (body) => syn.run(`require net("x.test")\n${body}`, { host, labels: true, input });
+  const leak = run('http_post("https://x.test/", {"t": input.tarjeta})');
+  check("labels: un privado no llega al hook http", !leak.ok && leak.errors.some((e) => e.includes("label_violation")) && seen.http.length === 0, { leak, seen });
+  const branch = run('when input.tarjeta == "4111-1111"\n    fetch("https://x.test/si", {"method": "GET"})');
+  check("labels: una rama sobre un privado no llama a la red", !branch.ok && seen.http.length === 0, { branch, seen });
+  const kv = run('state_set("k", input.tarjeta)');
+  check("labels: un privado no llega al kv del host", !kv.ok && seen.kv.every((w) => !w.includes("4111")), { kv, seen });
+  const pub = run('http_post("https://x.test/", {"n": input.nombre})');
+  check("labels: un valor público sí sale", pub.ok && seen.http.length === 1, { pub, seen });
+  // `private_seen` = la corrida desenvolvió un privado o decidió una rama con uno (entonces `steps`
+  // no se publica). Un sumidero que rechaza el argumento antes de mirarlo no lo prende.
+  check("labels: una rama sobre un privado prende private_seen", branch.private_seen === true, branch);
+}
+
+// 10. v0.6.45 (D2) — límites medidos por el motor: pasos y memoria. Terminan con ok:false y un error
+//     que lo dice (no un trap), y la instancia sigue sirviendo.
+{
+  const loop = "let n be 0\neach i in range(3000)\n    each j in range(3000)\n        set n to n + 1\nprint(n)";
+  const steps = syn.run(loop, { maxSteps: 100000 });
+  check("maxSteps: corta con un error claro", !steps.ok && steps.errors.some((e) => e.includes("step limit reached")), steps);
+  const grow = 'let s be "0123456789"\neach i in range(40)\n    set s to s + s\nprint(length(s))';
+  const mem = syn.run(grow, { maxMemoryMb: 64 });
+  check("maxMemoryMb: corta con un error claro, no un trap", !mem.ok && mem.errors.some((e) => e.includes("memory limit reached")), mem);
+  const after = syn.run("print(1 + 1)");
+  check("después de un límite la instancia sigue y sin límites no hay corte", after.ok && after.output[0] === "2", after);
+  const free = syn.run("let n be 0\neach i in range(1000)\n    set n to n + 1\nprint(n)", { maxSteps: 1000000 });
+  check("maxSteps holgado no molesta", free.ok && free.output[0] === "1000", free);
+}
+
+// 10b. v0.6.45 (D4) — después de un trap la API síncrona recrea la instancia sola (antes la llamada
+//      siguiente pedía `await syn.ready()`). El trap se provoca con un acceso fuera de la memoria del
+//      módulo en el mismo camino de la llamada: es un trap real y no llena la RAM.
+{
+  const inst = syn._inst;
+  const realCall = inst.call;
+  inst.call = () => inst.exports.synsema_call(0xfffffff0, 64);
+  let trapped = null;
+  try {
+    syn.run("print(1)");
+  } catch (e) {
+    trapped = e;
+  }
+  inst.call = realCall;
+  check("trap: la llamada falla diciendo que la instancia se recreó", trapped && String(trapped.message).includes("the instance was recreated"), String(trapped));
+  const r = syn.run("print(2 + 3)");
+  check("trap: la llamada siguiente anda sin ready()", r.ok && r.output[0] === "5", r);
+}
+
+// 11. v0.6.45 (D3/D2) — modo asíncrono: llamadas concurrentes se encolan (antes: "one call at a time
+//     per instance"), `workers` las reparte y `timeoutMs` corta una que no termina.
+{
+  const pool = await Synsema.load(wasmPath, { workers: 2 });
+  const many = await Promise.all(Array.from({ length: 6 }, (_, i) => pool.runAsync(`print(${i} * 2)`)));
+  check("async: 6 llamadas concurrentes terminan todas", many.every((r, i) => r.ok && r.output[0] === String(i * 2)), many);
+  let timedOut = null;
+  try {
+    await pool.runAsync("let n be 0\neach i in range(100000)\n    each j in range(100000)\n        set n to n + 1", { timeoutMs: 300 });
+  } catch (e) {
+    timedOut = e;
+  }
+  check("async: timeoutMs corta con un error claro", timedOut && String(timedOut.message).includes("did not finish in 300 ms"), String(timedOut));
+  const again = await pool.runAsync("print(7)");
+  check("async: después del timeout el pool sigue", again.ok && again.output[0] === "7", again);
+  await pool.close();
+}
+
+// 12. v0.6.45 (D5) — `loadNode()` encuentra el .wasm del paquete sin rutas del usuario.
+{
+  const { copyFileSync, existsSync: ex } = await import("node:fs");
+  const pkgWasm = resolve(root, "packages/synsema-wasm/synsema.wasm");
+  const backup = ex(pkgWasm) ? readFileSync(pkgWasm) : null;
+  copyFileSync(wasmPath, pkgWasm);
+  try {
+    const n = await Synsema.loadNode();
+    await n.ready();
+    const r = n.run("print(40 + 2)");
+    check("loadNode: carga el synsema.wasm del paquete", r.ok && r.output[0] === "42", r);
+  } finally {
+    if (backup) {
+      const { writeFileSync } = await import("node:fs");
+      writeFileSync(pkgWasm, backup);
+    }
+  }
+}
+
+// 13. v0.6.45 — state_merge / state_cas en wasm. Con KV del host son atómicos sólo si el host
+//     ofrece `kv.cas`; sin él lo dicen. Sin host, el estado es de la instancia.
+{
+  const store = new Map();
+  let interfere = 0; // > 0: el próximo cas "pierde" contra otro escritor, que escribe en el medio
+  const kv = {
+    get: (ns, k) => store.get(`${ns}/${k}`) ?? null,
+    set: (ns, k, v) => { store.set(`${ns}/${k}`, v); },
+    list: (ns) => [...store.keys()].filter((k) => k.startsWith(ns + "/")).map((k) => k.slice(ns.length + 1)),
+    cas: (ns, k, expected, v) => {
+      const key = `${ns}/${k}`;
+      if (interfere > 0) {
+        interfere--;
+        store.set(key, JSON.stringify({ ...JSON.parse(store.get(key) ?? "{}"), otro: true }));
+        return false;
+      }
+      if ((store.get(key) ?? null) !== expected) return false;
+      store.set(key, v);
+      return true;
+    },
+  };
+  const host = { kv };
+  const a = syn.run('print(state_merge("canales", {"a": true}))', { host });
+  interfere = 1;
+  const b = syn.run('let m be state_merge("canales", {"b": true})\nprint(keys(m))', { host });
+  check("state_merge: con kv.cas reintenta y no pierde lo del otro escritor", a.ok && b.ok && ["a", "b", "otro"].every((k) => b.output[0].includes(k)), { a, b });
+  const c = syn.run('print(state_cas("v", nothing, 1))\nprint(state_cas("v", nothing, 2))\nprint(state_cas("v", 1.0, 3))\nprint(state_get("v"))', { host });
+  check("state_cas: ausente = nothing; igualdad del lenguaje (1.0 == 1)", c.ok && c.output.join(" ") === "true false true 3", c);
+  const noCas = syn.run('state_merge("x", {"a": 1})', { host: { kv: { get: kv.get, set: kv.set } } });
+  check("state_merge: un kv sin cas lo dice (no pierde escrituras en silencio)", !noCas.ok && noCas.errors[0].includes("does not offer cas"), noCas);
+  const local = syn.run('print(state_merge("x", {"a": 1}))\nprint(state_cas("y", nothing, 5))');
+  check("state_merge/state_cas sin host: estado de la instancia", local.ok && local.output[1] === "true", local);
+}
+
 console.log(failures ? `\n${failures} FAIL` : "\nall ok");
 process.exit(failures ? 1 : 0);

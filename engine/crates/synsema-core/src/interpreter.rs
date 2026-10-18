@@ -3114,6 +3114,11 @@ impl Interpreter {
     /// Corta con error si hay cancelación pendiente. Lo llaman `exec_block` (por
     /// statement) y los builtins bloqueantes al salir de su espera.
     pub fn check_cancel(&self) -> Result<(), Control> {
+        // v0.6.45 (D2): en wasm, la bandera también enruta acá los límites de la corrida embebida.
+        #[cfg(target_arch = "wasm32")]
+        if let Some(r) = crate::wasm_limits::check(self.steps) {
+            return r.map_err(|m| Control::Error(RuntimeError::new(m)));
+        }
         if self.cancel.flag.load(std::sync::atomic::Ordering::Relaxed) {
             let reason = self.cancel.reason.lock().map(|g| g.clone()).unwrap_or_default();
             let msg = if reason.is_empty() {

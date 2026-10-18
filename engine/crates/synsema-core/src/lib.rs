@@ -49,5 +49,7 @@ pub mod templates;
 pub mod term_guard;
 pub mod testgen;
 pub mod tokens;
+#[cfg(target_arch = "wasm32")]
+pub mod wasm_limits;
 pub mod types;
 pub mod waiting;

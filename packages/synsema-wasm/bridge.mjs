@@ -118,16 +118,35 @@ export async function createBridge(module, { bridgeBytes = 4 * 1024 * 1024 } = {
   w.post({ type: "init", module, sab });
   await ready;
 
+  // v0.6.45 (D3): las llamadas a un mismo worker se ENCOLAN (antes la segunda fallaba con "one call
+  // at a time per instance": un servidor con dos requests a la vez se rompía). Para correr en
+  // paralelo, varios workers: `Synsema.load(src, { workers: n })`.
+  let tail = Promise.resolve();
+  let queued = 0;
+  function callNow(request, host) {
+    return new Promise((resolve, reject) => {
+      pending = { resolve, reject, host };
+      Atomics.store(ctrl, 0, 0);
+      w.post({ type: "call", request });
+    });
+  }
+
   return {
     call(request, host) {
-      if (pending) return Promise.reject(new Error("synsema: one call at a time per instance"));
-      return new Promise((resolve, reject) => {
-        pending = { resolve, reject, host };
-        Atomics.store(ctrl, 0, 0);
-        w.post({ type: "call", request });
-      });
+      queued++;
+      const run = () => callNow(request, host);
+      const p = tail.then(run, run).finally(() => queued--);
+      tail = p.catch(() => {});
+      return p;
+    },
+    /** Llamadas en curso + encoladas (para elegir el worker menos ocupado). */
+    load() {
+      return queued;
     },
     async close() {
+      const p = pending;
+      pending = null;
+      p?.reject(new Error("synsema: the worker was closed"));
       await w.terminate();
     },
   };

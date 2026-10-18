@@ -54,6 +54,8 @@ export function offersOf(host) {
   const o = {};
   if (typeof host.http === "function") o.http = true;
   if (host.kv && typeof host.kv.get === "function") o.kv = true;
+  // v0.6.45: comparar-y-cambiar, lo que hace atómicos state_merge/state_cas con un KV compartido.
+  if (host.kv && typeof host.kv.cas === "function") o.kv_cas = true;
   if (typeof host.llm === "function") o.llm = true;
   if (typeof host.log === "function") o.log = true;
   if (typeof host.sleep === "function" || host.sleep === true) o.sleep = true;
@@ -89,6 +91,10 @@ export function dispatchHostSync(host, kind, payload) {
       return {};
     case "kv_list":
       return host.kv ? { keys: host.kv.list ? syncOnly("kv.list", host.kv.list(payload.ns)) : [] } : undefined;
+    case "kv_cas":
+      return host.kv && typeof host.kv.cas === "function"
+        ? { swapped: !!syncOnly("kv.cas", host.kv.cas(payload.ns, payload.key, payload.expected ?? null, payload.value)) }
+        : undefined;
     case "llm":
       return typeof host.llm === "function" ? normalizeLlm(syncOnly("llm", host.llm(payload.op, payload.prompt))) : undefined;
     case "log":
@@ -128,6 +134,10 @@ export async function dispatchHostAsync(host, kind, payload) {
       return {};
     case "kv_list":
       return host.kv ? { keys: host.kv.list ? await host.kv.list(payload.ns) : [] } : undefined;
+    case "kv_cas":
+      return host.kv && typeof host.kv.cas === "function"
+        ? { swapped: !!(await host.kv.cas(payload.ns, payload.key, payload.expected ?? null, payload.value)) }
+        : undefined;
     case "llm":
       return typeof host.llm === "function" ? normalizeLlm(await host.llm(payload.op, payload.prompt)) : undefined;
     case "log":
@@ -194,6 +204,23 @@ export function sleepSync(secs) {
  * (el bridge async lo implementa con Atomics). Devuelve `{ call(request) -> response }`.
  */
 export async function instantiate(module, hostCall) {
+  const { imports, bind } = hostImports(hostCall);
+  const instance = await WebAssembly.instantiate(module, imports);
+  return bind(instance.exports);
+}
+
+/**
+ * v0.6.45 (D4) — lo mismo, SÍNCRONO (`new WebAssembly.Instance`): con el `Module` ya compilado es
+ * barato, y es lo que deja a la API síncrona recrear la instancia después de un trap sin pedirle
+ * al usuario un `await syn.ready()`. (En el main thread de un navegador puede estar acotado por
+ * tamaño; ahí se cae al camino de siempre.)
+ */
+export function instantiateSync(module, hostCall) {
+  const { imports, bind } = hostImports(hostCall);
+  return bind(new WebAssembly.Instance(module, imports).exports);
+}
+
+function hostImports(hostCall) {
   let exports = null;
   const mem = () => new Uint8Array(exports.memory.buffer);
   const writeBytes = (bytes) => {
@@ -233,8 +260,14 @@ export async function instantiate(module, hostCall) {
       },
     },
   };
-  const instance = await WebAssembly.instantiate(module, imports);
-  exports = instance.exports;
+  const bind = (ex) => {
+    exports = ex;
+    return callable(ex, mem, writeBytes);
+  };
+  return { imports, bind };
+}
+
+function callable(exports, mem, writeBytes) {
   return {
     exports,
     call(request) {
@@ -260,6 +293,14 @@ function requestOf(op, source, opts = {}) {
   if (opts.env) r.env = opts.env;
   if (opts.ceiling) r.ceiling = opts.ceiling;
   if (opts.host) r.host = offersOf(opts.host);
+  // v0.6.45 (D1): etiquetas de flujo. Antes no se reenviaban y el motor las tenía apagadas aunque
+  // el host las pidiera.
+  if (opts.labels) r.labels = true;
+  if (opts.result) r.result = opts.result;
+  if (opts.input) r.input = { var: opts.input.var, value: opts.input.value, sources: opts.input.sources ?? {} };
+  // v0.6.45 (D2): límites de la corrida (los mide el motor: pasos deterministas y la memoria del módulo).
+  if (opts.maxSteps) r.max_steps = opts.maxSteps;
+  if (opts.maxMemoryMb) r.max_memory_mb = opts.maxMemoryMb;
   return r;
 }
 
@@ -277,15 +318,48 @@ function normalizeRequest(request) {
 }
 
 export class Synsema {
-  /** @param {WebAssembly.Module} module */
-  constructor(module) {
+  /**
+   * @param {WebAssembly.Module} module
+   * @param {{workers?: number}} [opts] `workers`: cuántos Workers usa el modo asíncrono (default 1).
+   */
+  constructor(module, opts = {}) {
     this.module = module;
     this._inst = null;
+    this._workers = Math.max(1, opts.workers | 0 || 1);
+    this._bridges = [];
   }
 
   /** Carga el .wasm (bytes, Module, URL/path, Response). */
-  static async load(src) {
-    return new Synsema(await readModule(src));
+  static async load(src, opts = {}) {
+    return new Synsema(await readModule(src), opts);
+  }
+
+  /**
+   * v0.6.45 (D5) — Node: carga el `synsema.wasm` que viene en el paquete, sin que el que lo usa
+   * resuelva la ruta. Lo lee del directorio de este archivo y, si un bundler lo movió (Turbopack,
+   * webpack), de `node_modules/@synsema/wasm`: anda en un script, en una ruta `/api` y en una
+   * Server Action de Next.
+   */
+  static async loadNode(opts = {}) {
+    const { readFile } = await import("node:fs/promises");
+    const { fileURLToPath } = await import("node:url");
+    const { dirname, join } = await import("node:path");
+    const candidates = [];
+    try {
+      candidates.push(join(dirname(fileURLToPath(import.meta.url)), "synsema.wasm"));
+    } catch {
+      // import.meta.url reescrito a algo que no es file:
+    }
+    candidates.push(join(process.cwd(), "node_modules", "@synsema", "wasm", "synsema.wasm"));
+    let lastErr;
+    for (const p of candidates) {
+      try {
+        return new Synsema(await WebAssembly.compile(await readFile(p)), opts);
+      } catch (e) {
+        lastErr = e;
+      }
+    }
+    throw new Error(`synsema: cannot find synsema.wasm (tried ${candidates.join(", ")}): ${lastErr && lastErr.message}`);
   }
 
   async _instance() {
@@ -304,10 +378,19 @@ export class Synsema {
     try {
       return inst.call(request);
     } catch (e) {
-      // Un trap deja la instancia inservible: se reinstancia en la próxima llamada.
+      // Un trap deja la instancia inservible: se recrea ya (sincrónico, con el Module compilado),
+      // así la próxima llamada anda sin `await syn.ready()` (v0.6.45, D4). Si el host no deja
+      // instanciar sincrónico, queda descartada y `ready()` la recrea.
       this._inst = null;
       this._ready = null;
-      throw new Error(`synsema: the module trapped (${e && e.message ? e.message : e}); the instance was discarded`);
+      try {
+        const self = this;
+        this._inst = instantiateSync(this.module, (kind, payload) => dispatchHostSync(self._host, kind, payload));
+        this._ready = Promise.resolve(this._inst);
+      } catch {
+        // sin instancia: la próxima llamada pide `ready()`
+      }
+      throw new Error(`synsema: the module trapped (${e && e.message ? e.message : e}); the instance was recreated`);
     } finally {
       this._host = null;
     }
@@ -343,28 +426,58 @@ export class Synsema {
 
   // ---- modo asíncrono (Worker + Atomics) ----
 
+  /** El worker menos ocupado; crea uno nuevo mientras no se llegó a `workers`. */
   async _bridge() {
-    if (!this._worker) {
+    const idle = this._bridges.find((b) => b.load() === 0);
+    if (idle) return idle;
+    if (this._bridges.length < this._workers) {
       const { createBridge } = await import("./bridge.mjs");
-      this._worker = await createBridge(this.module);
+      const b = await createBridge(this.module);
+      this._bridges.push(b);
+      return b;
     }
-    return this._worker;
+    return this._bridges.reduce((a, b) => (b.load() < a.load() ? b : a));
+  }
+  /**
+   * v0.6.45 (D2) — `timeoutMs`: si la llamada no terminó en ese plazo, el Worker se termina (el
+   * código corría en otro hilo: el del servidor nunca se bloquea) y la llamada falla con un error
+   * claro; el próximo pedido usa un Worker nuevo.
+   */
+  async _callAsync(request, opts) {
+    const b = await this._bridge();
+    const call = b.call(request, opts.host);
+    if (!(opts.timeoutMs > 0)) return call;
+    let timer;
+    const timeout = new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`synsema: the call did not finish in ${opts.timeoutMs} ms; its worker was stopped`)), opts.timeoutMs);
+    });
+    try {
+      return await Promise.race([call, timeout]);
+    } catch (e) {
+      if (String(e && e.message).includes("did not finish")) {
+        this._bridges = this._bridges.filter((x) => x !== b);
+        call.catch(() => {});
+        await b.close();
+      }
+      throw e;
+    } finally {
+      clearTimeout(timer);
+    }
   }
   async runAsync(source, opts = {}) {
-    return (await this._bridge()).call(requestOf("run", source, opts), opts.host);
+    return this._callAsync(requestOf("run", source, opts), opts);
   }
   async testAsync(source, opts = {}) {
-    return (await this._bridge()).call(requestOf("test", source, opts), opts.host);
+    return this._callAsync(requestOf("test", source, opts), opts);
   }
   async handleAsync(source, request, opts = {}) {
-    return (await this._bridge()).call({ ...requestOf("handle", source, opts), request: normalizeRequest(request) }, opts.host);
+    return this._callAsync({ ...requestOf("handle", source, opts), request: normalizeRequest(request) }, opts);
   }
-  /** Termina el Worker del modo asíncrono (si se creó). */
+  /** Termina los Workers del modo asíncrono (si se crearon). */
   async close() {
-    if (this._worker) {
-      await this._worker.close();
-      this._worker = null;
-    }
+    const bs = this._bridges;
+    this._bridges = [];
+    await Promise.all(bs.map((b) => b.close()));
   }
 }
 

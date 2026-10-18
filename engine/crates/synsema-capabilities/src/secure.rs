@@ -30,12 +30,11 @@ pub fn set_child_no_window(on: bool) {
 /// la cual el CRT y WinSock no arrancan (la misma única excepción que `run_program`). Todo lo demás
 /// lo pasa el programa explícito por `env`.
 pub fn clean_env_keep() -> Vec<(String, String)> {
-    let mut keep = Vec::new();
     #[cfg(windows)]
     if let Ok(v) = std::env::var("SystemRoot") {
-        keep.push(("SystemRoot".to_string(), v));
+        return vec![("SystemRoot".to_string(), v)];
     }
-    keep
+    Vec::new()
 }
 
 /// `opts.env_clean` de `run`/`proc_spawn`: ausente o `false` = hereda (menos los secretos); `true` =

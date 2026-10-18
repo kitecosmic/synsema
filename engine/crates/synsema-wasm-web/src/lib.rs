@@ -298,6 +298,16 @@ impl HostProvider for WebHost {
             _ => Ok(()),
         })
     }
+    fn kv_cas(&self, ns: &str, key: &str, expected: Option<&str>, value: &str) -> Option<Result<bool, String>> {
+        if !self.offers("kv_cas") {
+            return None;
+        }
+        let r = host_call_json("kv_cas", &json!({"ns": ns, "key": key, "expected": expected, "value": value}))?;
+        Some(match r.get("error").and_then(Value::as_str) {
+            Some(e) if !e.is_empty() => Err(e.to_string()),
+            _ => Ok(r.get("swapped").and_then(Value::as_bool).unwrap_or(false)),
+        })
+    }
     fn kv_list(&self, ns: &str) -> Option<Vec<String>> {
         if !self.offers("kv") {
             return None;
@@ -432,7 +442,16 @@ fn opts_from(req: &Map<String, Value>) -> Result<RunOptions, String> {
         Some(_) => return Err("input must be an object {var, value, sources?}".to_string()),
     };
     // Este artefacto no tiene FS en ningún host (los archivos van por `env`/fuente).
-    Ok(RunOptions { filename, env, ceiling, no_fs: true, labels, result, input, sources })
+    // v0.6.45 (D2): `"max_steps"` y `"max_memory_mb"` (enteros positivos) — los límites de la corrida.
+    let limit = |k: &str| -> Result<Option<u64>, String> {
+        match req.get(k) {
+            None | Some(Value::Null) => Ok(None),
+            Some(v) => v.as_u64().filter(|n| *n > 0).map(Some).ok_or_else(|| format!("{} must be a positive integer", k)),
+        }
+    };
+    let max_steps = limit("max_steps")?;
+    let max_memory_mb = limit("max_memory_mb")?;
+    Ok(RunOptions { filename, env, ceiling, no_fs: true, labels, result, input, sources, max_steps, max_memory_mb })
 }
 
 fn install_host(req: &Map<String, Value>) {

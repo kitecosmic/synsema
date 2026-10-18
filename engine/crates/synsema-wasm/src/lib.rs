@@ -103,6 +103,11 @@ pub struct RunOptions {
     /// que exista y no sea `nothing` llega al programa como `private(valor, principales)`.
     /// Exige `labels` (sin etiquetas no hay fuentes que marcar: error, no silencio).
     pub sources: Vec<(String, Vec<String>)>,
+    /// v0.6.45 (D2) — tope de pasos del intérprete (`steps()`); al pasarlo, la corrida termina con
+    /// un error claro, no con un trap. Sólo en wasm32 (en el binario nativo se ignora).
+    pub max_steps: Option<u64>,
+    /// v0.6.45 (D2) — tope de la memoria lineal del módulo, en MB. Sólo en wasm32.
+    pub max_memory_mb: Option<u64>,
 }
 
 impl RunOptions {
@@ -116,6 +121,8 @@ impl RunOptions {
             result: None,
             input: None,
             sources: Vec::new(),
+            max_steps: None,
+            max_memory_mb: None,
         }
     }
 }
@@ -852,6 +859,116 @@ fn register_state_builtins(interp: &Interpreter, host_kv: bool) {
             Ok(syn_map(map))
         }));
     }
+
+    // v0.6.45 — `state_merge` y `state_cas`, atómicos como bajo `serve`. Sin KV del host el
+    // estado es de esta instancia (un hilo): ya es atómico. Con KV del host puede ser compartido
+    // entre instancias, y entonces sólo se promete atomicidad si el host ofrece `kv.cas`: si no,
+    // error claro (leer-modificar-guardar perdería escrituras concurrentes en silencio).
+    const CAS_ATTEMPTS: usize = 64;
+    fn host_cas(who: &str) -> Result<Rc<dyn HostProvider>, Control> {
+        match hostcap::provider() {
+            Some(p) if p.offers("kv_cas") => Ok(p),
+            _ => Err(rt_err(&format!(
+                "{}: the host's kv does not offer cas (kv.cas), so this update would not be atomic across instances; offer kv.cas, or use state_set if one writer is enough",
+                who
+            ))),
+        }
+    }
+    fn raw_of(p: &Rc<dyn HostProvider>, key: &str) -> Option<String> {
+        p.kv_get(NS, key).flatten()
+    }
+    fn value_of(raw: &Option<String>) -> SynValue {
+        raw.as_deref()
+            .and_then(|r| serde_json::from_str::<serde_json::Value>(r).ok())
+            .map(|v| json_to_syn(&v))
+            .unwrap_or(SynValue::Nothing)
+    }
+    fn merged(who: &str, key: &str, current: &SynValue, patch: &synsema_core::types::MapRef) -> Result<SynValue, Control> {
+        let mut out = SynMap::new();
+        match current {
+            SynValue::Nothing => {}
+            SynValue::Map(m) => {
+                for (k, v) in m.borrow().iter() {
+                    out.insert(k.clone(), v.clone());
+                }
+            }
+            other => {
+                return Err(rt_err(&format!(
+                    "{}: the value of '{}' is {}, not a map — use state_set to replace it",
+                    who,
+                    key,
+                    other.type_name()
+                )))
+            }
+        }
+        for (k, v) in patch.borrow().iter() {
+            out.insert(k.clone(), v.clone());
+        }
+        Ok(syn_map(out))
+    }
+    {
+        let l = local.clone();
+        interp.register_builtin("state_merge", 2, Rc::new(move |_i, args, _l| {
+            const F: &str = "state_merge";
+            let key = key_arg(args, F)?;
+            let patch = match args.get(1) {
+                Some(SynValue::Map(m)) => m.clone(),
+                Some(other) => return Err(rt_err(&format!("{}: the second argument must be a map, got {}", F, other.type_name()))),
+                None => return Err(rt_err(&format!("{}: missing the map to merge", F))),
+            };
+            if !host_kv {
+                let current = l.borrow().get(&key).cloned().unwrap_or(SynValue::Nothing);
+                let v = merged(F, &key, &current, &patch)?;
+                l.borrow_mut().insert(key, v.clone());
+                return Ok(v);
+            }
+            let p = host_cas(F)?;
+            for _ in 0..CAS_ATTEMPTS {
+                let raw = raw_of(&p, &key);
+                let v = merged(F, &key, &value_of(&raw), &patch)?;
+                match p.kv_cas(NS, &key, raw.as_deref(), &dumps_syn(&v)) {
+                    Some(Ok(true)) => return Ok(v),
+                    Some(Ok(false)) => continue,
+                    Some(Err(e)) => return Err(rt_err(&format!("{}: host kv: {}", F, e))),
+                    None => break,
+                }
+            }
+            Err(rt_err(&format!("{}: '{}' kept changing under concurrent writers ({} attempts)", F, key, CAS_ATTEMPTS)))
+        }));
+    }
+    {
+        let l = local.clone();
+        interp.register_builtin("state_cas", 3, Rc::new(move |_i, args, _l| {
+            const F: &str = "state_cas";
+            let key = key_arg(args, F)?;
+            let expected = args.get(1).cloned().unwrap_or(SynValue::Nothing);
+            let new = args.get(2).cloned().unwrap_or(SynValue::Nothing);
+            if !host_kv {
+                let current = l.borrow().get(&key).cloned().unwrap_or(SynValue::Nothing);
+                if !current.syn_equals(&expected) {
+                    return Ok(SynValue::Bool(false));
+                }
+                l.borrow_mut().insert(key, new);
+                return Ok(SynValue::Bool(true));
+            }
+            let p = host_cas(F)?;
+            // Igualdad del LENGUAJE (`2.0 == 2`): se compara el valor leído y se escribe con `cas`
+            // contra el texto EXACTO que se leyó; si otro escribió en el medio, se vuelve a leer.
+            for _ in 0..CAS_ATTEMPTS {
+                let raw = raw_of(&p, &key);
+                if !value_of(&raw).syn_equals(&expected) {
+                    return Ok(SynValue::Bool(false));
+                }
+                match p.kv_cas(NS, &key, raw.as_deref(), &dumps_syn(&new)) {
+                    Some(Ok(true)) => return Ok(SynValue::Bool(true)),
+                    Some(Ok(false)) => continue,
+                    Some(Err(e)) => return Err(rt_err(&format!("{}: host kv: {}", F, e))),
+                    None => break,
+                }
+            }
+            Err(rt_err(&format!("{}: '{}' kept changing under concurrent writers ({} attempts)", F, key, CAS_ATTEMPTS)))
+        }));
+    }
 }
 
 // Los stubs del perfil puro (sockets/DB/cron/hub/archivos/hilos) viven en
@@ -884,10 +1001,34 @@ pub(crate) fn prepare(program: &Program, opts: &RunOptions) -> (Interpreter, Rc<
     if let Some(cl) = &opts.ceiling {
         caps.borrow_mut().ceiling = Some(Rc::new(cl.clone()));
     }
+    // v0.6.45 (D2): los límites de ESTA corrida (los de una anterior nunca se cuelan). Con alguno
+    // pedido, la bandera de cancelación queda prendida para que el chequeo por sentencia que ya
+    // existe los mire (ver `synsema_core::wasm_limits`); sin límites, el camino de siempre.
+    #[cfg(target_arch = "wasm32")]
+    {
+        synsema_core::wasm_limits::disarm();
+        if opts.max_steps.is_some() || opts.max_memory_mb.is_some() {
+            synsema_core::wasm_limits::arm(opts.max_steps, opts.max_memory_mb.map(|mb| mb.saturating_mul(1 << 20)));
+            let token = synsema_core::interpreter::CancelToken::new();
+            token.flag.store(true, std::sync::atomic::Ordering::Relaxed);
+            interp.set_cancel_token(token);
+        }
+    }
     let ctx = WireCtx { env: env_store(opts), statements: &program.statements, filename: &opts.filename, no_fs: opts.no_fs };
     wire_pure(&mut interp, &caps, &ctx);
     if opts.labels {
         interp.set_labels(true);
+        // v0.6.45 (D1): los MISMOS sumideros que el nativo (una sola lista, `label_lists`). Antes el
+        // wasm encendía las etiquetas sin registrar ninguno: `print` redactaba, pero `fetch`/`http_*`
+        // hacia el hook del host, `state_set` al KV y `remember` salían con el dato en claro (en
+        // nativo los mismos programas daban `label_violation`). Un nombre que el wasm no tiene se
+        // ignora, como en el nativo.
+        for name in synsema_stdlib::label_lists::LABEL_SINK_BUILTINS
+            .iter()
+            .chain(synsema_core::interpreter::CORE_SINK_BUILTINS.iter())
+        {
+            interp.register_label_sink(name);
+        }
     }
     (interp, caps)
 }
@@ -962,6 +1103,26 @@ pub(crate) fn finish_keep(interp: &mut Interpreter, result: Result<SynValue, Con
 /// Corre el programa. Nunca panica por un error del programa: parse/runtime van a
 /// `errors`; la salida de `print` a `output` (el core la colecta con
 /// `live_output = false` — no se toca stdout).
+/// v0.6.45 (D1) — los builtins que registra el wasm para `opts`, con el host que esté instalado
+/// en este hilo (`hostcap::install`), ordenados. Es la fuente del anti-rot de etiquetas del wasm
+/// (`tests/labels_host_sinks.rs`): la clasificación se cruza con lo registrado de verdad.
+pub fn registered_builtin_names(opts: &RunOptions) -> Vec<String> {
+    let program = match parse_source("", &opts.filename) {
+        Ok(p) => p,
+        Err(_) => return Vec::new(),
+    };
+    let (interp, _caps) = prepare(&program, opts);
+    let env = interp.global_env.borrow();
+    let mut names: Vec<String> = env
+        .bindings
+        .iter()
+        .filter(|(_, v)| matches!(v, synsema_core::types::SynValue::Builtin(_)))
+        .map(|(k, _)| k.to_string())
+        .collect();
+    names.sort();
+    names
+}
+
 pub fn run(source: &str, opts: &RunOptions) -> Report {
     let program = match parse_source(source, &opts.filename) {
         Err(e) => {

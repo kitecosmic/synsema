@@ -77,6 +77,7 @@ pub mod oidc;
 pub mod platform;
 // El perfil puro como pared (stubs OS-facing compartidos por nativo `--profile pure` y wasm).
 pub mod pure;
+pub mod label_lists;
 pub mod raster;
 // v0.6.20 — parsers de texto de la plataforma. Puros.
 pub mod toml_fmt;

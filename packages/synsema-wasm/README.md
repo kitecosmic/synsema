@@ -8,7 +8,10 @@ store, an `llm`, a `log`. No Synsema backend, nothing to install on the host.
 ```js
 import { Synsema } from "@synsema/wasm";
 
-const syn = await Synsema.load(new URL("@synsema/wasm/synsema.wasm", import.meta.url));
+// Node (also Next.js API routes and Server Actions): the .wasm that ships in this package.
+const syn = await Synsema.loadNode();
+// Browser / edge: serve synsema.wasm with your static files and load it by URL:
+//   const syn = await Synsema.load("/synsema.wasm");
 await syn.ready();
 
 const r = syn.run(`print(keccak256("hola"))`);
@@ -18,6 +21,31 @@ r.audit;   // every capability check: {capability, granted, source, reason, orig
            // origin: "program" (asked/called by the program) | "runtime" (ambient host grant)
            // sign/spend/wallet/reveal need an audit sink: offer `kv` (namespace "audit") or they refuse
 ```
+
+## Untrusted code: labels, time limit, concurrency
+
+Code a model wrote is the usual reason to embed Synsema. Three options make that safe to run
+inside a server:
+
+```js
+const syn = await Synsema.loadNode({ workers: 4 }); // async calls run on up to 4 Workers
+
+const r = await syn.runAsync(code, {
+  host,
+  labels: true,                                    // information-flow labels on
+  input: { var: "customer", value: row, sources: { card: ["customer"] } },
+  timeoutMs: 2000,                                 // the Worker is stopped past this
+});
+```
+
+- With `labels: true`, every key listed in `sources` reaches the program as a private value. A
+  private value, or a branch that depended on one, never reaches `print`, your `http` hook
+  (`fetch`/`http_*`), your `kv` (`state_*`, `remember`) or your `llm`: the call fails with
+  `label_violation` before the hook runs. `r.private_seen` says whether one went through.
+- `timeoutMs` (async mode): the call fails with a clear error and its Worker is replaced; the
+  server's own thread never blocks.
+- Concurrent async calls queue per Worker; `workers: n` spreads them. In the sync API a trap
+  recreates the instance by itself.
 
 ## Lending capabilities (the host)
 
