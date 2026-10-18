@@ -234,6 +234,9 @@ pub struct SpawnOpts {
     /// de proveedor, `.env`). Se aplica antes de `env` (que puede volver a pasar una
     /// explícitamente). F3 de la auditoría de seguridad.
     pub strip_env: Vec<String>,
+    /// v0.6.45 (A9) — `env_clean: true`: el hijo arranca sin entorno (sólo `env` y, en Windows,
+    /// `SystemRoot`).
+    pub env_clean: bool,
 }
 
 impl Default for SpawnOpts {
@@ -252,6 +255,7 @@ impl Default for SpawnOpts {
             term: None,
             process_group: true,
             strip_env: Vec::new(),
+            env_clean: false,
         }
     }
 }
@@ -456,12 +460,14 @@ impl LiveProc {
         for k in &opts.strip_env {
             c.env_remove(k);
         }
-        for k in &opts.strip_env {
-            c.env_remove(k);
+        if opts.env_clean {
+            c.env_clear();
+            c.envs(synsema_capabilities::secure::clean_env_keep());
         }
         for (k, v) in &opts.env {
             c.env(k, v);
         }
+        synsema_capabilities::secure::hide_child_window(&mut c);
         #[cfg(unix)]
         if opts.process_group {
             // Grupo propio (pgid = pid del hijo): `kill(-pid)` alcanza a los nietos.
@@ -553,6 +559,17 @@ impl LiveProc {
                 if let Ok(here) = std::env::current_dir() {
                     b.cwd(here);
                 }
+            }
+        }
+        // v0.6.45 (A9): el camino pty tampoco hereda los secretos de Synsema (F3): antes sólo el
+        // camino con pipes los quitaba, y un `proc_spawn(…, {"pty": true})` los dejaba pasar.
+        for k in &opts.strip_env {
+            b.env_remove(k);
+        }
+        if opts.env_clean {
+            b.env_clear();
+            for (k, v) in synsema_capabilities::secure::clean_env_keep() {
+                b.env(k, v);
             }
         }
         let mut has_term = false;

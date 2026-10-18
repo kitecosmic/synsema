@@ -2574,6 +2574,14 @@ static LIVE_SERVERS: AtomicUsize = AtomicUsize::new(0);
 /// `synsema serve` corre en este proceso (top-level, workers, cron, agentes). Lo que
 /// `shutdown()` necesita para distinguir "sólo bajo serve" de "todavía no hay nada corriendo".
 static UNDER_SERVE: AtomicBool = AtomicBool::new(false);
+/// v0.6.45 (A5) — el bloque `serve` ya abrió su puerto (se marca en el hilo del programa, justo
+/// después del `bind`; `LIVE_SERVERS` sube recién dentro del hilo del server y dejaría una carrera).
+static SERVE_BOUND: AtomicBool = AtomicBool::new(false);
+
+pub fn mark_serve_bound() {
+    SERVE_BOUND.store(true, AtomicOrd::SeqCst);
+}
+
 /// El hilo parkeado del camino sólo-cron (sin server), para despertarlo.
 static CRON_ONLY: std::sync::Mutex<Option<std::thread::Thread>> = std::sync::Mutex::new(None);
 
@@ -2714,9 +2722,15 @@ pub fn register_serve_exit_builtin(interp: &synsema_core::interpreter::Interpret
     interp.register_builtin(
         "exit",
         -1,
-        Rc::new(|_i, _args, loc| {
+        Rc::new(|_i, args, loc| {
+            // v0.6.45 (A5): mientras nada escucha (el preámbulo antes de `serve on`), terminar no
+            // corta ningún request: `exit(code)` vale como en `run` — el patrón de una app de una
+            // sola instancia ("si ya estoy corriendo, mostrá la ventana y salí").
+            if !SERVE_BOUND.load(AtomicOrd::SeqCst) && !cron_only_live() {
+                return synsema_core::interpreter::exit_builtin(args, loc);
+            }
             Err(Control::Error(RuntimeError::at(
-                "exit() ends a `synsema run` program; under serve use shutdown(reason), which drains the requests in flight",
+                "exit() works under serve only before it listens; once it serves, use shutdown(reason), which drains the requests in flight",
                 loc.clone(),
             )))
         }),

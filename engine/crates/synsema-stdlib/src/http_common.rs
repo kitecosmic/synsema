@@ -138,9 +138,27 @@ struct FetchOpts {
     tls: Option<TlsCheck>,
 }
 
+/// v0.6.45 (A11, decisión V1-C6) — la forma posicional de `fetch` sale en v1: hasta entonces anda,
+/// con un aviso por proceso (el `DeprecationWarning` de Python, el `#[deprecated]` de Rust). La regla
+/// general: como mucho dos opcionales posicionales; más, un mapa de opciones como último argumento.
+static FETCH_POSITIONAL_NOTICED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[cold]
+#[inline(never)]
+fn notice_fetch_positional() {
+    if !FETCH_POSITIONAL_NOTICED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        eprintln!(
+            "[synsema] deprecated: fetch(url, method, headers, body, timeout) goes away in v1 — write fetch(url, {{\"method\": …, \"headers\": …, \"body\": …, \"timeout\": …}})"
+        );
+    }
+}
+
 fn fetch_opts(args: &[SynValue]) -> Result<FetchOpts, Control> {
     let Some(SynValue::Map(m)) = args.get(1) else {
         // Forma posicional (corta): fetch(url, method?, headers?, body?, timeout?).
+        if args.len() > 1 {
+            notice_fetch_positional();
+        }
         return Ok(FetchOpts {
             method: args.get(1).map(raw_str).unwrap_or_else(|| "GET".to_string()),
             headers: header_pairs(args.get(2), "fetch")?,

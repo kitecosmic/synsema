@@ -6,6 +6,82 @@ Each says what changed, why, and what to write instead.
 
 Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the release date.
 
+## Unreleased (v0.6.45)
+
+**Behavior changes (read these first).**
+- **`env(name, nothing)` and `secret(name, nothing)` give `nothing` when the variable is not
+  defined.** Before, the default went through its Python text form: `env` gave the text `"None"`,
+  which passed as a valid value (an address, a name) and failed far from the cause, and `secret`
+  sealed the text `"None"` (sent as a header it went out as `Bearer None`). Check it with
+  `when v == nothing`. A defined variable still wins over the default, and without a default an
+  undefined variable is still an error.
+- **A bool default of `env` is Synsema text:** `env(name, true)` gives `"true"`, not `"True"`. A
+  number keeps its text (`env("PORT", 8080)` → `"8080"`).
+
+**Fixes.**
+- **`judge` and the LLM operations inside `parallel_map` and inside a `spawn`ed agent** use the
+  same providers as the code that started them. Before, each `parallel_map` item and each agent
+  under `synsema run` ran in a fresh interpreter without providers: `judge` answered OFFLINE
+  (`available: false`) and `reason`/`decide`/`analyze`/`generate` gave their placeholders, while
+  the same code on the main thread got real answers. Under `serve`, agents were already wired. The
+  process token budget (`SYNSEMA_LLM_BUDGET`) holds inside them too.
+- **A WebSocket or TCP peer that goes away without closing (a reset: the process died, the network
+  dropped; `os error 10054` on Windows) arrives as `{type: "close", reason: "connection reset by
+  peer"}`.** Before, `select` (and `ws_recv`/`tcp_recv`) raised `select: connection N: IO error: …`
+  and the error cut the wait of every other connection in the same `select`. Sending on that TCP
+  connection afterwards is an error that says the other side is gone. A protocol violation (an
+  invalid frame, a message over the size limit) is still an error, as before.
+- **`exit(code)` works in a `serve` program before it listens.** A single-instance desktop app can
+  now do "if another instance is running, ask it to show its window and leave" in the lines before
+  `serve on`: the process ends with that code and no error (before it was `exit() ends a synsema run
+  program…`, and `synsema serve` exited with 1). Once the server listens, `exit` is still an error
+  — it would cut the requests in flight — and `shutdown(reason)` is the way out, as before.
+- **Windows: a `--no-console` binary no longer opens a console window for each child.** `run`,
+  `proc_spawn` and `run_program` with pipes created the child (`ssh`, `git`, `powershell`) with its
+  own visible console window, which the user could close and kill the process with. When the
+  process has no console, children are now created with `CREATE_NO_WINDOW`. With a console (a
+  program run from a terminal) nothing changes: the child shares it, so `ssh` can still ask for a
+  password there.
+
+**Security.**
+- **`proc_spawn(…, {"pty": true})` no longer passes Synsema's secrets to the child.** Since the
+  v0.6.14 audit, `run` and `proc_spawn` remove the provider keys, the human-channel secrets and the
+  names loaded from `.env` from a child's environment, so a program with `exec` but without
+  `env`/`secret` cannot read them with `printenv`. The pseudo-terminal path skipped that step: a
+  child started with `pty: true` saw, for example, `ANTHROPIC_API_KEY`. It is removed there too.
+
+**New.**
+- **`tcp_write(conn, data)` and `pipe_write(end, data)`** take what fits right now and return how
+  many bytes they took, never waiting (`0` = full right now). `tcp_send`/`pipe_send` stay
+  all-or-timeout. A loop that serves many streams credits each one with what it really took,
+  instead of parsing the text of a timeout error.
+- **`pipe_stats(end)`** → `{queued_in, queued_out, status}`, like `tcp_stats`.
+- **`state_merge(key, map)` and `state_cas(key, expected, new)`** under `serve`, both atomic.
+  Read-modify-write of a shared map with `state_get`/`state_set` lost writes under concurrency (13
+  simultaneous webhooks left 7 entries). `state_merge` merges the map into the stored one (shallow)
+  and returns the result; merging into a value that is not a map is an error. `state_cas` writes
+  `new` only if the current value equals `expected` (a missing key is `nothing`; `2.0` equals `2`,
+  as in the language) and returns whether it wrote. `state_incr` was and stays the atomic counter.
+- **`{"env_clean": true}` in `run` and `proc_spawn`**: the child starts with no environment from
+  the parent, only what the program passes in `env` (plus `SystemRoot` on Windows, without which
+  the C runtime and sockets do not start). Without it, the child inherits the environment minus
+  Synsema's secrets, as before. The command itself is still found on the parent's `PATH`; pass
+  `PATH` in `env` if the child starts other programs.
+- **`synsema check` warns a call to a name that exists nowhere**: `without(xs, k)` with no `task
+  without` and no builtin of that name passed `check` and failed only when that line ran. The
+  warning names the line and, for a Python reflex (`len`, `str`), the Synsema form. It only fires
+  when the name is not a builtin and is not defined or used as a value anywhere in the file, so it
+  gives no false positives (run over 2325 `.syn` files: only deliberate cases). A warning does not
+  change the exit code.
+
+**Deprecated.**
+- **The positional form of `fetch(url, method, headers, body, timeout)` goes away in v1.** Write
+  `fetch(url, {"method": …, "headers": …, "body": …, "timeout": …})`, the main form since v0.6.43.
+  Until v1 the positional form still works and prints one notice per process to stderr;
+  `synsema check` points at each call whose second argument is a text literal or `nothing`. The
+  rule from here on: a builtin takes at most two optional positional arguments, and an options map
+  as the last argument beyond that.
+
 ## v0.6.44 — 2026-10-08
 
 `hmac` with bytes, bit operations, values that leave as text are never their printed form, and the full list of drivers in the `serve --attested` notice.

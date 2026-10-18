@@ -1373,6 +1373,75 @@ fn register_serve_state_builtins(interp: &Interpreter, state: SharedState) {
             Ok(SynValue::Number(new_val))
         }));
     }
+    // v0.6.45 (A8) — leer-modificar-guardar de un mapa desde varios requests a la vez perdía
+    // escrituras (13 webhooks simultáneos: llegaron 7). Las dos operaciones corren enteras bajo el
+    // mismo candado. No hay `state_update(k, fn)` a propósito: una lambda que corra bajo el candado
+    // global y llame a `state_*` se traba.
+    {
+        let s = state.clone();
+        interp.register_builtin("state_merge", 2, Rc::new(move |_i, args, _l| {
+            let key = match args.first() {
+                Some(v) => v.to_string(),
+                None => return Err(Control::Error(RuntimeError::new("state_merge: missing key"))),
+            };
+            let patch = match args.get(1) {
+                Some(SynValue::Map(m)) => m.clone(),
+                Some(other) => {
+                    return Err(Control::Error(RuntimeError::new(format!(
+                        "state_merge: the second argument must be a map, got {}",
+                        other.type_name()
+                    ))))
+                }
+                None => return Err(Control::Error(RuntimeError::new("state_merge: missing the map to merge"))),
+            };
+            let mut guard = s.lock().unwrap();
+            let mut merged = SynMap::new();
+            match guard.get(&key).map(from_send) {
+                None | Some(SynValue::Nothing) => {}
+                Some(SynValue::Map(m)) => {
+                    for (k, v) in m.borrow().iter() {
+                        merged.insert(k.clone(), v.clone());
+                    }
+                }
+                Some(other) => {
+                    return Err(Control::Error(RuntimeError::new(format!(
+                        "state_merge: the value of '{}' is {}, not a map — use state_set to replace it",
+                        key,
+                        other.type_name()
+                    ))))
+                }
+            }
+            for (k, v) in patch.borrow().iter() {
+                merged.insert(k.clone(), v.clone());
+            }
+            let val = SynValue::Map(merged.into_ref());
+            let sent = to_send(&val);
+            journal_state_write(&guard, &key, Some(sent.clone()));
+            guard.insert(key, sent);
+            Ok(val)
+        }));
+    }
+    {
+        let s = state.clone();
+        interp.register_builtin("state_cas", 3, Rc::new(move |_i, args, _l| {
+            let key = match args.first() {
+                Some(v) => v.to_string(),
+                None => return Err(Control::Error(RuntimeError::new("state_cas: missing key"))),
+            };
+            let expected = args.get(1).cloned().unwrap_or(SynValue::Nothing);
+            let new = args.get(2).cloned().unwrap_or(SynValue::Nothing);
+            let mut guard = s.lock().unwrap();
+            // Una clave ausente vale `nothing`, como en `state_get`.
+            let current = guard.get(&key).map(from_send).unwrap_or(SynValue::Nothing);
+            if !current.syn_equals(&expected) {
+                return Ok(syn_bool(false));
+            }
+            let sent = to_send(&new);
+            journal_state_write(&guard, &key, Some(sent.clone()));
+            guard.insert(key, sent);
+            Ok(syn_bool(true))
+        }));
+    }
     {
         let s = state.clone();
         interp.register_builtin("state_delete", 1, Rc::new(move |_i, args, _l| {
@@ -1862,7 +1931,7 @@ fn run_socket(
 /// request: no nombra `request`/`params`/`query`/`read_body*` ni un parámetro del path, y no
 /// llama a una task del programa (un builtin como `env(...)` sí vale, como hasta ahora).
 fn static_proxy_target<'a>(stmt: &'a Node, param_names: &[String], env: &Rc<RefCell<Environment>>) -> Option<&'a Node> {
-    const REQUEST_NAMES: [&str; 5] = ["request", "params", "query", "read_body", "read_body_bytes"];
+    use synsema_stdlib::routing::REQUEST_NAMES;
     let NodeKind::ProxyStatement { target } = &stmt.kind else { return None };
     let mut dynamic = false;
     synsema_core::ast_api::walk(target, &mut |n| match &n.kind {
@@ -3700,6 +3769,8 @@ fn make_serve_hook(
                 ))))
             }
         };
+        // v0.6.45 (A5): desde acá el proceso escucha; `exit()` deja de ser válido.
+        server::mark_serve_bound();
         let scheme = if use_tls { "HTTPS" } else { "HTTP" };
         println!("Serving {} on port {} ({} route(s))", scheme, port_str, n_routes);
         if let Some(id) = &attested_identity {
@@ -4108,6 +4179,16 @@ fn serve_inner(source: &str, filename: &str, secure: bool, overrides: ServeOverr
     let r = interp.execute(&program);
     for line in &interp.output {
         println!("{}", line);
+    }
+    // v0.6.45 (A5): un `exit(code)` del preámbulo (antes de escuchar) es el fin pedido, no una
+    // falla: sin "Runtime error" y con su código, como en `run`.
+    let exit = match &r {
+        Err(Control::Error(e)) => e.exit_code,
+        _ => None,
+    };
+    crate::engine::note_exit_code(exit);
+    if let Some(code) = exit {
+        return RunResult { success: code == 0, output: std::mem::take(&mut interp.output), errors: Vec::new() };
     }
     if let Err(Control::Error(e)) = &r {
         return RunResult {

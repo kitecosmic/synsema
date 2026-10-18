@@ -257,6 +257,7 @@ pub fn register_run_program_builtin(interp: &Interpreter, caps: Rc<RefCell<Capab
             if let Some(dir) = &cwd {
                 c.current_dir(dir);
             }
+            synsema_capabilities::secure::hide_child_window(&mut c);
             c.stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped());

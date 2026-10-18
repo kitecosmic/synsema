@@ -575,6 +575,17 @@ fn is_would_block(e: &tungstenite::Error) -> bool {
     matches!(e, tungstenite::Error::Io(io) if io.kind() == std::io::ErrorKind::WouldBlock)
 }
 
+/// v0.6.45 (A3) — el otro lado se fue sin despedirse (RST, proceso muerto, red caída; en Windows
+/// `os error 10054`): es una DESCONEXIÓN y llega como `{type: "close"}`, no como un error que corta
+/// el `select` de todas las demás conexiones. Lo usan el WebSocket y el TCP crudo.
+pub(crate) fn is_peer_gone(kind: std::io::ErrorKind) -> bool {
+    use std::io::ErrorKind::*;
+    matches!(kind, ConnectionReset | ConnectionAborted | BrokenPipe | UnexpectedEof)
+}
+
+/// El motivo que lleva el `close` de una desconexión abrupta.
+pub(crate) const PEER_GONE_REASON: &str = "connection reset by peer";
+
 // =========================================================
 // Establecer la conexión (handshake bloqueante → promoción a mio)
 // =========================================================
@@ -875,6 +886,10 @@ impl WsRegistry {
                     // matada, proceso muerto): es una DESCONEXIÓN, no una violación de
                     // protocolo del programa → `close` con motivo (y reconexión si la hay).
                     self.mark_gone(handle, syn_text("connection reset without closing handshake"));
+                    return false;
+                }
+                Err(tungstenite::Error::Io(io)) if is_peer_gone(io.kind()) => {
+                    self.mark_gone(handle, syn_text(PEER_GONE_REASON));
                     return false;
                 }
                 Err(e) => {
@@ -1654,7 +1669,8 @@ fn ws_send(args: &[SynValue], reg: &Registry) -> Result<SynValue, Control> {
             c.pending_flush = true;
         }
         Err(e) => {
-            let closed = matches!(e, tungstenite::Error::ConnectionClosed | tungstenite::Error::AlreadyClosed);
+            let closed = matches!(e, tungstenite::Error::ConnectionClosed | tungstenite::Error::AlreadyClosed)
+                || matches!(&e, tungstenite::Error::Io(io) if is_peer_gone(io.kind()));
             if closed {
                 drop(r);
                 reg.borrow_mut().mark_gone(handle, SynValue::Nothing);
@@ -2651,6 +2667,7 @@ fn proc_spawn(i: &Interpreter, args: &[SynValue], reg: &Registry) -> Result<SynV
             Some(SynValue::Bool(b)) => opts.process_group = *b,
             Some(other) => return Err(err(format!("{}: process_group must be a boolean, got {}", F, other.type_name()))),
         }
+        opts.env_clean = synsema_capabilities::secure::env_clean_opt(m.get("env_clean"), F)?;
     }
     // F3: el hijo NO hereda los secretos de Synsema (mismo criterio que run()).
     opts.strip_env = i.sensitive_env().iter().cloned().collect();
@@ -3338,11 +3355,23 @@ pub fn register_ws_builtins(interp: &Interpreter, caps: Rc<RefCell<CapabilitySet
     }
     {
         let reg = reg.clone();
+        interp.register_builtin("tcp_write", 2, Rc::new(move |_i, a, _l| ws_net::tcp_write(a, &reg)));
+    }
+    {
+        let reg = reg.clone();
         interp.register_builtin("pipe", -1, Rc::new(move |_i, a, _l| ws_net::pipe_create(a, &reg)));
     }
     {
         let reg = reg.clone();
         interp.register_builtin("pipe_send", -1, Rc::new(move |i, a, _l| ws_net::pipe_send(i, a, &reg)));
+    }
+    {
+        let reg = reg.clone();
+        interp.register_builtin("pipe_write", 2, Rc::new(move |_i, a, _l| ws_net::pipe_write(a, &reg)));
+    }
+    {
+        let reg = reg.clone();
+        interp.register_builtin("pipe_stats", 1, Rc::new(move |_i, a, _l| ws_net::pipe_stats(a, &reg)));
     }
     {
         let reg = reg.clone();

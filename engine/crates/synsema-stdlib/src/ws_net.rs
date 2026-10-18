@@ -46,6 +46,9 @@ pub(super) struct TcpConn {
     eof: bool,
     /// Error de transporte: se entrega una vez como error atrapable y el handle se retira.
     error: Option<String>,
+    /// v0.6.45 (A3) — el otro lado se fue sin despedirse (RST): `eof` queda puesto y el `close`
+    /// lleva este motivo; mandar después es error (los bytes no tienen a dónde ir).
+    gone: Option<&'static str>,
     interest: Option<Interest>,
     sent: u64,
     received: u64,
@@ -53,6 +56,12 @@ pub(super) struct TcpConn {
 }
 
 impl TcpConn {
+    fn mark_gone(&mut self) {
+        self.eof = true;
+        self.gone = Some(PEER_GONE_REASON);
+        self.outbound.clear();
+    }
+
     fn desired_interest(&self) -> Option<Interest> {
         let read = !self.eof && self.error.is_none() && self.inbound_len < self.max_buffer;
         let write = !self.outbound.is_empty() && self.error.is_none();
@@ -104,6 +113,7 @@ impl WsRegistry {
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) if is_peer_gone(e.kind()) => c.mark_gone(),
                 Err(e) => c.error = Some(e.to_string()),
             }
         }
@@ -113,18 +123,17 @@ impl WsRegistry {
     /// Escribe lo pendiente hasta `WouldBlock`.
     pub(super) fn tcp_flush(&mut self, h: i64) {
         let Some(c) = self.tcps.get_mut(&h) else { return };
-        while !c.outbound.is_empty() && c.error.is_none() {
+        while !c.outbound.is_empty() && c.error.is_none() && c.gone.is_none() {
             let (front, _) = c.outbound.as_slices();
             match c.stream.write(front) {
-                Ok(0) => {
-                    c.error = Some("the connection closed while sending".to_string());
-                }
+                Ok(0) => c.mark_gone(),
                 Ok(n) => {
                     c.outbound.drain(..n);
                     c.sent += n as u64;
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) if is_peer_gone(e.kind()) => c.mark_gone(),
                 Err(e) => c.error = Some(e.to_string()),
             }
         }
@@ -177,6 +186,9 @@ impl WsRegistry {
             // antes se hacía `shutdown(Both)` acá y la respuesta no llegaba.
             let mut m = SynMap::new();
             m.insert("type", syn_text("close"));
+            if let Some(reason) = c.gone {
+                m.insert("reason", syn_text(reason));
+            }
             return Some(Ok(m));
         }
         None
@@ -434,6 +446,7 @@ pub(super) fn tcp_connect(i: &mut Interpreter, args: &[SynValue], reg: &Registry
             max_buffer,
             eof: false,
             error: None,
+            gone: None,
             interest: None,
             sent: 0,
             received: 0,
@@ -462,6 +475,9 @@ pub(super) fn tcp_send(i: &mut Interpreter, args: &[SynValue], reg: &Registry) -
                 r.tcp_retire(h);
                 return Err(err(format!("{}: connection {}: {}", F, h, e)));
             }
+            if let Some(reason) = c.gone {
+                return Err(err(format!("{}: connection {}: the other side is gone ({})", F, h, reason)));
+            }
             let room = c.max_buffer.saturating_sub(c.outbound.len());
             let n = room.min(data.len() - off);
             c.outbound.extend(&data[off..off + n]);
@@ -484,6 +500,29 @@ pub(super) fn tcp_send(i: &mut Interpreter, args: &[SynValue], reg: &Registry) -
         }
         reg.borrow_mut().poll_process((deadline - now).min(Duration::from_millis(250)));
     }
+}
+
+/// v0.6.45 (A4) — `tcp_write(conn, data)` → cuántos bytes aceptó, **sin esperar nunca** (el `write`
+/// de Rust y de Go; `tcp_send` es el `write_all`). Acepta lo que entra en el buffer de salida
+/// (`max_buffer`) y devuelve el número: un bucle que reparte muchos streams no se frena por un lector
+/// lento y acredita sólo lo que entró, sin leer el texto de un error. 0 = lleno ahora.
+pub(super) fn tcp_write(args: &[SynValue], reg: &Registry) -> Result<SynValue, Control> {
+    const F: &str = "tcp_write";
+    let h = tcp_handle(reg, args.first(), F)?;
+    let data = bytes_arg(args.get(1), F)?;
+    let mut r = reg.borrow_mut();
+    let c = r.tcps.get_mut(&h).ok_or_else(|| err(format!("{}: connection {} closed", F, h)))?;
+    if let Some(e) = c.error.clone() {
+        r.tcp_retire(h);
+        return Err(err(format!("{}: connection {}: {}", F, h, e)));
+    }
+    if let Some(reason) = c.gone {
+        return Err(err(format!("{}: connection {}: the other side is gone ({})", F, h, reason)));
+    }
+    let n = c.max_buffer.saturating_sub(c.outbound.len()).min(data.len());
+    c.outbound.extend(&data[..n]);
+    r.tcp_flush(h);
+    Ok(syn_int(n as i64))
 }
 
 /// Espera un evento de UN handle (`tcp_recv`/`pipe_recv`): el mismo núcleo que `select`.
@@ -571,6 +610,40 @@ pub(super) fn pipe_send(i: &mut Interpreter, args: &[SynValue], reg: &Registry) 
         }
     }
     Ok(SynValue::Nothing)
+}
+
+/// v0.6.45 (A4) — `pipe_write(end, data)` → cuántos bytes aceptó, sin esperar nunca (ver
+/// `tcp_write`). 0 = el buffer de esa dirección está lleno ahora.
+pub(super) fn pipe_write(args: &[SynValue], reg: &Registry) -> Result<SynValue, Control> {
+    const F: &str = "pipe_write";
+    let h = pipe_handle(reg, args.first(), F)?;
+    let data = bytes_arg(args.get(1), F)?;
+    let res = {
+        let r = reg.borrow();
+        let p = r.pipes.get(&h).ok_or_else(|| err(format!("{}: pipe end {} closed", F, h)))?;
+        p.end.try_write(&data)
+    };
+    match res {
+        Ok(n) => Ok(syn_int(n as i64)),
+        Err(WriteError::Full) => Ok(syn_int(0)),
+        Err(WriteError::Closed) => {
+            reg.borrow_mut().pipes.remove(&h);
+            Err(err(format!("{}: the other end of pipe {} is closed", F, h)))
+        }
+    }
+}
+
+/// v0.6.45 (A4) — `pipe_stats(end)` → `{queued_in, queued_out, status}`, como `tcp_stats`.
+pub(super) fn pipe_stats(args: &[SynValue], reg: &Registry) -> Result<SynValue, Control> {
+    let h = pipe_handle(reg, args.first(), "pipe_stats")?;
+    let r = reg.borrow();
+    let p = r.pipes.get(&h).ok_or_else(|| err(format!("pipe_stats: pipe end {} closed", h)))?;
+    let (queued_in, queued_out) = p.end.queued();
+    let mut m = SynMap::new();
+    m.insert("queued_in", syn_int(queued_in as i64));
+    m.insert("queued_out", syn_int(queued_out as i64));
+    m.insert("status", syn_text(if p.end.at_eof() { "closing" } else { "open" }));
+    Ok(syn_map(m))
 }
 
 pub(super) fn pipe_recv(i: &mut Interpreter, args: &[SynValue], reg: &Registry) -> Result<SynValue, Control> {

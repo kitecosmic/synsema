@@ -371,7 +371,24 @@ fn resolve(env: &EnvStore, name: &str, default: Option<&SynValue>) -> Option<Str
     if let Some(v) = env.get(name) {
         return Some(v);
     }
-    default.map(raw_str)
+    default.filter(|d| !matches!(d, SynValue::Nothing)).map(default_text)
+}
+
+/// v0.6.45 (A2) — el texto de un default de `env`/`secret`. Antes pasaba por `raw_str`, que es
+/// la forma de Python: `env("X", true)` daba `"True"`. Un número sigue dando su texto
+/// (`env("PORT", 8080)` → `"8080"`, como documenta la skill).
+fn default_text(v: &SynValue) -> String {
+    match v {
+        SynValue::Bool(b) => if *b { "true" } else { "false" }.to_string(),
+        other => raw_str(other),
+    }
+}
+
+/// v0.6.45 (A2) — `env(n, nothing)` / `secret(n, nothing)` sin la variable definida dan
+/// `nothing`, no el texto `"None"` (que pasaba como un valor válido, y en un secret salía
+/// como `Bearer None`). Sin default, una variable indefinida sigue siendo error.
+fn nothing_default(default: Option<&SynValue>) -> bool {
+    matches!(default, Some(SynValue::Nothing))
 }
 
 /// Error de capability denegada que **sugiere el fix a quien puede hacerlo** (§1/§3):
@@ -787,6 +804,7 @@ pub fn register_secret_builtins(
                 }
                 match resolve(&env, &name, args.get(1)) {
                     Some(v) => Ok(syn_text(v)),
+                    None if nothing_default(args.get(1)) => Ok(SynValue::Nothing),
                     None => Err(undefined_var("env", &name)),
                 }
             }),
@@ -807,6 +825,7 @@ pub fn register_secret_builtins(
                 }
                 match resolve(&env, &name, args.get(1)) {
                     Some(v) => Ok(syn_secret(name, v)),
+                    None if nothing_default(args.get(1)) => Ok(SynValue::Nothing),
                     None => Err(undefined_var("secret", &name)),
                 }
             }),

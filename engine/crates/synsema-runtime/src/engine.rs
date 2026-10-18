@@ -399,6 +399,8 @@ pub const LABEL_SINK_BUILTINS: &[&str] = &[
     "ws_connect", "ws_send", "ws_broadcast", "ws_close", "push_send", "oidc_verify",
     // v0.6.42: TCP crudo y pipes (un pipe cruza a otro intérprete: escribir y cerrar son salidas).
     "tcp_connect", "tcp_send", "tcp_close", "pipe_send", "pipe_close",
+    // v0.6.45 (A4): escribir sin esperar también es una salida.
+    "tcp_write", "pipe_write",
     "eth_rpc", "eth_call", "eth_send_raw", "eth_balance", "eth_nonce", "eth_receipt", "eth_wait_receipt",
     "eth_estimate_gas", "eth_gas_price", "eth_fee_history", "eth_chain_id",
     "solana_rpc", "solana_send", "solana_confirm", "solana_balance", "solana_latest_blockhash", "spl_balance",
@@ -418,7 +420,7 @@ pub const LABEL_SINK_BUILTINS: &[&str] = &[
     "mongo_count", "mongo_aggregate", "mongo_collections",
     // Memoria persistente, estado y progreso (synsema-agents, serve)
     "remember", "recall", "forget_memory", "add_rule", "create_progress", "start_step", "complete_step", "fail_step",
-    "state_set", "state_get", "state_incr", "state_delete", "state_all",
+    "state_set", "state_get", "state_incr", "state_delete", "state_all", "state_merge", "state_cas",
     // Bus, cron, entorno, gasto, attestation, archivos comprimidos, exportes
     "bus_publish", "bus_subscribe", "bus_unsubscribe", "cron_every", "cron_after", "cron_cancel",
     "env", "secret", "reveal", "spend", "attest", "attest_key",
@@ -437,14 +439,14 @@ pub const LABEL_SINK_BUILTINS: &[&str] = &[
 /// El anti-rot no puede buscarlos en el wiring base. La sentencia `emit` y la respuesta HTTP son
 /// sumideros del propio `serve` (`serve.rs`/`routing.rs`), no builtins.
 pub const LABEL_SINKS_SERVE_ONLY: &[&str] =
-    &["state_set", "state_get", "state_incr", "state_delete", "state_all", "agents", "agent_stop"];
+    &["state_set", "state_get", "state_incr", "state_delete", "state_all", "state_merge", "state_cas", "agents", "agent_stop"];
 
 /// Familias OS-facing (las tablas de `synsema_stdlib::pure`) que NO son sumideros porque LEEN: entradas
 /// (stdin, sockets, procesos, terminal, watches, bus) y consultas del estado del host. Se declaran aparte
 /// para que el anti-rot pueda exigir que toda familia que hable con el SO esté clasificada a mano: o
 /// sumidero, o lectura declarada acá. Todas están además en `LABEL_PURE_BUILTINS`.
 pub const LABEL_OS_READ_BUILTINS: &[&str] = &[
-    "pipe", "pipe_recv", "tcp_recv", "tcp_stats",
+    "pipe", "pipe_recv", "tcp_recv", "tcp_stats", "pipe_stats",
     "agents", "bus_recv", "bus_topics", "cron_list", "cron_status", "cwd", "proc_recv", "proc_select",
     "proc_stats", "proc_status", "read_line", "select", "self_path", "term_recv", "term_size", "term_stats",
     "watch_recv", "watch_stats", "ws_recv", "ws_select", "ws_select_all", "ws_stats", "ws_status",
@@ -465,7 +467,7 @@ pub const LABEL_PURE_BUILTINS: &[&str] = &[
     // el anti-rot al extenderse a ese wiring (auditoría ronda 3, M3).
     "agents",
     // v0.6.42: leer de un TCP o de un pipe, y crear un pipe (memoria del proceso, nada sale).
-    "pipe", "pipe_recv", "tcp_recv", "tcp_stats",
+    "pipe", "pipe_recv", "tcp_recv", "tcp_stats", "pipe_stats",
     "bus_recv", "bus_topics", "cron_list", "cron_status", "cwd", "proc_recv", "proc_select", "proc_stats",
     "proc_status", "read_line", "select", "self_path", "term_recv", "term_size", "term_stats", "watch_recv",
     "watch_stats", "ws_recv", "ws_select", "ws_select_all", "ws_stats", "ws_status",
@@ -976,14 +978,73 @@ pub(crate) fn wire_real_judge_provider(interp: &mut Interpreter) {
         Some(p) => p,
         None => return,
     };
+    let decide = crate::judge_provider::decide_via_judge(&store);
+    wire_judge_with(interp, provider, decide);
+}
+
+fn wire_judge_with(
+    interp: &mut Interpreter,
+    provider: Arc<crate::judge_provider::WiredJudgeProvider>,
+    decide_via_judge: bool,
+) {
+    let stash = provider.clone();
     interp.set_judge_usage_callback(Rc::new(crate::judge_provider::judge_tokens_total));
     interp.set_judge_model_callback(Rc::new(crate::judge_provider::judge_last_model));
     interp.set_judge_callback(Rc::new(move |req| provider.judge_for_interpreter(req)));
     // v0.6.26 — `SYNSEMA_JUDGE_DECIDE=1`: `decide between […] given X` se sirve con el juez
     // (una pregunta `choose`), calibrado y sin normalización ni reintento. Opt-in del host:
     // cambia qué modelo contesta. Sólo con provider de judge cableado (arriba).
-    if crate::judge_provider::decide_via_judge(&store) {
+    if decide_via_judge {
         interp.set_decide_via_judge(true);
+    }
+    provider_cell(interp).borrow_mut().judge = Some((stash, decide_via_judge));
+}
+
+/// v0.6.45 (A1) — los providers reales que tiene cableados un intérprete, guardados en su `ext`
+/// para que lo que corre EN SU NOMBRE en otro hilo (cada item de `parallel_map`, cada agente de
+/// `spawn`) use las MISMAS instancias: sin releer el `.env`, y con exactamente lo que tiene el
+/// llamador (si está offline, el otro también). Antes esos intérpretes no cableaban nada y
+/// `judge`/`reason` caían a OFFLINE/placeholder. Cruzan hilos sin problema: los providers son
+/// `Send + Sync` y los contadores de presupuesto (`LLM_TOKENS_USED`, `IDENTITY_TOKENS_USED`, los
+/// del judge) son estáticos del proceso, así que compartir la instancia no saltea ningún techo.
+#[derive(Clone, Default)]
+pub(crate) struct WiredProviders {
+    llm: Option<Arc<dyn LLMProvider>>,
+    judge: Option<(Arc<crate::judge_provider::WiredJudgeProvider>, bool)>,
+}
+
+const WIRED_PROVIDERS_KEY: &str = "synsema.wired_providers";
+
+/// La celda (una por intérprete) es compartida a propósito: el hook de `spawn` se arma en
+/// `wire_swarm_hooks` ANTES de que se cableen los providers, así que captura la celda y la lee
+/// recién cuando el programa hace `spawn`.
+type ProviderCell = RefCell<WiredProviders>;
+
+fn provider_cell(interp: &Interpreter) -> Rc<ProviderCell> {
+    let found = interp
+        .ext
+        .borrow()
+        .get(WIRED_PROVIDERS_KEY)
+        .and_then(|a| a.clone().downcast::<ProviderCell>().ok());
+    if let Some(cell) = found {
+        return cell;
+    }
+    let cell = Rc::new(ProviderCell::default());
+    interp.ext.borrow_mut().insert(WIRED_PROVIDERS_KEY, cell.clone() as Rc<dyn std::any::Any>);
+    cell
+}
+
+pub(crate) fn wired_providers(interp: &Interpreter) -> WiredProviders {
+    provider_cell(interp).borrow().clone()
+}
+
+/// Cablea en `interp` los providers de otro intérprete (ver [`WiredProviders`]).
+pub(crate) fn wire_providers(interp: &mut Interpreter, wired: &WiredProviders) {
+    if let Some(p) = &wired.llm {
+        wire_llm_with(interp, p.clone());
+    }
+    if let Some((p, decide)) = &wired.judge {
+        wire_judge_with(interp, p.clone(), *decide);
     }
 }
 
@@ -997,6 +1058,11 @@ pub(crate) fn wire_real_llm_provider(interp: &mut Interpreter) {
         Some(p) => Arc::new(crate::llm_providers::ReloadingProvider::new(p)),
         None => return,
     };
+    wire_llm_with(interp, provider);
+}
+
+fn wire_llm_with(interp: &mut Interpreter, provider: Arc<dyn LLMProvider>) {
+    provider_cell(interp).borrow_mut().llm = Some(provider.clone());
     // llm_usage(): tokens LLM acumulados del proceso (F-A). Se cablea junto al
     // provider (con provider real siempre hay metering — MeteredProvider); offline el
     // callback no se setea y el builtin del core devuelve 0.
@@ -1262,6 +1328,12 @@ static LAST_RUN_PRIVATE: std::sync::atomic::AtomicBool = std::sync::atomic::Atom
 
 /// v0.6.42 — el código que pidió `exit(code)` en la última corrida (-1 = no llamó a `exit`).
 static LAST_RUN_EXIT: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
+/// v0.6.45 (A5) — `serve` anota el código de un `exit(code)` del preámbulo (antes de escuchar),
+/// o que no lo hubo, por el mismo canal que `run`.
+pub(crate) fn note_exit_code(code: Option<i32>) {
+    LAST_RUN_EXIT.store(code.unwrap_or(-1), std::sync::atomic::Ordering::SeqCst);
+}
 
 /// El código de `exit(code)` de la última corrida, si el programa lo llamó.
 pub fn last_run_exit_code() -> Option<i32> {
@@ -2006,6 +2078,7 @@ pub(crate) fn wire_swarm_hooks(
         let mem = mem.clone();
         let builder = builder.clone();
         let caps_spawn = caps.clone();
+        let providers = provider_cell(interp);
         Rc::new(move |agent, body, args, globals, spawn_subject| {
             let send_args: Vec<(String, SendValue)> =
                 args.iter().map(|(k, v)| (k.clone(), to_send(v))).collect();
@@ -2026,7 +2099,9 @@ pub(crate) fn wire_swarm_hooks(
                 llm_tokens: crate::llm_providers::current_delegated_llm_budget(),
                 delegations: caps_spawn.borrow().delegations(),
             };
-            Ok(spawn_agent(sw.clone(), agent.to_string(), body, send_args, global_snap, ceiling.clone(), mem.clone(), builder.clone(), subject))
+            // v0.6.45 (A1): el agente usa los mismos providers que el que lo spawnea.
+            let wired = providers.borrow().clone();
+            Ok(spawn_agent(sw.clone(), agent.to_string(), body, send_args, global_snap, ceiling.clone(), mem.clone(), builder.clone(), subject, wired))
         })
     };
 
@@ -2097,6 +2172,7 @@ fn spawn_agent(
     mem: Option<MemoryCtx>,
     builder: Option<InterpBuilder>,
     subject: crate::subject::Subject,
+    providers: WiredProviders,
 ) -> String {
     let instance_id = swarm.register_new_agent(&agent_name);
     let sw = swarm.clone();
@@ -2114,7 +2190,13 @@ fn spawn_agent(
                     wire_swarm_hooks(&mut interp, sw.clone(), &id, ceiling.clone(), mem.clone(), Some(b.clone()), &caps);
                     (interp, caps)
                 }
-                None => setup_swarm_interpreter(sw.clone(), &id, ceiling, mem, true),
+                // Bajo serve el builder ya cablea los providers; sin builder (`run`), los del
+                // que lo spawneó.
+                None => {
+                    let (mut interp, caps) = setup_swarm_interpreter(sw.clone(), &id, ceiling, mem, true);
+                    wire_providers(&mut interp, &providers);
+                    (interp, caps)
+                }
             };
             // T1: el agente corre EN NOMBRE del sujeto que lo spawneó, bajo su techo delegado
             // y sus presupuestos. El guard vive hasta el final del hilo.

@@ -16,6 +16,54 @@ use std::process::{Command, Stdio};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
+/// v0.6.45 (A6) — el proceso no tiene consola (un build `--no-console` de Windows): un hijo con
+/// pipes se crea con `CREATE_NO_WINDOW`, si no abre una ventana de consola propia. Lo decide la
+/// CLI al arrancar (`stdio::has_console`); embebido como librería queda apagado (lo de siempre).
+/// Con consola no se toca: el hijo comparte la del padre y un `ssh` puede pedir la clave ahí.
+static CHILD_NO_WINDOW: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_child_no_window(on: bool) {
+    CHILD_NO_WINDOW.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// v0.6.45 (A9) — las variables que un hijo con `env_clean` conserva: en Windows `SystemRoot`, sin
+/// la cual el CRT y WinSock no arrancan (la misma única excepción que `run_program`). Todo lo demás
+/// lo pasa el programa explícito por `env`.
+pub fn clean_env_keep() -> Vec<(String, String)> {
+    let mut keep = Vec::new();
+    #[cfg(windows)]
+    if let Ok(v) = std::env::var("SystemRoot") {
+        keep.push(("SystemRoot".to_string(), v));
+    }
+    keep
+}
+
+/// `opts.env_clean` de `run`/`proc_spawn`: ausente o `false` = hereda (menos los secretos); `true` =
+/// el hijo arranca sin entorno.
+pub fn env_clean_opt(v: Option<&SynValue>, who: &str) -> Result<bool, Control> {
+    match v {
+        None | Some(SynValue::Nothing) => Ok(false),
+        Some(SynValue::Bool(b)) => Ok(*b),
+        Some(other) => Err(Control::Error(RuntimeError::new(format!(
+            "{}: env_clean must be a boolean, got {}",
+            who,
+            other.type_name()
+        )))),
+    }
+}
+
+/// Aplica `CREATE_NO_WINDOW` a `c` si el proceso no tiene consola (sólo Windows).
+pub fn hide_child_window(c: &mut Command) {
+    #[cfg(windows)]
+    if CHILD_NO_WINDOW.load(std::sync::atomic::Ordering::Relaxed) {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        c.creation_flags(CREATE_NO_WINDOW);
+    }
+    #[cfg(not(windows))]
+    let _ = c;
+}
+
 use chrono::{DateTime, Datelike, NaiveDateTime, Timelike, Utc};
 use regex::RegexBuilder;
 
@@ -1166,12 +1214,18 @@ pub fn register_secure_builtins(interp: &Interpreter, caps: Rc<RefCell<Capabilit
                 for name in i.sensitive_env() {
                     c.env_remove(name);
                 }
+                // v0.6.45 (A9): `{"env_clean": true}` — el hijo no hereda nada del entorno.
+                if env_clean_opt(opt("env_clean").as_ref(), "run")? {
+                    c.env_clear();
+                    c.envs(clean_env_keep());
+                }
                 if let Some(SynValue::Map(m)) = opt("env") {
                     for (k, v) in m.borrow().iter() {
                         c.env(k.as_str(), raw_str(v)); // override explícito (gana sobre el strip)
                     }
                 }
 
+                hide_child_window(&mut c);
                 let mut child = c.spawn().map_err(|e| {
                     Control::Error(RuntimeError::new(format!(
                         "run: cannot start \"{}\": {}",
