@@ -44,6 +44,18 @@ Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the rele
   password there.
 
 **Security.**
+- **RS256 signing (`jwt_sign` with `"alg": "RS256"`, `rsa_sign_sha256`) is constant-time in the
+  native binary.** The `rsa` crate is not constant-time on private-key operations
+  (RUSTSEC-2023-0071, "Marvin"; no stable fix upstream) and the signature did not even use
+  blinding. The native binary now signs with `ring` (BoringSSL), already in the binary for TLS;
+  the wasm build, where `ring` does not compile, signs with `rsa` and blinding. The signature bytes
+  are the same either way. The audit configuration claimed the crate was only used to verify,
+  which stopped being true in v0.6.20; it now says what is true.
+- **Dependencies with advisories updated:** `rustls` 0.23.46 (RUSTSEC-2026-0346…0349), `zip` 9
+  for `zip_extract`/`zip_create` (RUSTSEC-2026-0367…0369 — never reachable through `zip_extract`,
+  which never used the affected `extract`), `lru` 0.18 (unsound `pop`), and `rust_decimal` 1.43,
+  which drops `rkyv` 0.7 from the lock. `mysql` 28.0.4, `chacha20` and `private-gemm-x86` replace
+  yanked versions. `cargo audit` is clean.
 - **`proc_spawn(…, {"pty": true})` no longer passes Synsema's secrets to the child.** Since the
   v0.6.14 audit, `run` and `proc_spawn` remove the provider keys, the human-channel secrets and the
   names loaded from `.env` from a child's environment, so a program with `exec` but without

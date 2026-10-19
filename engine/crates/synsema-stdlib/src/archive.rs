@@ -314,7 +314,8 @@ fn zip_extract(caps: &Rc<RefCell<CapabilitySet>>, args: &[SynValue]) -> Result<S
     let mut total: u64 = 0;
     for i in 0..archive.len() {
         let mut f = archive.by_index(i).map_err(|e| err(format!("{}: entry {}: {}", F, i, e)))?;
-        let raw = f.name().to_string();
+        // zip 9: un nombre que no decodifica es un error, no un texto adivinado.
+        let raw = f.name().map_err(|e| err(format!("{}: entry {}: unreadable name: {}", F, i, e)))?.to_string();
         let is_symlink = f.unix_mode().map(|m| m & 0o170000 == 0o120000).unwrap_or(false);
         if is_symlink {
             continue;

@@ -703,11 +703,31 @@ fn ed25519_signing_key(key: &[u8], who: &str) -> Result<ed25519_dalek::SigningKe
 }
 
 /// RSASSA-PKCS1-v1_5 con SHA-256 (RS256). Determinista.
+/// RS256 (PKCS#1 v1.5 + SHA-256). v0.6.45: el crate `rsa` 0.9 no es de tiempo constante en las
+/// operaciones con la clave PRIVADA (RUSTSEC-2023-0071, "Marvin"; sin versión estable que lo
+/// arregle), y `sign` ni siquiera cegaba. En el binario nativo firma `ring` (BoringSSL, tiempo
+/// constante; ya está en el binario por TLS). En wasm, donde `ring` no compila sin C, firma `rsa` CON
+/// cegado (`sign_with_rng`), que esconde la clave del tiempo de la exponenciación. La firma es la
+/// misma en los dos caminos: PKCS#1 v1.5 es determinista.
 fn rs256_sign(key: &rsa::RsaPrivateKey, msg: &[u8]) -> Vec<u8> {
+    #[cfg(feature = "native")]
+    if let Some(sig) = rs256_sign_ring(key, msg) {
+        return sig;
+    }
     use rsa::pkcs1v15::SigningKey;
-    use rsa::signature::{SignatureEncoding, Signer};
+    use rsa::signature::{RandomizedSigner, SignatureEncoding};
     let sk = SigningKey::<Sha256>::new(key.clone());
-    sk.sign(msg).to_bytes().to_vec()
+    sk.sign_with_rng(&mut rand::rngs::OsRng, msg).to_bytes().to_vec()
+}
+
+#[cfg(feature = "native")]
+fn rs256_sign_ring(key: &rsa::RsaPrivateKey, msg: &[u8]) -> Option<Vec<u8>> {
+    use rsa::pkcs1::EncodeRsaPrivateKey;
+    let der = key.to_pkcs1_der().ok()?;
+    let kp = ring::signature::RsaKeyPair::from_der(der.as_bytes()).ok()?;
+    let mut sig = vec![0u8; kp.public().modulus_len()];
+    kp.sign(&ring::signature::RSA_PKCS1_SHA256, &ring::rand::SystemRandom::new(), msg, &mut sig).ok()?;
+    Some(sig)
 }
 
 fn rs256_verify(key: &rsa::RsaPublicKey, msg: &[u8], sig: &[u8]) -> bool {
@@ -1816,6 +1836,20 @@ mod v0620_tests {
         let header = String::from_utf8(b64url_decode(parts[0]).unwrap()).unwrap();
         let signing_input = format!("{}.{}", parts[0], parts[1]);
         (header, signing_input, b64url_decode(parts[2]).unwrap())
+    }
+
+    /// v0.6.45: los dos caminos de RS256 — `ring` (nativo, tiempo constante) y `rsa` con cegado
+    /// (wasm) — dan la MISMA firma (PKCS#1 v1.5 es determinista).
+    #[test]
+    fn rs256_ring_and_blinded_rsa_give_the_same_signature() {
+        use rsa::pkcs1v15::SigningKey;
+        use rsa::signature::{RandomizedSigner, SignatureEncoding};
+        let sk = rsa::RsaPrivateKey::new(&mut rand::rngs::OsRng, 2048).expect("keygen");
+        let msg = b"header.payload";
+        let ring = rs256_sign_ring(&sk, msg).expect("ring firma una clave PKCS#1");
+        let blinded = SigningKey::<Sha256>::new(sk.clone()).sign_with_rng(&mut rand::rngs::OsRng, msg).to_bytes().to_vec();
+        assert_eq!(ring, blinded);
+        assert_eq!(rs256_sign(&sk, msg), ring, "el camino nativo es ring");
     }
 
     #[test]

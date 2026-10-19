@@ -36,6 +36,9 @@ resvg.workspace = true
 usvg.workspace = true
 # v0.6.45 (B7): qr_matrix / qr_svg (puro, también en wasm).
 qrcode.workspace = true
+# v0.6.45: firma RS256 en tiempo constante en el binario nativo (RUSTSEC-2023-0071 en `rsa`). ring ya
+# está en el binario por rustls; sólo native (en wasm no compila sin C).
+ring = { version = "0.17", optional = true }
 # v0.6.45 (B9): html_select / html_text / html_unescape.
 scraper.workspace = true
 # El árbol de scraper (no lo reexporta); la misma versión que ya trae scraper: ninguna crate nueva.
@@ -176,6 +179,7 @@ native = [
     "dep:zip",
     "dep:tar",
     "dep:rustls",
+    "dep:ring",
     "dep:rustls-pemfile",
     "dep:rcgen",
     "dep:rustls-native-certs",
