@@ -167,6 +167,33 @@ fn locate_for_read(caps: &Rc<RefCell<CapabilitySet>>, raw: &str, source: &str) -
     Ok(Located::Disk(path))
 }
 
+/// v0.6.45 — el error de leer un archivo, con la causa real. Antes todo era `File not found`: un
+/// archivo abierto en exclusiva por otro proceso, una carpeta, un link roto o un texto que no es
+/// UTF-8 decían lo mismo, y quien lo lee (una persona o un agente) buscaba un archivo que estaba,
+/// sin poder decidir si reintentar. `File not found` queda sólo para lo que no existe.
+pub(crate) fn read_error(path: &str, e: &std::io::Error) -> Control {
+    use std::io::ErrorKind;
+    let why = if std::fs::metadata(path).map(|m| m.is_dir()).unwrap_or(false) {
+        "it is a directory (use list_dir)".to_string()
+    } else if e.kind() == ErrorKind::NotFound {
+        if std::fs::symlink_metadata(path).is_ok() {
+            "it is a broken link (it points to something that does not exist)".to_string()
+        } else {
+            return Control::Error(RuntimeError::new(format!("File not found: {}", path)));
+        }
+    } else if cfg!(windows) && matches!(e.raw_os_error(), Some(32) | Some(33)) {
+        // ERROR_SHARING_VIOLATION / ERROR_LOCK_VIOLATION: otro proceso lo tiene abierto sin compartir.
+        "in use by another process (it is open without sharing; retry later)".to_string()
+    } else if e.kind() == ErrorKind::PermissionDenied {
+        "permission denied".to_string()
+    } else if e.kind() == ErrorKind::InvalidData {
+        "it is not valid UTF-8 text (use read_file_bytes)".to_string()
+    } else {
+        e.to_string()
+    };
+    Control::Error(RuntimeError::new(format!("Cannot read file {}: {}", path, why)))
+}
+
 /// Rango de líneas 1-based (EOL preservado) sobre un texto en memoria (bundle).
 fn lines_range_str(s: &str, offset: usize, limit: Option<usize>) -> String {
     s.split_inclusive('\n')
@@ -286,7 +313,10 @@ fn grep_collect(path: &str, glob: &Option<String>, out: &mut Vec<String>) -> Res
         out.push(path.to_string());
         return Ok(());
     }
-    fn walk(dir: &str, glob: &Option<String>, out: &mut Vec<String>) {
+    // v0.6.45 — el `file.read` se chequeó sobre `path`; lo que se recorre tiene que quedar adentro
+    // EN DISCO. Un link a una carpeta no se sigue (como ripgrep; además evita ciclos) y un link a
+    // un archivo entra sólo si lleva a algo dentro de `path`.
+    fn walk(root: &str, dir: &str, glob: &Option<String>, out: &mut Vec<String>) {
         let rd = match std::fs::read_dir(dir) {
             Ok(x) => x,
             Err(_) => return,
@@ -294,8 +324,12 @@ fn grep_collect(path: &str, glob: &Option<String>, out: &mut Vec<String>) -> Res
         for e in rd.flatten() {
             let p = e.path();
             let ps = p.to_string_lossy().replace('\\', "/");
+            let link = e.file_type().map(|t| t.is_symlink()).unwrap_or(true);
+            if link && (p.is_dir() || !synsema_core::capscope::physically_beneath(root, &ps)) {
+                continue;
+            }
             if p.is_dir() {
-                walk(&ps, glob, out);
+                walk(root, &ps, glob, out);
             } else {
                 let name = e.file_name().to_string_lossy().into_owned();
                 let inc = match glob {
@@ -308,7 +342,7 @@ fn grep_collect(path: &str, glob: &Option<String>, out: &mut Vec<String>) -> Res
             }
         }
     }
-    walk(path, glob, out);
+    walk(path, path, glob, out);
     Ok(())
 }
 
@@ -455,12 +489,14 @@ pub fn register_pure_fs(interp: &Interpreter, hint: &'static str) {
                 m.insert("size", syn_int(bytes.len() as i64));
                 m.insert("modified", SynValue::Nothing);
                 m.insert("bundled", syn_bool(true));
+                m.insert("is_link", syn_bool(false));
             }
             None => {
                 m.insert("exists", syn_bool(false));
                 m.insert("is_dir", syn_bool(false));
                 m.insert("size", syn_int(0));
                 m.insert("modified", SynValue::Nothing);
+                m.insert("is_link", syn_bool(false));
             }
         }
         Ok(syn_map(m))
@@ -500,6 +536,7 @@ pub fn register_pure_fs(interp: &Interpreter, hint: &'static str) {
             m.insert("name", syn_text(name));
             m.insert("is_dir", syn_bool(is_dir));
             m.insert("size", syn_int(size));
+            m.insert("is_link", syn_bool(false));
             syn_map(m)
         }).collect()))
     }));
@@ -533,10 +570,7 @@ pub fn register_secure_builtins(interp: &Interpreter, caps: Rc<RefCell<Capabilit
                     }
                     return match std::fs::read_to_string(&path) {
                         Ok(c) => Ok(syn_text(c)),
-                        Err(_) => Err(Control::Error(RuntimeError::new(format!(
-                            "File not found: {}",
-                            path
-                        )))),
+                        Err(e) => Err(read_error(&path, &e)),
                     };
                 }
                 // rango por líneas (1-based)
@@ -571,10 +605,7 @@ pub fn register_secure_builtins(interp: &Interpreter, caps: Rc<RefCell<Capabilit
                 }
                 match read_lines_range(&path, offset as usize, limit) {
                     Ok(s) => Ok(syn_text(s)),
-                    Err(_) => Err(Control::Error(RuntimeError::new(format!(
-                        "File not found: {}",
-                        path
-                    )))),
+                    Err(e) => Err(read_error(&path, &e)),
                 }
             }),
         );
@@ -632,6 +663,7 @@ pub fn register_secure_builtins(interp: &Interpreter, caps: Rc<RefCell<Capabilit
                                 m.insert("name", syn_text(name));
                                 m.insert("is_dir", syn_bool(is_dir));
                                 m.insert("size", syn_int(size));
+                                m.insert("is_link", syn_bool(false));
                                 syn_map(m)
                             })
                             .collect();
@@ -646,26 +678,32 @@ pub fn register_secure_builtins(interp: &Interpreter, caps: Rc<RefCell<Capabilit
                 let rd = std::fs::read_dir(&path).map_err(|_| {
                     Control::Error(RuntimeError::new(format!("Not a directory: {}", path)))
                 })?;
-                let mut entries: Vec<(String, bool, i64)> = Vec::new();
+                // v0.6.45 — un link (symlink, junction) dice `is_link: true` y su `is_dir` es el de
+                // lo que apunta, igual que en `file_info` (antes una junction salía `is_dir: false`
+                // acá y `true` allá). Su `size` es 0: el tamaño de algo que puede estar fuera del
+                // scope no se da gratis; `file_info` lo da si el destino queda adentro.
+                let mut entries: Vec<(String, bool, i64, bool)> = Vec::new();
                 for e in rd.flatten() {
                     let name = e.file_name().to_string_lossy().into_owned();
-                    let md = e.metadata().ok();
+                    let is_link = e.file_type().map(|t| t.is_symlink()).unwrap_or(false);
+                    let md = if is_link { std::fs::metadata(e.path()).ok() } else { e.metadata().ok() };
                     let is_dir = md.as_ref().map(|m| m.is_dir()).unwrap_or(false);
-                    let size = if is_dir {
+                    let size = if is_dir || is_link {
                         0
                     } else {
                         md.as_ref().map(|m| m.len() as i64).unwrap_or(0)
                     };
-                    entries.push((name, is_dir, size));
+                    entries.push((name, is_dir, size, is_link));
                 }
                 entries.sort_by(|a, b| a.0.cmp(&b.0)); // orden estable por nombre
                 let items = entries
                     .into_iter()
-                    .map(|(name, is_dir, size)| {
+                    .map(|(name, is_dir, size, is_link)| {
                         let mut m = SynMap::new();
                         m.insert("name", syn_text(name));
                         m.insert("is_dir", syn_bool(is_dir));
                         m.insert("size", syn_int(size));
+                        m.insert("is_link", syn_bool(is_link));
                         syn_map(m)
                     })
                     .collect();
@@ -690,11 +728,15 @@ pub fn register_secure_builtins(interp: &Interpreter, caps: Rc<RefCell<Capabilit
                         m.insert("size", syn_int(bytes.len() as i64));
                         m.insert("modified", SynValue::Nothing);
                         m.insert("bundled", syn_bool(true));
+                        m.insert("is_link", syn_bool(false));
                         return Ok(syn_map(m));
                     }
                     Located::Disk(p) => p,
                 };
                 let mut m = SynMap::new();
+                // v0.6.45 — `is_link`: la ruta misma es un symlink o una junction (los datos de
+                // abajo son los de lo que apunta). Un link roto da `exists: false, is_link: true`.
+                let is_link = std::fs::symlink_metadata(&path).map(|m| m.file_type().is_symlink()).unwrap_or(false);
                 match std::fs::metadata(&path) {
                     Ok(md) => {
                         let modified = md
@@ -719,6 +761,7 @@ pub fn register_secure_builtins(interp: &Interpreter, caps: Rc<RefCell<Capabilit
                         m.insert("modified", SynValue::Nothing);
                     }
                 }
+                m.insert("is_link", syn_bool(is_link));
                 Ok(syn_map(m))
             }),
         );
@@ -869,10 +912,7 @@ pub fn register_secure_builtins(interp: &Interpreter, caps: Rc<RefCell<Capabilit
                 };
                 match std::fs::read(&path) {
                     Ok(b) => Ok(syn_bytes(b)),
-                    Err(_) => Err(Control::Error(RuntimeError::new(format!(
-                        "File not found: {}",
-                        path
-                    )))),
+                    Err(e) => Err(read_error(&path, &e)),
                 }
             }),
         );
@@ -1075,9 +1115,7 @@ pub fn register_secure_builtins(interp: &Interpreter, caps: Rc<RefCell<Capabilit
                 if old.is_empty() {
                     return Err(Control::Error(RuntimeError::new("edit_file: empty pattern")));
                 }
-                let content = std::fs::read_to_string(&path).map_err(|_| {
-                    Control::Error(RuntimeError::new(format!("File not found: {}", path)))
-                })?;
+                let content = std::fs::read_to_string(&path).map_err(|e| read_error(&path, &e))?;
                 let count = content.matches(&old).count();
                 if count == 0 {
                     return Err(Control::Error(RuntimeError::new("edit_file: pattern not found")));

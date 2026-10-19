@@ -184,6 +184,17 @@ pub(crate) fn resolve_module_path(
     if !target.is_file() {
         return Err(format!("module not found: {}", raw_path));
     }
+    // v0.6.45 — la contención de arriba es por NOMBRE: un symlink o una junction debajo de la raíz
+    // que lleva afuera la pasaba, y `use` cargaba código de otro lado (lo que se aprobó por hash o
+    // se firmó no era lo que corría). Se decide también en disco: el módulo, con los links
+    // resueltos, tiene que quedar bajo la raíz resuelta. Un link que ES parte de la raíz vale.
+    if !crate::capscope::physically_beneath(&abs_bound.to_string_lossy(), &abs_target.to_string_lossy()) {
+        let what = if abs_bound == abs_base { "importing directory" } else { "project root" };
+        return Err(format!(
+            "module path escapes the {} through a link (symlink or junction): '{}'",
+            what, raw_path
+        ));
+    }
     Ok(resolved)
 }
 

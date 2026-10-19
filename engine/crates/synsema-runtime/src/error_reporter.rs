@@ -53,6 +53,12 @@ fn error_patterns() -> Vec<(&'static str, &'static str, bool, bool, Vec<&'static
             "Ensure the task is defined before it's called",
             "Use type_of() to inspect the value",
         ]),
+        // v0.6.45 — antes que "Capability not granted": no falta un `require`, un link saca la ruta.
+        ("a link \\(symlink or junction\\) on the way leads outside", "capability", false, false, vec![
+            "A link (symlink or junction) under the granted folder points outside it",
+            "Grant the place the link points to, or remove the link",
+            "list_dir and file_info report is_link for each entry",
+        ]),
         ("Capability not granted", "capability", false, false, vec![
             "Add the matching 'require' at the top of the program",
             "If the host set a ceiling (--sandbox/--cap-set), it must widen it — the program cannot",
@@ -79,6 +85,12 @@ fn error_patterns() -> Vec<(&'static str, &'static str, bool, bool, Vec<&'static
             "Increase the timeout parameter",
             "Retry — it may be a temporary slowdown",
             "Consider an async approach",
+        ]),
+        // v0.6.45 — el archivo existe y otro proceso lo tiene abierto sin compartir: reintentar sirve.
+        ("in use by another process", "io", true, true, vec![
+            "Another process has the file open without sharing",
+            "Retry after a short wait",
+            "file_info(path) still reports it: the file exists",
         ]),
         ("File not found", "io", true, false, vec![
             "Check that the file path is correct",

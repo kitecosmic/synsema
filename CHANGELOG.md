@@ -17,6 +17,11 @@ Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the rele
   undefined variable is still an error.
 - **A bool default of `env` is Synsema text:** `env(name, true)` gives `"true"`, not `"True"`. A
   number keeps its text (`env("PORT", 8080)` → `"8080"`).
+- **`read_file` says why it cannot read a file.** Everything was `File not found`, even a file that
+  exists: one another process holds open without sharing (`in use by another process … retry
+  later`), a folder (`it is a directory`), a broken link, a file that is not UTF-8 text
+  (`use read_file_bytes`), or a permission. `File not found` is now only for what does not exist.
+  Same for `read_file_bytes` and `edit_file`.
 
 **Fixes.**
 - **`svg_to_png`/`svg_to_pdf` with `opts.fonts` fall back per glyph.** A title in your font with one
@@ -48,6 +53,17 @@ Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the rele
   password there.
 
 **Security.**
+- **A link no longer takes a path out of its limit.** `use`, the `file`/`file.read`/`file.write`
+  scopes (the program's `require`, the host ceiling and a delegated ceiling) and `grep` compared
+  paths by name, so a symlink or a junction under the allowed folder that pointed elsewhere passed:
+  `use "./ext/o.syn"` loaded code from outside the project (what was approved by hash was not what
+  ran), and `read_file("data/ext/x")` read outside `file.read("./data/*")`. Now the path is also
+  judged where it really leads. A link that IS part of the granted path (the project reached
+  through a link, `./data` itself a link) still works; a link below it that leads out is refused
+  with its own message (`a link (symlink or junction) on the way leads outside it`), and a `deny`
+  of a place also catches a path that reaches it through a link. `grep` does not follow links to
+  folders. What remains: the check and the open are two steps, so a link swapped in between is not
+  caught, and a hard link is not visible from its name.
 - **RS256 signing (`jwt_sign` with `"alg": "RS256"`, `rsa_sign_sha256`) is constant-time in the
   native binary.** The `rsa` crate is not constant-time on private-key operations
   (RUSTSEC-2023-0071, "Marvin"; no stable fix upstream) and the signature did not even use
@@ -142,6 +158,10 @@ Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the rele
   `http_post(url, body, headers = {…}, timeout = 30)`, `http(method = "PUT", url = u, body = b)`;
   also `http_bytes`, `http_put`, `http_delete`. Positional calls keep working. An unknown name is an
   error, and so is passing the same argument by position and by name.
+- **`list_dir` and `file_info` tell links apart:** each entry has `is_link`. A link's `is_dir` is
+  that of what it points to, the same in both (a junction was `is_dir: false` in `list_dir` and
+  `true` in `file_info`); in `list_dir` a link's `size` is 0 (ask `file_info`, which only answers
+  when the link leads inside the grant).
 
 **Deprecated.**
 - **The positional form of `fetch(url, method, headers, body, timeout)` goes away in v1.** Write

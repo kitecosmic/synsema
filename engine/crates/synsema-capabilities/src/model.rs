@@ -267,7 +267,46 @@ impl Capability {
     /// - scope None = wildcard total.
     /// - self con scope y other con scope None → no cubre.
     /// - match exacto o glob (`*.example.com` cubre `api.example.com`).
+    /// - v0.6.45: una RUTA además tiene que quedar dentro del scope EN DISCO — un link (symlink,
+    ///   junction) debajo del scope que lleva afuera la deja afuera, aunque por nombre esté
+    ///   adentro. Es la misma decisión para el grant, el techo del host y los techos delegados.
     pub fn covers(&self, other: &Capability) -> bool {
+        if !self.covers_by_name(other) {
+            return false;
+        }
+        match (self.physical_scope_pair(other), &self.scope, &other.scope) {
+            (true, Some(g), Some(r)) => synsema_core::capscope::path_within_physically(g, r),
+            _ => true,
+        }
+    }
+
+    /// v0.6.45 — para un `deny`: ¿la ruta pedida llega EN DISCO a lo que este scope nombra? Un
+    /// link a un lugar denegado da con la denegación aunque su nombre no coincida.
+    pub fn reaches_physically(&self, other: &Capability) -> bool {
+        if self.ty != other.ty
+            && !(self.ty == CapabilityType::File
+                && matches!(other.ty, CapabilityType::FileRead | CapabilityType::FileWrite))
+        {
+            return false;
+        }
+        match (self.physical_scope_pair(other), &self.scope, &other.scope) {
+            (true, Some(g), Some(r)) => synsema_core::capscope::path_reaches_physically(g, r),
+            _ => false,
+        }
+    }
+
+    /// ¿Los dos scopes son rutas de disco (file/file.read/file.write, o una base SQLite)?
+    fn physical_scope_pair(&self, other: &Capability) -> bool {
+        let path_ty = |t: CapabilityType| {
+            matches!(t, CapabilityType::File | CapabilityType::FileRead | CapabilityType::FileWrite | CapabilityType::Db)
+        };
+        let url = |c: &Capability| c.ty == CapabilityType::Db && c.scope.as_deref().is_some_and(|s| s.contains("://"));
+        path_ty(self.ty) && path_ty(other.ty) && !url(self) && !url(other)
+    }
+
+    /// La comparación por NOMBRE de `covers` (sin mirar el disco): la de siempre. La usa el
+    /// mensaje de un rechazo para decir que fue un link y no un scope de menos.
+    pub fn covers_by_name(&self, other: &Capability) -> bool {
         if self.ty != other.ty {
             let file_covers = self.ty == CapabilityType::File
                 && matches!(other.ty, CapabilityType::FileRead | CapabilityType::FileWrite);
@@ -465,6 +504,8 @@ pub enum DenyCause {
 /// El texto del techo, idéntico en todas las ramas (los clasificadores del audit
 /// comparan por string).
 pub const ABOVE_CEILING: &str = "above host ceiling (--sandbox/--cap-set)";
+/// v0.6.45 — el `reason` del audit cuando un grant cubre la ruta por nombre y un link la saca.
+pub const LINK_ESCAPE: &str = "resolves outside the grant through a link";
 /// `reason` de un grant ambiental que entró (stdout/time/llm bajo `run` no-secure,
 /// `serve(port)` por `--port`).
 pub const AMBIENT_GRANT: &str = "auto-granted by the runtime";
@@ -773,8 +814,11 @@ impl CapabilitySet {
 
     fn check_inner(&mut self, requested: &Capability, source: &str, audit: bool) -> Result<(), DenyCause> {
         // 1) Denegaciones explícitas primero.
-        let denied_by: Option<Capability> =
-            self.denied.iter().find(|d| d.covers(requested)).cloned();
+        let denied_by: Option<Capability> = self
+            .denied
+            .iter()
+            .find(|d| d.covers_by_name(requested) || d.reaches_physically(requested))
+            .cloned();
         if let Some(d) = denied_by {
             if audit {
                 self.push_audit(CapabilityAuditEntry {
@@ -858,15 +902,27 @@ impl CapabilitySet {
 
         // 4) Sin grant.
         if audit {
+            let reason = if self.escapes_through_link(requested) {
+                LINK_ESCAPE
+            } else {
+                "No matching grant found"
+            };
             self.push_audit(CapabilityAuditEntry {
                 capability: requested.clone(),
                 granted: false,
                 source: source.to_string(),
-                reason: "No matching grant found".to_string(),
+                reason: reason.to_string(),
                 origin: "program",
             });
         }
         Err(DenyCause::NoGrant)
+    }
+
+    /// v0.6.45 — ¿un grant la cubre por NOMBRE pero no en disco? Es un link debajo del scope que
+    /// lleva afuera, no un `require` que falta: el mensaje y el audit lo dicen.
+    fn escapes_through_link(&self, requested: &Capability) -> bool {
+        self.granted.iter().any(|c| c.covers_by_name(requested))
+            || self.parent.as_ref().map(|p| p.borrow().escapes_through_link(requested)).unwrap_or(false)
     }
 
     fn is_declared(&self, requested: &Capability) -> bool {
@@ -921,8 +977,16 @@ impl CapabilitySet {
     /// Chequea y devuelve error si no está otorgada.
     pub fn require(&mut self, requested: &Capability, source: &str) -> Result<(), CapabilityViolation> {
         if let Err(cause) = self.check_cause(requested, source) {
+            let message = if cause == DenyCause::NoGrant && self.escapes_through_link(requested) {
+                format!(
+                    "Capability not granted: {} — by name the path is inside the granted scope, but a link (symlink or junction) on the way leads outside it. Synsema checks where a path really leads: grant the place the link points to, or remove the link",
+                    requested
+                )
+            } else {
+                Self::denial_message(requested, &cause)
+            };
             return Err(CapabilityViolation {
-                message: Self::denial_message(requested, &cause),
+                message,
                 requested: Some(requested.clone()),
                 source: source.to_string(),
                 cause,
@@ -1171,6 +1235,46 @@ mod tests {
         assert!(star.covers(&escape));
         let total = cap(CapabilityType::File, None);
         assert!(total.covers(&escape));
+    }
+
+    /// v0.6.45 — un link debajo del scope que lleva afuera: el grant no lo cubre (aunque por nombre
+    /// sí) y un `deny` del destino lo alcanza (aunque por nombre no).
+    #[test]
+    fn a_link_under_the_scope_is_judged_where_it_leads() {
+        let root = std::env::temp_dir().join(format!("synsema-v0645-capslink-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("data")).unwrap();
+        std::fs::create_dir_all(root.join("outside")).unwrap();
+        std::fs::write(root.join("outside/secret.txt"), "x").unwrap();
+        #[cfg(windows)]
+        assert!(std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(root.join("data").join("ext"))
+            .arg(root.join("outside"))
+            .output()
+            .unwrap()
+            .status
+            .success());
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(root.join("outside"), root.join("data/ext")).unwrap();
+        let r = root.to_string_lossy().replace('\\', "/");
+        let via_link = cap(CapabilityType::FileRead, Some(&format!("{}/data/ext/secret.txt", r)));
+        let grant = cap(CapabilityType::FileRead, Some(&format!("{}/data/*", r)));
+        assert!(grant.covers_by_name(&via_link));
+        assert!(!grant.covers(&via_link), "el link saca la ruta del scope");
+        let mut set = CapabilitySet::new("t");
+        set.grant(grant.clone());
+        let err = set.require(&via_link, "test").unwrap_err();
+        assert!(err.message.contains("a link (symlink or junction) on the way leads outside"), "{}", err.message);
+        assert!(set.audit_log.iter().any(|e| e.reason == LINK_ESCAPE));
+        // Un deny del destino alcanza la ruta por el link.
+        let mut set = CapabilitySet::new("t");
+        set.grant(cap(CapabilityType::FileRead, None));
+        set.deny(cap(CapabilityType::FileRead, Some(&format!("{}/outside/*", r))));
+        assert!(matches!(set.check_cause(&via_link, "test"), Err(DenyCause::ExplicitlyDenied(_))));
+        // Lo que está de verdad adentro sigue cubierto.
+        assert!(grant.covers(&cap(CapabilityType::FileRead, Some(&format!("{}/data/nuevo.txt", r)))));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
