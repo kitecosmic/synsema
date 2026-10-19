@@ -163,6 +163,14 @@ pub const LABEL_PURE_BUILTINS: &[&str] = &[
     "oauth_basic",
     // v0.6.44 (HB2): bits sobre enteros de 64 bits y XOR de bytes.
     "bit_and", "bit_or", "bit_xor", "bit_not", "shl", "shr", "xor_bytes",
+    // v0.6.45 (B1, B2): gzip y percent-encoding (puros, en los tres hosts).
+    "gzip", "gunzip", "url_encode", "url_decode",
+    // v0.6.45 (B3): leer un header sin distinguir mayúsculas.
+    "header",
+    // v0.6.45 (B7): códigos QR.
+    "qr_matrix", "qr_svg",
+    // v0.6.45 (B9): HTML real (WHATWG) y selectores CSS.
+    "html_select", "html_text", "html_unescape",
     // v0.6.29: blockchain `<familia>_<acción>` (puros: construir, derivar, decodificar).
     "evm_address", "evm_signature", "evm_tx", "evm_tx_raw", "evm_tx_create", "evm_create_address",
     "evm_create2_address", "abi_event_topic", "abi_decode_log", "algorand_address", "algorand_tx_raw",
@@ -175,4 +183,6 @@ pub const LABEL_PURE_BUILTINS: &[&str] = &[
     "polyfit", "polyval", "mode", "rng", "rng_spawn", "random_normal", "shuffle", "sample", "choice", "date",
     "datetime", "duration", "parse_date", "parse_datetime", "truncate", "add_months", "date_range",
     "timestamp", "to_timezone", "in_units", "add_days", "jsonl_encode", "jsonl_decode", "lineage", "parquet_read", "parquet_write",
+    // v0.6.45 (B4): el esquema y los row groups de un Parquet, sin leer los datos.
+    "parquet_info",
 ];

@@ -511,6 +511,10 @@ pub(crate) fn wire_common_with_state(
     synsema_stdlib::hashing::register_hash_builtins(interp);
     // Bits sobre enteros de 64 bits y `xor_bytes` (puro, v0.6.44).
     synsema_stdlib::bits::register_bit_builtins(interp);
+    synsema_stdlib::encoding::register_encoding_builtins(interp);
+    synsema_stdlib::headers::register_header_builtins(interp);
+    synsema_stdlib::qr::register_qr_builtins(interp);
+    synsema_stdlib::html::register_html_builtins(interp);
     // JSON del lenguaje (puro, sin capability): json_encode/json_for_script/json_decode.
     // Vivían dentro de register_database_builtins; ahora en json.rs para que existan
     // también en el perfil wasm (sin `native`).

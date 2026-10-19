@@ -238,6 +238,8 @@ struct ChartSpec {
     th: &'static ThemeColors,
     /// `{"stack": true}` — sólo bar/area; apila las series en el orden dado.
     stack: bool,
+    /// v0.6.45 (B5): rotación y salteo de las etiquetas de categoría (ver `XAxis`).
+    x_axis: XAxis,
 }
 
 impl ChartSpec {
@@ -254,9 +256,9 @@ impl ChartSpec {
 // Lectura de opts
 // =========================================================
 
-const VALID_OPTS: [&str; 19] = [
+const VALID_OPTS: [&str; 20] = [
     "title", "x", "y", "width", "height", "colors", "x_label", "y_label", "legend", "background",
-    "theme", "stack", "value", "x_labels", "y_labels", "scale", "center", "bins", "total",
+    "theme", "stack", "value", "x_labels", "y_labels", "scale", "center", "bins", "total", "x_axis",
 ];
 
 /// Opts comunes a TODOS los kinds.
@@ -268,11 +270,13 @@ const COMMON_OPTS: [&str; 9] =
 /// pie/scatter/heatmap/… falla listando los kinds que sí la soportan (§3.1).
 fn kind_extra_opts(kind: Kind) -> &'static [&'static str] {
     match kind {
-        Kind::Bar | Kind::Area => &["x", "y", "stack"],
-        Kind::Line | Kind::Scatter | Kind::Pie | Kind::Donut | Kind::Boxplot => &["x", "y"],
-        Kind::Heatmap => &["x", "y", "value", "x_labels", "y_labels", "scale", "center"],
+        // v0.6.45 (B5): `x_axis` en los kinds con etiquetas de categoría bajo el eje X.
+        Kind::Bar | Kind::Area => &["x", "y", "stack", "x_axis"],
+        Kind::Line | Kind::Boxplot => &["x", "y", "x_axis"],
+        Kind::Scatter | Kind::Pie | Kind::Donut => &["x", "y"],
+        Kind::Heatmap => &["x", "y", "value", "x_labels", "y_labels", "scale", "center", "x_axis"],
         Kind::Histogram => &["bins"],
-        Kind::Waterfall => &["x", "y", "total"],
+        Kind::Waterfall => &["x", "y", "total", "x_axis"],
     }
 }
 
@@ -502,6 +506,56 @@ fn num_of(v: &SynValue, name: &str, what: &str) -> Result<f64, Control> {
     }
 }
 
+/// v0.6.45 (B5) — `x_axis: {angle, every, format}`: las etiquetas de categoría del eje X. Con 15
+/// barras se salteaban etiquetas y con 365 fechas se superponían. `angle` (0–90, grados) las rota
+/// como `labelAngle` de Vega-Lite / `tickangle` de Plotly; `every` muestra una de cada n (el `dtick`
+/// de Plotly; sin él, el salteo automático de siempre, ~12 visibles); `format` es el strftime de
+/// `format_time` para un eje de fechas. Sin `x_axis` el SVG es byte a byte el de antes (goldens).
+#[derive(Clone, Default)]
+struct XAxis {
+    angle: f64,
+    every: Option<usize>,
+    format: Option<String>,
+}
+
+fn x_axis_opts(opts: &MapObj, name: &str) -> Result<XAxis, Control> {
+    let mut ax = XAxis::default();
+    let m = match opts.get("x_axis") {
+        None | Some(SynValue::Nothing) => return Ok(ax),
+        Some(SynValue::Map(m)) => m.clone(),
+        Some(other) => {
+            return Err(err(format!(
+                "{}: option \"x_axis\" must be a map like {{\"angle\": 45, \"every\": 2, \"format\": \"%b %d\"}}, got {}",
+                name,
+                other.type_name()
+            )))
+        }
+    };
+    for (k, v) in m.borrow().iter() {
+        match (k.as_str(), v) {
+            ("angle", SynValue::Number(n)) if (0.0..=90.0).contains(&n.to_f64()) => ax.angle = n.to_f64(),
+            ("every", SynValue::Number(n)) if n.is_integer() && n.to_f64() >= 1.0 => ax.every = Some(n.to_f64() as usize),
+            ("format", SynValue::Text(t)) => ax.format = Some(t.to_string()),
+            ("angle", other) => return Err(err(format!("{}: x_axis.angle must be a number of degrees from 0 to 90, got {}", name, other))),
+            ("every", other) => return Err(err(format!("{}: x_axis.every must be a positive integer, got {}", name, other))),
+            ("format", other) => {
+                return Err(err(format!("{}: x_axis.format must be a strftime pattern (\"%b %d\"), got {}", name, other.type_name())))
+            }
+            (other, _) => return Err(err(format!("{}: unknown x_axis key {:?} (valid: angle, every, format)", name, other))),
+        }
+    }
+    Ok(ax)
+}
+
+/// `x_of` con el `format` de `x_axis` aplicado a un date/datetime (el mismo strftime que
+/// `format_time`, con sus errores).
+fn x_of_fmt(v: &SynValue, fmt: Option<&str>) -> Result<XValue, Control> {
+    match (fmt, v) {
+        (Some(f), SynValue::Time(t)) => Ok(XValue::Label(synsema_core::temporal::format(t, f)?)),
+        _ => Ok(x_of(v)),
+    }
+}
+
 /// Valor de eje x: número → posición; texto (u otro escalar) → label categórico.
 /// Un `secret` como label → "[redacted]" (G8).
 fn x_of(v: &SynValue) -> XValue {
@@ -553,6 +607,7 @@ fn from_rows(
     kind: Kind,
     name: &str,
 ) -> Result<Vec<Series>, Control> {
+    let fmt = x_axis_opts(opts, name)?.format;
     let x_field = opt_text(opts, "x", name)?.ok_or_else(|| {
         err(format!(
             "{}: data is a list of maps (rows); pass {{\"x\": \"field\", \"y\": \"field\"}} to pick the columns",
@@ -587,7 +642,7 @@ fn from_rows(
                 i + 1
             ))
         })?;
-        let x = x_of(xv);
+        let x = x_of_fmt(xv, fmt.as_deref())?;
         if kind == Kind::Scatter {
             if let XValue::Label(l) = &x {
                 return Err(err(format!(
@@ -853,7 +908,9 @@ fn normalize_series(args: &[SynValue], name: &str) -> Result<ChartSpec, Control>
         b => b,
     };
 
+    let x_axis = x_axis_opts(&opts, name)?;
     Ok(ChartSpec {
+        x_axis,
         kind,
         title: opt_text(&opts, "title", name)?,
         x_label: opt_text(&opts, "x_label", name)?,
@@ -1034,6 +1091,7 @@ fn normalize_heatmap(
     th: &'static ThemeColors,
     name: &str,
 ) -> Result<HeatmapData, Control> {
+    let x_fmt = x_axis_opts(opts, name)?.format;
     let label_list = |key: &str| -> Result<Option<Vec<String>>, Control> {
         match opts.get(key) {
             None | Some(SynValue::Nothing) => Ok(None),
@@ -1113,7 +1171,7 @@ fn normalize_heatmap(
                     ))
                 })
             };
-            let xl = x_display(&x_of(&get(&xf)?));
+            let xl = x_display(&x_of_fmt(&get(&xf)?, x_fmt.as_deref())?);
             let yl = x_display(&x_of(&get(&yf)?));
             let v = num_of(
                 &get(&vf)?,
@@ -1615,6 +1673,7 @@ fn normalize_boxplot(
     opts: &MapObj,
     name: &str,
 ) -> Result<Vec<BoxGroup>, Control> {
+    let x_fmt = x_axis_opts(opts, name)?.format;
     match &args[1] {
         SynValue::List(l) => {
             let items = l.borrow().to_vec();
@@ -1645,7 +1704,7 @@ fn normalize_boxplot(
                                 )))
                             }
                         };
-                        let g = m.get(&xf).map(|v| x_display(&x_of(v))).ok_or_else(|| {
+                        let g = m.get(&xf).map(|v| x_of_fmt(v, x_fmt.as_deref())).transpose()?.map(|x| x_display(&x)).ok_or_else(|| {
                             err(format!(
                                 "{}: the x field {:?} is missing in row {}",
                                 name,
@@ -1766,6 +1825,7 @@ fn normalize_waterfall(
     opts: &MapObj,
     name: &str,
 ) -> Result<(Vec<WfStep>, Option<String>), Control> {
+    let x_fmt = x_axis_opts(opts, name)?.format;
     let total_label = match opts.get("total") {
         None | Some(SynValue::Nothing) | Some(SynValue::Bool(false)) => None,
         Some(SynValue::Bool(true)) => Some("Total".to_string()),
@@ -1824,7 +1884,7 @@ fn normalize_waterfall(
                         )))
                     }
                 };
-                let label = m.get(&xf).map(|v| x_display(&x_of(v))).ok_or_else(|| {
+                let label = m.get(&xf).map(|v| x_of_fmt(v, x_fmt.as_deref())).transpose()?.map(|x| x_display(&x)).ok_or_else(|| {
                     err(format!(
                         "{}: the x field {:?} is missing in row {}",
                         name,
@@ -1953,11 +2013,29 @@ struct Layout {
     plot_h: f64,
 }
 
+/// El largo (en caracteres) de la etiqueta de categoría más larga del eje X.
+fn longest_x_label(spec: &ChartSpec) -> usize {
+    match &spec.data {
+        ChartData::Series(s) => s.first().map(|s| s.points.iter().map(|(x, _)| x_display(x).chars().count()).max().unwrap_or(0)).unwrap_or(0),
+        ChartData::Heatmap(hm) => hm.x_labels.iter().map(|l| l.chars().count()).max().unwrap_or(0),
+        ChartData::Boxplot(g) => g.iter().map(|b| b.name.chars().count()).max().unwrap_or(0),
+        ChartData::Waterfall { steps, .. } => steps.iter().map(|w| w.label.chars().count()).max().unwrap_or(0),
+        _ => 0,
+    }
+}
+
 fn layout(spec: &ChartSpec) -> Result<Layout, Control> {
     let left = 52.0 + if spec.y_label.is_some() { 18.0 } else { 0.0 };
     let top = 12.0 + if spec.title.is_some() { 26.0 } else { 0.0 };
     let right = 16.0 + if spec.legend { 132.0 } else { 0.0 };
-    let bottom = 32.0 + if spec.x_label.is_some() { 18.0 } else { 0.0 };
+    let bottom: f64 = 32.0 + if spec.x_label.is_some() { 18.0 } else { 0.0 };
+    // v0.6.45 (B5): una etiqueta rotada cuelga ~6,2 px por carácter × sen(ángulo) (font-size 11).
+    let bottom = if spec.x_axis.angle > 0.0 {
+        let longest = longest_x_label(spec) as f64;
+        bottom.max(22.0 + longest * 6.2 * spec.x_axis.angle.to_radians().sin() + if spec.x_label.is_some() { 18.0 } else { 0.0 })
+    } else {
+        bottom
+    };
     let (left, bottom) = if matches!(spec.kind, Kind::Pie | Kind::Donut) {
         (16.0, 16.0)
     } else {
@@ -2078,17 +2156,31 @@ fn legend(items: &[(String, &str)], spec: &ChartSpec, l: &Layout, out: &mut Stri
     }
 }
 
-/// Labels de categoría bajo el eje X (como máximo ~12, salteando deterministamente).
+/// Labels de categoría bajo el eje X (como máximo ~12, salteando deterministamente; `x_axis` cambia
+/// el salteo y las rota).
 fn category_labels(
     labels: &[String],
     centers: &[f64],
     l: &Layout,
     th: &'static ThemeColors,
+    ax: &XAxis,
     out: &mut String,
 ) {
-    let step = labels.len().div_ceil(12).max(1);
+    let step = ax.every.unwrap_or_else(|| labels.len().div_ceil(12).max(1));
     for (i, (label, cx)) in labels.iter().zip(centers).enumerate() {
         if i % step != 0 {
+            continue;
+        }
+        if ax.angle > 0.0 {
+            // Rotada sobre su punto de anclaje y terminando en él (la etiqueta cuelga hacia la
+            // izquierda y abajo, como en Vega-Lite / Plotly).
+            let (x, y) = (fx(*cx), fx(l.top + l.plot_h + 14.0));
+            out.push_str(&format!(
+                "<text x=\"{x}\" y=\"{y}\" text-anchor=\"end\" font-size=\"11\" fill=\"{}\" transform=\"rotate(-{} {x} {y})\">{}</text>\n",
+                th.ink,
+                fx(ax.angle),
+                esc(label)
+            ));
             continue;
         }
         out.push_str(&format!(
@@ -2170,7 +2262,7 @@ fn render_bar(spec: &ChartSpec, l: &Layout, out: &mut String) {
     ));
     let labels: Vec<String> = series[0].points.iter().map(|(x, _)| x_display(x)).collect();
     let centers: Vec<f64> = (0..n).map(|i| l.left + band * (i as f64 + 0.5)).collect();
-    category_labels(&labels, &centers, l, spec.th, out);
+    category_labels(&labels, &centers, l, spec.th, &spec.x_axis, out);
 }
 
 /// Bar apilado: positivos hacia arriba, negativos hacia abajo del eje (estándar);
@@ -2240,7 +2332,7 @@ fn render_bar_stacked(spec: &ChartSpec, series: &[Series], l: &Layout, out: &mut
     ));
     let labels: Vec<String> = series[0].points.iter().map(|(x, _)| x_display(x)).collect();
     let centers: Vec<f64> = (0..n).map(|i| l.left + band * (i as f64 + 0.5)).collect();
-    category_labels(&labels, &centers, l, spec.th, out);
+    category_labels(&labels, &centers, l, spec.th, &spec.x_axis, out);
 }
 
 /// Mapeo x→px de line/scatter/area (banda categórica o escala numérica).
@@ -2344,7 +2436,7 @@ fn render_line_scatter(spec: &ChartSpec, l: &Layout, out: &mut String) {
         let n = labels.len();
         let band = l.plot_w / n as f64;
         let centers: Vec<f64> = (0..n).map(|i| l.left + band * (i as f64 + 0.5)).collect();
-        category_labels(&labels, &centers, l, spec.th, out);
+        category_labels(&labels, &centers, l, spec.th, &spec.x_axis, out);
     }
 }
 
@@ -2436,7 +2528,7 @@ fn render_area(spec: &ChartSpec, l: &Layout, out: &mut String) {
         let labels: Vec<String> = series[0].points.iter().map(|(x, _)| x_display(x)).collect();
         let band = l.plot_w / n as f64;
         let centers: Vec<f64> = (0..n).map(|i| l.left + band * (i as f64 + 0.5)).collect();
-        category_labels(&labels, &centers, l, spec.th, out);
+        category_labels(&labels, &centers, l, spec.th, &spec.x_axis, out);
     }
 }
 
@@ -2593,7 +2685,7 @@ fn render_heatmap(spec: &ChartSpec, hm: &HeatmapData, l: &Layout, out: &mut Stri
         ));
     }
     let centers: Vec<f64> = (0..nx).map(|i| l.left + cw * (i as f64 + 0.5)).collect();
-    category_labels(&hm.x_labels, &centers, l, spec.th, out);
+    category_labels(&hm.x_labels, &centers, l, spec.th, &spec.x_axis, out);
 
     if spec.legend {
         // Barra de gradiente vertical: 24 segmentos muestreados de min (abajo) a
@@ -2785,7 +2877,7 @@ fn render_boxplot(spec: &ChartSpec, groups: &[BoxGroup], l: &Layout, out: &mut S
     }
     let labels: Vec<String> = groups.iter().map(|g| g.name.clone()).collect();
     let centers: Vec<f64> = (0..n).map(|i| l.left + band * (i as f64 + 0.5)).collect();
-    category_labels(&labels, &centers, l, spec.th, out);
+    category_labels(&labels, &centers, l, spec.th, &spec.x_axis, out);
 }
 
 /// waterfall (§3.6): barras flotantes (cada una arranca donde terminó la acumulada
@@ -2869,7 +2961,7 @@ fn render_waterfall(
         labels.push(t.clone());
     }
     let centers: Vec<f64> = (0..n).map(|i| l.left + band * (i as f64 + 0.5)).collect();
-    category_labels(&labels, &centers, l, spec.th, out);
+    category_labels(&labels, &centers, l, spec.th, &spec.x_axis, out);
 }
 
 /// Renderer central: `ChartSpec` normalizado → SVG completo (determinista, G7).

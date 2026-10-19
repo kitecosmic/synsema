@@ -59,6 +59,14 @@ pub mod discovery;
 pub mod hashing;
 // Bits sobre enteros de 64 bits y `xor_bytes` (HB2, v0.6.44). Puro.
 pub mod bits;
+// v0.6.45 (B1, B2): gzip/gunzip, url_encode/url_decode.
+pub mod encoding;
+// v0.6.45 (B3): header(r, nombre) sin distinguir mayúsculas.
+pub mod headers;
+// v0.6.45 (B7): qr_matrix / qr_svg.
+pub mod qr;
+// v0.6.45 (B9): html_select / html_text / html_unescape.
+pub mod html;
 /// Protocolo host↔intérprete (F2): capabilities que un embebedor OFRECE (http/kv/llm/log).
 pub mod hostcap;
 /// Lo puro del cliente HTTP, compartido por los dos transportes.
