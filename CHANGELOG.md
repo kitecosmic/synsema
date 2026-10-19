@@ -99,6 +99,29 @@ Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the rele
     offers `kv.cas(ns, key, expected, value)` (new, optional); without it they say so instead of
     risking lost writes. Without a host `kv`, the state belongs to the instance and is atomic.
 
+- **Data builtins** (pure, in the native engine, `--profile pure` and wasm unless noted):
+  - `gzip(data)` / `gunzip(bytes, {"max_bytes": n})` for loose `.json.gz`/`.csv.gz` files.
+    `gunzip` reads concatenated members and stops a bomb: by default it refuses more than the larger
+    of 256 MiB and 64 × the input. `gzip` is deterministic (no name or time in the header).
+  - `url_encode(text)` / `url_decode(text)` (RFC 3986). Everything but `A-Z a-z 0-9 - . _ ~` is
+    encoded; decoding is strict (a malformed `%` or invalid UTF-8 is an error) and `+` is not a
+    space.
+  - `header(r, name)`: a response header regardless of case (`get(r["headers"], "retry-after")`
+    missed `Retry-After`). It takes a response or a map of headers (`request.headers`).
+  - `parquet_read(bytes, {"columns": […], "row_groups": […], "limit": n})` reads a part of a file:
+    the limits count only what is read, and the input is copied once instead of twice.
+    `parquet_info(bytes)` gives the columns, the row count and the row groups without reading the
+    data. (Native only, like the rest of Parquet.)
+  - `chart_svg(…, {"x_axis": {"angle": 45, "every": 2, "format": "%b %d"}})` rotates, thins and
+    formats the category labels under the X axis (bar, line, area, heatmap, boxplot, waterfall).
+    `format` is the strftime of `format_time`. Without `x_axis` the SVG is byte for byte as before.
+  - `qr_matrix(data, {"ecc", "version"})` → rows of 0/1, and `qr_svg(data, {…, "module", "margin",
+    "dark", "light"})` → an SVG with the quiet zone (ISO/IEC 18004; `ecc` L/M/Q/H, default M).
+  - `html_select(html, css)` → `[{tag, attrs, text, html}]` on real HTML (WHATWG parsing: unclosed
+    tags, unquoted attributes, entities), `html_text(html)` → the readable text (no scripts or
+    styles, one line per block) and `html_unescape(text)`. What they return keeps the input's
+    labels: reading a private page does not make it public.
+
 **Deprecated.**
 - **The positional form of `fetch(url, method, headers, body, timeout)` goes away in v1.** Write
   `fetch(url, {"method": …, "headers": …, "body": …, "timeout": …})`, the main form since v0.6.43.
