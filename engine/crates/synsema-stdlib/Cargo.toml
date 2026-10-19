@@ -45,6 +45,9 @@ scraper.workspace = true
 ego-tree = "=0.11.0"
 tiny-skia.workspace = true
 fontdb.workspace = true
+# v0.6.45 (B6): leer el cmap de una fuente para el respaldo por glifo (la misma versión que ya trae
+# fontdb: ninguna crate nueva).
+ttf-parser = "=0.25.1"
 svg2pdf.workspace = true
 # v0.6.20: xml_parse (roxmltree, ya transitiva de usvg) y toml_parse/toml_encode. Puros.
 roxmltree.workspace = true

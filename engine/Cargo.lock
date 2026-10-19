@@ -5403,6 +5403,7 @@ dependencies = [
  "tokio-postgres-rustls",
  "tokio-rustls",
  "toml",
+ "ttf-parser",
  "tungstenite",
  "usvg",
  "uuid 0.8.2",

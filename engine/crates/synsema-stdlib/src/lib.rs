@@ -67,6 +67,8 @@ pub mod headers;
 pub mod qr;
 // v0.6.45 (B9): html_select / html_text / html_unescape.
 pub mod html;
+// v0.6.45 (B6): respaldo de fuente por glifo en svg_to_png/svg_to_pdf.
+pub mod font_fallback;
 /// Protocolo host↔intérprete (F2): capabilities que un embebedor OFRECE (http/kv/llm/log).
 pub mod hostcap;
 /// Lo puro del cliente HTTP, compartido por los dos transportes.

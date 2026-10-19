@@ -19,6 +19,10 @@ Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the rele
   number keeps its text (`env("PORT", 8080)` → `"8080"`).
 
 **Fixes.**
+- **`svg_to_png`/`svg_to_pdf` with `opts.fonts` fall back per glyph.** A title in your font with one
+  character it lacks (an arrow, an emoji) came out entirely in the fallback font; now only that
+  character does, and the rest keeps your font, as in a browser. Without `opts.fonts` the output is
+  byte for byte the same.
 - **`judge` and the LLM operations inside `parallel_map` and inside a `spawn`ed agent** use the
   same providers as the code that started them. Before, each `parallel_map` item and each agent
   under `synsema run` ran in a fresh interpreter without providers: `judge` answered OFFLINE

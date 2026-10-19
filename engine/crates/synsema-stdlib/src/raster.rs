@@ -90,7 +90,7 @@ fn svg_arg<'a>(args: &'a [SynValue], name: &str) -> Result<&'a str, Control> {
 /// externos (http://, rutas locales) devuelve None a propósito — un builtin puro no
 /// sale a la red ni toca disco (G8); sólo los data: URLs embebidos resuelven.
 fn parse_tree(svg: &str, name: &str) -> Result<usvg::Tree, Control> {
-    parse_tree_with(svg, name, embedded_fontdb())
+    parse_tree_with(svg, name, embedded_fontdb(), false)
 }
 
 /// v0.6.20 — la fontdb embebida MÁS las fuentes propias del caller (`opts.fonts`): una base
@@ -145,9 +145,20 @@ fn fonts_opt(
     Ok(out)
 }
 
-fn parse_tree_with(svg: &str, name: &str, fontdb: Arc<fontdb::Database>) -> Result<usvg::Tree, Control> {
+/// `per_glyph`: con fuentes propias (`opts.fonts`), el respaldo es por glifo (`font_fallback`); sin
+/// ellas, el de usvg tal cual (los goldens no cambian).
+fn parse_tree_with(svg: &str, name: &str, fontdb: Arc<fontdb::Database>, per_glyph: bool) -> Result<usvg::Tree, Control> {
+    let font_resolver = if per_glyph {
+        usvg::FontResolver {
+            select_font: usvg::FontResolver::default_font_selector(),
+            select_fallback: crate::font_fallback::selector(),
+        }
+    } else {
+        usvg::FontResolver::default()
+    };
     let opt = usvg::Options {
         fontdb,
+        font_resolver,
         font_family: "DejaVu Sans".to_string(),
         image_href_resolver: usvg::ImageHrefResolver {
             resolve_data: usvg::ImageHrefResolver::default_data_resolver(),
@@ -337,7 +348,7 @@ pub fn svg_to_png_with(args: &[SynValue], loader: Option<FontLoader<'_>>) -> Res
         }
     };
 
-    let tree = parse_tree_with(svg, NAME, fontdb_with(&fonts))?;
+    let tree = parse_tree_with(svg, NAME, fontdb_with(&fonts), !fonts.is_empty())?;
     let (w0, h0) = (f64::from(tree.size().width()), f64::from(tree.size().height()));
     // usvg garantiza tamaño > 0 (un SVG sin dimensiones deducibles ya falló al parsear).
     let (out_w, out_h) = match (want_w, want_h, scale) {
@@ -398,7 +409,7 @@ pub fn svg_to_pdf_with(args: &[SynValue], loader: Option<FontLoader<'_>>) -> Res
     let want_h = opt_pos_number(&opts, "height", NAME)?;
     let fonts = fonts_opt(&opts, NAME, loader)?;
 
-    let tree = parse_tree_with(svg, NAME, fontdb_with(&fonts))?;
+    let tree = parse_tree_with(svg, NAME, fontdb_with(&fonts), !fonts.is_empty())?;
     let (w0, h0) = (f64::from(tree.size().width()), f64::from(tree.size().height()));
 
     // Override de tamaño de página (en puntos) vía dpi UNIFORME (la conversión es
@@ -488,6 +499,78 @@ pub fn register_raster_builtins_with_caps(
 
 #[cfg(test)]
 mod tests {
+    /// Un `name` mínimo (familia, estilo, nombre completo, PostScript) para la fuente de prueba.
+    fn name_table(family: &str) -> Vec<u8> {
+        let recs: Vec<(u16, Vec<u8>)> = [(1, family.to_string()), (2, "Book".to_string()), (4, family.to_string()), (6, family.replace(' ', ""))]
+            .into_iter()
+            .map(|(id, t)| (id, t.encode_utf16().flat_map(|u| u.to_be_bytes()).collect()))
+            .collect();
+        let mut out = Vec::new();
+        out.extend_from_slice(&0u16.to_be_bytes());
+        out.extend_from_slice(&(recs.len() as u16).to_be_bytes());
+        out.extend_from_slice(&((6 + 12 * recs.len()) as u16).to_be_bytes());
+        let mut strings = Vec::new();
+        for (id, bytes) in &recs {
+            for v in [3u16, 1, 0x409, *id, bytes.len() as u16, strings.len() as u16] {
+                out.extend_from_slice(&v.to_be_bytes());
+            }
+            strings.extend_from_slice(bytes);
+        }
+        out.extend_from_slice(&strings);
+        out
+    }
+
+    /// DejaVu con sólo ASCII y otra familia: una fuente "de marca" a la que le falta el `→`.
+    fn ascii_font() -> Vec<u8> {
+        let face = ttf_parser::Face::parse(EMBEDDED_FONT, 0).unwrap();
+        let pairs: Vec<(u32, u16)> = (0x20u32..0x7f).filter_map(|cp| face.glyph_index(char::from_u32(cp).unwrap()).map(|g| (cp, g.0))).collect();
+        crate::font_fallback::replace_tables(
+            EMBEDDED_FONT,
+            &[(*b"cmap", crate::font_fallback::cmap_format12(&pairs)), (*b"name", name_table("TestAscii"))],
+        )
+        .unwrap()
+    }
+
+    /// Las familias que usó cada glifo del primer texto del SVG, en orden.
+    fn glyph_families(svg: &str, per_glyph: bool) -> Vec<String> {
+        let tree = parse_tree_with(svg, "test", fontdb_with(&[ascii_font()]), per_glyph).ok().unwrap();
+        let db = tree.fontdb().clone();
+        fn first_text(g: &usvg::Group) -> Option<usvg::Text> {
+            for n in g.children() {
+                match n {
+                    usvg::Node::Text(t) => return Some((**t).clone()),
+                    usvg::Node::Group(g) => {
+                        if let Some(t) = first_text(g) {
+                            return Some(t);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            None
+        }
+        let text = first_text(tree.root()).expect("un texto");
+        text.layouted()
+            .iter()
+            .flat_map(|sp| sp.positioned_glyphs.iter())
+            .map(|g| db.face(g.font).map(|f| f.families[0].0.clone()).unwrap_or_default())
+            .collect()
+    }
+
+    /// v0.6.45 (B6): con una fuente propia a la que le falta un glifo, sólo ESE glifo cae a otra
+    /// fuente (antes usvg pasaba el texto entero a DejaVu).
+    #[test]
+    fn a_missing_glyph_falls_back_alone() {
+        let svg = r#"<svg xmlns="http://www.w3.org/2000/svg" width="300" height="40"><text x="4" y="28" font-family="TestAscii" font-size="20">Hola → mundo</text></svg>"#;
+        let fams = glyph_families(svg, true);
+        assert_eq!(fams.len(), 12, "{:?}", fams);
+        assert_eq!(fams.iter().filter(|f| f.as_str() == "TestAscii").count(), 11, "{:?}", fams);
+        assert_eq!(fams[5], "DejaVu Sans", "la flecha viene del respaldo: {:?}", fams);
+        // El selector de siempre (lo que hacía antes): todo el texto en DejaVu.
+        let before = glyph_families(svg, false);
+        assert!(before.iter().all(|f| f == "DejaVu Sans"), "{:?}", before);
+    }
+
     use super::*;
     use synsema_core::types::{syn_map, syn_secret, syn_text};
 

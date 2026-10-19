@@ -2971,6 +2971,7 @@ dependencies = [
  "synsema-core",
  "tiny-skia",
  "toml",
+ "ttf-parser",
  "usvg",
  "windows-sys 0.52.0",
  "winreg",
