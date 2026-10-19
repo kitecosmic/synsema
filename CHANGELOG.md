@@ -134,13 +134,21 @@ Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the rele
     styles, one line per block) and `html_unescape(text)`. What they return keeps the input's
     labels: reading a private page does not make it public.
 
+- **HTTP builtins take named arguments:** `http_get(url, headers = {…}, query = {…}, timeout = 10)`,
+  `http_post(url, body, headers = {…}, timeout = 30)`, `http(method = "PUT", url = u, body = b)`;
+  also `http_bytes`, `http_put`, `http_delete`. Positional calls keep working. An unknown name is an
+  error, and so is passing the same argument by position and by name.
+
 **Deprecated.**
 - **The positional form of `fetch(url, method, headers, body, timeout)` goes away in v1.** Write
   `fetch(url, {"method": …, "headers": …, "body": …, "timeout": …})`, the main form since v0.6.43.
   Until v1 the positional form still works and prints one notice per process to stderr;
-  `synsema check` points at each call whose second argument is a text literal or `nothing`. The
-  rule from here on: a builtin takes at most two optional positional arguments, and an options map
-  as the last argument beyond that.
+  `synsema check` points at each call whose second argument is a text literal or `nothing`.
+- **Beyond two optional positional arguments, pass them by name.** `http_get(url, headers, query,
+  timeout)`, `http(…)`, `http_bytes(…)`, `http_post(…)` and `http_put(…)` with a third optional
+  argument by position still work; `synsema check` says which name to use (`timeout = …`). The
+  positional form of those goes away in v1. (An options map, as `fetch` has, would have been
+  ambiguous here: the next argument is already a map — the headers, or a JSON body.)
 
 ## v0.6.44 — 2026-10-08
 

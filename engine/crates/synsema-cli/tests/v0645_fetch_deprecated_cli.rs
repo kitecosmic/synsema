@@ -53,3 +53,22 @@ fn run_says_it_once_per_process() {
     let n = err.lines().filter(|l| l.contains("[synsema] deprecated: fetch(")).count();
     assert_eq!(n, 1, "{}", err);
 }
+
+/// v0.6.45 (B8): del tercer opcional en adelante, por nombre. `check` señala la forma posicional y
+/// dice qué nombre usar; con nombres no avisa.
+#[test]
+fn check_points_the_third_positional_optional_to_its_name() {
+    let src = r#"require net("x.test")
+http_get("https://x.test/", {}, {}, 5)
+http_get("https://x.test/", {}, timeout = 5)
+http_post("https://x.test/", {"a": 1}, {}, 10)
+http("GET", "https://x.test/", {}, {}, "cuerpo", 5)
+"#;
+    let (code, err) = synsema("named", src, &["check"]);
+    assert_eq!(code, 0, "{}", err);
+    let w: Vec<&str> = err.lines().filter(|l| l.contains("by position")).collect();
+    assert_eq!(w.len(), 3, "{:?}", w);
+    assert!(w[0].contains("app.syn:2:") && w[0].contains("timeout = …"), "{}", w[0]);
+    assert!(w[1].contains("app.syn:4:") && w[1].contains("http_post"), "{}", w[1]);
+    assert!(w[2].contains("app.syn:5:") && w[2].contains("pass body, timeout by name"), "{}", w[2]);
+}

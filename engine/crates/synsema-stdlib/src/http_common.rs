@@ -410,6 +410,13 @@ pub fn response_to_syn(r: HttpResult) -> SynValue {
 
 /// Registra los seis builtins cliente sobre `transport`. Cada uno gatea `net(host)`
 /// ANTES de tocar el transporte — misma firma y mismo retorno en los dos perfiles.
+///
+/// v0.6.45 (B8): con NOMBRES de parámetros (`register_builtin_named`): `http_get(url, timeout = 10)`,
+/// `http_post(url, body, headers = {…})`. Un mapa de opciones habría sido ambiguo — el argumento
+/// siguiente ya es un mapa (los headers, o un body JSON) —; los argumentos con nombre no (como
+/// `requests` de Python, Swift o Kotlin), y la firma queda como dato que `synsema code` puede mostrar.
+/// Regla: como mucho dos opcionales por posición; del tercero en adelante, por nombre (`synsema
+/// check` avisa; la forma posicional sale en v1).
 pub fn register_http_client_builtins(
     interp: &Interpreter,
     caps: Rc<RefCell<CapabilitySet>>,
@@ -418,9 +425,9 @@ pub fn register_http_client_builtins(
     // http(method, url, headers?, query?, body?, timeout?)
     {
         let caps = caps.clone();
-        interp.register_builtin(
+        interp.register_builtin_named(
             "http",
-            -1,
+            vec!["method", "url", "headers", "query", "body", "timeout"],
             Rc::new(move |_i, args, _loc| {
                 let method = raw_str(args.first().unwrap_or(&SynValue::Nothing));
                 let url = raw_str(args.get(1).unwrap_or(&SynValue::Nothing));
@@ -445,9 +452,9 @@ pub fn register_http_client_builtins(
     // http_get(url, headers?, query?, timeout?)
     {
         let caps = caps.clone();
-        interp.register_builtin(
+        interp.register_builtin_named(
             "http_get",
-            -1,
+            vec!["url", "headers", "query", "timeout"],
             Rc::new(move |_i, args, _loc| {
                 let url = raw_str(args.first().unwrap_or(&SynValue::Nothing));
                 require_net(&caps, &url, "http_get()")?;
@@ -470,9 +477,9 @@ pub fn register_http_client_builtins(
     // http_post(url, body, headers?, timeout?)
     {
         let caps = caps.clone();
-        interp.register_builtin(
+        interp.register_builtin_named(
             "http_post",
-            -1,
+            vec!["url", "body", "headers", "timeout"],
             Rc::new(move |_i, args, _loc| {
                 let url = raw_str(args.first().unwrap_or(&SynValue::Nothing));
                 require_net(&caps, &url, "http_post()")?;
@@ -495,9 +502,9 @@ pub fn register_http_client_builtins(
     // http_put(url, body, headers?, timeout?)
     {
         let caps = caps.clone();
-        interp.register_builtin(
+        interp.register_builtin_named(
             "http_put",
-            -1,
+            vec!["url", "body", "headers", "timeout"],
             Rc::new(move |_i, args, _loc| {
                 let url = raw_str(args.first().unwrap_or(&SynValue::Nothing));
                 require_net(&caps, &url, "http_put()")?;
@@ -520,9 +527,9 @@ pub fn register_http_client_builtins(
     // http_delete(url, headers?, timeout?)
     {
         let caps = caps.clone();
-        interp.register_builtin(
+        interp.register_builtin_named(
             "http_delete",
-            -1,
+            vec!["url", "headers", "timeout"],
             Rc::new(move |_i, args, _loc| {
                 let url = raw_str(args.first().unwrap_or(&SynValue::Nothing));
                 require_net(&caps, &url, "http_delete()")?;
@@ -567,9 +574,9 @@ pub fn register_http_client_builtins(
     // imágenes, tarballs: un binario que pasa por texto se corrompe).
     {
         let caps = caps.clone();
-        interp.register_builtin(
+        interp.register_builtin_named(
             "http_bytes",
-            -1,
+            vec!["method", "url", "headers", "query", "body", "timeout"],
             Rc::new(move |_i, args, _loc| {
                 let method = raw_str(args.first().unwrap_or(&SynValue::Nothing));
                 let url = raw_str(args.get(1).unwrap_or(&SynValue::Nothing));

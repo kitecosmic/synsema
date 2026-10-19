@@ -2119,6 +2119,42 @@ fn deprecated_fetch_warnings(program: &synsema_core::ast::Program, path: &str) -
     out
 }
 
+/// v0.6.45 (B8) — los builtins HTTP con más de dos opcionales: del tercero en adelante van por
+/// nombre (`http_get(url, headers, query, timeout = 10)`). Cada fila: (builtin, obligatorios,
+/// nombres de todos los parámetros en orden).
+const NAMED_AFTER_TWO: &[(&str, usize, &[&str])] = &[
+    ("http", 2, &["method", "url", "headers", "query", "body", "timeout"]),
+    ("http_bytes", 2, &["method", "url", "headers", "query", "body", "timeout"]),
+    ("http_get", 1, &["url", "headers", "query", "timeout"]),
+    ("http_post", 1, &["url", "body", "headers", "timeout"]),
+    ("http_put", 1, &["url", "body", "headers", "timeout"]),
+];
+
+fn positional_beyond_two_warnings(program: &synsema_core::ast::Program, path: &str) -> Vec<String> {
+    use synsema_core::ast::NodeKind as NK;
+    let mut out = Vec::new();
+    for stmt in &program.statements {
+        synsema_core::ast_api::walk(stmt, &mut |n| {
+            let NK::TaskCall { name, arguments } = &n.kind else { return };
+            let NK::Identifier { name: callee } = &name.kind else { return };
+            let Some((f, req, names)) = NAMED_AFTER_TWO.iter().find(|(f, _, _)| *f == callee.as_str()) else { return };
+            let positional = arguments.iter().filter(|a| a.name.is_none()).count();
+            if positional > req + 2 {
+                let extra: Vec<&str> = names[req + 2..positional.min(names.len())].to_vec();
+                out.push(format!(
+                    "{}:{}: warning: {}() takes at most two optional arguments by position; pass {} by name ({} = …) — the positional form goes away in v1",
+                    path,
+                    n.location.line,
+                    f,
+                    extra.join(", "),
+                    extra[0]
+                ));
+            }
+        });
+    }
+    out
+}
+
 fn is_positional_literal(k: &synsema_core::ast::NodeKind) -> bool {
     use synsema_core::ast::NodeKind as NK;
     match k {
@@ -2319,6 +2355,9 @@ fn cmd_check(args: &[String]) -> ExitCode {
                         eprintln!("{}", w);
                     }
                     for w in deprecated_fetch_warnings(&program, &path) {
+                        eprintln!("{}", w);
+                    }
+                    for w in positional_beyond_two_warnings(&program, &path) {
                         eprintln!("{}", w);
                     }
                     // T1 (DX, §10.3 del spec de identidad): lo que el programa —o una task de un
