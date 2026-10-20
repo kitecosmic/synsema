@@ -173,6 +173,12 @@ Keep writing the gate even if you never expect to be offline — but note that s
 is a **choice**, not a fate: `SYNSEMA_JUDGE_PROVIDER=laya` answers from a checkpoint on disk with no
 network and no key (below).
 
+**Inside `parallel_map` and `spawn`ed agents (v0.6.45+)** a `judge` block uses the same provider as
+the code that started them. Up to v0.6.44, under `synsema run`, each `parallel_map` item and each
+agent ran without providers, so `judge` answered `available: false` there while the same code on
+the main thread got real answers (under `serve`, agents were already wired). Fanning a `judge` out
+over many items with `parallel_map` now works as written; `SYNSEMA_JUDGE_BUDGET` still applies.
+
 ## Running the judge LOCALLY — `SYNSEMA_JUDGE_PROVIDER=laya` (v0.6.27+)
 
 The judge slot is a **protocol, not a vendor**. The official binaries ship a second backend: a Laya

@@ -23,9 +23,9 @@ Nothing works without declaring capabilities.
 require net("api.example.com")
 require net("*.example.com")        -- wildcard
 require net("http://localhost:8545") -- only that port: stored as net("localhost:8545")
-require file("/data/*")             -- read AND write under /data/
-require file.read("./logs/*")       -- read-only (least-privilege)
-require file.write("./out/*")       -- write-only
+require file("/data/**")            -- read AND write /data and everything below it
+require file.read("./logs/**")      -- read-only (least-privilege); "./logs/*" = only the files directly in ./logs
+require file.write("./out/**")      -- write-only
 require exec("ffmpeg")
 require env("API_KEY")
 require secret("STRIPE_API_KEY")    -- read as an opaque, redacted secret
@@ -136,14 +136,17 @@ tool that declares `require file.write("out/*")` still fails with `Capability no
 > in both.) Symptom: a file/exec tool under serve returns `Capability not granted` — you're missing the
 > `require` in the **entry**.
 
-**Directory-tree scope:** to read/write files under a dir, grant **both** `file("dir")` (the dir node,
-for `list_dir`) **and** `file("dir/*")` (the files inside). Scopes are **literal** — `require exec(cmd)`
-with a variable does not parse; use `require exec` for any command, `exec("git")` for one.
-exec` gates both `run` (one-shot) and `proc_spawn` (live process, v0.6.7+; also with
-pty: true`, v0.6.8+ — a pseudo-terminal grants no extra OS power, so there is no separate
+**Directory-tree scope (v0.6.45+):** a folder and everything below it is **`file("dir/**")`**. `**`
+also covers `dir` itself, so one line serves `list_dir("dir")`, `read_file("dir/a/b.txt")`, `grep` and
+`watch`. `file("dir/*")` is only the files directly in `dir` (not `dir/sub/x`, and not `dir` itself for
+`list_dir`); `file("dir")` is the folder node alone. (Before v0.6.45 the idiom was `file("dir")` +
+`file("dir/*")`, because `*` crossed folders; that pair no longer reaches subfolders.) Scopes are
+**literal** — `require exec(cmd)` with a variable does not parse; use `require exec` for any command,
+`exec("git")` for one. `exec` gates both `run` (one-shot) and `proc_spawn` (live process, v0.6.7+;
+also with `pty: true`, v0.6.8+ — a pseudo-terminal grants no extra OS power, so there is no separate
 capability) with the same scope; `/openapi.json` lists it under `x-synsema-capabilities` for
 routes that call either. `file.read` also gates `watch(path)` (v0.6.9+): watching a tree is
-reading it, same scope shape as `list_dir` (`file("dir")` + `file("dir/*")`).
+reading it — `file.read("dir/**")`.
 
 Plain `call`/normal invocation does NOT isolate — use `call_tool` for untrusted, model-chosen tools.
 
@@ -214,8 +217,9 @@ synsema test --cap-set "stdout,time,random,secret,file=scratch_*" program.syn
   (`attest`, `attest_key`, `attestation_document`, `attestation_key`, `attestation_verify`),
   `serve --attested` and `run --attest` are in [attestation.md](attestation.md).
 
-- **`sandbox_run` capability** (v0.6.14+): `require sandbox_run` lets a program run *another* Synsema program with `run_program(source, {ceiling, profile, env, timeout})` in a child process under a ceiling that is the intersection with its own — the child can never exceed the parent (asking for more is trimmed, not fatal, and the parent's audit records it as `above parent ceiling`). See [builtins.md](builtins.md) and [processes.md](processes.md).
-- **`render` of a disk template reads a file:** the top-level `render(path)` needs `require file.read("<path>")` (v0.6.14+; nested `include`/`layout` and bundled templates don't).
+- **`sandbox_run` capability** (v0.6.14+): `require sandbox_run` lets a program run *another* Synsema program with `run_program(source, {ceiling, profile, env, timeout})` in a child process under a ceiling that is the intersection with its own — the child can never exceed the parent (asking for more is trimmed, not fatal, and the parent's audit records it as `above parent ceiling`). v0.6.45+: the child's ceiling travels with **absolute** paths, anchored where the parent decided them; a ceiling scope with a comma or an empty scope is refused (`{"file.read": "x,exec"}` used to give the child `exec`); an `env` that sets `SYNSEMA_*` or a host-path variable (`HOME`, `USERPROFILE`, `TMP`/`TEMP`/`TMPDIR`, `APPDATA`, `XDG_*`, `OLLAMA_MODELS`, `HF_*`) is refused; `filename` is a label and cannot have folders. See [builtins.md](builtins.md) and [processes.md](processes.md).
+- **Templates read files:** the top-level `render(path)` needs `require file.read("<path>")` (v0.6.14+), and since v0.6.45 so do `{ include "…" }` and `{ layout "…" }` read from disk. Grant the template folder once: `require file.read("./templates/**")`. Templates inside a `synsema build` binary need nothing.
+- **Serving files is reading them (v0.6.45+):** `static "/x" from "./public"` needs `require file.read("./public/**")` (the serve refuses to start and names the line to add); `tls cert "<c>" key "<k>"` in a `serve` block needs `file.read` on both files (the `--tls-cert`/`--tls-key` flags are the operator's and need nothing). `grep` on a folder needs `file.read("<folder>/**")`; `edit_file` needs `file.read` as well as `file.write`.
 - **The error names who can fix it — and says it is a permission, not a bug.** Not declared →
   `Capability not granted: X — this is a permission, not a bug: add `require X` to the program's preamble
   (or to the importing file, when this code runs in a module)` (v0.6.28+: the exact line to add is in the
@@ -290,7 +294,20 @@ names. Works on `run`/`test`/`conform`/`serve`. It is the same audit the wasm `r
 - `call_tool` runs a task with ONLY its declared capabilities (∩ the program's); a plain call uses the program's ambient capabilities
 - Wildcard: `net("*.example.com")` covers all subdomains
 - `net` scope is a host, or `host:port` when a port is written (v0.6.29+): `net("api.x.com")` covers every port of that host; `net("localhost:8545")` or `net("http://localhost:8545/")` covers only port 8545, and a call to `http://localhost:8546/` is denied. IPv6 with a port is `net("[::1]:8545")`. A URL is stored without credentials, path or query.
-- Path glob: `file("/data/*")` covers all files in /data/. `file` grants **read+write**; use `file.read(scope)` / `file.write(scope)` for least-privilege. Path scope is **faithful**: a `..` escape (`file("./data/*")` + `read_file("./data/../../etc/passwd")`) normalizes outside the scope and is denied. `require file` / `file("*")` cover the whole disk. `~/` expands to the home dir in scopes AND paths (v0.6.20+: `file.read("~/.config/app/*")`; `~user/` unsupported). `cwd()` needs `file.read(".")` — the grant of `list_dir(".")` (`./*`, `*` cover it; `./data/*` does not). `delete_*` and `zip_extract`/`tar_extract` need `file.write` on **every** path they remove/write.
+- **Path scopes are globs by segment (v0.6.45+)**, like gitignore and shell globs:
+  - `*` and `?` match **inside one path segment**: `file.read("./data/*")` = the files directly in `./data`; `file.read("*.csv")` = the `.csv` files of the working directory, not every `.csv` on the disk.
+  - `**` crosses folders: `file.read("./data/**")` = everything below `./data` **and `./data` itself**.
+  - No wildcard matches `..`, and none jumps from a relative path to an absolute one. A `..` in the path is normalized first: `read_file("./data/../../etc/passwd")` lands outside `./data/**` and is denied.
+  - `require file.read("*")` is **not** the whole disk (it was before v0.6.45): it is the files of the working directory. The whole-disk grant is `require file` / `require file.read` / `require file.write` with **no scope**.
+  - `cwd()` and `list_dir(".")` need `file.read(".")`, `"./**"` or `"**"` (`"./*"` names the files, not the folder).
+  - A scope at a drive root (`C:/**`) covers the drive. On Windows a `/data` scope means `<drive of the working directory>:/data`. In a case-sensitive folder (those WSL creates) `DATA` and `data` are different places.
+  - `file` grants **read+write**; use `file.read(scope)` / `file.write(scope)` for least-privilege. `~/` expands to the home dir in scopes AND paths (v0.6.20+: `file.read("~/.config/app/**")`; `~user/` unsupported). `delete_*` and `zip_extract`/`tar_extract` need `file.write` on **every** path they remove/write.
+- **Links are judged where they lead (v0.6.45+).** `use`, the `file`/`file.read`/`file.write` scopes (the program's `require`, the host ceiling, a delegated ceiling) and `grep` check where a path really leads, not only its name:
+  - A link that IS part of the granted path (the project reached through a link, `./data` itself a link) works.
+  - A symlink or junction **below** the grant that leads outside is refused: `Capability not granted: file_read("data/ext/s.txt") — by name the path is inside the granted scope, but a link (symlink or junction) on the way leads outside it. … grant the place the link points to, or remove the link`. Same for `use "./ext/o.syn"` through a link.
+  - A `deny` of a place also catches a path that reaches it through a link. A broken link is judged where it points (writing through `data/log.txt -> ~/.ssh/authorized_keys` is refused); a path that cannot be resolved is refused.
+  - `grep` does not follow links to folders (it skips them) and respects a `deny` inside the tree. `list_dir`/`file_info` mark links with `is_link`.
+  - Not caught yet: a link swapped in between the check and the open, and hard links.
 - Name prefix: `secret("APP_*")` / `env("APP_*")` / `reveal("APP_*")` covers `APP_DB`, `APP_KEY`, … (only a trailing `*`)
 - `db` scope: a **file path** for SQLite; a **canonical URL** for remote engines (Postgres/MySQL/MongoDB/Redis) —
   `scheme://host/db` with **no credentials, port, or query** (so `mysql://user:pw@localhost:3306/appdb?ssl-mode=REQUIRED`

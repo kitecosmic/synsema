@@ -47,8 +47,11 @@ synsema build desk.syn -o desk --serve --no-console --icon icon.svg [--bundle]  
   `--domain`, `--tls-auto`, `--tls-cert`/`--tls-key`, `--secure` are the `synsema serve` knobs,
   baked in (TLS files are read from disk at start). The serve block's **static mounts are bundled
   automatically** (`static "/x" from "./public"` → `public/` goes in; a missing dir is a build
-  error) and served from the bundle before the disk, with a content ETag — an installable app
-  (PWA) is one file. Ctrl-C/SIGTERM = ordered shutdown, exit 0. `--serve --profile pure` is refused.
+  error) and served **only** from the bundle (v0.6.45+: a file that is not in the bundle no longer
+  falls back to the disk), with a content ETag — an installable app (PWA) is one file. A bundled
+  static folder is part of the program and needs no `file.read`; the same program under
+  `synsema serve` (not built) needs `require file.read("./public/**")`. Ctrl-C/SIGTERM = ordered
+  shutdown, exit 0. `--serve --profile pure` is refused.
 
 - The built binary **runs your program**: its whole argv is the program's (`args()`), the baked
   `--cap-set`/`--profile` apply and can't be raised from inside, and it reads its own bundle — a
@@ -171,6 +174,7 @@ Canonical pattern — one servable file, dev-clean in the repo. The **filename i
 
 ```
 require serve(8080)
+require file.read("./public/**")    -- v0.6.45+: serving a folder is reading it
 serve on 8080
     static "/" from "./public"
     route "GET /" ...
@@ -234,8 +238,30 @@ synsema build desk.syn -o desk --serve --icon icon.svg --bundle --engine-binary 
   `cron_every(2, maybe_quit)` → `shutdown("window closed")` when `windows == 0` for > 3 s, and
   `shutdown("no window opened in 30 s")` when no socket EVER connected 30 s after start (`let
   started be now()`; otherwise a browser that never opens leaves an invisible process). The top
-  level continues after the serve block, so `open_window()` is called right after it. Shortcut:
-  `synsema init --desktop` (v0.6.19+) writes `desk.syn` + `public/desk.js` on top of the PWA
+  level continues after the serve block, so `open_window()` is called right after it.
+  **Single instance (v0.6.45+):** `exit(code)` works in the lines before `serve on` (once the server
+  listens it is still an error; use `shutdown`). So a second launch can ask the running one to show
+  its window and leave — the first launch finds nobody (the `fetch` gives `status: 0` and an
+  `error`, it does not raise) and goes on to serve:
+
+```synsema
+require serve(47811)
+require net("127.0.0.1:47811")
+
+-- another instance already running? ask it to show its window, then leave
+let r be fetch("http://127.0.0.1:47811/show", {"method": "POST", "timeout": 2})
+when r["status"] == 200
+    print("already running: asked it to show its window")
+    exit(0)
+
+serve on 47811
+    bind "127.0.0.1"
+    route "POST /show"
+        -- bring the window forward here (open_window() in the full recipe)
+        give "ok"
+```
+
+- **Shortcut:** `synsema init --desktop` (v0.6.19+) writes `desk.syn` + `public/desk.js` on top of the PWA
   scaffold, with the API in `api.syn` (`export routes api`, mounted by both entries — per-route
   `rate_limit`/`timeout` inside a group work since v0.6.19; `DESK_NO_WINDOW=1` skips the browser).
 - **Honest limits:** fixed port (address in use dies silently under `--no-console` — pick an unusual
@@ -490,7 +516,8 @@ wasmtime run synsema-wasm.wasm --version      # the artifact's version (release 
 ```js
 // embed (Node/Bun/browser) — @synsema/wasm
 import { Synsema } from "@synsema/wasm";
-const syn = await Synsema.load(new URL("@synsema/wasm/synsema.wasm", import.meta.url));
+const syn = await Synsema.loadNode({ workers: 4 });   // Node/Bun/Next: the synsema.wasm shipped in the package
+// browser: await Synsema.load(new URL("/synsema.wasm", location.href))  — your own copy of the file
 await syn.ready();
 const host = {
   http: (req) => ({ status: 200, headers: [], body: "{}" }),        // sync; or async with runAsync
@@ -504,7 +531,7 @@ await syn.runAsync(program, { host: { async http(req) { const r = await fetch(re
 ```
 
 API (same in JS/Python/Go): `run(source, {filename, env, ceiling, host})` →
-`{ok, output, errors, audit, llm_tokens}`; `test` → `{passed, failed, lines}`; `check` →
+`{ok, output, errors, audit, llm_tokens, exit}`; `test` → `{passed, failed, lines}`; `check` →
 `{ok, errors}` (parse + the memory-declaration rule — one `require memory`, valid name; a
 `remember` WITHOUT `require memory` is NOT flagged here, it's denied at `run` — same as native
 `synsema check`); `handle(source, request)` →
@@ -533,6 +560,38 @@ declared but the host doesn't lend it; `Explicitly denied by …`), and `origin`
 entry there: `"program"` (a `require` or a call of the program) vs `"runtime"` (an ambient grant
 the host tried — `time`/`llm` under a ceiling — that the program never asked for). "This tenant
 tried to read STRIPE_KEY" = `origin == "program" && !granted`; no need to re-parse the source.
+
+**Loading and limits in `@synsema/wasm` (v0.6.45+, names as in `index.d.ts`):**
+- `Synsema.loadNode(opts?)` loads the `synsema.wasm` shipped in the package (Node, Bun, Next.js
+  routes and Server Actions — no path to resolve). `Synsema.load(src, opts?)` takes a
+  `WebAssembly.Module`, bytes, a `URL`, a path string or a `Response`. The old
+  `new URL("@synsema/wasm/synsema.wasm", import.meta.url)` never resolved a package name: don't write it.
+- `LoadOptions`: `workers` (async Workers, default 1; async calls wait in ONE queue and go to a free
+  Worker — no more "one call at a time per instance"), `startMs` (how long a Worker may take to start,
+  default 30 000).
+- `RunOptions` (in `run`/`test`/`handle` and their `*Async`): `filename`, `env`, `ceiling`, `host`, and
+  - `maxSteps` — interpreter steps (deterministic, counted from the start of the run; in `handle`, per
+    request) and `maxMemoryMb` — the bytes the run reserves. Both modes. Past either the run ends with
+    `ok: false` and an error naming the limit (never a trap; in `handle` a 500). A positive integer:
+    `0` is an error, not "no limit". No call inherits the previous call's limits.
+  - `timeoutMs` — async API only, counted from when the call starts running (not while queued): past
+    it the call fails with a clear error and its Worker is replaced. `0` = no deadline. A host hook
+    already running is not cut; its result is discarded.
+  - `labels: true` — information-flow labels: a private value (or a branch on one) reaches no sink:
+    not `print`, not the `http` hook (`fetch`/`http_*`), not `kv` (`state_*`, `remember`), not `llm`,
+    not `sleep`. `result: "<global name>"` returns that variable's final value WITH its labels
+    (private parts as `{"$private": [...]}`); `input: {var, value, sources}` binds a global before the
+    run, each key of `sources` arriving as `private(value, principals)` (needs `labels: true`).
+    `RunResult` then has `declassify` and `private_seen`, and `steps` is `null` after a private value.
+- A Worker that dies fails the call it was running (not retried) and is replaced. `close()` is final:
+  what waits fails with "closed". After a trap the sync API recreates the instance by itself.
+- A host hook that returns something that is not JSON (a `BigInt`, a circular object) or throws
+  without a message is an error of that call, not a hung Worker.
+- `state_merge`/`state_cas` with the host's `kv` are atomic only if the `kv` offers
+  `cas(ns, key, expected, value)` → `true`/`false` (`expected` `null` = key missing); without it they
+  fail saying so. Without a host `kv` the state belongs to the instance and is atomic.
+- Each call asks the host for 32 bytes of entropy once (they seed the run's generator); with
+  `labels`, `now()` is the clock read at the start and at each host interaction.
 
 Value in wasm: `sign`/`spend`/`wallet`/`reveal` are fail-loud (no audit line → no operation). A wasm
 host has no filesystem, so the audit line goes to the host `kv` under namespace `audit` (key

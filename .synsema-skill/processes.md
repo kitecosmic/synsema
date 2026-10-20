@@ -87,9 +87,26 @@ let r be run("python", ["./work/gen.py"], 60, {"cwd": "./work"})
 Combine with `grep` + `edit_file` (see [builtins.md](builtins.md)) for search → edit → run.
 
 **Note (v0.6.14+):** `run`/`proc_spawn` no longer leak Synsema's secrets to the child — the LLM
-provider keys and `.env`-loaded variables are stripped from the child's environment (the base OS env
-like `PATH` stays, so commands work). A secret the child truly needs is passed explicitly via
-`opts.env`. So `run("printenv")` under `require exec` no longer dumps your API keys.
+provider keys, the human-channel secrets and `.env`-loaded variables are stripped from the child's
+environment (the base OS env like `PATH` stays, so commands work). A secret the child truly needs is
+passed explicitly via `opts.env`. So `run("printenv")` under `require exec` no longer dumps your API
+keys. **v0.6.45+:** the same holds for `proc_spawn(…, {"pty": true})` (the pty path used to skip it).
+
+**A child with no inherited environment — `{"env_clean": true}` (v0.6.45+, `run` and `proc_spawn`).**
+The child starts with only what `env` passes (plus `SystemRoot` on Windows, without which the C
+runtime and sockets do not start). The command itself is still found on the parent's `PATH`; pass
+`PATH` in `env` if the child starts other programs:
+
+```synsema
+require exec("git")
+let r be run("git", ["status", "--short"], 30, {"env_clean": true, "env": {"PATH": "/usr/bin:/bin", "LANG": "C"}})
+print(r["stdout"])
+```
+
+**Windows, a `--no-console` binary (v0.6.45+):** `run`, `proc_spawn` and `run_program` with pipes
+create children with `CREATE_NO_WINDOW` when the process has no console — before, each child
+(`ssh`, `git`, `powershell`) got its own visible console window, and closing it killed the child.
+From a terminal nothing changes: the child shares the console, so `ssh` can still ask for a password.
 
 ## Run **Synsema** under a ceiling — `run_program` (v0.6.14+)
 
@@ -117,6 +134,24 @@ key)})` runs the child under **that token's authority** — the third way the to
 `serve` request and `sandbox under`. The child keeps `stdout` and `time` (process-local, not the token's to
 give) unless the token carries `deterministic: true`; a plain `{capability: scopes}` map works the same way. This is the language-level "run the code the LLM generated, safely" — the ceiling is
 enforced by the child process itself. See [capabilities.md](capabilities.md) and [builtins.md](builtins.md).
+
+**What `run_program` refuses and where the child lives (v0.6.45+):**
+- An `env` that sets `SYNSEMA_*` or a variable the engine uses to pick host paths: `HOME`,
+  `USERPROFILE`, `TMP`/`TEMP`/`TMPDIR`, `APPDATA`, `XDG_*`, `OLLAMA_MODELS`, `HF_*` (`SYNSEMA_AUDIT`
+  made the child create or truncate any file; `HOME` chose where `reveal` audits).
+- A ceiling whose scope has a comma or is empty (`{"file.read": "x,exec"}` split into extra items and
+  gave the child `exec`). One scope per item; several scopes = a list.
+- A `filename` with folders: it is a label for the child's errors, not a path.
+- The ceiling travels with **absolute** paths, anchored where the parent decided them: `./data/**`
+  means the parent's `./data`, also with `cwd` (it used to resolve against the child's folder). On
+  Windows a `/data/**` scope is the working directory's drive.
+- The child's state and temporary files go where the parent keeps its own (the folder of the
+  parent's `memory` database), never in the `cwd` you pass. A parent whose memory does not persist
+  (stdin, `--profile pure`) gives the child none: its memory lives in memory for that run. A **pure**
+  child (the default profile) never touches the disk.
+- A `"native"` child whose ceiling grants `memory=m` shares `m.db` with the parent (also from a
+  `cron` tick or a `serve` handler): each process writes only the entries it changed, the child's new
+  ids are marked (`mem_<n>_p<process>`), and the parent reloads when the child returns.
 
 ## Give an LLM a shell tool (least-privilege)
 A tool is a user task; wrap `run` and dispatch with `call_tool` (runs with ONLY what it declares):
@@ -324,12 +359,12 @@ runtime's job — undo only what you drew yourself (hidden cursor, colours).
 ## File-watch — `watch` (engine v0.6.9+)
 
 Changes on disk as a **handle with events**, in the same hub as processes, sockets and the
-bus (so it goes into `select`). Gate: `file_read(path)` — watching a tree is reading it
-(`require file("src")` + `require file("src/*")`, like `list_dir`).
+bus (so it goes into `select`). Gate: `file_read(path)` — watching a tree is reading it:
+`require file.read("src/**")` (v0.6.45+: `**` covers `src`, everything below it and `src` itself;
+the old `file("src")` + `file("src/*")` pair no longer reaches subfolders).
 
 ```synsema
-require file("src")
-require file("src/*")
+require file.read("src/**")
 require exec("cargo")
 let w be watch("src", {"interval": 0.2, "ignore": ["*.tmp", "target"]})
 let build be nothing

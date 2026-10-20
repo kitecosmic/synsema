@@ -209,6 +209,23 @@ route "GET /count"
     give state_get("visits", 0)     -- default 0 if unset
 ```
 - `state_set(key, value)` / `state_get(key, default?)` / `state_incr(key, delta?)` / `state_delete(key)` / `state_all()` → a map snapshot of every key (`{"a": 1, "hits": 2}`).
+- **Read-modify-write must be atomic (v0.6.45+):** `state_get` + change + `state_set` of a shared map
+  LOSES writes under concurrency (13 simultaneous webhooks left 7 entries). Use:
+  - `state_merge(key, map)` → merges `map` into the stored map (shallow; a missing key starts from
+    `{}`) and returns the result. Merging into a value that is not a map is an error:
+    `state_merge: the value of 'n' is number, not a map — use state_set to replace it`.
+  - `state_cas(key, expected, new)` → writes `new` only if the current value equals `expected` (a
+    missing key is `nothing`; `2.0` equals `2`, as in the language) and returns whether it wrote
+    (`true`/`false`). Retry in a loop for a computed update.
+  - `state_incr(key, delta?)` is the atomic counter.
+
+```
+route "POST /hook/:id"
+    state_merge("seen", {params.id: true})           -- every concurrent webhook lands
+    give "ok"
+route "POST /claim/:who"
+    give {"won": state_cas("owner", nothing, params.who)}  -- only the first claimant writes
+```
 - In-memory (gone on restart). For durable state use SQL ([stdlib.md](stdlib.md)) or the agent
   memory (`remember`/`recall`) **and progress** (`create_progress`/`resume_point`/…) — **both persist
   across serve requests** (shared store), so a plan created in one request advances in the next.
@@ -363,6 +380,10 @@ Declare a directory and any GET/HEAD that doesn't match a declared route is serv
 from it. You can mount several dirs, each at its own URL prefix:
 
 ```
+require serve(8090)
+require file.read("./public/**")      -- v0.6.45+: each served folder is read, so it is declared
+require file.read("./assets/**")
+require file.read("./dist/**")
 serve on 8090
     static "./public"                 -- root mount: "/" → ./public/index.html
     static "/assets" from "./assets" cache "1h"          -- + Cache-Control policy
@@ -393,12 +414,17 @@ serve on 8090
 - **Declared routes always win.** If a path is declared (for any method) it is
   never shadowed by a file — a different method on it gets `405`, not a file.
 - **Only `GET`/`HEAD`.** A `POST` to a static path is not served (→ `404`/`405`).
-- **The declaration is the permission.** `static "./public"` grants reading from
-  that directory; you do **not** also need a `file()` capability for it. Relative
-  paths are resolved against the program's working directory.
+- **Serving a folder is reading it: declare `require file.read("<dir>/**")` (v0.6.45+).**
+  The file is chosen by a remote client, so the folder is a read grant like any other.
+  Without it the serve refuses to start: `Capability not granted: static "/s" from "public"
+  serves the files of that folder — … add `require file.read("public/**")` to the program's
+  preamble`. (Up to v0.6.44 the declaration itself was the permission — even
+  `static "/" from "/"` served the disk.) A folder that travels inside a `synsema build`
+  binary is part of the program and needs nothing — and is served **only** from the bundle.
+  Relative paths are resolved against the program's working directory.
 - **Path traversal is blocked, per mount.** `../`, encoded `..%2f`, absolute paths
-  and symlinks escaping the directory are rejected — the resolved real path must
-  stay inside that mount's root.
+  and symlinks or junctions leading out of the directory are rejected — the real path
+  must stay inside that mount's root (and inside the `file.read` grant).
 
 > **Same-origin tip:** if the landing page is served by `static` from the same
 > server as the API, the browser's `fetch` is **same-origin** and needs no CORS.
@@ -424,6 +450,7 @@ push_keys.syn                 -- one-off: prints the VAPID pair for .env
 ```
 require serve(8080)
 require file.read("index.html")            -- render() reads the page from disk
+require file.read("./public/**")           -- v0.6.45+: the static folder is read
 serve on 8080
     static "/" from "./public" cache "1h"  -- the service worker MUST live at /sw.js (scope "/")
     route "GET /"
@@ -487,8 +514,9 @@ serve on 8080
   (served as JSON by the static mount); Microsoft Store takes the PWA directly; App Store needs a
   native wrapper and **Web Push does not work in WKWebView**.
 - **One binary (v0.6.16+):** `synsema build app.syn -o app --serve --bind 0.0.0.0 --port 8080` —
-  the serve block's static mounts and the templates travel inside; served from the bundle before the
-  disk. See [deploy.md](deploy.md) § `synsema build`.
+  the serve block's static mounts and the templates travel inside; a bundled static mount is served
+  only from the bundle (v0.6.45+: no fallback to the disk) and needs no `file.read`. See
+  [deploy.md](deploy.md) § `synsema build`.
 
 ### Desktop app — `bind "127.0.0.1"` + `shutdown()` (engine v0.6.18+)
 
@@ -501,6 +529,11 @@ serve on 8080
   from a route, a `socket` block, a cron job or an agent. Log: `[serve] shutdown requested by the
   program: <reason>`. Idempotent. Error under `run` and before anything listens; a `secret` reason is
   refused; **no capability**.
+- **`exit(code)` before `serve on` (v0.6.45+)** ends the process with that code and no error, so the
+  lines before the serve block can decide not to serve (a single-instance desktop app asks the
+  running one to show its window and leaves — the recipe is in [deploy.md](deploy.md) § Desktop app).
+  Once the server listens, `exit` is still an error (it would cut requests in flight): use
+  `shutdown(reason)`.
 - **The recipe** (verified live on Windows, `synsema serve` and the built `.exe` alike): open the
   browser in app mode with `run()` under `exec` (`platform()["os"]` picks `cmd` / `open` /
   `xdg-open`; each attempt in `try … recover`, first success wins), count windows in a `socket`
@@ -1394,6 +1427,8 @@ in front for: TLS, auto-HTTPS (ACME), virtual hosts, reverse proxy, HTTP/2.
 
 ```
 require serve(443)
+require file.read("./cert.pem")             -- v0.6.45+: the program reads both files
+require file.read("./key.pem")
 serve on 443
     domain "example.com"
     tls cert "./cert.pem" key "./key.pem"   -- manual cert
@@ -1401,7 +1436,8 @@ serve on 443
     route "GET /" ...
 ```
 
-- `tls cert <expr> key <expr>` — manual certificate.
+- `tls cert <expr> key <expr>` — manual certificate. v0.6.45+: needs `file.read` on both files,
+  like `mtls_identity`. The `--tls-cert`/`--tls-key` flags are the operator's and need nothing.
 - `tls auto "email"` — **automatic HTTPS** via ACME (Let's Encrypt): issues the certs,
   serves the HTTP-01 challenge on :80, stores them in `~/.synsema/certs/` (or
   `SYNSEMA_CERT_DIR`), and a background thread renews each one by its real expiry (< 30 days).
@@ -1485,6 +1521,7 @@ serve on 443
           route "GET /*path"
               give redirect("https://example.com/" + params.path)
       -- default host (apex) = your real site; statics keep working
+      -- (with require file.read("./static/**") at the top, v0.6.45+)
       static "/assets" from "./static"
       route "GET /" ...
   ```
@@ -1554,7 +1591,7 @@ serve on 443
         auth with check_token
         route "GET /users" ...
     host "app.example.com"
-        static "./app"
+        static "./app"                     -- needs require file.read("./app/**") (v0.6.45+)
     host "*.tenant.example.com"           -- wildcard subdomains
         route "GET /" ...
     route "GET /"                          -- default host (no Host match)
@@ -1752,6 +1789,19 @@ Recommended project structure: `layouts/`, `partials/`, `pages/`, `static/` (CSS
 `content/` (markdown/content sources). Paths are cwd-relative and traversal-safe —
 **including `include`/`layout` paths inside templates** (they resolve against the
 working directory, not against the including template).
+
+**Every template read from disk needs `file.read` (v0.6.45+)** — the page `render()` opens and
+each `{ include }` / `{ layout }` it pulls in. A missing grant names the file:
+`Capability not granted: file_read("templates/partials/nav.html") — … add require file.read(…)`.
+Grant the template tree once:
+
+```synsema
+require file.read("./templates/**")     -- pages, layouts and partials under ./templates
+let page be render("templates/page.html", {"title": "Home"})
+print(body of page)
+```
+
+Templates bundled in a `synsema build` binary need no grant.
 
 **content() and CSS:** a `content()` page's HTML is wrapped in `<main class="prose">` and
 can declare a stylesheet via page meta (`{"stylesheet": "/assets/style.css"}`) — head-only,

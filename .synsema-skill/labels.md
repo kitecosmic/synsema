@@ -75,6 +75,23 @@ The second one surprises people, so it is worth stating plainly: the *number* of
 is not redactable even when each value is. One `print` per iteration of a loop that branches on a
 secret spells the secret out by line count.
 
+Three more places the branch itself is the leak (v0.6.45+):
+
+- **`require` in a private branch is a `label_violation`** — what is granted cannot depend on
+  private data (a later public `try random_int(...)` published which way the branch went). Also a
+  `require` whose scope is a private value, and a `require` inside a `task` (the tool's ceiling under
+  `call_tool`) whose scope is private or whose task is defined in a private branch:
+  the error reads "label_violation: \`require net\` runs in a branch decided by a private value
+  (or its scope is private); what is granted cannot depend on private data — declare it at the top
+  of the program …".
+  Declare capabilities at the top of the program, with literal scopes.
+- **Operations that write the audit log do not run in a private branch**: `sign` and the signing
+  builtins, `spend`, `reveal`, the wallet operations fail with `label_violation` and write nothing
+  (whether their audit entry existed told the operator which way the branch went). Decide with a
+  public value, or `declassify` the condition first (that leaves its own record).
+- **A capability check inside a private branch leaves no audit entry** (`--audit` and the wasm
+  `audit`): how many entries there were would tell the branch or how many times a private loop ran.
+
 Two more that catch people, because the redaction happens **at the sink** and nowhere else:
 
 - **`text(v)` does not sanitise.** It returns the real content, still private. Passing a value
@@ -217,6 +234,9 @@ nothing private, and every line of the listing is a decision somebody made and w
   wrote to the shared `state_*` store, because both live in its own memory; a file or an HTTP call
   it cannot undo. Do not put public effects in a loop that branches on private data.
 - **Timing and resource use** are not modelled at all.
+- **Audit in private branches.** Since v0.6.45 audit-writing operations refuse to run there and
+  capability checks there are not logged; a sealed run receipt that records them without revealing
+  the branch is planned, not shipped.
 - **Crossing into another interpreter** (`parallel_map`, `run_program`, cron, the bus, the swarm)
   is a sink: a labelled argument is refused, before any worker starts. That is a **deliberate
   fail-closed decision, not an impossibility** — the channel between interpreters does carry

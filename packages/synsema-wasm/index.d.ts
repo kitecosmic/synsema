@@ -119,6 +119,8 @@ export interface RunResult {
   llm_tokens: number;
   /** v0.6.42 — el código de salida: el de `exit(code)` si el programa lo pidió, si no 0 (ok) o 1. */
   exit: number;
+  /** Los pasos del intérprete que llevó la corrida; `null` con `labels` si tocó un valor o una rama privada. */
+  steps: number | null;
   /** Con `result`: el valor final de esa variable (las partes privadas como `{"$private": [...]}`). */
   result?: unknown;
   /** Con `labels`: cada `declassify` que corrió (quién, qué principal, dónde). */

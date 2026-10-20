@@ -15,12 +15,20 @@ Pick `render()` when you want design control; `content()` when you want agent-re
 `render("page.html", data)` returns an HTML response. The template is HTML with `{ ... }`
 holes. You write the markup; nothing is added or imposed.
 
-```
+```synsema
+require serve(8080)
+require file.read("./static/**")              -- v0.6.45+: the static folder is read
+require file.read("./pages/**")               -- the pages render() opens
+require file.read("./layouts/**")             -- v0.6.45+: { layout } reads from disk too
+require file.read("./partials/**")            -- v0.6.45+: and { include }
 serve on 8080
     static "/assets" from "./static"          -- your CSS, JS, images, fonts
     route "GET /"
         give render("pages/home.html", {"title": "My App"})
 ```
+
+(Keeping every template under one folder — `./templates/pages`, `./templates/partials`, … — makes
+it one line: `require file.read("./templates/**")`.)
 
 ### Holes — the full vocabulary
 
@@ -144,10 +152,15 @@ See [modules.md](modules.md) and [serve.md](serve.md) for the rules.
 - **`render("literal.html")` templates are validated at startup** (file exists + parses,
   recursively through literal `include`/`layout`) — a typo fails before the first request.
   `synsema check app.syn` validates them too, plus all `use` imports.
-- **Capability (v0.6.14+):** a top-level `render(path)` reading a template from **disk** needs
-  `require file.read("<path>")` (or `require file("templates/*")` for a tree) — one line covers a
-  directory. Nested `{ include }`/`{ layout }` don't need their own (static, confined to the working
-  dir), and a template **baked into a `synsema build` binary** needs no capability (it's the program).
+- **Capability:** a top-level `render(path)` reading a template from **disk** needs
+  `require file.read("<path>")` (v0.6.14+), and **since v0.6.45 so does every `{ include }` and
+  `{ layout }` it pulls in from disk** (before they were only kept inside the working directory, so
+  a page could include `.env` without declaring it). One line covers a tree:
+  `require file.read("./templates/**")` (`/*` would be only the files directly in that folder). The
+  error names the file: `Capability not granted: file_read("templates/partials/nav.html")`. A
+  template **baked into a `synsema build` binary** needs no capability (it's the program).
+- **`static` needs `require file.read("<dir>/**")` (v0.6.45+)** — serving a folder is reading it;
+  the serve refuses to start without it and names the line.
 
 ## Installable on phones and desktop — PWA (engine v0.6.15+)
 

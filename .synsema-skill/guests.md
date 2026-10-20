@@ -50,7 +50,11 @@ and `print` becomes the Executor's log (`INF …`) — which under Nitro is writ
 enclave, so it is a public sink: with information-flow labels on (the guest always turns them on)
 `print`, `show` and `log` are refused with `label_violation` when they run under a private branch,
 because the number of lines is not redactable even when the value is. Printing a private value
-from public control flow still works and still shows `private(app)`. Vela's upload limit is 50 MB.
+from public control flow still works and still shows `private(app)`. Since v0.6.45 the same rule
+covers a `require` (in a private branch, or with a private scope) and the operations that write the
+audit log (`sign` and the signing builtins, `spend`, `reveal`, wallet operations): under a private
+branch they are a `label_violation` — declare capabilities at the top and decide signing with a
+public value ([labels.md](labels.md)). Vela's upload limit is 50 MB.
 
 Node probe = Node 20 or 24+, **never 22**: Node 22.x segfaults intermittently inside V8 while
 running this module (concurrent tier-up race; 22.23.2 on Linux crashed 1 run in 3, 20 and 24
@@ -263,7 +267,9 @@ and subtypes, log parsing, calldata, EIP-712 digests.
   JSON shape (`{"Type": [{"name","type"}, …]}`, domain keys `name`/`version`/`chainId`/`verifyingContract`).
 - `http_post(url, map)` sends JSON with the Content-Type; `bytes` bodies go raw; the response has
   `status`, `ok`, `body`, `json`, `headers`. `multipart_encode(parts)` → `{body, content_type}`.
-  `require file.read("*")` for a path given on the CLI; `args()` needs no capability; `sleep` needs
+  `require file.read` (no scope) for a path given on the CLI — since v0.6.45 `file.read("*")` is
+  only the files of the working directory, so grant the folder you expect (`"./in/**"`) or no scope;
+  `args()` needs no capability; `sleep` needs
   `time`; `secp256k1_sign` needs `sign("<secret label>")`.
 
 ## Adding another host

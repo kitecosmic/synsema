@@ -120,8 +120,9 @@ Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the rele
   the same code on the main thread got real answers. Under `serve`, agents were already wired. The
   process token budget (`SYNSEMA_LLM_BUDGET`) holds inside them too.
 - **A WebSocket or TCP peer that goes away without closing (a reset: the process died, the network
-  dropped; `os error 10054` on Windows) arrives as `{type: "close", reason: "connection reset by
-  peer"}`.** Before, `select` (and `ws_recv`/`tcp_recv`) raised `select: connection N: IO error: …`
+  dropped; `os error 10054` on Windows) arrives as a `close` event with `connection reset by peer`**
+  (TCP: `{type: "close", reason: …}`; WebSocket, with the same field its close events always had:
+  `{type: "close", data: …}`). Before, `select` (and `ws_recv`/`tcp_recv`) raised `select: connection N: IO error: …`
   and the error cut the wait of every other connection in the same `select`. Sending on that TCP
   connection afterwards is an error that says the other side is gone. A protocol violation (an
   invalid frame, a message over the size limit) is still an error, as before.
