@@ -146,6 +146,29 @@ for waterfall: `[up, down, total]`), `legend` (auto: shown for ≥2 series or pi
 on heatmap it is the gradient bar), `background` (hex; default transparent),
 `theme` (`"light"` default | `"dark"` — dark series/ink/scales; explicit `colors` beats it).
 
+**Category labels under the X axis — `x_axis` (v0.6.45+;** bar, line, area, heatmap, boxplot,
+waterfall**):** `{"x_axis": {"angle": 45, "every": 2, "format": "%b %d"}}` rotates the labels,
+shows one in `every`, and formats dates with `format_time`'s strftime. Without `x_axis` the SVG is
+byte for byte as before.
+
+```synsema
+let rows be [{"day": date(2026, 1, 5), "sales": 12}, {"day": date(2026, 1, 6), "sales": 9},
+             {"day": date(2026, 1, 7), "sales": 15}, {"day": date(2026, 1, 8), "sales": 11}]
+let svg be chart_svg("bar", rows, {"x": "day", "y": "sales",
+                                   "x_axis": {"angle": 45, "every": 2, "format": "%b %d"}})
+print(contains(svg, "Jan 05"), contains(svg, "Jan 06"))   -- true false (every 2nd label)
+```
+
+**QR codes (v0.6.45+, pure):** `qr_matrix(data, {"ecc", "version"}?)` → rows of 0/1;
+`qr_svg(data, {"ecc", "version", "module", "margin", "dark", "light"}?)` → an SVG with the quiet
+zone (ISO/IEC 18004; `ecc` `"L"`/`"M"`/`"Q"`/`"H"`, default M). Rasterize it with `svg_to_png`.
+
+```synsema
+let qr be qr_svg("https://example.com", {"ecc": "Q", "module": 6, "margin": 4, "dark": "#111111", "light": "#ffffff"})
+let png be svg_to_png(qr)
+print(length(qr_matrix("https://example.com", {"ecc": "H"})))   -- 29 (modules per side)
+```
+
 **Per-kind opts** (an opt on the wrong kind errors naming the kinds that take it;
 an unknown opt errors listing all valid ones — typos never pass silently):
 
@@ -220,9 +243,20 @@ serve on 8080
   a list of `.ttf`/`.otf` paths, each under `file.read` — a font bundled by `synsema build` needs
   none — loaded for that call only; `font-family="Arial"` resolves with `C:/Windows/Fonts/arial.ttf`,
   unknown families still fall back to DejaVu; same SVG + same fonts → same bytes; `svg_to_pdf` too).
+  **v0.6.45+:** with `fonts` the fallback is **per glyph** — a character your font lacks (an arrow,
+  an emoji) comes from the fallback while the rest keeps your font (without `fonts` the output is
+  byte for byte the same as before). At most 16 fonts with 64 faces in total (a collection counts
+  all its faces), at most 16 fallback fonts per run of text; a font whose lookups would be slow
+  (more than 16 cmap subtables, a format-13 subtable over 4096 groups, more than 64 tables) is
+  refused, naming it. Real fonts (CJK collections, color emoji, variable fonts) pass.
+  **`max_text_chars`** (v0.6.45+, default 16 384): one `<text>` longer than that (its `tspan`s,
+  `<tref>` text and expanded entities included, also inside an embedded `data:` SVG) is refused —
+  `svg_to_png: a <text> has 20000 characters, above the 16384 character limit (its layout time grows
+  with the square of its length); split it into several <text> or raise it with {"max_text_chars": n}`.
+  The limit is per `<text>`: a long document with one `<text>` per line is not affected.
 - `svg_to_pdf(svg, opts?)` → single-page **vector** PDF (crisp at any zoom, printable).
   Opts: `width`/`height` in points (one alone scales proportionally; both must match the
-  SVG's aspect ratio or you get a clear error).
+  SVG's aspect ratio or you get a clear error), `fonts` and `max_text_chars` as above.
 - Safety: embedded `<script>` is ignored (nothing executes); external `<image href>`
   (http:// or local paths) is **never fetched** — no network, no disk (only `data:` URLs
   resolve). A `secret` as the svg argument → type error.

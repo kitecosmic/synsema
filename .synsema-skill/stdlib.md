@@ -16,15 +16,18 @@ see [builtins.md](builtins.md).
 ```
 -- Full control. Don't hardcode credentials: pass a `secret` (materialized at the
 -- socket, redacted in logs). bearer() builds the Authorization: Bearer <token> value.
+-- Beyond two optional arguments, pass them BY NAME (v0.6.45+; the positional form goes away in v1).
 let r be http("POST", "https://api.store.com/orders",
-    {"Authorization": bearer(secret("STORE_API_KEY")), "Content-Type": "application/json"},
-    {"page": "1"},
-    json_encode({"product": "laptop", "quantity": 1})
+    headers = {"Authorization": bearer(secret("STORE_API_KEY"))},
+    query = {"page": "1"},
+    body = {"product": "laptop", "quantity": 1},      -- a map → JSON + Content-Type
+    timeout = 20
 )
 
 -- Shorthands
 let r be http_get("https://api.store.com/products")
 let r be http_get(url, {"Authorization": bearer(secret("STORE_API_KEY"))}, {"page": "1"})
+let r be http_get(url, headers = {"Accept": "application/json"}, timeout = 10)
 let r be http_post(url, {"name": "Alice"}, {"Authorization": bearer(secret("STORE_API_KEY"))})  -- a map → JSON + Content-Type (v0.6.20+)
 let r be http_put(url, {"name": "Bob"})
 let r be http_delete(url, {"x-api-key": secret("STORE_API_KEY")})  -- any header, not just Bearer
@@ -36,14 +39,33 @@ let r be http_delete(url, {"x-api-key": secret("STORE_API_KEY")})  -- any header
 > (`{name: Alice}`) with no header — `json_encode(map)` + the header still works on every version.
 > Verified against a local `serve` echo route (engine v0.6.20).
 
-**Timeout (optional, trailing arg on every HTTP builtin; a key in `fetch`'s map):** seconds as a
+**Timeout (optional on every HTTP builtin; a key in `fetch`'s map):** seconds as a
 positive number; absent or invalid → **30** (the historical default). Signatures: `fetch(url,
-{method, headers, body, timeout, tls_pin, attested})` (v0.6.43+ main form; positional `fetch(url, method?,
-headers?, body?, timeout?)` still works), `http(method, url, headers?, query?, body?, timeout?)`,
+{method, headers, body, timeout, tls_pin, attested})` (the form to write), `http(method, url, headers?, query?, body?, timeout?)`,
 `http_get(url, headers?, query?, timeout?)`, `http_post(url, body, headers?, timeout?)`,
-`http_put(url, body, headers?, timeout?)`, `http_delete(url, headers?, timeout?)`. Use it for slow
-APIs (>30s) or to fail fast: `fetch(url, {"timeout": 120})`. `tls_pin` fixes the server's key
-(builtins.md § I/O; attestation.md § Talking to the attested key).
+`http_put(url, body, headers?, timeout?)`, `http_delete(url, headers?, timeout?)`, `http_bytes(method, url, headers?, query?, body?, timeout?)`.
+
+**Named arguments (v0.6.45+).** The `http*` builtins take their arguments by name:
+`http_get(url, headers = {…}, query = {…}, timeout = 10)`, `http_post(url, body, headers = {…}, timeout = 30)`,
+`http(method = "PUT", url = u, body = b)`. **Beyond two optional arguments by position, use names**
+(`body` of `http_post`/`http_put` counts as optional): `http_get(url, h, q, 10)` and
+`http_post(url, b, h, 30)` still work but are deprecated (gone in v1) and `synsema check` says which
+name to use (`pass timeout by name (timeout = …)`). An unknown name is an error, and so is the same
+argument by position and by name. (An options map like `fetch`'s would be ambiguous here: the next
+argument is already a map — the headers, or a JSON body.)
+
+**`fetch` positional is DEPRECATED (v0.6.45, gone in v1):** write `fetch(url, {"method": "POST",
+"headers": h, "body": b, "timeout": 30})`, never `fetch(url, "POST", h, b)`. The old form still works,
+prints one notice per process to stderr, and `synsema check` warns on each call whose second argument
+is a text literal or `nothing`. Use the timeout for slow APIs (>30s) or to fail fast:
+`fetch(url, {"timeout": 120})`. `tls_pin` fixes the server's key (builtins.md § I/O; attestation.md §
+Talking to the attested key).
+
+**`header(r, name)` (v0.6.45+)** reads a response header regardless of case:
+`header(r, "retry-after")` finds `Retry-After` (`get(r["headers"], "retry-after")` misses it); also
+takes a map of headers (`request.headers`); `nothing` when absent. `url_encode`/`url_decode` (RFC
+3986, strict) build query strings by hand; `gunzip(bytes of http_bytes("GET", url))` opens a
+`.json.gz` download (builtins.md § Bytes).
 
 > **Credentials go in headers:** pass a `secret` directly as a header value —
 > `{"x-api-key": secret("KEY")}` or any custom header; it's materialized only at the
@@ -84,14 +106,8 @@ error of r       -- ONLY present when the transport failed (DNS, refused, timeou
 - `error of r` does **not** exist on a normal response, not even a 404/500 — reading it is
   `Map has no key 'error'`. Branch on `ok of r` / `status of r`, or `contains(r, "error")`.
 - Header names keep the server's casing (`Content-Type` from GitHub, `content-type` from your
-  own `serve`). Look one up without guessing:
-  ```
-  task header(r, name)
-      each k in keys(headers of r)
-          when lower(k) == lower(name)
-              give (headers of r)[k]
-      give nothing
-  ```
+  own `serve`). Look one up without guessing with the builtin `header(r, "content-type")`
+  (v0.6.45+; `nothing` when absent) — don't define your own `task header`, it would shadow it.
 
 ## WebSocket (live feeds — general transport, not just blockchain)
 
@@ -128,7 +144,12 @@ ws_close(conn)                      -- clean close frame (idempotent)
 - `ws_recv(conn, timeout?)` → the message map, or **`nothing`** on timeout (default 30s).
   NEVER blocks forever; ping/pong handled transparently.
 - `ws_send(conn, data)` / `ws_close(conn)`. A dead connection errors on send/recv (the
-  handle is retired) — atrapable with `try`/`recover`.
+  handle is retired) — catchable with `try`/`recover`. v0.6.45+: a peer that goes away without
+  closing (a reset — the process died, the network dropped; `os error 10054` on Windows) arrives
+  as `{type: "close", data: "connection reset by peer"}` (the `data` field WebSocket close events
+  always had) in `ws_recv`/`ws_select`/`select` instead of an IO
+  error that cut every other connection of the same `select`. A protocol violation (invalid frame,
+  a message over the size limit) is still an error.
 
 **Multiplexing thousands of feeds — `ws_select` (the event-loop primitive).** Watch M
 connections from ONE thread, react to the first ready, no thread-per-connection. This is
@@ -257,6 +278,16 @@ Universal API routed by the `db_open` target: a **file path** → SQLite (built-
 `postgres://…` → Postgres; `mysql://…` → MySQL. Parameterized queries everywhere (safe from injection).
 `bytes` columns round-trip to/from `BLOB`/`BYTEA` byte-exactly (binary-safe).
 
+**SQLite boundaries (v0.6.45+).** `ATTACH DATABASE '<file>'` and `VACUUM INTO '<file>'` are refused
+(`not authorized` / `authorization denied`), with the name written or computed (`ATTACH ? AS x`,
+`'a' || '.db'`): they opened or created any file without `require db(...)`. Open another database
+with `db_open` (gated by `db`). A plain `VACUUM` and `ATTACH ':memory:'` work. The pragmas
+`temp_store_directory`/`data_store_directory` are refused. `db_open` refuses a `file:` URI
+(`file:/etc/x.db`, `./file:…`) and a `://` that is not a known server (`… is not a database path …;
+open the database by its path, e.g. db_open("./data/app.db")`). Connections run in SQLite's
+**defensive mode**: `PRAGMA writable_schema`, `journal_mode=OFF` and hand writes to the schema or to
+FTS5's internal tables have no effect (FTS5 views, triggers and `rebuild` work).
+
 ```
 require db("./store.db")           -- declare the DB you use (db("*") / require db = any)
 
@@ -264,6 +295,7 @@ require db("./store.db")           -- declare the DB you use (db("*") / require 
 db_open("./store.db")              -- file (persistent)
 db_open(":memory:", "memory")      -- in-memory (fast, temporary)
 db_open("./data.db", "readonly")   -- read-only
+-- v0.6.45+: open other databases with db_open (gated), never ATTACH 'file' / VACUUM INTO 'file'
 
 -- Create tables
 sql_exec("CREATE TABLE products (name TEXT, price REAL, stock INTEGER)")
@@ -467,8 +499,11 @@ write_file("./out/by_region.svg", chart_svg("bar", ranked, {"x": "region", "y": 
 
 - **File formats:** CSV (`csv_parse` with `{"types": {...}}` — an empty field is `nothing`),
   JSON Lines (`jsonl_encode`/`jsonl_decode`), Parquet (`parquet_read(bytes)`/`parquet_write(rows,
-  opts?)`, zstd/snappy/gzip/lz4, native only). Bytes/text in and out; the disk is
-  `read_file`/`read_file_bytes`/`write_file` with `file.read`/`file.write`.
+  opts?)`, zstd/snappy/gzip/lz4, native only; v0.6.45+ `parquet_info(bytes)` → columns, row count
+  and row groups without reading the data, and `parquet_read(bytes, {"columns": [...],
+  "row_groups": [...], "limit": n})` reads only that part), loose `.csv.gz`/`.json.gz` with
+  `gunzip` (v0.6.45+), scraped pages with `html_select`/`html_text` (v0.6.45+). Bytes/text in and
+  out; the disk is `read_file`/`read_file_bytes`/`write_file` with `file.read`/`file.write`.
 - **Tables:** `group_by` → `[{key, items}]`, `summarize` + `sum_of`/`mean_of`/`min_of`/`max_of`/
   `median_of`/`quantile_of`/`first_of`/`n_unique_of`/`count()`, `count_by`, `join` (inner/left/right/outer/semi/anti),
   `pivot`, `is_missing`/`count`/`count_missing`/`fill_missing`/`drop_missing`/`fill_nan`.

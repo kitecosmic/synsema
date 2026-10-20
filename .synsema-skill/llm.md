@@ -47,6 +47,13 @@ Resolution precedence is the same as `env()`/`secret()`: **process environ > `.e
 A key in `.env` reaches the runtime without leaking to the shell/children, and the `.syn` program
 still can't read it (the provider is used by the runtime, not the program).
 
+**`parallel_map` items and `spawn`ed agents use the same provider (v0.6.45+).** Up to v0.6.44, under
+`synsema run`, `reason`/`decide`/`analyze`/`generate` inside a `parallel_map` item or a spawned
+agent ran in a fresh interpreter without providers and returned their offline placeholders, while
+the same code on the main thread got real answers (under `serve` agents were already wired). Now
+they reach the caller's provider, and the process token budget (`SYNSEMA_LLM_BUDGET`) holds inside
+them too — fanning prompts out with `parallel_map` is the intended pattern.
+
 ## Context-aware prompts
 Every LLM call automatically receives:
 - Program intent
@@ -383,13 +390,14 @@ ambient capabilities — use `call_tool` to dispatch untrusted, model-chosen too
 `require` at the top of its body (literal scope); the **program grants** the superset. Under `serve`
 the per-task `require` is only the *declaration* `call_tool` intersects — the real grant goes in the
 **entry's** top-level `require`s (a file/exec tool under serve fails with `Capability not granted`
-otherwise). Dir scope = `file("dir")` + `file("dir/*")`; any command = `require exec`. See
+otherwise). Dir scope = `file("dir/**")` (v0.6.45+: the folder, everything below it and the folder
+itself; `dir/*` is only the files directly in it); any command = `require exec`. See
 [capabilities.md](capabilities.md#per-tool-least-privilege-call_tool).
 ```
 task tool_write(name, content)
-    require file.write("workspace/*")    -- the tool's declaration
+    require file.write("workspace/**")   -- the tool's declaration
     write_file("workspace/" + name, content)
--- entry: require serve(N) + require file("workspace") + require file("workspace/*") + require exec
+-- entry: require serve(N) + require file("workspace/**") + require exec
 ```
 
 Offline (no provider configured) `llm_step` returns the safe placeholder

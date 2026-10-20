@@ -36,7 +36,10 @@ let results be parallel_map(safe_fetch, ids)   -- never aborts; each item is val
 **Isolation:** each item runs in its own interpreter scope (CSP model — inputs are
 snapshot-copied, like `spawn`). It inherits the caller's capabilities under the frozen
 intent: a `fetch`/`read_file` inside still needs its `require`. A module's exported state is one
-per worker, whichever alias reaches it ([modules.md](modules.md)).
+per worker, whichever alias reaches it ([modules.md](modules.md)). The LLM operations and `judge`
+inside an item use the **same providers** as the caller (v0.6.45+; before, under `synsema run`, they
+gave offline placeholders / `available: false` there), and `SYNSEMA_LLM_BUDGET` holds across items.
+The same holds for `spawn`ed agents.
 
 **Seeded generators** (v0.6.29+): a generator given as an item reaches its worker as a **copy of
 its state** — pass one child per item and the results are numpy's `g.spawn(n)` bit for bit. The

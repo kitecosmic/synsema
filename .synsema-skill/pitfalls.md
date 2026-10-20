@@ -2,8 +2,8 @@
 
 Read this FIRST if something fails. Each row is a real mistake that costs hours to debug.
 
-> **Just upgraded and something that worked now fails?** Start at *Upgrading to v0.6.29* (then
-> *Upgrading to v0.6.24*), right below.
+> **Just upgraded and something that worked now fails?** Start at *Upgrading to v0.6.45* (file
+> scopes, `static`, templates), then *v0.6.42*, *v0.6.29* and *v0.6.24*, right below.
 >
 > **Jump to the `## ` section that matches your failure:** Errors (parse/runtime messages) ·
 > Database SQL · Database MongoDB · Database Redis · HTTP server (serve) · Language features
@@ -11,6 +11,29 @@ Read this FIRST if something fails. Each row is a real mistake that costs hours 
 > Behavioral surprises · Anti-patterns · Secrets & config
 > Coming from Python? The traps that LOOK like Python but aren't are also collected in
 > [python-diff.md](python-diff.md).
+
+## Upgrading to v0.6.45 — what behaves differently
+
+| You see | What changed | What to write |
+|---|---|---|
+| `Capability not granted: file_read("data/sub/b.txt")` with `require file.read("./data/*")` | Path scopes are **globs by segment**: `*` stays inside one folder; `**` crosses folders | `require file.read("./data/**")` — the folder, everything below it and the folder itself |
+| `require file("dir")` + `require file("dir/*")` no longer reaches `dir/sub/x` | Same rule: the old two-line idiom relied on `*` crossing `/` | one line: `require file("dir/**")` |
+| `require file.read("*")` stopped reading `/etc/...` or `C:/...` | `*` is now "the files of the working directory", not the whole disk | the whole disk is `require file.read` with **no scope**; better, name the folder (`"./data/**"`) |
+| `cwd()` / `list_dir(".")` denied with `file.read("./*")` or `"*"` | `./*` names the files, not the folder | `require file.read(".")` (or `"./**"`, `"**"`) |
+| `serve` refuses to start: `static "/s" from "public" serves the files of that folder — … add require file.read("public/**")` | Serving a folder is reading it (before, the `static` line was the permission) | add exactly that line; a folder bundled by `synsema build` needs nothing |
+| `render()` fails with `Capability not granted: file_read("templates/partials/nav.html")` | `{ include }` and `{ layout }` from disk need `file.read`, like the page | `require file.read("./templates/**")` |
+| `grep(dir, …)` denied with `file.read("./proj")` | `grep` reads the whole tree | `require file.read("./proj/**")` |
+| `edit_file` denied with only `file.write` | it reads the file to find the text | add `file.read` on the same path |
+| a `tls cert "c" key "k"` server no longer starts | the program reads both files | `require file.read("./cert.pem")` + `require file.read("./key.pem")` (the `--tls-cert`/`--tls-key` flags need nothing) |
+| `… a link (symlink or junction) on the way leads outside it` | links below a grant are judged where they lead | grant the place the link points to, or remove the link; a link that IS the granted path still works |
+| `env("X", nothing)` now gives `nothing` (it gave the text `"None"`); `env("X", true)` gives `"true"` | the default is no longer passed through its Python text | `when v == nothing`; compare bools as `"true"` |
+| `SQLite: not authorized` on `ATTACH DATABASE 'x.db'` / `VACUUM INTO 'x.db'` | they opened files without `require db(...)` | `db_open` the other database; `ATTACH ':memory:'` and plain `VACUUM` work |
+| `label_violation` on a `require` inside `when <private>` (with `--labels`) | what is granted cannot depend on private data; also a task's `require` with a private scope | declare capabilities at the top of the program |
+| `label_violation` on `sign`/`spend`/`reveal`/wallet ops in a private branch (with `--labels`) | their audit entry would tell which way the branch went | decide with a public value, or `declassify` the condition first |
+| `run_program(…, {"env": {"HOME": …}})` / a `"SYNSEMA_*"` variable is refused; a ceiling `"x,exec"` is refused | those let the child pick host paths or extra capabilities | pass only the child's own variables; one scope per item |
+| `svg_to_png: a <text> has N characters, above the 16384 character limit` | layout time grows with the square of a `<text>`'s length | split it into several `<text>`, or `{"max_text_chars": n}` |
+| stderr: `fetch(url, method, …) is deprecated` / `check` warns on `http_get(url, h, q, 10)` | the positional `fetch` and a third optional positional `http*` argument go away in v1 | `fetch(url, {"method": …, "headers": …, "body": …})`; `http_get(url, h, q, timeout = 10)` |
+| `synsema check` prints `warning: … there is no task, variable or builtin named 'len' in this file` | `check` now flags calls to names that exist nowhere (the call would fail when the line runs) | use the Synsema name it suggests (`length(x)`); warnings never change the exit code |
 
 ## Upgrading to v0.6.42 — what behaves differently
 
@@ -116,7 +139,7 @@ Everything above is inert with labels off, except the first three rows.
 | Error message | Cause | Solution |
 |---|---|---|
 | `Unterminated string` | Literal newline inside `"..."` | Use `\n` escape. Strings are single-line only. |
-| `Capability not granted: file_write(...)` | Missing `require` or scope too narrow | Add `require file("/path/*")` at top of program |
+| `Capability not granted: file_write(...)` | Missing `require` or scope too narrow | Add `require file("/path/**")` at top of program (`/path/*` = only the files directly in `/path`, v0.6.45+) — the error names the exact line |
 | `Capability not granted: net(...)` | Missing `require` for the domain | Add `require net("domain.com")` |
 | `Invalid memory category: 'preferencia'` | Categories are English-only | Use exactly: `preference`, `rule`, `learning`, `decision`, `context` |
 | `Capability not granted: memory` on `remember`/`recall`/`add_rule`/`create_progress` | Persistent state is opt-in: the program declares no memory (it is NOT auto-granted, even under `run`) | Add `require memory("<name>")` at the top — the name keys `<dir>/.synsema/state/<name>.db` ([memory.md](memory.md)) |
@@ -227,7 +250,7 @@ byte-strings (text/bytes/number); structured data goes via `json_encode`/`json_d
 | `X-Forwarded-For` sets the client for rate limiting | The real peer IP is used; XFF is ignored | XFF is forgeable; trusted-proxy/per-user keying is future work |
 | Behind a proxy the sitemap/robots/OpenAPI `servers` say `https://127.0.0.1:PORT/...` | The proxy rewrote `Host` to the backend authority; `X-Forwarded-Host` is ignored on purpose (forgeable → host header injection) | Declare `domain "example.com"` in the serve block — that is the base URL |
 | `give "<h1>Hi</h1>"` renders as an HTML page | It's JSON — the response is the quoted string `"<h1>Hi</h1>"` | Use `html("<h1>Hi</h1>")` (or `respond(...)`) for a real page |
-| `static "./public"` also needs `require file(...)` | No — the `static` declaration **is** the read permission for that dir | Just declare `static "./public"`; the path is relative to the working dir |
+| `static "./public"` needs no capability | Since v0.6.45 it does: serving a folder is reading it; the serve refuses to start and names the line | `require file.read("./public/**")` next to `static "./public"` (a folder bundled by `synsema build` needs nothing) |
 | `cors "*"` works with `Authorization`/cookies | The CORS spec forbids `*` for credentialed requests | Use a specific origin: `cors "https://app.example.com"` |
 | A static file shadows my declared route | Declared routes always win; static is only the fallback | Expected — rename the file or the route if you really want the file |
 | A catch-all `*path` swallows a more specific route | Precedence is by specificity, not order: exact > `:param` > `*catchall` | Expected — the exact/`:param` route wins even if declared after the catch-all |
@@ -492,7 +515,8 @@ byte-strings (text/bytes/number); structured data goes via `json_encode`/`json_d
 | Boxplot draws a group of 1 value | Error — **≥2 values per group** (a 1-point box is garbage) | Aggregate differently or drop the group |
 | `svg_to_png` renders animations / scripts | The PNG is the **static** state (resvg ignores scripts/SMIL) | By design — nothing in an SVG ever executes |
 | A `<image href="http://...">` loads in the PNG | Never fetched — **no network, no disk** from a pure builtin | Embed the image as a `data:` URL if you need it rasterized |
-| Any font in the SVG renders as requested | One embedded sans (DejaVu); unknown families fall back to it unless you pass them in `opts.fonts` (v0.6.20+, `file.read` per font); missing glyphs (full CJK, color emoji) → tofu | Deterministic by design; custom/system fonts may come later |
+| Any font in the SVG renders as requested | One embedded sans (DejaVu); unknown families fall back to it unless you pass them in `opts.fonts` (v0.6.20+, `file.read` per font); missing glyphs (full CJK, color emoji) → tofu | Deterministic by design. With `opts.fonts` the fallback is per glyph (v0.6.45+): one missing character no longer turns the whole title into the fallback font. At most 16 fonts / 64 faces; a font with pathological tables is refused naming it |
+| A long `<text>` (a whole paragraph from the data) renders slowly or fails | v0.6.45+: more than 16 384 characters in ONE `<text>` → `svg_to_png: a <text> has N characters, above the 16384 character limit …` | One `<text>` per line (the limit is per `<text>`), or `{"max_text_chars": n}` on purpose |
 | Huge `width`/`scale` just works | Above ~16.7M output pixels → error naming `max_pixels` | Deliberate anti-DoS ceiling; raise it explicitly: `{"max_pixels": n}` |
 
 ## Blockchain (sign/verify — see stdlib.md § Blockchain)
@@ -577,8 +601,9 @@ byte-strings (text/bytes/number); structured data goes via `json_encode`/`json_d
 | Cron output appears after program ends | Output is buffered | Fixed in recent versions. Update to latest. Use `synsema serve` to keep the process alive for live output. |
 | An unknown `--flag` is ignored | (v0.6.14+) it's a **usage error, exit 2** on `run`/`test`/`conform` | Typos are caught, not silently dropped. `synsema run --audit json p.syn` now works; before, `--audit` was ignored and `json` taken as the path. |
 | `print` works under any `--cap-set` | (v0.6.14+) under a ceiling, `stdout` is a real capability | A `--cap-set` without `stdout` denies output at the first `print`/`show`/`log`. `--sandbox` includes it; no ceiling = output free. |
-| `render("page.html")` needs no capability | (v0.6.14+) a **disk** template read needs `require file.read("page.html")` | Closes reading arbitrary files via a request-derived path. Nested `include`/`layout` and **bundled** (`synsema build`) templates don't; one line covers a tree: `require file.read("templates/*")`. |
-| `run("printenv")` under `exec` dumps my API keys | (v0.6.14+) Synsema's secrets (provider keys + `.env` vars) are stripped from the child env | The base OS env (`PATH`…) is kept; pass a secret a child needs explicitly via `opts.env`. Same for `proc_spawn`. |
+| `render("page.html")` needs no capability | (v0.6.14+) a **disk** template read needs `require file.read("page.html")`; since v0.6.45 so do nested `{ include }`/`{ layout }` | Closes reading arbitrary files via a request-derived path. **Bundled** (`synsema build`) templates need nothing; one line covers a tree: `require file.read("./templates/**")`. |
+| `run("printenv")` under `exec` dumps my API keys | (v0.6.14+) Synsema's secrets (provider keys + `.env` vars) are stripped from the child env — also with `proc_spawn(…, {"pty": true})` since v0.6.45 (the pty path used to skip it) | The base OS env (`PATH`…) is kept; pass a secret a child needs explicitly via `opts.env`. For NO inherited environment at all: `{"env_clean": true}` (v0.6.45+; pass `PATH` in `env` if the child starts other programs). |
+| A `--no-console` app opens a console window for each `run`/`proc_spawn` child (Windows) | Fixed in v0.6.45: children are created with `CREATE_NO_WINDOW` when the process has no console | Nothing to write; from a terminal the child still shares it (so `ssh` can ask for a password) |
 
 ## Anti-patterns
 
@@ -599,9 +624,9 @@ byte-strings (text/bytes/number); structured data goes via `json_encode`/`json_d
 | `json of r` → `Map has no key 'json'` | `json of r` exists: the parsed body when the server said JSON, else `nothing` | Branch on it; `json_decode(body of r)` still fine |
 | `body of r` is enough for a PDF/image | Still lossy text | `http_bytes(...)` → `bytes of r` (exact) |
 | `split(s, "")` errors | Returns the characters | Same as JS/Python `list(s)` |
-| `cwd()` works without a capability | `Capability not granted: file_read(".")` | `require file.read(".")` (or `./*` / `*`) — the grant of `list_dir(".")`; `./data/*` does NOT cover it |
-| `delete_dir("./tmp")` removes a tree | Error `"tmp" is not empty (pass {"recursive": true} …)` | `{"recursive": true}` + `file.write` on the dir AND every path inside (`./tmp` + `./tmp/*`) |
-| `zip_extract(z, "./out")` with `file.write("./out")` extracts | Denied at the first entry (`file_write("out/a.txt")`) | The grant is per path written: `file.write("./out/*")` (dest need not exist) |
+| `cwd()` works without a capability | `Capability not granted: file_read(".")` | `require file.read(".")` (or `"./**"` / `"**"`) — the grant of `list_dir(".")`; since v0.6.45 `"./*"` and `"*"` do NOT cover it (they name the files inside) |
+| `delete_dir("./tmp")` removes a tree | Error `"tmp" is not empty (pass {"recursive": true} …)` | `{"recursive": true}` + `file.write` on the dir AND every path inside: `file.write("./tmp/**")` |
+| `zip_extract(z, "./out")` with `file.write("./out")` extracts | Denied at the first entry (`file_write("out/a.txt")`) | The grant is per path written: `file.write("./out/**")` (dest need not exist; `./out/*` misses subfolders since v0.6.45) |
 | `use "../lib/x.syn"` is always blocked | Allowed while it stays under the **project root** (the entry file's dir); above it → `escapes the project root` | Move the file into the project or restructure; the root is the entry's directory, not the cwd |
 | `route "GET /:lang"` serves `/openapi.json` as a lang | The reserved URLs (`/openapi.json`, `/docs`, `/llms.txt`, `/sitemap.xml`, `/robots.txt`) are served **first**; `synsema check` warns | Declare a **literal** route (or a static file at the exact path) if you really want to override one |
 | A `private` route is unreachable | `private` (route/group) only hides it from discovery/OpenAPI — it is still served | Auth is `requires auth`; `private` is about publication |
@@ -630,7 +655,8 @@ byte-strings (text/bytes/number); structured data goes via `json_encode`/`json_d
 | `secret("X")` without `require secret("X")` | `secret("X") not permitted: missing capability` | Add `require secret("X")` (or a `require secret("X_*")` prefix). Same for `env`. |
 | `… not permitted: declared but above the host ceiling (--sandbox/--cap-set)` | The `require` IS there; the HOST's ceiling (`--sandbox`, `--cap-set`, the embedder's `ceiling`) does not lend it | Nothing to change in the program — do NOT add the `require` again (loop). The host widens the ceiling or the call stays denied. Same text for `net`/`db`/`file`… via `Capability not granted: … — declared but above the host ceiling` |
 | Comparing a secret with `==` in a loop over guesses | Fine — `==` on a secret is constant-time | For HMAC/signature checks use `verify_hmac` (also constant-time) |
-| Expecting `env("X")` to return `nothing` when unset | It raises a clear error (fail-loud) | Pass a default: `env("X", "devvalue")`, or set it in `.env`/the environment |
+| Expecting `env("X")` to return `nothing` when unset | It raises a clear error (fail-loud) | Pass a default: `env("X", "devvalue")`, or `env("X", nothing)` → `nothing` when unset (v0.6.45+; it used to give the text `"None"`), then `when v == nothing` |
+| `env("DEBUG", false)` compared with `"False"` | A bool default is Synsema text since v0.6.45: `"false"`/`"true"` | Compare with `"true"`; a number keeps its text (`env("PORT", 8080)` → `"8080"`) |
 | Putting a secret in a query param or JSON body | Redacted (fail-closed) → the upstream gets `secret(NAME)` | Send credentials via a header: `{"Authorization": bearer(secret("KEY"))}` |
 
 ## WebAssembly (wasip1 CLI + `@synsema/wasm` embed) — see [deploy.md](deploy.md) § WebAssembly
@@ -644,6 +670,20 @@ byte-strings (text/bytes/number); structured data goes via `json_encode`/`json_d
   hooks (browser `fetch`, IndexedDB, LLM SDKs) need `runAsync`/`handleAsync` (Worker +
   `Atomics.wait`); in browsers that needs cross-origin isolation (COOP `same-origin` + COEP
   `require-corp`) — without it, use sync hooks.
+- **Loading in Node / Next.js**: `await Synsema.loadNode()` (v0.6.45+) loads the `synsema.wasm` that
+  ships in the package. `Synsema.load(new URL("@synsema/wasm/synsema.wasm", import.meta.url))` (the
+  old README) never resolved a package name: don't write it.
+- **Untrusted code in a server**: pass `maxSteps` and/or `maxMemoryMb` per call (both modes; `0` is
+  an error, not "no limit") and `timeoutMs` in the async API; past a limit the call ends with
+  `ok: false` and an error naming it, never a trap. Each call sets its own limits (none are
+  inherited).
+- **Concurrent `runAsync` calls queue** (v0.6.45+; they used to fail "one call at a time per
+  instance"); spread them with `Synsema.load(src, { workers: n })` / `loadNode({ workers: n })`.
+- **`state_merge`/`state_cas` fail with a host `kv` that has no `cas`**: add
+  `cas(ns, key, expected, value)` → `true`/`false` (`expected` `null` = missing) to make them
+  atomic across instances.
+- **`labels: true` really refuses** (v0.6.45+): a private value reaching the `http`/`kv`/`llm`/`sleep`
+  hooks is a `label_violation` (before, only `print` redacted).
 - **`require` still rules**: the host lending `http`/`kv`/`llm` grants nothing — without
   `require net("host")`/`require memory("x")`/`require llm` the builtin fails with `Capability not
   granted` BEFORE the host is called; and the embedder's `ceiling` denies above what the host lends.

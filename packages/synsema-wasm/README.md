@@ -34,6 +34,7 @@ const r = await syn.runAsync(code, {
   host,
   labels: true,                                    // information-flow labels on
   input: { var: "customer", value: row, sources: { card: ["customer"] } },
+  result: "out",                                   // r.result = the final value of `out`
   timeoutMs: 2000,                                 // the Worker is stopped past this
   maxSteps: 5_000_000,                             // interpreter steps, deterministic
   maxMemoryMb: 64,                                 // memory the run reserves
@@ -44,19 +45,30 @@ const r = await syn.runAsync(code, {
   private value, or a branch that depended on one, never reaches `print`, your `http` hook
   (`fetch`/`http_*`), your `kv` (`state_*`, `remember`), your `llm` or your `sleep` (its number
   crosses to the host): the call fails with `label_violation` before the hook runs.
-  `r.private_seen` says whether one went through.
+  `r.private_seen` says whether one went through; then `r.steps` is `null` (how many steps the
+  run took depended on the data). `sources` needs `labels: true`.
+- `result: "out"` returns the final value of the global `out` in `r.result`, with its labels: a
+  private part comes back as `{"$private": ["customer"], "value": …}`. `r.declassify` lists each
+  `declassify` the run made. Without `labels`, `result` is plain JSON.
 - `timeoutMs` (async mode): `0` means no deadline; otherwise milliseconds, up to 2147483647,
-  counted from when the call starts running, not while it waits in the queue. Past it the call fails with a clear error and its Worker is replaced. The server's own
-  thread never blocks. A host hook with no deadline of its own that never answers keeps its Worker
-  busy unless the call has a `timeoutMs`.
+  counted from when the call starts running, not while it waits in the queue. Past it the call
+  fails with a clear error and its Worker is replaced. The server's own thread never blocks. A
+  host hook already running (a `fetch`) is not cut; its result is discarded. A host hook with no
+  deadline of its own that never answers keeps its Worker busy unless the call has a `timeoutMs`.
 - `maxSteps` and `maxMemoryMb` (both modes): the run ends with `ok: false` and an error that says
   which limit it hit — never a trap. `maxSteps` counts interpreter steps from the start of the run
   (in `handle`, of each request); `maxMemoryMb` counts the memory the run reserves, not what the
-  instance already held.
+  instance already held. Both are positive integers: `0` is an error, not "no limit". No call
+  inherits the limits of the previous one.
 - Concurrent async calls wait in one queue and go to the first free Worker (up to `workers: n`). A
   Worker that does not start in `startMs` (an option of `Synsema.load`/`loadNode`, default 30 s) is
-  stopped. In the sync API a trap
-  recreates the instance by itself.
+  stopped. A Worker that dies fails the call it was running (not retried: it may have had
+  effects) and is replaced. `close()` is final: what waits fails with "closed".
+- A host hook that returns something that is not JSON (a `BigInt`, a circular object) or throws a
+  value without a message counts as that hook failing in that call, in both APIs — not a hung
+  Worker or a trapped module.
+- In the sync API a trap recreates the instance by itself (the call throws
+  `synsema: the module trapped (…); the instance was recreated`; the next call works).
 
 ## Lending capabilities (the host)
 
@@ -77,7 +89,25 @@ syn.run(`require llm\nprint(reason about "the weather")`, { host, ceiling: "stdo
 ```
 
 - `kv` backs persistent agent memory (`remember`/`recall`, rules, progress — namespace
-  `memory:<declared name>`) and `state_*` (namespace `state`).
+  `memory:<declared name>`) and `state_*` (namespace `state`). `delete` and `list` are optional.
+- `kv.cas(ns, key, expected, value)` (optional) is compare-and-swap: write `value` only if the
+  stored text is exactly `expected` (`null` = the key does not exist) and return `true` or
+  `false` — anything else fails the call with `kv.cas must return true or false`. Your store must
+  compare and write in one step (a transaction, a conditional put):
+
+  ```js
+  cas: (ns, k, expected, v) => {
+    if ((store.get(ns + "/" + k) ?? null) !== expected) return false;
+    store.set(ns + "/" + k, v);
+    return true;
+  },
+  ```
+
+  `state_merge(key, map)` and `state_cas(key, expected, new)` depend on it. With a host `kv`
+  that has `cas` they are atomic, also across instances sharing the store. With a host `kv`
+  without `cas` they fail saying so (`the host's kv does not offer cas (kv.cas) …`) instead of
+  risking a lost write. With no host `kv`, the state belongs to the wasm instance and is atomic:
+  it lasts across that instance's `handle` requests, and each `run` starts with an empty state.
 - `llm` backs `reason`/`decide`/`analyze`/`generate`; `llm_usage()` sums the tokens you report.
 - `http` backs `fetch`/`http_*` and the blockchain read-side RPC — after the `net(host)`
   gate, with the same URL canonicalization as the native binary.
@@ -120,8 +150,12 @@ validates without running; `syn.version()` is the artifact's release tag.
 ## Files, time, randomness
 
 This artifact has **no filesystem** (`read_file` says so; pass data through `env` or the
-source). `now()` comes from `Date.now()`; `random()`, `token()` and every signature nonce
-come from `crypto.getRandomValues`. For file-based confidential jobs use the wasip1 build
+source). `now()` comes from `Date.now()`. Each call asks the host once for 32 bytes of
+entropy (`crypto.getRandomValues`), which seed that run's own ChaCha generator: `random()`,
+`random_bytes(n)`, `token()` and RSA blinding draw from it and never ask the host again, so how
+much randomness a run used does not show. With `labels`, `now()` returns the clock read at the
+start of the run and at each interaction with the host (a hook call), so when and how often the
+program read the clock does not show either. For file-based confidential jobs use the wasip1 build
 under wasmtime (see the Synsema docs, *WebAssembly*).
 
 ## Other languages

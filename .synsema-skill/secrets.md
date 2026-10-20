@@ -10,9 +10,19 @@ Define any variable once (in a `.env` file or the process environment) and read 
 by name. There are two ways to read, depending on sensitivity:
 
 ```synsema
-let port be env("PORT", 8080)                 -- plain string config
+let port be env("PORT", 8080)                 -- plain string config: "8080" when PORT is unset
 let key  be secret("STRIPE_API_KEY")          -- opaque, redacted everywhere
+let hook be env("WEBHOOK_URL", nothing)       -- nothing when unset (v0.6.45+)
+when hook == nothing
+    print("no webhook configured")
 ```
+
+A default is returned as text: a number keeps its text (`env("PORT", 8080)` → `"8080"`), a bool
+is Synsema text (`env("X", true)` → `"true"`, v0.6.45+; it used to be `"True"`). **`nothing` as
+the default gives `nothing`** when the variable is not defined, for `env` and `secret` alike
+(v0.6.45+; before, both gave the text `"None"`, which passed as a valid value — `secret` sent it as
+`Bearer None`). A defined variable always wins over the default; without a default, an undefined
+variable is an error.
 
 | Builtin | Returns | Capability |
 |---|---|---|
@@ -122,8 +132,12 @@ serve on 8080
 ```synsema
 require secret("STRIPE_API_KEY")
 require net("api.stripe.com")
-let r be fetch("https://api.stripe.com/v1/charges", "POST",
-               {"Authorization": bearer(secret("STRIPE_API_KEY"))}, body)
+let body be {"amount": 2000, "currency": "usd"}
+let r be fetch("https://api.stripe.com/v1/charges", {
+    "method": "POST",
+    "headers": {"Authorization": bearer(secret("STRIPE_API_KEY"))},
+    "body": body
+})
 ```
 
 ```
@@ -189,8 +203,8 @@ route "POST /proxy"
     when not contains(request.headers, "x-provider-key")
         give fail(400, "missing x-provider-key")
     let user_key be as_secret(request.headers["x-provider-key"], "user_key")
-    let r be fetch("https://api.provider.com/v1/...", "POST",
-                   {"Authorization": bearer(user_key)}, body)   -- materializes only at the socket
+    let r be fetch("https://api.provider.com/v1/...", {"method": "POST",
+        "headers": {"Authorization": bearer(user_key)}, "body": body})   -- materializes only at the socket
     give {"ok": true}
 ```
 
