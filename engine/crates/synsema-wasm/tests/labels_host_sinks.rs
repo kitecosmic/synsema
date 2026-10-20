@@ -100,11 +100,15 @@ fn a_private_value_cannot_reach_the_host_sleep_hook() {
     assert!(r.ok, "un sleep público sigue: {:?}", r.errors);
 }
 
+/// El control va por el KV del host: `state_set` del wasm habla siempre con el hook. La red no sirve
+/// de control acá: con `cargo test --workspace` las features se unifican, `synsema-stdlib` queda con
+/// `native` y `http_post` sale por el transporte real en vez del hook (en el build wasm no pasa).
 #[test]
 fn public_values_still_reach_the_host() {
-    let (r, spy) = run_with_secret("http_post(\"https://x.test/\", {\"n\": input.nombre})\n");
+    let (r, spy) = run_with_secret("state_set(\"k\", input.nombre)\n");
     assert!(r.ok, "{:?}", r.errors);
-    assert_eq!(spy.http.borrow().len(), 1, "el control: un valor público sí sale");
+    let kv = spy.kv.borrow();
+    assert!(kv.len() == 1 && kv[0].contains("Ana"), "el control: un valor público sí sale: {:?}", kv);
 }
 
 /// Anti-rot del wasm (par de `every_effectful_family_is_a_label_sink` del runtime): todo builtin que
