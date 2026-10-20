@@ -9,6 +9,69 @@ Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the rele
 ## Unreleased (v0.6.45)
 
 **Behavior changes (read these first).**
+- **A `*` in a file scope stays inside one folder.** Path scopes are now globs by segment, like
+  gitignore and shell globs: `*` and `?` match within one path segment, `**` crosses folders (and
+  `./data/**` also covers `./data` itself), and no wildcard matches `..` or jumps from a relative
+  path to an absolute one. Before, `*` matched across `/` and `..`: `require file.read("./*")`
+  granted `/etc/passwd`, and `file.read("*.csv")` any `.csv` on the disk, while the docs called them
+  "this folder". To read a folder with its subfolders, write `./data/**`; `./data/*` is its files.
+  `cwd()` now needs `file.read(".")`, `"./**"` or `"**"` (`"./*"` names the files, not the folder).
+  The whole-disk grant is still `require file.read` with no scope.
+- **`static "/x" from "./public"` needs `require file.read("./public/**")`.** Serving a folder is
+  reading it, and the file is chosen by a remote client; before, nothing was declared (even
+  `static "/" from "/"` served the disk). The error at startup says the exact line to add. A folder
+  that travels inside a `synsema build` binary is part of the program and needs nothing, as with
+  `read_file`. The `--pwa` and `--desktop` templates carry the line.
+- **`{ include }` and `{ layout }` read from disk need `file.read`, like `render()`.** Before they
+  were only kept inside the working directory, so a program that can write templates could include
+  `.env` in a page without declaring it reads it.
+- **`grep` on a folder needs `file.read("<folder>/**")`.** It reads the whole tree; with the new
+  globs, `file.read("./proj")` is the folder alone. Same as `static`.
+- **`edit_file` needs `file.read` as well as `file.write`.** It reads the file to find the text,
+  and its answers (not found / ambiguous / how many replaced) tell whether a text is inside.
+- **`tls cert "<c>" key "<k>"` in a `serve` block needs `file.read` on both files**, like
+  `mtls_identity`. The `--tls-cert`/`--tls-key` flags are the operator's and need nothing.
+- **A `static` folder that travels inside a `synsema build` binary is served only from the bundle:**
+  a file that is not in the bundle no longer falls back to the disk without a grant.
+- **SQLite refuses `ATTACH DATABASE '<file>'` and `VACUUM INTO '<file>'`,** with the name written
+  out or computed (`ATTACH ? AS x`, `'a' || '.db'`), and the pragmas `temp_store_directory` and
+  `data_store_directory`. They opened or created any file without `require db(...)` (and, with an
+  SQL injection, the attacker picked the path). Open another database with `db_open`, which is
+  gated. A plain `VACUUM` and `ATTACH ':memory:'` still work. `db_open` refuses a `file:` URI
+  (`file:/etc/x.db`, also written `./file:…`) and a path with `://` that is not a known server: they
+  name another place than the one the scope sees; open the database by its path. Connections run in
+  SQLite's defensive mode: no `PRAGMA writable_schema`, no `journal_mode=OFF`, no hand writes to the
+  schema or to FTS5's internal tables (FTS5 views, triggers and `rebuild` still work).
+- **With labels on, a `require` in a branch decided by a private value (or with a private scope)
+  is a `label_violation`:** what is granted cannot depend on private data (a later public
+  `try random_int(...)` published the branch). Declare capabilities at the top of the program. The
+  same holds for a `require` inside a `task` (it is the tool's ceiling in `call_tool`): a task with
+  a `require` whose scope is private, or defined in a private branch, is a `label_violation`.
+- **With labels on, an operation that writes the audit log (`sign` and the signing builtins,
+  `spend`, `reveal`, the wallet operations) does not run in a branch decided by a private value.**
+  Whether its audit entry existed told the operator (or the wasm host's `kv`) which way the branch
+  went. It now fails with `label_violation` and writes nothing; decide with a public value, or
+  `declassify` the condition first (that leaves its own record). A sealed run receipt that audits
+  these without revealing the branch is planned for the next version.
+- **`run_program` refuses an `env` that sets `SYNSEMA_*` variables or the ones the engine uses to
+  pick host paths** (`HOME`, `USERPROFILE`, `TMP`/`TEMP`/`TMPDIR`, `APPDATA`, `XDG_*`,
+  `OLLAMA_MODELS`, `HF_*`: `SYNSEMA_AUDIT` made the child create or truncate any file, `HOME` chose
+  where `reveal` audits), **a ceiling whose scope has a comma or is empty** (it split into extra items:
+  `{"file.read": "x,exec"}` gave the child `exec`), **and a `filename` with folders** (it is a label;
+  with a folder, the child's `memory` state landed there). The child keeps its state and its
+  temporary files where the parent keeps its own — the folder of the parent's `memory` database,
+  absolute (with several programs in one `synsema test`, the one of the program that calls) — never
+  in the `cwd` the program passes nor next to the module that calls; a parent whose memory does not
+  persist (stdin, `--profile pure`) gives the child none, and the child's memory lives in memory
+  for that run (also with `profile: "pure"`, the default: a pure child never touches the disk). A
+  `"native"` child whose ceiling grants `memory=m` shares `m.db` with the parent — also from a
+  `cron` tick or a `serve` handler: each process now writes only the entries it changed, the
+  child's new ids carry a mark (`mem_<n>_p<process>`) so they cannot collide with the parent's, and
+  when the child returns the parent reloads the base. Before, the child rewrote every entry from its
+  own snapshot (a `forget` the parent did meanwhile came back) and the parent's next `remember`
+  reused the id of the child's entry and overwrote it. Without a home
+  directory to fall back on, a `memory` that cannot get its folder lives in memory for that run
+  (it was a relative path, created in the working directory).
 - **`env(name, nothing)` and `secret(name, nothing)` give `nothing` when the variable is not
   defined.** Before, the default went through its Python text form: `env` gave the text `"None"`,
   which passed as a valid value (an address, a name) and failed far from the cause, and `secret`
@@ -22,12 +85,34 @@ Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the rele
   later`), a folder (`it is a directory`), a broken link, a file that is not UTF-8 text
   (`use read_file_bytes`), or a permission. `File not found` is now only for what does not exist.
   Same for `read_file_bytes` and `edit_file`.
+- **`svg_to_png`/`svg_to_pdf` refuse a `<text>` longer than 16 384 characters** (counting its
+  `tspan`s and the text a `<tref>` pulls in, with entities expanded, and inside an SVG embedded in a
+  `data:` URL; also for the icons of `synsema build --icon` and `synsema init --pwa`). The renderer lays a
+  text out in a time that grows with the square of its length: 16 k characters take 0.3 s, 64 k
+  2.6 s, 128 k 10 s, 400 k several minutes. A title that comes in the data could hold a `serve`
+  worker for minutes. The error says how many characters there are; raise the limit with
+  `{"max_text_chars": n}`, like `max_pixels`, or split the text into several `<text>` (the limit is
+  per `<text>`, so a long document with one `<text>` per line is not affected). Content the renderer
+  draws many times (`<use>`, markers, masks) multiplies the cost of the text inside it; a limit for
+  that comes in a later version.
 
 **Fixes.**
+- **`svg_to_png`/`svg_to_pdf` refuse a font in `opts.fonts` that would make every lookup slow**
+  (more than 16 character-map subtables, a format 13 subtable with more than 4096 groups, a face
+  with more than 64 tables), take at most 16 fonts with at most 64 faces in total (a collection
+  counts all its faces: pass the single faces you use instead of a whole "Super OTC"), and try at
+  most 16 fallback fonts for one run of text (beyond that, the rest is shown as missing glyphs): the
+  renderer looks every font up for every character and reshapes the whole text with each fallback,
+  and crafted fonts made a render take minutes. The error names the font. Real fonts (one CJK
+  collection per weight, color emoji, variable fonts, Apple's LastResort) are accepted.
 - **`svg_to_png`/`svg_to_pdf` with `opts.fonts` fall back per glyph.** A title in your font with one
   character it lacks (an arrow, an emoji) came out entirely in the fallback font; now only that
   character does, and the rest keeps your font, as in a browser. Without `opts.fonts` the output is
-  byte for byte the same.
+  byte for byte the same. When the per-glyph layout would leave a missing glyph (your font forms a
+  ligature or a combining mark in that text, or the fallback is a `.ttc` collection), the whole
+  document is laid out as before, where the fallback replaces the run. A font with a malformed
+  character map is used as before, without a per-glyph copy, and so is every pair of fonts after
+  the first 16 in one document (each per-glyph copy weighs as much as its fallback font).
 - **`judge` and the LLM operations inside `parallel_map` and inside a `spawn`ed agent** use the
   same providers as the code that started them. Before, each `parallel_map` item and each agent
   under `synsema run` ran in a fresh interpreter without providers: `judge` answered OFFLINE
@@ -57,25 +142,55 @@ Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the rele
   scopes (the program's `require`, the host ceiling and a delegated ceiling) and `grep` compared
   paths by name, so a symlink or a junction under the allowed folder that pointed elsewhere passed:
   `use "./ext/o.syn"` loaded code from outside the project (what was approved by hash was not what
-  ran), and `read_file("data/ext/x")` read outside `file.read("./data/*")`. Now the path is also
-  judged where it really leads. A link that IS part of the granted path (the project reached
-  through a link, `./data` itself a link) still works; a link below it that leads out is refused
-  with its own message (`a link (symlink or junction) on the way leads outside it`), and a `deny`
-  of a place also catches a path that reaches it through a link. `grep` does not follow links to
-  folders. What remains: the check and the open are two steps, so a link swapped in between is not
-  caught, and a hard link is not visible from its name.
-- **RS256 signing (`jwt_sign` with `"alg": "RS256"`, `rsa_sign_sha256`) is constant-time in the
-  native binary.** The `rsa` crate is not constant-time on private-key operations
-  (RUSTSEC-2023-0071, "Marvin"; no stable fix upstream) and the signature did not even use
-  blinding. The native binary now signs with `ring` (BoringSSL), already in the binary for TLS;
-  the wasm build, where `ring` does not compile, signs with `rsa` and blinding. The signature bytes
-  are the same either way. The audit configuration claimed the crate was only used to verify,
+  ran), and `read_file("data/ext/x")` read outside `file.read("./data/**")`. Now the path is also
+  judged where it really leads:
+  - A link that IS part of the granted path (the project reached through a link, `./data` itself a
+    link) still works; a link below it that leads out is refused with its own message (`a link
+    (symlink or junction) on the way leads outside it`). A `deny` of a place also catches a path
+    that reaches it through a link.
+  - A broken link is followed to where it points: writing through `data/log.txt ->
+    ~/.ssh/authorized_keys` (target not created yet) is refused, for `append_file`, `zip_extract`,
+    `db_open` and the rest. If a path cannot be resolved, the answer is no: a link target with `..`
+    after a name (which the system resolves through that name), a volume without a letter or a
+    network share as a link target.
+  - The temporary file of `write_file`/`edit_file` has a random name and is created with
+    `create_new`, so a link planted with its name is never followed (it was `<path>.synsema.tmp`).
+  - In a case-sensitive folder (those WSL creates), `DATA` and `data` are different places; a scope
+    at a drive root (`C:/**`) covers the drive (it covered nothing); a `\\?\` path is resolved.
+  - `grep` does not follow links to folders, and respects a `deny` inside the tree it searches.
+  - `run_program` sends the child's ceiling with absolute paths, anchored where the parent decided
+    them (with `cwd`, `./data` used to resolve against the child's folder).
+  - `db_open`, `mtls_identity`, templates and `static` open the path that was checked (they checked
+    the normalized path and opened the raw one).
+  - A large request body spilled to disk goes to a private folder of the process, created once
+    with a random name and mode 0700, each file 0600 and `create_new` (it was a predictable name in
+    the temp folder, written through links, in a folder anyone could create first).
+  - On Windows, a `/data` scope is compared as `<drive of the working directory>:/data` against a
+    path with a drive, so a `run_program` child that declares `/data/**` fits the parent's ceiling.
+  - Cost, only for file operations under a scoped grant: one disk query per path segment below the
+    grant, up to four; deeper, or when a link shows up, the path and the grant are resolved on disk.
+    Measured in release on Windows (every query goes through the antivirus), for a 54 µs read:
+    +29 µs one level below the grant, +57 two, +80 three, +103 four, +117 deeper. Linux: +2.5 µs /
+    +3.9 µs one and two levels below, for a 5 µs read. The interpreter is untouched.
+  - What remains: the check and the open are two steps, so a link swapped in between is not caught
+    (the fix is to open relative to the grant's folder with `openat2`/`RESOLVE_BENEATH` on Linux and
+    `OBJ_DONT_REPARSE` on Windows: planned for the next version), and a hard link is not visible
+    from its name.
+- **RS256 signing (`jwt_sign` with `"alg": "RS256"`, `rsa_sign_sha256`) is constant-time or
+  blinded.** The `rsa` crate is not constant-time on private-key operations (RUSTSEC-2023-0071,
+  "Marvin"; no stable fix upstream) and the signature did not even use blinding. The native binary
+  now signs with `ring` (BoringSSL, already in the binary for TLS) the keys `ring` accepts: 2048 to
+  4096 bits, e ≥ 65537, two primes. Other keys (1024 or 8192 bits, e = 3, multi-prime), and every
+  key in the wasm build, where `ring` does not compile, are signed by `rsa` with blinding. The
+  signature bytes are the same either way. Blinding needs entropy: a wasm host without
+  `host_random_fill` now gets an error instead of a trap. The audit configuration claimed the crate was only used to verify,
   which stopped being true in v0.6.20; it now says what is true.
 - **Dependencies with advisories updated:** `rustls` 0.23.46 (RUSTSEC-2026-0346…0349), `zip` 9
   for `zip_extract`/`zip_create` (RUSTSEC-2026-0367…0369 — never reachable through `zip_extract`,
   which never used the affected `extract`), `lru` 0.18 (unsound `pop`), and `rust_decimal` 1.43,
   which drops `rkyv` 0.7 from the lock. `mysql` 28.0.4, `chacha20` and `private-gemm-x86` replace
-  yanked versions. `cargo audit` is clean.
+  yanked versions. `cargo audit` is clean, also for the lock of the Vela guest, which CI now audits
+  too (it still had `rkyv` 0.7).
 - **`proc_spawn(…, {"pty": true})` no longer passes Synsema's secrets to the child.** Since the
   v0.6.14 audit, `run` and `proc_spawn` remove the provider keys, the human-channel secrets and the
   names loaded from `.env` from a child's environment, so a program with `exec` but without
@@ -114,13 +229,45 @@ Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the rele
   change the exit code.
 
 - **`@synsema/wasm` for untrusted code in a server.**
-  - `maxSteps` and `maxMemoryMb` per call: the engine measures them (deterministic steps, the
-    module's real memory) and ends the run with `ok: false` and an error that says so, not a trap.
-    Costs nothing when not set; with limits on, 3–11 % on interpreter-bound code.
-  - `timeoutMs` in the async API: past it the call fails with a clear error and its Worker is
-    replaced, so the server's thread never blocks.
+  - `maxSteps` and `maxMemoryMb` per call, in both modes (in `handle`, for each request): the run
+    ends with `ok: false` and an error that says which limit it hit, never a trap. `maxSteps` counts
+    deterministic interpreter steps from the start of the run; `maxMemoryMb` counts the bytes the
+    run reserves — the module's allocator refuses the reservation that would go over (it counts
+    bytes requested; the module's own memory can grow up to about twice that and is not given
+    back). A `0` is an error, not "no limit". No call inherits the limits of the previous one. Cost in the wasm build: counting allocations is ~3–4 % on
+    allocation-heavy code without limits; with limits on, 1–3 % when allocating and 9–14 % on a
+    tight compute loop. The native binary compiles none of this.
+  - `timeoutMs` in the async API, counted from when the call starts running (not while it waits in
+    the queue): past it the call fails with a clear error and its Worker is replaced, so the
+    server's thread never blocks. A host hook already running (a `fetch`) is not cut; its result is
+    discarded.
+  - Async calls wait in one queue and go to a free Worker, so a burst spreads over `workers: n`. A
+    Worker that dies fails the call it was running (not retried: it may have had effects) and is
+    replaced. `close()` is final: what waits fails with "closed", including on a Worker still
+    starting. A Worker that does not start in `startMs` (default 30 s, an option of `Synsema.load`)
+    is stopped. A host hook that returns something that is not JSON (a `BigInt`, a circular object)
+    or throws a value without a message is an error of that call, in both APIs, not a hung Worker or
+    a trapped module; `timeoutMs` is 0 (no deadline) or a finite number of milliseconds up to 2³¹−1.
+  - With `labels`, `sleep` is a sink in the wasm build: its number crosses to the host's `sleep`
+    hook, so a private value (or a private branch) cannot reach it.
+  - With `labels`, `steps` is `null` when the run touched a private value or branch (how many steps
+    it took depended on the data), as in the native binary.
+  - With `labels`, a capability check made inside a private branch leaves no audit entry (here and
+    in the native `--audit`): how many entries there were told which way the branch went, or how
+    many times a private loop ran. The sealed run receipt of the next version will record them
+    without revealing the branch.
+  - The host sees a fixed shape: each call asks it for 32 bytes of entropy once, which seed the
+    run's own ChaCha generator (`random_bytes(n)`, `token`, `random()` and RSA blinding never ask
+    again, so a private `n` does not show); and with `labels`, `now()` returns the clock read at the
+    start and at each interaction with the host, so when and how often it was called does not
+    show.
+  - `kv_cas`: a host that does not answer, or answers `swapped` with something other than a bool,
+    gets its own error (it read as "kept changing under concurrent writers"), and the package
+    requires the host's `kv.cas` to return `true` or `false`. `handle` keeps a separate prepared app
+    per `labels` setting and per set of host hooks.
   - Concurrent async calls queue instead of failing with "one call at a time per instance", and
-    `Synsema.load(src, { workers: n })` spreads them over n Workers.
+    `Synsema.load(src, { workers: n })` spreads them over n Workers (concurrent calls at startup
+    no longer create more Workers than `n`).
   - After a trap, the sync API recreates the instance by itself (before, the next call asked for
     `await syn.ready()`).
   - `Synsema.loadNode()` loads the `synsema.wasm` that ships in the package, so it works in Next.js

@@ -159,6 +159,7 @@ pub(crate) fn gate_and_audit(
     curve: &str,
     loc: &SourceLocation,
 ) -> Result<(), Control> {
+    crate::secrets::audited_op_preflight("sign")?;
     let checked = caps
         .borrow_mut()
         .check_cause(&Capability::new(CapabilityType::Sign, Some(name.to_string())), "sign-builtin");

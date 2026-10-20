@@ -8,6 +8,7 @@
 intent: "Serve a server-rendered landing page"
 
 require serve(8096)
+require file.read("./examples/public/**")
 
 task features()
     give ["Zero dependencies", "Auto-escaped by default", "each / when in templates"]

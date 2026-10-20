@@ -437,6 +437,13 @@ impl HostRouter {
             // el disco — el mismo orden de overlay que `read_file`/`render`.
             let (data, ct, etag) = match bundled_static(mount, &rel) {
                 Some(hit) => hit,
+                // v0.6.45 (ronda 2, B5): un mount que viaja en el bundle no tiene `file.read`
+                // declarado (es parte del programa), así que no cae al disco: un archivo que no está
+                // en el bundle no existe para ese mount (su `fallback`, del bundle también).
+                None if mount.bundled.is_some() => match mount.fallback.as_deref().and_then(|fb| bundled_static(mount, fb)) {
+                    Some(hit) => hit,
+                    None => continue,
+                },
                 None => {
                     let target = match resolve_in(base, &rel) {
                         Some(t) => t,
@@ -3855,12 +3862,116 @@ async fn read_req_body(body: Incoming, max: Option<i64>) -> Result<Bytes, ()> {
     }
 }
 
-/// Path único para un body spilled a disco (como tempfile del oráculo).
-fn spill_path() -> PathBuf {
+/// Vuelca un body grande a disco y devuelve su ruta. v0.6.45 (ronda 2, M4): antes era
+/// `temp_dir()/syn_body_<pid>_<n>` (predecible) con `fs::write`, que sigue links: un usuario local
+/// plantaba el link y el cliente remoto escribía donde apuntaba. Ahora va a una carpeta del proceso
+/// (0700 en Unix; si ya existe tiene que ser una carpeta de verdad, no un link) con un nombre al azar
+/// y `create_new`, que nunca sigue un link ni pisa un archivo.
+fn spill_write(bytes: &[u8]) -> Option<PathBuf> {
+    use std::io::Write;
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!("syn_body_{}_{}", std::process::id(), n))
+    let dir = spill_dir()?;
+    for _ in 0..8 {
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let p = dir.join(format!("body_{:016x}_{}", rand::random::<u64>(), n));
+        let before = dir_identity(&dir);
+        let mut o = std::fs::OpenOptions::new();
+        o.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            o.mode(0o600);
+        }
+        match o.open(&p) {
+            // Ronda 4 (revisión, H6): la carpeta se vuelve a verificar DESPUÉS de crear el archivo; si
+            // cambió en el medio (la borraron y la recreó otro), el archivo no se usa.
+            Ok(_) if before.is_none() || dir_identity(&dir) != before => {
+                let _ = std::fs::remove_file(&p);
+                return None;
+            }
+            Ok(mut f) => return f.write_all(bytes).ok().map(|_| p),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(_) => return None,
+        }
+    }
+    None
+}
+
+/// Borra el volcado de un body al soltarse.
+struct SpillGuard(Option<PathBuf>);
+
+impl Drop for SpillGuard {
+    fn drop(&mut self) {
+        if let Some(p) = &self.0 {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+}
+
+/// Ronda 3 (M6) y ronda 4 (B2): la carpeta del volcado del proceso, con un nombre al azar y `0700`
+/// desde que nace (`DirBuilder::mode`, sin ventana en `0755`); si el nombre ya existe se prueba otro,
+/// nunca se adopta una carpeta que creó otro. En cada volcado se verifica que siga siendo la MISMA
+/// carpeta (en Unix, dispositivo e inodo): si un limpiador de `/tmp` la borró y otro usuario la
+/// recreó con el mismo nombre, se arma otra. Un fallo pasajero no se recuerda para siempre.
+fn spill_dir() -> Option<PathBuf> {
+    static DIR: std::sync::Mutex<Option<(PathBuf, (u64, u64, u32))>> = std::sync::Mutex::new(None);
+    // Un Mutex envenenado no apaga el volcado para siempre (ronda 4, revisión).
+    let mut g = DIR.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((d, id)) = g.as_ref() {
+        if dir_identity(d) == Some(*id) {
+            return Some(d.clone());
+        }
+    }
+    *g = None;
+    for _ in 0..8 {
+        let d = std::env::temp_dir().join(format!("synsema-spill-{:016x}", rand::random::<u64>()));
+        #[allow(unused_mut)] // `mut` sólo en Unix (`mode`)
+        let mut b = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            b.mode(0o700);
+        }
+        match b.create(&d) {
+            Ok(()) => {
+                // Sin una identidad válida (un FS que no respeta el modo pedido), no se usa y no se
+                // deja la carpeta vacía atrás.
+                let Some(id) = dir_identity(&d) else {
+                    let _ = std::fs::remove_dir(&d);
+                    return None;
+                };
+                *g = Some((d.clone(), id));
+                return Some(d);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(_) => return None,
+        }
+    }
+    None
+}
+
+/// La identidad de una carpeta de verdad (no un link): en Unix (dispositivo, inodo, dueño), y sólo si
+/// su modo es exactamente `0700` — un inodo liberado se reutiliza seguido, así que el inodo solo no
+/// alcanza (ronda 4, revisión). En Windows la carpeta temporal es del usuario y basta con que exista
+/// como carpeta.
+fn dir_identity(d: &std::path::Path) -> Option<(u64, u64, u32)> {
+    let m = std::fs::symlink_metadata(d).ok()?;
+    if !m.is_dir() || m.file_type().is_symlink() {
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if m.mode() & 0o777 != 0o700 {
+            return None;
+        }
+        Some((m.dev(), m.ino(), m.uid()))
+    }
+    #[cfg(not(unix))]
+    {
+        Some((0, 0, 0))
+    }
 }
 
 async fn handle_request(
@@ -3991,9 +4102,11 @@ async fn handle_request(
     // decodificación lossy de `body`); vacío cuando spilleó (el file es la fuente cruda).
     let (body_str, body_raw, body_file): (String, Vec<u8>, Option<PathBuf>) =
         if body_bytes.len() > MEM_SPILL {
-            let p = spill_path();
-            let _ = std::fs::write(&p, &body_bytes);
-            (String::new(), Vec::new(), Some(p))
+            match spill_write(&body_bytes) {
+                Some(p) => (String::new(), Vec::new(), Some(p)),
+                // Sin dónde volcarlo a salvo, el body queda en memoria (ya está leído entero).
+                None => (String::from_utf8_lossy(&body_bytes).into_owned(), body_bytes.to_vec(), None),
+            }
         } else {
             (String::from_utf8_lossy(&body_bytes).into_owned(), body_bytes.to_vec(), None)
         };
@@ -4066,7 +4179,11 @@ async fn handle_request(
     // Un SOLO closure: corre el intérprete sync (dispatch + handler). El `Ctx` es !Send
     // pero queda LOCAL al job (nunca se captura) → el closure captura sólo inputs Send, así
     // sirve igual para el pool (sized) que para un hilo dedicado (stream).
+    // Ronda 4 (B2): el volcado del body se borra al soltar el guard — al terminar el job, si el
+    // handler entra en pánico o si el job nunca llega a correr.
+    let spill_guard = SpillGuard(body_file.clone());
     let job = move || {
+        let _spill = &spill_guard;
         // Contabilidad de la request (inflight + token activo): se cierra al terminar
         // el job INCLUSO si el handler paniquea (el pool atrapa el panic; el Drop corre
         // durante el desenrollado).
@@ -4215,10 +4332,7 @@ async fn handle_request(
                 rt2.release_stream();
             }
         }
-        // Limpia el body spilled a disco (si lo hubo).
-        if let Some(p) = &body_file {
-            let _ = std::fs::remove_file(p);
-        }
+        // El body volcado a disco lo borra `spill_guard` al soltarse.
     };
 
     if streaming_route {

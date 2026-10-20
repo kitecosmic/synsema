@@ -56,7 +56,8 @@ require sign("VELA_SECP_KEY")
 require sign("VELA_USER_KEY")
 require random
 require time
-require file.read("*")
+-- `deploy` reads the artifact path given on the command line: the grant has no scope.
+require file.read
 require file.write(".env")
 require reveal("ecdh_keypair.private")
 

@@ -630,6 +630,16 @@ fn iso_now() -> String {
 /// para que una redirección de variable hacia un secret fuera de scope quede registrada.
 /// Devuelve Err si no se puede escribir → en el camino CONCEDIDO `reveal()` falla (sin
 /// auditoría no hay revelación, §7).
+/// v0.6.45 (ronda 3, M2) — la puerta de una operación que AUDITA, ANTES de todo lo demás: en una rama
+/// decidida por un valor privado no corre, y no deja rastro en ningún lado (ni el audit de
+/// capabilities del `check_cause`, ni el cupo de `SYNSEMA_SIGN_CEILING`, ni su propio log).
+pub fn audited_op_preflight(op: &str) -> Result<(), Control> {
+    if synsema_core::labels::pc_private_now() {
+        return Err(Control::Error(RuntimeError::new(synsema_core::labels::audited_in_private_branch(op))));
+    }
+    Ok(())
+}
+
 fn write_audit_entry(name: &str, loc: &SourceLocation, granted: bool) -> Result<(), String> {
     write_audit_op("reveal", "reveal.log", name, loc, granted, "")
 }
@@ -737,6 +747,13 @@ fn write_audit_op(
     granted: bool,
     extra: &str,
 ) -> Result<(), String> {
+    // v0.6.45 (ronda 2, M2): en una rama decidida por un valor privado no se escribe nada (ni la
+    // entrada concedida ni la denegada): que exista ya revela la rama. La operación falla con
+    // `label_violation`. Un recibo sellado de forma fija que audite igual sin revelar nada queda
+    // para la versión siguiente.
+    if synsema_core::labels::pc_private_now() {
+        return Err(synsema_core::labels::audited_in_private_branch(op.split(' ').next().unwrap_or(op)));
+    }
     let program = std::path::Path::new(&*loc.file)
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
@@ -853,6 +870,7 @@ pub fn register_secret_builtins(
                     }
                 };
                 let name = inner.name().to_string();
+                audited_op_preflight("reveal")?;
                 // Auditoría externa: un secret SELLADO no se revela ni con la capability:
                 // Es material de identidad (`attestation_key()`) que sólo consumen los bordes
                 // criptográficos (ecdh_shared_secret/firma). El intento queda auditado igual.

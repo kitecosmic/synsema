@@ -80,6 +80,7 @@ pub(crate) fn gate_wallet(
     op: &str,
     loc: &SourceLocation,
 ) -> Result<(), Control> {
+    crate::secrets::audited_op_preflight("wallet")?;
     let checked = caps
         .borrow_mut()
         .check_cause(&Capability::new(CapabilityType::Wallet, Some(name.to_string())), "wallet-builtin");

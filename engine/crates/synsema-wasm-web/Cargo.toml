@@ -26,3 +26,6 @@ serde_json.workspace = true
 # backend del SO de siempre.
 [target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
 getrandom = { version = "0.2", features = ["custom"] }
+# v0.6.45 (ronda 2, B2): el generador de la corrida (ChaCha, `StdRng`), sembrado UNA vez por llamada
+# con 32 bytes del host. Ya está en el árbol (stdlib).
+rand.workspace = true

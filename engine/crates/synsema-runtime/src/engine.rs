@@ -66,6 +66,53 @@ pub(crate) struct MemoryCtx {
     pub(crate) progress: std::sync::Arc<std::sync::Mutex<ProgressManager>>,
     pub(crate) on_write_mem: std::sync::Arc<dyn Fn(&AgentMemory) + Send + Sync>,
     pub(crate) on_write_prog: std::sync::Arc<dyn Fn(&ProgressManager) + Send + Sync>,
+    /// Lo que `run_program` necesita de la memoria de ESTA corrida (`None` si no persiste).
+    pub(crate) child: Option<ChildState>,
+}
+
+/// v0.6.45 (ronda 5, M1 y B1) — el estado de una corrida, visto desde `run_program`: la carpeta
+/// ABSOLUTA donde vive su `.db` (el hijo la recibe como `SYNSEMA_STATE_DIR`) y cómo recargar la base
+/// cuando el hijo vuelve. Es de la corrida, no del proceso: `synsema test`/`conform` corren muchos
+/// programas en un proceso y cada uno pasa la suya (antes un `OnceLock` la fijaba el primero).
+#[derive(Clone)]
+pub(crate) struct ChildState {
+    pub(crate) dir: std::path::PathBuf,
+    /// Trae lo que el hijo escribió en la base compartida y sube el contador de ids (si no, el
+    /// próximo `remember` del padre reusaba el id de una entrada del hijo y la pisaba).
+    pub(crate) reload: Arc<dyn Fn() + Send + Sync>,
+}
+
+/// La memoria declarada tal como viaja por `serve` y por los ticks de cron (que arman sus
+/// intérpretes en otros hilos, desde argumentos `Send`): el nombre y, si persiste, su `ChildState`.
+/// Ronda 5 (revisión): antes los workers leían el `ChildState` de un static del proceso, y con dos
+/// `serve` en un proceso el hijo de uno guardaba en la carpeta del otro.
+#[derive(Clone)]
+pub(crate) struct MemName {
+    pub(crate) name: String,
+    pub(crate) child: Option<ChildState>,
+}
+
+/// El `ChildState` de una memoria con base en disco. Mismo orden de locks que los `on_write`
+/// (el store primero, después la base).
+pub(crate) fn child_state_for(
+    dir: std::path::PathBuf,
+    sp: Arc<std::sync::Mutex<crate::persistence::StatePersistence>>,
+    memory: Arc<std::sync::Mutex<AgentMemory>>,
+    progress: Arc<std::sync::Mutex<ProgressManager>>,
+) -> ChildState {
+    let reload: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+        if let Ok(mut m) = memory.lock() {
+            if let Ok(p) = sp.lock() {
+                p.reload_memory(&mut m);
+            }
+        }
+        if let Ok(mut g) = progress.lock() {
+            if let Ok(p) = sp.lock() {
+                p.reload_progress(&mut g);
+            }
+        }
+    });
+    ChildState { dir, reload }
 }
 
 /// Identidad declarada resuelta: nombre + persistencia abierta (None si el `.db`
@@ -73,6 +120,8 @@ pub(crate) struct MemoryCtx {
 pub(crate) struct DeclaredState {
     pub(crate) name: String,
     pub(crate) persistence: Option<crate::persistence::StatePersistence>,
+    /// La carpeta (absoluta) del `.db` abierto; `None` sin persistencia.
+    pub(crate) dir: Option<std::path::PathBuf>,
 }
 
 /// Sugerencia de nombre para el error/warning (decisión #8): el stem del archivo,
@@ -229,15 +278,21 @@ pub(crate) fn resolve_declared_state(
             // declarada — la identidad existe pero SIN disco (in-memory para esta corrida),
             // igual que bajo wasm. El gate de la capability sigue mandando aparte.
             if crate::host::profile() == crate::host::Profile::Pure {
-                return Ok(Some(DeclaredState { name, persistence: None }));
+                return Ok(Some(DeclaredState { name, persistence: None, dir: None }));
             }
             // Techo del host: memoria declarada pero denegada por `--cap-set`/`--sandbox`
             // → identidad sin disco (cero archivos; el uso falla con el error de siempre).
             if let Some(ceil) = ceiling {
                 let want = Capability::new(CapabilityType::Memory, Some(name.clone()));
                 if !ceil.iter().any(|c| c.covers(&want)) {
-                    return Ok(Some(DeclaredState { name, persistence: None }));
+                    return Ok(Some(DeclaredState { name, persistence: None, dir: None }));
                 }
+            }
+            // Ronda 5 (M1): un hijo de `run_program` guarda donde le dice el padre
+            // (`SYNSEMA_STATE_DIR`); si el padre no se lo dio es porque el padre no persiste, y el
+            // hijo tampoco: si no, caía junto a su `filename`, relativo al `cwd` que elige el programa.
+            if crate::run_program::is_child() && std::env::var("SYNSEMA_STATE_DIR").ok().filter(|s| !s.is_empty()).is_none() {
+                return Ok(Some(DeclaredState { name, persistence: None, dir: None }));
             }
             // Dir de estado: override explícito, o project-local (`<dir>/.synsema/state`).
             // `<stdin>` no tiene dir de programa: sin `SYNSEMA_STATE_DIR`, la memoria
@@ -251,7 +306,7 @@ pub(crate) fn resolve_declared_state(
                         "synsema: warning: memory \"{}\" is declared but the program has no file location (<stdin>): state lives in memory for this run only and will NOT persist. Run from a .syn file, or set SYNSEMA_STATE_DIR, to persist it",
                         name
                     );
-                    return Ok(Some(DeclaredState { name, persistence: None }));
+                    return Ok(Some(DeclaredState { name, persistence: None, dir: None }));
                 }
                 None => {
                     let base = std::path::Path::new(filename)
@@ -267,6 +322,18 @@ pub(crate) fn resolve_declared_state(
                 Ok(()) => dir,
                 Err(e) => {
                     let fallback = crate::persistence::home_state_dir();
+                    // Ronda 4 (revisión): sin `HOME`/`USERPROFILE` el respaldo quedaba RELATIVO
+                    // (`.synsema/state`) y se creaba en el cwd, que en un hijo de `run_program` elige
+                    // el programa. Sin un home absoluto, la memoria vive sólo en esta corrida.
+                    if !fallback.is_absolute() {
+                        eprintln!(
+                            "synsema: warning: could not create state dir '{}' ({}) and there is no home directory: memory \"{}\" lives in memory for this run only and will NOT persist",
+                            dir.display(),
+                            e,
+                            name
+                        );
+                        return Ok(Some(DeclaredState { name, persistence: None, dir: None }));
+                    }
                     eprintln!(
                         "synsema: warning: could not create state dir '{}' ({}); using '{}'",
                         dir.display(),
@@ -293,7 +360,14 @@ pub(crate) fn resolve_declared_state(
                     None
                 }
             };
-            Ok(Some(DeclaredState { name, persistence }))
+            let dir = persistence.as_ref().and_then(|_| {
+                if dir.is_absolute() {
+                    Some(dir)
+                } else {
+                    std::env::current_dir().ok().map(|c| c.join(dir))
+                }
+            });
+            Ok(Some(DeclaredState { name, persistence, dir }))
         }
     }
 }
@@ -310,6 +384,14 @@ pub(crate) fn build_memory_ctx(rs: DeclaredState) -> MemoryCtx {
     if let Some(p) = &sp {
         p.lock().unwrap().load_into(&mut memory.lock().unwrap(), &mut progress.lock().unwrap());
     }
+    // Ronda 5 (B1): un hijo de `run_program` que comparte la base marca sus ids.
+    if sp.is_some() && crate::run_program::is_child() {
+        memory.lock().unwrap().set_id_tag(format!("p{}", std::process::id()));
+    }
+    let child = match (&sp, rs.dir) {
+        (Some(p), Some(dir)) => Some(child_state_for(dir, p.clone(), memory.clone(), progress.clone())),
+        _ => None,
+    };
     let on_write_mem: Arc<dyn Fn(&AgentMemory) + Send + Sync> = {
         let sp = sp.clone();
         Arc::new(move |mem: &AgentMemory| {
@@ -330,7 +412,7 @@ pub(crate) fn build_memory_ctx(rs: DeclaredState) -> MemoryCtx {
             }
         })
     };
-    MemoryCtx { name: rs.name, memory, progress, on_write_mem, on_write_prog }
+    MemoryCtx { name: rs.name, memory, progress, on_write_mem, on_write_prog, child }
 }
 
 /// Resolución + contexto en un paso (camino común de run/test/diag/swarm).
@@ -448,6 +530,7 @@ pub(crate) fn wire_common_with_state(
     mem_gate: MemoryGate,
     mem: Option<MemoryCtx>,
 ) {
+    let child_state = mem.as_ref().and_then(|m| m.child.clone());
     // Etiquetas de flujo por proceso (`--labels`, `serve --attested`). Se fijan
     // acá porque TODOS los intérpretes del runtime (run, serve por request, agentes, cron,
     // Parallel_map) pasan por este wiring: un intérprete sin etiquetas en un proceso con
@@ -623,8 +706,8 @@ pub(crate) fn wire_common_with_state(
             let path = args.first().map(|v| v.to_string()).unwrap_or_default();
             // Gate de `file.read` para la llamada de NIVEL SUPERIOR (el vector de LFI: el
             // path puede venir de un request). Un template del bundle es el programa: sin
-            // gate. Los include/layout ANIDADOS son estáticos y `resolve_template_path` los
-            // confina al cwd — parte del programa, cubiertos por este mismo render.
+            // gate. Los include/layout ANIDADOS pasan por el mismo gate en `templates.rs`
+            // (v0.6.45; antes sólo se los confinaba al cwd).
             if synsema_core::bundle::get(&synsema_core::bundle::normalize_name(&path).unwrap_or_default()).is_none() {
                 i.gate_template_read(&path)?;
             }
@@ -783,7 +866,7 @@ pub(crate) fn wire_common_with_state(
     }
     // run_program(source, opts): Synsema ejecutando Synsema en un proceso hijo bajo
     // techo ∩ padre (gateado por `sandbox_run`).
-    crate::run_program::register_run_program_builtin(interp, caps.clone());
+    crate::run_program::register_run_program_builtin(interp, caps.clone(), child_state);
     // `--profile pure`: la segunda pared. Se registra AL FINAL para pisar por nombre a
     // los builtins OS-facing ya cableados (última registración gana).
     if crate::host::profile() == crate::host::Profile::Pure {

@@ -1354,14 +1354,18 @@ fn covered(declared: &[(String, Option<String>)], cap: &str, scope: &Option<Stri
         match (&ds, scope) {
             (None, _) => true,          // `require net` sin scope cubre todo
             (Some(_), None) => true,     // scope dinámico/desconocido: el tipo declarado alcanza (sin falsos positivos)
+            // v0.6.45: una ruta se decide SÓLO con el matcher del runtime (`path_covers`, glob por
+            // segmentos): los atajos de abajo (`*` cubre todo, prefijo `d/`) ya no valen para rutas.
+            (Some(d), Some(s)) if cap.starts_with("file") => d == s || crate::capscope::path_covers(d, s),
+            // Ronda 3 (B4): una base SQLite (`db` con ruta, no una URL de servidor) también.
+            (Some(d), Some(s)) if cap == "db" && !crate::capscope::is_db_url(d) && !crate::capscope::is_db_url(s) => {
+                d == s || crate::capscope::path_covers(d, s)
+            }
             (Some(d), Some(s)) => {
                 d == "*"
                     || d == s
                     || s.starts_with(&format!("{}/", d))
                     || s.ends_with(&format!(".{}", d.trim_start_matches("*."))) && d.starts_with("*.")
-                    // Una ruta se decide con el MISMO matcher que el runtime (`./**` cubre
-                    // `x.csv`: las dos se normalizan antes del glob).
-                    || (cap.starts_with("file") && crate::capscope::path_covers(d, s))
                     // Un glob (`require net("*.x")`…) cubre lo que cubre en el runtime
                     // (`fnmatch`: `*` es cualquier cosa, `?` un carácter).
                     || (d.contains(['*', '?']) && fnmatch(s, d))
@@ -1990,7 +1994,9 @@ task check_token(req)
         assert_eq!(m["scope"], "c.d");
         assert_eq!(m["hint"], "add `require net(\"c.d\")`");
         // Wildcard de subdominio y path de archivo bajo el prefijo declarado.
-        let wild = tmp_root(&[("x.syn", "require net(\"*.c.d\")\nrequire file(\"data\")\ntask go()\n    let r be fetch(\"https://api.c.d/x\")\n    write_file(\"data/out.txt\", \"1\")\n")]);
+        // v0.6.45: `check` decide las rutas con el matcher del runtime: `file("data")` es la carpeta
+        // sola; lo de adentro es `data/**` (antes `check` aceptaba el prefijo y el runtime negaba).
+        let wild = tmp_root(&[("x.syn", "require net(\"*.c.d\")\nrequire file(\"data/**\")\ntask go()\n    let r be fetch(\"https://api.c.d/x\")\n    write_file(\"data/out.txt\", \"1\")\n")]);
         assert_eq!(caps(&wild, None)["files"][0]["missing"].as_array().unwrap().len(), 0, "{}", caps(&wild, None));
     }
 

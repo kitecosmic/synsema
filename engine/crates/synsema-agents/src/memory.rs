@@ -165,6 +165,7 @@ pub struct AgentMemory {
     pub violations: Vec<RuleViolation>,
     persist_path: Option<String>,
     counter: u64,
+    id_tag: Option<String>,
     /// Etiqueta del backend de persistencia cuando NO es el nativo (p.ej. `host-kv`
     /// en el perfil wasm): `memory_summary` la reporta para que el programa (y quien
     /// lo lee) sepa dónde vive el estado. `None` = nativo (salida sin cambios).
@@ -185,6 +186,7 @@ impl AgentMemory {
             violations: Vec::new(),
             persist_path: None,
             counter: 0,
+            id_tag: None,
             backend: None,
         }
     }
@@ -196,7 +198,17 @@ impl AgentMemory {
 
     fn next_id(&mut self) -> String {
         self.counter += 1;
-        format!("mem_{}", self.counter)
+        match &self.id_tag {
+            Some(t) => format!("mem_{}_{}", self.counter, t),
+            None => format!("mem_{}", self.counter),
+        }
+    }
+
+    /// v0.6.45 (ronda 5, B1) — marca los ids nuevos de este proceso (`mem_<n>_<marca>`): el hijo de
+    /// `run_program` comparte la base con el padre y los dos cuentan desde el mismo número; sin la
+    /// marca, dos `remember` simultáneos daban el mismo id y uno pisaba al otro.
+    pub fn set_id_tag(&mut self, tag: String) {
+        self.id_tag = Some(tag);
     }
 
     /// Sube el piso del contador (tras cargar estado persistido, para no reusar ids).

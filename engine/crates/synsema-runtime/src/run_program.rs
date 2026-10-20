@@ -50,6 +50,18 @@ pub const RUN_SUBJECT_VAR: &str = "SYNSEMA_RUN_SUBJECT";
 pub const DEFAULT_MAX_DEPTH: u32 = 4;
 pub const DEFAULT_TIMEOUT_SECS: f64 = 30.0;
 
+/// Ronda 3 (M4) — variables con las que el motor elige rutas del host.
+fn engine_path_var(k: &str) -> bool {
+    let u = k.to_ascii_uppercase();
+    matches!(
+        u.as_str(),
+        "HOME" | "USERPROFILE" | "HOMEDRIVE" | "HOMEPATH" | "TMP" | "TEMP" | "TMPDIR" | "APPDATA" | "LOCALAPPDATA"
+            | "OLLAMA_MODELS"
+    ) || u.starts_with("XDG_")
+        || u.starts_with("HF_")
+        || u.starts_with("HUGGINGFACE_")
+}
+
 fn rt(msg: impl Into<String>) -> Control {
     Control::Error(RuntimeError::new(msg))
 }
@@ -72,6 +84,11 @@ fn text_of(v: &SynValue, what: &str) -> Result<String, Control> {
     }
 }
 
+/// ¿Este proceso es el hijo de un `run_program`?
+pub(crate) fn is_child() -> bool {
+    depth_limits().0 > 0
+}
+
 /// Profundidad actual (0 en el proceso raíz) y máximo permitido.
 fn depth_limits() -> (u32, u32) {
     let depth = std::env::var(DEPTH_VAR).ok().and_then(|v| v.parse().ok()).unwrap_or(0u32);
@@ -87,7 +104,24 @@ fn spawn_tree(cmd: &mut std::process::Command) -> Result<synsema_stdlib::proc::T
     synsema_stdlib::proc::spawn_tree(cmd)
 }
 
-pub fn register_run_program_builtin(interp: &Interpreter, caps: Rc<RefCell<CapabilitySet>>) {
+/// Recarga la memoria del padre al volver el hijo (también si el padre se cancela en el medio).
+struct ReloadOnDrop(Option<crate::engine::ChildState>);
+
+impl Drop for ReloadOnDrop {
+    fn drop(&mut self) {
+        if let Some(s) = &self.0 {
+            (s.reload)();
+        }
+    }
+}
+
+/// `child`: la memoria con base en disco de la corrida que registra el builtin (`None` si no
+/// persiste): su carpeta va al hijo y, si el techo le cede `memory`, se recarga al volver.
+pub(crate) fn register_run_program_builtin(
+    interp: &Interpreter,
+    caps: Rc<RefCell<CapabilitySet>>,
+    child: Option<crate::engine::ChildState>,
+) {
     interp.register_builtin(
         "run_program",
         -1,
@@ -183,6 +217,37 @@ pub fn register_run_program_builtin(interp: &Interpreter, caps: Rc<RefCell<Capab
                     });
                 }
             }
+            // v0.6.45 — un scope de ruta relativo (`./data/*`) se decidió contra el cwd del PADRE; el
+            // hijo lo resolvería contra el suyo, y con `cwd` (o un `cd` del hijo) el techo se anclaba
+            // en otro lado (`cwd: "/"` convertía `./data` en `/data`). Viajan absolutos.
+            for cap in kept.iter_mut() {
+                let is_path = matches!(
+                    cap.ty,
+                    CapabilityType::File | CapabilityType::FileRead | CapabilityType::FileWrite | CapabilityType::Db
+                );
+                if let (true, Some(s)) = (is_path, cap.scope.as_ref()) {
+                    if !(cap.ty == CapabilityType::Db && (synsema_capabilities::model::is_db_url(s) || s == ":memory:")) {
+                        cap.scope = Some(synsema_core::capscope::absolute_scope(s));
+                    }
+                }
+            }
+            // Ronda 2 (A5): el techo viaja como `--cap-set` separado por comas. Un scope con una
+            // coma (`{"file.read": "data/x,exec,file.read=y"}`, o un cwd con coma al volverlo
+            // absoluto) se partía en items y le daba al hijo `exec` sin scope. No viaja.
+            // Ronda 3 (B4): un scope vacío o con espacios en los bordes tampoco viaja (`build_ceiling`
+            // lo recorta y un `Some("")` se volvía una capability sin scope: total en el hijo).
+            if let Some(bad) = kept.iter().find(|c| c.scope.as_deref().is_some_and(|s| s.trim().is_empty() || s.trim() != s)) {
+                return Err(rt(format!(
+                    "run_program: ceiling: the scope of {} is empty or has spaces at its ends, which cannot travel to the child",
+                    bad
+                )));
+            }
+            if let Some(bad) = kept.iter().find(|c| c.scope.as_deref().is_some_and(|s| s.contains(','))) {
+                return Err(rt(format!(
+                    "run_program: ceiling: the scope of {} has a comma, which cannot travel to the child",
+                    bad
+                )));
+            }
             let cap_set = if kept.is_empty() {
                 "none".to_string()
             } else {
@@ -195,6 +260,25 @@ pub fn register_run_program_builtin(interp: &Interpreter, caps: Rc<RefCell<Capab
                 None | Some(SynValue::Nothing) => {}
                 Some(SynValue::Map(m)) => {
                     for (k, v) in m.borrow().iter() {
+                        // Ronda 2 (A6): una `SYNSEMA_*` configura al MOTOR del hijo, no al programa
+                        // (`SYNSEMA_AUDIT` le hacía crear/truncar cualquier archivo, `SYNSEMA_STATE_DIR`
+                        // y los modelos locales elegían rutas del host). Las que el hijo necesita las
+                        // pone `run_program` más abajo; el programa no puede.
+                        if k.to_ascii_uppercase().starts_with("SYNSEMA_") {
+                            return Err(rt(format!(
+                                "run_program: env cannot set {} (SYNSEMA_* variables configure the engine, not the program)",
+                                k
+                            )));
+                        }
+                        // Ronda 3 (M4): las variables con las que el motor del hijo elige RUTAS del
+                        // host (dónde audita `reveal`, sus temporales, de dónde carga modelos) son la
+                        // misma clase que `SYNSEMA_*`.
+                        if engine_path_var(k) {
+                            return Err(rt(format!(
+                                "run_program: env cannot set {} (it chooses where the child's engine reads or writes on the host)",
+                                k
+                            )));
+                        }
                         env.push((k.to_string(), text_of(v, &format!("env \"{}\"", k))?));
                     }
                 }
@@ -222,6 +306,14 @@ pub fn register_run_program_builtin(interp: &Interpreter, caps: Rc<RefCell<Capab
                 None | Some(SynValue::Nothing) => "<run_program>".to_string(),
                 Some(v) => text_of(&v, "filename")?,
             };
+            // Ronda 3 (M4): `filename` es una ETIQUETA (errores y audit): con una carpeta, el estado
+            // del hijo (`memory`) se anclaba ahí (`/x/y/p.syn` → `/x/y/.synsema/state`).
+            if filename.contains(['/', '\\']) || filename.contains("..") {
+                return Err(rt(format!(
+                    "run_program: filename is a label, not a path (no folders): {:?}",
+                    filename
+                )));
+            }
 
             // 6) El hijo: el mismo binario, en modo motor, fuente por stdin, informe JSON.
             let exe = std::env::current_exe().map_err(|e| rt(format!("run_program: cannot resolve the engine binary: {}", e)))?;
@@ -240,6 +332,30 @@ pub fn register_run_program_builtin(interp: &Interpreter, caps: Rc<RefCell<Capab
                 .env_clear();
             for (k, v) in &env {
                 c.env(k, v);
+            }
+            // Ronda 4 (M3): dónde guarda el hijo su estado (`memory`) y sus temporales lo decide el
+            // PADRE, no la opción `cwd` del programa (con `cwd` afuera, el hijo creaba
+            // `<cwd>/.synsema/state` aunque el techo no tuviera ningún `file.write`). Va ABSOLUTO y es
+            // el mismo lugar que usa el padre: su `SYNSEMA_STATE_DIR`, o `.synsema/state` junto al
+            // archivo del programa que llama (con un programa por stdin, junto al cwd del padre). El
+            // hijo comparte así las bases `memory` que su techo le deja (`memory=m`).
+            // Ronda 4 (revisión): la carpeta de la ENTRADA del padre (no la del módulo que llama: con
+            // `loc.file` un `run_program` desde `src/lib.syn` dejaba el estado en `src/.synsema`).
+            // Ronda 5 (M1): la carpeta de la memoria de ESTA corrida (con varios programas en un
+            // proceso, la del que llama). Sin base en disco (stdin, perfil puro, sin home), el hijo
+            // no recibe ninguna y tampoco persiste (`resolve_declared_state`).
+            if let Some(s) = &child {
+                c.env("SYNSEMA_STATE_DIR", &s.dir);
+            }
+            // Ronda 5 (B1): padre e hijo comparten la base; lo que el hijo escribió se trae al volver.
+            // Un hijo `pure` no toca el disco: no hay nada que recargar (ronda 6, N1).
+            let shares_memory =
+                child_profile == Profile::Native && kept.iter().any(|c| c.ty == CapabilityType::Memory);
+            let _reload = ReloadOnDrop(if shares_memory { child.clone() } else { None });
+            for k in ["TMP", "TEMP", "TMPDIR"] {
+                if let Ok(v) = std::env::var(k) {
+                    c.env(k, v);
+                }
             }
             c.env(DEPTH_VAR, (depth + 1).to_string())
                 .env(RUN_SUBJECT_VAR, subject.to_env_json())

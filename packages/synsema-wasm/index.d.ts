@@ -78,16 +78,26 @@ export interface RunOptions {
    */
   input?: { var: string; value: unknown; sources?: Record<string, string[]> };
   /**
-   * Sólo en el modo asíncrono: si la llamada no termina en este plazo, su Worker se termina y la
-   * Promise falla con un error claro (el código no confiable nunca bloquea el hilo del servidor).
+   * Sólo en el modo asíncrono: si la llamada no termina en este plazo — contado desde que EMPIEZA a
+   * correr, no desde que entró a la cola —, su Worker se termina y la Promise falla con un error
+   * claro (el código no confiable nunca bloquea el hilo del servidor). Un hook del host sin plazo
+   * propio que nunca contesta ocupa su Worker si la llamada no tiene `timeoutMs`. `0` = sin plazo;
+   * si no, un número finito de milisegundos, como mucho 2147483647.
    */
   timeoutMs?: number;
   /**
-   * Tope de pasos del intérprete (los de `steps()`, deterministas). Al pasarlo la corrida termina
-   * con `ok: false` y un error que lo dice, no con un trap. Sirve en los dos modos.
+   * Tope de pasos del intérprete (los de `steps()`, deterministas), contados desde que empieza la
+   * corrida (en `handle`, cada request). Al pasarlo la corrida termina con `ok: false` y un error
+   * que lo dice, no con un trap. Sirve en los dos modos. Un entero positivo.
    */
   maxSteps?: number;
-  /** Tope de la memoria del módulo en MB (medida exacta, no estimada). Igual que `maxSteps`. */
+  /**
+   * Tope en MB de la memoria que RESERVA la corrida (los bytes vivos que cuenta el allocator del
+   * módulo desde que empieza, no lo que la instancia ya tenía). La reserva que lo pasaría se
+   * rechaza y la corrida termina con `ok: false` y "memory limit reached" (en `handle`, un 500).
+   * Cuenta bytes pedidos: la memoria del módulo puede crecer hasta ~2× eso y no se devuelve.
+   * Igual que `maxSteps`. Un entero positivo.
+   */
   maxMemoryMb?: number;
 }
 
@@ -166,6 +176,11 @@ export declare function instantiate(
 export interface LoadOptions {
   /** Cuántos Workers usa el modo asíncrono (default 1). Con más, `runAsync` corre en paralelo. */
   workers?: number;
+  /**
+   * Cuánto puede tardar un Worker en arrancar antes de darlo por perdido (ms, default 30 000; entre 1
+   * y 2147483647). Opción de `Synsema.load`/`loadNode`.
+   */
+  startMs?: number;
 }
 
 export declare function instantiateSync(
@@ -192,12 +207,16 @@ export declare class Synsema {
   check(source: string, opts?: { filename?: string }): CheckResult;
   handle(source: string, request: HandleRequest, opts?: RunOptions): HandleResult;
   /**
-   * Modo asíncrono (Worker + Atomics): los hooks del host pueden ser async. Llamadas concurrentes
-   * se encolan por Worker (o se reparten, con `workers`).
+   * Modo asíncrono (Worker + Atomics): los hooks del host pueden ser async. Las llamadas esperan en
+   * una sola cola y van al primer Worker libre (hasta `workers`).
    */
   runAsync(source: string, opts?: RunOptions): Promise<RunResult>;
   testAsync(source: string, opts?: RunOptions): Promise<TestResult>;
   handleAsync(source: string, request: HandleRequest, opts?: RunOptions): Promise<HandleResult>;
+  /**
+   * Termina los Workers del modo asíncrono. Es final: lo que espera en la cola falla con "closed" y
+   * una llamada asíncrona posterior también (la API síncrona sigue andando).
+   */
   close(): Promise<void>;
 }
 

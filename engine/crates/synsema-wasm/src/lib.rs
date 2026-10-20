@@ -934,7 +934,8 @@ fn register_state_builtins(interp: &Interpreter, host_kv: bool) {
                     Some(Ok(true)) => return Ok(v),
                     Some(Ok(false)) => continue,
                     Some(Err(e)) => return Err(rt_err(&format!("{}: host kv: {}", F, e))),
-                    None => break,
+                    // v0.6.45: el host no contestó el cas (antes salía como "kept changing").
+                    None => return Err(rt_err(&format!("{}: the host's kv.cas did not answer", F))),
                 }
             }
             Err(rt_err(&format!("{}: '{}' kept changing under concurrent writers ({} attempts)", F, key, CAS_ATTEMPTS)))
@@ -967,7 +968,8 @@ fn register_state_builtins(interp: &Interpreter, host_kv: bool) {
                     Some(Ok(true)) => return Ok(SynValue::Bool(true)),
                     Some(Ok(false)) => continue,
                     Some(Err(e)) => return Err(rt_err(&format!("{}: host kv: {}", F, e))),
-                    None => break,
+                    // v0.6.45: el host no contestó el cas (antes salía como "kept changing").
+                    None => return Err(rt_err(&format!("{}: the host's kv.cas did not answer", F))),
                 }
             }
             Err(rt_err(&format!("{}: '{}' kept changing under concurrent writers ({} attempts)", F, key, CAS_ATTEMPTS)))
@@ -997,6 +999,33 @@ fn env_store(opts: &RunOptions) -> Rc<EnvStore> {
     })
 }
 
+/// v0.6.45 (D2) — arma los límites de la corrida (o del request, en el modo handler) y prende la
+/// bandera de cancelación para que el chequeo por sentencia los mire. Sin límites pedidos, desarma
+/// y deja el camino de siempre. Un `reset_for_request` pone un token nuevo con la bandera apagada:
+/// por eso el handler la vuelve a armar antes de cada request (antes los límites valían sólo en el
+/// primero).
+pub(crate) fn arm_limits(interp: &mut Interpreter, opts: &RunOptions) {
+    #[cfg(target_arch = "wasm32")]
+    {
+        synsema_core::wasm_limits::disarm();
+        if opts.max_steps.is_some() || opts.max_memory_mb.is_some() {
+            let bytes = opts.max_memory_mb.map(|mb| mb.saturating_mul(1 << 20));
+            synsema_core::wasm_limits::arm(opts.max_steps, bytes, interp.steps());
+            let token = synsema_core::interpreter::CancelToken::new();
+            token.flag.store(true, std::sync::atomic::Ordering::Relaxed);
+            interp.set_cancel_token(token);
+        }
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    let _ = (interp, opts);
+}
+
+/// Desarma los límites al terminar (una corrida, el top-level del handler o un request).
+pub(crate) fn disarm_limits() {
+    #[cfg(target_arch = "wasm32")]
+    synsema_core::wasm_limits::disarm();
+}
+
 /// Intérprete + CapabilitySet cableados para `program`, con el techo aplicado ANTES
 /// de los auto-grants (idéntico al runtime).
 pub(crate) fn prepare(program: &Program, opts: &RunOptions) -> (Interpreter, Rc<RefCell<CapabilitySet>>) {
@@ -1008,16 +1037,7 @@ pub(crate) fn prepare(program: &Program, opts: &RunOptions) -> (Interpreter, Rc<
     // v0.6.45 (D2): los límites de ESTA corrida (los de una anterior nunca se cuelan). Con alguno
     // pedido, la bandera de cancelación queda prendida para que el chequeo por sentencia que ya
     // existe los mire (ver `synsema_core::wasm_limits`); sin límites, el camino de siempre.
-    #[cfg(target_arch = "wasm32")]
-    {
-        synsema_core::wasm_limits::disarm();
-        if opts.max_steps.is_some() || opts.max_memory_mb.is_some() {
-            synsema_core::wasm_limits::arm(opts.max_steps, opts.max_memory_mb.map(|mb| mb.saturating_mul(1 << 20)));
-            let token = synsema_core::interpreter::CancelToken::new();
-            token.flag.store(true, std::sync::atomic::Ordering::Relaxed);
-            interp.set_cancel_token(token);
-        }
-    }
+    arm_limits(&mut interp, opts);
     let ctx = WireCtx { env: env_store(opts), statements: &program.statements, filename: &opts.filename, no_fs: opts.no_fs };
     wire_pure(&mut interp, &caps, &ctx);
     if opts.labels {
@@ -1030,6 +1050,7 @@ pub(crate) fn prepare(program: &Program, opts: &RunOptions) -> (Interpreter, Rc<
         for name in synsema_stdlib::label_lists::LABEL_SINK_BUILTINS
             .iter()
             .chain(synsema_core::interpreter::CORE_SINK_BUILTINS.iter())
+            .chain(synsema_stdlib::label_lists::WASM_EXTRA_SINK_BUILTINS.iter())
         {
             interp.register_label_sink(name);
         }
@@ -1083,6 +1104,7 @@ pub(crate) fn finish(mut interp: Interpreter, result: Result<SynValue, Control>)
 
 /// Como `finish` pero sin consumir el intérprete (el handler-mode lo conserva).
 pub(crate) fn finish_keep(interp: &mut Interpreter, result: Result<SynValue, Control>) -> RunResult {
+    disarm_limits();
     // T5 (ronda 6, B2): la salida de una corrida cortada por el chequeo de flujo no se entrega
     // — la cantidad de líneas antes del corte depende del dato privado. Bajo el guest esas
     // líneas son el log del Executor, que vive FUERA del enclave.
@@ -1147,6 +1169,7 @@ pub fn run(source: &str, opts: &RunOptions) -> Report {
     };
     let (mut interp, caps) = prepare(&program, opts);
     if let Err(e) = bind_input(&interp, opts) {
+        disarm_limits(); // ronda 2 (M1): esta salida no pasa por `finish`
         return Report {
             ok: false,
             output: Vec::new(),
@@ -1211,6 +1234,7 @@ pub fn test(source: &str, opts: &RunOptions) -> TestReport {
     };
     let (mut interp, caps) = prepare(&program, opts);
     let outcomes = interp.run_test_blocks(&program);
+    disarm_limits(); // ronda 2 (M1): `test` no pasa por `finish`
     let mut lines = Vec::with_capacity(outcomes.len());
     let mut passed = 0usize;
     for o in &outcomes {

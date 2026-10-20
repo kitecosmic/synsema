@@ -30,8 +30,10 @@
 -- u32 little-endian (4) · the program, UTF-8 · 0x20 filler to the end. Programs up to 524 204 bytes.
 intent: "verify a Vela guest module: a release's interpreter plus the program in its slot, byte by byte"
 
-require file.read("*")
-require file.write("*")
+-- The paths come from the command line (whoever runs the tool picks them), so the grant has no
+-- scope. Since v0.6.45 `*` in a file scope is only the files of one folder.
+require file.read
+require file.write
 -- the release assets: GitHub answers with a redirect to its object store (two hosts, old and new)
 require net("github.com")
 require net("objects.githubusercontent.com")

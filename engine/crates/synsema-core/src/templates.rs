@@ -68,6 +68,18 @@ fn is_bare_name(s: &str) -> bool {
     !matches!(s, "true" | "false" | "nothing")
 }
 
+/// v0.6.45 — un `{ include }` o `{ layout }` leído del disco pasa por el mismo `file.read` que
+/// `render()`. Antes sólo se lo confinaba al cwd: un programa que puede escribir plantillas
+/// (`file.write("./templates/*")`) incluía el `.env` en el HTML sin declarar que lo lee. Uno del
+/// bundle es parte del programa y no lo pide.
+fn gate_nested_template(interp: &Interpreter, path: &str) -> Result<(), Control> {
+    let bundled = crate::bundle::normalize_name(path).is_some_and(|k| crate::bundle::get(&k).is_some());
+    if bundled {
+        return Ok(());
+    }
+    interp.gate_template_read(path)
+}
+
 /// Resuelve un path de template (relativo al cwd, sin traversal).
 fn resolve_template_path(path: &str) -> Result<PathBuf, String> {
     // Overlay del bundle (`synsema build`): las templates del programa viven dentro del
@@ -88,7 +100,9 @@ fn resolve_template_path(path: &str) -> Result<PathBuf, String> {
     if Path::new(path).is_absolute() {
         return Err(format!("template path must be relative to the working dir: '{}'", path));
     }
-    let target = match cwd.join(path).canonicalize() {
+    // v0.6.45 (ronda 2, M5): se abre la ruta NORMALIZADA, la que chequeó el gate (`file.read`): con
+    // la cruda, en Unix `templates/link/../x` pasaba como `templates/x` y abría `<destino>/../x`.
+    let target = match cwd.join(crate::capscope::normalize_path(path)).canonicalize() {
         Ok(t) => t,
         Err(_) => return Err(format!("template not found: {}", path)),
     };
@@ -712,6 +726,7 @@ fn render_nodes(
                         "{}: template include nesting too deep", filename
                     ))));
                 }
+                gate_nested_template(interp, path)?;
                 let target = resolve_template_path(path)
                     .map_err(|m| Control::Error(RuntimeError::new(m)))?;
                 let inc_name = target
@@ -762,6 +777,10 @@ fn render_file(
         return Err(Control::Error(RuntimeError::new(format!(
             "template layout nesting too deep ({})", path
         ))));
+    }
+    // El de nivel superior lo gatea `render()`; un layout (depth > 0) se gatea acá.
+    if depth > 0 {
+        gate_nested_template(interp, path)?;
     }
     let target = resolve_template_path(path).map_err(|m| Control::Error(RuntimeError::new(m)))?;
     let filename = target

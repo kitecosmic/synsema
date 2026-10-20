@@ -1,6 +1,8 @@
 intent: "Sitio demo de la tanda frontend: rutas montadas desde un módulo, páginas de error propias, formularios y estáticos con cache. Correr desde la raíz del repo: synsema serve examples/sitio_demo.syn (o con --watch para el loop de dev)."
 
 require serve(8095)
+require file.read("./examples/public/**")
+require file.read("./examples/templates/*")   -- render() de la tienda y su layout/include
 
 use "./shop_routes.syn" as shop
 

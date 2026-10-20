@@ -1005,8 +1005,10 @@ pub fn register_http_builtins(interp: &Interpreter, caps: Rc<RefCell<CapabilityS
                         )
                         .map_err(|v| Control::Error(v.into_error()))?;
                 }
-                let certs = load_client_certs(&cert_path)?;
-                let key = load_client_key(&key_path)?;
+                // v0.6.45 — se abre la ruta normalizada, la que se chequeó (en Unix `link/..` de la
+                // cruda lleva a otro lado).
+                let certs = load_client_certs(&synsema_core::capscope::normalize_path(&cert_path))?;
+                let key = load_client_key(&synsema_core::capscope::normalize_path(&key_path))?;
                 match (client_identity().lock(), client_identity_hosts().lock()) {
                     (Ok(mut guard), Ok(mut scope)) => {
                         *guard = Some((certs, key));

@@ -9,7 +9,7 @@
 //!   absolutos. Deterministas: mismas entradas → mismos bytes (mtime fijo, sin reloj).
 //! - `zip_extract(bytes, dest, opts?) → [rutas]` y `tar_extract(bytes, dest, opts?) → [rutas]`
 //!   (tar detecta gzip por magic). **Cada ruta escrita pasa por `file.write`** (la misma grant
-//!   que pediría `write_file` para esa ruta: `file.write("./out/*")` extrae en `./out`); `dest`
+//!   que pediría `write_file` para esa ruta: `file.write("./out/**")` extrae en `./out`); `dest`
 //!   no se exige aparte ni se crea si el archivo no trae nada. **Zip-slip**: cada entrada se
 //!   normaliza léxicamente y debe quedar bajo `dest`; si no, error y nada escrito. Symlinks y
 //!   hardlinks se omiten (no se materializan). `opts.max_entries` (10 000) y `opts.max_bytes`
@@ -250,7 +250,7 @@ fn extract_args(args: &[SynValue], who: &str) -> Result<(Vec<u8>, Extract), Cont
     let opts = opts_arg(args.get(2), who, &["max_entries", "max_bytes"])?;
     // La puerta es `file.write` sobre CADA ruta escrita (`target_of`), como `write_file`, que
     // también crea los padres que falten: `dest` no se exige aparte (el idioma
-    // `file.write("./out/*")` debe poder extraer en `./out`).
+    // `file.write("./out/**")` debe poder extraer en `./out`; v0.6.45: `*` es un nivel, `**` todo).
     Ok((
         data,
         Extract {
@@ -439,8 +439,8 @@ mod tests {
         let mut set = CapabilitySet::new("test");
         let scope = normalize_path(&dir.to_string_lossy());
         set.grant(Capability::new(CapabilityType::FileWrite, Some(scope.clone())));
-        set.grant(Capability::new(CapabilityType::FileWrite, Some(format!("{}/*", scope))));
-        set.grant(Capability::new(CapabilityType::FileRead, Some(format!("{}/*", scope))));
+        set.grant(Capability::new(CapabilityType::FileWrite, Some(format!("{}/**", scope))));
+        set.grant(Capability::new(CapabilityType::FileRead, Some(format!("{}/**", scope))));
         Rc::new(RefCell::new(set))
     }
 
@@ -561,7 +561,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
-    /// Segunda ronda — el idioma `file.write("./out/*")` (sin grant sobre `out` en sí) extrae en
+    /// Segunda ronda — el idioma `file.write("./out/**")` (sin grant sobre `out` en sí) extrae en
     /// `./out` aunque no exista todavía: la puerta es por ruta escrita, como `write_file`.
     #[test]
     fn extract_works_with_a_glob_scope_that_does_not_cover_dest_itself() {
@@ -569,7 +569,7 @@ mod tests {
         let dest = d.join("out");
         let dest_s = dest.to_string_lossy().replace('\\', "/");
         let mut set = CapabilitySet::new("test");
-        set.grant(Capability::new(CapabilityType::FileWrite, Some(format!("{}/*", normalize_path(&dest_s)))));
+        set.grant(Capability::new(CapabilityType::FileWrite, Some(format!("{}/**", normalize_path(&dest_s)))));
         let caps = Rc::new(RefCell::new(set));
         let z = bytes_of(ok(zip_create(&caps_for(&d), &[syn_list(vec![entry("a/b.txt", "x"), entry("c.txt", "y")])])));
         assert!(!dest.exists());

@@ -268,12 +268,38 @@ fn atomic_write(path: &str, data: &[u8]) -> std::io::Result<()> {
     if let Some(parent) = Path::new(path).parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let tmp = format!("{}.synsema.tmp", path);
-    std::fs::write(&tmp, data)
-        .and_then(|_| std::fs::rename(&tmp, path))
-        .inspect_err(|_| {
+    // v0.6.45 — el temporal no se chequea contra el scope (es un nombre nuestro), así que no puede
+    // seguir links: antes era `<ruta>.synsema.tmp` (predecible) con `fs::write`, y un link plantado
+    // con ese nombre hacía escribir fuera del scope. Ahora lleva un sufijo al azar y se crea con
+    // `create_new` (O_CREAT|O_EXCL / CREATE_NEW): falla si el nombre existe, sea link o no, y nunca
+    // sigue uno. Si el nombre ya existe se prueba otro.
+    let mut last = None;
+    for _ in 0..8 {
+        let tmp = format!("{}.{:016x}.synsema.tmp", path, rand::random::<u64>());
+        let file = std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp);
+        let mut file = match file {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                last = Some(e);
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
+        // Ronda 2 (B5) y ronda 3 (B4): el reemplazo conserva los permisos del archivo que reemplaza
+        // (un secreto 0600 reescrito quedaba 0644 por el umask), y se aplican sobre el handle ANTES
+        // de escribir el contenido, no después por ruta.
+        #[cfg(unix)]
+        if let Ok(m) = std::fs::metadata(path) {
+            let _ = file.set_permissions(m.permissions());
+        }
+        let written = file.write_all(data);
+        // Cerrado antes del rename: en Windows no se renombra un archivo abierto.
+        drop(file);
+        return written.and_then(|_| std::fs::rename(&tmp, path)).inspect_err(|_| {
             let _ = std::fs::remove_file(&tmp);
-        })
+        });
+    }
+    Err(last.unwrap_or_else(|| std::io::Error::other("could not create a temporary file")))
 }
 
 /// Lee todo el stream pero guarda como mucho `cap` bytes; si hubo más, marca truncado.
@@ -802,6 +828,16 @@ pub fn register_secure_builtins(interp: &Interpreter, caps: Rc<RefCell<Capabilit
                     }
                     Located::Disk(p) => p,
                 };
+                // v0.6.45 (ronda 2, M3): buscar en una carpeta es leer su árbol entero; con el glob
+                // por segmentos, `file.read("./proj")` es la carpeta sola. Hace falta lo mismo que
+                // pide `static`: `file.read("<carpeta>/**")`.
+                if std::fs::metadata(&target).map(|m| m.is_dir()).unwrap_or(false) {
+                    require(
+                        &caps,
+                        Capability::new(CapabilityType::FileRead, Some(format!("{}/**", target.trim_end_matches('/')))),
+                        "grep()",
+                    )?;
+                }
                 if pattern.is_empty() {
                     return Err(Control::Error(RuntimeError::new("grep: empty pattern")));
                 }
@@ -849,6 +885,9 @@ pub fn register_secure_builtins(interp: &Interpreter, caps: Rc<RefCell<Capabilit
                 // -- recorrido (orden estable: por ruta, luego por línea) --
                 let mut files = Vec::new();
                 grep_collect(&target, &glob, &mut files)?;
+                // v0.6.45 — un `deny` dentro del árbol también vale para `grep` (antes sólo se
+                // chequeaba la raíz y `deny file.read("./proj/.env")` no frenaba la búsqueda).
+                files.retain(|f| !caps.borrow().denies(&Capability::new(CapabilityType::FileRead, Some(f.clone()))));
                 files.sort();
 
                 let mut out_matches: Vec<SynValue> = Vec::new();
@@ -1041,8 +1080,8 @@ pub fn register_secure_builtins(interp: &Interpreter, caps: Rc<RefCell<Capabilit
 
     // v0.6.20 — cwd() → el directorio de trabajo real, normalizado. Bajo `file.read(".")`:
     // el nombre absoluto de `.` es información del host (bajo --sandbox no se filtra gratis) y
-    // es exactamente la misma grant que exige `list_dir(".")`; `file.read("./*")` y `"*"`
-    // también la cubren. Bajo un binario de `synsema build` es el cwd de verdad, nunca el
+    // es exactamente la misma grant que exige `list_dir(".")`; `file.read("./**")` y `"**"`
+    // también la cubren (v0.6.45: `./*` son los archivos de la carpeta, no la carpeta). Bajo un binario de `synsema build` es el cwd de verdad, nunca el
     // overlay del bundle.
     {
         let caps = caps.clone();
@@ -1094,8 +1133,8 @@ pub fn register_secure_builtins(interp: &Interpreter, caps: Rc<RefCell<Capabilit
 
     // edit_file(path, old, new, replace_all?) → {replaced:N}. Reemplaza por match exacto
     // de string. Sin replace_all exige UNICIDAD (0 → not found; >1 → ambiguo). Escritura
-    // atómica. Solo file.write: lee internamente para localizar `old` pero NO expone el
-    // contenido (solo devuelve `replaced`), así que no es canal de lectura.
+    // atómica. Pide file.write y, desde v0.6.45, también file.read: sus respuestas (no está /
+    // ambiguo / cuántos reemplazó) dicen si un texto está adentro.
     {
         let caps = caps.clone();
         interp.register_builtin(
@@ -1109,6 +1148,14 @@ pub fn register_secure_builtins(interp: &Interpreter, caps: Rc<RefCell<Capabilit
                 require(
                     &caps,
                     Capability::new(CapabilityType::FileWrite, Some(path.clone())),
+                    "edit_file()",
+                )?;
+                // v0.6.45 (ronda 2, B5): `edit_file` lee el archivo para buscar `old`, y sus
+                // respuestas (no está / ambiguo / cuántos reemplazó) dicen si un texto está adentro:
+                // es una lectura, y pide `file.read` también.
+                require(
+                    &caps,
+                    Capability::new(CapabilityType::FileRead, Some(path.clone())),
                     "edit_file()",
                 )?;
                 reject_bundled_write(&path)?;
@@ -1513,8 +1560,30 @@ pub fn register_secure_builtins(interp: &Interpreter, caps: Rc<RefCell<Capabilit
                         lo, hi
                     ))));
                 }
-                use rand::Rng;
-                Ok(syn_int(rand::thread_rng().gen_range(lo..=hi)))
+                // En nativo, `thread_rng` (ChaCha que se resiembra solo; ronda 4, B3: con `OsRng` era
+                // una syscall por llamada, un 19 % más lento en un bucle). En wasm, `OsRng` (el
+                // generador de la corrida, sembrado por llamada) con un error claro sin entropía.
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    use rand::Rng;
+                    return Ok(syn_int(rand::thread_rng().gen_range(lo..=hi)));
+                }
+                #[cfg(target_arch = "wasm32")]
+                {
+                    use rand::RngCore;
+                    let span = (hi as i128 - lo as i128 + 1) as u128;
+                    let zone = u64::MAX as u128 + 1 - ((u64::MAX as u128 + 1) % span);
+                    loop {
+                        let mut b = [0u8; 8];
+                        rand::rngs::OsRng.try_fill_bytes(&mut b).map_err(|_| {
+                            Control::Error(RuntimeError::new("random_int: no entropy available from the host"))
+                        })?;
+                        let x = u64::from_le_bytes(b) as u128;
+                        if x < zone {
+                            return Ok(syn_int((lo as i128 + (x % span) as i128) as i64));
+                        }
+                    }
+                }
             }),
         );
     }
@@ -1598,7 +1667,8 @@ mod v0620_tests {
         std::fs::write(sub.join("deep").join("f.txt"), "x").unwrap();
         let empty = d.join("empty");
         std::fs::create_dir_all(&empty).unwrap();
-        let scope = format!("{}/*", slash(&d));
+        // `**`: el recursivo exige `file.write` sobre cada ruta del árbol (v0.6.45: `*` es un nivel).
+        let scope = format!("{}/**", slash(&d));
         let g = [(CapabilityType::FileWrite, Some(scope))];
         assert_eq!(run(&g, &format!("print(delete_dir(\"{}\"))", slash(&empty))).unwrap(), vec!["true"]);
         assert!(!empty.exists());
@@ -1619,7 +1689,8 @@ mod v0620_tests {
     }
 
     /// §4.2 — cwd() bajo `file.read(".")` (la misma grant que `list_dir(".")`): sin grant o
-    /// con una grant que no cubre `.` deniega; con `.`, `./*` o `*` la devuelve normalizada.
+    /// con una grant que no cubre `.` deniega; con `.`, `./**` o `**` la devuelve normalizada.
+    /// v0.6.45: `./*` (los archivos de la carpeta) ya no cubre la carpeta misma; `**` sí.
     #[test]
     fn cwd_requires_file_read_on_dot() {
         let want = normalize_path(&std::env::current_dir().unwrap().to_string_lossy());
@@ -1627,7 +1698,9 @@ mod v0620_tests {
         assert!(denied.contains("Capability not granted"), "{}", denied);
         let denied = run(&[(CapabilityType::FileRead, Some("./data/*".to_string()))], "print(cwd())").unwrap_err();
         assert!(denied.contains("Capability not granted"), "{}", denied);
-        for scope in [".", "./*", "*"] {
+        let denied = run(&[(CapabilityType::FileRead, Some("./*".to_string()))], "print(cwd())").unwrap_err();
+        assert!(denied.contains("Capability not granted"), "{}", denied);
+        for scope in [".", "./**", "**"] {
             assert_eq!(run(&[(CapabilityType::FileRead, Some(scope.to_string()))], "print(cwd())").unwrap(), vec![want.clone()], "scope {}", scope);
         }
     }
@@ -1644,7 +1717,7 @@ mod v0620_tests {
         let e = run(&exact, &format!("print(delete_dir(\"{}\", {{\"recursive\": true}}))", slash(&tree))).unwrap_err();
         assert!(e.contains("Capability not granted"), "{}", e);
         assert!(tree.join("sub").join("f.txt").exists(), "nada borrado");
-        let wide = [(CapabilityType::FileWrite, Some(format!("{}/*", slash(&d))))];
+        let wide = [(CapabilityType::FileWrite, Some(format!("{}/**", slash(&d))))];
         assert_eq!(run(&wide, &format!("print(delete_dir(\"{}\", {{\"recursive\": true}}))", slash(&tree))).unwrap(), vec!["true"]);
         assert!(!tree.exists());
         let _ = std::fs::remove_dir_all(&d);

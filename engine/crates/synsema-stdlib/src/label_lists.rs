@@ -7,6 +7,13 @@
 //! anti-rot `every_effectful_family_is_a_label_sink` (runtime) y su par del wasm las cruzan con lo
 //! registrado de verdad.
 
+/// v0.6.45 — sumideros que lo son SÓLO en el wasm embebible. `sleep` en nativo es un canal de tiempo
+/// (puro para las etiquetas, como en `LABEL_PURE_BUILTINS`); en el wasm el número cruza el ABI como
+/// dato hacia el hook `sleep` del host (`{"secs": …}`), así que con etiquetas encendidas un valor
+/// privado (o una rama privada) no puede llegar ahí. Lo registra `synsema-wasm` además de las listas
+/// del nativo.
+pub const WASM_EXTRA_SINK_BUILTINS: &[&str] = &["sleep"];
+
 /// Builtins del stdlib/agents/runtime que tienen EFECTO fuera del
 /// programa (archivos, red, bases de datos, sockets, procesos, memoria persistente, entorno,
 /// Programas hijos, notificaciones, attestation, gasto): bajo etiquetas son sumideros públicos.

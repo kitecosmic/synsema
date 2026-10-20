@@ -87,6 +87,19 @@ fn a_private_value_never_reaches_the_host_kv() {
     assert!(spy.kv.borrow().iter().all(|w| !w.contains("4111")), "el dato privado llegó al KV: {:?}", spy.kv.borrow());
 }
 
+/// v0.6.45 (auditoría, M5): en wasm el número de `sleep` cruza el ABI hacia el hook del host, así
+/// que con etiquetas es un sumidero (en nativo es sólo tiempo). Antes `sleep(input.pin / 1e6)` le
+/// entregaba el PIN al host.
+#[test]
+fn a_private_value_cannot_reach_the_host_sleep_hook() {
+    let (r, _spy) = run_with_secret("sleep(length(input.tarjeta) / 1000)\n");
+    assert!(!r.ok && violation(&r), "debía ser label_violation: {:?}", r.errors);
+    let (r, _spy) = run_with_secret("when input.tarjeta == \"4111-1111\"\n    sleep(0.001)\n");
+    assert!(!r.ok && violation(&r), "la rama privada tampoco: {:?}", r.errors);
+    let (r, _spy) = run_with_secret("sleep(0.001)\n");
+    assert!(r.ok, "un sleep público sigue: {:?}", r.errors);
+}
+
 #[test]
 fn public_values_still_reach_the_host() {
     let (r, spy) = run_with_secret("http_post(\"https://x.test/\", {\"n\": input.nombre})\n");

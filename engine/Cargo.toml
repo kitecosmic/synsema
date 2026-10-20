@@ -57,7 +57,8 @@ chrono = { version = "0.4", default-features = false, features = ["std"] }
 # Zonas horarias IANA (v0.6.29, tipos date/datetime): la base tz embebida, puro Rust.
 chrono-tz = { version = "0.10", default-features = false, features = ["std"] }
 # SQLite estático (binario único, sin DLL). Compila C → requiere gcc (WinLibs en Windows).
-rusqlite = { version = "0.32", features = ["bundled"] }
+# v0.6.45: `hooks` para el authorizer que cierra ATTACH / VACUUM INTO a un archivo (database.rs).
+rusqlite = { version = "0.32", features = ["bundled", "hooks"] }
 # Secretos (feature `secret`): todo puro-Rust (RustCrypto), sin deps C → preserva el
 # binario único estático.
 #   zeroize  : borra el plaintext de memoria al drop (best-effort, §5 del spec).

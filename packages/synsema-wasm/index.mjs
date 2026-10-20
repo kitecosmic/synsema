@@ -62,10 +62,36 @@ export function offersOf(host) {
   return o;
 }
 
+/**
+ * v0.6.45 (ronda 4, M6) — el texto de un error que NUNCA lanza: un hook puede lanzar
+ * `Object.create(null)` o un objeto cuyo `message` es un getter que lanza, y un `String(e)` lanzaba
+ * fuera del manejo (el proceso caía o el Worker quedaba esperando para siempre).
+ */
+export function safeMsg(e) {
+  try {
+    if (e && typeof e.message === "string") return e.message;
+    return String(e);
+  } catch {
+    return "the host hook threw a value that cannot be shown";
+  }
+}
+
+/** `JSON.stringify` de la respuesta de un hook, o un `{error}` si no es JSON (un BigInt, un ciclo). */
+export function safeJson(result, kind) {
+  try {
+    return JSON.stringify(result ?? null);
+  } catch (e) {
+    return JSON.stringify({ error: `host ${kind} returned a non-JSON value: ${safeMsg(e)}` });
+  }
+}
+
 /** Un hook async usado desde la API síncrona devolvería una Promise donde el intérprete
  *  espera un valor: en vez de un `{status: 0}` mudo, un error que nombra el fix. */
 function syncOnly(kind, r) {
   if (r && typeof r.then === "function") {
+    // Ronda 3 (M9): la Promise queda con un handler; si no, al rechazar tiraba el proceso
+    // (unhandledRejection) después de que la corrida ya había devuelto.
+    r.then(undefined, () => {});
     throw new Error(`synsema: the host \`${kind}\` hook returned a Promise — use runAsync/handleAsync (Worker + Atomics) or make the hook synchronous`);
   }
   return r;
@@ -93,17 +119,17 @@ export function dispatchHostSync(host, kind, payload) {
       return host.kv ? { keys: host.kv.list ? syncOnly("kv.list", host.kv.list(payload.ns)) : [] } : undefined;
     case "kv_cas":
       return host.kv && typeof host.kv.cas === "function"
-        ? { swapped: !!syncOnly("kv.cas", host.kv.cas(payload.ns, payload.key, payload.expected ?? null, payload.value)) }
+        ? casReply(syncOnly("kv.cas", host.kv.cas(payload.ns, payload.key, payload.expected ?? null, payload.value)))
         : undefined;
     case "llm":
       return typeof host.llm === "function" ? normalizeLlm(syncOnly("llm", host.llm(payload.op, payload.prompt))) : undefined;
     case "log":
       if (typeof host.log !== "function") return undefined;
-      host.log(payload.line);
+      syncOnly("log", host.log(payload.line));
       return {};
     case "sleep":
       if (typeof host.sleep === "function") {
-        host.sleep(payload.secs);
+        syncOnly("sleep", host.sleep(payload.secs));
         return {};
       }
       if (host.sleep === true) {
@@ -136,7 +162,7 @@ export async function dispatchHostAsync(host, kind, payload) {
       return host.kv ? { keys: host.kv.list ? await host.kv.list(payload.ns) : [] } : undefined;
     case "kv_cas":
       return host.kv && typeof host.kv.cas === "function"
-        ? { swapped: !!(await host.kv.cas(payload.ns, payload.key, payload.expected ?? null, payload.value)) }
+        ? casReply(await host.kv.cas(payload.ns, payload.key, payload.expected ?? null, payload.value))
         : undefined;
     case "llm":
       return typeof host.llm === "function" ? normalizeLlm(await host.llm(payload.op, payload.prompt)) : undefined;
@@ -237,10 +263,12 @@ function hostImports(hostCall) {
         try {
           result = hostCall(kind, payload);
         } catch (e) {
-          result = { error: String(e && e.message ? e.message : e) };
+          result = { error: safeMsg(e) };
         }
         if (result === undefined) return 0;
-        const bytes = te.encode(JSON.stringify(result ?? null));
+        // Ronda 4 (B1): un valor que no es JSON vuelve como error del hook (antes hacía trapear el
+        // módulo y se perdía la corrida).
+        const bytes = te.encode(safeJson(result, kind));
         const ptr = exports.synsema_alloc(4 + bytes.length);
         const m = mem();
         new DataView(m.buffer).setUint32(ptr, bytes.length, true);
@@ -276,8 +304,20 @@ function callable(exports, mem, writeBytes) {
       let out;
       try {
         out = exports.synsema_call(rp, req.length);
+      } catch (e) {
+        // v0.6.45 (D2): el allocator del módulo rechazó una reserva por `maxMemoryMb` y Rust hizo
+        // trap. La instancia igual se descarta (lo hace quien llama), pero la corrida no "trapeó":
+        // se pasó del tope que el host pidió, y eso vuelve como un error de la corrida.
+        if (typeof exports.synsema_limit_hit === "function" && exports.synsema_limit_hit() === 1) {
+          e.synsemaResult = limitResult(request);
+        }
+        throw e;
       } finally {
-        exports.synsema_free(rp, req.length);
+        try {
+          exports.synsema_free(rp, req.length);
+        } catch {
+          // instancia rota por el trap: se descarta entera
+        }
       }
       const m = mem();
       const len = new DataView(m.buffer).getUint32(out, true);
@@ -286,6 +326,33 @@ function callable(exports, mem, writeBytes) {
       return JSON.parse(json);
     },
   };
+}
+
+const MEMORY_LIMIT = "Runtime error: memory limit reached: the run reserved more than maxMemoryMb";
+
+/** El resultado de una corrida cortada por `maxMemoryMb`, con la forma de su `op`. */
+function limitResult(request) {
+  if (request.op === "handle") {
+    return {
+      status: 500,
+      content_type: "application/json",
+      headers: [["content-type", "application/json"]],
+      body: JSON.stringify({ error: "memory limit reached", status: 500 }),
+      log: [],
+      errors: [MEMORY_LIMIT],
+      audit: [],
+    };
+  }
+  if (request.op === "test") return { ok: false, passed: 0, failed: 0, lines: [MEMORY_LIMIT], audit: [] };
+  return { ok: false, output: [], errors: [MEMORY_LIMIT], audit: [], llm_tokens: 0, exit: 1 };
+}
+
+/**
+ * v0.6.45 (ronda 2, B2): `kv.cas` del host tiene que contestar `true` o `false`. Un `cas` sin
+ * `return` (undefined) contaba como `false` y el motor reintentaba 64 veces hasta "kept changing".
+ */
+function casReply(v) {
+  return typeof v === "boolean" ? { swapped: v } : { error: `kv.cas must return true or false, got ${v === undefined ? "undefined" : JSON.stringify(v)}` };
 }
 
 function requestOf(op, source, opts = {}) {
@@ -299,8 +366,10 @@ function requestOf(op, source, opts = {}) {
   if (opts.result) r.result = opts.result;
   if (opts.input) r.input = { var: opts.input.var, value: opts.input.value, sources: opts.input.sources ?? {} };
   // v0.6.45 (D2): límites de la corrida (los mide el motor: pasos deterministas y la memoria del módulo).
-  if (opts.maxSteps) r.max_steps = opts.maxSteps;
-  if (opts.maxMemoryMb) r.max_memory_mb = opts.maxMemoryMb;
+  // `!= null`: un 0 (o un valor inválido) llega al motor, que lo rechaza con un error claro; antes
+  // se descartaba por falsy y la corrida quedaba sin límite.
+  if (opts.maxSteps != null) r.max_steps = opts.maxSteps;
+  if (opts.maxMemoryMb != null) r.max_memory_mb = opts.maxMemoryMb;
   return r;
 }
 
@@ -326,6 +395,12 @@ export class Synsema {
     this.module = module;
     this._inst = null;
     this._workers = Math.max(1, opts.workers | 0 || 1);
+    // Ronda 4 (B1): cuánto puede tardar un Worker en arrancar (default 30 s). Validado como
+    // `timeoutMs`: un valor fuera del rango de los timers vencía en 1 ms y ningún Worker arrancaba.
+    if (opts.startMs != null && !(Number.isFinite(opts.startMs) && opts.startMs > 0 && opts.startMs <= 2147483647)) {
+      throw new Error("synsema: startMs must be a number of milliseconds between 1 and 2147483647");
+    }
+    this._startMs = opts.startMs;
     this._bridges = [];
   }
 
@@ -390,7 +465,8 @@ export class Synsema {
       } catch {
         // sin instancia: la próxima llamada pide `ready()`
       }
-      throw new Error(`synsema: the module trapped (${e && e.message ? e.message : e}); the instance was recreated`);
+      if (e && e.synsemaResult) return e.synsemaResult;
+      throw new Error(`synsema: the module trapped (${safeMsg(e)}); the instance was recreated`);
     } finally {
       this._host = null;
     }
@@ -426,43 +502,104 @@ export class Synsema {
 
   // ---- modo asíncrono (Worker + Atomics) ----
 
-  /** El worker menos ocupado; crea uno nuevo mientras no se llegó a `workers`. */
-  async _bridge() {
-    const idle = this._bridges.find((b) => b.load() === 0);
-    if (idle) return idle;
-    if (this._bridges.length < this._workers) {
-      const { createBridge } = await import("./bridge.mjs");
-      const b = await createBridge(this.module);
-      this._bridges.push(b);
-      return b;
-    }
-    return this._bridges.reduce((a, b) => (b.load() < a.load() ? b : a));
-  }
   /**
-   * v0.6.45 (D2) — `timeoutMs`: si la llamada no terminó en ese plazo, el Worker se termina (el
-   * código corría en otro hilo: el del servidor nunca se bloquea) y la llamada falla con un error
-   * claro; el próximo pedido usa un Worker nuevo.
+   * v0.6.45 (ronda 2, M8) — una cola CENTRAL: cada llamada asíncrona entra acá y `_pump()` (sin
+   * `await`, así no hay carreras) la entrega a un Worker libre, o crea uno mientras no se llegó a
+   * `workers`. Un Worker corre una llamada a la vez. Antes cada llamada elegía Worker por su cuenta
+   * después de un `await`: una ráfaga de 4 con `workers: 2` quedaba toda en uno.
    */
-  async _callAsync(request, opts) {
-    const b = await this._bridge();
-    const call = b.call(request, opts.host);
-    if (!(opts.timeoutMs > 0)) return call;
-    let timer;
-    const timeout = new Promise((_, reject) => {
-      timer = setTimeout(() => reject(new Error(`synsema: the call did not finish in ${opts.timeoutMs} ms; its worker was stopped`)), opts.timeoutMs);
-    });
-    try {
-      return await Promise.race([call, timeout]);
-    } catch (e) {
-      if (String(e && e.message).includes("did not finish")) {
-        this._bridges = this._bridges.filter((x) => x !== b);
-        call.catch(() => {});
-        await b.close();
+  _pump() {
+    this._queue = this._queue ?? [];
+    this._bridges = (this._bridges ?? []).filter((b) => !b.closed());
+    this._spawning = this._spawning ?? 0;
+    while (this._queue.length > 0 && !this._closed) {
+      const idle = this._bridges.find((b) => !b.busy());
+      if (idle) {
+        this._dispatch(idle, this._queue.shift());
+        continue;
       }
-      throw e;
-    } finally {
-      clearTimeout(timer);
+      if (this._bridges.length + this._spawning < this._workers) {
+        // Ronda 4 (B1): después de un arranque fallido con Workers sanos, no se reintenta antes de un
+        // segundo (cada intento instancia el .wasm entero, y el motivo suele ser falta de memoria).
+        // El timer se arma ACÁ, por lo que falta (revisión H1: armado sólo al fallar, un segundo fallo
+        // o un timer que vencía unos ms antes dejaban la cola sin nadie que la despertara). Sin
+        // Workers sanos no se espera: o arranca uno, o la cola falla.
+        const wait = (this._spawnRetryAt ?? 0) - performance.now();
+        if (wait > 0 && this._bridges.length > 0) {
+          if (!this._retryTimer) {
+            this._retryTimer = setTimeout(() => {
+              this._retryTimer = null;
+              this._pump();
+            }, Math.ceil(wait) + 1);
+            if (typeof this._retryTimer.unref === "function") this._retryTimer.unref();
+          }
+          break;
+        }
+        this._spawning++;
+        this._spawnAbort = this._spawnAbort ?? new AbortController();
+        const signal = this._spawnAbort.signal;
+        import("./bridge.mjs")
+          .then(({ createBridge }) => createBridge(this.module, { signal, startMs: this._startMs }))
+          .then(
+            (b) => {
+              this._spawning--;
+              // `close()` llegó mientras nacía: se cierra, no queda vivo.
+              if (this._closed) return b.close();
+              this._bridges.push(b);
+              this._pump();
+            },
+            (err) => {
+              this._spawning--;
+              // No se pudo crear un Worker (ronda 4, revisión: sin esto, con `workers` ≥ 2 el arranque
+              // fallido se reintentaba sin pausa y la cola no fallaba nunca). Tres casos:
+              // - hay Workers sanos: lo encolado sigue con ellos y el próximo arranque espera un
+              //   segundo (un solo timer, que no retiene el proceso);
+              // - no hay sanos pero otro arranque está en vuelo: se espera a ése;
+              // - no queda ninguno: lo encolado falla con esta causa, sin colgarse.
+              if (this._bridges.filter((b) => !b.closed()).length > 0) {
+                this._spawnRetryAt = performance.now() + 1000;
+                return this._pump(); // arma el timer de la espera
+              }
+              if (this._spawning > 0) return;
+              const q = this._queue.splice(0);
+              for (const it of q) it.reject(err);
+            },
+          );
+      }
+      break;
     }
+  }
+
+  _dispatch(b, it) {
+    b.call(it.request, it.host, it.timeoutMs).then(it.resolve, (e) => {
+      // No se llegó a mandar (el Worker se cerró antes): vuelve al principio de la cola. Lo que sí
+      // corrió (un timeout, un Worker que murió en el medio) NO se reintenta: pudo tener efectos.
+      if (e && e.synsemaWorkerClosed && !this._closed) {
+        this._queue.unshift(it);
+      } else {
+        it.reject(e);
+      }
+    }).finally(() => this._pump());
+  }
+
+  /**
+   * v0.6.45 (D2) — `timeoutMs`: si la llamada no terminó en ese plazo (contado desde que EMPIEZA
+   * a correr, no desde que entró a la cola), su Worker se termina (el código corría en otro hilo:
+   * el del servidor nunca se bloquea) y la llamada falla con un error claro. Los hooks del host que
+   * ya estaban en curso (un `fetch`) no se cortan: terminan solos y su resultado se descarta.
+   */
+  _callAsync(request, opts) {
+    if (this._closed) return Promise.reject(new Error("synsema: closed (close() is final; load a new instance)"));
+    // Ronda 3 (B1): un plazo fuera del rango de los timers (o `Infinity`) vencía en 1 ms. `0` sigue
+    // siendo "sin plazo", como antes (ronda 4).
+    if (opts.timeoutMs != null && !(Number.isFinite(opts.timeoutMs) && opts.timeoutMs >= 0 && opts.timeoutMs <= 2147483647)) {
+      return Promise.reject(new Error("synsema: timeoutMs must be 0 (no deadline) or a number of milliseconds up to 2147483647"));
+    }
+    return new Promise((resolve, reject) => {
+      this._queue = this._queue ?? [];
+      this._queue.push({ request, host: opts.host, timeoutMs: opts.timeoutMs > 0 ? opts.timeoutMs : 0, resolve, reject });
+      this._pump();
+    });
   }
   async runAsync(source, opts = {}) {
     return this._callAsync(requestOf("run", source, opts), opts);
@@ -473,9 +610,19 @@ export class Synsema {
   async handleAsync(source, request, opts = {}) {
     return this._callAsync({ ...requestOf("handle", source, opts), request: normalizeRequest(request) }, opts);
   }
-  /** Termina los Workers del modo asíncrono (si se crearon). */
+  /**
+   * Termina los Workers del modo asíncrono. Es FINAL (ronda 2, B1): lo que esperaba en la cola falla
+   * con "closed", un Worker que estaba naciendo se cierra al nacer, y una llamada asíncrona posterior
+   * falla. La API síncrona sigue andando.
+   */
   async close() {
-    const bs = this._bridges;
+    this._closed = true;
+    if (this._retryTimer) clearTimeout(this._retryTimer);
+    // Los Workers que están naciendo se abortan (ronda 3, M9).
+    this._spawnAbort?.abort();
+    const q = (this._queue ?? []).splice(0);
+    for (const it of q) it.reject(new Error("synsema: closed (close() is final; load a new instance)"));
+    const bs = this._bridges ?? [];
     this._bridges = [];
     await Promise.all(bs.map((b) => b.close()));
   }
