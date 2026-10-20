@@ -278,3 +278,29 @@ fn golden_bar_full_opts() {
     ];
     check("bar_full_opts", &svg_of(&args));
 }
+
+/// v0.6.45 (B5): `x_axis` — 15 categorías rotadas 45° y una de cada 2. Golden NUEVO (los de
+/// arriba no cambian: sin `x_axis` el SVG es byte a byte el de antes).
+#[test]
+fn bar_x_axis_rotated_every() {
+    let rows: Vec<SynValue> = (1..=15)
+        .map(|i| {
+            let mut m = SynMap::new();
+            m.insert("cat", syn_text(&format!("categoria_{:02}", i)));
+            m.insert("n", syn_int(i * 3));
+            syn_map(m)
+        })
+        .collect();
+    let mut ax = SynMap::new();
+    ax.insert("angle", syn_int(45));
+    ax.insert("every", syn_int(2));
+    let args = vec![
+        syn_text("bar"),
+        syn_list(rows),
+        opts(vec![("x", syn_text("cat")), ("y", syn_text("n")), ("x_axis", syn_map(ax))]),
+    ];
+    let svg = svg_of(&args);
+    assert_eq!(svg.matches("rotate(-45 ").count(), 8, "15 etiquetas, una de cada 2 = 8 rotadas");
+    assert!(svg.contains("categoria_01") && !svg.contains("categoria_02") && svg.contains("categoria_15"));
+    check("bar_x_axis_rotated_every", &svg);
+}

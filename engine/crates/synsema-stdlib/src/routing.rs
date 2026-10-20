@@ -1106,6 +1106,11 @@ fn body_streamed_error(what: &str) -> synsema_core::interpreter::RuntimeError {
     ))
 }
 
+/// v0.6.45 — los nombres que `request_bindings` liga en cada request: una sola lista para el
+/// `proxy to` estático de `serve.rs` y para el aviso de `synsema check` (A10), que si no los
+/// tomaría por llamadas a nombres inexistentes (`read_body()`).
+pub const REQUEST_NAMES: [&str; 5] = ["request", "params", "query", "read_body", "read_body_bytes"];
+
 /// Las bindings que ve un handler, LOCALES al scope hijo del request (no globales →
 /// no se filtran al siguiente request al reusar el intérprete): `request`, `query`,
 /// `params` y el builtin `read_body` (lee el cuerpo, en memoria o del temp file spilled).

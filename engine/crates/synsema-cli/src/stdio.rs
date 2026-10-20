@@ -130,3 +130,22 @@ pub fn attach_parent_console() -> bool {
 pub fn attach_parent_console() -> bool {
     false
 }
+
+/// v0.6.45 (A6) — ¿este proceso tiene consola? Un build `--no-console` (subsistema GUI) que no se
+/// pegó a la del padre no la tiene: entonces cada hijo de consola (`ssh`, `git`, `powershell`)
+/// lanzado con pipes abría una ventana negra propia, que el usuario no entiende y puede cerrar
+/// matando el proceso. Se pregunta una vez, después de decidir el `attach`.
+#[cfg(windows)]
+pub fn has_console() -> bool {
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetConsoleWindow() -> *mut std::ffi::c_void;
+    }
+    // SAFETY: GetConsoleWindow no toma argumentos y sólo lee el estado del proceso.
+    unsafe { !GetConsoleWindow().is_null() }
+}
+
+#[cfg(not(windows))]
+pub fn has_console() -> bool {
+    true
+}

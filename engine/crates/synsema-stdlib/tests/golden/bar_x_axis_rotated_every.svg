@@ -1,0 +1,38 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 360" width="640" height="360" role="img" font-family="system-ui, sans-serif">
+<line x1="52" y1="285.39" x2="624" y2="285.39" stroke="#e1e0d9" stroke-width="1"/>
+<text x="44" y="288.89" text-anchor="end" font-size="11" fill="#898781">0</text>
+<line x1="52" y1="230.71" x2="624" y2="230.71" stroke="#e1e0d9" stroke-width="1"/>
+<text x="44" y="234.21" text-anchor="end" font-size="11" fill="#898781">10</text>
+<line x1="52" y1="176.03" x2="624" y2="176.03" stroke="#e1e0d9" stroke-width="1"/>
+<text x="44" y="179.53" text-anchor="end" font-size="11" fill="#898781">20</text>
+<line x1="52" y1="121.36" x2="624" y2="121.36" stroke="#e1e0d9" stroke-width="1"/>
+<text x="44" y="124.86" text-anchor="end" font-size="11" fill="#898781">30</text>
+<line x1="52" y1="66.68" x2="624" y2="66.68" stroke="#e1e0d9" stroke-width="1"/>
+<text x="44" y="70.18" text-anchor="end" font-size="11" fill="#898781">40</text>
+<line x1="52" y1="12" x2="624" y2="12" stroke="#e1e0d9" stroke-width="1"/>
+<text x="44" y="15.5" text-anchor="end" font-size="11" fill="#898781">50</text>
+<rect x="58.71" y="268.99" width="24.71" height="16.4" fill="#2a78d6"/>
+<rect x="96.84" y="252.58" width="24.71" height="32.81" fill="#2a78d6"/>
+<rect x="134.98" y="236.18" width="24.71" height="49.21" fill="#2a78d6"/>
+<rect x="173.11" y="219.78" width="24.71" height="65.61" fill="#2a78d6"/>
+<rect x="211.24" y="203.37" width="24.71" height="82.02" fill="#2a78d6"/>
+<rect x="249.38" y="186.97" width="24.71" height="98.42" fill="#2a78d6"/>
+<rect x="287.51" y="170.57" width="24.71" height="114.82" fill="#2a78d6"/>
+<rect x="325.64" y="154.16" width="24.71" height="131.23" fill="#2a78d6"/>
+<rect x="363.78" y="137.76" width="24.71" height="147.63" fill="#2a78d6"/>
+<rect x="401.91" y="121.36" width="24.71" height="164.03" fill="#2a78d6"/>
+<rect x="440.04" y="104.95" width="24.71" height="180.44" fill="#2a78d6"/>
+<rect x="478.18" y="88.55" width="24.71" height="196.84" fill="#2a78d6"/>
+<rect x="516.31" y="72.15" width="24.71" height="213.25" fill="#2a78d6"/>
+<rect x="554.44" y="55.74" width="24.71" height="229.65" fill="#2a78d6"/>
+<rect x="592.58" y="39.34" width="24.71" height="246.05" fill="#2a78d6"/>
+<line x1="52" y1="285.39" x2="624" y2="285.39" stroke="#c3c2b7" stroke-width="1"/>
+<text x="71.07" y="299.39" text-anchor="end" font-size="11" fill="#52514e" transform="rotate(-45 71.07 299.39)">categoria_01</text>
+<text x="147.33" y="299.39" text-anchor="end" font-size="11" fill="#52514e" transform="rotate(-45 147.33 299.39)">categoria_03</text>
+<text x="223.6" y="299.39" text-anchor="end" font-size="11" fill="#52514e" transform="rotate(-45 223.6 299.39)">categoria_05</text>
+<text x="299.87" y="299.39" text-anchor="end" font-size="11" fill="#52514e" transform="rotate(-45 299.87 299.39)">categoria_07</text>
+<text x="376.13" y="299.39" text-anchor="end" font-size="11" fill="#52514e" transform="rotate(-45 376.13 299.39)">categoria_09</text>
+<text x="452.4" y="299.39" text-anchor="end" font-size="11" fill="#52514e" transform="rotate(-45 452.4 299.39)">categoria_11</text>
+<text x="528.67" y="299.39" text-anchor="end" font-size="11" fill="#52514e" transform="rotate(-45 528.67 299.39)">categoria_13</text>
+<text x="604.93" y="299.39" text-anchor="end" font-size="11" fill="#52514e" transform="rotate(-45 604.93 299.39)">categoria_15</text>
+</svg>

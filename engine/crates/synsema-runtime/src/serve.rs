@@ -184,7 +184,7 @@ pub(crate) struct CronExecEnv {
     secure: bool,
     /// Nombre de la memoria DECLARADA del programa (DB-M1) — `None` si no declara.
     /// Define el gate de los builtins de estado persistente en el intérprete del tick.
-    mem_name: Option<String>,
+    mem_name: Option<crate::engine::MemName>,
 }
 
 /// Slot del entorno de ejecución: bajo serve se llena UNA vez (con el bind listo);
@@ -432,7 +432,7 @@ pub(crate) fn run_mode_cron_executor(
     // Memoria DECLARADA (DB-M1): los ticks comparten los stores (y la persistencia
     // on-write) del programa. Sin declaración: stores descartables + gate cerrado
     // (los builtins fallan; los stores quedan inalcanzables — G-1).
-    let mem_name = mem.as_ref().map(|m| m.name.clone());
+    let mem_name = mem.as_ref().map(|m| crate::engine::MemName { name: m.name.clone(), child: m.child.clone() });
     let (shared_memory, on_write_mem): (SharedMemoryStore, OnWriteFn) = match &mem {
         Some(m) => (m.memory.clone(), m.on_write_mem.clone()),
         None => (Arc::new(Mutex::new(AgentMemory::new())), Arc::new(|_| {})),
@@ -1373,6 +1373,75 @@ fn register_serve_state_builtins(interp: &Interpreter, state: SharedState) {
             Ok(SynValue::Number(new_val))
         }));
     }
+    // v0.6.45 (A8) — leer-modificar-guardar de un mapa desde varios requests a la vez perdía
+    // escrituras (13 webhooks simultáneos: llegaron 7). Las dos operaciones corren enteras bajo el
+    // mismo candado. No hay `state_update(k, fn)` a propósito: una lambda que corra bajo el candado
+    // global y llame a `state_*` se traba.
+    {
+        let s = state.clone();
+        interp.register_builtin("state_merge", 2, Rc::new(move |_i, args, _l| {
+            let key = match args.first() {
+                Some(v) => v.to_string(),
+                None => return Err(Control::Error(RuntimeError::new("state_merge: missing key"))),
+            };
+            let patch = match args.get(1) {
+                Some(SynValue::Map(m)) => m.clone(),
+                Some(other) => {
+                    return Err(Control::Error(RuntimeError::new(format!(
+                        "state_merge: the second argument must be a map, got {}",
+                        other.type_name()
+                    ))))
+                }
+                None => return Err(Control::Error(RuntimeError::new("state_merge: missing the map to merge"))),
+            };
+            let mut guard = s.lock().unwrap();
+            let mut merged = SynMap::new();
+            match guard.get(&key).map(from_send) {
+                None | Some(SynValue::Nothing) => {}
+                Some(SynValue::Map(m)) => {
+                    for (k, v) in m.borrow().iter() {
+                        merged.insert(k.clone(), v.clone());
+                    }
+                }
+                Some(other) => {
+                    return Err(Control::Error(RuntimeError::new(format!(
+                        "state_merge: the value of '{}' is {}, not a map — use state_set to replace it",
+                        key,
+                        other.type_name()
+                    ))))
+                }
+            }
+            for (k, v) in patch.borrow().iter() {
+                merged.insert(k.clone(), v.clone());
+            }
+            let val = SynValue::Map(merged.into_ref());
+            let sent = to_send(&val);
+            journal_state_write(&guard, &key, Some(sent.clone()));
+            guard.insert(key, sent);
+            Ok(val)
+        }));
+    }
+    {
+        let s = state.clone();
+        interp.register_builtin("state_cas", 3, Rc::new(move |_i, args, _l| {
+            let key = match args.first() {
+                Some(v) => v.to_string(),
+                None => return Err(Control::Error(RuntimeError::new("state_cas: missing key"))),
+            };
+            let expected = args.get(1).cloned().unwrap_or(SynValue::Nothing);
+            let new = args.get(2).cloned().unwrap_or(SynValue::Nothing);
+            let mut guard = s.lock().unwrap();
+            // Una clave ausente vale `nothing`, como en `state_get`.
+            let current = guard.get(&key).map(from_send).unwrap_or(SynValue::Nothing);
+            if !current.syn_equals(&expected) {
+                return Ok(syn_bool(false));
+            }
+            let sent = to_send(&new);
+            journal_state_write(&guard, &key, Some(sent.clone()));
+            guard.insert(key, sent);
+            Ok(syn_bool(true))
+        }));
+    }
     {
         let s = state.clone();
         interp.register_builtin("state_delete", 1, Rc::new(move |_i, args, _l| {
@@ -1478,7 +1547,7 @@ fn build_base_interp(
     approvals: &ServeApprovals,
     cron: &CronWiring,
     secure: bool,
-    mem_name: &Option<String>,
+    mem_name: &Option<crate::engine::MemName>,
     agent_builder: Option<crate::engine::InterpBuilder>,
 ) -> (Interpreter, Rc<RefCell<CapabilitySet>>, Originals) {
     let mut interp = Interpreter::new();
@@ -1500,17 +1569,18 @@ fn build_base_interp(
     // el grant de `memory("<nombre>")` si el programa lo declaró; un `sandbox` dentro
     // del handler lo vacía como al resto (G-2/G-9).
     let mem_gate = match mem_name {
-        Some(n) => crate::engine::declared_memory_gate(caps.clone(), n.clone()),
+        Some(n) => crate::engine::declared_memory_gate(caps.clone(), n.name.clone()),
         None => crate::engine::undeclared_memory_gate("my-agent".to_string()),
     };
     // Ctx compartido para lo que este worker propague (cron registrado desde rutas,
     // workers de parallel_map dentro de un handler): mismos stores + on_write.
     let mem_ctx: Option<crate::engine::MemoryCtx> = mem_name.as_ref().map(|n| crate::engine::MemoryCtx {
-        name: n.clone(),
+        name: n.name.clone(),
         memory: shared_memory.clone(),
         progress: shared_progress.clone(),
         on_write_mem: on_write.clone(),
         on_write_prog: on_write_progress.clone(),
+        child: n.child.clone(),
     });
     // Pre-populamos el AgentMemory con las reglas del top-level para que
     // add_rule/check_rules/get_rules funcionen desde los route handlers.
@@ -1670,7 +1740,7 @@ fn with_serve_interp<R>(
     approvals: &ServeApprovals,
     cron: &CronWiring,
     secure: bool,
-    mem_name: &Option<String>,
+    mem_name: &Option<crate::engine::MemName>,
     f: impl FnOnce(&mut Interpreter, &Rc<RefCell<CapabilitySet>>) -> R,
 ) -> R {
     let key = Arc::as_ptr(snapshot) as *const () as usize;
@@ -1799,7 +1869,7 @@ fn run_socket(
     body: &[Node],
     ctx: &Ctx,
     secure: bool,
-    mem_name: &Option<String>,
+    mem_name: &Option<crate::engine::MemName>,
     link: Box<dyn std::any::Any + Send>,
 ) -> StreamEnd {
     with_serve_interp(swarm, snapshot, caps_snap, shared_db, rules_snap, shared_memory, on_write, shared_progress, on_write_progress, shared_state, approvals, cron, secure, mem_name, move |interp, caps| {
@@ -1862,7 +1932,7 @@ fn run_socket(
 /// request: no nombra `request`/`params`/`query`/`read_body*` ni un parámetro del path, y no
 /// llama a una task del programa (un builtin como `env(...)` sí vale, como hasta ahora).
 fn static_proxy_target<'a>(stmt: &'a Node, param_names: &[String], env: &Rc<RefCell<Environment>>) -> Option<&'a Node> {
-    const REQUEST_NAMES: [&str; 5] = ["request", "params", "query", "read_body", "read_body_bytes"];
+    use synsema_stdlib::routing::REQUEST_NAMES;
     let NodeKind::ProxyStatement { target } = &stmt.kind else { return None };
     let mut dynamic = false;
     synsema_core::ast_api::walk(target, &mut |n| match &n.kind {
@@ -1981,7 +2051,7 @@ fn serve_task_runner(
     approvals: &ServeApprovals,
     cron: &CronWiring,
     secure: bool,
-    mem_name: &Option<String>,
+    mem_name: &Option<crate::engine::MemName>,
     node: Node,
 ) -> Arc<dyn Fn(&[&str]) -> Result<bool, String> + Send + Sync> {
     let (swarm, snapshot, caps_snap, shared_db, rules_snap) =
@@ -2025,7 +2095,7 @@ fn run_route(
     body: &[Node],
     ctx: &Ctx,
     secure: bool,
-    mem_name: &Option<String>,
+    mem_name: &Option<crate::engine::MemName>,
 ) -> GiveOutcome {
     with_serve_interp(swarm, snapshot, caps_snap, shared_db, rules_snap, shared_memory, on_write, shared_progress, on_write_progress, shared_state, approvals, cron, secure, mem_name, |interp, caps| {
         // T6.4 — identidad del sujeto de ESTA request (y su techo de gasto
@@ -2095,7 +2165,7 @@ fn run_stream(
     body: &[Node],
     ctx: &Ctx,
     secure: bool,
-    mem_name: &Option<String>,
+    mem_name: &Option<crate::engine::MemName>,
     emit: Emitter,
 ) -> StreamEnd {
     with_serve_interp(swarm, snapshot, caps_snap, shared_db, rules_snap, shared_memory, on_write, shared_progress, on_write_progress, shared_state, approvals, cron, secure, mem_name, move |interp, caps| {
@@ -2268,6 +2338,18 @@ fn validate_route_templates(routes_n: &[Node]) -> Result<(), Control> {
 /// Construye la tabla (rutas + estáticos + auth) de un host (default o vhost) desde
 /// sus nodos AST. Reusado por el host default y por cada bloque `host "..."`.
 #[allow(clippy::too_many_arguments)]
+/// v0.6.45 (ronda 2, M6): el `tls cert "<c>" key "<k>"` de un bloque `serve` es código del
+/// programa: lee esos PEM bajo `file.read`, como `mtls_identity`, y se abre la ruta normalizada que
+/// se chequeó. Los `--tls-cert`/`--tls-key` de la línea de comandos son del operador y no pasan por
+/// acá.
+fn gate_tls_pem(caps: &Rc<RefCell<CapabilitySet>>, raw: &str) -> Result<String, Control> {
+    let path = synsema_capabilities::model::normalize_path(raw);
+    caps.borrow_mut()
+        .require(&Capability::new(CapabilityType::FileRead, Some(path.clone())), "serve tls")
+        .map_err(|v| Control::Error(v.into_error()))?;
+    Ok(path)
+}
+
 fn build_host_table(
     interp: &mut Interpreter,
     env: &Rc<RefCell<synsema_core::interpreter::Environment>>,
@@ -2289,7 +2371,7 @@ fn build_host_table(
     swarm: &Arc<Swarm>,
     shared_db: &SharedDb,
     secure: bool,
-    mem_name: &Option<String>,
+    mem_name: &Option<crate::engine::MemName>,
 ) -> Result<HostTable, Control> {
     // Templates literales de las rutas: validados al construir el serve (fail-fast).
     validate_route_templates(routes_n)?;
@@ -2299,7 +2381,9 @@ fn build_host_table(
     let mut seen_prefixes: Vec<String> = Vec::new();
     for mount in static_mounts_n {
         if let NodeKind::StaticMount { directory, prefix, cache, fallback } = &mount.kind {
-            let dir = interp.eval(directory, env)?.to_string();
+            // v0.6.45 (ronda 2, M5): la carpeta NORMALIZADA, la misma que chequea el gate de abajo
+            // (con la cruda, en Unix `./public/link/..` pasaba como `./public` y servía otro lado).
+            let dir = synsema_capabilities::model::normalize_path(&interp.eval(directory, env)?.to_string());
             let prefix_str = match prefix {
                 Some(p) => interp.eval(p, env)?.to_string(),
                 None => "/".to_string(),
@@ -2312,6 +2396,23 @@ fn build_host_table(
                 ))));
             }
             seen_prefixes.push(key);
+            // v0.6.45 — servir una carpeta es leerla, y el archivo lo elige un cliente remoto: hace
+            // falta `file.read("<dir>/**")` declarado (antes no se pedía nada, y `static "/" from "/"`
+            // servía el disco sin que el preámbulo lo dijera). Una carpeta que viaja dentro del
+            // binario de `synsema build` es parte del programa y no lo pide, como `read_file`.
+            let bundled = synsema_core::bundle::mounted()
+                .and_then(|b| synsema_core::bundle::normalize_name(&dir).map(|k| b.has_prefix(&k)))
+                .unwrap_or(false);
+            if !bundled {
+                let scope = format!("{}/**", dir.trim_end_matches(['/', '\\']));
+                let need = Capability::new(CapabilityType::FileRead, Some(scope.clone()));
+                if !caps_snap.iter().any(|c| c.covers(&need)) {
+                    return Err(Control::Error(RuntimeError::new(format!(
+                        "Capability not granted: static \"{}\" from \"{}\" serves the files of that folder — this is a permission, not a bug: add `require file.read(\"{}\")` to the program's preamble",
+                        prefix_str, dir, scope
+                    ))));
+                }
+            }
             // `cache "<spec>"` → valor Cache-Control, validado ACÁ (arranque), nunca
             // en un request.
             let cache_val = match cache {
@@ -2837,7 +2938,7 @@ fn run_mounted_route(
     handler_key: &str,
     ctx: &Ctx,
     secure: bool,
-    mem_name: &Option<String>,
+    mem_name: &Option<crate::engine::MemName>,
 ) -> GiveOutcome {
     with_serve_interp(swarm, snapshot, caps_snap, shared_db, rules_snap, shared_memory, on_write, shared_progress, on_write_progress, shared_state, approvals, cron, secure, mem_name, |interp, caps| {
         // T1 — el SUJETO de esta request (identidad, techo de gasto y techo delegado del
@@ -2930,7 +3031,7 @@ fn run_mounted_stream(
     handler_key: &str,
     ctx: &Ctx,
     secure: bool,
-    mem_name: &Option<String>,
+    mem_name: &Option<crate::engine::MemName>,
     emit: Emitter,
 ) -> StreamEnd {
     with_serve_interp(swarm, snapshot, caps_snap, shared_db, rules_snap, shared_memory, on_write, shared_progress, on_write_progress, shared_state, approvals, cron, secure, mem_name, move |interp, caps| {
@@ -3000,7 +3101,7 @@ fn run_mounted_socket(
     handler_key: &str,
     ctx: &Ctx,
     secure: bool,
-    mem_name: &Option<String>,
+    mem_name: &Option<crate::engine::MemName>,
     link: Box<dyn std::any::Any + Send>,
 ) -> StreamEnd {
     with_serve_interp(swarm, snapshot, caps_snap, shared_db, rules_snap, shared_memory, on_write, shared_progress, on_write_progress, shared_state, approvals, cron, secure, mem_name, move |interp, caps| {
@@ -3067,7 +3168,7 @@ fn make_serve_hook(
     on_write_progress: OnWriteProgressFn,
     shared_state: SharedState,
     cron: CronWiring,
-    mem_name: Option<String>,
+    mem_name: Option<crate::engine::MemName>,
 ) -> ServeHook {
     Rc::new(move |interp, node, env| {
         let (
@@ -3479,13 +3580,15 @@ fn make_serve_hook(
         let host_certs: Vec<(String, String, String)> = if cli_overrides_tls {
             Vec::new()
         } else {
-            built_vhosts
-                .iter()
-                .filter_map(|v| match (&v.tls_cert, &v.tls_key) {
-                    (Some(c), Some(k)) => Some((v.pattern.clone(), c.clone(), k.clone())),
-                    _ => None,
-                })
-                .collect()
+            // Los PEM por host se gatean recién acá, cuando de verdad se usan (con `--tls-auto` o
+            // `--tls-cert` la CLI manda y no se leen).
+            let mut out = Vec::new();
+            for v in &built_vhosts {
+                if let (Some(c), Some(k)) = (&v.tls_cert, &v.tls_key) {
+                    out.push((v.pattern.clone(), gate_tls_pem(&caps, c)?, gate_tls_pem(&caps, k)?));
+                }
+            }
+            out
         };
 
         // Modo TLS efectivo:
@@ -3497,9 +3600,10 @@ fn make_serve_hook(
                 (Some(c), Some(k)) => (Some(c.clone()), Some(k.clone())),
                 _ if cli_forces_auto => (None, None),
                 _ => match (tls_cert_n, tls_key_n) {
-                    (Some(c), Some(k)) => {
-                        (Some(interp.eval(c, env)?.to_string()), Some(interp.eval(k, env)?.to_string()))
-                    }
+                    (Some(c), Some(k)) => (
+                        Some(gate_tls_pem(&caps, &interp.eval(c, env)?.to_string())?),
+                        Some(gate_tls_pem(&caps, &interp.eval(k, env)?.to_string())?),
+                    ),
                     _ => (None, None),
                 },
             };
@@ -3700,6 +3804,8 @@ fn make_serve_hook(
                 ))))
             }
         };
+        // v0.6.45 (A5): desde acá el proceso escucha; `exit()` deja de ser válido.
+        server::mark_serve_bound();
         let scheme = if use_tls { "HTTPS" } else { "HTTP" };
         println!("Serving {} on port {} ({} route(s))", scheme, port_str, n_routes);
         if let Some(id) = &attested_identity {
@@ -4000,8 +4106,12 @@ fn serve_inner(source: &str, filename: &str, secure: bool, overrides: ServeOverr
     // borraba el progress persistido en cada `remember` (DE-028). Comparten UNA
     // `StatePersistence` (mismo .db), y ningún callback toma el lock del OTRO store, así
     // que no hay inversión de orden de locks.
+    let (declared_persistence, declared_dir) = match declared {
+        Some(d) => (d.persistence, d.dir),
+        None => (None, None),
+    };
     let shared_persistence: Option<Arc<Mutex<crate::persistence::StatePersistence>>> =
-        declared.and_then(|d| d.persistence).map(|p| Arc::new(Mutex::new(p)));
+        declared_persistence.map(|p| Arc::new(Mutex::new(p)));
     if let Some(ref p) = shared_persistence {
         p.lock().unwrap().load_into(
             &mut shared_memory.lock().unwrap(),
@@ -4034,13 +4144,27 @@ fn serve_inner(source: &str, filename: &str, secure: bool, overrides: ServeOverr
         Some(n) => crate::engine::declared_memory_gate(caps.clone(), n.clone()),
         None => crate::engine::undeclared_memory_gate(crate::engine::suggested_memory_name(filename)),
     };
+    // Ronda 5 (M1/B1): lo que `run_program` necesita de esta memoria (carpeta + recarga). Viaja con
+    // el nombre (`MemName`) a los workers y a los ticks de cron.
+    let serve_child: Option<crate::engine::ChildState> = match (&shared_persistence, declared_dir) {
+        (Some(p), Some(dir)) => Some(crate::engine::child_state_for(
+            dir,
+            p.clone(),
+            shared_memory.clone(),
+            shared_progress.clone(),
+        )),
+        _ => None,
+    };
     let top_mem_ctx: Option<crate::engine::MemoryCtx> = mem_name.as_ref().map(|n| crate::engine::MemoryCtx {
         name: n.clone(),
         memory: shared_memory.clone(),
         progress: shared_progress.clone(),
         on_write_mem: persist_memory.clone(),
         on_write_prog: persist_progress.clone(),
+        child: serve_child.clone(),
     });
+    let mem_name: Option<crate::engine::MemName> =
+        mem_name.map(|name| crate::engine::MemName { name, child: serve_child.clone() });
     // `top_level_memory` sigue siendo el AgentMemory per-intérprete del top-level.
     // Gestiona add_rule/check_rules (gap-15). Para remember/recall usamos shared_memory.
     let top_level_memory = Rc::new(RefCell::new(AgentMemory::new()));
@@ -4108,6 +4232,16 @@ fn serve_inner(source: &str, filename: &str, secure: bool, overrides: ServeOverr
     let r = interp.execute(&program);
     for line in &interp.output {
         println!("{}", line);
+    }
+    // v0.6.45 (A5): un `exit(code)` del preámbulo (antes de escuchar) es el fin pedido, no una
+    // falla: sin "Runtime error" y con su código, como en `run`.
+    let exit = match &r {
+        Err(Control::Error(e)) => e.exit_code,
+        _ => None,
+    };
+    crate::engine::note_exit_code(exit);
+    if let Some(code) = exit {
+        return RunResult { success: code == 0, output: std::mem::take(&mut interp.output), errors: Vec::new() };
     }
     if let Err(Control::Error(e)) = &r {
         return RunResult {

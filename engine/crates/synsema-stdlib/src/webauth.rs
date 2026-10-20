@@ -394,7 +394,7 @@ fn b_jwt_sign(args: &[SynValue], caps: &Rc<RefCell<CapabilitySet>>, loc: &synsem
                 }
             };
             let r = match (alg, private_key_from_pem(&pem, F)) {
-                (JwtAlg::Rs256, Ok(AsymPrivate::Rsa(k))) => Ok(rs256_sign(&k, signing_input.as_bytes())),
+                (JwtAlg::Rs256, Ok(AsymPrivate::Rsa(k))) => rs256_sign(&k, signing_input.as_bytes()).map_err(|e| err(format!("{}: {}", F, e))),
                 (JwtAlg::Es256, Ok(AsymPrivate::P256(k))) => Ok(es256_sign(&k, signing_input.as_bytes())),
                 (JwtAlg::Rs256, Ok(_)) => {
                     Err(err(format!("{}: alg RS256 needs an RSA private key, got another key type", F)))
@@ -702,12 +702,42 @@ fn ed25519_signing_key(key: &[u8], who: &str) -> Result<ed25519_dalek::SigningKe
     )))
 }
 
-/// RSASSA-PKCS1-v1_5 con SHA-256 (RS256). Determinista.
-fn rs256_sign(key: &rsa::RsaPrivateKey, msg: &[u8]) -> Vec<u8> {
+/// RS256 (RSASSA-PKCS1-v1_5 + SHA-256). v0.6.45: el crate `rsa` 0.9 no es de tiempo constante en las
+/// operaciones con la clave PRIVADA (RUSTSEC-2023-0071, "Marvin"; sin versión estable que lo
+/// arregle), y `sign` ni siquiera cegaba. En el binario nativo firma `ring` (BoringSSL, tiempo
+/// constante; ya está en el binario por TLS) cuando la clave entra en lo que `ring` acepta: módulo de
+/// 2048 a 4096 bits, e ≥ 65537 y dos primos. Las demás (1024 u 8192 bits, e = 3, multiprimo) y todas
+/// en wasm, donde `ring` no compila sin C, firman con `rsa` CON cegado (`sign_with_rng`), que esconde
+/// la base de la exponenciación (no protege de un ataque de caché local). La firma es la misma en los
+/// dos caminos: PKCS#1 v1.5 es determinista. El cegado necesita entropía: se pide UNA vez, con
+/// `try_fill_bytes`, para sembrar el generador de la firma; sin ella (un host wasm sin
+/// `host_random_fill`) es un error, no un trap (ronda 2, B4: con `OsRng` directo, un pedido posterior
+/// que fallara entraba en pánico).
+fn rs256_sign(key: &rsa::RsaPrivateKey, msg: &[u8]) -> Result<Vec<u8>, String> {
+    #[cfg(feature = "native")]
+    if let Some(sig) = rs256_sign_ring(key, msg) {
+        return Ok(sig);
+    }
+    use rand::{RngCore, SeedableRng};
     use rsa::pkcs1v15::SigningKey;
-    use rsa::signature::{SignatureEncoding, Signer};
+    use rsa::signature::{RandomizedSigner, SignatureEncoding};
+    let mut seed = [0u8; 32];
+    rand::rngs::OsRng
+        .try_fill_bytes(&mut seed)
+        .map_err(|_| "RSA signing needs entropy for blinding and the host provides none (host_random_fill)".to_string())?;
+    let mut rng = rand::rngs::StdRng::from_seed(seed);
     let sk = SigningKey::<Sha256>::new(key.clone());
-    sk.sign(msg).to_bytes().to_vec()
+    Ok(sk.sign_with_rng(&mut rng, msg).to_bytes().to_vec())
+}
+
+#[cfg(feature = "native")]
+fn rs256_sign_ring(key: &rsa::RsaPrivateKey, msg: &[u8]) -> Option<Vec<u8>> {
+    use rsa::pkcs1::EncodeRsaPrivateKey;
+    let der = key.to_pkcs1_der().ok()?;
+    let kp = ring::signature::RsaKeyPair::from_der(der.as_bytes()).ok()?;
+    let mut sig = vec![0u8; kp.public().modulus_len()];
+    kp.sign(&ring::signature::RSA_PKCS1_SHA256, &ring::rand::SystemRandom::new(), msg, &mut sig).ok()?;
+    Some(sig)
 }
 
 fn rs256_verify(key: &rsa::RsaPublicKey, msg: &[u8], sig: &[u8]) -> bool {
@@ -773,7 +803,7 @@ fn b_rsa_sign_sha256(args: &[SynValue]) -> Result<SynValue, Control> {
     let msg = msg_bytes(&args[0], F)?;
     let pem = pem_text(&args[1], F, "the private key")?;
     match private_key_from_pem(&pem, F)? {
-        AsymPrivate::Rsa(k) => Ok(syn_bytes(rs256_sign(&k, &msg))),
+        AsymPrivate::Rsa(k) => rs256_sign(&k, &msg).map(syn_bytes).map_err(|e| err(format!("{}: {}", F, e))),
         AsymPrivate::P256(_) => Err(err(format!("{}: needs an RSA private key, got an EC key (use ecdsa_p256_sign)", F))),
         AsymPrivate::Ed25519(_) => Err(err(format!("{}: needs an RSA private key, got an Ed25519 key (use ed25519_sign)", F))),
     }
@@ -1816,6 +1846,33 @@ mod v0620_tests {
         let header = String::from_utf8(b64url_decode(parts[0]).unwrap()).unwrap();
         let signing_input = format!("{}.{}", parts[0], parts[1]);
         (header, signing_input, b64url_decode(parts[2]).unwrap())
+    }
+
+    /// v0.6.45: los dos caminos de RS256 — `ring` (nativo, tiempo constante) y `rsa` con cegado
+    /// (wasm) — dan la MISMA firma (PKCS#1 v1.5 es determinista).
+    #[cfg(feature = "native")]
+    #[test]
+    fn rs256_ring_and_blinded_rsa_give_the_same_signature() {
+        use rsa::pkcs1v15::SigningKey;
+        use rsa::signature::{RandomizedSigner, SignatureEncoding};
+        let sk = rsa::RsaPrivateKey::new(&mut rand::rngs::OsRng, 2048).expect("keygen");
+        let msg = b"header.payload";
+        let ring = rs256_sign_ring(&sk, msg).expect("ring firma una clave PKCS#1");
+        let blinded = SigningKey::<Sha256>::new(sk.clone()).sign_with_rng(&mut rand::rngs::OsRng, msg).to_bytes().to_vec();
+        assert_eq!(ring, blinded);
+        assert_eq!(rs256_sign(&sk, msg).unwrap(), ring, "el camino nativo es ring");
+    }
+
+    /// v0.6.45 (auditoría, M6): una clave fuera de lo que `ring` acepta (acá 1024 bits) no firma con
+    /// `ring`; cae a `rsa` con cegado y la firma verifica igual.
+    #[cfg(feature = "native")]
+    #[test]
+    fn rs256_outside_ring_range_falls_back_to_blinded_rsa() {
+        let sk = rsa::RsaPrivateKey::new(&mut rand::rngs::OsRng, 1024).expect("keygen");
+        let msg = b"header.payload";
+        assert!(rs256_sign_ring(&sk, msg).is_none(), "ring no firma 1024 bits");
+        let sig = rs256_sign(&sk, msg).expect("cae a rsa");
+        assert!(rs256_verify(&sk.to_public_key(), msg, &sig));
     }
 
     #[test]

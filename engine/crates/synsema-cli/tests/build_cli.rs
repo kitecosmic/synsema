@@ -464,7 +464,7 @@ fn built_binary_sees_the_real_working_directory() {
     std::fs::write(dir.join("assets").join("data.txt"), "bundled").unwrap();
     std::fs::write(
         dir.join("lamp.syn"),
-        "require file.read(\"*\")\nprint(length(list_dir(\".\")))\nprint(read_file(\"data.txt\"))\nprint(read_file(\"bundle:assets/data.txt\"))\nprint(read_file(\"assets/data.txt\"))\nprint(cwd())\n",
+        "require file.read(\"**\")\nprint(length(list_dir(\".\")))\nprint(read_file(\"data.txt\"))\nprint(read_file(\"bundle:assets/data.txt\"))\nprint(read_file(\"assets/data.txt\"))\nprint(cwd())\n",
     )
     .unwrap();
     let lamp = build(&dir, &[]);

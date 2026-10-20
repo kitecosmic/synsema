@@ -3,18 +3,32 @@
 
 [advisories]
 ignore = [
-    # rkyv 0.7 (RUSTSEC-2026-0235): entra a Cargo.lock solo como dependencia OPCIONAL
-    # de rust_decimal, con la feature `rkyv` DESACTIVADA — el crate no se compila ni se
-    # linkea en ningún binario (verificable: `cargo tree -i rkyv` no imprime nada).
-    # rust_decimal 1.x pinnea rkyv 0.7; quitar este ignore cuando rust_decimal migre a
-    # rkyv >= 0.8.17 o el lock deje de listar opcionales no activados.
-    "RUSTSEC-2026-0235",
-
     # rsa 0.9 (RUSTSEC-2023-0071, "Marvin"): timing sidechannel en operaciones de CLAVE
-    # PRIVADA (decrypt/sign). synsema-stdlib usa `rsa` EXCLUSIVAMENTE para VERIFICAR
-    # firmas RS256 con clave PÚBLICA (oidc.rs — jwt_verify/oidc_verify); el único uso de
-    # SigningKey vive en #[cfg(test)] para fabricar tokens de prueba. Sin clave privada
-    # en producción no hay superficie Marvin. Upstream no publica fix ("no fixed upgrade
-    # is available"); revisar si algún día firmamos RS256.
+    # PRIVADA. Upstream no publica versión estable que lo arregle (0.10 sigue en rc).
+    # Corregido 2026-10-19 (v0.6.45): la justificación anterior decía que sólo se verificaba
+    # con clave pública, y ya no era cierto desde v0.6.20 (`jwt_sign` RS256 y
+    # `rsa_sign_sha256` firman con la privada). Hoy:
+    #   - binario nativo, claves de 2048 a 4096 bits con e >= 65537 y dos primos (lo que `ring`
+    #     acepta): la FIRMA la hace `ring` (BoringSSL, tiempo constante), no `rsa` (webauth.rs
+    #     `rs256_sign_ring`; test `rs256_ring_and_blinded_rsa_give_the_same_signature`);
+    #   - el resto de las claves en nativo (1024/8192 bits, e = 3, multiprimo; test
+    #     `rs256_outside_ring_range_falls_back_to_blinded_rsa`) y todas en wasm (donde ring no
+    #     compila sin C): `rsa` firma CON cegado (`sign_with_rng`), que aleatoriza la base de la
+    #     exponenciación (contra el ataque de tiempo remoto; no protege de un ataque de caché local);
+    #   - `rsa` queda para operaciones de clave PÚBLICA (verificar RS256/PSS, el OAEP con la EK
+    #     de NitroTPM), que Marvin no afecta, y para generar claves en tests.
+    # Quitar cuando `rsa` 0.10 estable (crypto-bigint, tiempo constante) llegue y se adopte.
     "RUSTSEC-2023-0071",
+
+    # zip 8.6 (RUSTSEC-2026-0367 / 0368 / 0369): las tres son de `ZipArchive::extract` /
+    # `ZipStreamReader::extract` (bits SUID, symlinks fuera del destino, permisos a través de un
+    # symlink). Agregado 2026-10-19 (v0.6.45). `zip_extract` de Synsema ya usa zip 9 (y nunca usó
+    # `extract`: extrae a mano, salta symlinks y no copia permisos de Unix). zip 8.6 sólo entra por
+    # `candle-core` 0.11 (feature `llm-local`/`judge-laya` del binario oficial), que la usa en
+    # `npy.rs` (leer y escribir `.npz`) y `pickle.rs` (leer `.pth`) desde un archivo, y jamás llama a
+    # `extract` (revisado en candle-core-0.11.0); synsema-infer no llama a npy/npz/pickle. Quitar
+    # cuando candle publique una versión con zip >= 9 o el backend propio deje de depender de candle.
+    "RUSTSEC-2026-0367",
+    "RUSTSEC-2026-0368",
+    "RUSTSEC-2026-0369",
 ]

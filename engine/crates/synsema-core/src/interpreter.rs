@@ -2189,6 +2189,11 @@ impl Interpreter {
         self.labels
     }
 
+    /// ¿Hay etiqueta de PC efectiva? Lo mismo que `!pc_label().is_empty()`, sin armar la unión.
+    pub fn pc_is_private(&self) -> bool {
+        !self.pc.last().unwrap_or(&self.no_label).is_empty() || !self.control_taint.is_empty() || !self.loop_taint.is_empty()
+    }
+
     /// Etiqueta de PC efectiva del contexto en curso: la del bloque en ejecución UNIDA a las dos
     /// de continuación — la de la TASK (`control_taint`: lo que sigue a un `give`/`raise`
     /// disparado desde un contexto privado) y la del BUCLE (`loop_taint`: lo que sigue a un
@@ -2589,6 +2594,9 @@ impl Interpreter {
         loc: &SourceLocation,
     ) -> Result<SynValue, Control> {
         let r = if self.labels {
+            // M2 (ronda 2): el escritor del audit tiene que saber si la rama es privada. Con un guard
+            // (ronda 3, B2): un pánico dentro del builtin no deja el flag prendido en el hilo.
+            let _pc = labels::PcPrivateGuard::set(self.pc_is_private());
             self.call_builtin_labelled(bt, args, loc)
         } else {
             let f = bt.func.clone();
@@ -3114,6 +3122,11 @@ impl Interpreter {
     /// Corta con error si hay cancelación pendiente. Lo llaman `exec_block` (por
     /// statement) y los builtins bloqueantes al salir de su espera.
     pub fn check_cancel(&self) -> Result<(), Control> {
+        // v0.6.45 (D2): en wasm, la bandera también enruta acá los límites de la corrida embebida.
+        #[cfg(target_arch = "wasm32")]
+        if let Some(r) = crate::wasm_limits::check(self.steps) {
+            return r.map_err(|m| Control::Error(RuntimeError::new(m)));
+        }
         if self.cancel.flag.load(std::sync::atomic::Ordering::Relaxed) {
             let reason = self.cancel.reason.lock().map(|g| g.clone()).unwrap_or_default();
             let msg = if reason.is_empty() {
@@ -5597,10 +5610,30 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
         let NodeKind::RequireStatement { capability, scope } = &node.kind else { unreachable!("exec_require_statement: otro nodo") };
         {
         // El scope se evalúa a su str (igual que el oráculo: str(eval(scope))).
-        let scope_val = match scope {
-            Some(s) => Some(self.exec(s, env)?.to_string()),
+        let scope_v = match scope {
+            Some(s) => Some(self.exec(s, env)?),
             None => None,
         };
+        // v0.6.45 (ronda 4, revisión): con etiquetas, un `require` dentro de una rama privada (o con
+        // un scope que sale de un valor privado) no concede nada: lo concedido dependería del dato
+        // (un `try random_int(…)` público después lo publicaba) y su entrada de audit — "above host
+        // ceiling" — sólo aparecía si la rama se tomaba.
+        // Dentro de un `sandbox` o de una tool el `require` no concede nada (más abajo): ahí no hay
+        // nada que depender del dato (ronda 4, revisión).
+        if self.labels
+            && !self.in_sandbox()
+            && !self.in_tool_scope()
+            && (self.pc_is_private() || scope_v.as_ref().is_some_and(|v| !labels::label_deep(v).is_empty()))
+        {
+            return Err(Control::Error(RuntimeError::labels(
+                format!(
+                    "label_violation: `require {}` runs in a branch decided by a private value (or its scope is private); what is granted cannot depend on private data — declare it at the top of the program, or declassify(<the condition>, \"<why it may be published>\")",
+                    capability
+                ),
+                loc.clone(),
+            )));
+        }
+        let scope_val = scope_v.map(|v| v.to_string());
         // Dentro de un `sandbox` o del cuerpo de una tool (`call_tool`) NO se
         // conceden capabilities: un `require` ahí es no-op. Si no, se podría
         // re-grantear para escapar del aislamiento / del least-privilege por-tool
@@ -5969,11 +6002,26 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
         let has_requires = body.iter().any(|s| matches!(s.kind, NodeKind::RequireStatement { .. }));
         for stmt in body.iter() {
             if let NodeKind::RequireStatement { capability, scope } = &stmt.kind {
-                let scope_val = match scope {
-                    Some(s) => Some(self.exec(s, env)?.to_string()),
+                let scope_v = match scope {
+                    Some(s) => Some(self.exec(s, env)?),
                     None => None,
                 };
-                required_caps.push((capability.clone(), scope_val));
+                // Ronda 5 (B2): el `require` de una task es el techo de la tool en `call_tool`; con
+                // etiquetas, el mismo chequeo que `exec_require_statement` (lo concedido no puede
+                // depender de un dato privado: una lectura que anda o no según el valor, y un `try`
+                // público alrededor, lo publicaba).
+                if self.labels
+                    && (self.pc_is_private() || scope_v.as_ref().is_some_and(|v| !labels::label_deep(v).is_empty()))
+                {
+                    return Err(Control::Error(RuntimeError::labels(
+                        format!(
+                            "label_violation: `require {}` in task {} is defined in a branch decided by a private value (or its scope is private); what a tool is granted cannot depend on private data — define the task at the top of the program with a public scope, or declassify(<the value>, \"<why it may be published>\")",
+                            capability, name
+                        ),
+                        stmt.location.clone(),
+                    )));
+                }
+                required_caps.push((capability.clone(), scope_v.map(|v| v.to_string())));
             } else if has_requires {
                 clean_body.push(stmt.clone());
             }

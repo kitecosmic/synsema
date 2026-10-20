@@ -301,5 +301,331 @@ print("slept")`;
   check("check(): valida la declaración de memoria sin ejecutar", !c.ok && c.errors[0].includes("Multiple memory declarations"), c);
 }
 
+// 9. v0.6.45 (D1) — etiquetas por la API: `labels` + `input.sources`. Un valor privado (o una rama
+//    que dependió de uno) no llega al hook `http` ni al `kv` del host; uno público sí. Antes el
+//    paquete no reenviaba `labels` y el motor, aunque las encendiera, no registraba sumideros.
+{
+  const seen = { http: [], kv: [] };
+  const host = {
+    http(req) {
+      seen.http.push(`${req.method} ${req.url} ${typeof req.body === "string" ? req.body : req.body ? new TextDecoder().decode(req.body) : ""}`);
+      return { status: 200, headers: [["content-type", "application/json"]], body: "{}" };
+    },
+    kv: {
+      get: () => null,
+      set: (ns, k, v) => { seen.kv.push(`${ns}/${k}=${v}`); },
+      delete: () => {},
+      list: () => [],
+    },
+  };
+  const input = { var: "input", value: { tarjeta: "4111-1111", nombre: "Ana" }, sources: { tarjeta: ["cliente"] } };
+  const run = (body) => syn.run(`require net("x.test")\n${body}`, { host, labels: true, input });
+  const leak = run('http_post("https://x.test/", {"t": input.tarjeta})');
+  check("labels: un privado no llega al hook http", !leak.ok && leak.errors.some((e) => e.includes("label_violation")) && seen.http.length === 0, { leak, seen });
+  const branch = run('when input.tarjeta == "4111-1111"\n    fetch("https://x.test/si", {"method": "GET"})');
+  check("labels: una rama sobre un privado no llama a la red", !branch.ok && seen.http.length === 0, { branch, seen });
+  const kv = run('state_set("k", input.tarjeta)');
+  check("labels: un privado no llega al kv del host", !kv.ok && seen.kv.every((w) => !w.includes("4111")), { kv, seen });
+  const pub = run('http_post("https://x.test/", {"n": input.nombre})');
+  check("labels: un valor público sí sale", pub.ok && seen.http.length === 1, { pub, seen });
+  // `private_seen` = la corrida desenvolvió un privado o decidió una rama con uno (entonces `steps`
+  // no se publica). Un sumidero que rechaza el argumento antes de mirarlo no lo prende.
+  check("labels: una rama sobre un privado prende private_seen", branch.private_seen === true, branch);
+  // v0.6.45 (auditoría, M5): en wasm el número de `sleep` cruza el ABI hacia el hook del host.
+  const nap = run("sleep(length(input.tarjeta) / 1000)");
+  check("labels: un privado no llega al hook sleep", !nap.ok && nap.errors.some((e) => e.includes("label_violation")), nap);
+  // Ronda 3 (M3): con una rama privada en la corrida, `steps` no se publica.
+  check("labels: con una rama privada, steps es null", branch.steps === null, branch);
+  check("labels: sin nada privado, steps se publica", typeof pub.steps === "number", pub);
+}
+
+// 10. v0.6.45 (D2) — límites medidos por el motor: pasos y memoria. Terminan con ok:false y un error
+//     que lo dice (no un trap), y la instancia sigue sirviendo.
+{
+  const loop = "let n be 0\neach i in range(3000)\n    each j in range(3000)\n        set n to n + 1\nprint(n)";
+  const steps = syn.run(loop, { maxSteps: 100000 });
+  check("maxSteps: corta con un error claro", !steps.ok && steps.errors.some((e) => e.includes("step limit reached")), steps);
+  const free = syn.run("let n be 0\neach i in range(1000)\n    set n to n + 1\nprint(n)", { maxSteps: 1000000 });
+  check("maxSteps holgado no molesta", free.ok && free.output[0] === "1000", free);
+  // Memoria (auditoría de v0.6.45, A3): una instancia NUEVA y un tope POR ENCIMA de lo que ocupa al
+  // arrancar, para que el corte lo cause el programa y no la base. Antes el tope medía el máximo
+  // histórico de la instancia y el programa revenía en trap antes del chequeo.
+  const fresh = await Synsema.load(wasmPath);
+  await fresh.ready();
+  const grow = 'let s be "0123456789"\neach i in range(40)\n    set s to s + s\nprint(length(s))';
+  const mem = fresh.run(grow, { maxMemoryMb: 32 });
+  check("maxMemoryMb: corta con un error claro, no un trap", !mem.ok && mem.errors.some((e) => e.includes("memory limit reached")), mem);
+  const after = fresh.run("print(1 + 1)");
+  check("después de un límite la instancia sigue y sin límites no hay corte", after.ok && after.output[0] === "2", after);
+  const oneShot = fresh.run("let z be zeros(30000000)\nprint(length(z))", { maxMemoryMb: 80 });
+  check("maxMemoryMb: una sola sentencia que reserva de golpe también corta", !oneShot.ok && oneShot.errors.some((e) => e.includes("memory limit reached")), oneShot);
+  const big = fresh.run('let s be "0123456789"\neach i in range(23)\n    set s to s + s\nprint(length(s))');
+  check("sin límite, una corrida grande pasa", big.ok, big);
+  const small = fresh.run("let n be 0\neach i in range(10)\n    set n to n + 1\nprint(n)", { maxMemoryMb: 16 });
+  check("maxMemoryMb: una corrida grande anterior no corta a una chica", small.ok && small.output[0] === "10", small);
+  const zero = fresh.run("print(1)", { maxSteps: 0 });
+  check("maxSteps: 0 es un error, no 'sin límite'", !zero.ok && zero.errors.some((e) => e.includes("max_steps")), zero);
+  // Modo handler (auditoría, A4): el límite vale en CADA request, no sólo en el primero.
+  const app = 'require serve(8080)\nserve on 8080\n    route "GET /loop"\n        let n be 0\n        each i in range(200000)\n            set n to n + 1\n        give {"n": n}';
+  const statuses = [1, 2, 3].map(() => fresh.handle(app, { method: "GET", path: "/loop" }, { maxSteps: 10000 }).status);
+  check("handler: maxSteps corta en cada request", statuses.every((s) => s === 500), statuses);
+  // Ronda 2 (M1): ninguna llamada hereda los límites de otra. `test` y un error de `bind_input`
+  // volvían sin desarmar, y la siguiente (sin límites) moría al reservar su pedido.
+  fresh.test('test "t"\n    assert 1 == 1', { maxMemoryMb: 2 });
+  const bigInput = { var: "input", value: { big: "x".repeat(6_000_000) } };
+  const afterTest = fresh.run("print(length(input.big))", { input: bigInput });
+  check("límites: después de test con maxMemoryMb, una corrida sin límites anda", afterTest.ok && afterTest.output[0] === "6000000", afterTest);
+  fresh.run("print(1)", { maxMemoryMb: 2, input: { var: "input", value: { a: 1 }, sources: { a: ["x"] } } });
+  const afterBind = fresh.run("print(length(input.big))", { input: bigInput });
+  check("límites: después de un error de input con maxMemoryMb, una corrida sin límites anda", afterBind.ok, afterBind);
+}
+
+// 10b. v0.6.45 (D4) — después de un trap la API síncrona recrea la instancia sola (antes la llamada
+//      siguiente pedía `await syn.ready()`). El trap se provoca con un acceso fuera de la memoria del
+//      módulo en el mismo camino de la llamada: es un trap real y no llena la RAM.
+{
+  const inst = syn._inst;
+  const realCall = inst.call;
+  inst.call = () => inst.exports.synsema_call(0xfffffff0, 64);
+  let trapped = null;
+  try {
+    syn.run("print(1)");
+  } catch (e) {
+    trapped = e;
+  }
+  inst.call = realCall;
+  check("trap: la llamada falla diciendo que la instancia se recreó", trapped && String(trapped.message).includes("the instance was recreated"), String(trapped));
+  const r = syn.run("print(2 + 3)");
+  check("trap: la llamada siguiente anda sin ready()", r.ok && r.output[0] === "5", r);
+}
+
+// 11. v0.6.45 (D3/D2) — modo asíncrono: llamadas concurrentes se encolan (antes: "one call at a time
+//     per instance"), `workers` las reparte y `timeoutMs` corta una que no termina.
+{
+  const pool = await Synsema.load(wasmPath, { workers: 2 });
+  const many = await Promise.all(Array.from({ length: 6 }, (_, i) => pool.runAsync(`print(${i} * 2)`)));
+  check("async: 6 llamadas concurrentes terminan todas", many.every((r, i) => r.ok && r.output[0] === String(i * 2)), many);
+  let timedOut = null;
+  try {
+    await pool.runAsync("let n be 0\neach i in range(100000)\n    each j in range(100000)\n        set n to n + 1", { timeoutMs: 300 });
+  } catch (e) {
+    timedOut = e;
+  }
+  check("async: timeoutMs corta con un error claro", timedOut && String(timedOut.message).includes("did not finish in 300 ms"), String(timedOut));
+  const again = await pool.runAsync("print(7)");
+  check("async: después del timeout el pool sigue", again.ok && again.output[0] === "7", again);
+  await pool.close();
+  // Auditoría de v0.6.45 (A5, M8): con un solo Worker, el timeout de una llamada encolada no mata a
+  // la que está corriendo (el reloj arranca cuando la llamada empieza), y la que espera detrás de una
+  // que vence no queda colgada: va a otro Worker. Tres llamadas al arrancar crean UN Worker.
+  const one = await Synsema.load(wasmPath, { workers: 1 });
+  // ~1,3 s: bastante más que el timeout de la encolada de atrás.
+  const longA = "let n be 0\neach i in range(8000)\n    each j in range(1000)\n        set n to n + 1\nprint(n)";
+  const [a, b, c] = await Promise.allSettled([
+    one.runAsync(longA),
+    one.runAsync("print(2)", { timeoutMs: 300 }),
+    one.runAsync("print(3)"),
+  ]);
+  check("async: el timeout de una encolada no mata a la que corre", a.status === "fulfilled" && a.value.ok, a);
+  check("async: la encolada con timeout corre cuando le toca", b.status === "fulfilled" && b.value.output[0] === "2", b);
+  check("async: la de atrás termina", c.status === "fulfilled" && c.value.output[0] === "3", c);
+  check("async: workers 1 = un Worker aunque lleguen juntas", one._bridges.length === 1, one._bridges.length);
+  const hang = "let n be 0\neach i in range(100000)\n    each j in range(100000)\n        set n to n + 1";
+  const [h, behind] = await Promise.allSettled([one.runAsync(hang, { timeoutMs: 300 }), one.runAsync("print(9)")]);
+  check("async: la que vence falla con su timeout", h.status === "rejected" && String(h.reason.message).includes("did not finish in 300 ms"), String(h.reason));
+  check("async: la que esperaba detrás no queda colgada", behind.status === "fulfilled" && behind.value.output[0] === "9", behind);
+  await one.close();
+  // Ronda 2 (M8, B1): `close()` es final, también para un Worker que está naciendo, y una ráfaga se
+  // reparte entre los Workers.
+  const late = await Synsema.load(wasmPath, { workers: 1 });
+  const pendingCall = late.runAsync("print(1)");
+  await late.close();
+  const lateR = await pendingCall.then((v) => ({ ok: true, v }), (e) => ({ ok: false, e: String(e.message) }));
+  check("async: close() mientras nace el Worker: lo encolado falla con closed", !lateR.ok && lateR.e.includes("closed"), lateR);
+  await new Promise((r) => setTimeout(r, 1500));
+  check("async: close() mientras nace el Worker: no queda ninguno", (late._bridges ?? []).length === 0 && (late._spawning ?? 0) === 0, late._bridges);
+  const afterClose = await late.runAsync("print(1)").then(() => "ok", (e) => String(e.message));
+  check("async: después de close() una llamada falla con closed", afterClose.includes("closed"), afterClose);
+  const two = await Synsema.load(wasmPath, { workers: 2 });
+  await two.runAsync("print(0)");
+  const t0 = performance.now();
+  await two.runAsync(longA);
+  const single = performance.now() - t0;
+  // Estructural, no por tiempo (la proporción depende de la carga de la máquina): a los 300 ms de la
+  // ráfaga, los dos Workers corren a la vez.
+  const burstCalls = Promise.all([1, 2, 3, 4].map(() => two.runAsync(longA)));
+  await new Promise((r) => setTimeout(r, 300));
+  const busyNow = two._bridges.filter((b) => b.busy()).length;
+  await burstCalls;
+  check("async: una ráfaga de 4 con workers 2 usa los dos a la vez", two._bridges.length === 2 && busyNow === 2, { single, busyNow, n: two._bridges.length });
+  await two.close();
+}
+
+// 12. v0.6.45 (D5) — `loadNode()` encuentra el .wasm del paquete sin rutas del usuario.
+{
+  const { copyFileSync, existsSync: ex } = await import("node:fs");
+  const pkgWasm = resolve(root, "packages/synsema-wasm/synsema.wasm");
+  const backup = ex(pkgWasm) ? readFileSync(pkgWasm) : null;
+  copyFileSync(wasmPath, pkgWasm);
+  try {
+    const n = await Synsema.loadNode();
+    await n.ready();
+    const r = n.run("print(40 + 2)");
+    check("loadNode: carga el synsema.wasm del paquete", r.ok && r.output[0] === "42", r);
+  } finally {
+    if (backup) {
+      const { writeFileSync } = await import("node:fs");
+      writeFileSync(pkgWasm, backup);
+    }
+  }
+}
+
+// 13. v0.6.45 — state_merge / state_cas en wasm. Con KV del host son atómicos sólo si el host
+//     ofrece `kv.cas`; sin él lo dicen. Sin host, el estado es de la instancia.
+{
+  const store = new Map();
+  let interfere = 0; // > 0: el próximo cas "pierde" contra otro escritor, que escribe en el medio
+  const kv = {
+    get: (ns, k) => store.get(`${ns}/${k}`) ?? null,
+    set: (ns, k, v) => { store.set(`${ns}/${k}`, v); },
+    list: (ns) => [...store.keys()].filter((k) => k.startsWith(ns + "/")).map((k) => k.slice(ns.length + 1)),
+    cas: (ns, k, expected, v) => {
+      const key = `${ns}/${k}`;
+      if (interfere > 0) {
+        interfere--;
+        store.set(key, JSON.stringify({ ...JSON.parse(store.get(key) ?? "{}"), otro: true }));
+        return false;
+      }
+      if ((store.get(key) ?? null) !== expected) return false;
+      store.set(key, v);
+      return true;
+    },
+  };
+  const host = { kv };
+  const a = syn.run('print(state_merge("canales", {"a": true}))', { host });
+  interfere = 1;
+  const b = syn.run('let m be state_merge("canales", {"b": true})\nprint(keys(m))', { host });
+  check("state_merge: con kv.cas reintenta y no pierde lo del otro escritor", a.ok && b.ok && ["a", "b", "otro"].every((k) => b.output[0].includes(k)), { a, b });
+  const c = syn.run('print(state_cas("v", nothing, 1))\nprint(state_cas("v", nothing, 2))\nprint(state_cas("v", 1.0, 3))\nprint(state_get("v"))', { host });
+  check("state_cas: ausente = nothing; igualdad del lenguaje (1.0 == 1)", c.ok && c.output.join(" ") === "true false true 3", c);
+  const noCas = syn.run('state_merge("x", {"a": 1})', { host: { kv: { get: kv.get, set: kv.set } } });
+  check("state_merge: un kv sin cas lo dice (no pierde escrituras en silencio)", !noCas.ok && noCas.errors[0].includes("does not offer cas"), noCas);
+  const local = syn.run('print(state_merge("x", {"a": 1}))\nprint(state_cas("y", nothing, 5))');
+  check("state_merge/state_cas sin host: estado de la instancia", local.ok && local.output[1] === "true", local);
+  // Ronda 2 (B2): un `cas` del host que no devuelve un booleano es un error del host.
+  const badCas = syn.run('state_cas("z", nothing, 1)', { host: { kv: { get: kv.get, set: kv.set, cas: () => {} } } });
+  check("state_cas: un kv.cas que no devuelve true/false lo dice", !badCas.ok && badCas.errors[0].includes("must return true or false"), badCas);
+}
+
+// 14. v0.6.45 (auditoría, ronda 2, B2) — lo que el host VE: la entropía se pide una vez por llamada
+//     (32 bytes, aunque el programa pida 1000) y, con etiquetas, el reloj sólo avanza en una
+//     interacción con el host. Se instancia a mano para espiar los imports.
+{
+  const fills = [];
+  let clockCalls = 0;
+  let fakeNow = 1_000_000;
+  let ex = null;
+  const imports = {
+    synsema_host: {
+      host_call: () => 0,
+      host_random_fill(ptr, len) {
+        fills.push(len);
+        new Uint8Array(ex.memory.buffer, ptr, len).fill(7);
+        return 0;
+      },
+      host_now_ms() {
+        clockCalls++;
+        fakeNow += 1000;
+        return fakeNow;
+      },
+    },
+  };
+  const { instance } = await WebAssembly.instantiate(readFileSync(wasmPath), imports);
+  ex = instance.exports;
+  const call = (req) => {
+    const bytes = new TextEncoder().encode(JSON.stringify(req));
+    const p = ex.synsema_alloc(bytes.length);
+    new Uint8Array(ex.memory.buffer).set(bytes, p);
+    const out = ex.synsema_call(p, bytes.length);
+    ex.synsema_free(p, bytes.length);
+    const len = new DataView(ex.memory.buffer).getUint32(out, true);
+    const json = new TextDecoder().decode(new Uint8Array(ex.memory.buffer, out + 4, len));
+    ex.synsema_free(out, 4 + len);
+    return JSON.parse(json);
+  };
+  call({ op: "run", source: "print(1)" }); // calentamiento: lo que pida la instancia al nacer
+  fills.length = 0;
+  const r = call({ op: "run", source: "require random\nprint(length(random_bytes(1000)))\nprint(length(token(64)))" });
+  check("entropía: una consulta de 32 bytes por llamada, aunque el programa pida 1000", r.ok && fills.length === 1 && fills[0] === 32, { r, fills });
+  const loop = "require time\nlet a be now()\nlet n be 0\neach i in range(2000)\n    set n to n + 1\nlet b be now()\nprint(a == b)";
+  const fenced = call({ op: "run", source: loop, labels: true });
+  check("reloj con etiquetas: now() no avanza sin una interacción con el host", fenced.ok && fenced.output[0] === "true", fenced);
+  const free = call({ op: "run", source: loop });
+  check("reloj sin etiquetas: el de siempre", free.ok && free.output[0] === "false", free);
+}
+
+// 15. v0.6.45 (auditoría, ronda 3) — bordes del paquete: un hook que devuelve algo no serializable,
+//     un `timeoutMs` fuera de rango y un hook async que rechaza en la API síncrona.
+{
+  const pool = await Synsema.load(wasmPath, { workers: 1 });
+  // Un `kv.get` que devuelve un BigInt llega tal cual a la serialización (un `http` lo frenaba antes
+  // la normalización del status): prueba `safeJson` de verdad.
+  const big = await pool.runAsync('print(state_get("x"))', {
+    host: { kv: { get: async () => 10n, set: async () => {} } },
+  }).then((r) => ({ settled: true, r }), (e) => ({ settled: true, e: String(e.message) }));
+  // El hook contesta `{error}` (safeJson); que el motor lo vea como `nothing` es el ítem del backlog
+  // "un kv.get que falla se ve como nothing" (v0.6.46).
+  check("async: un hook que devuelve un BigInt no tira el proceso ni cuelga", big.settled && big.r && big.r.ok, big);
+  const again = await pool.runAsync("print(5)");
+  check("async: después del hook roto el Worker sigue", again.ok && again.output[0] === "5", again);
+  const inf = await pool.runAsync("print(1)", { timeoutMs: Infinity }).then(() => "ok", (e) => String(e.message));
+  check("async: timeoutMs Infinity se rechaza (vencía en 1 ms)", inf.includes("timeoutMs must be"), inf);
+  await pool.close();
+  let unhandled = 0;
+  const onUnhandled = () => unhandled++;
+  process.on("unhandledRejection", onUnhandled);
+  syn.run('print(state_get("x"))', { host: { kv: { get: async () => { throw new Error("boom"); }, set: () => {} } } });
+  await new Promise((r) => setTimeout(r, 200));
+  process.off("unhandledRejection", onUnhandled);
+  check("sync: un hook async que rechaza no deja un rechazo sin manejar", unhandled === 0, unhandled);
+  // Ronda 4 (M2): reemplazar Workers por timeout no deja listeners colgados de la señal compartida.
+  const { getEventListeners } = await import("node:events");
+  const swap = await Synsema.load(wasmPath, { workers: 1 });
+  const hang = "let n be 0\neach i in range(100000)\n    each j in range(100000)\n        set n to n + 1";
+  for (let i = 0; i < 4; i++) await swap.runAsync(hang, { timeoutMs: 150 }).catch(() => {});
+  await swap.runAsync("print(1)");
+  const listeners = swap._spawnAbort ? getEventListeners(swap._spawnAbort.signal, "abort").length : 0;
+  check("async: Workers reemplazados no dejan listeners de aborto", listeners === 0, listeners);
+  // Ronda 4 (M6): un hook que lanza algo sin texto mostrable no tira el proceso ni cuelga.
+  const weird = await swap.runAsync('require net("x.test")\nlet r be fetch("https://x.test/")\nprint(r["status"])', {
+    host: { http: async () => { throw Object.create(null); } },
+    timeoutMs: 5000,
+  }).then((r) => ({ settled: true, r }), (e) => ({ settled: true, e: String(e.message) }));
+  check("async: un hook que lanza un valor raro se responde", weird.settled && !String(weird.e ?? "").includes("did not finish"), weird);
+  // `timeoutMs: 0` sigue siendo "sin plazo".
+  const zero = await swap.runAsync("print(2)", { timeoutMs: 0 });
+  check("async: timeoutMs 0 es sin plazo", zero.ok && zero.output[0] === "2", zero);
+  await swap.close();
+  // Ronda 4 (B1): en la API síncrona, un hook que devuelve un BigInt es un error de ese hook, no un trap.
+  const bigSync = syn.run('print(state_get("x"))', { host: { kv: { get: () => 10n, set: () => {} } } });
+  check("sync: un hook que devuelve un BigInt no hace trapear el módulo", typeof bigSync === "object" && bigSync.ok, bigSync);
+  // Ronda 4 (revisión, A1): con `workers: 2` y un módulo que no se puede instanciar, las llamadas
+  // fallan (no se reintenta sin pausa ni quedan colgadas) y no queda ningún arranque en vuelo.
+  const broken = new WebAssembly.Module(new Uint8Array([0, 97, 115, 109, 1, 0, 0, 0, 1, 4, 1, 96, 0, 0, 2, 9, 1, 3, 101, 110, 118, 1, 102, 0, 0]));
+  const bad = new Synsema(broken, { workers: 2 });
+  const t0 = performance.now();
+  const outcomes = await Promise.allSettled([bad.runAsync("print(1)"), bad.runAsync("print(2)")]);
+  check("async: un arranque que siempre falla rechaza las llamadas", outcomes.every((o) => o.status === "rejected"), outcomes.map((o) => o.status));
+  check("async: sin arranques en vuelo después del fallo", (bad._spawning ?? 0) === 0 && performance.now() - t0 < 10000, { spawning: bad._spawning, ms: performance.now() - t0 });
+  await bad.close();
+  let startErr = null;
+  try {
+    new Synsema(broken, { startMs: Infinity });
+  } catch (e) {
+    startErr = String(e.message);
+  }
+  check("startMs fuera de rango es un error", startErr && startErr.includes("startMs"), startErr);
+}
+
 console.log(failures ? `\n${failures} FAIL` : "\nall ok");
 process.exit(failures ? 1 : 0);

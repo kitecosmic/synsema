@@ -86,6 +86,76 @@ mod imports {
 }
 
 // =========================================================
+// v0.6.45 (D2): el allocator que cuenta (maxMemoryMb)
+// =========================================================
+
+/// El allocator del módulo: el del sistema (dlmalloc en wasm32), contando los bytes vivos en
+/// `wasm_limits::LIVE`. Con `maxMemoryMb` armado, una reserva que pasaría el techo se RECHAZA
+/// (devuelve null): Rust no sigue sin esa memoria y el módulo hace trap, pero `HIT` queda prendido y
+/// el paquete JS lo traduce en un error de la corrida. Sin límite armado el costo es una suma
+/// atómica relajada por reserva (un hilo: no hay contención).
+#[cfg(target_arch = "wasm32")]
+struct CountingAlloc;
+
+#[cfg(target_arch = "wasm32")]
+unsafe impl std::alloc::GlobalAlloc for CountingAlloc {
+    unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+        if !synsema_core::wasm_limits::reserve(layout.size()) {
+            return std::ptr::null_mut();
+        }
+        let p = std::alloc::System.alloc(layout);
+        if p.is_null() {
+            synsema_core::wasm_limits::release(layout.size());
+        }
+        p
+    }
+    unsafe fn alloc_zeroed(&self, layout: std::alloc::Layout) -> *mut u8 {
+        if !synsema_core::wasm_limits::reserve(layout.size()) {
+            return std::ptr::null_mut();
+        }
+        let p = std::alloc::System.alloc_zeroed(layout);
+        if p.is_null() {
+            synsema_core::wasm_limits::release(layout.size());
+        }
+        p
+    }
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
+        std::alloc::System.dealloc(ptr, layout);
+        synsema_core::wasm_limits::release(layout.size());
+    }
+    unsafe fn realloc(&self, ptr: *mut u8, layout: std::alloc::Layout, new_size: usize) -> *mut u8 {
+        let old = layout.size();
+        if new_size > old && !synsema_core::wasm_limits::reserve(new_size - old) {
+            return std::ptr::null_mut();
+        }
+        let p = std::alloc::System.realloc(ptr, layout, new_size);
+        if p.is_null() {
+            if new_size > old {
+                synsema_core::wasm_limits::release(new_size - old);
+            }
+        } else if new_size < old {
+            synsema_core::wasm_limits::release(old - new_size);
+        }
+        p
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+#[global_allocator]
+static ALLOC: CountingAlloc = CountingAlloc;
+
+/// v0.6.45 (D2) — `1` si la última corrida pasó `maxMemoryMb` (el allocator rechazó una reserva y
+/// el módulo hizo trap). El host lo pregunta DESPUÉS del trap, sobre la misma instancia, para
+/// devolver un error en vez del trap; no reserva nada.
+#[no_mangle]
+pub extern "C" fn synsema_limit_hit() -> u32 {
+    #[cfg(target_arch = "wasm32")]
+    return synsema_core::wasm_limits::HIT.load(std::sync::atomic::Ordering::Relaxed) as u32;
+    #[cfg(not(target_arch = "wasm32"))]
+    0
+}
+
+// =========================================================
 // memoria: buffers `[u32 LE len][bytes]`
 // =========================================================
 
@@ -152,6 +222,7 @@ fn host_call_json(kind: &str, payload: &Value) -> Option<Value> {
     let raw = unsafe {
         imports::host_call(kind.as_ptr(), kind.len() as u32, p.as_ptr(), p.len() as u32)
     };
+    tick_fenced_clock();
     let bytes = unsafe { unpack_and_free(raw) }?;
     if bytes.is_empty() {
         return Some(Value::Null);
@@ -298,6 +369,21 @@ impl HostProvider for WebHost {
             _ => Ok(()),
         })
     }
+    fn kv_cas(&self, ns: &str, key: &str, expected: Option<&str>, value: &str) -> Option<Result<bool, String>> {
+        if !self.offers("kv_cas") {
+            return None;
+        }
+        let r = host_call_json("kv_cas", &json!({"ns": ns, "key": key, "expected": expected, "value": value}))?;
+        Some(match r.get("error").and_then(Value::as_str) {
+            Some(e) if !e.is_empty() => Err(e.to_string()),
+            // v0.6.45: un `swapped` que no es booleano es un host roto, no "otro escribió" (antes
+            // contaba como false y se reintentaba 64 veces hasta "kept changing").
+            _ => match r.get("swapped") {
+                Some(Value::Bool(b)) => Ok(*b),
+                other => Err(format!("kv.cas must answer {{swapped: true|false}}, got {}", other.map(|v| v.to_string()).unwrap_or_else(|| "nothing".to_string()))),
+            },
+        })
+    }
     fn kv_list(&self, ns: &str) -> Option<Vec<String>> {
         if !self.offers("kv") {
             return None;
@@ -340,16 +426,80 @@ impl HostProvider for WebHost {
 // entropía + reloj + pausa del host
 // =========================================================
 
+// v0.6.45 (auditoría, ronda 2, B2) — el host ve la FORMA de lo que se le pide, no sólo el contenido:
+// `random_bytes(n)` le pedía `n` bytes (y con `n` privado, el host leía `n`), y `now()` dentro de una
+// rama privada le avisaba que la rama se tomó. Ahora:
+// - **Entropía:** al empezar cada llamada se le piden al host 32 bytes fijos, que siembran un
+//   generador ChaCha propio de la corrida; `random_bytes`/`token`/`random()` y el cegado de RSA salen
+//   de ahí y nunca vuelven a llamar al host. Fuera de una llamada (al iniciar la instancia, sin
+//   programa corriendo) se le pide directo, como antes.
+// - **Reloj, con etiquetas:** `now()` devuelve la última lectura, que se toma al empezar y en cada
+//   interacción con el host (que ya es pública: un sumidero no corre en una rama privada). Cuándo y
+//   cuántas veces se llamó a `now()` no sale. Sin etiquetas, el reloj de siempre.
+
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+thread_local! {
+    static RUN_RNG: RefCell<Option<rand::rngs::StdRng>> = const { RefCell::new(None) };
+}
+
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+fn host_fill(buf: &mut [u8]) -> bool {
+    unsafe { imports::host_random_fill(buf.as_mut_ptr(), buf.len() as u32) == 0 }
+}
+
+/// Siembra el generador de la corrida (una consulta de 32 bytes al host). Sin entropía del host,
+/// la corrida no tiene generador y lo que lo necesite falla con un error claro.
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+fn seed_run_rng() {
+    use rand::SeedableRng;
+    let mut seed = [0u8; 32];
+    let rng = host_fill(&mut seed).then(|| rand::rngs::StdRng::from_seed(seed));
+    RUN_RNG.with(|r| *r.borrow_mut() = rng);
+}
+
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+fn end_run_rng() {
+    RUN_RNG.with(|r| *r.borrow_mut() = None);
+}
+
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 fn host_getrandom(buf: &mut [u8]) -> Result<(), getrandom::Error> {
-    let rc = unsafe { imports::host_random_fill(buf.as_mut_ptr(), buf.len() as u32) };
-    if rc == 0 {
+    use rand::RngCore;
+    // Dentro de una llamada: el generador de la corrida (el host no ve cuánto se pide).
+    let in_run = RUN_RNG.with(|r| r.borrow_mut().as_mut().map(|g| g.fill_bytes(buf)).is_some());
+    if in_run || (!IN_CALL.with(|c| c.get()) && host_fill(buf)) {
         Ok(())
     } else {
         // Código custom (getrandom reserva el rango ≥ CUSTOM_START para el embebedor).
         let code = core::num::NonZeroU32::new(getrandom::Error::CUSTOM_START + 1).expect("non-zero");
         Err(getrandom::Error::from(code))
     }
+}
+
+thread_local! {
+    /// ¿Hay una llamada en curso? (`call_json` la marca.)
+    static IN_CALL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Reloj cercado (con etiquetas): la última lectura del host, en segundos.
+    static FENCED_CLOCK: std::cell::Cell<Option<f64>> = const { std::cell::Cell::new(None) };
+}
+
+fn host_now_secs() -> f64 {
+    let ms = unsafe { imports::host_now_ms() };
+    ms / 1000.0
+}
+
+/// Con etiquetas encendidas, el reloj de la corrida es una lectura en un momento público.
+fn fence_clock(on: bool) {
+    FENCED_CLOCK.with(|c| c.set(on.then(host_now_secs)));
+}
+
+/// Una interacción con el host (pública): el reloj cercado avanza acá.
+fn tick_fenced_clock() {
+    FENCED_CLOCK.with(|c| {
+        if c.get().is_some() {
+            c.set(Some(host_now_secs()));
+        }
+    });
 }
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 getrandom::register_custom_getrandom!(host_getrandom);
@@ -364,7 +514,7 @@ fn init_once() {
     if done {
         return;
     }
-    synsema_core::clock::set_clock(Some(Box::new(|| unsafe { imports::host_now_ms() } / 1000.0)));
+    synsema_core::clock::set_clock(Some(Box::new(|| FENCED_CLOCK.with(|c| c.get()).unwrap_or_else(host_now_secs))));
     synsema_core::clock::set_sleep(Some(Box::new(|secs: f64| {
         if let Some(p) = hostcap::provider() {
             p.sleep(secs);
@@ -399,8 +549,8 @@ fn opts_from(req: &Map<String, Value>) -> Result<RunOptions, String> {
         _ => Some(HashMap::new()),
     };
     let ceiling = match req.get("ceiling") {
-        Some(Value::String(s)) => synsema_wasm::parse_ceiling(s)?,
-        Some(Value::Bool(true)) => synsema_wasm::parse_ceiling("sandbox")?,
+        Some(Value::String(s)) => synsema_wasm::parse_ceiling(s).map_err(|e| format!("ceiling: {}", e))?,
+        Some(Value::Bool(true)) => synsema_wasm::parse_ceiling("sandbox").map_err(|e| format!("ceiling: {}", e))?,
         _ => None,
     };
     // `"labels": true` enciende las etiquetas de flujo; `"result": "<var>"` pide
@@ -432,7 +582,16 @@ fn opts_from(req: &Map<String, Value>) -> Result<RunOptions, String> {
         Some(_) => return Err("input must be an object {var, value, sources?}".to_string()),
     };
     // Este artefacto no tiene FS en ningún host (los archivos van por `env`/fuente).
-    Ok(RunOptions { filename, env, ceiling, no_fs: true, labels, result, input, sources })
+    // v0.6.45 (D2): `"max_steps"` y `"max_memory_mb"` (enteros positivos) — los límites de la corrida.
+    let limit = |k: &str| -> Result<Option<u64>, String> {
+        match req.get(k) {
+            None | Some(Value::Null) => Ok(None),
+            Some(v) => v.as_u64().filter(|n| *n > 0).map(Some).ok_or_else(|| format!("{} must be a positive integer", k)),
+        }
+    };
+    let max_steps = limit("max_steps")?;
+    let max_memory_mb = limit("max_memory_mb")?;
+    Ok(RunOptions { filename, env, ceiling, no_fs: true, labels, result, input, sources, max_steps, max_memory_mb })
 }
 
 fn install_host(req: &Map<String, Value>) {
@@ -483,8 +642,10 @@ fn dispatch(req: &Map<String, Value>) -> Value {
             };
             let opts = match opts_from(req) {
                 Ok(o) => o,
-                Err(e) => return err_response(&format!("ceiling: {}", e)),
+                // El prefijo lo pone cada opción (`ceiling: …`, `max_steps must be …`).
+                Err(e) => return err_response(&e),
             };
+            fence_clock(opts.labels);
             install_host(req);
             match op {
                 "run" => {
@@ -495,7 +656,12 @@ fn dispatch(req: &Map<String, Value>) -> Value {
                     out.insert("errors".into(), json!(r.errors));
                     out.insert("audit".into(), audit_json(&r.audit));
                     out.insert("llm_tokens".into(), json!(r.llm_tokens));
-                    out.insert("steps".into(), json!(r.steps));
+                    // Ronda 3 (M3): con una rama o un valor privado en la corrida, `steps` no se
+                    // publica (cuántos pasos dio dependía del dato), como en el nativo.
+                    out.insert(
+                        "steps".into(),
+                        if opts.labels && r.private_seen { Value::Null } else { json!(r.steps) },
+                    );
                     // v0.6.42 — el código de salida, con el mismo nombre que `run --format json`:
                     // el de `exit(code)` si lo pidió, si no 0/1 según `ok`.
                     out.insert("exit".into(), json!(r.exit_code.unwrap_or(if r.ok { 0 } else { 1 })));
@@ -558,11 +724,31 @@ fn dispatch(req: &Map<String, Value>) -> Value {
 /// `synsema_call`, usable desde Rust nativo en los tests).
 pub fn call_json(request: &str) -> String {
     init_once();
+    // v0.6.45 (D2; ronda 2, M1): ninguna llamada hereda los límites de otra. Se desarman al entrar y
+    // al salir: `test` y un error de `bind_input` volvían sin desarmar, y la llamada siguiente (aun
+    // sin límites, o el `synsema_alloc` del host para escribirle el pedido) moría por el tope de la
+    // anterior. Este artefacto cuenta la memoria (el allocator de arriba): `maxMemoryMb` se cumple,
+    // también cuando el embebedor llama acá sin pasar por `synsema_call` (el guest de Vela).
+    #[cfg(target_arch = "wasm32")]
+    {
+        synsema_core::wasm_limits::COUNTING.store(true, std::sync::atomic::Ordering::Relaxed);
+        synsema_core::wasm_limits::disarm();
+        synsema_core::wasm_limits::HIT.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+    seed_run_rng();
+    IN_CALL.with(|c| c.set(true));
     let resp = match serde_json::from_str::<Value>(request) {
         Ok(Value::Object(m)) => dispatch(&m),
         Ok(_) => err_response("the request must be a JSON object"),
         Err(e) => err_response(&format!("invalid request JSON: {}", e)),
     };
+    #[cfg(target_arch = "wasm32")]
+    synsema_core::wasm_limits::disarm();
+    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+    end_run_rng();
+    IN_CALL.with(|c| c.set(false));
+    fence_clock(false);
     hostcap::install(None);
     resp.to_string()
 }

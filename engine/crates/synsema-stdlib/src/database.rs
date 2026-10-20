@@ -146,6 +146,11 @@ impl DatabaseManager {
     /// SQLite (camino actual, sin cambios). Devuelve la key usada como identificador
     /// (canon_url para los remotos; ruta/`:memory:` para SQLite).
     pub fn open(&mut self, target: &str, mode: &str) -> Result<String, String> {
+        // Ronda 4 (revisión, B6): la URL de un servidor llega al driver con el esquema en minúscula y
+        // sin espacios adelante — lo mismo que ve el gate (`is_db_url`/`canon_url`); si no,
+        // `"POSTGRES://…"` pasaba el gate como URL y el driver lo leía como `clave=valor`.
+        let normalized = normalize_db_url(target);
+        let target = normalized.as_str();
         if is_mongo_url(target) {
             let key = canon_url(target);
             if self.connections.contains_key(&key) {
@@ -195,12 +200,59 @@ impl DatabaseManager {
             if self.connections.contains_key(&key) {
                 return Ok(key);
             }
+            // v0.6.45 — se abre la ruta NORMALIZADA, la misma que chequeó `require db(...)` (antes se
+            // abría la cruda y en Unix `link/..` llevaba a otro lado).
+            let path = synsema_core::capscope::normalize_path(target);
+            // Ronda 2 (A4) y ronda 3 (A1, A2): una URI `file:` de SQLite (`file:%2Fetc%2Fx.db`) o una
+            // ruta con `://` nombran otro lugar que el que ve el scope. Se mira la ruta que SE ABRE
+            // (`./file:…` y `x/../file:…` normalizan a `file:…`), y además una ruta relativa se abre
+            // como `./<ruta>`: SQLite sólo toma como URI lo que empieza literalmente con `file:`.
+            if path.get(..5).is_some_and(|p| p.eq_ignore_ascii_case("file:")) || path.contains("://") {
+                return Err(format!(
+                    "db_open: {:?} is not a database path (a `file:` URI or a `://` URL that is not a known server); open the database by its path, e.g. db_open(\"./data/app.db\")",
+                    target
+                ));
+            }
+            let rooted = path.starts_with('/') || matches!(path.as_bytes(), [c, b':', ..] if c.is_ascii_alphabetic());
+            let path = if rooted || path == ":memory:" { path } else { format!("./{}", path) };
             let conn = match mode {
-                "readonly" => Connection::open_with_flags(target, OpenFlags::SQLITE_OPEN_READ_ONLY),
+                "readonly" => Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY),
                 "memory" => Connection::open_in_memory(),
-                _ => Connection::open(target),
+                _ => Connection::open(&path),
             }
             .map_err(|e| e.to_string())?;
+            // Ronda 3 (B3): modo defensivo — sin `writable_schema`, `journal_mode=OFF` ni escrituras
+            // a mano en el esquema o en las tablas internas de FTS5, que con un esquema armado le
+            // hacían llegar texto no UTF-8 al authorizer. El esquema NO se marca como no confiable
+            // (ronda 4, M1): eso rompía `MATCH`/`bm25()`/`snippet()` dentro de vistas y triggers de
+            // una base existente, y no protege nada acá (Synsema no registra funciones SQL propias
+            // ni habilita `load_extension`).
+            conn.set_db_config(rusqlite::config::DbConfig::SQLITE_DBCONFIG_DEFENSIVE, true)
+                .map_err(|e| e.to_string())?;
+            // v0.6.45 — `ATTACH DATABASE '<ruta>'` y `VACUUM INTO '<ruta>'` (que por dentro hace un
+            // ATTACH) abrían o creaban cualquier archivo sin pasar por `require db(...)`; con una
+            // inyección SQL, la ruta la elegía un atacante. Se rechaza el ATTACH a un archivo; el de
+            // una base temporal (`''`, lo que usa un VACUUM normal) o `:memory:` sigue. Otra base se
+            // abre con `db_open`, que pasa por el gate.
+            // Ronda 2 (A3): con el nombre como EXPRESIÓN (`ATTACH ? AS x`, `ATTACH 'a'||'.db'`),
+            // SQLite le pasa NULL al authorizer y rusqlite lo da como `Unknown { SQLITE_ATTACH }`:
+            // también se rechaza. Y los pragmas que cambian, para todo el proceso, dónde caen las
+            // rutas relativas y los temporales de SQLite (B5).
+            conn.authorizer(Some(|ctx: rusqlite::hooks::AuthContext<'_>| {
+                use rusqlite::hooks::{AuthAction, Authorization};
+                match ctx.action {
+                    AuthAction::Attach { filename } if filename.is_empty() || filename == ":memory:" => Authorization::Allow,
+                    AuthAction::Attach { .. } => Authorization::Deny,
+                    AuthAction::Unknown { code, .. } if code == rusqlite::ffi::SQLITE_ATTACH => Authorization::Deny,
+                    AuthAction::Pragma { pragma_name, .. }
+                        if pragma_name.eq_ignore_ascii_case("data_store_directory")
+                            || pragma_name.eq_ignore_ascii_case("temp_store_directory") =>
+                    {
+                        Authorization::Deny
+                    }
+                    _ => Authorization::Allow,
+                }
+            }));
             self.connections.insert(key.clone(), Backend::Sqlite(conn));
             if self.default_db.is_none() {
                 self.default_db = Some(key.clone());
@@ -609,7 +661,28 @@ fn syn_to_value(v: &SynValue) -> Value {
 // -- Postgres: conexión, rewriter, bind, lectura --
 
 fn is_pg_url(target: &str) -> bool {
-    target.starts_with("postgres://") || target.starts_with("postgresql://")
+    scheme_is(target, &["postgres://", "postgresql://"])
+}
+
+/// Una URL de servidor con el esquema en minúscula y sin espacios adelante; cualquier otra cosa (una
+/// ruta de SQLite), tal cual.
+fn normalize_db_url(target: &str) -> String {
+    if !synsema_core::capscope::is_db_url(target) {
+        return target.to_string();
+    }
+    let t = target.trim_start();
+    match t.split_once("://") {
+        Some((scheme, rest)) => format!("{}://{}", scheme.to_ascii_lowercase(), rest),
+        None => t.to_string(),
+    }
+}
+
+/// Ronda 4 (N2): el esquema de una URL de base, con el MISMO criterio que el gate
+/// (`capscope::is_db_url`: sin distinguir mayúsculas ni espacios al principio). Si no, el gate decía
+/// URL y `open` decía SQLite.
+fn scheme_is(target: &str, schemes: &[&str]) -> bool {
+    let l = target.trim_start().to_ascii_lowercase();
+    schemes.iter().any(|s| l.starts_with(s))
 }
 
 /// Mapea un error de Postgres a un mensaje útil: el `Display` de `postgres::Error` solo da
@@ -1020,7 +1093,7 @@ fn pg_cell_to_syn(row: &postgres::Row, i: usize, ty: &Type) -> SynValue {
 // -- MySQL: conexión, TLS opt-in, bind, lectura (M2) --
 
 fn is_mysql_url(target: &str) -> bool {
-    target.starts_with("mysql://")
+    scheme_is(target, &["mysql://"])
 }
 
 /// Mapea un error del crate `mysql` a un mensaje útil. Su `Display` ya incluye el detalle
@@ -1249,7 +1322,7 @@ fn mysql_cell_to_syn(v: mysql::Value, col: &mysql::Column) -> SynValue {
 // -- MongoDB: conexión, errores, conversión SynValue <-> BSON (M3) --
 
 fn is_mongo_url(target: &str) -> bool {
-    target.starts_with("mongodb://") || target.starts_with("mongodb+srv://")
+    scheme_is(target, &["mongodb://", "mongodb+srv://"])
 }
 
 /// Mapea un error del crate `mongodb` a un mensaje útil (su `Display` ya trae detalle del
@@ -1408,7 +1481,7 @@ fn bson_to_syn(b: &Bson) -> SynValue {
 // -- Redis: conexión, errores, conversión SynValue <-> redis::Value (M4) --
 
 fn is_redis_url(target: &str) -> bool {
-    target.starts_with("redis://") || target.starts_with("rediss://")
+    scheme_is(target, &["redis://", "rediss://"])
 }
 
 /// Mapea un error del crate `redis` a un mensaje útil (su `Display` ya trae el detalle: kind +
@@ -1749,6 +1822,17 @@ pub fn register_database_builtins<H: DbHandle>(
             Rc::new(move |_i, args, _loc| {
                 let target = raw_str(args.first().ok_or_else(|| err("missing argument"))?);
                 let mode = args.get(1).map(raw_str).unwrap_or_else(|| "readwrite".to_string());
+                // Ronda 2 (A4): la URI `file:` se rechaza ANTES del gate, con su propio mensaje (la
+                // forma que se abre la vuelve a mirar `open`).
+                let norm = synsema_core::capscope::normalize_path(&target);
+                if (norm.get(..5).is_some_and(|p| p.eq_ignore_ascii_case("file:")) || norm.contains("://"))
+                    && !synsema_capabilities::model::is_db_url(&target)
+                {
+                    return Err(err(format!(
+                        "db_open: {:?} is not a database path (a `file:` URI or a `://` URL that is not a known server); open the database by its path, e.g. db_open(\"./data/app.db\")",
+                        target
+                    )));
+                }
                 require_db(&caps, &db_scope_for(&target, &mode), "db_open()")?;
                 db.write(|m| m.open(&target, &mode)).map_err(err)?;
                 Ok(syn_bool(true))

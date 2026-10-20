@@ -12,6 +12,7 @@
 intent: "Serve a waitlist landing page and collect signups"
 
 require serve(8090)
+require file.read("./examples/public/**")
 require db(":memory:")
 require time
 

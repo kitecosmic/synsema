@@ -425,13 +425,11 @@ fn run_bundled(bundle: synsema_core::bundle::Bundle, program_args: Vec<String>) 
             (c, _) => c,
         };
         let result = run_serve_program_with_overrides(&source, &filename, s.secure, ov);
-        if !result.success {
-            for e in &result.errors {
-                eprintln!("{}", e);
-            }
-            return ExitCode::from(1);
+        for e in &result.errors {
+            eprintln!("{}", e);
         }
-        return ExitCode::SUCCESS;
+        // v0.6.45 (A5): un `exit(code)` antes de escuchar decide el código, como en `run`.
+        return ExitCode::from(run_exit_code(&result));
     }
     synsema_core::interpreter::LIVE_STDOUT.store(true, std::sync::atomic::Ordering::Relaxed);
     let result = run_program_ceiled(&source, &filename, ceiling);
@@ -484,7 +482,11 @@ fn main() -> ExitCode {
         // Un build `--no-console` (subsistema GUI) usado como CLI: que se vea en la consola
         // del padre si la hay (cmd/PowerShell); sin consola padre no cambia nada.
         stdio::attach_parent_console();
-    } else {
+    }
+    // v0.6.45 (A6): sin consola (un build `--no-console` en modo programa), los hijos con pipes de
+    // `run`/`proc_spawn`/`run_program` se crean sin ventana.
+    synsema_capabilities::secure::set_child_no_window(!stdio::has_console());
+    if !engine_prefix {
         match std::env::current_exe()
             .map_err(|e| e.to_string())
             .and_then(|p| synsema_core::bundle::detect(&p))
@@ -1452,15 +1454,13 @@ fn cmd_serve(args: &[String]) -> ExitCode {
 
     // Bloquea mientras el server corra; sólo retorna si no se levantó o falló.
     let result = run_serve_program_with_overrides(&source, &path, secure, ov);
-    if !result.success {
-        for e in &result.errors {
-            eprintln!("{}", e);
-        }
-        audit::summary(1);
-        return ExitCode::from(1);
+    for e in &result.errors {
+        eprintln!("{}", e);
     }
-    audit::summary(0);
-    ExitCode::SUCCESS
+    // v0.6.45 (A5): un `exit(code)` antes de escuchar decide el código, como en `run`.
+    let code = run_exit_code(&result);
+    audit::summary(code as i32);
+    ExitCode::from(code)
 }
 
 /// run <archivo.syn> [--flat] [--explain] [--format human|json]: ejecuta el programa,
@@ -2095,6 +2095,171 @@ fn run_serve_watch(entry: &str) -> ExitCode {
 /// caps` (declaradas / necesarias / faltantes, con importadores transitivos) y lo vuelca en
 /// una línea por capability faltante. Las ambiente bajo `run` (`time`, `llm`, `stdout`) no
 /// gritan: se auto-conceden ahí y `code caps` las marca aparte.
+/// v0.6.45 (A11, decisión V1-C6) — `fetch(url, "POST", …)` posicional sale en v1. Sólo se avisa
+/// cuando el segundo argumento es un literal que no es un mapa (texto o `nothing`): un segundo
+/// argumento variable puede ser el mapa de opciones, y ahí no se adivina.
+fn deprecated_fetch_warnings(program: &synsema_core::ast::Program, path: &str) -> Vec<String> {
+    use synsema_core::ast::NodeKind as NK;
+    let mut out = Vec::new();
+    for stmt in &program.statements {
+        synsema_core::ast_api::walk(stmt, &mut |n| {
+            let NK::TaskCall { name, arguments } = &n.kind else { return };
+            if !matches!(&name.kind, NK::Identifier { name } if name == "fetch") {
+                return;
+            }
+            let Some(second) = arguments.get(1) else { return };
+            if is_positional_literal(&second.value.kind) {
+                out.push(format!(
+                    "{}:{}: warning: fetch(url, method, headers, body, timeout) is deprecated and goes away in v1 — write fetch(url, {{\"method\": …, \"headers\": …, \"body\": …, \"timeout\": …}})",
+                    path, n.location.line
+                ));
+            }
+        });
+    }
+    out
+}
+
+/// v0.6.45 (B8) — los builtins HTTP con más de dos opcionales: del tercero en adelante van por
+/// nombre (`http_get(url, headers, query, timeout = 10)`). Cada fila: (builtin, obligatorios,
+/// nombres de todos los parámetros en orden).
+const NAMED_AFTER_TWO: &[(&str, usize, &[&str])] = &[
+    ("http", 2, &["method", "url", "headers", "query", "body", "timeout"]),
+    ("http_bytes", 2, &["method", "url", "headers", "query", "body", "timeout"]),
+    ("http_get", 1, &["url", "headers", "query", "timeout"]),
+    ("http_post", 1, &["url", "body", "headers", "timeout"]),
+    ("http_put", 1, &["url", "body", "headers", "timeout"]),
+];
+
+fn positional_beyond_two_warnings(program: &synsema_core::ast::Program, path: &str) -> Vec<String> {
+    use synsema_core::ast::NodeKind as NK;
+    let mut out = Vec::new();
+    for stmt in &program.statements {
+        synsema_core::ast_api::walk(stmt, &mut |n| {
+            let NK::TaskCall { name, arguments } = &n.kind else { return };
+            let NK::Identifier { name: callee } = &name.kind else { return };
+            let Some((f, req, names)) = NAMED_AFTER_TWO.iter().find(|(f, _, _)| *f == callee.as_str()) else { return };
+            let positional = arguments.iter().filter(|a| a.name.is_none()).count();
+            if positional > req + 2 {
+                let extra: Vec<&str> = names[req + 2..positional.min(names.len())].to_vec();
+                out.push(format!(
+                    "{}:{}: warning: {}() takes at most two optional arguments by position; pass {} by name ({} = …) — the positional form goes away in v1",
+                    path,
+                    n.location.line,
+                    f,
+                    extra.join(", "),
+                    extra[0]
+                ));
+            }
+        });
+    }
+    out
+}
+
+fn is_positional_literal(k: &synsema_core::ast::NodeKind) -> bool {
+    use synsema_core::ast::NodeKind as NK;
+    match k {
+        NK::TextLiteral { .. } => true,
+        NK::Identifier { name } => name == "nothing",
+        _ => false,
+    }
+}
+
+/// v0.6.45 (A10) — una llamada `f(...)` a un nombre que no existe en ningún lado (`without(xs, k)`
+/// sin `task without` ni builtin) pasaba `check` y fallaba recién cuando esa línea corría
+/// (`Undefined variable: 'without'`). Conservador a propósito, para no dar falsos positivos: avisa
+/// sólo si el nombre no es un builtin del motor (la lista sale del wiring real, no de una tabla) y no
+/// aparece definido en NINGÚN lugar del archivo (task, `let`, parámetro, variable de `each`/`recover`
+/// /`observe`, tipo, variante, agente, alias, grupo de rutas, parámetro de ruta, patrón) ni usado como
+/// valor (un nombre que viaja como valor puede ser una lambda). Sin alcances: si está definido en otro
+/// lado del archivo, no se juzga. Las llamadas `alias.f()` ya las cubre el aviso de exports.
+fn undefined_call_warnings(program: &synsema_core::ast::Program, path: &str) -> Vec<String> {
+    use synsema_core::ast::{Node, NodeKind as NK};
+    use std::collections::HashSet;
+    let mut defined: HashSet<String> = HashSet::new();
+    let mut callees: HashSet<*const Node> = HashSet::new();
+    let mut calls: Vec<(String, usize)> = Vec::new();
+    for stmt in &program.statements {
+        synsema_core::ast_api::walk(stmt, &mut |n| {
+            match &n.kind {
+                NK::TaskCall { name, .. } => {
+                    if let NK::Identifier { name: callee } = &name.kind {
+                        callees.insert(name.as_ref() as *const Node);
+                        calls.push((callee.to_string(), n.location.line));
+                    }
+                }
+                NK::TaskDefinition { name, parameters, .. } => {
+                    defined.insert(name.clone());
+                    defined.extend(parameters.iter().map(|p| p.name.to_string()));
+                }
+                NK::LambdaExpression { parameters, .. } => defined.extend(parameters.iter().map(|p| p.to_string())),
+                NK::LetBinding { name, .. } => {
+                    defined.insert(name.to_string());
+                }
+                NK::EachStatement { variable, .. } => {
+                    defined.insert(variable.to_string());
+                }
+                NK::TryRecover { error_variable, .. } => {
+                    defined.insert(error_variable.clone());
+                }
+                NK::ObserveStatement { variable, .. } => {
+                    defined.insert(variable.clone());
+                }
+                NK::TypeDefinition { name, .. } | NK::AgentDefinition { name, .. } | NK::RoutesDeclaration { name, .. } => {
+                    defined.insert(name.clone());
+                }
+                NK::EnumDefinition { name, variants } => {
+                    defined.insert(name.clone());
+                    defined.extend(variants.iter().map(|(v, _)| v.clone()));
+                }
+                NK::UseImport { alias, .. } => {
+                    defined.insert(alias.clone());
+                }
+                NK::RouteDefinition { param_names, .. } => defined.extend(param_names.iter().cloned()),
+                NK::ExpectStatement { target, .. } => {
+                    defined.insert(target.clone());
+                }
+                NK::ListPattern { rest: Some(Some(r)), .. } => {
+                    defined.insert(r.clone());
+                }
+                NK::MapPattern { fields } => defined.extend(fields.iter().map(|(f, _)| f.clone())),
+                _ => {}
+            }
+        });
+    }
+    // Un identificador que aparece como VALOR (no como el nombre de una llamada): una variable, un
+    // patrón que liga, una task pasada a `apply`. Si el nombre se usa así en algún lado, no se juzga.
+    for stmt in &program.statements {
+        synsema_core::ast_api::walk(stmt, &mut |n| {
+            if let NK::Identifier { name } = &n.kind {
+                if !callees.contains(&(n as *const Node)) {
+                    defined.insert(name.to_string());
+                }
+            }
+        });
+    }
+    let candidates: Vec<(String, usize)> = calls.into_iter().filter(|(name, _)| !defined.contains(name)).collect();
+    if candidates.is_empty() {
+        return Vec::new();
+    }
+    // La lista real de builtins arma dos intérpretes: sólo si hay algo que juzgar.
+    let mut builtins: HashSet<String> = synsema_runtime::engine::registered_builtin_names().into_iter().collect();
+    builtins.extend(synsema_runtime::serve::registered_serve_builtin_names());
+    builtins.extend(synsema_stdlib::routing::REQUEST_NAMES.iter().map(|s| s.to_string()));
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut out = Vec::new();
+    for (name, line) in candidates {
+        if builtins.contains(&name) || !seen.insert(name.clone()) {
+            continue;
+        }
+        let hint = synsema_core::reflexes::name_hint(&name).map(|h| format!(" — did you mean {}?", h)).unwrap_or_default();
+        out.push(format!(
+            "{}:{}: warning: `{}(...)` — there is no task, variable or builtin named '{}' in this file; it fails when that line runs{}",
+            path, line, name, name, hint
+        ));
+    }
+    out
+}
+
 fn capability_warnings(path: &str) -> Vec<String> {
     use synsema_core::codeintel::{caps, Root};
     let p = std::path::Path::new(path);
@@ -2184,6 +2349,15 @@ fn cmd_check(args: &[String]) -> ExitCode {
                         );
                     }
                     for w in &warnings {
+                        eprintln!("{}", w);
+                    }
+                    for w in undefined_call_warnings(&program, &path) {
+                        eprintln!("{}", w);
+                    }
+                    for w in deprecated_fetch_warnings(&program, &path) {
+                        eprintln!("{}", w);
+                    }
+                    for w in positional_beyond_two_warnings(&program, &path) {
                         eprintln!("{}", w);
                     }
                     // T1 (DX, §10.3 del spec de identidad): lo que el programa —o una task de un

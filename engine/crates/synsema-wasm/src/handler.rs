@@ -169,7 +169,23 @@ fn cache_key(source: &str, opts: &RunOptions) -> String {
         .as_ref()
         .map(|c| c.iter().map(|x| x.to_string()).collect())
         .unwrap_or_default();
-    format!("{}\u{0}{}\u{0}{}\u{0}{}", opts.filename, env.join(";"), ceiling.join(","), source)
+    // v0.6.45: `labels` también: con otra configuración de etiquetas es otra app (antes se reusaba
+    // la primera y la opción se ignoraba sin aviso). Y lo que ofrece el host (ronda 2, B2): la app
+    // cablea `state_*` al KV del host o a un mapa local según haya `kv`; reusarla con otro host
+    // perdía la durabilidad sin aviso.
+    let offers: Vec<&str> = match synsema_stdlib::hostcap::provider() {
+        Some(p) => ["http", "kv", "kv_cas", "llm", "log", "sleep"].into_iter().filter(|w| p.offers(w)).collect(),
+        None => Vec::new(),
+    };
+    format!(
+        "{}\u{0}{}\u{0}{}\u{0}{}\u{0}{}\u{0}{}",
+        opts.filename,
+        env.join(";"),
+        ceiling.join(","),
+        opts.labels,
+        offers.join(","),
+        source
+    )
 }
 
 fn json_err(status: u16, msg: &str) -> (u16, ResponseBody) {
@@ -630,7 +646,10 @@ pub fn handle(source: &str, opts: &RunOptions, req: &HttpRequestIn) -> HandleRep
     APP.with(|a| {
         let mut guard = a.borrow_mut();
         let app = guard.as_mut().expect("prepared");
+        // v0.6.45 (D2): los límites valen en CADA request (el reset del anterior apagó la bandera).
+        crate::arm_limits(&mut app.interp, opts);
         let (response, log) = dispatch(app, req);
+        crate::disarm_limits();
         let audit = export_audit(&app.caps);
         // Aislamiento entre requests (como `with_serve_interp`): el próximo request
         // arranca del estado post-top-level, no del que dejó este handler.

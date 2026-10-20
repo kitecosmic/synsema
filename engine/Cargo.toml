@@ -57,7 +57,8 @@ chrono = { version = "0.4", default-features = false, features = ["std"] }
 # Zonas horarias IANA (v0.6.29, tipos date/datetime): la base tz embebida, puro Rust.
 chrono-tz = { version = "0.10", default-features = false, features = ["std"] }
 # SQLite estático (binario único, sin DLL). Compila C → requiere gcc (WinLibs en Windows).
-rusqlite = { version = "0.32", features = ["bundled"] }
+# v0.6.45: `hooks` para el authorizer que cierra ATTACH / VACUUM INTO a un archivo (database.rs).
+rusqlite = { version = "0.32", features = ["bundled", "hooks"] }
 # Secretos (feature `secret`): todo puro-Rust (RustCrypto), sin deps C → preserva el
 # binario único estático.
 #   zeroize  : borra el plaintext de memoria al drop (best-effort, §5 del spec).
@@ -179,7 +180,7 @@ toml = { version = "1", default-features = false, features = ["std", "parse", "d
 #         paquete): es dependencia nueva.
 #   tar : sin `xattr` (unix-only y no lo necesitamos). Puro-Rust.
 # Verificado con `cargo tree -p synsema-stdlib`: cero `*-sys` nuevo.
-zip = { version = "8", default-features = false, features = ["deflate-flate2"] }
+zip = { version = "9", default-features = false, features = ["deflate-flate2"] }
 tar = { version = "0.4", default-features = false }
 # Export PNG/PDF (Batch 9): rasterización SVG (stack resvg, RazrFalcon/linebender) +
 # SVG→PDF vectorial (svg2pdf, ecosistema typst). TODO PURO-Rust, SIN C (cero `*-sys`).
@@ -192,6 +193,14 @@ tar = { version = "0.4", default-features = false }
 # usvg::Tree por tipo) — verificado con `cargo tree -p synsema-stdlib`.
 resvg = { version = "0.45", default-features = false, features = ["text"] }
 usvg = { version = "0.45", default-features = false, features = ["text"] }
+# v0.6.45 (B7): códigos QR (ISO/IEC 18004) para `qr_matrix`/`qr_svg`. kennytm (colaborador histórico
+# del compilador), puro Rust, ~23 M de descargas; sin features por defecto no trae NINGUNA dependencia
+# (sin `image`, sin `svg`: el SVG lo arma stdlib). Pineado exacto: el estándar no cambia.
+qrcode = { version = "=0.14.1", default-features = false }
+# v0.6.45 (B9): HTML real (WHATWG, html5ever de Servo) + selectores CSS (`selectors` de Servo) para
+# `html_select`/`html_text`/`html_unescape`. rust-scraper; sin features por defecto. Entra con la
+# condición de §3.4 del spec: revisión de supply chain y medir binario y .wasm (≤ ~1,5 MB).
+scraper = { version = "=0.27.0", default-features = false }
 tiny-skia = "0.11"
 fontdb = { version = "0.23", default-features = false }
 svg2pdf = { version = "0.13", default-features = false, features = ["text"] }

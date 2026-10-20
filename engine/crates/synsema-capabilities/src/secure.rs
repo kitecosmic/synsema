@@ -16,6 +16,53 @@ use std::process::{Command, Stdio};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
+/// v0.6.45 (A6) — el proceso no tiene consola (un build `--no-console` de Windows): un hijo con
+/// pipes se crea con `CREATE_NO_WINDOW`, si no abre una ventana de consola propia. Lo decide la
+/// CLI al arrancar (`stdio::has_console`); embebido como librería queda apagado (lo de siempre).
+/// Con consola no se toca: el hijo comparte la del padre y un `ssh` puede pedir la clave ahí.
+static CHILD_NO_WINDOW: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_child_no_window(on: bool) {
+    CHILD_NO_WINDOW.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// v0.6.45 (A9) — las variables que un hijo con `env_clean` conserva: en Windows `SystemRoot`, sin
+/// la cual el CRT y WinSock no arrancan (la misma única excepción que `run_program`). Todo lo demás
+/// lo pasa el programa explícito por `env`.
+pub fn clean_env_keep() -> Vec<(String, String)> {
+    #[cfg(windows)]
+    if let Ok(v) = std::env::var("SystemRoot") {
+        return vec![("SystemRoot".to_string(), v)];
+    }
+    Vec::new()
+}
+
+/// `opts.env_clean` de `run`/`proc_spawn`: ausente o `false` = hereda (menos los secretos); `true` =
+/// el hijo arranca sin entorno.
+pub fn env_clean_opt(v: Option<&SynValue>, who: &str) -> Result<bool, Control> {
+    match v {
+        None | Some(SynValue::Nothing) => Ok(false),
+        Some(SynValue::Bool(b)) => Ok(*b),
+        Some(other) => Err(Control::Error(RuntimeError::new(format!(
+            "{}: env_clean must be a boolean, got {}",
+            who,
+            other.type_name()
+        )))),
+    }
+}
+
+/// Aplica `CREATE_NO_WINDOW` a `c` si el proceso no tiene consola (sólo Windows).
+pub fn hide_child_window(c: &mut Command) {
+    #[cfg(windows)]
+    if CHILD_NO_WINDOW.load(std::sync::atomic::Ordering::Relaxed) {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        c.creation_flags(CREATE_NO_WINDOW);
+    }
+    #[cfg(not(windows))]
+    let _ = c;
+}
+
 use chrono::{DateTime, Datelike, NaiveDateTime, Timelike, Utc};
 use regex::RegexBuilder;
 
@@ -120,6 +167,33 @@ fn locate_for_read(caps: &Rc<RefCell<CapabilitySet>>, raw: &str, source: &str) -
     Ok(Located::Disk(path))
 }
 
+/// v0.6.45 — el error de leer un archivo, con la causa real. Antes todo era `File not found`: un
+/// archivo abierto en exclusiva por otro proceso, una carpeta, un link roto o un texto que no es
+/// UTF-8 decían lo mismo, y quien lo lee (una persona o un agente) buscaba un archivo que estaba,
+/// sin poder decidir si reintentar. `File not found` queda sólo para lo que no existe.
+pub(crate) fn read_error(path: &str, e: &std::io::Error) -> Control {
+    use std::io::ErrorKind;
+    let why = if std::fs::metadata(path).map(|m| m.is_dir()).unwrap_or(false) {
+        "it is a directory (use list_dir)".to_string()
+    } else if e.kind() == ErrorKind::NotFound {
+        if std::fs::symlink_metadata(path).is_ok() {
+            "it is a broken link (it points to something that does not exist)".to_string()
+        } else {
+            return Control::Error(RuntimeError::new(format!("File not found: {}", path)));
+        }
+    } else if cfg!(windows) && matches!(e.raw_os_error(), Some(32) | Some(33)) {
+        // ERROR_SHARING_VIOLATION / ERROR_LOCK_VIOLATION: otro proceso lo tiene abierto sin compartir.
+        "in use by another process (it is open without sharing; retry later)".to_string()
+    } else if e.kind() == ErrorKind::PermissionDenied {
+        "permission denied".to_string()
+    } else if e.kind() == ErrorKind::InvalidData {
+        "it is not valid UTF-8 text (use read_file_bytes)".to_string()
+    } else {
+        e.to_string()
+    };
+    Control::Error(RuntimeError::new(format!("Cannot read file {}: {}", path, why)))
+}
+
 /// Rango de líneas 1-based (EOL preservado) sobre un texto en memoria (bundle).
 fn lines_range_str(s: &str, offset: usize, limit: Option<usize>) -> String {
     s.split_inclusive('\n')
@@ -194,12 +268,38 @@ fn atomic_write(path: &str, data: &[u8]) -> std::io::Result<()> {
     if let Some(parent) = Path::new(path).parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let tmp = format!("{}.synsema.tmp", path);
-    std::fs::write(&tmp, data)
-        .and_then(|_| std::fs::rename(&tmp, path))
-        .inspect_err(|_| {
+    // v0.6.45 — el temporal no se chequea contra el scope (es un nombre nuestro), así que no puede
+    // seguir links: antes era `<ruta>.synsema.tmp` (predecible) con `fs::write`, y un link plantado
+    // con ese nombre hacía escribir fuera del scope. Ahora lleva un sufijo al azar y se crea con
+    // `create_new` (O_CREAT|O_EXCL / CREATE_NEW): falla si el nombre existe, sea link o no, y nunca
+    // sigue uno. Si el nombre ya existe se prueba otro.
+    let mut last = None;
+    for _ in 0..8 {
+        let tmp = format!("{}.{:016x}.synsema.tmp", path, rand::random::<u64>());
+        let file = std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp);
+        let mut file = match file {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                last = Some(e);
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
+        // Ronda 2 (B5) y ronda 3 (B4): el reemplazo conserva los permisos del archivo que reemplaza
+        // (un secreto 0600 reescrito quedaba 0644 por el umask), y se aplican sobre el handle ANTES
+        // de escribir el contenido, no después por ruta.
+        #[cfg(unix)]
+        if let Ok(m) = std::fs::metadata(path) {
+            let _ = file.set_permissions(m.permissions());
+        }
+        let written = file.write_all(data);
+        // Cerrado antes del rename: en Windows no se renombra un archivo abierto.
+        drop(file);
+        return written.and_then(|_| std::fs::rename(&tmp, path)).inspect_err(|_| {
             let _ = std::fs::remove_file(&tmp);
-        })
+        });
+    }
+    Err(last.unwrap_or_else(|| std::io::Error::other("could not create a temporary file")))
 }
 
 /// Lee todo el stream pero guarda como mucho `cap` bytes; si hubo más, marca truncado.
@@ -239,7 +339,10 @@ fn grep_collect(path: &str, glob: &Option<String>, out: &mut Vec<String>) -> Res
         out.push(path.to_string());
         return Ok(());
     }
-    fn walk(dir: &str, glob: &Option<String>, out: &mut Vec<String>) {
+    // v0.6.45 — el `file.read` se chequeó sobre `path`; lo que se recorre tiene que quedar adentro
+    // EN DISCO. Un link a una carpeta no se sigue (como ripgrep; además evita ciclos) y un link a
+    // un archivo entra sólo si lleva a algo dentro de `path`.
+    fn walk(root: &str, dir: &str, glob: &Option<String>, out: &mut Vec<String>) {
         let rd = match std::fs::read_dir(dir) {
             Ok(x) => x,
             Err(_) => return,
@@ -247,8 +350,12 @@ fn grep_collect(path: &str, glob: &Option<String>, out: &mut Vec<String>) -> Res
         for e in rd.flatten() {
             let p = e.path();
             let ps = p.to_string_lossy().replace('\\', "/");
+            let link = e.file_type().map(|t| t.is_symlink()).unwrap_or(true);
+            if link && (p.is_dir() || !synsema_core::capscope::physically_beneath(root, &ps)) {
+                continue;
+            }
             if p.is_dir() {
-                walk(&ps, glob, out);
+                walk(root, &ps, glob, out);
             } else {
                 let name = e.file_name().to_string_lossy().into_owned();
                 let inc = match glob {
@@ -261,7 +368,7 @@ fn grep_collect(path: &str, glob: &Option<String>, out: &mut Vec<String>) -> Res
             }
         }
     }
-    walk(path, glob, out);
+    walk(path, path, glob, out);
     Ok(())
 }
 
@@ -408,12 +515,14 @@ pub fn register_pure_fs(interp: &Interpreter, hint: &'static str) {
                 m.insert("size", syn_int(bytes.len() as i64));
                 m.insert("modified", SynValue::Nothing);
                 m.insert("bundled", syn_bool(true));
+                m.insert("is_link", syn_bool(false));
             }
             None => {
                 m.insert("exists", syn_bool(false));
                 m.insert("is_dir", syn_bool(false));
                 m.insert("size", syn_int(0));
                 m.insert("modified", SynValue::Nothing);
+                m.insert("is_link", syn_bool(false));
             }
         }
         Ok(syn_map(m))
@@ -453,6 +562,7 @@ pub fn register_pure_fs(interp: &Interpreter, hint: &'static str) {
             m.insert("name", syn_text(name));
             m.insert("is_dir", syn_bool(is_dir));
             m.insert("size", syn_int(size));
+            m.insert("is_link", syn_bool(false));
             syn_map(m)
         }).collect()))
     }));
@@ -486,10 +596,7 @@ pub fn register_secure_builtins(interp: &Interpreter, caps: Rc<RefCell<Capabilit
                     }
                     return match std::fs::read_to_string(&path) {
                         Ok(c) => Ok(syn_text(c)),
-                        Err(_) => Err(Control::Error(RuntimeError::new(format!(
-                            "File not found: {}",
-                            path
-                        )))),
+                        Err(e) => Err(read_error(&path, &e)),
                     };
                 }
                 // rango por líneas (1-based)
@@ -524,10 +631,7 @@ pub fn register_secure_builtins(interp: &Interpreter, caps: Rc<RefCell<Capabilit
                 }
                 match read_lines_range(&path, offset as usize, limit) {
                     Ok(s) => Ok(syn_text(s)),
-                    Err(_) => Err(Control::Error(RuntimeError::new(format!(
-                        "File not found: {}",
-                        path
-                    )))),
+                    Err(e) => Err(read_error(&path, &e)),
                 }
             }),
         );
@@ -585,6 +689,7 @@ pub fn register_secure_builtins(interp: &Interpreter, caps: Rc<RefCell<Capabilit
                                 m.insert("name", syn_text(name));
                                 m.insert("is_dir", syn_bool(is_dir));
                                 m.insert("size", syn_int(size));
+                                m.insert("is_link", syn_bool(false));
                                 syn_map(m)
                             })
                             .collect();
@@ -599,26 +704,32 @@ pub fn register_secure_builtins(interp: &Interpreter, caps: Rc<RefCell<Capabilit
                 let rd = std::fs::read_dir(&path).map_err(|_| {
                     Control::Error(RuntimeError::new(format!("Not a directory: {}", path)))
                 })?;
-                let mut entries: Vec<(String, bool, i64)> = Vec::new();
+                // v0.6.45 — un link (symlink, junction) dice `is_link: true` y su `is_dir` es el de
+                // lo que apunta, igual que en `file_info` (antes una junction salía `is_dir: false`
+                // acá y `true` allá). Su `size` es 0: el tamaño de algo que puede estar fuera del
+                // scope no se da gratis; `file_info` lo da si el destino queda adentro.
+                let mut entries: Vec<(String, bool, i64, bool)> = Vec::new();
                 for e in rd.flatten() {
                     let name = e.file_name().to_string_lossy().into_owned();
-                    let md = e.metadata().ok();
+                    let is_link = e.file_type().map(|t| t.is_symlink()).unwrap_or(false);
+                    let md = if is_link { std::fs::metadata(e.path()).ok() } else { e.metadata().ok() };
                     let is_dir = md.as_ref().map(|m| m.is_dir()).unwrap_or(false);
-                    let size = if is_dir {
+                    let size = if is_dir || is_link {
                         0
                     } else {
                         md.as_ref().map(|m| m.len() as i64).unwrap_or(0)
                     };
-                    entries.push((name, is_dir, size));
+                    entries.push((name, is_dir, size, is_link));
                 }
                 entries.sort_by(|a, b| a.0.cmp(&b.0)); // orden estable por nombre
                 let items = entries
                     .into_iter()
-                    .map(|(name, is_dir, size)| {
+                    .map(|(name, is_dir, size, is_link)| {
                         let mut m = SynMap::new();
                         m.insert("name", syn_text(name));
                         m.insert("is_dir", syn_bool(is_dir));
                         m.insert("size", syn_int(size));
+                        m.insert("is_link", syn_bool(is_link));
                         syn_map(m)
                     })
                     .collect();
@@ -643,11 +754,15 @@ pub fn register_secure_builtins(interp: &Interpreter, caps: Rc<RefCell<Capabilit
                         m.insert("size", syn_int(bytes.len() as i64));
                         m.insert("modified", SynValue::Nothing);
                         m.insert("bundled", syn_bool(true));
+                        m.insert("is_link", syn_bool(false));
                         return Ok(syn_map(m));
                     }
                     Located::Disk(p) => p,
                 };
                 let mut m = SynMap::new();
+                // v0.6.45 — `is_link`: la ruta misma es un symlink o una junction (los datos de
+                // abajo son los de lo que apunta). Un link roto da `exists: false, is_link: true`.
+                let is_link = std::fs::symlink_metadata(&path).map(|m| m.file_type().is_symlink()).unwrap_or(false);
                 match std::fs::metadata(&path) {
                     Ok(md) => {
                         let modified = md
@@ -672,6 +787,7 @@ pub fn register_secure_builtins(interp: &Interpreter, caps: Rc<RefCell<Capabilit
                         m.insert("modified", SynValue::Nothing);
                     }
                 }
+                m.insert("is_link", syn_bool(is_link));
                 Ok(syn_map(m))
             }),
         );
@@ -712,6 +828,16 @@ pub fn register_secure_builtins(interp: &Interpreter, caps: Rc<RefCell<Capabilit
                     }
                     Located::Disk(p) => p,
                 };
+                // v0.6.45 (ronda 2, M3): buscar en una carpeta es leer su árbol entero; con el glob
+                // por segmentos, `file.read("./proj")` es la carpeta sola. Hace falta lo mismo que
+                // pide `static`: `file.read("<carpeta>/**")`.
+                if std::fs::metadata(&target).map(|m| m.is_dir()).unwrap_or(false) {
+                    require(
+                        &caps,
+                        Capability::new(CapabilityType::FileRead, Some(format!("{}/**", target.trim_end_matches('/')))),
+                        "grep()",
+                    )?;
+                }
                 if pattern.is_empty() {
                     return Err(Control::Error(RuntimeError::new("grep: empty pattern")));
                 }
@@ -759,6 +885,9 @@ pub fn register_secure_builtins(interp: &Interpreter, caps: Rc<RefCell<Capabilit
                 // -- recorrido (orden estable: por ruta, luego por línea) --
                 let mut files = Vec::new();
                 grep_collect(&target, &glob, &mut files)?;
+                // v0.6.45 — un `deny` dentro del árbol también vale para `grep` (antes sólo se
+                // chequeaba la raíz y `deny file.read("./proj/.env")` no frenaba la búsqueda).
+                files.retain(|f| !caps.borrow().denies(&Capability::new(CapabilityType::FileRead, Some(f.clone()))));
                 files.sort();
 
                 let mut out_matches: Vec<SynValue> = Vec::new();
@@ -822,10 +951,7 @@ pub fn register_secure_builtins(interp: &Interpreter, caps: Rc<RefCell<Capabilit
                 };
                 match std::fs::read(&path) {
                     Ok(b) => Ok(syn_bytes(b)),
-                    Err(_) => Err(Control::Error(RuntimeError::new(format!(
-                        "File not found: {}",
-                        path
-                    )))),
+                    Err(e) => Err(read_error(&path, &e)),
                 }
             }),
         );
@@ -954,8 +1080,8 @@ pub fn register_secure_builtins(interp: &Interpreter, caps: Rc<RefCell<Capabilit
 
     // v0.6.20 — cwd() → el directorio de trabajo real, normalizado. Bajo `file.read(".")`:
     // el nombre absoluto de `.` es información del host (bajo --sandbox no se filtra gratis) y
-    // es exactamente la misma grant que exige `list_dir(".")`; `file.read("./*")` y `"*"`
-    // también la cubren. Bajo un binario de `synsema build` es el cwd de verdad, nunca el
+    // es exactamente la misma grant que exige `list_dir(".")`; `file.read("./**")` y `"**"`
+    // también la cubren (v0.6.45: `./*` son los archivos de la carpeta, no la carpeta). Bajo un binario de `synsema build` es el cwd de verdad, nunca el
     // overlay del bundle.
     {
         let caps = caps.clone();
@@ -1007,8 +1133,8 @@ pub fn register_secure_builtins(interp: &Interpreter, caps: Rc<RefCell<Capabilit
 
     // edit_file(path, old, new, replace_all?) → {replaced:N}. Reemplaza por match exacto
     // de string. Sin replace_all exige UNICIDAD (0 → not found; >1 → ambiguo). Escritura
-    // atómica. Solo file.write: lee internamente para localizar `old` pero NO expone el
-    // contenido (solo devuelve `replaced`), así que no es canal de lectura.
+    // atómica. Pide file.write y, desde v0.6.45, también file.read: sus respuestas (no está /
+    // ambiguo / cuántos reemplazó) dicen si un texto está adentro.
     {
         let caps = caps.clone();
         interp.register_builtin(
@@ -1024,13 +1150,19 @@ pub fn register_secure_builtins(interp: &Interpreter, caps: Rc<RefCell<Capabilit
                     Capability::new(CapabilityType::FileWrite, Some(path.clone())),
                     "edit_file()",
                 )?;
+                // v0.6.45 (ronda 2, B5): `edit_file` lee el archivo para buscar `old`, y sus
+                // respuestas (no está / ambiguo / cuántos reemplazó) dicen si un texto está adentro:
+                // es una lectura, y pide `file.read` también.
+                require(
+                    &caps,
+                    Capability::new(CapabilityType::FileRead, Some(path.clone())),
+                    "edit_file()",
+                )?;
                 reject_bundled_write(&path)?;
                 if old.is_empty() {
                     return Err(Control::Error(RuntimeError::new("edit_file: empty pattern")));
                 }
-                let content = std::fs::read_to_string(&path).map_err(|_| {
-                    Control::Error(RuntimeError::new(format!("File not found: {}", path)))
-                })?;
+                let content = std::fs::read_to_string(&path).map_err(|e| read_error(&path, &e))?;
                 let count = content.matches(&old).count();
                 if count == 0 {
                     return Err(Control::Error(RuntimeError::new("edit_file: pattern not found")));
@@ -1166,12 +1298,18 @@ pub fn register_secure_builtins(interp: &Interpreter, caps: Rc<RefCell<Capabilit
                 for name in i.sensitive_env() {
                     c.env_remove(name);
                 }
+                // v0.6.45 (A9): `{"env_clean": true}` — el hijo no hereda nada del entorno.
+                if env_clean_opt(opt("env_clean").as_ref(), "run")? {
+                    c.env_clear();
+                    c.envs(clean_env_keep());
+                }
                 if let Some(SynValue::Map(m)) = opt("env") {
                     for (k, v) in m.borrow().iter() {
                         c.env(k.as_str(), raw_str(v)); // override explícito (gana sobre el strip)
                     }
                 }
 
+                hide_child_window(&mut c);
                 let mut child = c.spawn().map_err(|e| {
                     Control::Error(RuntimeError::new(format!(
                         "run: cannot start \"{}\": {}",
@@ -1422,8 +1560,30 @@ pub fn register_secure_builtins(interp: &Interpreter, caps: Rc<RefCell<Capabilit
                         lo, hi
                     ))));
                 }
-                use rand::Rng;
-                Ok(syn_int(rand::thread_rng().gen_range(lo..=hi)))
+                // En nativo, `thread_rng` (ChaCha que se resiembra solo; ronda 4, B3: con `OsRng` era
+                // una syscall por llamada, un 19 % más lento en un bucle). En wasm, `OsRng` (el
+                // generador de la corrida, sembrado por llamada) con un error claro sin entropía.
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    use rand::Rng;
+                    return Ok(syn_int(rand::thread_rng().gen_range(lo..=hi)));
+                }
+                #[cfg(target_arch = "wasm32")]
+                {
+                    use rand::RngCore;
+                    let span = (hi as i128 - lo as i128 + 1) as u128;
+                    let zone = u64::MAX as u128 + 1 - ((u64::MAX as u128 + 1) % span);
+                    loop {
+                        let mut b = [0u8; 8];
+                        rand::rngs::OsRng.try_fill_bytes(&mut b).map_err(|_| {
+                            Control::Error(RuntimeError::new("random_int: no entropy available from the host"))
+                        })?;
+                        let x = u64::from_le_bytes(b) as u128;
+                        if x < zone {
+                            return Ok(syn_int((lo as i128 + (x % span) as i128) as i64));
+                        }
+                    }
+                }
             }),
         );
     }
@@ -1507,7 +1667,8 @@ mod v0620_tests {
         std::fs::write(sub.join("deep").join("f.txt"), "x").unwrap();
         let empty = d.join("empty");
         std::fs::create_dir_all(&empty).unwrap();
-        let scope = format!("{}/*", slash(&d));
+        // `**`: el recursivo exige `file.write` sobre cada ruta del árbol (v0.6.45: `*` es un nivel).
+        let scope = format!("{}/**", slash(&d));
         let g = [(CapabilityType::FileWrite, Some(scope))];
         assert_eq!(run(&g, &format!("print(delete_dir(\"{}\"))", slash(&empty))).unwrap(), vec!["true"]);
         assert!(!empty.exists());
@@ -1528,7 +1689,8 @@ mod v0620_tests {
     }
 
     /// §4.2 — cwd() bajo `file.read(".")` (la misma grant que `list_dir(".")`): sin grant o
-    /// con una grant que no cubre `.` deniega; con `.`, `./*` o `*` la devuelve normalizada.
+    /// con una grant que no cubre `.` deniega; con `.`, `./**` o `**` la devuelve normalizada.
+    /// v0.6.45: `./*` (los archivos de la carpeta) ya no cubre la carpeta misma; `**` sí.
     #[test]
     fn cwd_requires_file_read_on_dot() {
         let want = normalize_path(&std::env::current_dir().unwrap().to_string_lossy());
@@ -1536,7 +1698,9 @@ mod v0620_tests {
         assert!(denied.contains("Capability not granted"), "{}", denied);
         let denied = run(&[(CapabilityType::FileRead, Some("./data/*".to_string()))], "print(cwd())").unwrap_err();
         assert!(denied.contains("Capability not granted"), "{}", denied);
-        for scope in [".", "./*", "*"] {
+        let denied = run(&[(CapabilityType::FileRead, Some("./*".to_string()))], "print(cwd())").unwrap_err();
+        assert!(denied.contains("Capability not granted"), "{}", denied);
+        for scope in [".", "./**", "**"] {
             assert_eq!(run(&[(CapabilityType::FileRead, Some(scope.to_string()))], "print(cwd())").unwrap(), vec![want.clone()], "scope {}", scope);
         }
     }
@@ -1553,7 +1717,7 @@ mod v0620_tests {
         let e = run(&exact, &format!("print(delete_dir(\"{}\", {{\"recursive\": true}}))", slash(&tree))).unwrap_err();
         assert!(e.contains("Capability not granted"), "{}", e);
         assert!(tree.join("sub").join("f.txt").exists(), "nada borrado");
-        let wide = [(CapabilityType::FileWrite, Some(format!("{}/*", slash(&d))))];
+        let wide = [(CapabilityType::FileWrite, Some(format!("{}/**", slash(&d))))];
         assert_eq!(run(&wide, &format!("print(delete_dir(\"{}\", {{\"recursive\": true}}))", slash(&tree))).unwrap(), vec!["true"]);
         assert!(!tree.exists());
         let _ = std::fs::remove_dir_all(&d);

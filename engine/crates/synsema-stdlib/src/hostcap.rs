@@ -65,6 +65,14 @@ pub trait HostProvider {
     fn kv_list(&self, _ns: &str) -> Option<Vec<String>> {
         None
     }
+    /// v0.6.45 — comparar-y-cambiar atómico: escribe `value` sólo si el valor actual es
+    /// exactamente `expected` (`None` = la clave no existe). `Some(Ok(true))` = escribió. Es lo que
+    /// hace atómicos `state_merge`/`state_cas` cuando el KV es compartido entre instancias (un KV de
+    /// verdad lo ofrece: Redis `WATCH`, Cloudflare KV con metadata, un `UPDATE … WHERE`). `None` = el
+    /// host no lo ofrece, y esas dos operaciones lo dicen en vez de perder escrituras en silencio.
+    fn kv_cas(&self, _ns: &str, _key: &str, _expected: Option<&str>, _value: &str) -> Option<Result<bool, String>> {
+        None
+    }
     /// Op LLM (`reason`/`decide`/`analyze`/`generate`/`step`…) → contenido.
     fn llm(&self, _op: &str, _prompt: &str) -> Option<HostLlmResult> {
         None

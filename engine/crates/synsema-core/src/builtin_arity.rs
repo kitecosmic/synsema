@@ -169,6 +169,11 @@ pub const BUILTIN_ARITY: &[(&str, usize, Option<usize>)] = &[
     ("format_time", 1, Some(2)),
     ("get_rules", 0, Some(1)),
     ("grep", 2, Some(3)),
+    // v0.6.45 (B1): gunzip(bytes, {max_bytes}?)
+    ("gunzip", 1, Some(2)),
+    // v0.6.45 (B7): qr_matrix / qr_svg (datos, opts?)
+    ("qr_matrix", 1, Some(2)),
+    ("qr_svg", 1, Some(2)),
     ("hd_derive", 2, Some(4)),
     ("histogram", 1, Some(2)),
     ("hkdf_sha256", 4, Some(4)),

@@ -35,7 +35,7 @@ use parquet::schema::types::Type;
 use synsema_core::interpreter::{Control, Interpreter, RuntimeError};
 use synsema_core::number::Number;
 use synsema_core::temporal::Temporal;
-use synsema_core::types::{syn_bool, syn_bytes, syn_float, syn_list, syn_map, syn_number, syn_text, SynValue};
+use synsema_core::types::{syn_bool, syn_bytes, syn_float, syn_int, syn_list, syn_map, syn_number, syn_text, SynValue};
 
 /// Clave de los metadatos del archivo con la zona IANA de cada columna de datetimes.
 const TZ_KEY: &str = "synsema.timezones";
@@ -354,13 +354,33 @@ impl<'a> Thrift<'a> {
     }
 }
 
-/// Recorre los encabezados de TODAS las páginas y rechaza el archivo si una página declara
+/// Recorre los encabezados de las páginas que se van a leer y rechaza el archivo si una página declara
 /// más de `MAX_PAGE_BYTES` descomprimidos o si el total supera `max_total` — antes de que el
 /// lector reserve esa memoria (un encabezado que miente pedía 2 GiB por columna y abortaba).
-fn check_expansion(data: &[u8], meta: &parquet::file::metadata::ParquetMetaData, max_total: u64, fname: &str) -> Result<(), Control> {
+///
+/// v0.6.45 (B4) — cuenta sólo los row groups (`rgs`) y las columnas de primer nivel
+/// (`cols`) que se van a leer: pedir una columna de un archivo grande no debe fallar por el tamaño
+/// de las demás.
+fn check_expansion_of(
+    data: &[u8],
+    meta: &parquet::file::metadata::ParquetMetaData,
+    max_total: u64,
+    fname: &str,
+    rgs: Option<&[usize]>,
+    cols: Option<&std::collections::HashSet<String>>,
+) -> Result<(), Control> {
     let mut total: u64 = 0;
-    for rg in meta.row_groups() {
+    for (ri, rg) in meta.row_groups().iter().enumerate() {
+        if rgs.is_some_and(|r| !r.contains(&ri)) {
+            continue;
+        }
         for col in rg.columns() {
+            if let Some(c) = cols {
+                let root = col.column_path().parts().first().cloned().unwrap_or_default();
+                if !c.contains(&root) {
+                    continue;
+                }
+            }
             let start = col.dictionary_page_offset().unwrap_or(col.data_page_offset()).max(0) as usize;
             let len = col.compressed_size().max(0) as usize;
             let end = start.checked_add(len).filter(|e| *e <= data.len()).ok_or_else(|| {
@@ -403,19 +423,40 @@ fn parquet_read(args: &[SynValue]) -> Result<SynValue, Control> {
     const F: &str = "parquet_read";
     // `parquet_read(bytes, {"max_cells": n, "max_bytes": n})`: los topes contra un archivo
     // hostil (por defecto 50 millones de celdas y max(1 GiB, 64 × el archivo) descomprimidos).
+    // v0.6.45 (B4): `columns` (sólo esas), `row_groups` (sólo esos, por índice) y `limit` (las
+    // primeras n filas). Un data lake real no entra en memoria: se lee por partes.
     let (mut max_cells, mut max_bytes_opt) = (DEFAULT_MAX_CELLS, None::<u64>);
+    let mut columns: Option<Vec<String>> = None;
+    let mut row_groups: Option<Vec<usize>> = None;
+    let mut limit: Option<u64> = None;
     match args.get(1) {
         None | Some(SynValue::Nothing) => {}
         Some(SynValue::Map(m)) => {
             for (k, v) in m.borrow().iter() {
-                let n = match v {
-                    SynValue::Number(Number::Int(n)) if *n > 0 => *n as u64,
-                    other => return Err(err(format!("{}: option {:?} must be a positive integer, got {}", F, k, other))),
-                };
                 match k.as_str() {
-                    "max_cells" => max_cells = n,
-                    "max_bytes" => max_bytes_opt = Some(n),
-                    other => return Err(err(format!("{}: unknown option {:?} (valid: max_cells, max_bytes)", F, other))),
+                    "columns" => columns = Some(text_list(v, F, "columns")?),
+                    "row_groups" => {
+                        row_groups = Some(
+                            int_list(v, F, "row_groups")?.into_iter().map(|n| n as usize).collect(),
+                        )
+                    }
+                    _ => {
+                        let n = match v {
+                            SynValue::Number(Number::Int(n)) if *n > 0 => *n as u64,
+                            other => return Err(err(format!("{}: option {:?} must be a positive integer, got {}", F, k, other))),
+                        };
+                        match k.as_str() {
+                            "max_cells" => max_cells = n,
+                            "max_bytes" => max_bytes_opt = Some(n),
+                            "limit" => limit = Some(n),
+                            other => {
+                                return Err(err(format!(
+                                    "{}: unknown option {:?} (valid: columns, row_groups, limit, max_cells, max_bytes)",
+                                    F, other
+                                )))
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -433,11 +474,36 @@ fn parquet_read(args: &[SynValue]) -> Result<SynValue, Control> {
         None => return Err(err("parquet_read(bytes)")),
     };
     let file_len = data.len() as u64;
-    let reader = SerializedFileReader::new(bytes::Bytes::from(data.clone())).map_err(|e| err(format!("{}: not a Parquet file: {}", F, e)))?;
+    // v0.6.45 (B4): una sola copia de la entrada (antes `data.clone()` hacía dos); `Bytes` se
+    // comparte por referencia entre el lector y el chequeo de expansión.
+    let data = bytes::Bytes::from(data);
+    let reader = SerializedFileReader::new(data.clone()).map_err(|e| err(format!("{}: not a Parquet file: {}", F, e)))?;
     let max_bytes = max_bytes_opt.unwrap_or_else(|| (1024 * 1024 * 1024u64).max(file_len.saturating_mul(64)));
-    check_expansion(&data, reader.metadata(), max_bytes, F)?;
-    let cells = (reader.metadata().file_metadata().num_rows().max(0) as u64)
-        .saturating_mul(reader.metadata().file_metadata().schema_descr().num_columns() as u64);
+    let meta = reader.metadata();
+    let all_cols: Vec<String> = meta.file_metadata().schema_descr().root_schema().get_fields().iter().map(|f| f.name().to_string()).collect();
+    if let Some(cs) = &columns {
+        for c in cs {
+            if !all_cols.contains(c) {
+                return Err(err(format!("{}: the file has no column {:?} (columns: {})", F, c, all_cols.join(", "))));
+            }
+        }
+    }
+    let n_rgs = meta.num_row_groups();
+    if let Some(rs) = &row_groups {
+        for &r in rs {
+            if r >= n_rgs {
+                return Err(err(format!("{}: row group {} does not exist (the file has {}: 0..{})", F, r, n_rgs, n_rgs)));
+            }
+        }
+    }
+    let col_set: Option<std::collections::HashSet<String>> = columns.as_ref().map(|c| c.iter().cloned().collect());
+    check_expansion_of(&data, meta, max_bytes, F, row_groups.as_deref(), col_set.as_ref())?;
+    let rows_selected: u64 = match &row_groups {
+        Some(rs) => rs.iter().map(|&r| meta.row_group(r).num_rows().max(0) as u64).sum(),
+        None => meta.file_metadata().num_rows().max(0) as u64,
+    };
+    let cols_selected = columns.as_ref().map(|c| c.len()).unwrap_or(all_cols.len()) as u64;
+    let cells = rows_selected.min(limit.unwrap_or(u64::MAX)).saturating_mul(cols_selected);
     if cells > max_cells {
         return Err(err(format!(
             "{}: the file has {} cells (rows × columns); the limit is {} — raise it on purpose with {{\"max_cells\": n}}",
@@ -519,12 +585,28 @@ fn parquet_read(args: &[SynValue]) -> Result<SynValue, Control> {
             }
         }
     }
-    let rows = reader.get_row_iter(None).map_err(|e| err(format!("{}: {}", F, e)))?;
-    let mut out = Vec::new();
+    // La proyección: el esquema con sólo las columnas pedidas, en el orden del archivo.
+    let projection = match &columns {
+        None => None,
+        Some(cs) => {
+            let fields: Vec<_> = fmeta
+                .schema_descr()
+                .root_schema()
+                .get_fields()
+                .iter()
+                .filter(|f| cs.iter().any(|c| c == f.name()))
+                .cloned()
+                .collect();
+            Some(
+                parquet::schema::types::Type::group_type_builder(fmeta.schema_descr().root_schema().name())
+                    .with_fields(fields)
+                    .build()
+                    .map_err(|e| err(format!("{}: {}", F, e)))?,
+            )
+        }
+    };
     // Las columnas como claves una vez por lectura: cada fila suma una referencia (F4.4).
-    let mut keys: Vec<Key> = Vec::new();
-    for row in rows {
-        let row = row.map_err(|e| err(format!("{}: {}", F, e)))?;
+    let convert = |row: parquet::record::Row, keys: &mut Vec<Key>| -> Result<SynValue, Control> {
         let mut m = SynMap::with_capacity(keys.len());
         for (ci, (k, v)) in row.get_column_iter().enumerate() {
             let mut val = match (v, nanos.contains(k)) {
@@ -553,7 +635,33 @@ fn parquet_read(args: &[SynValue]) -> Result<SynValue, Control> {
             }
             m.insert(keys[ci].clone(), val);
         }
-        out.push(syn_map(m));
+        Ok(syn_map(m))
+    };
+    let cap = limit.unwrap_or(u64::MAX);
+    let mut out = Vec::new();
+    let mut keys: Vec<Key> = Vec::new();
+    match &row_groups {
+        None => {
+            for row in reader.get_row_iter(projection.clone()).map_err(|e| err(format!("{}: {}", F, e)))? {
+                if out.len() as u64 >= cap {
+                    break;
+                }
+                let row = row.map_err(|e| err(format!("{}: {}", F, e)))?;
+                out.push(convert(row, &mut keys)?);
+            }
+        }
+        Some(rs) => {
+            'groups: for &r in rs {
+                let rg = reader.get_row_group(r).map_err(|e| err(format!("{}: {}", F, e)))?;
+                for row in rg.get_row_iter(projection.clone()).map_err(|e| err(format!("{}: {}", F, e)))? {
+                    if out.len() as u64 >= cap {
+                        break 'groups;
+                    }
+                    let row = row.map_err(|e| err(format!("{}: {}", F, e)))?;
+                    out.push(convert(row, &mut keys)?);
+                }
+            }
+        }
     }
     Ok(syn_list(out))
 }
@@ -1097,7 +1205,80 @@ fn parquet_write(args: &[SynValue]) -> Result<SynValue, Control> {
     Ok(syn_bytes(buf))
 }
 
+/// v0.6.45 (B4) — `parquet_info(bytes)` → `{rows, columns: [{name, type}], row_groups: [{rows,
+/// bytes}]}`: lo que hay en el archivo sin leer los datos, para decidir qué columnas y qué row groups
+/// pedir.
+fn parquet_info(args: &[SynValue]) -> Result<SynValue, Control> {
+    const F: &str = "parquet_info";
+    let data = match args.first() {
+        Some(SynValue::Bytes(b)) => bytes::Bytes::from(b.to_vec()),
+        Some(other) => return Err(err(format!("{}: expected the file's bytes (read_file_bytes(path)), got {}", F, other.type_name()))),
+        None => return Err(err("parquet_info(bytes)")),
+    };
+    let reader = SerializedFileReader::new(data).map_err(|e| err(format!("{}: not a Parquet file: {}", F, e)))?;
+    let meta = reader.metadata();
+    let fmeta = meta.file_metadata();
+    let mut cols = Vec::new();
+    for f in fmeta.schema_descr().root_schema().get_fields() {
+        let mut m = SynMap::new();
+        m.insert("name", syn_text(f.name()));
+        let ty = if f.is_primitive() {
+            match f.get_basic_info().logical_type_ref() {
+                Some(lt) => format!("{:?}", lt).to_lowercase(),
+                None => format!("{}", f.get_physical_type()).to_lowercase(),
+            }
+        } else {
+            "group".to_string()
+        };
+        m.insert("type", syn_text(ty));
+        cols.push(syn_map(m));
+    }
+    let mut rgs = Vec::new();
+    for rg in meta.row_groups() {
+        let mut m = SynMap::new();
+        m.insert("rows", syn_int(rg.num_rows()));
+        m.insert("bytes", syn_int(rg.total_byte_size()));
+        rgs.push(syn_map(m));
+    }
+    let mut out = SynMap::new();
+    out.insert("rows", syn_int(fmeta.num_rows()));
+    out.insert("columns", syn_list(cols));
+    out.insert("row_groups", syn_list(rgs));
+    Ok(syn_map(out))
+}
+
+fn text_list(v: &SynValue, f: &str, opt: &str) -> Result<Vec<String>, Control> {
+    match v {
+        SynValue::List(l) => l
+            .borrow()
+            .to_vec()
+            .iter()
+            .map(|x| match x {
+                SynValue::Text(t) => Ok(t.to_string()),
+                other => Err(err(format!("{}: {} must be a list of column names, got {}", f, opt, other.type_name()))),
+            })
+            .collect(),
+        other => Err(err(format!("{}: {} must be a list, got {}", f, opt, other.type_name()))),
+    }
+}
+
+fn int_list(v: &SynValue, f: &str, opt: &str) -> Result<Vec<u64>, Control> {
+    match v {
+        SynValue::List(l) => l
+            .borrow()
+            .to_vec()
+            .iter()
+            .map(|x| match x {
+                SynValue::Number(Number::Int(n)) if *n >= 0 => Ok(*n as u64),
+                other => Err(err(format!("{}: {} must be a list of indexes (0, 1, …), got {}", f, opt, other))),
+            })
+            .collect(),
+        other => Err(err(format!("{}: {} must be a list, got {}", f, opt, other.type_name()))),
+    }
+}
+
 pub fn register_parquet_builtins(interp: &Interpreter) {
+    interp.register_builtin("parquet_info", 1, Rc::new(|_i, a, _l| parquet_info(a)));
     interp.register_builtin("parquet_read", -1, Rc::new(|_i, a, _l| parquet_read(a)));
     interp.register_builtin("parquet_write", -1, Rc::new(|_i, a, _l| parquet_write(a)));
 }
@@ -1128,5 +1309,81 @@ mod tests {
         assert_eq!(durs.get("d"), Some(&1));
         assert_eq!(durs.get("m"), Some(&1_000));
         assert_eq!(durs.len(), 2);
+    }
+
+    /// Un Parquet de 3 row groups × 2 filas, columnas `a` (int64), `b` (texto), `c` (int64): a = 0..6.
+    fn three_row_groups() -> Vec<u8> {
+        use parquet::data_type::{ByteArray, ByteArrayType, Int64Type};
+        use parquet::file::properties::WriterProperties;
+        use parquet::file::writer::SerializedFileWriter;
+        let schema = std::sync::Arc::new(
+            parquet::schema::parser::parse_message_type("message s { required int64 a; required binary b (UTF8); required int64 c; }")
+                .unwrap(),
+        );
+        let mut buf = Vec::new();
+        let mut w = SerializedFileWriter::new(&mut buf, schema, std::sync::Arc::new(WriterProperties::builder().build())).unwrap();
+        for g in 0..3i64 {
+            let mut rg = w.next_row_group().unwrap();
+            let a = [g * 2, g * 2 + 1];
+            let mut col = rg.next_column().unwrap().unwrap();
+            col.typed::<Int64Type>().write_batch(&a, None, None).unwrap();
+            col.close().unwrap();
+            let mut col = rg.next_column().unwrap().unwrap();
+            let b: Vec<ByteArray> = a.iter().map(|n| ByteArray::from(format!("r{}", n).as_str())).collect();
+            col.typed::<ByteArrayType>().write_batch(&b, None, None).unwrap();
+            col.close().unwrap();
+            let mut col = rg.next_column().unwrap().unwrap();
+            col.typed::<Int64Type>().write_batch(&[100, 101], None, None).unwrap();
+            col.close().unwrap();
+            rg.close().unwrap();
+        }
+        w.close().unwrap();
+        buf
+    }
+
+    fn opts(pairs: &[(&str, SynValue)]) -> SynValue {
+        let mut m = SynMap::new();
+        for (k, v) in pairs {
+            m.insert(*k, v.clone());
+        }
+        syn_map(m)
+    }
+
+    fn rows(v: SynValue) -> Vec<String> {
+        let SynValue::List(l) = v else { panic!("esperaba una lista") };
+        let items = l.borrow().to_vec();
+        items.iter().map(|r| r.to_string()).collect()
+    }
+
+    /// v0.6.45 (B4): `columns`, `row_groups` y `limit` leen por partes; `parquet_info` dice qué hay.
+    #[test]
+    fn parquet_read_by_parts() {
+        let file = syn_bytes(three_row_groups());
+        let info = parquet_info(&[file.clone()]).ok().unwrap().to_string();
+        assert!(info.contains("rows: 6"), "{}", info);
+        assert_eq!(info.matches("rows: 2").count(), 3, "tres row groups de 2: {}", info);
+        let only_a = rows(parquet_read(&[file.clone(), opts(&[("columns", syn_list(vec![syn_text("a")]))])]).ok().unwrap());
+        assert_eq!(only_a.len(), 6);
+        assert!(only_a.iter().all(|r| r.contains("a:") && !r.contains("b:")), "{:?}", only_a);
+        let rg1 = rows(parquet_read(&[file.clone(), opts(&[("row_groups", syn_list(vec![syn_int(1)]))])]).ok().unwrap());
+        assert_eq!(rg1.len(), 2);
+        assert!(rg1[0].contains("a: 2") && rg1[1].contains("a: 3"), "{:?}", rg1);
+        let lim = rows(parquet_read(&[file.clone(), opts(&[("limit", syn_int(3))])]).ok().unwrap());
+        assert_eq!(lim.len(), 3);
+        let both = rows(
+            parquet_read(&[
+                file.clone(),
+                opts(&[("row_groups", syn_list(vec![syn_int(2), syn_int(0)])), ("columns", syn_list(vec![syn_text("b")])), ("limit", syn_int(3))]),
+            ])
+            .ok()
+            .unwrap(),
+        );
+        assert_eq!(both, vec![r#"{b: "r4"}"#, r#"{b: "r5"}"#, r#"{b: "r0"}"#], "el orden es el de row_groups");
+        let msg = |r: Result<SynValue, Control>| match r {
+            Err(Control::Error(e)) => e.to_string(),
+            _ => panic!("esperaba un error"),
+        };
+        assert!(msg(parquet_read(&[file.clone(), opts(&[("columns", syn_list(vec![syn_text("zz")]))])])).contains("no column \"zz\""));
+        assert!(msg(parquet_read(&[file, opts(&[("row_groups", syn_list(vec![syn_int(3)]))])])).contains("row group 3 does not exist"));
     }
 }

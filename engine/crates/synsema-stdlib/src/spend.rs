@@ -390,6 +390,7 @@ pub fn register_spend_builtins(interp: &Interpreter, caps: Rc<RefCell<Capability
                 None => return Err(err("spend: missing argument 3 (reason)")),
             };
             let amount_text = amount.to_string();
+            crate::secrets::audited_op_preflight("spend")?;
             // Identidad del sujeto (T6.4): quién pidió esto. Precede al agente que
             // ejecuta — el gasto se le imputa a la identidad autenticada, y si no
             // hay ninguna, al agente en curso (o "main").

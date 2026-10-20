@@ -110,6 +110,7 @@ fn build_worker_interp(
     bus: &Option<Arc<synsema_agents::bus::Bus>>,
     subject: &crate::subject::Subject,
     scope: &ScopeCtx,
+    providers: &crate::engine::WiredProviders,
 ) -> (Interpreter, ModuleRegistry, crate::llm_providers::LlmIdentityScope) {
     let mut interp = Interpreter::new();
     let caps = Rc::new(RefCell::new(CapabilitySet::new("parallel")));
@@ -132,6 +133,9 @@ fn build_worker_interp(
     // grant de `memory("<nombre>")` ya viene en `granted` (heredado del scope llamador),
     // así que el gate del worker pasa exactamente cuando pasaba en el padre.
     wire_common(&mut interp, &caps, secure, mem.as_ref(), "my-agent");
+    // v0.6.45 (A1): los MISMOS providers de LLM y de judge que el llamador (sin ellos `judge`
+    // daba OFFLINE y `reason` el placeholder dentro de `parallel_map`).
+    crate::engine::wire_providers(&mut interp, providers);
     // El worker ve el MISMO bus que el padre (bus_publish/subscribe/select): un worker
     // no es una isla de eventos.
     if let Some(b) = bus {
@@ -214,6 +218,7 @@ fn run_parallel(
     mem: Option<MemoryCtx>,
     bus: Option<Arc<synsema_agents::bus::Bus>>,
     subject: crate::subject::Subject,
+    providers: crate::engine::WiredProviders,
 ) -> Result<Vec<(SendValue, Vec<synsema_core::rng::Generator>)>, RuntimeError> {
     let n = items.len();
     if n == 0 {
@@ -239,7 +244,7 @@ fn run_parallel(
                 break;
             }
             let (mut interp, mut registry, _subject_scope) =
-                build_worker_interp(&globals, &granted, &denied, secure, &ceiling, &mem, &bus, &subject, ctx);
+                build_worker_interp(&globals, &granted, &denied, secure, &ceiling, &mem, &bus, &subject, ctx, &providers);
             let task_value = reconstruct_task(&interp, &task_snap, &mut registry, ctx);
             // Los entornos de módulo de este item quedan a cargo de su intérprete: se vacían
             // cuando muere (si no, cada item dejaba vivo el programa entero: la fuga de lampson).
@@ -422,6 +427,7 @@ pub(crate) fn register_parallel_builtins(
                 mem,
                 synsema_stdlib::ws::bus_of_interp(i),
                 subject,
+                crate::engine::wired_providers(i),
             ) {
                 Ok(results) => {
                     // Lo que cada worker avanzó de SUS generadores vuelve al padre (como con

@@ -91,9 +91,10 @@ fn fix5_scope_is_faithful_no_traversal_bypass() {
         r.errors
     );
 
-    // Poder total intacto: wildcard cubre cualquier ruta, incluso vía `..`.
+    // Poder total intacto: `require file` sin scope cubre cualquier ruta, incluso vía `..`
+    // (v0.6.45: `file("*")` ya no es poder total; son los archivos del cwd).
     let r = run(
-        &format!("require file(\"*\")\nprint(read_file(\"{base}/sandbox/../secret.txt\"))"),
+        &format!("require file\nprint(read_file(\"{base}/sandbox/../secret.txt\"))"),
         "<t>",
     );
     assert!(r.success, "wildcard debe cubrir todo: {:?}", r.errors);
@@ -575,8 +576,9 @@ fn grep_respects_target_scope() {
     std::fs::write(sub.join("c.txt"), "hello\n").unwrap();
     let base = syn(&d);
 
-    // Scope a la carpeta target → permite grepear el subárbol bajo UN chequeo.
-    let r = run(&format!("require file(\"{base}\")\nlet r be grep(\"{base}\", \"hello\")\nprint(text(length(r[\"matches\"])))"), "<t>");
+    // Scope al árbol del target (v0.6.45: `<carpeta>/**`, que también cubre la carpeta misma) →
+    // permite grepear el subárbol bajo UN chequeo.
+    let r = run(&format!("require file(\"{base}/**\")\nlet r be grep(\"{base}\", \"hello\")\nprint(text(length(r[\"matches\"])))"), "<t>");
     assert!(r.success, "grep bajo scope del target debe funcionar: {:?}", r.errors);
     assert_eq!(r.output, vec!["2".to_string()]);
 

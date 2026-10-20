@@ -371,7 +371,24 @@ fn resolve(env: &EnvStore, name: &str, default: Option<&SynValue>) -> Option<Str
     if let Some(v) = env.get(name) {
         return Some(v);
     }
-    default.map(raw_str)
+    default.filter(|d| !matches!(d, SynValue::Nothing)).map(default_text)
+}
+
+/// v0.6.45 (A2) — el texto de un default de `env`/`secret`. Antes pasaba por `raw_str`, que es
+/// la forma de Python: `env("X", true)` daba `"True"`. Un número sigue dando su texto
+/// (`env("PORT", 8080)` → `"8080"`, como documenta la skill).
+fn default_text(v: &SynValue) -> String {
+    match v {
+        SynValue::Bool(b) => if *b { "true" } else { "false" }.to_string(),
+        other => raw_str(other),
+    }
+}
+
+/// v0.6.45 (A2) — `env(n, nothing)` / `secret(n, nothing)` sin la variable definida dan
+/// `nothing`, no el texto `"None"` (que pasaba como un valor válido, y en un secret salía
+/// como `Bearer None`). Sin default, una variable indefinida sigue siendo error.
+fn nothing_default(default: Option<&SynValue>) -> bool {
+    matches!(default, Some(SynValue::Nothing))
 }
 
 /// Error de capability denegada que **sugiere el fix a quien puede hacerlo** (§1/§3):
@@ -613,6 +630,16 @@ fn iso_now() -> String {
 /// para que una redirección de variable hacia un secret fuera de scope quede registrada.
 /// Devuelve Err si no se puede escribir → en el camino CONCEDIDO `reveal()` falla (sin
 /// auditoría no hay revelación, §7).
+/// v0.6.45 (ronda 3, M2) — la puerta de una operación que AUDITA, ANTES de todo lo demás: en una rama
+/// decidida por un valor privado no corre, y no deja rastro en ningún lado (ni el audit de
+/// capabilities del `check_cause`, ni el cupo de `SYNSEMA_SIGN_CEILING`, ni su propio log).
+pub fn audited_op_preflight(op: &str) -> Result<(), Control> {
+    if synsema_core::labels::pc_private_now() {
+        return Err(Control::Error(RuntimeError::new(synsema_core::labels::audited_in_private_branch(op))));
+    }
+    Ok(())
+}
+
 fn write_audit_entry(name: &str, loc: &SourceLocation, granted: bool) -> Result<(), String> {
     write_audit_op("reveal", "reveal.log", name, loc, granted, "")
 }
@@ -720,6 +747,13 @@ fn write_audit_op(
     granted: bool,
     extra: &str,
 ) -> Result<(), String> {
+    // v0.6.45 (ronda 2, M2): en una rama decidida por un valor privado no se escribe nada (ni la
+    // entrada concedida ni la denegada): que exista ya revela la rama. La operación falla con
+    // `label_violation`. Un recibo sellado de forma fija que audite igual sin revelar nada queda
+    // para la versión siguiente.
+    if synsema_core::labels::pc_private_now() {
+        return Err(synsema_core::labels::audited_in_private_branch(op.split(' ').next().unwrap_or(op)));
+    }
     let program = std::path::Path::new(&*loc.file)
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
@@ -787,6 +821,7 @@ pub fn register_secret_builtins(
                 }
                 match resolve(&env, &name, args.get(1)) {
                     Some(v) => Ok(syn_text(v)),
+                    None if nothing_default(args.get(1)) => Ok(SynValue::Nothing),
                     None => Err(undefined_var("env", &name)),
                 }
             }),
@@ -807,6 +842,7 @@ pub fn register_secret_builtins(
                 }
                 match resolve(&env, &name, args.get(1)) {
                     Some(v) => Ok(syn_secret(name, v)),
+                    None if nothing_default(args.get(1)) => Ok(SynValue::Nothing),
                     None => Err(undefined_var("secret", &name)),
                 }
             }),
@@ -834,6 +870,7 @@ pub fn register_secret_builtins(
                     }
                 };
                 let name = inner.name().to_string();
+                audited_op_preflight("reveal")?;
                 // Auditoría externa: un secret SELLADO no se revela ni con la capability:
                 // Es material de identidad (`attestation_key()`) que sólo consumen los bordes
                 // criptográficos (ecdh_shared_secret/firma). El intento queda auditado igual.

@@ -267,7 +267,46 @@ impl Capability {
     /// - scope None = wildcard total.
     /// - self con scope y other con scope None → no cubre.
     /// - match exacto o glob (`*.example.com` cubre `api.example.com`).
+    /// - v0.6.45: una RUTA además tiene que quedar dentro del scope EN DISCO — un link (symlink,
+    ///   junction) debajo del scope que lleva afuera la deja afuera, aunque por nombre esté
+    ///   adentro. Es la misma decisión para el grant, el techo del host y los techos delegados.
     pub fn covers(&self, other: &Capability) -> bool {
+        if !self.covers_by_name(other) {
+            return false;
+        }
+        match (self.physical_scope_pair(other), &self.scope, &other.scope) {
+            (true, Some(g), Some(r)) => synsema_core::capscope::path_within_physically(g, r),
+            _ => true,
+        }
+    }
+
+    /// v0.6.45 — para un `deny`: ¿la ruta pedida llega EN DISCO a lo que este scope nombra? Un
+    /// link a un lugar denegado da con la denegación aunque su nombre no coincida.
+    pub fn reaches_physically(&self, other: &Capability) -> bool {
+        if self.ty != other.ty
+            && !(self.ty == CapabilityType::File
+                && matches!(other.ty, CapabilityType::FileRead | CapabilityType::FileWrite))
+        {
+            return false;
+        }
+        match (self.physical_scope_pair(other), &self.scope, &other.scope) {
+            (true, Some(g), Some(r)) => synsema_core::capscope::path_reaches_physically(g, r),
+            _ => false,
+        }
+    }
+
+    /// ¿Los dos scopes son rutas de disco (file/file.read/file.write, o una base SQLite)?
+    fn physical_scope_pair(&self, other: &Capability) -> bool {
+        let path_ty = |t: CapabilityType| {
+            matches!(t, CapabilityType::File | CapabilityType::FileRead | CapabilityType::FileWrite | CapabilityType::Db)
+        };
+        let url = |c: &Capability| c.ty == CapabilityType::Db && c.scope.as_deref().is_some_and(is_db_url);
+        path_ty(self.ty) && path_ty(other.ty) && !url(self) && !url(other)
+    }
+
+    /// La comparación por NOMBRE de `covers` (sin mirar el disco): la de siempre. La usa el
+    /// mensaje de un rechazo para decir que fue un link y no un scope de menos.
+    pub fn covers_by_name(&self, other: &Capability) -> bool {
         if self.ty != other.ty {
             let file_covers = self.ty == CapabilityType::File
                 && matches!(other.ty, CapabilityType::FileRead | CapabilityType::FileWrite);
@@ -298,7 +337,7 @@ impl Capability {
         #[cfg(not(any(windows, target_os = "macos")))]
         let case_fold = |s: String| -> String { s };
         let canon = |s: &str| -> String {
-            if is_db && s.contains("://") {
+            if is_db && is_db_url(s) {
                 canon_url(s)
             } else {
                 normalize_path(s)
@@ -312,9 +351,21 @@ impl Capability {
                 None => false,
                 Some(other_scope) => {
                     if is_path {
-                        let grant = case_fold(canon(self_scope));
-                        let req = case_fold(canon(other_scope));
-                        grant == req || fnmatch(&req, &grant)
+                        // v0.6.45: una ruta relativa contra una absoluta se compara en la misma forma
+                        // (la relativa, con el cwd). Las URLs de base de datos, tal cual.
+                        let url = is_db && (is_db_url(self_scope) || is_db_url(other_scope));
+                        let (g0, r0) = if url {
+                            (canon(self_scope), canon(other_scope))
+                        } else {
+                            synsema_core::capscope::same_form(self_scope, other_scope)
+                        };
+                        let grant = case_fold(g0);
+                        let req = case_fold(r0);
+                        // Una URL de base de datos sigue con el glob de siempre; una ruta, con el
+                        // glob por segmentos (v0.6.45: `*` ya no cruza `/` ni `..`).
+                        // `db("*")` sigue cubriendo una URL pedida (el glob de siempre).
+                        grant == req
+                            || if url { fnmatch(&req, &grant) } else { synsema_core::capscope::path_glob(&req, &grant) }
                     } else if self.ty == CapabilityType::Net {
                         // Host y puerto por separado: un grant sin puerto cubre cualquier puerto
                         // del host; con puerto, sólo ese.
@@ -412,6 +463,8 @@ pub fn net_request_scope(url: &str) -> Option<String> {
 /// de una ruta de archivo SQLite). Preserva un `*` como nombre/host para los globs
 /// (`db("postgres://localhost/*")`). Idempotente.
 pub fn canon_url(url: &str) -> String {
+    // Ronda 4 (revisión, B6): sin espacios adelante, como `is_db_url` y `db_open`.
+    let url = url.trim_start();
     let (scheme, rest) = match url.split_once("://") {
         Some((s, r)) => (s.to_lowercase(), r),
         None => return url.to_lowercase(),
@@ -465,6 +518,16 @@ pub enum DenyCause {
 /// El texto del techo, idéntico en todas las ramas (los clasificadores del audit
 /// comparan por string).
 pub const ABOVE_CEILING: &str = "above host ceiling (--sandbox/--cap-set)";
+/// v0.6.45 (ronda 3, A2) — ¿un scope de `db` es la URL de un servidor? El MISMO criterio que usa
+/// `db_open` para elegir backend (esquemas conocidos), no "contiene `://`": `data/a://../../x.db` se
+/// juzgaba como URL (sin chequeo de ruta, con el glob que cruza `/`) y se abría como un archivo de
+/// SQLite fuera del scope.
+pub fn is_db_url(s: &str) -> bool {
+    synsema_core::capscope::is_db_url(s)
+}
+
+/// v0.6.45 — el `reason` del audit cuando un grant cubre la ruta por nombre y un link la saca.
+pub const LINK_ESCAPE: &str = "resolves outside the grant through a link";
 /// `reason` de un grant ambiental que entró (stdout/time/llm bajo `run` no-secure,
 /// `serve(port)` por `--port`).
 pub const AMBIENT_GRANT: &str = "auto-granted by the runtime";
@@ -685,6 +748,14 @@ impl CapabilitySet {
     /// Pushea una entrada al `audit_log` del set y la entrega al sink del proceso (si
     /// hay). ÚNICO camino de escritura del audit: todo chequeo/grant pasa por acá.
     pub fn push_audit(&mut self, entry: CapabilityAuditEntry) {
+        // v0.6.45 (ronda 4, M5): con etiquetas, una entrada generada en una rama decidida por un valor
+        // privado no se registra: cuántas hubo decía qué rama se tomó y cuántas vueltas dio un bucle
+        // privado (5 entradas con n=1, 54 con n=50). Lo que audita en serio (`sign`/`spend`/
+        // `reveal`/wallet) ya no corre en una rama privada; el recibo sellado de v0.6.46 va a
+        // registrar estas entradas sin revelar la rama.
+        if synsema_core::labels::pc_private_now() {
+            return;
+        }
         audit_sink::emit(&self.name, &entry);
         self.audit_log.push(entry);
     }
@@ -773,8 +844,11 @@ impl CapabilitySet {
 
     fn check_inner(&mut self, requested: &Capability, source: &str, audit: bool) -> Result<(), DenyCause> {
         // 1) Denegaciones explícitas primero.
-        let denied_by: Option<Capability> =
-            self.denied.iter().find(|d| d.covers(requested)).cloned();
+        let denied_by: Option<Capability> = self
+            .denied
+            .iter()
+            .find(|d| d.covers_by_name(requested) || d.reaches_physically(requested))
+            .cloned();
         if let Some(d) = denied_by {
             if audit {
                 self.push_audit(CapabilityAuditEntry {
@@ -858,15 +932,35 @@ impl CapabilitySet {
 
         // 4) Sin grant.
         if audit {
+            let reason = if self.escapes_through_link(requested) {
+                LINK_ESCAPE
+            } else {
+                "No matching grant found"
+            };
             self.push_audit(CapabilityAuditEntry {
                 capability: requested.clone(),
                 granted: false,
                 source: source.to_string(),
-                reason: "No matching grant found".to_string(),
+                reason: reason.to_string(),
                 origin: "program",
             });
         }
         Err(DenyCause::NoGrant)
+    }
+
+    /// v0.6.45 — ¿un grant la cubre por NOMBRE pero no en disco? Es un link debajo del scope que
+    /// lleva afuera, no un `require` que falta: el mensaje y el audit lo dicen.
+    fn escapes_through_link(&self, requested: &Capability) -> bool {
+        self.granted.iter().any(|c| c.covers_by_name(requested))
+            || self.parent.as_ref().map(|p| p.borrow().escapes_through_link(requested)).unwrap_or(false)
+    }
+
+    /// v0.6.45 — ¿un `deny` (propio o de un padre) alcanza esta capability, por nombre o en disco?
+    /// Para lo que recorre un árbol bajo un solo `require` (`grep`): cada archivo de adentro tiene
+    /// que respetar un `deny` del medio. Sin `deny` no hace nada (no paga ninguna consulta).
+    pub fn denies(&self, requested: &Capability) -> bool {
+        self.denied.iter().any(|d| d.covers_by_name(requested) || d.reaches_physically(requested))
+            || self.parent.as_ref().map(|p| p.borrow().denies(requested)).unwrap_or(false)
     }
 
     fn is_declared(&self, requested: &Capability) -> bool {
@@ -921,8 +1015,16 @@ impl CapabilitySet {
     /// Chequea y devuelve error si no está otorgada.
     pub fn require(&mut self, requested: &Capability, source: &str) -> Result<(), CapabilityViolation> {
         if let Err(cause) = self.check_cause(requested, source) {
+            let message = if cause == DenyCause::NoGrant && self.escapes_through_link(requested) {
+                format!(
+                    "Capability not granted: {} — by name the path is inside the granted scope, but a link (symlink or junction) on the way leads outside it. Synsema checks where a path really leads: grant the place the link points to, or remove the link",
+                    requested
+                )
+            } else {
+                Self::denial_message(requested, &cause)
+            };
             return Err(CapabilityViolation {
-                message: Self::denial_message(requested, &cause),
+                message,
                 requested: Some(requested.clone()),
                 source: source.to_string(),
                 cause,
@@ -1166,11 +1268,99 @@ mod tests {
         assert!(grant.covers(&ok), "ruta dentro del scope debe cubrirse");
         assert!(!grant.covers(&escape), "el bypass `..` debe quedar fuera del scope");
 
-        // Poder total preservado: wildcard cubre cualquier ruta, con o sin `..`.
+        // v0.6.45: el glob de ruta es por segmentos — `*` es "esta carpeta" y ya no cruza `/` ni
+        // `..` (antes `*` era poder total por nombre). El poder total es `require file.read` sin scope.
         let star = cap(CapabilityType::FileRead, Some("*"));
-        assert!(star.covers(&escape));
+        assert!(!star.covers(&escape));
+        assert!(star.covers(&cap(CapabilityType::FileRead, Some("./x.csv"))));
+        assert!(!star.covers(&cap(CapabilityType::FileRead, Some("./data/x.csv"))));
         let total = cap(CapabilityType::File, None);
         assert!(total.covers(&escape));
+    }
+
+    /// v0.6.45 — el glob de un scope de ruta, por segmentos.
+    #[test]
+    fn path_globs_match_by_segment() {
+        let g = |p: &str, pat: &str| synsema_core::capscope::path_glob(&normalize_path(p), &normalize_path(pat));
+        // `*` dentro de un segmento; `**` cruza (y cubre la carpeta misma).
+        assert!(g("data/a.csv", "./data/*"));
+        assert!(!g("data/sub/a.csv", "./data/*"));
+        assert!(g("data/sub/a.csv", "./data/**"));
+        assert!(g("data", "./data/**"));
+        assert!(g("data/sub/a.csv", "./data/**/*.csv"));
+        assert!(!g("data/sub/a.txt", "./data/**/*.csv"));
+        assert!(g("x.csv", "*.csv"));
+        assert!(!g("data/x.csv", "*.csv"));
+        assert!(!g("/etc/x.csv", "*.csv"));
+        // Ningún comodín coincide con `..` ni salta de relativa a absoluta.
+        assert!(!g("../x.csv", "*.csv"));
+        assert!(!g("../x", "**"));
+        assert!(!g("/etc/passwd", "./**"));
+        assert!(g("/etc/passwd", "/etc/*"));
+        assert!(g("C:/Users/x/a.txt", "C:/Users/*/a.txt"));
+        assert!(!g("D:/Users/x/a.txt", "C:/**"));
+        // Scope contra scope (el techo al conceder): un `**` pedido sólo lo cubre un `**`.
+        assert!(!g("data/**", "./data/*"));
+        assert!(g("data/*", "./data/**"));
+        // Ronda 2 (N1): un segmento pedido con comodines sólo lo cubre uno idéntico o `*`.
+        assert!(!g("data/a*", "./data/a?"));
+        assert!(!g("*", "./?"));
+        assert!(g("data/a*", "./data/*"));
+        assert!(g("data/a*", "./data/a*"));
+    }
+
+    /// Ronda 2 (N2): un `deny` sobre una unidad que no existe no deniega TODO archivo (su lugar no se
+    /// puede resolver: no alcanza a nada por el disco; por nombre sigue valiendo).
+    #[cfg(windows)]
+    #[test]
+    fn a_deny_on_a_missing_drive_does_not_deny_everything() {
+        let Some(missing) = ('D'..='Z').rev().find(|d| !std::path::Path::new(&format!("{}:\\", d)).exists()) else { return };
+        let mut set = CapabilitySet::new("t");
+        set.grant(cap(CapabilityType::FileRead, None));
+        set.deny(cap(CapabilityType::FileRead, Some(&format!("{}:/x/*", missing))));
+        let here = std::env::temp_dir().join("synsema-n2.txt").to_string_lossy().replace('\\', "/");
+        assert!(set.check_cause(&cap(CapabilityType::FileRead, Some(&here)), "t").is_ok());
+        assert!(set.check_cause(&cap(CapabilityType::FileRead, Some(&format!("{}:/x/a", missing))), "t").is_err());
+    }
+
+    /// v0.6.45 — un link debajo del scope que lleva afuera: el grant no lo cubre (aunque por nombre
+    /// sí) y un `deny` del destino lo alcanza (aunque por nombre no).
+    #[test]
+    fn a_link_under_the_scope_is_judged_where_it_leads() {
+        let root = std::env::temp_dir().join(format!("synsema-v0645-capslink-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("data")).unwrap();
+        std::fs::create_dir_all(root.join("outside")).unwrap();
+        std::fs::write(root.join("outside/secret.txt"), "x").unwrap();
+        #[cfg(windows)]
+        assert!(std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(root.join("data").join("ext"))
+            .arg(root.join("outside"))
+            .output()
+            .unwrap()
+            .status
+            .success());
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(root.join("outside"), root.join("data/ext")).unwrap();
+        let r = root.to_string_lossy().replace('\\', "/");
+        let via_link = cap(CapabilityType::FileRead, Some(&format!("{}/data/ext/secret.txt", r)));
+        let grant = cap(CapabilityType::FileRead, Some(&format!("{}/data/**", r)));
+        assert!(grant.covers_by_name(&via_link));
+        assert!(!grant.covers(&via_link), "el link saca la ruta del scope");
+        let mut set = CapabilitySet::new("t");
+        set.grant(grant.clone());
+        let err = set.require(&via_link, "test").unwrap_err();
+        assert!(err.message.contains("a link (symlink or junction) on the way leads outside"), "{}", err.message);
+        assert!(set.audit_log.iter().any(|e| e.reason == LINK_ESCAPE));
+        // Un deny del destino alcanza la ruta por el link.
+        let mut set = CapabilitySet::new("t");
+        set.grant(cap(CapabilityType::FileRead, None));
+        set.deny(cap(CapabilityType::FileRead, Some(&format!("{}/outside/*", r))));
+        assert!(matches!(set.check_cause(&via_link, "test"), Err(DenyCause::ExplicitlyDenied(_))));
+        // Lo que está de verdad adentro sigue cubierto.
+        assert!(grant.covers(&cap(CapabilityType::FileRead, Some(&format!("{}/data/nuevo.txt", r)))));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

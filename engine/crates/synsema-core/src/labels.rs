@@ -260,6 +260,54 @@ pub fn label_display_raw(l: &Label) -> String {
 }
 
 thread_local! {
+    /// v0.6.45 (auditoría, ronda 2, M2) — ¿el builtin en curso corre en una rama decidida por un
+    /// valor privado (la etiqueta de PC no vacía)? Lo fija el intérprete al despachar un builtin con
+    /// las etiquetas encendidas; lo lee el escritor del audit (`stdlib::secrets::write_audit_op`),
+    /// que no tiene el intérprete a mano.
+    static PC_PRIVATE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Fija si el builtin que va a correr está en una rama privada; devuelve lo anterior (para
+/// restaurarlo al volver: los builtins se anidan por sus callbacks).
+pub fn set_pc_private(v: bool) -> bool {
+    PC_PRIVATE.with(|c| c.replace(v))
+}
+
+/// Fija el flag mientras vive y restaura el anterior al soltarse (también si el builtin entra en
+/// pánico y un worker de `serve` lo atrapa).
+/// No es `Send` (el flag es del hilo): no puede soltarse en otro.
+pub struct PcPrivateGuard(bool, std::marker::PhantomData<*const ()>);
+
+impl PcPrivateGuard {
+    pub fn set(v: bool) -> Self {
+        PcPrivateGuard(set_pc_private(v), std::marker::PhantomData)
+    }
+}
+
+impl Drop for PcPrivateGuard {
+    fn drop(&mut self) {
+        set_pc_private(self.0);
+    }
+}
+
+/// ¿El builtin en curso corre en una rama decidida por un valor privado? Siempre `false` con las
+/// etiquetas apagadas.
+pub fn pc_private_now() -> bool {
+    PC_PRIVATE.with(|c| c.get())
+}
+
+/// El error de una operación que AUDITA (escribe el log de `reveal`/`sign`/`spend`/`wallet`) dentro
+/// de una rama privada: que la entrada exista o no ya dice qué camino tomó la rama, así que no se
+/// escribe y la operación no corre. El remedio es decidir con un valor público o desclasificar la
+/// condición (queda registrado en `declassify`).
+pub fn audited_in_private_branch(op: &str) -> String {
+    format!(
+        "label_violation: {} writes the audit log, and here it runs in a branch decided by a private value — whether the entry exists would tell which way the branch went; decide with a public value, or declassify(<the condition>, \"<why it may be published>\") it first",
+        op
+    )
+}
+
+thread_local! {
     /// T5 (ronda 7) — el texto con el que se REDACTA, fijado por el intérprete al cargar el
     /// programa: el conjunto de principales que el fuente declara (más los que registra el
     /// host), que es constante para la corrida. Nunca la etiqueta del valor concreto: esa varía

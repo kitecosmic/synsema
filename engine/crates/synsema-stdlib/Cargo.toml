@@ -34,8 +34,20 @@ ndarray.workspace = true
 # Export PNG/PDF (Batch 9): svg_to_png/svg_to_pdf en raster.rs. Puro-Rust, sin C (ver workspace).
 resvg.workspace = true
 usvg.workspace = true
+# v0.6.45 (B7): qr_matrix / qr_svg (puro, también en wasm).
+qrcode.workspace = true
+# v0.6.45: firma RS256 en tiempo constante en el binario nativo (RUSTSEC-2023-0071 en `rsa`). ring ya
+# está en el binario por rustls; sólo native (en wasm no compila sin C).
+ring = { version = "0.17", optional = true }
+# v0.6.45 (B9): html_select / html_text / html_unescape.
+scraper.workspace = true
+# El árbol de scraper (no lo reexporta); la misma versión que ya trae scraper: ninguna crate nueva.
+ego-tree = "=0.11.0"
 tiny-skia.workspace = true
 fontdb.workspace = true
+# v0.6.45 (B6): leer el cmap de una fuente para el respaldo por glifo (la misma versión que ya trae
+# fontdb: ninguna crate nueva).
+ttf-parser = "=0.25.1"
 svg2pdf.workspace = true
 # v0.6.20: xml_parse (roxmltree, ya transitiva de usvg) y toml_parse/toml_encode. Puros.
 roxmltree.workspace = true
@@ -114,7 +126,9 @@ crossterm = { version = "0.29", default-features = false, features = ["events", 
 # nuevo (mio son bindings de syscalls del SO ya presentes, no una lib C que compile). G8.
 mio = { version = "1", features = ["os-poll", "net"], optional = true }
 # A2 stack web: gzip (miniz_oxide puro-Rust, sin C) + TLS (rustls con backend ring).
-flate2 = { version = "1", optional = true }
+# v0.6.45: sin `optional`: `gzip`/`gunzip` son builtins puros y existen también en wasm (miniz_oxide
+# es puro Rust; ya estaba en el árbol y en el Cargo.lock de Vela, que registra los opcionales).
+flate2 = { version = "1" }
 # v0.6.20 (archive.rs): zip_*/tar_* — SÓLO native (extraer toca disco; en el perfil puro son
 # stubs). Comparten el flate2 de arriba.
 zip = { workspace = true, optional = true }
@@ -165,10 +179,10 @@ native = [
     "dep:mongodb",
     "dep:redis",
     "dep:mio",
-    "dep:flate2",
     "dep:zip",
     "dep:tar",
     "dep:rustls",
+    "dep:ring",
     "dep:rustls-pemfile",
     "dep:rcgen",
     "dep:rustls-native-certs",

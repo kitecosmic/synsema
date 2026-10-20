@@ -421,6 +421,12 @@ jobs:
         run: cargo install cargo-audit --version 0.22.2 --locked
       - name: Audit
         run: cargo audit --file engine/Cargo.lock
+      # v0.6.45: el guest de Vela tiene su propio lock (y compila con `--locked` en su job): una
+      # vulnerabilidad ahí no la veía nadie (quedó rkyv 0.7.46 cuando el motor ya lo había sacado).
+      - name: Audit (Vela guest lock)
+        # Corre aunque falle el del motor: cada lock dice lo suyo.
+        if: always()
+        run: cargo audit --file packages/guests/vela/Cargo.lock
 
   # Every Synsema program in the repository still LOADS. This is the gate that was missing when a
   # language rule stopped a program from loading and nobody noticed for a whole round: the engine's

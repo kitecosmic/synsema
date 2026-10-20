@@ -528,6 +528,7 @@ pub const PWA_APP_SYN: &str = r#"-- Tu app instalable (PWA). Este programa sirve
 require serve(8080)
 require time
 require file.read("index.html")      -- render() lee la página del disco (en un `synsema build` no hace falta: va dentro del binario)
+require file.read("./public/**")     -- static sirve esa carpeta (lo mismo: en un binario de `synsema build` viaja adentro)
 require env("VAPID_PUBLIC_KEY")
 require env("VAPID_SUBJECT")
 require secret("VAPID_PRIVATE_KEY")
@@ -965,6 +966,7 @@ pub const DESKTOP_DESK_SYN: &str = r#"-- Tu app como app de ESCRITORIO: el mismo
 require serve(8123)
 require time
 require file.read("index.html")
+require file.read("./public/**")
 require env("DESK_NO_WINDOW")
 require exec("cmd")            -- Windows: Edge viene con Windows; --app= da una ventana sin barra de direcciones
 require exec("open")           -- macOS: Chrome/Edge en modo app; si no, el navegador por defecto (una pestaña)
@@ -1068,6 +1070,7 @@ pub const PWA_FILES: [InitFile; 10] = [
         "4f589b3fa0ffb8177bf17fbfc35f816438482d557ea20e3091a854110ce65cd1", // v0.6.17–v0.6.18 (rutas inline)
         // 2026-09-20 (tanda judge): version intermedia cuyo sha nunca entro (guard salteado en CI shallow).
         "5028ebcd9aa63bd5cfe17971824d11f4a00fd30fca78c66545af51c1ec2740bc",
+        "4a4cbf351e55a2f3912536e66417b4bf75ce0f67df0c3546cf3eead3f86ed9cb", // hasta v0.6.44 (antes del require de static)
     ] },
     InitFile { name: "api.syn", content: PWA_API_SYN, past: &[] },
     InitFile { name: "push_keys.syn", content: PWA_PUSH_KEYS_SYN, past: &[] },
@@ -1093,6 +1096,7 @@ pub const DESKTOP_FILES: [InitFile; 2] = [
     InitFile { name: "desk.syn", content: DESKTOP_DESK_SYN, past: &[
         // 2026-09-20 (tanda judge): version intermedia cuyo sha nunca entro (guard salteado en CI shallow).
         "5badfe21c16dc374a42aa42b1e3c938d288c3c95cd6f973e0a17b4a1f36bbaa6",
+        "a20ee0d8db55342ea3964ee486f36ac61c28739eb4964da361b956bb4de8b17a", // hasta v0.6.44 (antes del require de static)
     ] },
     InitFile { name: "public/desk.js", content: DESKTOP_DESK_JS, past: &[] },
 ];

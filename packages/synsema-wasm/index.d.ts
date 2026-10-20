@@ -27,6 +27,12 @@ export interface KvStore {
   delete?(ns: string, key: string): void | Promise<void>;
   /** Claves del namespace (para `state_all`). */
   list?(ns: string): string[] | Promise<string[]>;
+  /**
+   * Comparar-y-cambiar atómico: escribe `value` sólo si el valor actual es exactamente `expected`
+   * (`null` = la clave no existe) y devuelve si escribió. Con esto `state_merge`/`state_cas` son
+   * atómicos aunque varias instancias compartan el KV; sin esto, esas dos lo dicen con un error.
+   */
+  cas?(ns: string, key: string, expected: string | null, value: string): boolean | Promise<boolean>;
 }
 
 export interface LlmResult {
@@ -57,6 +63,42 @@ export interface RunOptions {
   /** `"sandbox"` (stdout + time) o la lista de `--cap-set`: `"stdout,secret=ETH_*"`. */
   ceiling?: string;
   host?: Host;
+  /**
+   * v0.6.45 — etiquetas de flujo de información (`private`/`declassify`). Con `true`, un valor
+   * privado (o una rama que dependió de uno) no llega a ningún sumidero: ni `print`, ni el hook
+   * `http` (`fetch`/`http_*`), ni el `kv` (`state_*`, `remember`), ni el `llm`. Es lo que hay que
+   * encender para correr código que escribió un modelo sobre datos de un usuario.
+   */
+  labels?: boolean;
+  /** Nombre de una variable global cuyo valor final vuelve en `RunResult.result` CON sus etiquetas. */
+  result?: string;
+  /**
+   * La entrada del host, ligada como variable global antes de correr. Cada clave de `sources`
+   * presente llega al programa como `private(valor, principales)`. Exige `labels: true`.
+   */
+  input?: { var: string; value: unknown; sources?: Record<string, string[]> };
+  /**
+   * Sólo en el modo asíncrono: si la llamada no termina en este plazo — contado desde que EMPIEZA a
+   * correr, no desde que entró a la cola —, su Worker se termina y la Promise falla con un error
+   * claro (el código no confiable nunca bloquea el hilo del servidor). Un hook del host sin plazo
+   * propio que nunca contesta ocupa su Worker si la llamada no tiene `timeoutMs`. `0` = sin plazo;
+   * si no, un número finito de milisegundos, como mucho 2147483647.
+   */
+  timeoutMs?: number;
+  /**
+   * Tope de pasos del intérprete (los de `steps()`, deterministas), contados desde que empieza la
+   * corrida (en `handle`, cada request). Al pasarlo la corrida termina con `ok: false` y un error
+   * que lo dice, no con un trap. Sirve en los dos modos. Un entero positivo.
+   */
+  maxSteps?: number;
+  /**
+   * Tope en MB de la memoria que RESERVA la corrida (los bytes vivos que cuenta el allocator del
+   * módulo desde que empieza, no lo que la instancia ya tenía). La reserva que lo pasaría se
+   * rechaza y la corrida termina con `ok: false` y "memory limit reached" (en `handle`, un 500).
+   * Cuenta bytes pedidos: la memoria del módulo puede crecer hasta ~2× eso y no se devuelve.
+   * Igual que `maxSteps`. Un entero positivo.
+   */
+  maxMemoryMb?: number;
 }
 
 export interface AuditEntry {
@@ -77,6 +119,12 @@ export interface RunResult {
   llm_tokens: number;
   /** v0.6.42 — el código de salida: el de `exit(code)` si el programa lo pidió, si no 0 (ok) o 1. */
   exit: number;
+  /** Con `result`: el valor final de esa variable (las partes privadas como `{"$private": [...]}`). */
+  result?: unknown;
+  /** Con `labels`: cada `declassify` que corrió (quién, qué principal, dónde). */
+  declassify?: unknown[];
+  /** Con `labels`: si algún valor privado pasó por la corrida (entonces `steps` no se publica). */
+  private_seen?: boolean;
 }
 
 export interface TestResult {
@@ -125,20 +173,50 @@ export declare function instantiate(
   hostCall: (kind: string, payload: any) => any,
 ): Promise<{ exports: WebAssembly.Exports; call(request: object): any }>;
 
+export interface LoadOptions {
+  /** Cuántos Workers usa el modo asíncrono (default 1). Con más, `runAsync` corre en paralelo. */
+  workers?: number;
+  /**
+   * Cuánto puede tardar un Worker en arrancar antes de darlo por perdido (ms, default 30 000; entre 1
+   * y 2147483647). Opción de `Synsema.load`/`loadNode`.
+   */
+  startMs?: number;
+}
+
+export declare function instantiateSync(
+  module: WebAssembly.Module,
+  hostCall: (kind: string, payload: any) => any,
+): { exports: WebAssembly.Exports; call(request: object): any };
+
 export declare class Synsema {
-  constructor(module: WebAssembly.Module);
-  static load(src: ModuleSource): Promise<Synsema>;
-  /** Prepara la instancia síncrona (obligatorio antes de run/test/check/handle). */
+  constructor(module: WebAssembly.Module, opts?: LoadOptions);
+  static load(src: ModuleSource, opts?: LoadOptions): Promise<Synsema>;
+  /**
+   * Node: carga el `synsema.wasm` que trae el paquete (sin resolver rutas; anda en Next, rutas
+   * `/api` y Server Actions).
+   */
+  static loadNode(opts?: LoadOptions): Promise<Synsema>;
+  /**
+   * Prepara la instancia síncrona (obligatorio antes de run/test/check/handle). Después de un trap
+   * la instancia se recrea sola; no hace falta volver a llamarlo.
+   */
   ready(): Promise<this>;
   version(): string;
   run(source: string, opts?: RunOptions): RunResult;
   test(source: string, opts?: RunOptions): TestResult;
   check(source: string, opts?: { filename?: string }): CheckResult;
   handle(source: string, request: HandleRequest, opts?: RunOptions): HandleResult;
-  /** Modo asíncrono (Worker + Atomics): los hooks del host pueden ser async. */
+  /**
+   * Modo asíncrono (Worker + Atomics): los hooks del host pueden ser async. Las llamadas esperan en
+   * una sola cola y van al primer Worker libre (hasta `workers`).
+   */
   runAsync(source: string, opts?: RunOptions): Promise<RunResult>;
   testAsync(source: string, opts?: RunOptions): Promise<TestResult>;
   handleAsync(source: string, request: HandleRequest, opts?: RunOptions): Promise<HandleResult>;
+  /**
+   * Termina los Workers del modo asíncrono. Es final: lo que espera en la cola falla con "closed" y
+   * una llamada asíncrona posterior también (la API síncrona sigue andando).
+   */
   close(): Promise<void>;
 }
 

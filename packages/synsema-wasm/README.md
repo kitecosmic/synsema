@@ -8,7 +8,10 @@ store, an `llm`, a `log`. No Synsema backend, nothing to install on the host.
 ```js
 import { Synsema } from "@synsema/wasm";
 
-const syn = await Synsema.load(new URL("@synsema/wasm/synsema.wasm", import.meta.url));
+// Node (also Next.js API routes and Server Actions): the .wasm that ships in this package.
+const syn = await Synsema.loadNode();
+// Browser / edge: serve synsema.wasm with your static files and load it by URL:
+//   const syn = await Synsema.load("/synsema.wasm");
 await syn.ready();
 
 const r = syn.run(`print(keccak256("hola"))`);
@@ -18,6 +21,42 @@ r.audit;   // every capability check: {capability, granted, source, reason, orig
            // origin: "program" (asked/called by the program) | "runtime" (ambient host grant)
            // sign/spend/wallet/reveal need an audit sink: offer `kv` (namespace "audit") or they refuse
 ```
+
+## Untrusted code: labels, limits, concurrency
+
+Code a model wrote is the usual reason to embed Synsema. These options make that safe to run
+inside a server:
+
+```js
+const syn = await Synsema.loadNode({ workers: 4 }); // async calls run on up to 4 Workers
+
+const r = await syn.runAsync(code, {
+  host,
+  labels: true,                                    // information-flow labels on
+  input: { var: "customer", value: row, sources: { card: ["customer"] } },
+  timeoutMs: 2000,                                 // the Worker is stopped past this
+  maxSteps: 5_000_000,                             // interpreter steps, deterministic
+  maxMemoryMb: 64,                                 // memory the run reserves
+});
+```
+
+- With `labels: true`, every key listed in `sources` reaches the program as a private value. A
+  private value, or a branch that depended on one, never reaches `print`, your `http` hook
+  (`fetch`/`http_*`), your `kv` (`state_*`, `remember`), your `llm` or your `sleep` (its number
+  crosses to the host): the call fails with `label_violation` before the hook runs.
+  `r.private_seen` says whether one went through.
+- `timeoutMs` (async mode): `0` means no deadline; otherwise milliseconds, up to 2147483647,
+  counted from when the call starts running, not while it waits in the queue. Past it the call fails with a clear error and its Worker is replaced. The server's own
+  thread never blocks. A host hook with no deadline of its own that never answers keeps its Worker
+  busy unless the call has a `timeoutMs`.
+- `maxSteps` and `maxMemoryMb` (both modes): the run ends with `ok: false` and an error that says
+  which limit it hit — never a trap. `maxSteps` counts interpreter steps from the start of the run
+  (in `handle`, of each request); `maxMemoryMb` counts the memory the run reserves, not what the
+  instance already held.
+- Concurrent async calls wait in one queue and go to the first free Worker (up to `workers: n`). A
+  Worker that does not start in `startMs` (an option of `Synsema.load`/`loadNode`, default 30 s) is
+  stopped. In the sync API a trap
+  recreates the instance by itself.
 
 ## Lending capabilities (the host)
 

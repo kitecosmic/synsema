@@ -66,6 +66,53 @@ pub(crate) struct MemoryCtx {
     pub(crate) progress: std::sync::Arc<std::sync::Mutex<ProgressManager>>,
     pub(crate) on_write_mem: std::sync::Arc<dyn Fn(&AgentMemory) + Send + Sync>,
     pub(crate) on_write_prog: std::sync::Arc<dyn Fn(&ProgressManager) + Send + Sync>,
+    /// Lo que `run_program` necesita de la memoria de ESTA corrida (`None` si no persiste).
+    pub(crate) child: Option<ChildState>,
+}
+
+/// v0.6.45 (ronda 5, M1 y B1) — el estado de una corrida, visto desde `run_program`: la carpeta
+/// ABSOLUTA donde vive su `.db` (el hijo la recibe como `SYNSEMA_STATE_DIR`) y cómo recargar la base
+/// cuando el hijo vuelve. Es de la corrida, no del proceso: `synsema test`/`conform` corren muchos
+/// programas en un proceso y cada uno pasa la suya (antes un `OnceLock` la fijaba el primero).
+#[derive(Clone)]
+pub(crate) struct ChildState {
+    pub(crate) dir: std::path::PathBuf,
+    /// Trae lo que el hijo escribió en la base compartida y sube el contador de ids (si no, el
+    /// próximo `remember` del padre reusaba el id de una entrada del hijo y la pisaba).
+    pub(crate) reload: Arc<dyn Fn() + Send + Sync>,
+}
+
+/// La memoria declarada tal como viaja por `serve` y por los ticks de cron (que arman sus
+/// intérpretes en otros hilos, desde argumentos `Send`): el nombre y, si persiste, su `ChildState`.
+/// Ronda 5 (revisión): antes los workers leían el `ChildState` de un static del proceso, y con dos
+/// `serve` en un proceso el hijo de uno guardaba en la carpeta del otro.
+#[derive(Clone)]
+pub(crate) struct MemName {
+    pub(crate) name: String,
+    pub(crate) child: Option<ChildState>,
+}
+
+/// El `ChildState` de una memoria con base en disco. Mismo orden de locks que los `on_write`
+/// (el store primero, después la base).
+pub(crate) fn child_state_for(
+    dir: std::path::PathBuf,
+    sp: Arc<std::sync::Mutex<crate::persistence::StatePersistence>>,
+    memory: Arc<std::sync::Mutex<AgentMemory>>,
+    progress: Arc<std::sync::Mutex<ProgressManager>>,
+) -> ChildState {
+    let reload: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+        if let Ok(mut m) = memory.lock() {
+            if let Ok(p) = sp.lock() {
+                p.reload_memory(&mut m);
+            }
+        }
+        if let Ok(mut g) = progress.lock() {
+            if let Ok(p) = sp.lock() {
+                p.reload_progress(&mut g);
+            }
+        }
+    });
+    ChildState { dir, reload }
 }
 
 /// Identidad declarada resuelta: nombre + persistencia abierta (None si el `.db`
@@ -73,6 +120,8 @@ pub(crate) struct MemoryCtx {
 pub(crate) struct DeclaredState {
     pub(crate) name: String,
     pub(crate) persistence: Option<crate::persistence::StatePersistence>,
+    /// La carpeta (absoluta) del `.db` abierto; `None` sin persistencia.
+    pub(crate) dir: Option<std::path::PathBuf>,
 }
 
 /// Sugerencia de nombre para el error/warning (decisión #8): el stem del archivo,
@@ -229,15 +278,21 @@ pub(crate) fn resolve_declared_state(
             // declarada — la identidad existe pero SIN disco (in-memory para esta corrida),
             // igual que bajo wasm. El gate de la capability sigue mandando aparte.
             if crate::host::profile() == crate::host::Profile::Pure {
-                return Ok(Some(DeclaredState { name, persistence: None }));
+                return Ok(Some(DeclaredState { name, persistence: None, dir: None }));
             }
             // Techo del host: memoria declarada pero denegada por `--cap-set`/`--sandbox`
             // → identidad sin disco (cero archivos; el uso falla con el error de siempre).
             if let Some(ceil) = ceiling {
                 let want = Capability::new(CapabilityType::Memory, Some(name.clone()));
                 if !ceil.iter().any(|c| c.covers(&want)) {
-                    return Ok(Some(DeclaredState { name, persistence: None }));
+                    return Ok(Some(DeclaredState { name, persistence: None, dir: None }));
                 }
+            }
+            // Ronda 5 (M1): un hijo de `run_program` guarda donde le dice el padre
+            // (`SYNSEMA_STATE_DIR`); si el padre no se lo dio es porque el padre no persiste, y el
+            // hijo tampoco: si no, caía junto a su `filename`, relativo al `cwd` que elige el programa.
+            if crate::run_program::is_child() && std::env::var("SYNSEMA_STATE_DIR").ok().filter(|s| !s.is_empty()).is_none() {
+                return Ok(Some(DeclaredState { name, persistence: None, dir: None }));
             }
             // Dir de estado: override explícito, o project-local (`<dir>/.synsema/state`).
             // `<stdin>` no tiene dir de programa: sin `SYNSEMA_STATE_DIR`, la memoria
@@ -251,7 +306,7 @@ pub(crate) fn resolve_declared_state(
                         "synsema: warning: memory \"{}\" is declared but the program has no file location (<stdin>): state lives in memory for this run only and will NOT persist. Run from a .syn file, or set SYNSEMA_STATE_DIR, to persist it",
                         name
                     );
-                    return Ok(Some(DeclaredState { name, persistence: None }));
+                    return Ok(Some(DeclaredState { name, persistence: None, dir: None }));
                 }
                 None => {
                     let base = std::path::Path::new(filename)
@@ -267,6 +322,18 @@ pub(crate) fn resolve_declared_state(
                 Ok(()) => dir,
                 Err(e) => {
                     let fallback = crate::persistence::home_state_dir();
+                    // Ronda 4 (revisión): sin `HOME`/`USERPROFILE` el respaldo quedaba RELATIVO
+                    // (`.synsema/state`) y se creaba en el cwd, que en un hijo de `run_program` elige
+                    // el programa. Sin un home absoluto, la memoria vive sólo en esta corrida.
+                    if !fallback.is_absolute() {
+                        eprintln!(
+                            "synsema: warning: could not create state dir '{}' ({}) and there is no home directory: memory \"{}\" lives in memory for this run only and will NOT persist",
+                            dir.display(),
+                            e,
+                            name
+                        );
+                        return Ok(Some(DeclaredState { name, persistence: None, dir: None }));
+                    }
                     eprintln!(
                         "synsema: warning: could not create state dir '{}' ({}); using '{}'",
                         dir.display(),
@@ -293,7 +360,14 @@ pub(crate) fn resolve_declared_state(
                     None
                 }
             };
-            Ok(Some(DeclaredState { name, persistence }))
+            let dir = persistence.as_ref().and_then(|_| {
+                if dir.is_absolute() {
+                    Some(dir)
+                } else {
+                    std::env::current_dir().ok().map(|c| c.join(dir))
+                }
+            });
+            Ok(Some(DeclaredState { name, persistence, dir }))
         }
     }
 }
@@ -310,6 +384,14 @@ pub(crate) fn build_memory_ctx(rs: DeclaredState) -> MemoryCtx {
     if let Some(p) = &sp {
         p.lock().unwrap().load_into(&mut memory.lock().unwrap(), &mut progress.lock().unwrap());
     }
+    // Ronda 5 (B1): un hijo de `run_program` que comparte la base marca sus ids.
+    if sp.is_some() && crate::run_program::is_child() {
+        memory.lock().unwrap().set_id_tag(format!("p{}", std::process::id()));
+    }
+    let child = match (&sp, rs.dir) {
+        (Some(p), Some(dir)) => Some(child_state_for(dir, p.clone(), memory.clone(), progress.clone())),
+        _ => None,
+    };
     let on_write_mem: Arc<dyn Fn(&AgentMemory) + Send + Sync> = {
         let sp = sp.clone();
         Arc::new(move |mem: &AgentMemory| {
@@ -330,7 +412,7 @@ pub(crate) fn build_memory_ctx(rs: DeclaredState) -> MemoryCtx {
             }
         })
     };
-    MemoryCtx { name: rs.name, memory, progress, on_write_mem, on_write_prog }
+    MemoryCtx { name: rs.name, memory, progress, on_write_mem, on_write_prog, child }
 }
 
 /// Resolución + contexto en un paso (camino común de run/test/diag/swarm).
@@ -377,177 +459,11 @@ pub(crate) fn wire_common(
     }
 }
 
-/// Igual que `wire_common` pero con handles de progress/memory provistos por el caller
-/// (serve pre-carga las reglas del top-level en su AgentMemory per-worker) y el gate de
-/// memoria explícito. `mem` (si hay) viaja a los ejecutores de cron y a los workers de
-/// `parallel_map` para que TODOS los contextos compartan la misma memoria declarada.
-/// Builtins del stdlib/agents/runtime que tienen EFECTO fuera del
-/// programa (archivos, red, bases de datos, sockets, procesos, memoria persistente, entorno,
-/// Programas hijos, notificaciones, attestation, gasto): bajo etiquetas son sumideros públicos.
-/// Sumar un builtin con efecto sin listarlo acá lo deja fuera del chequeo: el test
-/// `every_effectful_family_is_a_label_sink` cruza esta lista con las familias registradas.
-pub const LABEL_SINK_BUILTINS: &[&str] = &[
-    // Archivos y procesos (synsema-capabilities/secure.rs, stdlib/proc.rs, watch.rs, term.rs)
-    "write_file", "append_file", "edit_file", "delete_file", "delete_dir", "read_file", "read_file_bytes",
-    "list_dir", "file_exists", "file_info", "grep", "run", "run_program",
-    "proc_spawn", "proc_send", "proc_close_stdin", "proc_kill", "proc_resize", "proc_wait", "proc_close",
-    "watch", "watch_close", "term_open", "term_write", "term_close", "shutdown",
-    // Red (stdlib/http.rs, ws.rs, webpush.rs, oidc.rs, blockchain_*_rpc.rs). `http` (el verbo
-    // genérico) faltaba: lo encontró el anti-rot cruzando la lista con lo registrado.
-    "http", "http_get", "http_post", "http_put", "http_delete", "http_bytes", "fetch",
-    "mtls_identity",
-    "ws_connect", "ws_send", "ws_broadcast", "ws_close", "push_send", "oidc_verify",
-    // v0.6.42: TCP crudo y pipes (un pipe cruza a otro intérprete: escribir y cerrar son salidas).
-    "tcp_connect", "tcp_send", "tcp_close", "pipe_send", "pipe_close",
-    "eth_rpc", "eth_call", "eth_send_raw", "eth_balance", "eth_nonce", "eth_receipt", "eth_wait_receipt",
-    "eth_estimate_gas", "eth_gas_price", "eth_fee_history", "eth_chain_id",
-    "solana_rpc", "solana_send", "solana_confirm", "solana_balance", "solana_latest_blockhash", "spl_balance",
-    "algorand_send", "algorand_wait", "algorand_account", "algorand_params",
-    "btc_rpc", "btc_send", "btc_utxos", "btc_balance", "btc_fee_estimates", "btc_wait",
-    // v0.6.29: `<familia>_<acción>` (los nombres de arriba quedan como alias hasta v1.0).
-    "evm_rpc", "evm_call", "evm_send", "evm_balance", "evm_nonce", "evm_receipt", "evm_wait",
-    "evm_estimate_gas", "evm_gas_price", "evm_fee_history", "evm_chain_id", "evm_block_number", "evm_logs",
-    "solana_wait",
-    // Bases de datos (stdlib/database.rs)
-    "db_open", "db_close", "sql", "sql_exec", "sql_batch", "sql_tables", "paged",
-    "redis_get", "redis_set", "redis_del", "redis_incr", "redis_incrby", "redis_decr", "redis_exists", "redis_expire",
-    "redis_persist", "redis_ttl", "redis_type", "redis_keys", "redis_mget", "redis_mset", "redis_hget", "redis_hset",
-    "redis_hdel", "redis_hgetall", "redis_hincrby", "redis_lpush", "redis_rpush", "redis_lpop", "redis_rpop",
-    "redis_lrange", "redis_llen", "redis_sadd", "redis_srem", "redis_smembers", "redis_sismember", "redis_lock", "redis_unlock",
-    "mongo_find", "mongo_find_one", "mongo_insert", "mongo_insert_many", "mongo_update", "mongo_delete",
-    "mongo_count", "mongo_aggregate", "mongo_collections",
-    // Memoria persistente, estado y progreso (synsema-agents, serve)
-    "remember", "recall", "forget_memory", "add_rule", "create_progress", "start_step", "complete_step", "fail_step",
-    "state_set", "state_get", "state_incr", "state_delete", "state_all",
-    // Bus, cron, entorno, gasto, attestation, archivos comprimidos, exportes
-    "bus_publish", "bus_subscribe", "bus_unsubscribe", "cron_every", "cron_after", "cron_cancel",
-    "env", "secret", "reveal", "spend", "attest", "attest_key",
-    // Agentes (sólo con swarm cableado) y fan-out a otros intérpretes. `parallel_map` es un
-    // SUMIDERO, no `label_aware`: rechaza argumentos etiquetados ANTES de lanzar un worker. Es
-    // fail-closed deliberado, no una imposibilidad (`SendValue::Private` existe desde el cierre
-    // del snapshot de `serve`); la nota de `parallel.rs` explica qué habría que especificar para
-    // hacerlo consciente. Sin esto el mapper recibía el valor ya despojado y hacía el efecto EN
-    // CLARO mientras el resultado volvía etiquetado: la fuga parecía rastreada.
-    "agent_stop", "parallel_map",
-    "zip_create", "zip_extract", "tar_create", "tar_extract", "svg_to_png", "svg_to_pdf",
-];
-
-/// De las listas anteriores, los que NO existen en un intérprete de `run` pelado porque el runtime los
-/// registra más tarde: bajo `serve` (estado compartido, por worker) o con un swarm cableado (agentes).
-/// El anti-rot no puede buscarlos en el wiring base. La sentencia `emit` y la respuesta HTTP son
-/// sumideros del propio `serve` (`serve.rs`/`routing.rs`), no builtins.
-pub const LABEL_SINKS_SERVE_ONLY: &[&str] =
-    &["state_set", "state_get", "state_incr", "state_delete", "state_all", "agents", "agent_stop"];
-
-/// Familias OS-facing (las tablas de `synsema_stdlib::pure`) que NO son sumideros porque LEEN: entradas
-/// (stdin, sockets, procesos, terminal, watches, bus) y consultas del estado del host. Se declaran aparte
-/// para que el anti-rot pueda exigir que toda familia que hable con el SO esté clasificada a mano: o
-/// sumidero, o lectura declarada acá. Todas están además en `LABEL_PURE_BUILTINS`.
-pub const LABEL_OS_READ_BUILTINS: &[&str] = &[
-    "pipe", "pipe_recv", "tcp_recv", "tcp_stats",
-    "agents", "bus_recv", "bus_topics", "cron_list", "cron_status", "cwd", "proc_recv", "proc_select",
-    "proc_stats", "proc_status", "read_line", "select", "self_path", "term_recv", "term_size", "term_stats",
-    "watch_recv", "watch_stats", "ws_recv", "ws_select", "ws_select_all", "ws_stats", "ws_status",
-];
-
-/// la contracara EXPLÍCITA de
-/// `LABEL_SINK_BUILTINS`: todo builtin del wiring nativo que NO tiene efecto fuera del intérprete.
-/// Entre las dos listas (más `CORE_SINK_BUILTINS` y los `label_aware` del core) cubren EXACTAMENTE
-/// Lo que el motor registra: el anti-rot `every_effectful_family_is_a_label_sink` lo cruza contra
-/// `registered_builtin_names()`, así que un builtin NUEVO rompe el test hasta que alguien decida, a
-/// mano, de qué lado está. Ése es exactamente el hueco por el que pasó `parallel_map`.
-pub const LABEL_PURE_BUILTINS: &[&str] = &[
-    // Entradas y consultas del HOST: leen (stdin, sockets, procesos, terminal, watches, bus, cron, cwd) o
-    // describen el proceso. NO son sumideros: un dato no SALE por ellas; el host que quiera tratarlas como
-    // FUENTES las etiqueta en su borde. El anti-rot las cruza con las tablas OS-facing de `pure.rs`: toda
-    // familia que hable con el SO tiene que estar acá o en la lista de sumideros
-    // `agents` (swarm-only, como `agent_stop`) sólo aparece en el wiring de serve/swarm: lo destapó
-    // el anti-rot al extenderse a ese wiring (auditoría ronda 3, M3).
-    "agents",
-    // v0.6.42: leer de un TCP o de un pipe, y crear un pipe (memoria del proceso, nada sale).
-    "pipe", "pipe_recv", "tcp_recv", "tcp_stats",
-    "bus_recv", "bus_topics", "cron_list", "cron_status", "cwd", "proc_recv", "proc_select", "proc_stats",
-    "proc_status", "read_line", "select", "self_path", "term_recv", "term_size", "term_stats", "watch_recv",
-    "watch_stats", "ws_recv", "ws_select", "ws_select_all", "ws_stats", "ws_status",
-    // Reloj, entropía y args del proceso: fuentes sin efecto de salida (`now`/`sleep` son además el canal de
-    // TIEMPO que la spec declara NO cubierto)
-    "arg", "args", "date_parts", "flush", "format_time", "now", "parse_time", "platform", "push_vapid_keys",
-    "random", "random_bytes", "random_int", "sleep", "steps", "token",
-    // Firma y custodia: escriben una entrada de AUDIT (nombre de la clave y ubicación, ambos públicos) pero el
-    // material y el resultado se quedan DENTRO del programa — la firma de un dato privado sale privada por el
-    // despacho genérico, y publicarla exige pasar por un sumidero o un `declassify`
-    "algorand_mnemonic", "algorand_mnemonic_to_key", "ecdsa_p256_sign", "ed25519_pubkey", "ed25519_sign",
-    "hd_derive", "http_sign", "keystore_export", "keystore_import", "mnemonic_from_entropy",
-    "mnemonic_generate", "mnemonic_to_entropy", "mnemonic_to_seed", "rsa_sign_sha256", "schnorr_pubkey",
-    "schnorr_sign", "secp256k1_pubkey", "secp256k1_recover", "secp256k1_sign", "wif_import",
-    // Identidad atestada y verificación de documentos: leen lo que el propio proceso publica; `attestation_key`
-    // Devuelve un secret SELLADO  que sólo consumen firma y ECDH con la clave propia
-    "attestation_document", "attestation_key", "attestation_verify",
-    // Estado declarado y observabilidad, sólo LECTURA (las escrituras — `remember`, `add_rule`,
-    // `create_progress`, `start_step`, `complete_step`, `fail_step`, `state_*` — sí son sumideros)
-    "check_rules", "get_rules", "judge_available", "judge_model", "judge_usage", "llm_available", "llm_usage",
-    "memory_summary", "openapi_json",
-    "progress_display", "progress_percent", "resume_point", "spend_total",
-    // Orden superior: no hacen efecto por sí mismos, DESPACHAN código del programa (el intérprete empuja el PC
-    // A los callbacks, y los sumideros que use el callee se comprueban ahí). `parallel_map` NO está acá: cruza
-    // A otro intérprete, donde la etiqueta no llega
-    "apply", "call", "call_tool", "chunk", "collect", "count_where", "every", "find_all", "find_first",
-    "fold", "group_by", "reduce", "some", "sort_by", "transform", "where", "zip_with",
-    // Plantillas y vocabulario de respuesta: construyen VALORES (el sumidero es la respuesta HTTP, en `serve.rs`)
-    "binary", "chart", "chart_svg", "clear_cookie", "code", "content", "created", "heading", "html", "image",
-    "link", "list", "not_found", "ok", "ordered_list", "page", "prose", "raw", "redirect", "render",
-    "respond", "section", "set_cookie", "with_header",
-    // Cómputo puro: texto, colecciones, números, matrices, estadística, fechas, formatos (json/csv/toml/xml),
-    // Criptografía sin material propio (hashes, MAC, verificación, ZK, ruido determinista), encoders de
-    // blockchain y helpers de test. Cero efecto fuera del intérprete
-    "abi_decode", "abi_encode", "abi_selector", "abs", "acos", "acosh", "aes_gcm_decrypt", "aes_gcm_encrypt",
-    "algo_address", "algorand_tx", "algorand_tx_encode", "append", "arange", "array", "as_secret", "asin",
-    "asinh", "assert", "assert_eq", "assert_error", "assert_ne", "at", "atan", "atan2", "atanh", "basic", "bearer",
-    "bech32_decode", "bech32_encode", "beta", "btc_address", "btc_address_decode", "btc_script", "btc_tx",
-    "btc_tx_raw", "btc_txid", "bytes", "bytes_to_int", "captoken_allows", "captoken_attenuate",
-    "canonical_json", "captoken_mint", "captoken_verify", "capture", "cbrt", "ceil", "clamp", "complex", "conj",
-    "constant_time_eq", "contains", "cos", "cosh", "csv_encode", "csv_parse", "decimal", "decode", "degrees",
-    "det", "dot", "ecdh_keypair", "ecdh_public", "ecdh_shared_secret", "ecdsa_p256_verify", "ed25519_verify", "eig",
-    "eip191_digest", "eip712_digest", "ends_with", "enumerate", "erf", "erfc", "eth_address", "exp", "eye",
-    "factorial", "fail", "flatten", "float", "floor", "fmt", "full", "gamma", "gaussian_noise", "gcd",
-    "groth16_verify", "hash160", "histogram", "hkdf_sha256", "hmac_sha256", "http_signature_verify", "hypot",
-    "identity", "imag", "index_of", "insert", "int_to_bytes", "int_to_bytes_le", "inv", "is_array", "is_bytes",
-    "is_complex", "is_decimal", "is_finite", "is_infinite", "is_nan", "join", "json_decode", "json_encode",
-    "json_for_script", "jwt_sign", "jwt_verify", "keccak256", "keys", "laplace_noise", "lcm", "length",
-    "lgamma", "linspace", "ln", "log10", "log2", "log_base", "lower", "matches", "matmul", "max", "mean",
-    "median", "min", "multipart_encode", "ndim", "norm", "number", "ones", "password_hash", "password_verify",
-    "percentile", "pow", "product", "psbt_decode", "psbt_encode", "psbt_finalize", "radians", "raise",
-    "range", "real", "replace_re", "replace_text", "reshape", "reverse", "rlp_decode", "rlp_encode", "round",
-    "round_to", "rsa_verify_sha256", "schnorr_verify", "secp256k1_verify", "sha256", "sha512", "sha512_256",
-    "shape", "sign", "sin", "sinh", "size", "slice", "solana_message", "solana_pda", "solana_tx", "solve",
-    "spl_ata", "spl_transfer_checked_data", "spl_transfer_data", "split", "sqrt", "starts_with", "std",
-    "strip_ansi", "sum", "svd", "tan", "tanh", "text", "to_list", "toml_encode", "toml_parse", "totp",
-    "totp_verify", "trace", "transpose", "trim", "trunc", "tx_eip1559", "tx_eip1559_raw", "type_of", "unique",
-    "upper", "values", "var", "verify_hmac", "webauthn_register", "webauthn_verify", "xml_parse", "zeros",
-    "did_key_decode", "did_key_document", "did_key_encode", "document_sign", "document_verify",
-    "receipt", "receipt_verify",
-    // v0.6.29: entero exacto, `0x…` y predicados de tipo.
-    "int", "hex", "is_integer", "is_text", "is_list", "is_map",
-    // v0.6.29: mapas, orden, texto y regex con sus nombres nuevos; la MAC en bytes.
-    "get", "remove", "merge", "items", "sort", "replace", "regex_find_all", "regex_capture",
-    "regex_replace", "fold_text", "hmac",
-    // v0.6.44: HTTP Basic como secret (y su variante con form-encoding de OAuth).
-    "oauth_basic",
-    // v0.6.44 (HB2): bits sobre enteros de 64 bits y XOR de bytes.
-    "bit_and", "bit_or", "bit_xor", "bit_not", "shl", "shr", "xor_bytes",
-    // v0.6.29: blockchain `<familia>_<acción>` (puros: construir, derivar, decodificar).
-    "evm_address", "evm_signature", "evm_tx", "evm_tx_raw", "evm_tx_create", "evm_create_address",
-    "evm_create2_address", "abi_event_topic", "abi_decode_log", "algorand_address", "algorand_tx_raw",
-    "solana_tx_raw",
-    // v0.6.29 (datos): tablas, faltantes, estadística, arrays, azar con semilla, fechas, JSONL,
-    // linaje. Todos puros (el azar con semilla es determinista; las fechas no leen el reloj).
-    "summarize", "count_by", "pivot", "count", "count_missing", "sum_of", "mean_of", "min_of", "max_of", "median_of",
-    "first_of", "n_unique_of", "quantile_of", "is_missing", "fill_missing", "drop_missing", "fill_nan",
-    "quantile", "concat", "stack", "argmin", "argmax", "cumsum", "diff", "cov", "corr", "lstsq",
-    "polyfit", "polyval", "mode", "rng", "rng_spawn", "random_normal", "shuffle", "sample", "choice", "date",
-    "datetime", "duration", "parse_date", "parse_datetime", "truncate", "add_months", "date_range",
-    "timestamp", "to_timezone", "in_units", "add_days", "jsonl_encode", "jsonl_decode", "lineage", "parquet_read", "parquet_write",
-];
+/// Las cuatro listas de clasificación de etiquetas viven en `synsema_stdlib::label_lists` desde
+/// v0.6.45 (D1): el wasm (`synsema-wasm`) registra sus sumideros desde la MISMA lista que el nativo.
+pub use synsema_stdlib::label_lists::{
+    LABEL_OS_READ_BUILTINS, LABEL_PURE_BUILTINS, LABEL_SINKS_SERVE_ONLY, LABEL_SINK_BUILTINS,
+};
 
 /// Todos los builtins registrados en el wiring NATIVO (un intérprete de `run`), ordenados.
 /// Es la fuente de verdad del anti-rot `every_effectful_family_is_a_label_sink`: la lista de
@@ -601,6 +517,10 @@ pub fn builtin_exists(name: &str) -> bool {
     NAMES.with(|n| n.contains(name))
 }
 
+/// Igual que `wire_common` pero con handles de progress/memory provistos por el caller
+/// (serve pre-carga las reglas del top-level en su AgentMemory per-worker) y el gate de
+/// memoria explícito. `mem` (si hay) viaja a los ejecutores de cron y a los workers de
+/// `parallel_map` para que TODOS los contextos compartan la misma memoria declarada.
 pub(crate) fn wire_common_with_state(
     interp: &mut Interpreter,
     caps: &Rc<RefCell<CapabilitySet>>,
@@ -610,6 +530,7 @@ pub(crate) fn wire_common_with_state(
     mem_gate: MemoryGate,
     mem: Option<MemoryCtx>,
 ) {
+    let child_state = mem.as_ref().and_then(|m| m.child.clone());
     // Etiquetas de flujo por proceso (`--labels`, `serve --attested`). Se fijan
     // acá porque TODOS los intérpretes del runtime (run, serve por request, agentes, cron,
     // Parallel_map) pasan por este wiring: un intérprete sin etiquetas en un proceso con
@@ -673,6 +594,10 @@ pub(crate) fn wire_common_with_state(
     synsema_stdlib::hashing::register_hash_builtins(interp);
     // Bits sobre enteros de 64 bits y `xor_bytes` (puro, v0.6.44).
     synsema_stdlib::bits::register_bit_builtins(interp);
+    synsema_stdlib::encoding::register_encoding_builtins(interp);
+    synsema_stdlib::headers::register_header_builtins(interp);
+    synsema_stdlib::qr::register_qr_builtins(interp);
+    synsema_stdlib::html::register_html_builtins(interp);
     // JSON del lenguaje (puro, sin capability): json_encode/json_for_script/json_decode.
     // Vivían dentro de register_database_builtins; ahora en json.rs para que existan
     // también en el perfil wasm (sin `native`).
@@ -781,8 +706,8 @@ pub(crate) fn wire_common_with_state(
             let path = args.first().map(|v| v.to_string()).unwrap_or_default();
             // Gate de `file.read` para la llamada de NIVEL SUPERIOR (el vector de LFI: el
             // path puede venir de un request). Un template del bundle es el programa: sin
-            // gate. Los include/layout ANIDADOS son estáticos y `resolve_template_path` los
-            // confina al cwd — parte del programa, cubiertos por este mismo render.
+            // gate. Los include/layout ANIDADOS pasan por el mismo gate en `templates.rs`
+            // (v0.6.45; antes sólo se los confinaba al cwd).
             if synsema_core::bundle::get(&synsema_core::bundle::normalize_name(&path).unwrap_or_default()).is_none() {
                 i.gate_template_read(&path)?;
             }
@@ -941,7 +866,7 @@ pub(crate) fn wire_common_with_state(
     }
     // run_program(source, opts): Synsema ejecutando Synsema en un proceso hijo bajo
     // techo ∩ padre (gateado por `sandbox_run`).
-    crate::run_program::register_run_program_builtin(interp, caps.clone());
+    crate::run_program::register_run_program_builtin(interp, caps.clone(), child_state);
     // `--profile pure`: la segunda pared. Se registra AL FINAL para pisar por nombre a
     // los builtins OS-facing ya cableados (última registración gana).
     if crate::host::profile() == crate::host::Profile::Pure {
@@ -976,14 +901,73 @@ pub(crate) fn wire_real_judge_provider(interp: &mut Interpreter) {
         Some(p) => p,
         None => return,
     };
+    let decide = crate::judge_provider::decide_via_judge(&store);
+    wire_judge_with(interp, provider, decide);
+}
+
+fn wire_judge_with(
+    interp: &mut Interpreter,
+    provider: Arc<crate::judge_provider::WiredJudgeProvider>,
+    decide_via_judge: bool,
+) {
+    let stash = provider.clone();
     interp.set_judge_usage_callback(Rc::new(crate::judge_provider::judge_tokens_total));
     interp.set_judge_model_callback(Rc::new(crate::judge_provider::judge_last_model));
     interp.set_judge_callback(Rc::new(move |req| provider.judge_for_interpreter(req)));
     // v0.6.26 — `SYNSEMA_JUDGE_DECIDE=1`: `decide between […] given X` se sirve con el juez
     // (una pregunta `choose`), calibrado y sin normalización ni reintento. Opt-in del host:
     // cambia qué modelo contesta. Sólo con provider de judge cableado (arriba).
-    if crate::judge_provider::decide_via_judge(&store) {
+    if decide_via_judge {
         interp.set_decide_via_judge(true);
+    }
+    provider_cell(interp).borrow_mut().judge = Some((stash, decide_via_judge));
+}
+
+/// v0.6.45 (A1) — los providers reales que tiene cableados un intérprete, guardados en su `ext`
+/// para que lo que corre EN SU NOMBRE en otro hilo (cada item de `parallel_map`, cada agente de
+/// `spawn`) use las MISMAS instancias: sin releer el `.env`, y con exactamente lo que tiene el
+/// llamador (si está offline, el otro también). Antes esos intérpretes no cableaban nada y
+/// `judge`/`reason` caían a OFFLINE/placeholder. Cruzan hilos sin problema: los providers son
+/// `Send + Sync` y los contadores de presupuesto (`LLM_TOKENS_USED`, `IDENTITY_TOKENS_USED`, los
+/// del judge) son estáticos del proceso, así que compartir la instancia no saltea ningún techo.
+#[derive(Clone, Default)]
+pub(crate) struct WiredProviders {
+    llm: Option<Arc<dyn LLMProvider>>,
+    judge: Option<(Arc<crate::judge_provider::WiredJudgeProvider>, bool)>,
+}
+
+const WIRED_PROVIDERS_KEY: &str = "synsema.wired_providers";
+
+/// La celda (una por intérprete) es compartida a propósito: el hook de `spawn` se arma en
+/// `wire_swarm_hooks` ANTES de que se cableen los providers, así que captura la celda y la lee
+/// recién cuando el programa hace `spawn`.
+type ProviderCell = RefCell<WiredProviders>;
+
+fn provider_cell(interp: &Interpreter) -> Rc<ProviderCell> {
+    let found = interp
+        .ext
+        .borrow()
+        .get(WIRED_PROVIDERS_KEY)
+        .and_then(|a| a.clone().downcast::<ProviderCell>().ok());
+    if let Some(cell) = found {
+        return cell;
+    }
+    let cell = Rc::new(ProviderCell::default());
+    interp.ext.borrow_mut().insert(WIRED_PROVIDERS_KEY, cell.clone() as Rc<dyn std::any::Any>);
+    cell
+}
+
+pub(crate) fn wired_providers(interp: &Interpreter) -> WiredProviders {
+    provider_cell(interp).borrow().clone()
+}
+
+/// Cablea en `interp` los providers de otro intérprete (ver [`WiredProviders`]).
+pub(crate) fn wire_providers(interp: &mut Interpreter, wired: &WiredProviders) {
+    if let Some(p) = &wired.llm {
+        wire_llm_with(interp, p.clone());
+    }
+    if let Some((p, decide)) = &wired.judge {
+        wire_judge_with(interp, p.clone(), *decide);
     }
 }
 
@@ -997,6 +981,11 @@ pub(crate) fn wire_real_llm_provider(interp: &mut Interpreter) {
         Some(p) => Arc::new(crate::llm_providers::ReloadingProvider::new(p)),
         None => return,
     };
+    wire_llm_with(interp, provider);
+}
+
+fn wire_llm_with(interp: &mut Interpreter, provider: Arc<dyn LLMProvider>) {
+    provider_cell(interp).borrow_mut().llm = Some(provider.clone());
     // llm_usage(): tokens LLM acumulados del proceso (F-A). Se cablea junto al
     // provider (con provider real siempre hay metering — MeteredProvider); offline el
     // callback no se setea y el builtin del core devuelve 0.
@@ -1262,6 +1251,12 @@ static LAST_RUN_PRIVATE: std::sync::atomic::AtomicBool = std::sync::atomic::Atom
 
 /// v0.6.42 — el código que pidió `exit(code)` en la última corrida (-1 = no llamó a `exit`).
 static LAST_RUN_EXIT: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
+/// v0.6.45 (A5) — `serve` anota el código de un `exit(code)` del preámbulo (antes de escuchar),
+/// o que no lo hubo, por el mismo canal que `run`.
+pub(crate) fn note_exit_code(code: Option<i32>) {
+    LAST_RUN_EXIT.store(code.unwrap_or(-1), std::sync::atomic::Ordering::SeqCst);
+}
 
 /// El código de `exit(code)` de la última corrida, si el programa lo llamó.
 pub fn last_run_exit_code() -> Option<i32> {
@@ -2006,6 +2001,7 @@ pub(crate) fn wire_swarm_hooks(
         let mem = mem.clone();
         let builder = builder.clone();
         let caps_spawn = caps.clone();
+        let providers = provider_cell(interp);
         Rc::new(move |agent, body, args, globals, spawn_subject| {
             let send_args: Vec<(String, SendValue)> =
                 args.iter().map(|(k, v)| (k.clone(), to_send(v))).collect();
@@ -2026,7 +2022,9 @@ pub(crate) fn wire_swarm_hooks(
                 llm_tokens: crate::llm_providers::current_delegated_llm_budget(),
                 delegations: caps_spawn.borrow().delegations(),
             };
-            Ok(spawn_agent(sw.clone(), agent.to_string(), body, send_args, global_snap, ceiling.clone(), mem.clone(), builder.clone(), subject))
+            // v0.6.45 (A1): el agente usa los mismos providers que el que lo spawnea.
+            let wired = providers.borrow().clone();
+            Ok(spawn_agent(sw.clone(), agent.to_string(), body, send_args, global_snap, ceiling.clone(), mem.clone(), builder.clone(), subject, wired))
         })
     };
 
@@ -2097,6 +2095,7 @@ fn spawn_agent(
     mem: Option<MemoryCtx>,
     builder: Option<InterpBuilder>,
     subject: crate::subject::Subject,
+    providers: WiredProviders,
 ) -> String {
     let instance_id = swarm.register_new_agent(&agent_name);
     let sw = swarm.clone();
@@ -2114,7 +2113,13 @@ fn spawn_agent(
                     wire_swarm_hooks(&mut interp, sw.clone(), &id, ceiling.clone(), mem.clone(), Some(b.clone()), &caps);
                     (interp, caps)
                 }
-                None => setup_swarm_interpreter(sw.clone(), &id, ceiling, mem, true),
+                // Bajo serve el builder ya cablea los providers; sin builder (`run`), los del
+                // que lo spawneó.
+                None => {
+                    let (mut interp, caps) = setup_swarm_interpreter(sw.clone(), &id, ceiling, mem, true);
+                    wire_providers(&mut interp, &providers);
+                    (interp, caps)
+                }
             };
             // T1: el agente corre EN NOMBRE del sujeto que lo spawneó, bajo su techo delegado
             // y sus presupuestos. El guard vive hasta el final del hilo.

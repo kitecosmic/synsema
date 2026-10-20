@@ -2,7 +2,7 @@
 // y en el navegador (module Worker). Instancia el .wasm con un hostCall que manda el
 // pedido al main thread y se bloquea con Atomics.wait hasta la respuesta.
 
-import { instantiate } from "./index.mjs";
+import { instantiate, safeMsg } from "./index.mjs";
 
 const td = new TextDecoder();
 const DATA_OFFSET = 16;
@@ -60,7 +60,14 @@ onMessage(async (m) => {
     module = m.module;
     ctrl = new Int32Array(m.sab, 0, 4);
     data = new Uint8Array(m.sab, DATA_OFFSET);
-    inst = await instantiate(module, hostCall);
+    // v0.6.45 (ronda 2, M8): un fallo al instanciar se avisa (en el navegador no dispara `onerror`
+    // y el main esperaba `ready` para siempre).
+    try {
+      inst = await instantiate(module, hostCall);
+    } catch (e) {
+      post({ type: "init-error", message: safeMsg(e) });
+      return;
+    }
     post({ type: "ready" });
     return;
   }
@@ -69,8 +76,16 @@ onMessage(async (m) => {
       const response = inst.call(m.request);
       post({ type: "result", response });
     } catch (e) {
-      post({ type: "error", message: `synsema: the module trapped (${e && e.message ? e.message : e}); the instance was recreated` });
-      inst = await instantiate(module, hostCall);
+      // v0.6.45: la instancia nueva se arma ANTES de avisar, así la próxima llamada (que el main
+      // manda al recibir la respuesta) no entra mientras se instancia.
+      try {
+        inst = await instantiate(module, hostCall);
+      } catch (e2) {
+        post({ type: "fatal", message: `the module trapped and could not be instantiated again: ${safeMsg(e2)}` });
+        return;
+      }
+      if (e && e.synsemaResult) post({ type: "result", response: e.synsemaResult });
+      else post({ type: "error", message: `synsema: the module trapped (${safeMsg(e)}); the instance was recreated` });
     }
   }
 });
