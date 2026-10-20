@@ -6,7 +6,7 @@ Each says what changed, why, and what to write instead.
 
 Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the release date.
 
-## Unreleased (v0.6.45)
+## v0.6.45 — 2026-10-20
 
 **Behavior changes (read these first).**
 - **A `*` in a file scope stays inside one folder.** Path scopes are now globs by segment, like
