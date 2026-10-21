@@ -50,6 +50,50 @@ fn runner() -> PathBuf {
     profile_dir.join("examples").join(format!("oracle_run{}", std::env::consts::EXE_SUFFIX))
 }
 
+/// v0.6.46 (auditoría de los tests, M1): `cargo test --test …` no recompila los ejemplos, así que el
+/// ejecutor puede ser de un motor viejo y el oráculo dar 0 diferencias sin haber probado el código de
+/// hoy. Falla si algo de lo que entró al ejecutor es más nuevo que él. Ronda 2: "lo que entró" es la
+/// lista que cargo escribe al lado (`oracle_run.d`), no las carpetas `src/`: un archivo que el
+/// ejecutor no compila (`#[cfg]` de wasm, una feature apagada, una dependencia opcional) no lo deja
+/// rojo para siempre, y la fuente embebida (`.ttf`) también cuenta.
+fn assert_runner_is_fresh(runner: &Path) {
+    let built = std::fs::metadata(runner).and_then(|m| m.modified()).expect("fecha del ejecutor");
+    let dep_info = runner.with_extension("d");
+    let text = std::fs::read_to_string(&dep_info)
+        .unwrap_or_else(|e| panic!("no está la lista de fuentes del ejecutor ({}): {}", dep_info.display(), e));
+    // `<ejecutor>: dep dep …` (formato de make; un espacio dentro de una ruta va como `\ `). En
+    // Windows el `C:` del ejecutor no lleva espacio después: el primer `: ` separa.
+    let deps = text.lines().next().and_then(|l| l.split_once(": ")).map(|(_, d)| d).unwrap_or("");
+    let mut paths = Vec::new();
+    let mut cur = String::new();
+    let mut chars = deps.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\\' && chars.peek() == Some(&' ') {
+            cur.push(' ');
+            chars.next();
+        } else if c.is_whitespace() {
+            if !cur.is_empty() {
+                paths.push(std::mem::take(&mut cur));
+            }
+        } else {
+            cur.push(c);
+        }
+    }
+    if !cur.is_empty() {
+        paths.push(cur);
+    }
+    assert!(paths.len() > 10, "la lista de fuentes del ejecutor ({}) no se entiende", dep_info.display());
+    for p in &paths {
+        // Una fuente que ya no está también obliga a recompilar.
+        let newer = std::fs::metadata(p).and_then(|m| m.modified()).map(|t| t > built).unwrap_or(true);
+        assert!(
+            !newer,
+            "el ejecutor del oráculo es más viejo que {}: no probaría el código de hoy. Compilarlo con `cargo build -p synsema-runtime --example oracle_run` (`cargo test --test …` no recompila los ejemplos)",
+            p
+        );
+    }
+}
+
 fn collect(dir: &Path, out: &mut Vec<PathBuf>) {
     let skip = ["target", "node_modules", ".git", "dist", "build", ".synsema", "serve_tmp"];
     let Ok(rd) = std::fs::read_dir(dir) else { return };
@@ -115,7 +159,14 @@ fn run_with(runner: &Path, file: &Path, reference: bool, resolver_check: bool, j
             Ok(Some(status)) => {
                 let text = reader.join().unwrap_or_default();
                 let last = text.lines().rev().find(|l| l.starts_with('{')).unwrap_or("");
-                return match serde_json::from_str(last) {
+                // v0.6.46 (auditoría de los tests, ronda 3): una duración medida (`validate (3ms)`, el
+                // `progress_display` de capa7_pm/progress.syn) cambia de corrida en corrida; si las dos
+                // referencias coincidían por casualidad, la de atajos daba otro número y salía como
+                // diferencia. Se compara el resto de la salida.
+                static MS: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+                let ms = MS.get_or_init(|| regex::Regex::new(r"\(\d+ms\)").unwrap());
+                let last = ms.replace_all(last, "(…ms)");
+                return match serde_json::from_str(&last) {
                     Ok(v) => Outcome::Done(v),
                     Err(_) => Outcome::Crash(format!("{}", status)),
                 };
@@ -192,6 +243,7 @@ fn shortcuts_match_the_reference_interpreter() {
         "no está el ejecutor del oráculo en {} (lo compila `cargo test -p synsema-runtime`)",
         runner.display()
     );
+    assert_runner_is_fresh(&runner);
     let root = repo_root();
     let mut files = Vec::new();
     for r in ROOTS {
@@ -315,6 +367,9 @@ fn shortcuts_match_the_reference_interpreter() {
         "como ruta de serve: {} programas comparados, bucles nativos (OSR) en {}",
         t.request_compared, t.request_osr_programs
     );
+    // v0.6.46 (auditoría de los tests, B3): un programa que no termina en TIMEOUT no se compara. Hoy
+    // son 1 o 2 del corpus local; si pasan del 2 % el "0 diferencias" ya no dice lo mismo.
+    assert!(t.timeouts * 50 <= files.len().max(50), "{} de {} programas no terminaron en {:?}: {}", t.timeouts, files.len(), TIMEOUT, t.timed_out.join(", "));
     // Que el "0 diferencias" del nivel nativo sea de código nativo de verdad.
     assert!(t.request_osr_programs >= 5, "los bucles de los handlers casi no corrieron en nativo: {} programas", t.request_osr_programs);
     assert!(t.native_programs >= 5 && t.native_deopts > 0, "el nivel nativo casi no corrió en el oráculo: {} programas", t.native_programs);

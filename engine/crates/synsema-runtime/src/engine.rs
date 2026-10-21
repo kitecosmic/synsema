@@ -1087,6 +1087,7 @@ fn finish(mut interp: Interpreter, result: Result<SynValue, Control>) -> RunResu
         _ => None,
     };
     LAST_RUN_EXIT.store(exit.unwrap_or(-1), std::sync::atomic::Ordering::SeqCst);
+    RUN_EXIT.with(|c| c.set(exit));
     if let Some(code) = exit {
         return RunResult { success: code == 0, output: std::mem::take(&mut interp.output), errors: Vec::new() };
     }
@@ -1285,6 +1286,14 @@ static LAST_RUN_PRIVATE: std::sync::atomic::AtomicBool = std::sync::atomic::Atom
 /// v0.6.42 — el código que pidió `exit(code)` en la última corrida (-1 = no llamó a `exit`).
 static LAST_RUN_EXIT: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
 
+thread_local! {
+    /// v0.6.46 — el `exit(code)` de la corrida de ESTE hilo del motor (lo fija `finish`). El motor
+    /// decide con éste, no con `LAST_RUN_EXIT`: con dos corridas a la vez en un proceso (un
+    /// embebedor, un binario de tests), la otra lo pisaba en el medio y un agente vivo quedaba
+    /// corriendo para siempre. `LAST_RUN_EXIT` queda para la CLI, que corre una por proceso.
+    static RUN_EXIT: std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) };
+}
+
 /// v0.6.45 (A5) — `serve` anota el código de un `exit(code)` del preámbulo (antes de escuchar),
 /// o que no lo hubo, por el mismo canal que `run`.
 pub(crate) fn note_exit_code(code: Option<i32>) {
@@ -1369,20 +1378,23 @@ pub fn run_program_ceiled_opts(
     let sw = swarm.clone();
     let src = source.to_string();
     let fname = filename.to_string();
-    let mut result = std::thread::Builder::new()
+    let result = std::thread::Builder::new()
         .stack_size(INTERP_STACK_SIZE)
-        .spawn(move || run_inner(&src, &fname, false, Some(sw), live_output, ceiling))
+        .spawn(move || {
+            RUN_EXIT.with(|c| c.set(None));
+            let r = run_inner(&src, &fname, false, Some(sw), live_output, ceiling);
+            (r, RUN_EXIT.with(|c| c.get()))
+        })
         .expect("no se pudo crear el hilo del motor")
         .join()
-        .unwrap_or_else(|p| RunResult {
-            success: false,
-            output: Vec::new(),
-            errors: vec![abort_message(&p)],
+        .unwrap_or_else(|p| {
+            (RunResult { success: false, output: Vec::new(), errors: vec![abort_message(&p)] }, None)
         });
+    let (mut result, run_exit) = result;
 
     // v0.6.42 (auditoría) — `exit(code)` termina el programa: los agentes vivos se detienen (si
     // no, `wait_all` esperaba a uno en bucle para siempre) y el código lo decide `exit`.
-    let exited = last_run_exit_code().is_some();
+    let exited = run_exit.is_some();
     // Los que `exit` detuvo: su error es la cancelación y no se informa. Un agente que ya había
     // fallado antes del `exit` sí (auditoría ronda 2: se descartaban todos).
     let stopped: std::collections::HashSet<String> = if exited {

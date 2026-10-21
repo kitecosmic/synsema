@@ -689,6 +689,45 @@ fn exit_stops_live_agents_instead_of_hanging() {
     assert_eq!(code, Some(3));
 }
 
+/// v0.6.46 (auditoría de los tests, A1): el motor decide con el `exit` de SU corrida. Antes leía
+/// `last_run_exit_code()`, que es del proceso: otra corrida que terminaba en el medio lo pisaba y el
+/// agente vivo quedaba corriendo para siempre (un embebedor con dos corridas a la vez).
+#[test]
+fn exit_stops_its_agents_while_another_run_finishes_next_to_it() {
+    let _g = RUN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let s2 = stop.clone();
+    let hammer = thread::spawn(move || {
+        while !s2.load(std::sync::atomic::Ordering::SeqCst) {
+            let _ = run("print(1)
+");
+        }
+    });
+    let src = "require time
+agent Forever
+    while true
+        sleep(0.05)
+spawn Forever
+print(\"main\")
+exit(3)
+";
+    for i in 0..5 {
+        let (tx, rx) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let _ = tx.send(run(src));
+        });
+        let r = rx.recv_timeout(Duration::from_secs(20));
+        if r.is_err() {
+            stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        let r = r.unwrap_or_else(|_| panic!("corrida {}: exit con un agente vivo se colgó", i));
+        assert_eq!(r.output, vec!["main"]);
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+    }
+    stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    hammer.join().unwrap();
+}
+
 /// Auditoría ronda 2: `exit` no informa la cancelación de los agentes que detiene, pero sí el
 /// error de uno que ya había fallado antes.
 #[test]

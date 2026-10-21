@@ -9,6 +9,12 @@
 
 use synsema_runtime::engine::run_source;
 
+/// Un puerto local donde no escucha nadie: se pide al sistema y se suelta (un número fijo, como el
+/// 59999 de antes, cae en el rango que el sistema reparte y otro proceso lo puede tener abierto).
+fn dead_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+}
+
 fn mysql_url() -> Option<String> {
     std::env::var("MYSQL_URL")
         .ok()
@@ -51,7 +57,7 @@ fn mysql_scope_mismatch_deny() {
 #[test]
 fn mysql_gate_passes_routing_to_mysql() {
     let r = run_source(
-        "require db\ndb_open(\"mysql://root@127.0.0.1:59999/nope\")",
+        &format!("require db\ndb_open(\"mysql://root@127.0.0.1:{}/nope\")", dead_port()),
         "<t>",
     );
     assert!(!r.success, "conectar a un puerto muerto debe fallar");

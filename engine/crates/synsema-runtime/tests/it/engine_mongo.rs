@@ -9,6 +9,12 @@
 
 use synsema_runtime::engine::run_source;
 
+/// Un puerto local donde no escucha nadie: se pide al sistema y se suelta (un número fijo, como el
+/// 59999 de antes, cae en el rango que el sistema reparte y otro proceso lo puede tener abierto).
+fn dead_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+}
+
 fn mongo_url() -> Option<String> {
     std::env::var("MONGO_URL")
         .ok()
@@ -54,7 +60,7 @@ fn mongo_scope_mismatch_deny() {
 #[test]
 fn mongo_gate_passes_routing_to_mongo() {
     let r = run_source(
-        "require db\ndb_open(\"mongodb://127.0.0.1:59999/nope?serverSelectionTimeoutMS=500\")",
+        &format!("require db\ndb_open(\"mongodb://127.0.0.1:{}/nope?serverSelectionTimeoutMS=500\")", dead_port()),
         "<t>",
     );
     assert!(!r.success, "conectar a un puerto muerto debe fallar");

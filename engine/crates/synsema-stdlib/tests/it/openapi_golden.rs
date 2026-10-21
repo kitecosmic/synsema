@@ -4,7 +4,7 @@
 //! MISMO camino estático que `synsema openapi` (sin ejecutar nada).
 //!
 //! Regenerar tras un cambio intencional del formato:
-//!   SYNSEMA_BLESS=1 cargo test -p synsema-stdlib --test openapi_golden
+//!   SYNSEMA_BLESS=1 cargo test -p synsema-stdlib --test it openapi_golden
 
 use std::path::PathBuf;
 

@@ -1,4 +1,4 @@
-//! Ejecutor del oráculo diferencial (`tests/reference_oracle.rs`): corre un `.syn` por el mismo
+//! Ejecutor del oráculo diferencial (`tests/it/reference_oracle.rs`): corre un `.syn` por el mismo
 //! camino que `synsema run --format json` y escribe en stdout un JSON con `ok`, `output`,
 //! `errors` y `steps`. Con `--reference` los intérpretes no toman atajos de ejecución. Con
 //! `--resolver-check` además compara cada búsqueda por nombre con lo que predijo el resolver

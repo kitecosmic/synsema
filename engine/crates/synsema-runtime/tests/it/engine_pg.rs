@@ -9,6 +9,12 @@
 
 use synsema_runtime::engine::run_source;
 
+/// Un puerto local donde no escucha nadie: se pide al sistema y se suelta (un número fijo, como el
+/// 59999 de antes, cae en el rango que el sistema reparte y otro proceso lo puede tener abierto).
+fn dead_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+}
+
 fn pg_url() -> Option<String> {
     std::env::var("DATABASE_URL").ok()
 }
@@ -51,7 +57,7 @@ fn pg_scope_mismatch_deny() {
 #[test]
 fn pg_gate_passes_routing_to_postgres() {
     let r = run_source(
-        "require db\ndb_open(\"postgres://postgres@127.0.0.1:59999/nope?sslmode=disable\")",
+        &format!("require db\ndb_open(\"postgres://postgres@127.0.0.1:{}/nope?sslmode=disable\")", dead_port()),
         "<t>",
     );
     assert!(!r.success, "conectar a un puerto muerto debe fallar");

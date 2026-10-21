@@ -5,10 +5,16 @@
 //! precede a la conexión, y un connstring a un puerto muerto falla con un error de RED — no de
 //! capability — lo que prueba que el gate pasó y el ruteo a Redis funciona. Los de
 //! **KV/TTL/estructuras/lock/binario** necesitan un Redis real → `#[ignore]`, gated por
-//! `REDIS_URL`. Corre: `cargo test --test engine_redis -- --ignored` con
+//! `REDIS_URL`. Corre: `cargo test -p synsema-runtime --test it engine_redis -- --ignored` con
 //! `REDIS_URL=redis://localhost:6379` seteada (scope `redis://localhost`).
 
 use synsema_runtime::engine::run_source;
+
+/// Un puerto local donde no escucha nadie: se pide al sistema y se suelta (un número fijo, como el
+/// 59999 de antes, cae en el rango que el sistema reparte y otro proceso lo puede tener abierto).
+fn dead_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+}
 
 fn redis_url() -> Option<String> {
     std::env::var("REDIS_URL")
@@ -62,7 +68,7 @@ fn redis_scope_mismatch_deny() {
 /// no de capability — → prueba "pasó el gate + ruteo a Redis" sin un servidor real.
 #[test]
 fn redis_gate_passes_routing_to_redis() {
-    let r = run_source("require db\ndb_open(\"redis://127.0.0.1:59999\")", "<t>");
+    let r = run_source(&format!("require db\ndb_open(\"redis://127.0.0.1:{}\")", dead_port()), "<t>");
     assert!(!r.success, "conectar a un puerto muerto debe fallar");
     assert!(
         !r.errors.iter().any(|e| e.contains("Capability not granted")),

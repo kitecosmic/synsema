@@ -46,7 +46,7 @@ fn receipt_steps_stay_a_number_without_private_data() {
     assert_eq!(out, ["number"]);
 }
 
-// `inputs` en una rama privada: en `synsema-cli/tests/v0646_tanda_e_cli.rs` (necesita stdin).
+// `inputs` en una rama privada: en `synsema-cli/tests/it/v0646_tanda_e_cli.rs` (necesita stdin).
 
 #[test]
 fn receipt_declassified_from_is_the_declared_set() {

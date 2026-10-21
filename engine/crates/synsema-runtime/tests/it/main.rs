@@ -1,8 +1,9 @@
 //! Los tests de integración de la crate en un solo binario (v0.6.46): cada archivo era un
 //! ejecutable que se linkeaba entero, y la regresión se iba en linkear. Los que tocan estado
 //! global del proceso (variables de entorno, el modo referencia, el nivel nativo, un
-//! allocator propio, las etiquetas del host, el log y el techo de host de `serve`, `shutdown()`)
-//! siguen en `tests/` como binarios propios: acá correrían al mismo tiempo que los demás.
+//! allocator propio, las etiquetas del host, el log y el techo de host de `serve`, `shutdown()`,
+//! lo que lee `last_run_exit_code()`) siguen en `tests/` como binarios propios: acá correrían al
+//! mismo tiempo que los demás.
 
 mod agentauth_e2e;
 mod agentic_bus_e2e;
@@ -48,7 +49,6 @@ mod v0629_audit;
 mod v0629_datos;
 mod v0629_language;
 mod v0630_audit;
-mod v0642_e2e;
 mod v0645_data_builtins_e2e;
 mod v0645_http_named_args_e2e;
 mod v0645_partial_write_e2e;

@@ -42,7 +42,7 @@ impl Node {
 }
 
 /// v0.6.42 — certificados automáticos (ACME) del bloque `serve`, aparte del nodo para no
-/// agrandar `NodeKind` (lo mide `tests/type_sizes.rs`): `tls auto [<email>]`, `domain <expr>`,
+/// agrandar `NodeKind` (lo mide `tests/it/type_sizes.rs`): `tls auto [<email>]`, `domain <expr>`,
 /// `domain ask <task>` (emisión bajo demanda: la task aprueba cada nombre nuevo) y
 /// `tls dns <task>` (reto DNS-01 publicado por el programa; lo exige un `*.` en `domain`).
 #[derive(Clone, Debug, PartialEq, Default)]

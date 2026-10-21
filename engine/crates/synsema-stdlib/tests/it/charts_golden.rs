@@ -6,7 +6,7 @@
 //! output default de un kind existente, esto falla (G1 — cero regresión).
 //!
 //! Regenerar (sólo para kinds NUEVOS o cambios de spec aprobados):
-//!   SYNSEMA_BLESS=1 cargo test -p synsema-stdlib --test charts_golden
+//!   SYNSEMA_BLESS=1 cargo test -p synsema-stdlib --test it charts_golden
 
 use synsema_core::types::SynMap;
 use std::path::PathBuf;
