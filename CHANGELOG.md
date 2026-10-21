@@ -6,6 +6,170 @@ Each says what changed, why, and what to write instead.
 
 Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the release date.
 
+## Unreleased (v0.6.46)
+
+**Behavior changes (read these first).**
+- **`json_encode`, `jsonl_encode`, `json_for_script` and `csv_encode` of a secret are an error.**
+  Before, the secret came out as `"[redacted]"`: the key never leaked, but the program got a
+  marker it could send on as if it were the data (in a body, in a file, to another agent). The
+  error names the secret and where it is (`json_encode: the value["auth"]["key"] is secret(K)…`).
+  Pass the secret to the request itself (a header, or the body or the URL once it is bound, see
+  New) and the engine writes it at the socket; or leave it out of what you encode.
+- **A list or a map with a secret inside, in a template hole, is an error.** `` `creds={creds}` ``
+  with `creds = {"k": secret(...)}` gave the text `creds={k: secret(K)}`: plain text that could end
+  up in a header or a URL with the placeholder instead of the key. Take the secret out on its own
+  (`` `{creds.k}` ``, which stays a secret) or use `bearer(...)`/`basic(...)`. A secret on its own
+  in a hole is unchanged.
+- **`declassify` and `private` can only be called by their name.** Reading them as a value is a
+  load error: an alias (`let d be declassify`), a list or map entry (`[declassify][0]`,
+  `{"k": declassify}`), an argument (`f(declassify, x)`), a returned value or a pipe through an
+  alias. Before, all of these published for real while `synsema code check --json` listed none of
+  them, so the review missed the call. A program that binds the name to a value
+  (`let private be 5`, a parameter called `private`) still loads; there, with labels on, a call
+  that does not use the name (`g(x, "why")` with `g` the builtin) fails at the call. The
+  `code check --json` inventory is now complete, and its `declassify_static_only` field is gone.
+  A bare key with one of these names (`{private: 1}`) is a load error too: a bare key evaluates the
+  name (v0.6.45 printed `{builtin:private: 1}`); write it quoted, `{"private": 1}`.
+- **`declassify` is a capability, and a host ceiling bounds it** (with `--labels`). Without a
+  ceiling nothing changes: the runtime grants it, like `unsafe` in your own Rust crate (explicit,
+  with its mandatory reason, and listed in full by `synsema code check --json`). With a ceiling
+  (`--cap-set`, `ceiling` in wasm) only the principals the ceiling names can be published:
+  `--cap-set stdout,declassify=clientes` lets `declassify` remove `clientes` and nothing else
+  (globs work, as for `secret`). **This breaks a program that runs under `--cap-set`, `--sandbox`
+  or `--deterministic` with `--labels` and declassifies:** add `declassify=<principal>` to the
+  ceiling (`--sandbox` and `--deterministic` never grant it). Inside a `sandbox` there is no
+  `declassify` unless `sandbox under {"declassify": "…"}` delegates it. A refusal is a
+  `label_violation` that `try`/`recover` cannot catch (whether it passes depends on the real label
+  of the value) and its message names the declared set, never the real one. Without `--labels` it is not checked:
+  `declassify` stays the identity. `require declassify("P")` is now understood (before it was
+  ignored), and a bare `require declassify` warns like a bare `require sign`.
+- **A `require` with a name that does not exist is a load error.** Before, `require nett("x")`
+  parsed and granted nothing, with no warning, and the program failed later with an error that
+  did not name the typo. Now the error names it and, when there is one, the closest real name:
+  ``unknown capability `nett` in `require` — did you mean `require net`?``, followed by the list
+  of known names. The same holds for a dotted name (`require file.raed(...)`) and for a `require`
+  inside a task or an agent. The audit form (`file_read`, `file_write`) still loads.
+- **The `http`, `http_bytes`, `http_post` and `http_put` builtins take one more optional argument,
+  `form`** (see New); a program never passed it, so nothing breaks, but a host that embeds the
+  engine and implements `http` receives a new field, **`redirect: "error"`, when the request carries
+  a secret** (in the URL, the query, the body or a header). A redirect would carry it to a host the
+  program never named (a cross-origin redirect in `fetch` drops `Authorization`, but not `X-Api-Key`
+  or any other header), and the native runtime does not follow redirects either; honor the field
+  (the browser `fetch` option of the same name does) or the protection is lost on that host. `examples/embed/node/demo.mjs` and `@synsema/wasm`'s types show
+  it.
+- **In wasm, `judge` checks its capability, and a `llm` hook that throws is an error.** A `judge`
+  block ran even when the `ceiling` did not grant `judge` (the native runtime always refused it);
+  now it is refused the same way. A host `llm` hook that threw gave the program an empty answer
+  with `ok: true`; now that call fails with the hook's message (or `the host's llm hook threw`;
+  redacted like any error when the call carried private data). The hook receives a third
+  argument, `{principals}` (see New).
+
+**Security.**
+- **`receipt()` no longer publishes what depended on a private value** (with `--labels`). Three
+  leaks, all with the program counter public and no `label_violation`: `steps` was the raw count
+  (a loop with `when i < n` over a private `n` gave 222 or 378), now `nothing` once a private value
+  was seen; `inputs` counted the reads made in a branch decided by a private value, which are now
+  left out of the public lineage; and `declassified[].from` was the real label (`["a","c"]` or
+  `["b","c"]` by a private index), now the declared set, and a `declassify` inside a private branch
+  is left out of the list (and its `[INF] declassify` log line is not written), since how many
+  there were told which branch was taken.
+- **An LLM operation under a private branch no longer writes a "granted llm" audit entry before
+  failing** (with `--labels`). `reason`/`decide`/`analyze`/`generate`/`judge` checked the
+  capability first and the program counter second, so the audit said the call was allowed inside
+  a branch decided by a private value, which tells which branch ran. The program counter is
+  checked first now, and nothing is written.
+
+**New.**
+- **A secret bound to a host: `require secret("K") for net("api.example.com")`.** APIs that take
+  the key in the URL (Alchemy, Infura, Telegram, Maps), in the query or in the body (OAuth
+  `client_secret_post`) were an error, and the only way out was `reveal()`. A bound secret goes in
+  the URL (`` `https://h/v2/{k}` ``), the query, a JSON body at any depth, a form or a header, only
+  to the hosts it names (several: `for net("a.x.com"), net("b.x.com")`; a subdomain wildcard
+  `*.x.com`), and only over https or wss (http and ws only to `127.0.0.1`, `localhost`, `::1`).
+  - The host of a request never comes from a secret: in a URL that is a secret, the scheme and
+    host have to be written out before it (`https://{k}.evil/`, `https://{k}@h/` and
+    `https://h{k}/` are errors).
+  - Adding two bound secrets keeps the hosts both allow (none in common is an error); `bearer`,
+    `basic` and `oauth_basic` keep the binding of what they wrap.
+  - An unbound secret still goes only in a header; in the URL, the query or the body the error now
+    gives the exact line, with the host: `require secret("K") for net("api.example.com")`.
+  - What the server echoes back (the body, the headers and the error of the response, a WebSocket
+    text frame, a JSON-RPC error) is masked: each secret that went out, as is, percent-encoded,
+    JSON-escaped or in base64, becomes `[secret K]`. It is a defense against an accidental echo,
+    not against a hostile server; the guarantee is the binding.
+  - The audit gets one entry per bound secret sent, `secret(K) → host` (source `bound-send`), and
+    `lineage()` (and the receipt's `inputs`) names the secrets of each request in `secrets`; never
+    the URL nor the value.
+  - The host ceiling can bind too: `--cap-set secret=K@api.example.com` (or a delegated ceiling,
+    `run_program`'s `ceiling`). A program that asks for `K` unbound, or bound to another host, gets
+    the line to write. A child whose ceiling asks for `K` unbound gets nothing above its parent's
+    binding.
+  - `evm_rpc` and the other JSON-RPC builtins, `algod`, `btc_rpc` and `ws_connect` take a bound
+    URL.
+  - `synsema check` warns an unbound secret that goes in the URL, the query, the body or the form of
+    a request, with the line to write.
+  - A secret derived from a bound one (`hkdf_sha256`, `hd_derive`) is a new secret and is not
+    bound; `as_secret` makes an unbound secret.
+- **Private data can reach a model the host chose, and the answer stays private** (with
+  `--labels`). Until now any private value in `reason`, `analyze`, `decide`, `generate`, `judge`,
+  `llm_step` or `llm_stream` was a `label_violation`. Now the program declares whose data it may
+  send (`require llm("customers")`, `require judge("customers")`) and the host allows it per
+  principal and per provider in its ceiling: `--cap-set "llm=customers@api.anthropic.com"` (the
+  host of `SYNSEMA_LLM_BASE_URL`, or the provider's default), `llm=customers@local` for a model in
+  the process (`SYNSEMA_LLM_PROVIDER=local`, the judge `laya`), `llm=customers@embedder` in wasm
+  (the host's `llm` hook). An item without a provider (`llm=customers`, `llm=*`) does not allow
+  private data; `llm=customers@*` allows any provider, written on purpose. An item with a scope
+  also allows the calls with public data, to whichever provider is configured. The program does not name the provider: the host picks it, and the
+  check follows the provider of each call (one that reloads its `.env` and changes host is checked
+  against the new one). A `decide` answered by the judge (`SYNSEMA_JUDGE_DECIDE`) is checked
+  against `judge=`. Without the ceiling item, or under a private branch, it is still a
+  `label_violation` and nothing is sent. With it, the prompt carries the data itself (before, the
+  few cases that got through sent `private(customers)`), the answer carries the label of what went
+  in (the whole map of `llm_step`, so choosing a tool with `r.name` needs a `declassify`, which
+  has its own ceiling; each chunk of `llm_stream`, whose callback runs under the label of the answer,
+  like the body of an `each` over a private list: how many chunks there were is private too, so a
+  public effect in it is a `label_violation`), and each call writes an audit entry
+  (`llm("customers@api.anthropic.com")`, source `llm-data`). In the receipt's lineage the answer
+  to a private prompt is hashed with the prompt's salt and its length is left out. A bare
+  `require llm` still means public data only, and `require llm("P")` now also covers public data
+  (before it broke every LLM operation). In wasm the `llm` hook gets a third argument,
+  `{principals}`, the owners of the private data in the prompt. **What this does not give:** the
+  provider sees the data (this allows a provider the host trusts; it does not protect the data
+  from it); what the model answers is private but not trusted (a `declassify` with its ceiling is
+  what stands between it and a sink); and the size of the prompt is visible on the network, as in
+  any `https` request.
+- **Trusted tools: the host loads a module of its own, and code it does not trust can only call
+  it.** `synsema run --trusted tools=./tools.syn app.syn` (repeatable; `trusted: {tools: source}`
+  in wasm) and, in the program, `use "trusted:tools" as t`. Each exported task of a trusted module
+  runs with **its own** `require` (bounded by `--trusted-cap-set`, `trusted_ceiling` in wasm, if
+  the host gives one) and nothing from the caller: not its grants, not its ceiling, not a
+  `sandbox`. So a program written by a model, under a ceiling without `declassify`, cannot publish
+  a customer's data, but it can call `t.reply(customer, text)`, whose policy (written by a person)
+  declassifies only the customer's own address. With `--trusted-cap-set`, a trusted task gets what
+  it declares (`require declassify("customers")`, `require net("mail.example.com")`) within that
+  ceiling; without it, it declassifies like a program without a ceiling (any principal), so give
+  the trusted modules a ceiling. Its arguments are data: a task, a lambda or a builtin among them
+  (also inside `ok(...)` or `content(...)`) is an error, since it would run with the tool's
+  capabilities. A trusted module sees the builtins and its own names, never the program's: a
+  program that defines `upper` before or after the `use` does not change what the tool runs. A
+  task of the program that would still run inside a tool (a callback such as the `on_reconnect` of
+  a WebSocket the program opened and passed to the tool) is an error there, not a call with the
+  tool's capabilities. And a
+  program cannot change a trusted module: `set t.x to …` changes only its own copy of the module's
+  exports, and another `use` sees the original. Its audit entries carry the module's name
+  (`trusted:tools`). A program cannot load a trusted module itself: the name comes only from the
+  host (an unknown one is a load error), and the program never sees the path. **What it does not
+  do yet:** inside a trusted tool, what would run in another interpreter next to the program's
+  names is an error (defining or spawning an agent, `parallel_map`, `cron_every`/`cron_after`, a
+  `use` of a file module; a trusted module can `use` another trusted one); so is `render` (with its
+  `include`s and layouts), since the template file lives where the program can write it and it would
+  run with the tool's capabilities: a tool builds its text itself. `--trusted` runs
+  under `synsema run` and `synsema test`, not `serve`. With trusted modules the whole program runs
+  on the tree-walker, without the bytecode VM.
+- **`form = {...}` in `http`, `http_bytes`, `http_post`, `http_put` and `fetch`** sends an
+  `application/x-www-form-urlencoded` body (the encoder of `oauth_basic`). Fields are text, a
+  number, a bool or a bound secret; `body` and `form` together are an error.
+
 ## v0.6.45 — 2026-10-20
 
 **Behavior changes (read these first).**

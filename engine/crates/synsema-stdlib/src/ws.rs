@@ -366,6 +366,9 @@ struct Conn {
     /// Socket ENTRANTE (ruta `socket` de serve): sin reconexión posible (el peer es
     /// quien reconecta), `ws_stats.role = "server"`.
     server_side: bool,
+    /// v0.6.46 (E1): los secrets que salieron al conectar; un frame de texto que los ecoa llega
+    /// enmascarado.
+    mask: Option<Box<crate::http_common::Outgoing>>,
 }
 
 impl Conn {
@@ -833,7 +836,11 @@ impl WsRegistry {
                 Ok(Message::Text(t)) => {
                     let mut m = SynMap::new();
                     m.insert("type", syn_text("text"));
-                    m.insert("data", syn_text(t.as_str()));
+                    let data = match self.conns.get(&handle).and_then(|c| c.mask.as_ref()) {
+                        Some(o) => o.mask_text(t.as_str()),
+                        None => t.as_str().to_string(),
+                    };
+                    m.insert("data", syn_text(data));
                     if !self.enqueue(handle, syn_map(m)) {
                         self.overflow_fail(handle);
                         return false;
@@ -1526,17 +1533,14 @@ fn parse_connect_opts(v: Option<&SynValue>, fname: &str) -> Result<ConnectOpts, 
 // Builtins
 // =========================================================
 
-fn parse_headers(v: Option<&SynValue>, fname: &str) -> Result<Vec<(String, String)>, Control> {
+fn parse_headers(v: Option<&SynValue>, fname: &str, out: &mut crate::http_common::Outgoing) -> Result<Vec<(String, String)>, Control> {
     match v {
         None | Some(SynValue::Nothing) => Ok(Vec::new()),
-        Some(SynValue::Map(m)) => {
+        Some(SynValue::Map(_)) => {
             // Un secret (p.ej. bearer()) se materializa SÓLO en el borde del socket. HB4: sellado,
             // bytes no UTF-8, `nothing`, bytes, listas y mapas → error (no su forma impresa).
-            let mut out = Vec::new();
-            for (k, v) in m.borrow().iter() {
-                out.push((k.to_string(), crate::secrets::edge_text(v, fname, &format!("header {:?}", k.to_string()))?));
-            }
-            Ok(out)
+            // v0.6.46 (E1): uno atado, sólo a su host (`Outgoing::admit`).
+            Ok(crate::http_common::header_pairs_to(v, out)?.unwrap_or_default())
         }
         Some(other) => Err(err(format!("{}: headers must be a map, got {}", fname, other.type_name()))),
     }
@@ -1544,8 +1548,12 @@ fn parse_headers(v: Option<&SynValue>, fname: &str) -> Result<Vec<(String, Strin
 
 fn ws_connect(args: &[SynValue], reg: &Registry) -> Result<SynValue, Control> {
     const F: &str = "ws_connect";
-    let url = match args.first() {
-        Some(SynValue::Text(s)) => s.to_string(),
+    // v0.6.46 (E1): la URL es texto, o un secret atado con el host escrito antes (`wss://h/{key}`).
+    let (url, mut out) = match args.first() {
+        Some(v @ SynValue::Text(_)) | Some(v @ SynValue::Secret(_)) => {
+            let (_public, real, out) = crate::http_common::request_url(v, F)?;
+            (real, out)
+        }
         Some(other) => return Err(err(format!("{}: the URL must be text, got {}", F, other.type_name()))),
         None => return Err(err(format!("{}: missing the URL", F))),
     };
@@ -1562,7 +1570,7 @@ fn ws_connect(args: &[SynValue], reg: &Registry) -> Result<SynValue, Control> {
         }
     }
     let (host, port, tls) = parse_ws_url(&url, F)?;
-    let headers = parse_headers(args.get(1), F)?;
+    let headers = parse_headers(args.get(1), F, &mut out)?;
     let opts = parse_connect_opts(args.get(2), F)?;
 
     let dial = DialParams {
@@ -1589,6 +1597,13 @@ fn ws_connect(args: &[SynValue], reg: &Registry) -> Result<SynValue, Control> {
     // establish() re-chequea net(host) (G21) y hace el handshake.
     let caps = reg.borrow().caps.clone();
     let (ws, negotiated, attested) = establish(&dial, &caps)?;
+    // v0.6.46 (E1): el audit de los secrets que salieron, y el eco enmascarado en los frames de texto.
+    let mask = if out.carries_secrets() {
+        out.audit(&caps);
+        Some(Box::new(out))
+    } else {
+        None
+    };
 
     let mut r = reg.borrow_mut();
     r.next_id += 1;
@@ -1622,6 +1637,7 @@ fn ws_connect(args: &[SynValue], reg: &Registry) -> Result<SynValue, Control> {
         closed_emitted: false,
         last_error: None,
         server_side,
+        mask,
     };
     r.conns.insert(handle, conn);
     r.token_to_handle.insert(token.0, handle);
@@ -1690,6 +1706,8 @@ fn run_pending(interp: &mut Interpreter, reg: &Registry, pending: Vec<PendingRec
         if reg.borrow().conns.contains_key(&p.handle) {
             // La task del usuario corre con permiso de CPU aunque estemos dentro de una espera.
             let _r = synsema_core::waiting::resumed();
+            // v0.6.46 (ronda 2): si el `ws_recv` corre dentro de una tool de confianza, una task
+            // que registró el programa es error acá (el chequeo de origen de `call_value`).
             interp.call_task(p.task, vec![syn_int(p.handle)])?;
         }
     }
@@ -2104,6 +2122,7 @@ pub fn adopt_server_socket(interp: &Interpreter, link: ServerSocketLink) -> Resu
         closed_emitted: false,
         last_error: None,
         server_side: true,
+        mask: None,
     };
     r.conns.insert(handle, conn);
     r.token_to_handle.insert(token.0, handle);

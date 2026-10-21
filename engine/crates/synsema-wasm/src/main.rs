@@ -44,16 +44,43 @@ fn with_big_stack<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> 
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    const USAGE: &str = "usage: synsema-wasm [--test] [--sandbox | --cap-set <list>] <file.syn | ->";
+    const USAGE: &str = "usage: synsema-wasm [--test] [--labels] [--sandbox | --cap-set <list>] [--trusted name=path]... [--trusted-cap-set <list>] <file.syn | ->";
     let mut test_mode = false;
     let mut sandbox = false;
+    let mut labels = false;
     let mut cap_set: Option<String> = None;
+    // v0.6.46 (E3b): los módulos de confianza (`--trusted nombre=ruta`, repetible) y su techo, como
+    // en `synsema run`.
+    let mut trusted_paths: Vec<(String, String)> = Vec::new();
+    let mut trusted_cap_set: Option<String> = None;
     let mut path: Option<String> = None;
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
             "--test" => test_mode = true,
             "--sandbox" => sandbox = true,
+            // v0.6.46: las etiquetas de flujo (`private`/`declassify`), como `synsema run --labels`.
+            "--labels" => labels = true,
+            "--trusted" => match args.get(i + 1).and_then(|v| v.split_once('=')) {
+                Some((n, p)) if !n.is_empty() && !p.is_empty() && n.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') => {
+                    trusted_paths.push((n.to_string(), p.to_string()));
+                    i += 1;
+                }
+                _ => {
+                    eprintln!("synsema-wasm: --trusted takes name=path (a name of letters, digits, '_' or '-'), e.g. --trusted tools=./tools.syn");
+                    std::process::exit(2);
+                }
+            },
+            "--trusted-cap-set" => match args.get(i + 1) {
+                Some(v) if !v.starts_with("--") => {
+                    trusted_cap_set = Some(v.clone());
+                    i += 1;
+                }
+                _ => {
+                    eprintln!("synsema-wasm: --trusted-cap-set requires a value (e.g. \"stdout,declassify=customers\")");
+                    std::process::exit(2);
+                }
+            },
             // Mismas formas que `synsema run`: `--cap-set <list>` y `--cap-set=<list>`.
             "--cap-set" => match args.get(i + 1) {
                 Some(v) if !v.starts_with("--") => {
@@ -81,6 +108,10 @@ fn main() {
                      --sandbox          host ceiling = [stdout, time] (compute + print only)\n\
                      --cap-set <list>   host ceiling = the listed capabilities (name or name=scope,\n\
                      \x20                  comma-separated) — a `require` above it is denied\n\
+                     --labels           information-flow labels (`private`/`declassify`)\n\
+                     --trusted n=path   a trusted module the program imports with `use \"trusted:n\"`\n\
+                     \x20                  (repeatable); its tasks run with their own `require`\n\
+                     --trusted-cap-set <list>  the ceiling of the trusted modules\n\
                      --version          print the artifact version\n\
                      -                  read the program from stdin",
                     USAGE
@@ -115,6 +146,35 @@ fn main() {
             std::process::exit(2);
         }
     };
+    // v0.6.46 (E3b): el programa no ve las rutas; el bin las lee y entrega las fuentes.
+    if trusted_paths.is_empty() && trusted_cap_set.is_some() {
+        eprintln!("synsema-wasm: --trusted-cap-set bounds the modules of --trusted; pass --trusted name=./file.syn too");
+        std::process::exit(2);
+    }
+    let mut trusted: Vec<(String, String)> = Vec::new();
+    for (name, p) in &trusted_paths {
+        if trusted.iter().any(|(n, _)| n == name) {
+            eprintln!("synsema-wasm: --trusted {}: the name is given twice", name);
+            std::process::exit(2);
+        }
+        match std::fs::read_to_string(p) {
+            Ok(src) => trusted.push((name.clone(), src)),
+            Err(e) => {
+                eprintln!("synsema-wasm: --trusted {}: cannot read {}: {}", name, p, e);
+                std::process::exit(2);
+            }
+        }
+    }
+    let trusted_ceiling = match trusted_cap_set.as_deref() {
+        None => None,
+        Some(spec) => match build_ceiling(false, Some(spec)) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("synsema-wasm: --trusted-cap-set: {}", e.trim_start_matches("--cap-set: "));
+                std::process::exit(2);
+            }
+        },
+    };
     let (source, filename) = if path == "-" {
         let mut buf = String::new();
         if let Err(e) = std::io::stdin().read_to_string(&mut buf) {
@@ -133,7 +193,7 @@ fn main() {
     };
     // `env: None` → EnvStore::load_default(): el `.env` llega por WASI (`--dir .`) y el
     // environ por `wasmtime --env`, igual que hasta ahora.
-    let opts = RunOptions { filename, env: None, ceiling, no_fs: false, labels: false, result: None, input: None, sources: Vec::new(), max_steps: None, max_memory_mb: None };
+    let opts = RunOptions { filename, env: None, ceiling, no_fs: false, labels, result: None, input: None, sources: Vec::new(), max_steps: None, max_memory_mb: None, trusted, trusted_ceiling };
 
     if test_mode {
         let r = with_big_stack(move || synsema_wasm::test(&source, &opts));

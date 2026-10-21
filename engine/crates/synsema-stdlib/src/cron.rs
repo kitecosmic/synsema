@@ -416,6 +416,18 @@ fn err(msg: &str) -> Control {
     Control::Error(synsema_core::interpreter::RuntimeError::new(msg))
 }
 
+/// v0.6.46 (ronda 1, A1): una tarea programada corre después, en otro intérprete, con los globales
+/// del programa; desde una tool de confianza la correría con las capabilities de la tool.
+fn not_in_trusted_tool(i: &Interpreter, name: &str) -> Result<(), Control> {
+    if i.in_trusted_scope() {
+        return Err(err(&format!(
+            "{}: a trusted tool cannot schedule tasks yet — the task would run with the tool's capabilities next to the program's names",
+            name
+        )));
+    }
+    Ok(())
+}
+
 /// Referencia al scheduler para los builtins. `Strong` en los intérpretes
 /// PRINCIPALES (dueños del ciclo de vida: al dropear el intérprete de un `run`, el
 /// scheduler se dropea y `cancel_all` apaga los hilos). `Weak` en los intérpretes
@@ -489,6 +501,7 @@ pub fn register_cron_builtins(
                             py_float_str(interval)
                         )));
                     }
+                    not_in_trusted_tool(i, "cron_every")?;
                     let (name, task) = exec(i, task_v, "cron_every").map_err(|m| err(&m))?;
                     sched_of(&sched, "cron_every")?.every(interval, &name, task);
                     return Ok(syn_text(name));
@@ -538,6 +551,7 @@ pub fn register_cron_builtins(
                         expr_src.trim()
                     )));
                 }
+                not_in_trusted_tool(i, "cron_every")?;
                 let (name, task) = exec(i, task_v, "cron_every").map_err(|m| err(&m))?;
                 sched_of(&sched, "cron_every")?.at(expr, zone, &name, task);
                 Ok(syn_text(name))
@@ -561,6 +575,7 @@ pub fn register_cron_builtins(
                     )));
                 }
                 let task_v = args.get(1).ok_or_else(|| err("missing argument"))?;
+                not_in_trusted_tool(i, "cron_after")?;
                 let (name, task) =
                     exec(i, task_v, "cron_after").map_err(|m| err(&m))?;
                 sched_of(&sched, "cron_after")?.after(delay, &name, task);

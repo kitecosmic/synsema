@@ -452,7 +452,7 @@ fn tls_pin_lets_a_synsema_client_talk_to_the_attested_key_only() {
     // Errores de uso: clave desconocida, argumentos después del mapa, pin que no es una clave,
     // pin sobre http://.
     let r = run(&format!("fetch(\"{}/ping\", {{\"pin\": \"00\"}})\n", base));
-    assert!(r.errors.join(" ").contains("fetch: unknown option \"pin\" (valid options: method, headers, body, timeout, tls_pin, attested)"), "{:?}", r.errors);
+    assert!(r.errors.join(" ").contains("fetch: unknown option \"pin\" (valid options: method, headers, body, form, timeout, tls_pin, attested)"), "{:?}", r.errors);
     let r = run(&format!("fetch(\"{}/ping\", {{\"tls_pin\": \"{}\"}}, 30)\n", base, pin_hex));
     assert!(r.errors.join(" ").contains("the options map is the last argument"), "{:?}", r.errors);
     let r = run(&format!("fetch(\"{}/ping\", {{\"tls_pin\": \"abcd\"}})\n", base));

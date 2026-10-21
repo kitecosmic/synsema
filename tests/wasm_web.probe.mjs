@@ -99,8 +99,10 @@ for (const name of ["wasm_pure", "wasm_agents", "wasm_respond", "wasm_sandbox", 
 //    child_process + curl no; usamos un mini cliente síncrono sobre el bridge async en 7).
 //    Acá el host `http` es SÍNCRONO y responde él mismo (simula un backend).
 {
+  const sentAuth = [];
   const host = {
     http(req) {
+      sentAuth.push((req.headers.find(([k]) => k.toLowerCase() === "authorization") ?? [])[1] ?? null);
       if (req.url === "https://api.example/ping") return { status: 200, headers: [["content-type", "application/json"]], body: JSON.stringify({ pong: true, method: req.method, auth: (req.headers.find(([k]) => k.toLowerCase() === "authorization") ?? [])[1] ?? null }) };
       return { status: 0, error: "host: unknown url " + req.url };
     },
@@ -114,7 +116,9 @@ let bad be fetch("https://api.example/nope")
 print(bad["error"])`;
   const r = syn.run(program, { host, env: { API_KEY: "s3cr3t" } });
   check("host http: fetch pasa por el host", r.ok && r.output[0] === "200" && r.output[1].includes('"pong":true'), r);
-  check("host http: el secret se materializa en el header (bearer)", r.output[1].includes('"auth":"Bearer s3cr3t"'), r.output);
+  check("host http: el secret se materializa en el header (bearer)", sentAuth[0] === "Bearer s3cr3t", sentAuth);
+  // v0.6.46 (E1): el eco de la clave en la respuesta vuelve enmascarado.
+  check("host http: el eco del secret vuelve enmascarado", r.output[1].includes('"auth":"[secret API_KEY]"') && !r.output[1].includes("s3cr3t"), r.output);
   check("host http: error de transporte del host → {error}", r.output[2].startsWith("host: unknown url"), r.output);
   const denied = syn.run('let r be fetch("https://api.example/ping")\nprint(r["status"])', { host });
   check("host http: sin `require net` el gate deniega ANTES de llamar al host", !denied.ok && denied.errors[0].includes("Capability not granted: net"), denied);
@@ -139,6 +143,59 @@ print(llm_usage())`;
   check("host llm: el prompt lleva el subject", calls[0][1].includes("the weather"), calls);
   const offline = syn.run('print(llm_available())\nprint(reason about "x")');
   check("sin host llm: placeholders offline del core", offline.ok && offline.output[0] === "false" && offline.output[1].startsWith("[reasoning about"), offline);
+  // v0.6.46 (E5): un hook que lanza es error de esa llamada (antes: "" con ok: true), con un Error
+  // o con cualquier valor.
+  for (const thrown of [new Error("boom"), "x"]) {
+    const bad = syn.run('require llm\nprint(reason "hola")', { host: { llm() { throw thrown; } } });
+    check(`host llm: un hook que lanza (${typeof thrown}) es error de la llamada`, !bad.ok && bad.output.length === 0 && bad.errors.length > 0, bad);
+  }
+  // Con etiquetas, un dato privado llega al hook sólo con `llm=P@embedder` en el techo; el hook
+  // recibe los principales y la respuesta sale privada.
+  const seenLlm = [];
+  const llmHost = { llm(op, prompt, info) { seenLlm.push([prompt, info && info.principals]); return "respuesta"; } };
+  const e5 = (ceiling) => syn.run('require llm("a")\nlet x be private("dato-secreto", "a")\nlet r be reason x\nprint(label_of(r))', { host: llmHost, labels: true, ceiling });
+  const deny = e5("stdout,llm=a@local");
+  check("E5: sin `llm=a@embedder` el privado no llega al hook", !deny.ok && deny.errors.some((e) => e.includes("label_violation")) && seenLlm.length === 0, { deny, seenLlm });
+  const allow = e5("stdout,llm=a@embedder");
+  check("E5: con el techo llega sin redactar y con los principales", allow.ok && allow.output[0] === "[private(a)]" && seenLlm.length === 1 && seenLlm[0][0].includes("dato-secreto") && JSON.stringify(seenLlm[0][1]) === '["a"]', { allow, seenLlm });
+  const judge = syn.run('let v be judge "hola"\n    q: whether "Is it a greeting?"\nprint(v.q.available)', { ceiling: "stdout" });
+  check("E5: `judge` se gatea en wasm (el techo sin judge lo niega)", !judge.ok && judge.errors.some((e) => e.includes("judge")), judge);
+}
+
+// v0.6.46 (E3b): `trusted` del embebedor. Bajo un techo sin `declassify`, el programa publica sólo
+// por la tool de confianza; directo, no.
+{
+  const trusted = { t: 'export task inicial(c)\n    require declassify("clientes")\n    give declassify(c.nombre, "la inicial del cliente")\n' };
+  const prog = (body) => `use "trusted:t" as t\nlet c be private({"nombre": "Ana"}, "clientes")\n${body}`;
+  const via = syn.run(prog("print(t.inicial(c))"), { labels: true, ceiling: "stdout", trusted });
+  check("E3b: la tool de confianza publica su política", via.ok && via.output[0] === "Ana", via);
+  const direct = syn.run(prog('print(declassify(c.nombre, "m"))'), { labels: true, ceiling: "stdout", trusted });
+  check("E3b: directo, el techo no da declassify", !direct.ok && direct.errors.some((e) => e.includes("declassify is not granted")), direct);
+  const none = syn.run(prog("print(1)"), { labels: true });
+  check("E3b: sin `trusted`, el módulo no existe", !none.ok && none.errors.some((e) => e.includes("no trusted module named 't'")), none);
+}
+
+// v0.6.46 (ronda 1, M1 y B1): `redirect: "error"` en toda request con un secret (también en un
+// header: `fetch` sólo quita `Authorization` al cambiar de host), y sólo en ésa: un RPC no deja la
+// marca puesta para las requests siguientes.
+{
+  const seen = [];
+  const rpcHost = {
+    http(req) {
+      seen.push([req.url.replace(/K3Y-[A-Z]+/, "<k>"), req.redirect ?? null]);
+      return { status: 200, headers: [["content-type", "application/json"]], body: '{"jsonrpc":"2.0","id":1,"result":"0x10"}' };
+    },
+  };
+  const pre = 'require secret("K") for net("127.0.0.1")\nrequire secret("U")\nrequire net("127.0.0.1")\nlet k be secret("K")\n';
+  const env = { K: "K3Y-SECRETO", U: "K3Y-SUELTO" };
+  const hdr = syn.run(pre + 'let r be http_get("http://127.0.0.1:9/h", {"X-Api-Key": k})\nprint(r["status"])', { host: rpcHost, env });
+  check("M1: un secret atado en un header pide redirect: error", hdr.ok && seen.length === 1 && seen[0][1] === "error", { hdr, seen });
+  seen.length = 0;
+  const loose = syn.run(pre + 'let r be http_get("http://127.0.0.1:9/h", {"X-Api-Key": secret("U")})\nprint(r["status"])', { host: rpcHost, env });
+  check("M1: uno no atado en un header también", loose.ok && seen.length === 1 && seen[0][1] === "error", { loose, seen });
+  seen.length = 0;
+  const rpc = syn.run(pre + 'print(evm_rpc(`http://127.0.0.1:9/v2/{k}`, "eth_blockNumber", []))\nlet r be http_get("http://127.0.0.1:9/publico")\nprint(r["status"])', { host: rpcHost, env });
+  check("B1: después de un RPC con un secret, una request sin secrets sigue redirects", rpc.ok && seen.length === 2 && seen[0][1] === "error" && seen[1][1] === null, { rpc, seen });
 }
 
 // 5. Memoria persistente sobre el KV del host (dos corridas, mismo store).
@@ -259,7 +316,7 @@ serve on 8080
   const port = server.address().port;
   const host = {
     async http(req) {
-      const res = await fetch(req.url, { method: req.method, headers: Object.fromEntries(req.headers), body: req.body ?? undefined });
+      const res = await fetch(req.url, { method: req.method, headers: Object.fromEntries(req.headers), body: req.body ?? undefined, redirect: req.redirect ?? "follow" });
       return { status: res.status, headers: res.headers, body: await res.text() };
     },
     kv: { get: async () => null, set: async () => {} },

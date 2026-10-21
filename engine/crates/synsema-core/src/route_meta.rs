@@ -179,6 +179,8 @@ pub const BUILTIN_CAPS: &[(&str, &str)] = &[
     ("llm_step", "llm"),
     // entorno y secretos
     ("env", "env"), ("secret", "secret"), ("reveal", "reveal"),
+    // v0.6.46 (E3): publicar un dato privado es una capability (sólo se chequea con etiquetas)
+    ("declassify", "declassify"),
     // memoria persistente del agente
     ("remember", "memory"), ("recall", "memory"), ("memory_summary", "memory"),
     ("add_rule", "memory"), ("check_rules", "memory"), ("get_rules", "memory"),
@@ -327,7 +329,7 @@ fn collect_caps(
 ) {
     let mut calls: Vec<String> = Vec::new();
     for stmt in body {
-        if let NodeKind::RequireStatement { capability, scope } = &stmt.kind {
+        if let NodeKind::RequireStatement { capability, scope, .. } = &stmt.kind {
             out.push(require_pair(capability, scope));
         }
         walk(stmt, &mut |n: &Node| match &n.kind {
@@ -413,7 +415,7 @@ fn task_table(program: &Program) -> HashMap<String, TaskSrc> {
             let requires = body
                 .iter()
                 .filter_map(|s| match &s.kind {
-                    NodeKind::RequireStatement { capability, scope } => Some(require_pair(capability, scope)),
+                    NodeKind::RequireStatement { capability, scope, .. } => Some(require_pair(capability, scope)),
                     _ => None,
                 })
                 .collect();
@@ -437,6 +439,10 @@ impl StaticProgram {
         let mut modules = HashMap::new();
         for stmt in &main.statements {
             if let NodeKind::UseImport { path, alias } = &stmt.kind {
+                // v0.6.46 (E3b): un módulo de confianza es del host (`--trusted`), no un archivo del proyecto.
+                if path.starts_with("trusted:") {
+                    continue;
+                }
                 let resolved = crate::templates::resolve_module_path(path, &base_dir, Some(&base_dir))
                     .map_err(|e| format!("{}: {}", file_path, e))?;
                 let src = match crate::bundle::get(&resolved) {

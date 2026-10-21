@@ -108,6 +108,12 @@ pub struct RunOptions {
     pub max_steps: Option<u64>,
     /// v0.6.45 (D2) — tope de la memoria lineal del módulo, en MB. Sólo en wasm32.
     pub max_memory_mb: Option<u64>,
+    /// v0.6.46 (E3b) — módulos de confianza del embebedor `(nombre, fuente)`: el programa los
+    /// importa con `use "trusted:nombre"`, y sus tasks exportadas corren con sus `require` ∩
+    /// `trusted_ceiling`, no con lo del programa.
+    pub trusted: Vec<(String, String)>,
+    /// v0.6.46 (E3b) — el techo de los módulos de confianza (la gramática de `ceiling`).
+    pub trusted_ceiling: Option<Vec<Capability>>,
 }
 
 impl RunOptions {
@@ -123,6 +129,8 @@ impl RunOptions {
             sources: Vec::new(),
             max_steps: None,
             max_memory_mb: None,
+            trusted: Vec::new(),
+            trusted_ceiling: None,
         }
     }
 }
@@ -309,7 +317,7 @@ pub fn llm_tokens_total() -> u64 {
 pub fn declared_memory_name(statements: &[Node]) -> Result<Option<String>, String> {
     let mut found: Option<String> = None;
     for stmt in statements {
-        if let NodeKind::RequireStatement { capability, scope } = &stmt.kind {
+        if let NodeKind::RequireStatement { capability, scope, .. } = &stmt.kind {
             if capability != "memory" {
                 continue;
             }
@@ -424,6 +432,11 @@ pub fn wire_pure(interp: &mut Interpreter, caps: &Rc<RefCell<CapabilitySet>>, ct
     // el audit nativo ↔ wasm bajo un ceiling y la denegación tiene que aparecer en los dos.
     // En el guest no hay red ni provider: un bloque `judge` degrada siempre a `available: false`.
     caps.borrow_mut().grant_ambient(Capability::new(CapabilityType::Judge, None));
+    // v0.6.46 (E3): `declassify` como capability, con el mismo helper que el nativo (paridad).
+    synsema_stdlib::captoken::install_declassify_hook(interp, caps.clone());
+    // v0.6.46 (E5): datos privados hacia el modelo, con el mismo helper que el nativo. En wasm el
+    // modelo es el del host que embebe (o ninguno): `llm=P@embedder` en el techo.
+    synsema_stdlib::captoken::install_llm_data_hook(interp, caps.clone(), Rc::new(|_| "embedder".to_string()));
 
     register_secure_builtins(interp, caps.clone());
     // Gate de stdout bajo techo (paridad con el nativo): `ceiling` sin `stdout` deniega
@@ -636,13 +649,15 @@ pub fn wire_pure(interp: &mut Interpreter, caps: &Rc<RefCell<CapabilitySet>>, ct
     // host (llm_available() = true; llm_usage() suma los tokens que el host reporte).
     // Sin él: placeholders offline del core, como hasta ahora. `require llm` no cambia.
     if host.as_ref().is_some_and(|h| h.offers("llm")) {
-        interp.set_llm_callback(Rc::new(|op: &str, prompt: &str| {
-            match hostcap::provider().and_then(|p| p.llm(op, prompt)) {
-                Some(r) => {
+        interp.set_llm_callback(Rc::new(|op: &str, prompt: &str, principals: &[Rc<str>]| {
+            let principals: Vec<String> = principals.iter().map(|p| p.to_string()).collect();
+            match hostcap::provider().and_then(|p| p.llm(op, prompt, &principals)) {
+                Some(Ok(r)) => {
                     LLM_TOKENS.with(|t| *t.borrow_mut() += r.tokens);
-                    r.content
+                    Ok(r.content)
                 }
-                None => format!("[llm: the host returned no answer for {}]", op),
+                Some(Err(e)) => Err(e),
+                None => Ok(format!("[llm: the host returned no answer for {}]", op)),
             }
         }));
         interp.set_llm_usage_callback(Rc::new(llm_tokens_total));
@@ -694,6 +709,13 @@ pub fn wire_pure(interp: &mut Interpreter, caps: &Rc<RefCell<CapabilitySet>>, ct
                      secret's label when generating)",
                 );
             }
+            // v0.6.46 (E3): ídem para `declassify` (publicar lo privado de cualquier principal).
+            if ty == CapabilityType::Declassify && scope.is_none() {
+                hostcap::log(
+                    "synsema: warning: bare `require declassify` permits publishing data private to ANY principal; \
+                     scope it with `require declassify(\"principal\")` (the principal the call removes)",
+                );
+            }
             c.borrow_mut().grant(Capability::new(ty, scope.map(|s| s.to_string())));
         }
     }));
@@ -705,6 +727,15 @@ pub fn wire_pure(interp: &mut Interpreter, caps: &Rc<RefCell<CapabilitySet>>, ct
         caps_llm
             .borrow_mut()
             .require(&Capability::new(CapabilityType::Llm, None), "llm operation")
+            .map_err(|v| v.into_error())
+    }));
+    // v0.6.46 (E5): el gate de `judge` también en wasm (antes no había: `judge` pasaba con o sin
+    // la capability, aunque el techo no la diera). Mismo chequeo que el nativo.
+    let caps_judge = caps.clone();
+    interp.set_judge_cap_hook(Rc::new(move || {
+        caps_judge
+            .borrow_mut()
+            .require(&Capability::new(CapabilityType::Judge, None), "judge block")
             .map_err(|v| v.into_error())
     }));
     // `sandbox under <caps>` (T1): techo delegado por bloque — mismo helper que el runtime.
@@ -1040,6 +1071,10 @@ pub(crate) fn prepare(program: &Program, opts: &RunOptions) -> (Interpreter, Rc<
     arm_limits(&mut interp, opts);
     let ctx = WireCtx { env: env_store(opts), statements: &program.statements, filename: &opts.filename, no_fs: opts.no_fs };
     wire_pure(&mut interp, &caps, &ctx);
+    // v0.6.46 (E3b): los módulos de confianza del embebedor, con el mismo helper que el nativo.
+    if !opts.trusted.is_empty() {
+        synsema_stdlib::captoken::install_trusted_modules(&mut interp, caps.clone(), &opts.trusted, opts.trusted_ceiling.clone());
+    }
     if opts.labels {
         interp.set_labels(true);
         // v0.6.45 (D1): los MISMOS sumideros que el nativo (una sola lista, `label_lists`). Antes el
@@ -1196,6 +1231,9 @@ pub fn run(source: &str, opts: &RunOptions) -> Report {
     let declassify = interp
         .take_declassify_log()
         .into_iter()
+        // v0.6.46 (E6.8): las declasificaciones de una rama privada no salen al host: cuántas hubo
+        // decía qué rama se tomó.
+        .filter(|e| !e.under_private_pc)
         .map(|e| DeclassifyRecord {
             reason: e.reason,
             // T5 (ronda 7): el `from` que sale al host es el conjunto DECLARADO por el programa,

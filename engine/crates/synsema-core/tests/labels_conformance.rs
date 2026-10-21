@@ -810,18 +810,15 @@ let b be declassify(TIER, \"top const\")\n\
 let c be declassify({\"k\": [1, \"x\"]}, \"literal map\")\n\
 let d be declassify(v, \"data\")\n\
 let f be (x) => declassify(x, \"in lambda\")\n";
-    // Un alias directo () SI se sigue: sin esto el listado del auditor
-    // quedaba vacio con una linea de indireccion.
-    let aliased = "let d be declassify
-let e be d
-let x be private(1, \"a\")
-let y be d(x, \"via alias\")
-let z be e(x, \"via alias del alias\")
-";
-    let asites = declassify_sites(&parse_source(aliased, "<labels>").unwrap());
-    assert_eq!(asites.len(), 2, "{:?}", asites);
-    assert_eq!(asites[0].reason.as_deref(), Some("via alias"));
-    assert_eq!(asites[1].reason.as_deref(), Some("via alias del alias"));
+    // v0.6.46 (E4): un alias ya no declasifica (leer `declassify` como valor es error de carga),
+    // así que el listado no necesita seguirlo para ser completo.
+    let aliased = "let d be declassify\nlet x be private(1, \"a\")\nlet y be d(x, \"via alias\")\n";
+    let aprog = parse_source(aliased, "<labels>").unwrap();
+    assert!(declassify_sites(&aprog).is_empty());
+    assert!(
+        matches!(synsema_core::interpreter::check_protected_names(&aprog), Err(Control::Error(e)) if e.message.contains("read as a value")),
+        "un alias de declassify tiene que ser error de carga"
+    );
 
     let sites2 = declassify_sites(&parse_source(src2, "<labels>").unwrap());
     let flags: Vec<(usize, bool)> = sites2.iter().map(|s| (s.line, s.constant)).collect();
@@ -851,8 +848,8 @@ let z be e(x, \"via alias del alias\")
     assert!(module["file"].as_str().unwrap().ends_with("util.syn"));
     let main = sites.iter().find(|s| s["reason"] == "main").unwrap();
     assert_eq!(main["constant"], serde_json::json!(true));
-    // El listado es estatico y lo dice (un alias que viajo como parametro no es decidible).
-    assert_eq!(out["declassify_static_only"], serde_json::json!(true));
+    // v0.6.46 (E4): el listado es completo; ya no lleva `declassify_static_only`.
+    assert!(out.get("declassify_static_only").is_none(), "{}", out);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -1056,10 +1053,13 @@ fn audit_b7_sinks_are_checked_before_running() {
     let (_i, r, seen) = with_sink("emit(1)\nemit(declassify(private(5, \"a\"), \"ok\"))\n");
     assert!(r.is_ok());
     assert_eq!(*seen.borrow(), vec!["1".to_string(), "5".to_string()]);
-    // Los sumideros del core: `llm_step` con un prompt privado no llega al proveedor.
-    assert!(synsema_core::interpreter::CORE_SINK_BUILTINS.contains(&"llm_step"));
+    // v0.6.46 (E5): `llm_step` deja de ser sumidero (su respuesta no salía etiquetada) y pasa a
+    // tener su propio gate: sin un host que lo permita (el techo `llm=a@…`), un prompt privado
+    // sigue sin llegar al proveedor.
+    assert!(!synsema_core::interpreter::CORE_SINK_BUILTINS.contains(&"llm_step"));
+    assert!(synsema_core::interpreter::CORE_LLM_LABEL_AWARE.contains(&"llm_step"));
     let msg = run_err("let p be private(\"secret prompt\", \"a\")\nlet r be llm_step(p, [], {})\n");
-    assert!(msg.contains("label_violation: llm_step(argument 0) is private to a"), "{}", msg);
+    assert!(msg.contains("label_violation: llm_step would send data private to (a) to the model"), "{}", msg);
     // Sentencias con efecto: `share` bajo PC / con valor privado.
     let msg = run_err("share private(1, \"a\") as \"k\"\n");
     assert!(msg.contains("label_violation: share(argument 0) is private to a"), "{}", msg);
@@ -1841,6 +1841,10 @@ fn every_syn_file_in_the_repo_still_loads() {
     }
     let mut files = Vec::new();
     walk(&root, &mut files);
+    // v0.6.46 (ronda 3, N4): `specs/` de la raíz está en `.gitignore` (notas y sondas locales, que
+    // fallan a propósito); no es del repo, y en CI no existe.
+    let specs = root.join("specs");
+    files.retain(|f| !f.starts_with(&specs));
     // El umbral sólo protege contra "la ruta quedó mal y no recorrí nada": NO puede asumir el
     // corpus local. `conformance/` (1400 de los ~1480 `.syn` del disco) está en `.gitignore`, así
     // que en un CHECKOUT LIMPIO —que es lo que hace CI— sólo existen los ~42 versionados. Con el

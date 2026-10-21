@@ -191,7 +191,7 @@ pub(crate) fn declared_memory_name(
     use synsema_core::ast::NodeKind;
     let mut found: Option<String> = None;
     for stmt in statements {
-        if let NodeKind::RequireStatement { capability, scope } = &stmt.kind {
+        if let NodeKind::RequireStatement { capability, scope, .. } = &stmt.kind {
             if capability != "memory" {
                 continue;
             }
@@ -572,6 +572,32 @@ pub(crate) fn wire_common_with_state(
         // derechos distintos).
         caps.borrow_mut().grant_ambient(Capability::new(CapabilityType::Judge, None));
     }
+    // v0.6.46 (E3): `declassify` es una capability (D3, el `unsafe` de Rust): de ambiente sin
+    // techo, también bajo secure/serve; con techo, sólo lo que el techo nombra.
+    synsema_stdlib::captoken::install_declassify_hook(interp, caps.clone());
+    // v0.6.46 (E5): datos privados hacia el modelo, sólo con `llm=P@<host>` en el techo. El host
+    // sale del provider cableado en ESTE intérprete al momento de la llamada (se cablea después,
+    // y uno que se recarga puede cambiar de host); sin provider, nada sale del proceso: `local`.
+    {
+        let cell = provider_cell(interp);
+        synsema_stdlib::captoken::install_llm_data_hook(
+            interp,
+            caps.clone(),
+            Rc::new(move |judge| {
+                let w = cell.borrow();
+                let ep = if judge {
+                    w.judge.as_ref().map(|(p, _)| p.endpoint())
+                } else {
+                    w.llm.as_ref().map(|p| p.endpoint())
+                };
+                ep.unwrap_or_else(|| "local".to_string())
+            }),
+        );
+    }
+    // v0.6.46 (E3b): los módulos de confianza del host (`--trusted`), para `use "trusted:…"`.
+    if let Some(t) = crate::host::trusted() {
+        synsema_stdlib::captoken::install_trusted_modules(interp, caps.clone(), &t.modules, t.ceiling.clone());
+    }
     register_secure_builtins(interp, caps.clone());
     // Secretos/env: carga el `.env` (antes de evaluar require/serve) y registra
     // env/secret/reveal/bearer/crypto. Deny-by-default: env()/secret()/reveal() exigen
@@ -751,6 +777,13 @@ pub(crate) fn wire_common_with_state(
                     "synsema: warning: bare `require wallet` permits creating custody from ANY secret; \
                      scope it with `require wallet(\"NAME\")` (the source secret's name, or the new \
                      secret's label when generating)"
+                );
+            }
+            // v0.6.46 (E3): ídem para `declassify` (publicar lo privado de cualquier principal).
+            if ty == CapabilityType::Declassify && scope.is_none() {
+                eprintln!(
+                    "synsema: warning: bare `require declassify` permits publishing data private to ANY principal; \
+                     scope it with `require declassify(\"principal\")` (the principal the call removes)"
                 );
             }
             c.borrow_mut().grant(Capability::new(ty, scope.map(|s| s.to_string())));
@@ -992,10 +1025,10 @@ fn wire_llm_with(interp: &mut Interpreter, provider: Arc<dyn LLMProvider>) {
     interp.set_llm_usage_callback(Rc::new(crate::llm_providers::llm_tokens_total));
     // Callback de texto: arma `LLMRequest::new(op)` + `data["prompt"]` → `call().content`.
     let p_text = provider.clone();
-    interp.set_llm_callback(Rc::new(move |op: &str, prompt: &str| {
+    interp.set_llm_callback(Rc::new(move |op: &str, prompt: &str, _principals: &[Rc<str>]| {
         let mut req = LLMRequest::new(op);
         req.data.insert("prompt".to_string(), prompt.to_string());
-        p_text.call(&req).content
+        Ok(p_text.call(&req).content)
     }));
     // Callback dedicado de `decide` (DE-039): las opciones viajan estructuradas y el
     // contrato completo (tool/enum forzado → normalización → 1 reintento → fallback
@@ -1737,9 +1770,9 @@ pub fn run_capturing_llm(source: &str, filename: &str) -> (RunResult, Vec<(Strin
         .spawn(move || {
             run_configured(&src, &fname, move |interp| {
                 let cap = captured.clone();
-                interp.set_llm_callback(Rc::new(move |op: &str, prompt: &str| {
+                interp.set_llm_callback(Rc::new(move |op: &str, prompt: &str, _principals: &[Rc<str>]| {
                     cap.lock().unwrap().push((op.to_string(), prompt.to_string()));
-                    "ok".to_string()
+                    Ok("ok".to_string())
                 }));
             })
         })
@@ -1797,8 +1830,8 @@ pub fn run_with_llm(source: &str, filename: &str, responses: HashMap<String, Str
             run_configured(&src, &fname, move |interp| {
                 let provider = Arc::new(MockProvider::new(responses));
                 // El mock keyea por `op` e ignora el prompt (retrocompat de los tests).
-                interp.set_llm_callback(Rc::new(move |op: &str, _prompt: &str| {
-                    provider.call(&LLMRequest::new(op)).content
+                interp.set_llm_callback(Rc::new(move |op: &str, _prompt: &str, _principals: &[Rc<str>]| {
+                    Ok(provider.call(&LLMRequest::new(op)).content)
                 }));
             })
         })

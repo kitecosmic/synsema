@@ -367,6 +367,10 @@ impl LocalGgufProvider {
 }
 
 impl LLMProvider for LocalGgufProvider {
+    /// v0.6.46 (ronda 1, B3): no sale del proceso.
+    fn endpoint(&self) -> String {
+        "local".to_string()
+    }
     fn call(&self, request: &LLMRequest) -> LLMResponse {
         let prompt = request.data.get("prompt").cloned().unwrap_or_default();
         let context = request.data.get("context").cloned().unwrap_or_default();

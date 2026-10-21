@@ -1265,6 +1265,7 @@ mod tests {
 
     #[test]
     fn header_pairs_reveal_at_socket_but_map_pairs_redacts() {
+        use crate::http_common::{header_pairs_to, map_pairs_to, Outgoing};
         use synsema_core::types::{syn_secret, syn_text, SynValue};
         let mut m = synsema_core::types::SynMap::new();
         m.insert("Authorization", syn_secret("STRIPE_KEY", "Bearer sk_live_LEAKCANARY"));
@@ -1272,18 +1273,21 @@ mod tests {
         let map = SynValue::Map(m.into_ref());
 
         // headers: el secret se MATERIALIZA (borde del socket) → plaintext real.
-        let hp = header_pairs(Some(&map), "t").ok().unwrap().unwrap();
+        let mut out = Outgoing::for_url("https://api.stripe.com/v1", "t");
+        let hp = header_pairs_to(Some(&map), &mut out).ok().unwrap().unwrap();
         let auth = hp.iter().find(|(k, _)| k == "Authorization").unwrap();
         assert_eq!(auth.1, "Bearer sk_live_LEAKCANARY");
         assert!(hp.iter().any(|(k, v)| k == "X-Trace" && v == "plain"));
 
-        // query params (map_pairs): un secret es ERROR (iría en la URL) — HB4: antes salía la
-        // cadena `secret(STRIPE_KEY)` como si fuera el valor.
-        let e = match map_pairs(Some(&map), "http_get") {
+        // query params: un secret NO atado es ERROR (iría en la URL), y el mensaje dice cómo atarlo
+        // (v0.6.46, E1; antes sólo decía que no había forma).
+        let mut out = Outgoing::for_url("https://api.stripe.com/v1", "http_get");
+        let e = match map_pairs_to(Some(&map), &mut out) {
             Err(synsema_core::interpreter::Control::Error(e)) => e.into_message(),
             _ => panic!("expected an error"),
         };
         assert!(e.contains("query parameter \"Authorization\" is secret(STRIPE_KEY)") && !e.contains("LEAKCANARY"), "{}", e);
+        assert!(e.contains("require secret(\"STRIPE_KEY\") for net(\"api.stripe.com\")"), "{}", e);
     }
 
     /// El certificado de cliente es la identidad del workload: sólo se presenta a

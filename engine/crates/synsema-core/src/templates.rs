@@ -749,7 +749,7 @@ fn render_nodes(
                                 ))));
                             }
                         };
-                        let child = Environment::child_scope(&interp.global_env, "template:include");
+                        let child = Environment::child_scope(&interp.template_parent(), "template:include");
                         for (k, v) in m.borrow().iter() {
                             env_set(&child, k, v.clone());
                         }
@@ -792,7 +792,7 @@ fn render_file(
         TNode::Layout { path } => Some(path.clone()),
         _ => None,
     });
-    let env = Environment::child(&interp.global_env, &format!("template:{}", filename));
+    let env = Environment::child(&interp.template_parent(), &format!("template:{}", filename));
     if let Some(SynValue::Map(m)) = data {
         for (k, v) in m.borrow().iter() {
             env_set(&env, k, v.clone());
@@ -830,6 +830,17 @@ pub fn render_template(
     path: &str,
     data: Option<&SynValue>,
 ) -> Result<String, Control> {
+    // v0.6.46 (ronda 3, R3-A1): un template es código que se lee del directorio de trabajo en cada
+    // llamada, donde el programa puede escribirlo (él, una corrida anterior o un proceso suyo), y
+    // correría con las capabilities de la tool. Hasta que el host le dé a la tool sus templates
+    // (como le da la fuente), dentro de una tool es error. Es la única entrada: `include` y los
+    // layouts se resuelven desde acá.
+    if interp.in_trusted_scope() {
+        return Err(Control::Error(RuntimeError::new(format!(
+            "render: a trusted tool cannot render templates yet ('{}'): the template file lives where the program can write it, and it would run with the tool's capabilities; build the text in the tool",
+            path
+        ))));
+    }
     let named = HashMap::new();
     let slots = Slots { default: "", named: &named };
     render_file(interp, path, data, &slots, 0)
@@ -1186,6 +1197,10 @@ fn check_program_static_inner(
         // módulo que importa: `../` sube mientras quede bajo ella.
         let project_root = project_root_of(stack.first().map(String::as_str).unwrap_or(file_path));
         for raw in uses {
+            // v0.6.46 (E3b): un módulo de confianza es del host (`--trusted`), no un archivo del proyecto.
+            if raw.starts_with("trusted:") {
+                continue;
+            }
             let resolved = resolve_module_path(&raw, &base_dir, project_root.as_deref())
                 .map_err(|e| format!("{}: {}", file_path, e))?;
             if stack.contains(&resolved) {
@@ -1252,6 +1267,10 @@ pub fn module_walk(uses: Vec<String>, file_path: &str, load: SourceLoader<'_>) -
     ) -> Result<(), String> {
         let base_dir = Path::new(importer).parent().map(|p| p.to_path_buf()).unwrap_or_default();
         for raw in uses {
+            // v0.6.46 (E3b): un módulo de confianza es del host (`--trusted`), no un archivo del proyecto.
+            if raw.starts_with("trusted:") {
+                continue;
+            }
             let resolved = resolve_module_path(&raw, &base_dir, root).map_err(|e| format!("{}: {}", importer, e))?;
             if stack.contains(&resolved) {
                 return Err(format!("circular import: module '{}' is already being loaded", raw));

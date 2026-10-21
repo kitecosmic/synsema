@@ -334,7 +334,7 @@ fn direct_caps(body: &[Node], ctx: &ScopeCtx) -> Vec<(String, Option<String>)> {
         }
     };
     for stmt in body {
-        if let NodeKind::RequireStatement { capability, scope } = &stmt.kind {
+        if let NodeKind::RequireStatement { capability, scope, .. } = &stmt.kind {
             push(require_pair(capability, scope));
         }
         walk(stmt, &mut |n| match &n.kind {
@@ -714,7 +714,7 @@ fn requires_of(program: &Program) -> Vec<Value> {
         .statements
         .iter()
         .filter_map(|s| match &s.kind {
-            NodeKind::RequireStatement { capability, scope } => {
+            NodeKind::RequireStatement { capability, scope, .. } => {
                 let (cap, sc) = require_pair(capability, scope);
                 Some(json!({"cap": cap, "scope": sc, "line": s.location.line}))
             }
@@ -916,7 +916,7 @@ fn top_requires(prog: &Program) -> Vec<(String, Option<String>)> {
     prog.statements
         .iter()
         .filter_map(|s| match &s.kind {
-            NodeKind::RequireStatement { capability, scope } => Some(require_pair(capability, scope)),
+            NodeKind::RequireStatement { capability, scope, .. } => Some(require_pair(capability, scope)),
             _ => None,
         })
         .collect()
@@ -1450,7 +1450,7 @@ pub fn caps(root: &Root, path: Option<&str>) -> Value {
             let own: Vec<(String, Option<String>)> = body
                 .iter()
                 .filter_map(|s| match &s.kind {
-                    NodeKind::RequireStatement { capability, scope } => Some(require_pair(capability, scope)),
+                    NodeKind::RequireStatement { capability, scope, .. } => Some(require_pair(capability, scope)),
                     _ => None,
                 })
                 .collect();
@@ -1579,46 +1579,16 @@ fn top_literal_names(program: &Program) -> BTreeSet<String> {
     out
 }
 
-/// Nombres ligados al builtin `declassify` por alias (`let d be declassify`), a cualquier
-/// profundidad. El listado del auditor los cuenta como sitios: si no, un alias lo vaciaba.
-/// No cubre un alias pasado como PARÁMETRO ni guardado en un mapa (eso no es decidible
-/// estáticamente): por eso el JSON de `check` declara `static_only`.
-fn declassify_aliases(program: &Program) -> BTreeSet<String> {
-    let mut out = BTreeSet::new();
-    out.insert("declassify".to_string());
-    // Punto fijo simple: `let a be declassify` y después `let b be a`.
-    loop {
-        let before = out.len();
-        for stmt in &program.statements {
-            walk(stmt, &mut |n| {
-                let inner = match &n.kind {
-                    NodeKind::ExportDeclaration { declaration } => declaration.as_ref(),
-                    _ => n,
-                };
-                if let NodeKind::LetBinding { name, value, .. } = &inner.kind {
-                    if value.as_identifier().is_some_and(|id| out.contains(id)) {
-                        out.insert(name.to_string());
-                    }
-                }
-            });
-        }
-        if out.len() == before {
-            break;
-        }
-    }
-    out
-}
-
 /// Todos los `declassify(...)` del programa, en orden de aparición (estático, sobre el AST;
-/// Entra en lambdas, L2, y sigue los alias `let d be declassify`).
+/// entra en lambdas, L2). v0.6.46 (E4): es completo, porque `declassify` sólo declasifica llamado
+/// por su nombre (un alias es error de carga o, si el programa liga el nombre, de ejecución).
 pub fn declassify_sites(program: &Program) -> Vec<DeclassifySite> {
     let consts = top_literal_names(program);
-    let aliases = declassify_aliases(program);
     let mut out = Vec::new();
     for stmt in &program.statements {
         walk(stmt, &mut |n| {
             if let NodeKind::TaskCall { name, arguments } = &n.kind {
-                if !name.as_identifier().is_some_and(|id| aliases.contains(id)) {
+                if name.as_identifier() != Some("declassify") {
                     return;
                 }
                 let constant = match arguments.first().map(|a| &a.value) {
@@ -1740,11 +1710,9 @@ pub fn check(root: &Root, path: Option<&str>) -> Value {
     }
     dedup_sorted(&mut errors);
     dedup_sorted(&mut warnings);
-    // `static_only`: el listado de `declassify` sale del AST (cubre lambdas y los alias
-    // `let d be declassify`), pero NO puede ver un alias que viajó como parámetro o dentro de
-    // Un contenedor. El registro de runtime (`Interpreter::declassify_log`) sí los ve todos:
-    // El auditor tiene que cruzar los dos.
-    json!({"ok": errors.is_empty(), "files": files.len(), "errors": errors, "warnings": warnings, "declassify": declassify, "declassify_static_only": true})
+    // v0.6.46 (E4): el listado de `declassify` es completo (sólo declasifica llamado por su nombre),
+    // así que ya no lleva `declassify_static_only`.
+    json!({"ok": errors.is_empty(), "files": files.len(), "errors": errors, "warnings": warnings, "declassify": declassify})
 }
 
 /// `search(pattern, path?, kinds?, regex?, limit?)`: texto en los archivos del proyecto.

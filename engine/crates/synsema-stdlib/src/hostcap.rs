@@ -27,6 +27,11 @@ pub struct HostHttpRequest<'a> {
     pub headers: &'a [(String, String)],
     pub body: Option<&'a [u8]>,
     pub timeout_secs: u64,
+    /// v0.6.46 (E1): la request lleva un secret (en la URL, la query, el body o un header: el `fetch`
+    /// sólo quita `Authorization` al cambiar de host): el host no tiene que seguir un redirect (el `fetch` del navegador los sigue por defecto;
+    /// con esto se pide `redirect: "error"`). Un hook propio que no lo respete queda fuera de lo
+    /// que el motor puede imponer: es contrato del hook.
+    pub forbid_redirects: bool,
 }
 
 /// Respuesta de una op LLM del host: contenido + tokens consumidos (0 si el host
@@ -74,7 +79,11 @@ pub trait HostProvider {
         None
     }
     /// Op LLM (`reason`/`decide`/`analyze`/`generate`/`step`…) → contenido.
-    fn llm(&self, _op: &str, _prompt: &str) -> Option<HostLlmResult> {
+    ///
+    /// v0.6.46 (E5): `principals` son los dueños de lo privado que lleva el prompt (vacío con
+    /// datos públicos; el techo `llm=P@embedder` ya lo permitió), para que el host decida o
+    /// audite. `Some(Err(texto))` = el hook falló (lanzó): es error de ESA llamada.
+    fn llm(&self, _op: &str, _prompt: &str, _principals: &[String]) -> Option<Result<HostLlmResult, String>> {
         None
     }
     /// Una línea de diagnóstico (los `warning:` que en nativo van a stderr).

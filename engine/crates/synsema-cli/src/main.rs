@@ -70,6 +70,10 @@ pub(crate) struct HostFlags {
     /// F4.2: `--jitless` (como `node --jitless`): sin el nivel nativo, todo en la VM. No apaga
     /// ningún chequeo; lo decide `main` antes de instalar el nivel (ver `jitless_requested`).
     pub jitless: bool,
+    /// v0.6.46 (E3b): `--trusted nombre=ruta` (repetible), los módulos de confianza que el
+    /// programa importa con `use "trusted:nombre"`, y `--trusted-cap-set`, su techo.
+    pub trusted: Vec<(String, String)>,
+    pub trusted_cap_set: Option<String>,
     pub filename: Option<String>,
     pub program_args: Vec<String>,
     pub rest: Vec<String>,
@@ -111,7 +115,51 @@ impl HostFlags {
         if self.labels {
             host::set_labels(true);
         }
+        self.apply_trusted(cmd)?;
         Ok(p)
+    }
+
+    /// v0.6.46 (E3b): lee los módulos de `--trusted` (el programa no ve la ruta) y fija su techo.
+    fn apply_trusted(&self, cmd: &str) -> Result<(), ExitCode> {
+        if self.trusted.is_empty() {
+            if self.trusted_cap_set.is_some() {
+                eprintln!("synsema {}: --trusted-cap-set bounds the modules of --trusted; pass --trusted name=./file.syn too", cmd);
+                return Err(ExitCode::from(2));
+            }
+            return Ok(());
+        }
+        // Ronda 1 (A1): bajo `serve` cada worker reconstruye los módulos colgados de los globales del
+        // programa; ahí una tool de confianza no quedaría aislada.
+        if cmd != "run" && cmd != "test" {
+            eprintln!("synsema {}: --trusted runs under `synsema run` and `synsema test` for now (a trusted tool is not isolated in the workers of `{}` yet)", cmd, cmd);
+            return Err(ExitCode::from(2));
+        }
+        let mut modules: Vec<(String, String)> = Vec::new();
+        for (name, path) in &self.trusted {
+            if modules.iter().any(|(n, _)| n == name) {
+                eprintln!("synsema {}: --trusted {}: the name is given twice", cmd, name);
+                return Err(ExitCode::from(2));
+            }
+            match std::fs::read_to_string(path) {
+                Ok(src) => modules.push((name.clone(), src)),
+                Err(e) => {
+                    eprintln!("synsema {}: --trusted {}: cannot read {}: {}", cmd, name, path, e);
+                    return Err(ExitCode::from(2));
+                }
+            }
+        }
+        let ceiling = match self.trusted_cap_set.as_deref() {
+            None => None,
+            Some(spec) => match build_ceiling(false, Some(spec)) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("synsema {}: --trusted-cap-set: {}", cmd, e.trim_start_matches("--cap-set: "));
+                    return Err(ExitCode::from(2));
+                }
+            },
+        };
+        host::set_trusted(host::Trusted { modules, ceiling });
+        Ok(())
     }
 
     /// Instala el sink de audit (`--audit`), y el colector si el subcomando va a emitir
@@ -160,6 +208,23 @@ pub(crate) fn take_host_flags(cmd: &str, args: &[String]) -> Result<HostFlags, E
             "--sandbox" => h.sandbox = true,
             "--deterministic" => h.deterministic = true,
             "--labels" => h.labels = true,
+            "--trusted" => {
+                let v = need_value("--trusted", args.get(i + 1))?;
+                match v.split_once('=') {
+                    Some((n, p)) if !n.is_empty() && !p.is_empty() && n.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') => {
+                        h.trusted.push((n.to_string(), p.to_string()))
+                    }
+                    _ => {
+                        eprintln!("synsema {}: --trusted takes name=path (a name of letters, digits, '_' or '-'), e.g. --trusted tools=./tools.syn", cmd);
+                        return Err(ExitCode::from(2));
+                    }
+                }
+                i += 1;
+            }
+            "--trusted-cap-set" => {
+                h.trusted_cap_set = Some(need_value("--trusted-cap-set", args.get(i + 1))?);
+                i += 1;
+            }
             "--jitless" => h.jitless = true,
             "--cap-set" => {
                 h.cap_set = Some(need_value("--cap-set", args.get(i + 1))?);
@@ -2123,12 +2188,142 @@ fn deprecated_fetch_warnings(program: &synsema_core::ast::Program, path: &str) -
 /// nombre (`http_get(url, headers, query, timeout = 10)`). Cada fila: (builtin, obligatorios,
 /// nombres de todos los parámetros en orden).
 const NAMED_AFTER_TWO: &[(&str, usize, &[&str])] = &[
-    ("http", 2, &["method", "url", "headers", "query", "body", "timeout"]),
-    ("http_bytes", 2, &["method", "url", "headers", "query", "body", "timeout"]),
+    ("http", 2, &["method", "url", "headers", "query", "body", "timeout", "form"]),
+    ("http_bytes", 2, &["method", "url", "headers", "query", "body", "timeout", "form"]),
     ("http_get", 1, &["url", "headers", "query", "timeout"]),
-    ("http_post", 1, &["url", "body", "headers", "timeout"]),
-    ("http_put", 1, &["url", "body", "headers", "timeout"]),
+    ("http_post", 1, &["url", "body", "headers", "timeout", "form"]),
+    ("http_put", 1, &["url", "body", "headers", "timeout", "form"]),
 ];
+
+/// v0.6.46 (E1.8) — un `require secret("K")` sin `for` cuando K va en la URL, la query, el body o
+/// el form de una request: en runtime es error (un secret no atado sólo va en un header), y acá se
+/// avisa antes con la línea a escribir. Se sigue `secret("K")` escrito en el argumento o por una
+/// variable (`let k be secret("K")`); los headers no cuentan. Aviso, no error.
+fn unbound_secret_warnings(program: &synsema_core::ast::Program, path: &str) -> Vec<String> {
+    use std::collections::{HashMap, HashSet};
+    use synsema_core::ast::{Node, NodeKind as NK};
+    fn lit(n: &Node) -> Option<&str> {
+        match &n.kind {
+            NK::TextLiteral { value } => Some(value.as_str()),
+            _ => None,
+        }
+    }
+    fn secret_call(n: &Node) -> Option<&str> {
+        match &n.kind {
+            NK::TaskCall { name, arguments } if matches!(&name.kind, NK::Identifier { name } if name == "secret") => {
+                arguments.first().and_then(|a| lit(&a.value))
+            }
+            _ => None,
+        }
+    }
+    let mut unbound: HashSet<String> = HashSet::new();
+    let mut bound: HashSet<String> = HashSet::new();
+    let mut vars: HashMap<String, String> = HashMap::new();
+    for stmt in &program.statements {
+        synsema_core::ast_api::walk(stmt, &mut |n| match &n.kind {
+            NK::RequireStatement { capability, scope: Some(sc), bound_to } if capability == "secret" => {
+                if let Some(k) = lit(sc) {
+                    if bound_to.is_some() {
+                        bound.insert(k.to_string());
+                    } else {
+                        unbound.insert(k.to_string());
+                    }
+                }
+            }
+            NK::LetBinding { name, value, .. } => {
+                if let Some(k) = secret_call(value) {
+                    vars.insert(name.to_string(), k.to_string());
+                }
+            }
+            _ => {}
+        });
+    }
+    let unbound: HashSet<String> = unbound.difference(&bound).cloned().collect();
+    if unbound.is_empty() {
+        return Vec::new();
+    }
+    // (builtin, posición y nombre de la URL, la query, el body y el form; un `Arg` con nombre
+    // cuenta igual).
+    const PLACES: &[(&str, &[(usize, &str)])] = &[
+        ("http", &[(1, "url"), (3, "query"), (4, "body"), (6, "form")]),
+        ("http_bytes", &[(1, "url"), (3, "query"), (4, "body"), (6, "form")]),
+        ("http_get", &[(0, "url"), (2, "query")]),
+        ("http_post", &[(0, "url"), (1, "body"), (4, "form")]),
+        ("http_put", &[(0, "url"), (1, "body"), (4, "form")]),
+        ("http_delete", &[(0, "url")]),
+        ("fetch", &[(0, "url"), (3, "body")]),
+        ("ws_connect", &[(0, "url")]),
+    ];
+    let mentions = |n: &Node| -> Vec<String> {
+        let mut found: Vec<String> = Vec::new();
+        synsema_core::ast_api::walk(n, &mut |m| {
+            let k = match &m.kind {
+                NK::Identifier { name } => vars.get(name.as_str()).cloned(),
+                _ => secret_call(m).map(str::to_string),
+            };
+            if let Some(k) = k {
+                if unbound.contains(&k) && !found.contains(&k) {
+                    found.push(k);
+                }
+            }
+        });
+        found
+    };
+    // El host escrito antes del primer hueco de la URL (`https://api.x.com/v2/{k}`).
+    let host_of = |n: &Node| -> Option<String> {
+        let mut first: Option<String> = None;
+        synsema_core::ast_api::walk(n, &mut |m| {
+            if first.is_none() {
+                first = lit(m).map(str::to_string);
+            }
+        });
+        let t = first?;
+        let rest = t.split_once("://")?.1;
+        let host = &rest[..rest.find(['/', '?', '#'])?];
+        (!host.is_empty() && !host.contains('@')).then(|| host.to_string())
+    };
+    let mut out = Vec::new();
+    for stmt in &program.statements {
+        synsema_core::ast_api::walk(stmt, &mut |n| {
+            let NK::TaskCall { name, arguments } = &n.kind else { return };
+            let NK::Identifier { name: callee } = &name.kind else { return };
+            let Some((f, places)) = PLACES.iter().find(|(f, _)| *f == callee.as_str()) else { return };
+            let positional: Vec<&Node> = arguments.iter().filter(|a| a.name.is_none()).map(|a| &a.value).collect();
+            let mut hits: Vec<(&str, &Node)> = Vec::new();
+            for &(i, what) in places.iter() {
+                if let Some(v) = positional.get(i) {
+                    hits.push((what, *v));
+                }
+                for a in arguments.iter().filter(|a| a.name.as_deref() == Some(what)) {
+                    hits.push((what, &a.value));
+                }
+            }
+            // `fetch(url, {"body": …, "form": …})`: las claves del mapa de opciones.
+            if *f == "fetch" {
+                if let Some(Node { kind: NK::MapLiteral { pairs }, .. }) = positional.get(1).copied() {
+                    for (k, v) in pairs {
+                        match lit(k) {
+                            Some("body") => hits.push(("body", v)),
+                            Some("form") => hits.push(("form", v)),
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            let url = hits.iter().find(|(w, _)| *w == "url").map(|(_, v)| *v);
+            let host = url.and_then(host_of).unwrap_or_else(|| "<the host>".to_string());
+            for (what, v) in &hits {
+                for k in mentions(v) {
+                    out.push(format!(
+                        "{}:{}: warning: secret(\"{}\") goes in the {} of {}() but is not bound to a host, and an unbound secret only goes in a header: write `require secret(\"{}\") for net(\"{}\")`",
+                        path, n.location.line, k, what, f, k, host
+                    ));
+                }
+            }
+        });
+    }
+    out
+}
 
 fn positional_beyond_two_warnings(program: &synsema_core::ast::Program, path: &str) -> Vec<String> {
     use synsema_core::ast::NodeKind as NK;
@@ -2358,6 +2553,9 @@ fn cmd_check(args: &[String]) -> ExitCode {
                         eprintln!("{}", w);
                     }
                     for w in positional_beyond_two_warnings(&program, &path) {
+                        eprintln!("{}", w);
+                    }
+                    for w in unbound_secret_warnings(&program, &path) {
                         eprintln!("{}", w);
                     }
                     // T1 (DX, §10.3 del spec de identidad): lo que el programa —o una task de un

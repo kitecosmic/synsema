@@ -299,6 +299,10 @@ impl HostProvider for WebHost {
         payload.insert("url".into(), json!(req.url));
         payload.insert("headers".into(), pairs_to_json(req.headers));
         payload.insert("timeout".into(), json!(req.timeout_secs));
+        // v0.6.46 (E1): con un secret en la request, el glue de JS pasa esto a `fetch`.
+        if req.forbid_redirects {
+            payload.insert("redirect".into(), json!("error"));
+        }
         match req.body {
             None => {
                 payload.insert("body".into(), Value::Null);
@@ -396,17 +400,23 @@ impl HostProvider for WebHost {
                 .unwrap_or_default(),
         )
     }
-    fn llm(&self, op: &str, prompt: &str) -> Option<HostLlmResult> {
+    fn llm(&self, op: &str, prompt: &str, principals: &[String]) -> Option<Result<HostLlmResult, String>> {
         if !self.offers("llm") {
             return None;
         }
-        let r = host_call_json("llm", &json!({"op": op, "prompt": prompt}))?;
+        let r = host_call_json("llm", &json!({"op": op, "prompt": prompt, "principals": principals}))?;
+        // v0.6.46 (E5, §0.13): un hook que lanza vuelve como `{error}`; antes contaba como una
+        // respuesta vacía con `ok: true`.
+        if let Some(e) = r.get("error") {
+            let m = str_of(e);
+            return Some(Err(if m.is_empty() { "the host's llm hook threw".to_string() } else { m }));
+        }
         let content = match &r {
             Value::String(s) => s.clone(),
             other => other.get("content").map(str_of).unwrap_or_default(),
         };
         let tokens = r.get("tokens").and_then(Value::as_u64).unwrap_or(0);
-        Some(HostLlmResult { content, tokens })
+        Some(Ok(HostLlmResult { content, tokens }))
     }
     fn log(&self, line: &str) -> bool {
         if !self.offers("log") {
@@ -591,7 +601,20 @@ fn opts_from(req: &Map<String, Value>) -> Result<RunOptions, String> {
     };
     let max_steps = limit("max_steps")?;
     let max_memory_mb = limit("max_memory_mb")?;
-    Ok(RunOptions { filename, env, ceiling, no_fs: true, labels, result, input, sources, max_steps, max_memory_mb })
+    // v0.6.46 (E3b): `"trusted": {"nombre": "fuente"}` y `"trusted_ceiling": "<cap-set>"`.
+    let trusted: Vec<(String, String)> = match req.get("trusted") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(Value::Object(m)) => m
+            .iter()
+            .map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())).ok_or_else(|| format!("trusted.{}: expected the module source as text", k)))
+            .collect::<Result<_, _>>()?,
+        Some(_) => return Err("trusted must be an object {name: source}".to_string()),
+    };
+    let trusted_ceiling = match req.get("trusted_ceiling") {
+        Some(Value::String(s)) => synsema_wasm::parse_ceiling(s).map_err(|e| format!("trusted_ceiling: {}", e))?,
+        _ => None,
+    };
+    Ok(RunOptions { filename, env, ceiling, no_fs: true, labels, result, input, sources, max_steps, max_memory_mb, trusted, trusted_ceiling })
 }
 
 fn install_host(req: &Map<String, Value>) {

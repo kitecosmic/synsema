@@ -325,6 +325,13 @@ pub(crate) fn register_parallel_builtins(
         "parallel_map",
         -1,
         Rc::new(move |i, args, _loc| {
+            // v0.6.46 (ronda 1, A1): los workers reconstruyen el módulo de la task colgado de los
+            // globales del programa, con las capabilities del llamador (acá, las de la tool).
+            if i.in_trusted_scope() {
+                return Err(err(
+                    "parallel_map: a trusted tool cannot fan out yet — its workers would run with the tool's capabilities next to the program's names; loop over the items in the tool",
+                ));
+            }
             let mem = mem.clone();
             let task = match args.first() {
                 Some(t @ (SynValue::Task(_) | SynValue::Builtin(_))) => t,

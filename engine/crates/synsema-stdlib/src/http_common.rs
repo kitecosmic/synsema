@@ -128,6 +128,411 @@ fn perr(msg: String) -> Control {
     Control::Error(RuntimeError::new(msg))
 }
 
+// =============================================================================================
+// v0.6.46 (E1, HB5): un secret atado a un host. Cada request arma un `Outgoing` con el destino
+// (sacado de la parte PÚBLICA de la URL) y cada secret que sale por ella pasa por `admit`: uno no
+// atado sólo va en un header (como antes); uno atado va en cualquier posición (URL, query, header,
+// body JSON, body form), pero sólo a sus hosts y sólo por https (por http, sólo a un loopback que la
+// atadura nombre: D2, la regla de Secure Contexts). Lo que salió se recuerda para enmascarar el eco
+// de la respuesta y para el audit.
+
+/// Lo que una request lleva de secrets.
+pub struct Outgoing {
+    who: String,
+    scheme: String,
+    /// El destino como lo pide `net`: `host` o `host:puerto` (el puerto, si la URL lo escribe).
+    dest: String,
+    host: String,
+    /// (nombre, texto) de cada secret materializado y de sus partes: el eco se enmascara con
+    /// cada uno.
+    sent: Vec<(String, String)>,
+    /// Los nombres que salieron, en orden (audit).
+    names: Vec<String>,
+    /// `true` si salió algún secret: en wasm la request pide `redirect: "error"` (ronda 1, M1: antes
+    /// sólo fuera de los headers, y un `X-Api-Key` atado seguía un redirect a otro host; el `fetch`
+    /// sólo quita `Authorization`). El nativo no sigue redirects.
+    forbid_redirects: bool,
+}
+
+impl Drop for Outgoing {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        for (_, v) in &mut self.sent {
+            v.zeroize();
+        }
+    }
+}
+
+fn is_loopback_host(h: &str) -> bool {
+    matches!(h, "localhost" | "127.0.0.1" | "::1")
+}
+
+impl Outgoing {
+    /// El contexto de una request a `public_url` (la parte pública: nunca el material).
+    pub fn for_url(public_url: &str, who: &str) -> Self {
+        let scheme = public_url.split_once("://").map(|(s, _)| s.to_ascii_lowercase()).unwrap_or_default();
+        let dest = synsema_capabilities::model::net_request_scope(public_url).unwrap_or_default();
+        let host = synsema_core::capscope::split_host_port(&dest).0.to_string();
+        Outgoing { who: who.to_string(), scheme, dest, host, sent: Vec::new(), names: Vec::new(), forbid_redirects: false }
+    }
+
+    /// ¿Salió algún secret?
+    pub fn carries_secrets(&self) -> bool {
+        !self.names.is_empty()
+    }
+
+    /// ¿La request tiene que pedir que no se sigan redirects? (Salió algún secret.)
+    pub fn forbids_redirects(&self) -> bool {
+        self.forbid_redirects
+    }
+
+    /// Un secret que sale en esta request por `what` ("header \"Authorization\"", "the URL", …).
+    /// Devuelve su texto; o el error que dice qué escribir.
+    pub fn admit(&mut self, s: &synsema_core::secret::SecretInner, what: &str, in_header: bool) -> Result<String, Control> {
+        match s.bound() {
+            None if in_header => {}
+            None => {
+                let place = if what.starts_with("the URL") {
+                    "URL"
+                } else if what.starts_with("query") {
+                    "query"
+                } else {
+                    "body"
+                };
+                return Err(perr(format!(
+                    "{}: {} is secret({}), and an unbound secret only goes in a header. If the API takes it in the {}, bind it to the host it goes to: `require secret(\"{}\") for net(\"{}\")`",
+                    self.who,
+                    what,
+                    s.name(),
+                    place,
+                    s.name(),
+                    if self.dest.is_empty() { "<the host>" } else { &self.dest }
+                )));
+            }
+            Some(b) => {
+                if self.dest.is_empty() || !b.iter().any(|p| synsema_core::capscope::bound_host_covers(p, &self.dest)) {
+                    return Err(perr(format!(
+                        "{}: secret({}) is bound to [{}]; this request goes to {} — it never goes to another host, not even in a header",
+                        self.who,
+                        s.name(),
+                        b.join(", "),
+                        if self.dest.is_empty() { "<no host>" } else { &self.dest }
+                    )));
+                }
+                let secure = matches!(self.scheme.as_str(), "https" | "wss");
+                let local_plain = matches!(self.scheme.as_str(), "http" | "ws") && is_loopback_host(&self.host);
+                if !secure && !local_plain {
+                    return Err(perr(format!(
+                        "{}: secret({}) only travels over https; this request to {} is {}://",
+                        self.who,
+                        s.name(),
+                        self.host,
+                        self.scheme
+                    )));
+                }
+            }
+        }
+        let text = crate::secrets::secret_text(s, &self.who, what)?;
+        self.forbid_redirects = true;
+        for n in s.names() {
+            if !self.names.contains(&n) {
+                self.names.push(n);
+            }
+        }
+        self.sent.push((s.name().to_string(), text.clone()));
+        self.sent.extend(s.atoms());
+        Ok(text)
+    }
+
+    /// El audit: una entrada por secret que salió, `secret(K) → host`. Nunca la URL.
+    pub fn audit(&self, caps: &Rc<RefCell<CapabilitySet>>) {
+        for n in &self.names {
+            caps.borrow_mut().push_audit(synsema_capabilities::model::CapabilityAuditEntry {
+                capability: Capability::new(CapabilityType::Secret, Some(n.clone())),
+                granted: true,
+                source: "bound-send".to_string(),
+                reason: format!("→ {}", self.dest),
+                origin: "program",
+            });
+        }
+    }
+
+    /// El eco enmascarado (E1.6): en el body, los headers y el error de la respuesta, cada secret
+    /// que salió — tal cual, en percent-encoding (hex en mayúscula y en minúscula, el de query y el
+    /// de formulario), escapado como JSON y en base64/base64url — pasa a `[secret K]`. Es una
+    /// defensa contra el eco accidental (`httpbin.org/anything`), no contra un servidor hostil: la
+    /// garantía es la atadura.
+    pub fn mask(&self, r: &mut HttpResult) {
+        if self.sent.is_empty() {
+            return;
+        }
+        let pats = self.patterns();
+        if pats.is_empty() {
+            return;
+        }
+        if let Some(b) = mask_bytes(r.body.as_bytes(), &pats) {
+            r.body = String::from_utf8_lossy(&b).into_owned();
+        }
+        if let Some(b) = mask_bytes(&r.body_bytes, &pats) {
+            r.body_bytes = b;
+        }
+        for (_, v) in r.headers.iter_mut() {
+            if let Some(b) = mask_bytes(v.as_bytes(), &pats) {
+                *v = String::from_utf8_lossy(&b).into_owned();
+            }
+        }
+        if let Some(e) = r.error.as_mut() {
+            if let Some(b) = mask_bytes(e.as_bytes(), &pats) {
+                *e = String::from_utf8_lossy(&b).into_owned();
+            }
+        }
+    }
+
+    /// El enmascarado de un texto suelto (un frame de `ws_recv`, el error de un RPC).
+    pub fn mask_text(&self, t: &str) -> String {
+        if self.sent.is_empty() {
+            return t.to_string();
+        }
+        match mask_bytes(t.as_bytes(), &self.patterns()) {
+            Some(b) => String::from_utf8_lossy(&b).into_owned(),
+            None => t.to_string(),
+        }
+    }
+
+    fn patterns(&self) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let mut out: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        for (name, v) in &self.sent {
+            if v.len() < MIN_MASKED {
+                note_short_secret(name);
+                continue;
+            }
+            let rep = format!("[secret {}]", name).into_bytes();
+            let q = pct(v);
+            let f = crate::secrets::form_urlencode(v);
+            let mut forms: Vec<String> = vec![v.clone(), lower_pct_hex(&q), lower_pct_hex(&f), q, f];
+            if let Ok(j) = serde_json::to_string(v) {
+                forms.push(j[1..j.len() - 1].to_string());
+            }
+            let b64 = synsema_core::bytesutil::b64_encode(v.as_bytes());
+            forms.push(b64.trim_end_matches('=').to_string());
+            forms.push(b64.replace('+', "-").replace('/', "_").trim_end_matches('=').to_string());
+            forms.push(b64);
+            for f in forms {
+                if f.len() >= MIN_MASKED && !out.iter().any(|(p, _)| p == f.as_bytes()) {
+                    out.push((f.into_bytes(), rep.clone()));
+                }
+            }
+        }
+        // El más largo primero: una forma que contiene a otra se reemplaza entera.
+        out.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+        out
+    }
+}
+
+/// Un secret más corto que esto no se enmascara (sería ruido: GitHub Actions tampoco enmascara
+/// valores triviales); la request avisa una vez por stderr.
+const MIN_MASKED: usize = 4;
+
+static SHORT_SECRET_NOTICED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[cold]
+#[inline(never)]
+fn note_short_secret(name: &str) {
+    if !SHORT_SECRET_NOTICED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        eprintln!(
+            "[synsema] warning: secret({}) is shorter than {} characters, so its echo in a response is not masked",
+            name, MIN_MASKED
+        );
+    }
+}
+
+/// `%2F` → `%2f`: el mismo percent-encoding con el hex en minúscula.
+fn lower_pct_hex(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            out.push('%');
+            out.push((b[i + 1] as char).to_ascii_lowercase());
+            out.push((b[i + 2] as char).to_ascii_lowercase());
+            i += 3;
+        } else {
+            out.push(b[i] as char);
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Reemplaza en una pasada cada aparición de un patrón (en cada posición, el más largo que
+/// empieza ahí). `None` si no había ninguno.
+fn mask_bytes(hay: &[u8], pats: &[(Vec<u8>, Vec<u8>)]) -> Option<Vec<u8>> {
+    let mut first = [false; 256];
+    for (p, _) in pats {
+        first[p[0] as usize] = true;
+    }
+    let mut out: Vec<u8> = Vec::new();
+    let mut changed = false;
+    let mut i = 0;
+    let mut last = 0;
+    while i < hay.len() {
+        if first[hay[i] as usize] {
+            if let Some((p, r)) = pats.iter().find(|(p, _)| hay[i..].starts_with(p)) {
+                out.extend_from_slice(&hay[last..i]);
+                out.extend_from_slice(r);
+                i += p.len();
+                last = i;
+                changed = true;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    if !changed {
+        return None;
+    }
+    out.extend_from_slice(&hay[last..]);
+    Some(out)
+}
+
+/// La URL de una request: un texto, o un secret ATADO cuyo esquema y autoridad están escritos
+/// antes del secret (`` `https://h/v2/{key}` ``): el host sale de esa parte pública, nunca del
+/// material. Devuelve (la URL pública para el gate y los mensajes, la URL real, el contexto).
+pub fn request_url(v: &SynValue, who: &str) -> Result<(String, String, Outgoing), Control> {
+    match v {
+        SynValue::Secret(s) => {
+            let prefix = s.public_prefix().unwrap_or("");
+            let closed = prefix
+                .split_once("://")
+                .map(|(_, rest)| !rest.is_empty() && rest.find(['/', '?', '#']).is_some())
+                .unwrap_or(false);
+            if s.bound().is_some() && !closed {
+                return Err(perr(format!(
+                    "{}: the URL is secret({}) and its host is not written out before the secret; write the scheme and host first (`https://host/…{{key}}`): the host of a request never comes from a secret",
+                    who,
+                    s.name()
+                )));
+            }
+            let public = if closed { format!("{}…", prefix) } else { String::new() };
+            let mut out = Outgoing::for_url(&public, who);
+            let real = out.admit(s, "the URL", false)?;
+            Ok((public, real, out))
+        }
+        other => {
+            let url = raw_str(other);
+            let out = Outgoing::for_url(&url, who);
+            Ok((url.clone(), url, out))
+        }
+    }
+}
+
+/// Un valor del programa con sus secrets materializados (cada uno pasa por `admit`), para un
+/// body JSON: el texto de la clave reemplaza al secret en el mapa o la lista, a cualquier nivel.
+fn materialize_body(v: &SynValue, out: &mut Outgoing) -> Result<SynValue, Control> {
+    match v {
+        SynValue::Secret(s) => Ok(syn_text(out.admit(s, "the body", false)?)),
+        SynValue::List(l) if synsema_core::secret::contains_secret(v).is_some() => {
+            let items = l.borrow().to_vec();
+            let mut xs = Vec::with_capacity(items.len());
+            for x in &items {
+                xs.push(materialize_body(x, out)?);
+            }
+            Ok(synsema_core::types::syn_list(xs))
+        }
+        SynValue::Map(m) if synsema_core::secret::contains_secret(v).is_some() => {
+            let mut nm = SynMap::new();
+            for (k, x) in m.borrow().iter() {
+                nm.insert(k.clone(), materialize_body(x, out)?);
+            }
+            Ok(syn_map(nm))
+        }
+        other => Ok(other.clone()),
+    }
+}
+
+/// Query params → pares, con los secrets atados materializados (`admit`); uno no atado es error
+/// con la línea a escribir. Texto, número o bool; `nothing`, bytes, listas y mapas son error (HB4).
+pub fn map_pairs_to(v: Option<&SynValue>, out: &mut Outgoing) -> Result<Option<Vec<(String, String)>>, Control> {
+    match v {
+        Some(SynValue::Map(m)) => {
+            let who = out.who.clone();
+            let mut pairs = Vec::new();
+            for (k, val) in m.borrow().iter() {
+                let what = format!("query parameter {:?}", k.to_string());
+                let text = match val {
+                    SynValue::Secret(s) => out.admit(s, &what, false)?,
+                    other => crate::secrets::edge_text(other, &who, &what)?,
+                };
+                pairs.push((k.to_string(), text));
+            }
+            Ok(Some(pairs))
+        }
+        _ => Ok(None),
+    }
+}
+
+/// Mapa de headers → pares: un secret no atado va como siempre; uno atado, sólo a sus hosts.
+pub fn header_pairs_to(v: Option<&SynValue>, out: &mut Outgoing) -> Result<Option<Vec<(String, String)>>, Control> {
+    match v {
+        Some(SynValue::Map(m)) => {
+            let who = out.who.clone();
+            let mut pairs = Vec::new();
+            for (k, val) in m.borrow().iter() {
+                let what = format!("header {:?}", k.to_string());
+                let text = match val {
+                    SynValue::Secret(s) => out.admit(s, &what, true)?,
+                    other => crate::secrets::edge_text(other, &who, &what)?,
+                };
+                pairs.push((k.to_string(), text));
+            }
+            Ok(Some(pairs))
+        }
+        _ => Ok(None),
+    }
+}
+
+/// El body de una request según su TIPO (v0.6.20): texto tal cual; bytes crudos; un map o una
+/// lista → JSON con `Content-Type: application/json` si el caller no puso uno. Un secret atado
+/// (suelto, o a cualquier nivel del JSON) se materializa para su host; uno no atado es error.
+pub fn body_arg_to(v: Option<&SynValue>, out: &mut Outgoing) -> Result<(Option<Vec<u8>>, Option<&'static str>), Control> {
+    Ok(match v {
+        None | Some(SynValue::Nothing) => (None, None),
+        Some(SynValue::Text(s)) => (Some(s.as_bytes().to_vec()), None),
+        Some(SynValue::Bytes(b)) => (Some(b.to_vec()), None),
+        Some(SynValue::Secret(s)) => (Some(out.admit(s, "the body", false)?.into_bytes()), None),
+        Some(v @ SynValue::Map(_)) | Some(v @ SynValue::List(_)) => {
+            let m = materialize_body(v, out)?;
+            (Some(dumps_syn(&m).into_bytes()), Some("application/json"))
+        }
+        Some(other) => (Some(raw_str(other).into_bytes()), None),
+    })
+}
+
+/// v0.6.46 (E1.5): un body `application/x-www-form-urlencoded` (el de OAuth `client_secret_post`)
+/// desde un mapa: texto, número, bool o un secret atado. `nothing`, bytes, listas y mapas son error,
+/// como en los headers. El mismo codificador que `oauth_basic` (WHATWG).
+pub fn form_body_to(v: &SynValue, out: &mut Outgoing) -> Result<Vec<u8>, Control> {
+    let SynValue::Map(m) = v else {
+        return Err(perr(format!("{}: form must be a map of fields, got {}", out.who, v.type_name())));
+    };
+    let who = out.who.clone();
+    let mut parts: Vec<String> = Vec::new();
+    for (k, val) in m.borrow().iter() {
+        let what = format!("form field {:?}", k.to_string());
+        let text = match val {
+            SynValue::Secret(s) => out.admit(s, &what, false)?,
+            other => crate::secrets::edge_text(other, &who, &what)?,
+        };
+        parts.push(format!(
+            "{}={}",
+            crate::secrets::form_urlencode(&k.to_string()),
+            crate::secrets::form_urlencode(&text)
+        ));
+    }
+    Ok(parts.join("&").into_bytes())
+}
+
 /// La forma de mapa de `fetch(url, {method, headers, body, timeout, tls_pin})`: mismos tipos y
 /// defaults que la posicional; una clave en `nothing` cuenta como ausente.
 struct FetchOpts {
@@ -153,7 +558,7 @@ fn notice_fetch_positional() {
     }
 }
 
-fn fetch_opts(args: &[SynValue]) -> Result<FetchOpts, Control> {
+fn fetch_opts(args: &[SynValue], out: &mut Outgoing) -> Result<FetchOpts, Control> {
     let Some(SynValue::Map(m)) = args.get(1) else {
         // Forma posicional (corta): fetch(url, method?, headers?, body?, timeout?).
         if args.len() > 1 {
@@ -161,8 +566,8 @@ fn fetch_opts(args: &[SynValue]) -> Result<FetchOpts, Control> {
         }
         return Ok(FetchOpts {
             method: args.get(1).map(raw_str).unwrap_or_else(|| "GET".to_string()),
-            headers: header_pairs(args.get(2), "fetch")?,
-            body: body_arg(args.get(3), "fetch")?,
+            headers: header_pairs_to(args.get(2), out)?,
+            body: body_arg_to(args.get(3), out)?,
             timeout: timeout_arg(args.get(4)),
             tls: None,
         });
@@ -174,8 +579,9 @@ fn fetch_opts(args: &[SynValue]) -> Result<FetchOpts, Control> {
         )));
     }
     let m = m.borrow().to_map();
-    const VALID: &str = "method, headers, body, timeout, tls_pin, attested";
-    let mut out = FetchOpts { method: "GET".to_string(), headers: None, body: (None, None), timeout: timeout_arg(None), tls: None };
+    const VALID: &str = "method, headers, body, form, timeout, tls_pin, attested";
+    let mut o = FetchOpts { method: "GET".to_string(), headers: None, body: (None, None), timeout: timeout_arg(None), tls: None };
+    let (mut body_seen, mut form_seen) = (false, false);
     for (k, v) in &m {
         if matches!(v, SynValue::Nothing) {
             // `tls_pin`/`attested` en `nothing` (p. ej. `id["public_key_hex"]` que no estaba) NO
@@ -186,15 +592,28 @@ fn fetch_opts(args: &[SynValue]) -> Result<FetchOpts, Control> {
             continue;
         }
         match k.as_str() {
-            "method" => out.method = raw_str(v),
-            "headers" => out.headers = header_pairs(Some(v), "fetch")?,
-            "body" => out.body = body_arg(Some(v), "fetch")?,
-            "timeout" => out.timeout = timeout_arg(Some(v)),
+            "method" => o.method = raw_str(v),
+            "headers" => o.headers = header_pairs_to(Some(v), out)?,
+            "body" => {
+                if form_seen {
+                    return Err(perr("fetch: pass body or form, not both (form is the body, encoded as a form)".to_string()));
+                }
+                body_seen = true;
+                o.body = body_arg_to(Some(v), out)?
+            }
+            "form" => {
+                if body_seen {
+                    return Err(perr("fetch: pass body or form, not both (form is the body, encoded as a form)".to_string()));
+                }
+                form_seen = true;
+                o.body = (Some(form_body_to(v, out)?), Some("application/x-www-form-urlencoded"))
+            }
+            "timeout" => o.timeout = timeout_arg(Some(v)),
             "tls_pin" | "attested" => {
-                if out.tls.is_some() {
+                if o.tls.is_some() {
                     return Err(perr("fetch: tls_pin and attested are two ways of fixing the server key; pass one".to_string()));
                 }
-                out.tls = Some(if k == "tls_pin" {
+                o.tls = Some(if k == "tls_pin" {
                     TlsCheck::Pin(parse_tls_pin(v, "fetch")?)
                 } else {
                     TlsCheck::Attested(crate::attested_client::parse_attested_spec(v, "fetch")?)
@@ -203,7 +622,7 @@ fn fetch_opts(args: &[SynValue]) -> Result<FetchOpts, Control> {
             other => return Err(perr(format!("fetch: unknown option {:?} (valid options: {})", other, VALID))),
         }
     }
-    Ok(out)
+    Ok(o)
 }
 
 pub fn urlencode(q: &[(String, String)]) -> String {
@@ -280,6 +699,18 @@ pub fn header_pairs(v: Option<&SynValue>, who: &str) -> Result<Option<Vec<(Strin
         Some(SynValue::Map(m)) => {
             let mut out = Vec::new();
             for (k, val) in m.borrow().iter() {
+                // v0.6.46 (E1): sin la request no se sabe adónde va: un secret atado no sale por acá
+                // (los builtins de red usan `header_pairs_to`, con el destino).
+                if let SynValue::Secret(s) = val {
+                    if let Some(b) = s.bound() {
+                        return Err(perr(format!(
+                            "{}: secret({}) is bound to [{}], and this call cannot check where the header goes",
+                            who,
+                            s.name(),
+                            b.join(", ")
+                        )));
+                    }
+                }
                 out.push((k.to_string(), crate::secrets::edge_text(val, who, &format!("header {:?}", k.to_string()))?));
             }
             Ok(Some(out))
@@ -309,7 +740,7 @@ pub fn timeout_arg(v: Option<&SynValue>) -> u64 {
 pub fn body_arg(v: Option<&SynValue>, who: &str) -> Result<(Option<Vec<u8>>, Option<&'static str>), Control> {
     // HB4 (v0.6.44): un secret en el body (directo o dentro de un map/lista) es ERROR. Antes salía
     // su forma redactada `secret(NAME)` como si fuera el valor: el servidor recibía esa cadena.
-    if let Some(name) = v.and_then(secret_inside) {
+    if let Some(name) = v.and_then(synsema_core::secret::contains_secret) {
         return Err(perr(format!(
             "{}: the body contains secret({}); in a body it would travel as the text \"secret({})\", not its value. Send the credential in a header: basic(user, secret) for HTTP Basic (OAuth client credentials accept it), bearer(secret), or the raw secret as a header value; an API that only takes it in the body has no way to receive a secret yet",
             who, name, name
@@ -324,16 +755,6 @@ pub fn body_arg(v: Option<&SynValue>, who: &str) -> Result<(Option<Vec<u8>>, Opt
         }
         Some(other) => (Some(raw_str(other).into_bytes()), None),
     })
-}
-
-/// El nombre del primer `secret` dentro de un valor (recorre listas y mapas).
-fn secret_inside(v: &SynValue) -> Option<String> {
-    match v {
-        SynValue::Secret(s) => Some(s.name().to_string()),
-        SynValue::List(l) => l.borrow().to_vec().iter().find_map(secret_inside),
-        SynValue::Map(m) => m.borrow().iter().find_map(|(_, x)| secret_inside(x)),
-        _ => None,
-    }
 }
 
 /// v0.6.20 — agrega el `Content-Type` por defecto si el caller no mandó uno (case-insensitive).
@@ -408,6 +829,152 @@ pub fn response_to_syn(r: HttpResult) -> SynValue {
     syn_map(m)
 }
 
+thread_local! {
+    /// v0.6.46 (E1, regla 5): la request en curso lleva un secret. El transporte del perfil wasm lo
+    /// pasa al host como `redirect: "error"` (el `fetch` del navegador sigue los redirects por
+    /// defecto y sólo quita `Authorization` al cambiar de host); el nativo no sigue redirects.
+    static SECRET_IN_REQUEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// ¿La request que está saliendo lleva un secret? (Lo lee el transporte del perfil wasm.)
+pub fn request_forbids_redirects() -> bool {
+    SECRET_IN_REQUEST.with(|c| c.get()) || rpc_forbids_redirects()
+}
+
+thread_local! {
+    /// v0.6.46 (E1): el contexto de la llamada de RPC en curso (evm/solana/algod/btc). Esos
+    /// builtins no pasan por los builtins cliente: `rpc_url` lo arma desde la URL, los headers lo
+    /// usan, y el transporte (`http_request`) lo cierra con el audit y el eco enmascarado. Vive lo
+    /// que dura el builtin ([`RpcCall`]).
+    static RPC_OUT: RefCell<Option<(Outgoing, bool)>> = const { RefCell::new(None) };
+    /// El set de capabilities del builtin de RPC en curso (para su audit), sin retenerlo.
+    static RPC_CAPS: RefCell<std::rc::Weak<RefCell<CapabilitySet>>> = RefCell::new(std::rc::Weak::new());
+}
+
+/// v0.6.46 (ronda 1, B1): una llamada a un builtin de RPC. Abre el contexto con SU set de
+/// capabilities y lo cierra al terminar, también por error. Antes quedaba cargado hasta el próximo
+/// RPC: en wasm toda request posterior pedía `redirect: "error"`, y las copias en claro del secret
+/// vivían en el hilo.
+pub struct RpcCall(());
+
+impl RpcCall {
+    pub fn open(caps: &Rc<RefCell<CapabilitySet>>) -> Self {
+        RPC_OUT.with(|o| *o.borrow_mut() = None);
+        RPC_CAPS.with(|c| *c.borrow_mut() = Rc::downgrade(caps));
+        RpcCall(())
+    }
+}
+
+impl Drop for RpcCall {
+    fn drop(&mut self) {
+        RPC_OUT.with(|o| *o.borrow_mut() = None);
+        RPC_CAPS.with(|c| *c.borrow_mut() = std::rc::Weak::new());
+    }
+}
+
+/// v0.6.46 (E1): la URL de un builtin de RPC: texto, o un secret atado con el host escrito antes
+/// (`` `https://eth-mainnet.g.alchemy.com/v2/{key}` ``). Devuelve la URL real; el host es el de la
+/// parte pública, así que el gate de `net` sobre la real mira el mismo host.
+pub fn rpc_url(v: &SynValue, fname: &str) -> Result<String, Control> {
+    RPC_OUT.with(|o| *o.borrow_mut() = None);
+    match v {
+        SynValue::Text(s) => Ok(s.to_string()),
+        SynValue::Secret(_) => {
+            let (_public, real, out) = request_url(v, fname)?;
+            RPC_OUT.with(|o| *o.borrow_mut() = Some((out, false)));
+            Ok(real)
+        }
+        other => Err(perr(format!(
+            "{}: the URL must be text (or a secret bound to its host: `require secret(\"K\") for net(\"host\")`), got {}",
+            fname,
+            other.type_name()
+        ))),
+    }
+}
+
+/// Un secret que va en un header de RPC (el token de algod, el `pass` de `btc_rpc`): no atado,
+/// como siempre; atado, sólo al host de `url`.
+pub fn rpc_admit_header(s: &synsema_core::secret::SecretInner, url: &str, fname: &str, what: &str) -> Result<String, Control> {
+    RPC_OUT.with(|o| {
+        let mut b = o.borrow_mut();
+        let entry = b.get_or_insert_with(|| (Outgoing::for_url(url, fname), false));
+        entry.0.admit(s, what, true)
+    })
+}
+
+/// Los headers de una llamada de RPC (algod), con cada secret por `rpc_admit_header`.
+pub fn rpc_header_pairs(v: Option<&SynValue>, url: &str, fname: &str) -> Result<Option<Vec<(String, String)>>, Control> {
+    RPC_OUT.with(|o| {
+        let mut b = o.borrow_mut();
+        let entry = b.get_or_insert_with(|| (Outgoing::for_url(url, fname), false));
+        header_pairs_to(v, &mut entry.0)
+    })
+}
+
+/// El cierre de una request de RPC: la primera vez, el audit (`secret(K) → host`); siempre, el eco
+/// enmascarado (un `evm_wait` hace varias). Sin secrets no hace nada.
+pub fn rpc_finish(r: &mut HttpResult) {
+    RPC_OUT.with(|o| {
+        if let Some((out, audited)) = o.borrow_mut().as_mut() {
+            if !out.carries_secrets() {
+                return;
+            }
+            if !*audited {
+                if let Some(c) = RPC_CAPS.with(|c| c.borrow().upgrade()) {
+                    out.audit(&c);
+                }
+                *audited = true;
+            }
+            out.mask(r);
+        }
+    })
+}
+
+/// ¿La llamada de RPC en curso lleva un secret? (Para el transporte wasm.)
+fn rpc_forbids_redirects() -> bool {
+    RPC_OUT.with(|o| o.borrow().as_ref().is_some_and(|(out, _)| out.forbids_redirects()))
+}
+
+/// El enmascarado de un texto con lo que salió en la llamada de RPC en curso (el `message` de un
+/// error del nodo).
+pub fn rpc_mask_text(t: &str) -> String {
+    RPC_OUT.with(|o| match o.borrow().as_ref() {
+        Some((out, _)) => out.mask_text(t),
+        None => t.to_string(),
+    })
+}
+
+/// v0.6.46 (E1): manda la request ya armada: el audit de los secrets que salen, la marca para el
+/// transporte y el eco enmascarado.
+pub fn send(caps: &Rc<RefCell<CapabilitySet>>, out: &Outgoing, f: impl FnOnce() -> HttpResult) -> HttpResult {
+    if !out.carries_secrets() {
+        return f();
+    }
+    out.audit(caps);
+    SECRET_IN_REQUEST.with(|c| c.set(out.forbids_redirects()));
+    let mut r = f();
+    SECRET_IN_REQUEST.with(|c| c.set(false));
+    out.mask(&mut r);
+    r
+}
+
+/// El body, o un body de formulario (`form = {...}`, E1.5): los dos juntos son error.
+fn body_or_form(
+    body: Option<&SynValue>,
+    form: Option<&SynValue>,
+    out: &mut Outgoing,
+) -> Result<(Option<Vec<u8>>, Option<&'static str>), Control> {
+    match form {
+        None | Some(SynValue::Nothing) => body_arg_to(body, out),
+        Some(f) => {
+            if !matches!(body, None | Some(SynValue::Nothing)) {
+                return Err(perr(format!("{}: pass body or form, not both (form is the body, encoded as a form)", out.who)));
+            }
+            Ok((Some(form_body_to(f, out)?), Some("application/x-www-form-urlencoded")))
+        }
+    }
+}
+
 /// Registra los seis builtins cliente sobre `transport`. Cada uno gatea `net(host)`
 /// ANTES de tocar el transporte — misma firma y mismo retorno en los dos perfiles.
 ///
@@ -422,28 +989,27 @@ pub fn register_http_client_builtins(
     caps: Rc<RefCell<CapabilitySet>>,
     transport: Transport,
 ) {
-    // http(method, url, headers?, query?, body?, timeout?)
+    // v0.6.46 (E1): cada builtin arma su `Outgoing` desde la URL (texto, o un secret atado con el
+    // host escrito antes), y cada secret de la URL, la query, los headers y el body pasa por él.
+    // El gate de `net` mira la parte pública. Después: el audit (`secret(K) → host`), la request
+    // y el eco enmascarado.
+
+    // http(method, url, headers?, query?, body?, timeout?, form?)
     {
         let caps = caps.clone();
         interp.register_builtin_named(
             "http",
-            vec!["method", "url", "headers", "query", "body", "timeout"],
+            vec!["method", "url", "headers", "query", "body", "timeout", "form"],
             Rc::new(move |_i, args, _loc| {
                 let method = raw_str(args.first().unwrap_or(&SynValue::Nothing));
-                let url = raw_str(args.get(1).unwrap_or(&SynValue::Nothing));
+                let (url, real, mut out) = request_url(args.get(1).unwrap_or(&SynValue::Nothing), "http")?;
                 require_net(&caps, &url, "http()")?;
-                let query = map_pairs(args.get(3), "http")?;
-                let (body, default_ct) = body_arg(args.get(4), "http")?;
-                let headers = with_default_content_type(header_pairs(args.get(2), "http")?, default_ct);
-                let r = transport(
-                    &method,
-                    &url,
-                    headers.as_deref(),
-                    query.as_deref(),
-                    body.as_deref(),
-                    timeout_arg(args.get(5)),
-                    None,
-                );
+                let query = map_pairs_to(args.get(3), &mut out)?;
+                let (body, default_ct) = body_or_form(args.get(4), args.get(6), &mut out)?;
+                let headers = with_default_content_type(header_pairs_to(args.get(2), &mut out)?, default_ct);
+                let r = send(&caps, &out, || {
+                    transport(&method, &real, headers.as_deref(), query.as_deref(), body.as_deref(), timeout_arg(args.get(5)), None)
+                });
                 Ok(response_to_syn(r))
             }),
         );
@@ -456,69 +1022,51 @@ pub fn register_http_client_builtins(
             "http_get",
             vec!["url", "headers", "query", "timeout"],
             Rc::new(move |_i, args, _loc| {
-                let url = raw_str(args.first().unwrap_or(&SynValue::Nothing));
+                let (url, real, mut out) = request_url(args.first().unwrap_or(&SynValue::Nothing), "http_get")?;
                 require_net(&caps, &url, "http_get()")?;
-                let headers = header_pairs(args.get(1), "http_get")?;
-                let query = map_pairs(args.get(2), "http_get")?;
-                let r = transport(
-                    "GET",
-                    &url,
-                    headers.as_deref(),
-                    query.as_deref(),
-                    None,
-                    timeout_arg(args.get(3)),
-                    None,
-                );
+                let headers = header_pairs_to(args.get(1), &mut out)?;
+                let query = map_pairs_to(args.get(2), &mut out)?;
+                let r = send(&caps, &out, || {
+                    transport("GET", &real, headers.as_deref(), query.as_deref(), None, timeout_arg(args.get(3)), None)
+                });
                 Ok(response_to_syn(r))
             }),
         );
     }
 
-    // http_post(url, body, headers?, timeout?)
+    // http_post(url, body, headers?, timeout?, form?) — `form = {...}`: body de formulario (E1.5).
     {
         let caps = caps.clone();
         interp.register_builtin_named(
             "http_post",
-            vec!["url", "body", "headers", "timeout"],
+            vec!["url", "body", "headers", "timeout", "form"],
             Rc::new(move |_i, args, _loc| {
-                let url = raw_str(args.first().unwrap_or(&SynValue::Nothing));
+                let (url, real, mut out) = request_url(args.first().unwrap_or(&SynValue::Nothing), "http_post")?;
                 require_net(&caps, &url, "http_post()")?;
-                let (body, default_ct) = body_arg(args.get(1), "http_post")?;
-                let headers = with_default_content_type(header_pairs(args.get(2), "http_post")?, default_ct);
-                let r = transport(
-                    "POST",
-                    &url,
-                    headers.as_deref(),
-                    None,
-                    body.as_deref(),
-                    timeout_arg(args.get(3)),
-                    None,
-                );
+                let (body, default_ct) = body_or_form(args.get(1), args.get(4), &mut out)?;
+                let headers = with_default_content_type(header_pairs_to(args.get(2), &mut out)?, default_ct);
+                let r = send(&caps, &out, || {
+                    transport("POST", &real, headers.as_deref(), None, body.as_deref(), timeout_arg(args.get(3)), None)
+                });
                 Ok(response_to_syn(r))
             }),
         );
     }
 
-    // http_put(url, body, headers?, timeout?)
+    // http_put(url, body, headers?, timeout?, form?)
     {
         let caps = caps.clone();
         interp.register_builtin_named(
             "http_put",
-            vec!["url", "body", "headers", "timeout"],
+            vec!["url", "body", "headers", "timeout", "form"],
             Rc::new(move |_i, args, _loc| {
-                let url = raw_str(args.first().unwrap_or(&SynValue::Nothing));
+                let (url, real, mut out) = request_url(args.first().unwrap_or(&SynValue::Nothing), "http_put")?;
                 require_net(&caps, &url, "http_put()")?;
-                let (body, default_ct) = body_arg(args.get(1), "http_put")?;
-                let headers = with_default_content_type(header_pairs(args.get(2), "http_put")?, default_ct);
-                let r = transport(
-                    "PUT",
-                    &url,
-                    headers.as_deref(),
-                    None,
-                    body.as_deref(),
-                    timeout_arg(args.get(3)),
-                    None,
-                );
+                let (body, default_ct) = body_or_form(args.get(1), args.get(4), &mut out)?;
+                let headers = with_default_content_type(header_pairs_to(args.get(2), &mut out)?, default_ct);
+                let r = send(&caps, &out, || {
+                    transport("PUT", &real, headers.as_deref(), None, body.as_deref(), timeout_arg(args.get(3)), None)
+                });
                 Ok(response_to_syn(r))
             }),
         );
@@ -531,24 +1079,18 @@ pub fn register_http_client_builtins(
             "http_delete",
             vec!["url", "headers", "timeout"],
             Rc::new(move |_i, args, _loc| {
-                let url = raw_str(args.first().unwrap_or(&SynValue::Nothing));
+                let (url, real, mut out) = request_url(args.first().unwrap_or(&SynValue::Nothing), "http_delete")?;
                 require_net(&caps, &url, "http_delete()")?;
-                let headers = header_pairs(args.get(1), "http_delete")?;
-                let r = transport(
-                    "DELETE",
-                    &url,
-                    headers.as_deref(),
-                    None,
-                    None,
-                    timeout_arg(args.get(2)),
-                    None,
-                );
+                let headers = header_pairs_to(args.get(1), &mut out)?;
+                let r = send(&caps, &out, || {
+                    transport("DELETE", &real, headers.as_deref(), None, None, timeout_arg(args.get(2)), None)
+                });
                 Ok(response_to_syn(r))
             }),
         );
     }
 
-    // fetch(url, {method, headers, body, timeout, tls_pin}) — o la forma corta posicional
+    // fetch(url, {method, headers, body, form, timeout, tls_pin}) — o la forma corta posicional
     // fetch(url, method?, headers?, body?, timeout?). Cliente HTTP real, gateado por net.
     // Default GET; mismo retorno que http_* (response_to_syn). `tls_pin` reemplaza la validación
     // contra las raíces del SO y el nombre por la igualdad exacta de la SPKI del servidor; sin él,
@@ -559,12 +1101,14 @@ pub fn register_http_client_builtins(
             "fetch",
             -1,
             Rc::new(move |_i, args, _loc| {
-                let url = raw_str(args.first().unwrap_or(&SynValue::Nothing));
+                let (url, real, mut out) = request_url(args.first().unwrap_or(&SynValue::Nothing), "fetch")?;
                 require_net(&caps, &url, "fetch()")?;
-                let o = fetch_opts(args)?;
+                let o = fetch_opts(args, &mut out)?;
                 let (body, default_ct) = o.body;
                 let headers = with_default_content_type(o.headers, default_ct);
-                let r = transport(&o.method, &url, headers.as_deref(), None, body.as_deref(), o.timeout, o.tls.as_ref());
+                let r = send(&caps, &out, || {
+                    transport(&o.method, &real, headers.as_deref(), None, body.as_deref(), o.timeout, o.tls.as_ref())
+                });
                 Ok(response_to_syn(r))
             }),
         );
@@ -576,23 +1120,17 @@ pub fn register_http_client_builtins(
         let caps = caps.clone();
         interp.register_builtin_named(
             "http_bytes",
-            vec!["method", "url", "headers", "query", "body", "timeout"],
+            vec!["method", "url", "headers", "query", "body", "timeout", "form"],
             Rc::new(move |_i, args, _loc| {
                 let method = raw_str(args.first().unwrap_or(&SynValue::Nothing));
-                let url = raw_str(args.get(1).unwrap_or(&SynValue::Nothing));
+                let (url, real, mut out) = request_url(args.get(1).unwrap_or(&SynValue::Nothing), "http_bytes")?;
                 require_net(&caps, &url, "http_bytes()")?;
-                let query = map_pairs(args.get(3), "http_bytes")?;
-                let (body, default_ct) = body_arg(args.get(4), "http_bytes")?;
-                let headers = with_default_content_type(header_pairs(args.get(2), "http_bytes")?, default_ct);
-                let r = transport(
-                    &method,
-                    &url,
-                    headers.as_deref(),
-                    query.as_deref(),
-                    body.as_deref(),
-                    timeout_arg(args.get(5)),
-                    None,
-                );
+                let query = map_pairs_to(args.get(3), &mut out)?;
+                let (body, default_ct) = body_or_form(args.get(4), args.get(6), &mut out)?;
+                let headers = with_default_content_type(header_pairs_to(args.get(2), &mut out)?, default_ct);
+                let r = send(&caps, &out, || {
+                    transport(&method, &real, headers.as_deref(), query.as_deref(), body.as_deref(), timeout_arg(args.get(5)), None)
+                });
                 Ok(response_to_syn_bytes(r))
             }),
         );
@@ -836,5 +1374,30 @@ mod v0620_tests {
         assert_eq!(parsed.len(), 2, "{:?}", String::from_utf8_lossy(&body));
         let e = multipart_encode(&[syn_list(vec![map(&[("name", syn_text("x"))])])]);
         assert!(matches!(e, Err(_)), "una parte sin value ni bytes es error");
+    }
+}
+
+#[cfg(test)]
+mod v0646_r1_tests {
+    use super::*;
+
+    /// v0.6.46 (ronda 1, M1): un secret en un header también pide que no se sigan redirects (el
+    /// `fetch` sólo quita `Authorization` al cambiar de host). B1: el contexto de un RPC se cierra
+    /// al terminar la llamada; después, una request sin secrets sigue redirects.
+    #[test]
+    fn a_secret_in_a_header_forbids_redirects_and_the_rpc_context_closes() {
+        let s = synsema_core::secret::SecretInner::new("K", "valor");
+        let mut out = Outgoing::for_url("https://api.example.com/x", "http_get");
+        assert!(!out.forbids_redirects());
+        assert!(out.admit(&s, "header \"X-Api-Key\"", true).is_ok());
+        assert!(out.forbids_redirects());
+        let caps = Rc::new(RefCell::new(CapabilitySet::new("t")));
+        {
+            let _call = RpcCall::open(&caps);
+            RPC_OUT.with(|o| *o.borrow_mut() = Some((out, false)));
+            assert!(request_forbids_redirects());
+        }
+        assert!(!request_forbids_redirects());
+        assert!(RPC_CAPS.with(|c| c.borrow().upgrade().is_none()));
     }
 }

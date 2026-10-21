@@ -69,6 +69,12 @@ pub enum CapabilityType {
     /// El determinista (`--deterministic` la niega solo). Nombre genérico a propósito:
     /// Es una capability del motor, como `time` o `random`, no un adaptador.
     Attest,
+    /// v0.6.46 (E3): publicar un dato privado (`declassify(v, motivo, to?)`) con las etiquetas
+    /// encendidas. Scope = principal que la llamada quita (o glob: `clientes*`). Es el `unsafe` de
+    /// Rust: sin techo del host la concede el runtime (sin rastro en el audit: es el modo de
+    /// siempre); con techo, sólo lo que el techo nombra (`--cap-set declassify=clientes`); dentro
+    /// de `sandbox`, nada salvo que `sandbox under` la delegue. Sin etiquetas no se chequea.
+    Declassify,
 }
 
 impl CapabilityType {
@@ -99,6 +105,7 @@ impl CapabilityType {
             Memory => "memory",
             SandboxRun => "sandbox_run",
             Attest => "attest",
+            Declassify => "declassify",
         }
     }
 
@@ -113,8 +120,9 @@ impl CapabilityType {
     }
 }
 
-/// Nombres aceptados por `--cap-set` (para el mensaje de error y los docs).
-pub const KNOWN_CAPABILITY_NAMES: &str = "net, file, file.read, file.write, exec, env, time, random, stdout, stdin, llm, judge, db, serve, secret, reveal, sign, wallet, spend, memory, sandbox_run, attest";
+/// Nombres aceptados por `--cap-set` (para el mensaje de error y los docs). v0.6.46 (D4): es la
+/// lista de core, la misma con la que el parser rechaza un `require` desconocido.
+pub const KNOWN_CAPABILITY_NAMES: &str = synsema_core::capscope::KNOWN_CAPABILITY_NAMES;
 
 /// Capabilities LOCALES AL PROCESO: el stdout, el stdin, el reloj y la entropía del proceso
 /// que corre. Un techo DELEGADO (un captoken, un `sandbox under`) NO las gobierna: quien
@@ -194,6 +202,37 @@ impl Delegation {
     }
 }
 
+/// v0.6.46 (E5) — `covers` de `llm`/`judge`. El scope nombra a QUIÉN pertenece lo privado que se
+/// le puede mandar al modelo, y opcionalmente a qué provider: `P` o `P@host` (`@local` = un modelo
+/// en el proceso, `@embedder` = el hook de wasm). El pedido de una llamada con datos públicos no
+/// lleva scope; el de una con datos de P lleva `P@<host del provider>`.
+/// - Sin scope (`require llm`, `--cap-set llm`): sólo datos públicos. No cubre ningún principal.
+/// - Con scope: cubre los datos públicos (antes `require llm("P")` rompía las operaciones) y los
+///   de los principales que nombra (exacto o glob). Si el pedido nombra el provider y éste
+///   también, tienen que coincidir (exacto o glob, sin mayúsculas); si alguno no lo nombra,
+///   vale cualquiera. Así un techo `llm=P@api.x` acepta el `require llm("P")` del programa, y en
+///   la llamada sólo cubre `P@api.x`.
+fn llm_scope_covers(grant: Option<&str>, req: Option<&str>) -> bool {
+    match (grant, req) {
+        (_, None) => true,
+        (None, Some(_)) => false,
+        (Some(g), Some(r)) => {
+            let split = |s: &str| match s.rsplit_once('@') {
+                Some((p, h)) => (p.to_string(), Some(h.to_ascii_lowercase())),
+                None => (s.to_string(), None),
+            };
+            let (gp, gh) = split(g);
+            let (rp, rh) = split(r);
+            let principal_ok = gp == rp || fnmatch(&rp, &gp);
+            principal_ok
+                && match (gh, rh) {
+                    (Some(g), Some(r)) => g == r || fnmatch(&r, &g),
+                    _ => true,
+                }
+        }
+    }
+}
+
 /// Mapa nombre→tipo (CAPABILITY_NAMES del oráculo).
 pub fn capability_type_from_name(name: &str) -> Option<CapabilityType> {
     use CapabilityType::*;
@@ -222,6 +261,7 @@ pub fn capability_type_from_name(name: &str) -> Option<CapabilityType> {
         "memory" => Memory,
         "sandbox_run" => SandboxRun,
         "attest" => Attest,
+        "declassify" => Declassify,
         _ => return None,
     })
 }
@@ -247,6 +287,18 @@ impl Capability {
             // Un nombre de host no distingue mayúsculas (como en el URL): `net("API.x.com")`
             // cubre `api.x.com` y al revés.
             (CapabilityType::Net, Some(s)) => Some(s.to_lowercase()),
+            // v0.6.46 (E1): un secret atado, `K@h1|h2` (el `require secret("K") for net(…)` y el
+            // techo `secret=K@h`): el nombre a la izquierda del ÚLTIMO `@`, y cada host como un
+            // scope de `net`.
+            (CapabilityType::Secret, Some(s)) if s.contains('@') => {
+                let (name, hosts) = s.rsplit_once('@').unwrap_or((&s, ""));
+                let hosts: Vec<String> = hosts
+                    .split('|')
+                    .filter(|h| !h.is_empty())
+                    .map(synsema_core::capscope::net_host_scope)
+                    .collect();
+                Some(format!("{}@{}", name, hosts.join("|")))
+            }
             (_, s) => s,
         };
         Self { ty, scope }
@@ -343,6 +395,9 @@ impl Capability {
                 normalize_path(s)
             }
         };
+        if matches!(self.ty, CapabilityType::Llm | CapabilityType::Judge) {
+            return llm_scope_covers(self.scope.as_deref(), other.scope.as_deref());
+        }
         match &self.scope {
             // Sin scope = grant wildcard (poder máximo: cubre cualquier ruta/URL). Intacto.
             None => true,
@@ -366,6 +421,21 @@ impl Capability {
                         // `db("*")` sigue cubriendo una URL pedida (el glob de siempre).
                         grant == req
                             || if url { fnmatch(&req, &grant) } else { synsema_core::capscope::path_glob(&req, &grant) }
+                    } else if self.ty == CapabilityType::Secret {
+                        // v0.6.46 (E1): el nombre como siempre (exacto o glob); si este lado ata
+                        // el secret a hosts, el otro tiene que estar atado a hosts que éstos
+                        // cubran. Sin atadura de este lado, cubre con o sin atadura del otro.
+                        let (gn, gh) = split_secret_scope(self_scope);
+                        let (rn, rh) = split_secret_scope(other_scope);
+                        let name_ok = gn == rn || fnmatch(rn, gn);
+                        name_ok
+                            && match (gh, rh) {
+                                (None, _) => true,
+                                (Some(_), None) => false,
+                                (Some(g), Some(r)) => r.split('|').all(|h| {
+                                    g.split('|').any(|p| synsema_core::capscope::bound_host_covers(p, h))
+                                }),
+                            }
                     } else if self.ty == CapabilityType::Net {
                         // Host y puerto por separado: un grant sin puerto cubre cualquier puerto
                         // del host; con puerto, sólo ese.
@@ -409,6 +479,15 @@ fn url_host_port(url: &str) -> (String, Option<String>) {
     };
     let port = port.filter(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit())).map(str::to_string);
     (host.to_lowercase(), port)
+}
+
+/// v0.6.46 (E1): un scope de `secret` → `(nombre, hosts de la atadura)`: `K@h1|h2` →
+/// `("K", Some("h1|h2"))`, `K` → `("K", None)`. Se parte en el ÚLTIMO `@`.
+pub fn split_secret_scope(scope: &str) -> (&str, Option<&str>) {
+    match scope.rsplit_once('@') {
+        Some((n, h)) => (n, Some(h)),
+        None => (scope, None),
+    }
 }
 
 /// `host` o `host:puerto` (IPv6 con puerto: `[::1]:8545`).
@@ -655,6 +734,17 @@ pub mod audit_sink {
     }
 }
 
+/// v0.6.46 (E3b): lo que el scope de un módulo de confianza deja de lado y devuelve al salir.
+pub struct TrustedSaved {
+    name: String,
+    granted: HashSet<Capability>,
+    denied: HashSet<Capability>,
+    parent: Option<Rc<RefCell<CapabilitySet>>>,
+    ceiling: Option<Rc<Vec<Capability>>>,
+    delegated: Vec<Rc<Delegation>>,
+    rejected_by_ceiling: Vec<Capability>,
+}
+
 /// Conjunto de capabilities otorgadas, con audit trail. Cada contexto de ejecución
 /// (global, sandbox, agente) tiene el suyo.
 pub struct CapabilitySet {
@@ -743,6 +833,77 @@ impl CapabilitySet {
     /// nunca lo pidió.
     pub fn grant_ambient(&mut self, capability: Capability) {
         self.grant_from(capability, "runtime");
+    }
+
+    /// v0.6.46 (E3): `declassify` de ambiente (D3: el `unsafe` de Rust). Sin techo, sin scope;
+    /// con techo, cada ítem `declassify=…` que el techo nombra (y nada si no nombra ninguno). Va
+    /// directo a `granted`, sin entrada de audit: la tenía todo programa, declasificara o no, y
+    /// el audit de cada corrida habría cambiado. Así `sandbox` la vacía como a todo grant, y
+    /// serve la recupera en cada request desde el snapshot del preámbulo.
+    pub fn grant_ambient_declassify(&mut self) {
+        match &self.ceiling {
+            None => {
+                self.granted.insert(Capability::new(CapabilityType::Declassify, None));
+            }
+            Some(c) => {
+                let items: Vec<Capability> = c.iter().filter(|c| c.ty == CapabilityType::Declassify).cloned().collect();
+                self.granted.extend(items);
+            }
+        }
+    }
+
+    /// v0.6.46 (E3b): entra al scope de un módulo de confianza. Deja de lado TODO lo del llamador
+    /// (grants, denials, padre, techo, techos delegados) y concede lo de ambiente (`stdout`, `time`,
+    /// `declassify` según el techo de confianza) más lo que la task declaró, filtrado por ese techo
+    /// (sin techo de confianza, lo declarado entero). El audit de adentro sale con el nombre
+    /// `trusted:<módulo>`. `leave_trusted_scope` lo devuelve todo.
+    pub fn enter_trusted_scope(
+        &mut self,
+        module: &str,
+        ceiling: Option<Rc<Vec<Capability>>>,
+        declared: &[Capability],
+    ) -> TrustedSaved {
+        let saved = TrustedSaved {
+            name: std::mem::replace(&mut self.name, format!("trusted:{}", module)),
+            granted: std::mem::take(&mut self.granted),
+            denied: std::mem::take(&mut self.denied),
+            parent: self.parent.take(),
+            ceiling: std::mem::replace(&mut self.ceiling, ceiling),
+            delegated: std::mem::take(&mut self.delegated),
+            rejected_by_ceiling: std::mem::take(&mut self.rejected_by_ceiling),
+        };
+        for ty in [CapabilityType::Stdout, CapabilityType::Time] {
+            let c = Capability::new(ty, None);
+            if self.within_ceiling(&c) {
+                self.granted.insert(c);
+            }
+        }
+        self.grant_ambient_declassify();
+        for c in declared {
+            self.grant(c.clone());
+        }
+        saved
+    }
+
+    /// v0.6.46 (E3b): sale del scope de confianza (ver `enter_trusted_scope`).
+    pub fn leave_trusted_scope(&mut self, s: TrustedSaved) {
+        self.name = s.name;
+        self.granted = s.granted;
+        self.denied = s.denied;
+        self.parent = s.parent;
+        self.ceiling = s.ceiling;
+        self.delegated = s.delegated;
+        self.rejected_by_ceiling = s.rejected_by_ceiling;
+    }
+
+    /// v0.6.46 (E5): ¿el techo del host tiene un ítem que nombra el provider (`P@host`, `P@*` para
+    /// cualquiera) y cubre esta capability? Para lo que sólo el host puede permitir (mandarle a un
+    /// modelo datos privados): sin techo, no; con `llm=P` o `llm=*` sin `@`, tampoco (ronda 1, M2:
+    /// valía "a cualquier provider", y `llm=*` era "todo lo privado a cualquier modelo").
+    pub fn ceiling_names(&self, cap: &Capability) -> bool {
+        self.ceiling.as_ref().is_some_and(|c| {
+            c.iter().any(|a| a.scope.as_deref().is_some_and(|s| s.contains('@')) && a.covers(cap))
+        })
     }
 
     /// Pushea una entrada al `audit_log` del set y la entrega al sink del proceso (si
@@ -963,6 +1124,49 @@ impl CapabilitySet {
             || self.parent.as_ref().map(|p| p.borrow().denies(requested)).unwrap_or(false)
     }
 
+    /// v0.6.46 (E1): los hosts a los que el programa ató el secret `name` (`require secret("K") for
+    /// net(…)`, en este set o en un padre): `Some("h1|h2")`, o `None` si ningún grant lo ata. Con
+    /// varios grants que lo atan, todos sus hosts. Es lo que `secret("K")` pide y guarda en el valor.
+    pub fn secret_binding(&self, name: &str) -> Option<String> {
+        let mut hosts: Vec<String> = Vec::new();
+        let mut collect = |set: &CapabilitySet| {
+            // Lo rechazado por el techo también: es lo que el programa declaró, y el mensaje que
+            // sigue (por encima del techo, con la línea a escribir) depende de pedirlo atado.
+            for c in set.granted.iter().chain(set.rejected_by_ceiling.iter()).filter(|c| c.ty == CapabilityType::Secret) {
+                if let Some((gn, Some(gh))) = c.scope.as_deref().map(split_secret_scope) {
+                    if gn == name || fnmatch(name, gn) {
+                        for h in gh.split('|') {
+                            if !hosts.iter().any(|x| x == h) {
+                                hosts.push(h.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        };
+        collect(self);
+        let mut next = self.parent.clone();
+        while let Some(p) = next {
+            collect(&p.borrow());
+            next = p.borrow().parent.clone();
+        }
+        if hosts.is_empty() {
+            None
+        } else {
+            Some(hosts.join("|"))
+        }
+    }
+
+    /// v0.6.46 (E1): los hosts a los que el TECHO del host ata el secret `name` (`--cap-set
+    /// secret=K@h`), para el mensaje que dice qué escribir.
+    pub fn ceiling_binding(&self, name: &str) -> Option<String> {
+        let c = self.ceiling.as_ref()?;
+        c.iter().filter(|c| c.ty == CapabilityType::Secret).find_map(|c| match c.scope.as_deref().map(split_secret_scope) {
+            Some((gn, Some(gh))) if gn == name || fnmatch(name, gn) => Some(gh.to_string()),
+            _ => None,
+        })
+    }
+
     fn is_declared(&self, requested: &Capability) -> bool {
         self.granted.iter().any(|c| c.covers(requested))
             || self.rejected_by_ceiling.iter().any(|c| c.covers(requested))
@@ -1132,10 +1336,9 @@ impl std::error::Error for CapabilityViolation {}
 pub fn parse_capability(name: &str, scope: Option<&str>) -> Result<Capability, String> {
     match capability_type_from_name(name) {
         Some(ty) => Ok(Capability::new(ty, scope.map(|s| s.to_string()))),
-        None => Err(format!(
-            "Unknown capability type: '{}'. Known: [net, file, file.read, file.write, exec, env, time, random, stdout, stdin, llm, db, serve, secret, reveal, sign, wallet, spend, memory]",
-            name
-        )),
+        // v0.6.46 (E3): la lista sale de `KNOWN_CAPABILITY_NAMES` (la escrita a mano no tenía
+        // judge, sandbox_run ni attest).
+        None => Err(format!("Unknown capability type: '{}'. Known: [{}]", name, KNOWN_CAPABILITY_NAMES)),
     }
 }
 
@@ -1631,7 +1834,21 @@ pub fn build_ceiling(sandbox: bool, cap_set: Option<&str>) -> Result<Option<Vec<
                     None => (item, None),
                 };
                 match capability_type_from_name(name) {
-                    Some(ty) => caps.push(Capability::new(ty, scope)),
+                    Some(ty) => {
+                        let cap = Capability::new(ty, scope);
+                        // v0.6.46 (E1): `secret=K@h` ata K a sus hosts, con la gramática de una
+                        // atadura (nada de `*` suelto).
+                        if let (CapabilityType::Secret, Some((_, Some(hosts)))) =
+                            (ty, cap.scope.as_deref().map(split_secret_scope))
+                        {
+                            for h in hosts.split('|') {
+                                if let Some(e) = synsema_core::capscope::bound_host_error(h) {
+                                    return Err(format!("--cap-set: {}: {}", item, e));
+                                }
+                            }
+                        }
+                        caps.push(cap)
+                    }
                     None => {
                         return Err(format!(
                             "--cap-set: unknown capability '{}'. Known: {} (or `none` for an empty ceiling)",
@@ -1675,10 +1892,59 @@ mod tanda_motor_tests {
         assert!(!cs.check(&Capability::new(CapabilityType::Exec, Some("cmd".into())), "run()"));
     }
 
+    /// v0.6.46 (E5): el scope de `llm`/`judge` nombra a quién pertenece lo privado y, opcional, el
+    /// host del provider. Sin scope = sólo datos públicos.
+    #[test]
+    fn e5_llm_scope_covers() {
+        let c = |s: Option<&str>| Capability::new(CapabilityType::Llm, s.map(|s| s.to_string()));
+        let covers = |g: Option<&str>, r: Option<&str>| c(g).covers(&c(r));
+        // Datos públicos: los cubre cualquier grant, con o sin scope.
+        assert!(covers(None, None) && covers(Some("a"), None) && covers(Some("a@api.x"), None));
+        // Sin scope no cubre ningún principal.
+        assert!(!covers(None, Some("a@api.x")) && !covers(None, Some("a")));
+        // El principal, exacto o glob; el host, si los dos lo nombran.
+        assert!(covers(Some("a"), Some("a@api.x")) && covers(Some("a@api.x"), Some("a@api.x")));
+        assert!(covers(Some("a@api.x"), Some("a")), "el techo `a@host` acepta el `require llm(\"a\")`");
+        assert!(!covers(Some("a@api.x"), Some("a@otro.y")) && !covers(Some("a@local"), Some("a@api.x")));
+        assert!(!covers(Some("b"), Some("a@api.x")));
+        assert!(covers(Some("*@local"), Some("b@local")) && covers(Some("a@*.x.com"), Some("a@api.x.com")));
+        assert!(covers(Some("a@API.X"), Some("a@api.x")));
+        // `judge` igual; `llm` no cubre `judge`.
+        let j = Capability::new(CapabilityType::Judge, Some("a@local".to_string()));
+        assert!(j.covers(&Capability::new(CapabilityType::Judge, Some("a@local".to_string()))));
+        assert!(!c(Some("a@local")).covers(&j));
+        // Ronda 1 (M2): para datos privados el techo tiene que nombrar el provider.
+        let set = |items: &[&str]| {
+            let mut cs = CapabilitySet::new("t");
+            cs.ceiling = Some(Rc::new(items.iter().map(|s| c(Some(s))).collect()));
+            cs
+        };
+        let req = c(Some("a@api.x"));
+        assert!(!set(&["a"]).ceiling_names(&req) && !set(&["*"]).ceiling_names(&req));
+        assert!(set(&["a@api.x"]).ceiling_names(&req) && set(&["a@*"]).ceiling_names(&req));
+        assert!(!set(&["a@otro.y"]).ceiling_names(&req) && !CapabilitySet::new("t").ceiling_names(&req));
+    }
+
+    /// v0.6.46 (D4): la lista de nombres de core (con la que el parser rechaza un `require`
+    /// desconocido) y los tipos son la misma cosa: cada nombre tiene su tipo y cada tipo su nombre.
+    #[test]
+    fn core_capability_names_match_the_types() {
+        use CapabilityType::*;
+        for name in KNOWN_CAPABILITY_NAMES.split(", ") {
+            assert!(capability_type_from_name(name).is_some(), "{} no tiene tipo", name);
+        }
+        let all = [Net, FileRead, FileWrite, File, Exec, Env, Time, Random, Stdout, Stdin, Llm, Judge, Db, Serve, Secret, Reveal, Sign, Wallet, Spend, Memory, SandboxRun, Attest, Declassify];
+        for ty in all {
+            assert!(synsema_core::capscope::is_capability_name(ty.wire_name()), "{:?}", ty);
+            assert!(synsema_core::capscope::is_capability_name(ty.name_lower()), "{:?}", ty);
+        }
+        assert_eq!(KNOWN_CAPABILITY_NAMES.split(", ").count(), all.len());
+    }
+
     #[test]
     fn cap_set_item_round_trips_every_type() {
         use CapabilityType::*;
-        for ty in [Net, FileRead, FileWrite, File, Exec, Env, Time, Random, Stdout, Stdin, Llm, Judge, Db, Serve, Secret, Reveal, Sign, Wallet, Spend, Memory, SandboxRun, Attest] {
+        for ty in [Net, FileRead, FileWrite, File, Exec, Env, Time, Random, Stdout, Stdin, Llm, Judge, Db, Serve, Secret, Reveal, Sign, Wallet, Spend, Memory, SandboxRun, Attest, Declassify] {
             for scope in [None, Some("x-*".to_string())] {
                 let cap = Capability::new(ty, scope.clone());
                 let back = build_ceiling(false, Some(&cap.cap_set_item())).unwrap().unwrap();

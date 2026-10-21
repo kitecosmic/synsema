@@ -109,7 +109,8 @@ print(hex(k_signing))
     assert_eq!(out[1], "0xc4afb1cc5771d871763a393e44b703571b55cc28424d1a5e86da6ed3c154a4b9");
 }
 
-/// HB4: lo que sale por un borde de texto nunca es una forma impresa.
+/// HB4: lo que sale por un borde de texto nunca es una forma impresa. v0.6.46 (E1): un secret no
+/// atado fuera de un header es error que dice cómo atarlo (los atados, en `v0646_tanda_e.rs`).
 #[test]
 fn bearer_headers_and_query_refuse_printed_forms() {
     for (src, needle) in [
@@ -119,9 +120,9 @@ fn bearer_headers_and_query_refuse_printed_forms() {
         ("bearer(as_secret(bytes(\"ffff\", \"hex\")))", "holds bytes that are not UTF-8"),
         ("require net(\"127.0.0.1\")\nfetch(\"http://127.0.0.1:9/\", {\"headers\": {\"X-Key\": nothing}})", "fetch: header \"X-Key\" is nothing"),
         ("require net(\"127.0.0.1\")\nhttp_get(\"http://127.0.0.1:9/\", {\"X-Raw\": bytes(\"a\")})", "http_get: header \"X-Raw\" must be text, a number or a secret, got bytes"),
-        ("require net(\"127.0.0.1\")\nhttp_get(\"http://127.0.0.1:9/\", nothing, {\"token\": as_secret(\"s\")})", "query parameter \"token\" is secret("),
-        ("require net(\"127.0.0.1\")\nhttp_post(\"http://127.0.0.1:9/\", {\"client_secret\": as_secret(\"s\")})", "http_post: the body contains secret(sealed)"),
-        ("require net(\"127.0.0.1\")\nfetch(\"http://127.0.0.1:9/\", {\"method\": \"POST\", \"body\": [1, {\"k\": as_secret(\"s\")}]})", "fetch: the body contains secret(sealed)"),
+        ("require net(\"127.0.0.1\")\nhttp_get(\"http://127.0.0.1:9/\", nothing, {\"token\": as_secret(\"s\")})", "query parameter \"token\" is secret(sealed), and an unbound secret only goes in a header"),
+        ("require net(\"127.0.0.1\")\nhttp_post(\"http://127.0.0.1:9/\", {\"client_secret\": as_secret(\"s\")})", "http_post: the body is secret(sealed), and an unbound secret only goes in a header"),
+        ("require net(\"127.0.0.1\")\nfetch(\"http://127.0.0.1:9/\", {\"method\": \"POST\", \"body\": [1, {\"k\": as_secret(\"s\")}]})", "fetch: the body is secret(sealed), and an unbound secret only goes in a header"),
     ] {
         let r = run(&format!("{}\n", src));
         assert!(!r.success && r.errors.join(" ").contains(needle), "{}: {:?}", src, r.errors);

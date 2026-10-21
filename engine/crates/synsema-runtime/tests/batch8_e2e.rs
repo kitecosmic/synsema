@@ -147,8 +147,12 @@ print("sigue vivo")"#,
 fn secret_never_leaks_in_csv_or_chart() {
     let o = out(
         r#"let s be as_secret("hunter2", "API_KEY")
-let enc be csv_encode([{"k": s, "v": "x"}])
-print(contains(enc, "[redacted]"))
+let enc be ""
+try
+    set enc to csv_encode([{"k": s, "v": "x"}])
+recover err
+    set enc to err
+print(contains(enc, "secret(API_KEY)"))
 print(contains(enc, "hunter2"))
 let svg be chart_svg("bar", [{"k": s, "v": 1}], {"x": "k", "y": "v"})
 print(contains(svg, "hunter2"))

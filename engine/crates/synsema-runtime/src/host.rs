@@ -37,6 +37,26 @@ static PROGRAM_ARGS: OnceLock<Vec<String>> = OnceLock::new();
 /// TODOS los intérpretes del proceso (`run --labels`, `test --labels`, `serve --attested`).
 static LABELS: OnceLock<bool> = OnceLock::new();
 
+/// v0.6.46 (E3b): los módulos de confianza que cargó quien invoca el binario (`--trusted
+/// nombre=ruta`, ya leídos: el programa no ve la ruta) y su techo (`--trusted-cap-set`).
+#[derive(Clone, Default)]
+pub struct Trusted {
+    pub modules: Vec<(String, String)>,
+    pub ceiling: Option<Vec<synsema_capabilities::model::Capability>>,
+}
+
+static TRUSTED: OnceLock<Trusted> = OnceLock::new();
+
+/// v0.6.46 (E3b): fija los módulos de confianza del proceso (una vez).
+pub fn set_trusted(t: Trusted) -> bool {
+    TRUSTED.set(t).is_ok()
+}
+
+/// v0.6.46 (E3b): los módulos de confianza del proceso, si hay.
+pub fn trusted() -> Option<&'static Trusted> {
+    TRUSTED.get().filter(|t| !t.modules.is_empty())
+}
+
 /// Fija el perfil del proceso (una vez). `false` si ya estaba fijado.
 pub fn set_profile(p: Profile) -> bool {
     PROFILE.set(p).is_ok()

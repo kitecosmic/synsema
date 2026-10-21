@@ -637,6 +637,10 @@ impl LLMProvider for AnthropicProvider {
         format!("anthropic:{}", self.model)
     }
 
+    fn endpoint(&self) -> String {
+        endpoint_host(&self.base_url)
+    }
+
     fn call_step(&self, request: &LLMRequest) -> LlmStepResponse {
         let prompt = request.data.get("prompt").cloned().unwrap_or_default();
         let context = request.data.get("context").cloned().unwrap_or_default();
@@ -1113,6 +1117,10 @@ impl LLMProvider for OpenAIProvider {
 
     fn name(&self) -> String {
         format!("openai:{}", self.model)
+    }
+
+    fn endpoint(&self) -> String {
+        endpoint_host(&self.base_url)
     }
 
     fn call_step(&self, request: &LLMRequest) -> LlmStepResponse {
@@ -1613,6 +1621,9 @@ impl LLMProvider for ReloadingProvider {
     fn name(&self) -> String {
         self.current().name()
     }
+    fn endpoint(&self) -> String {
+        self.current().endpoint()
+    }
     fn call_step(&self, request: &LLMRequest) -> LlmStepResponse {
         self.current().call_step(request)
     }
@@ -1746,6 +1757,10 @@ impl LLMProvider for MeteredProvider {
         self.inner.name()
     }
 
+    fn endpoint(&self) -> String {
+        self.inner.endpoint()
+    }
+
     fn call_step(&self, request: &LLMRequest) -> LlmStepResponse {
         let _slot = match self.budget_slot() {
             Ok(s) => s,
@@ -1809,6 +1824,12 @@ fn resolve_llm_budget(store: &EnvStore) -> Option<u64> {
 // =========================================================
 // factory + selección por env
 // =========================================================
+
+/// v0.6.46 (E5): el host al que va un provider de red (sin esquema, userinfo ni puerto, en
+/// minúsculas). Un `base_url` sin host da `?`, que ningún techo con host nombra.
+pub(crate) fn endpoint_host(base_url: &str) -> String {
+    synsema_capabilities::secure::url_hostname(base_url).filter(|h| !h.is_empty()).unwrap_or_else(|| "?".to_string())
+}
 
 /// Construye un provider real por nombre (puro, testeable). `base_url=None` → el base
 /// oficial del provider. `None` si el nombre no es un provider soportado.

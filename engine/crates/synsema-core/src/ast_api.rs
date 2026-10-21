@@ -113,7 +113,9 @@ pub(crate) fn children(n: &Node) -> Vec<&Node> {
             v.extend(timeout.iter().map(|b| b.as_ref()));
             v
         }
-        RequireStatement { scope, .. } => scope.iter().map(|b| b.as_ref()).collect(),
+        RequireStatement { scope, bound_to, .. } => {
+            scope.iter().map(|b| b.as_ref()).chain(bound_to.iter().flat_map(|v| v.iter())).collect()
+        }
         SandboxBlock { body, .. } => body.iter().collect(),
         InvariantDeclaration { condition, .. } => vec![condition],
         ApproveStatement { message, context, .. } => {
@@ -629,7 +631,9 @@ fn children_mut(n: &mut Node) -> Vec<&mut Node> {
             v.extend(timeout.iter_mut().map(|b| b.as_mut()));
             v
         }
-        RequireStatement { scope, .. } => scope.iter_mut().map(|b| b.as_mut()).collect(),
+        RequireStatement { scope, bound_to, .. } => {
+            scope.iter_mut().map(|b| b.as_mut()).chain(bound_to.iter_mut().flat_map(|v| v.iter_mut())).collect()
+        }
         SandboxBlock { body, .. } => body.iter_mut().collect(),
         InvariantDeclaration { condition, .. } => vec![condition.as_mut()],
         ApproveStatement { message, context, .. } => {

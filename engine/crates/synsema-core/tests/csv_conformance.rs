@@ -1,7 +1,7 @@
 //! Conformidad de CSV (Batch 8): `csv_parse`/`csv_encode` corriendo programas `.syn`
 //! REALES por el intérprete de core. Cubre RFC 4180 (quoting, escapes, CRLF/LF, BOM),
 //! round-trips, opts (headers/delimiter/numbers/eol) y los errores claros con línea (G5).
-//! El caso `secret` → `[redacted]` (G8) vive en los unit tests de `csv.rs` y en los e2e
+//! El caso `secret` → error (G8; v0.6.46 D8) vive en los unit tests de `csv.rs` y en los e2e
 //! del runtime (el builtin `secret()` no se registra en core).
 
 use synsema_core::interpreter::run_source;

@@ -59,6 +59,10 @@ impl LayaJudgeProvider {
 }
 
 impl JudgeProvider for LayaJudgeProvider {
+    /// v0.6.46 (ronda 1, B3): no sale del proceso.
+    fn endpoint(&self) -> String {
+        "local".to_string()
+    }
     fn judge(&self, request: &JudgeRequest) -> JudgeCall {
         // El orden de las opciones es el de declaración del programa y **se conserva**: es el
         // orden en que vuelven las probabilidades, y el que el programa espera leer.

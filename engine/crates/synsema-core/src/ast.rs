@@ -421,6 +421,10 @@ pub enum NodeKind {
     RequireStatement {
         capability: String,
         scope: Option<Box<Node>>,
+        /// v0.6.46 (E1): `require secret("K") for net("h1"), net("h2")` — las expresiones de los
+        /// hosts a los que el secret puede ir. En una caja (8 bytes) para no pasar el tope de
+        /// `NodeKind`.
+        bound_to: Option<Box<Vec<Node>>>,
     },
     SandboxBlock {
         body: Vec<Node>,

@@ -1344,9 +1344,8 @@ The inline form belongs where a value is used: let x be when c then a otherwise 
         let mut capability = cap_tok.as_str().to_string();
         // Capacidad punteada opcional: `file.read` / `file.write` (un solo nivel). El
         // lexer tokeniza `file.read` como Identifier Dot Identifier, así que reconstruimos
-        // el nombre punteado acá. La validación del nombre vive en `capability_type_from_name`
-        // (un nombre punteado desconocido parsea y el grant_hook lo ignora, igual que un
-        // nombre simple desconocido).
+        // el nombre punteado acá. v0.6.46 (D4): un nombre desconocido, simple o punteado, es error
+        // (ver `capscope::unknown_capability_error`, más abajo).
         if self.match_tok(TokenType::Dot).is_some() {
             let sub = self.expect(TokenType::Identifier, "Expected a capability sub-name after '.'")?;
             capability.push('.');
@@ -1362,6 +1361,11 @@ The inline form belongs where a value is used: let x be when c then a otherwise 
             // que es el peor no-op de la familia. Se honra lo que dice el programa.
             scope = Some(Box::new(self.parse_expression()?));
         }
+        // v0.6.46 (D4): un nombre que no existe es error, con el más cercano. Antes parseaba y el
+        // grant_hook lo ignoraba: `require nett("x")` no concedía nada, sin aviso.
+        if let Some(msg) = crate::capscope::unknown_capability_error(&capability) {
+            return Err(ParseError::new(msg, cap_tok.location.clone()));
+        }
         // DB-M1 decisión #1: la declaración ES la identidad — `require memory` sin
         // nombre no significa nada (¿qué .db abriría?). Error en el parse, no al
         // persistir, con el fix exacto en el mensaje (LLM-safe, decisión #8).
@@ -1371,7 +1375,42 @@ The inline form belongs where a value is used: let x be when c then a otherwise 
                 loc,
             ));
         }
-        Ok(Node::new(loc, NodeKind::RequireStatement { capability, scope }))
+        // v0.6.46 (E1): `for net("h"), net("h2")` ata un secret a sus hosts. `for` no es palabra
+        // reservada (como en `analyze … for`). Sólo `secret` lo toma, y con nombre.
+        let mut bound_to = None;
+        if self.current().ty == TokenType::Identifier && self.current_value_eq("for") {
+            if capability != "secret" {
+                return Err(ParseError::new(
+                    format!("`for net(...)` binds a secret to a host; only `require secret(...)` takes it, not `require {}`", capability),
+                    loc,
+                ));
+            }
+            if scope.is_none() {
+                return Err(ParseError::new(
+                    "bind a named secret: require secret(\"NAME\") for net(\"api.example.com\")",
+                    loc,
+                ));
+            }
+            self.advance();
+            let mut hosts = Vec::new();
+            loop {
+                let t = self.expect(TokenType::Identifier, "after `for`, name the host the secret goes to: net(\"api.example.com\")")?;
+                if t.as_str() != "net" {
+                    return Err(ParseError::new(
+                        "after `for`, name the host the secret goes to: net(\"api.example.com\")",
+                        t.location.clone(),
+                    ));
+                }
+                self.expect(TokenType::LParen, "")?;
+                hosts.push(self.parse_expression()?);
+                self.expect(TokenType::RParen, "")?;
+                if self.match_tok(TokenType::Comma).is_none() {
+                    break;
+                }
+            }
+            bound_to = Some(Box::new(hosts));
+        }
+        Ok(Node::new(loc, NodeKind::RequireStatement { capability, scope, bound_to }))
     }
 
     fn parse_sandbox(&mut self) -> Result<Node, ParseError> {
@@ -3470,7 +3509,7 @@ mod tests {
     fn require_stmt(src: &str) -> (String, bool) {
         let prog = parse_ok(src);
         match &prog.statements[0].kind {
-            NodeKind::RequireStatement { capability, scope } => (capability.clone(), scope.is_some()),
+            NodeKind::RequireStatement { capability, scope, .. } => (capability.clone(), scope.is_some()),
             other => panic!("esperaba RequireStatement, got {:?}", other),
         }
     }

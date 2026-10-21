@@ -122,7 +122,7 @@ export function dispatchHostSync(host, kind, payload) {
         ? casReply(syncOnly("kv.cas", host.kv.cas(payload.ns, payload.key, payload.expected ?? null, payload.value)))
         : undefined;
     case "llm":
-      return typeof host.llm === "function" ? normalizeLlm(syncOnly("llm", host.llm(payload.op, payload.prompt))) : undefined;
+      return typeof host.llm === "function" ? normalizeLlm(syncOnly("llm", host.llm(payload.op, payload.prompt, { principals: payload.principals ?? [] }))) : undefined;
     case "log":
       if (typeof host.log !== "function") return undefined;
       syncOnly("log", host.log(payload.line));
@@ -165,7 +165,7 @@ export async function dispatchHostAsync(host, kind, payload) {
         ? casReply(await host.kv.cas(payload.ns, payload.key, payload.expected ?? null, payload.value))
         : undefined;
     case "llm":
-      return typeof host.llm === "function" ? normalizeLlm(await host.llm(payload.op, payload.prompt)) : undefined;
+      return typeof host.llm === "function" ? normalizeLlm(await host.llm(payload.op, payload.prompt, { principals: payload.principals ?? [] })) : undefined;
     case "log":
       if (typeof host.log !== "function") return undefined;
       await host.log(payload.line);
@@ -370,6 +370,9 @@ function requestOf(op, source, opts = {}) {
   // se descartaba por falsy y la corrida quedaba sin límite.
   if (opts.maxSteps != null) r.max_steps = opts.maxSteps;
   if (opts.maxMemoryMb != null) r.max_memory_mb = opts.maxMemoryMb;
+  // v0.6.46 (E3b): módulos de confianza del embebedor y su techo.
+  if (opts.trusted) r.trusted = opts.trusted;
+  if (opts.trustedCeiling) r.trusted_ceiling = opts.trustedCeiling;
   return r;
 }
 

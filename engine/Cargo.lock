@@ -5230,6 +5230,7 @@ dependencies = [
  "synsema-llm",
  "synsema-runtime",
  "synsema-stdlib",
+ "tungstenite",
 ]
 
 [[package]]
