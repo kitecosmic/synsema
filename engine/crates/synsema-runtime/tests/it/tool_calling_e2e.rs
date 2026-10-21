@@ -23,7 +23,7 @@ fn final_(text: &str, tok: u64) -> LlmStepResponse {
     LlmStepResponse { step: LlmStep::Final(text.to_string()), tokens_used: tok }
 }
 
-const LIB: &str = include_str!("fixtures/safe_tool_loop.syn");
+const LIB: &str = include_str!("../fixtures/safe_tool_loop.syn");
 
 /// Arma el programa: la librería + un driver que imprime el resultado de `run_agent`.
 fn agent_program(question: &str, max_steps: u32, budget: u64) -> String {
