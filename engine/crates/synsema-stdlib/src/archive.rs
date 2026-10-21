@@ -27,6 +27,7 @@ use std::rc::Rc;
 
 
 use synsema_capabilities::model::{normalize_path, Capability, CapabilitySet, CapabilityType};
+use synsema_capabilities::nofollow::{OpenFor, Refused};
 use synsema_core::interpreter::{Control, Interpreter, RuntimeError};
 use synsema_core::types::{syn_bytes, syn_list, syn_text, SynValue};
 
@@ -119,8 +120,15 @@ fn entries_arg(caps: &Rc<RefCell<CapabilitySet>>, v: Option<&SynValue>, who: &st
                     synsema_capabilities::secure::bundled_audit(caps, CapabilityType::FileRead, &path, &format!("{}()", who));
                     b.to_vec()
                 } else {
-                    require(caps, CapabilityType::FileRead, &path, &format!("{}()", who))?;
-                    std::fs::read(&path).map_err(|e| err(format!("{}: cannot read {}: {}", who, path, e)))?
+                    let source = format!("{}()", who);
+                    require(caps, CapabilityType::FileRead, &path, &source)?;
+                    // v0.6.46 (E8): sin ventana entre el chequeo y la apertura.
+                    let mut b = Vec::new();
+                    synsema_capabilities::secure::open_checked(caps, &path, OpenFor::READ, &[CapabilityType::FileRead], &source)
+                        .map_err(|r| refused(r, |e| format!("{}: cannot read {}: {}", who, path, e)))?
+                        .read_to_end(&mut b)
+                        .map_err(|e| err(format!("{}: cannot read {}: {}", who, path, e)))?;
+                    b
                 }
             }
             (None, Some(other)) => {
@@ -294,11 +302,21 @@ fn read_capped<R: Read>(r: &mut R, remaining: u64, name: &str, who: &str, max_by
     Ok(buf)
 }
 
-fn write_entry(path: &Path, data: &[u8], who: &str) -> Result<(), Control> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| err(format!("{}: {}: {}", who, parent.display(), e)))?;
+/// v0.6.46 (E8): como `write_file`: reemplazo atómico relativo a la carpeta ya juzgada (sin ventana
+/// entre el chequeo de `target_of` y la escritura, y un link con el nombre de la entrada se
+/// reemplaza, no se sigue).
+fn write_entry(caps: &Rc<RefCell<CapabilitySet>>, path: &Path, data: &[u8], who: &str) -> Result<(), Control> {
+    let p = normalize_path(&path.to_string_lossy());
+    synsema_capabilities::secure::atomic_write(caps, &p, data, &[CapabilityType::FileWrite], &format!("{}()", who))
+        .map_err(|r| refused(r, |e| format!("{}: {}: {}", who, path.display(), e)))
+}
+
+/// El error de una apertura chequeada: la negación tal cual, o el de E/S con el formato del builtin.
+fn refused(r: Refused<Control>, io: impl FnOnce(std::io::Error) -> String) -> Control {
+    match r {
+        Refused::Denied(c) => c,
+        Refused::Io(e) => err(io(e)),
     }
-    std::fs::write(path, data).map_err(|e| err(format!("{}: {}: {}", who, path.display(), e)))
 }
 
 fn zip_extract(caps: &Rc<RefCell<CapabilitySet>>, args: &[SynValue]) -> Result<SynValue, Control> {
@@ -336,7 +354,7 @@ fn zip_extract(caps: &Rc<RefCell<CapabilitySet>>, args: &[SynValue]) -> Result<S
             std::fs::create_dir_all(&target).map_err(|e| err(format!("{}: {}: {}", F, target.display(), e)))?;
             continue;
         }
-        write_entry(&target, &buf, F)?;
+        write_entry(caps, &target, &buf, F)?;
         written.push(syn_text(name));
     }
     Ok(syn_list(written))
@@ -397,7 +415,7 @@ fn tar_extract(caps: &Rc<RefCell<CapabilitySet>>, args: &[SynValue]) -> Result<S
         if is_dir {
             std::fs::create_dir_all(&target).map_err(|e| err(format!("{}: {}: {}", F, target.display(), e)))?;
         } else {
-            write_entry(&target, &buf, F)?;
+            write_entry(caps, &target, &buf, F)?;
             written.push(syn_text(name));
         }
     }

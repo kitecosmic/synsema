@@ -250,3 +250,35 @@ fn e5_wasm_judge_gate() {
     let r = run_with(None);
     assert!(r.ok, "{:?}", r.errors);
 }
+
+/// v0.6.46 (E6-g): con `RunOptions.auditor`, `Report.receipt` trae el recibo sellado de la corrida:
+/// verifica, lo de la rama privada va adentro del sobre, y el `program_sha` es el del fuente. Sin
+/// auditor no hay recibo.
+#[test]
+fn e6_wasm_report_carries_the_receipt() {
+    let (sk, pk) = synsema_stdlib::sealed::generate_keypair();
+    let src = "require random\nlet p be private(5, \"app\")\nwhen p > 3\n    let r be random()\nprint(\"hola\")\n";
+    let mut opts = RunOptions::new("e6.syn");
+    opts.labels = true;
+    let plain = run(src, &opts);
+    assert!(plain.ok, "{:?}", plain.errors);
+    assert!(plain.receipt.is_none());
+
+    opts.auditor = Some(synsema_stdlib::sealed::parse_auditor_key(&pk).unwrap());
+    opts.sealed_bytes = Some(8192);
+    let r = run(src, &opts);
+    assert!(r.ok, "{:?}", r.errors);
+    assert_eq!(r.output, ["hola"]);
+    let receipt = r.receipt.expect("el recibo");
+    let header = synsema_stdlib::sealed::verify_receipt(&receipt).expect("verifica");
+    assert_eq!(header["program_sha"], synsema_core::bytesutil::hex_encode(&synsema_stdlib::attest::sha256(src.as_bytes())));
+    assert_eq!(header["sealed_bytes"], 8192);
+    let sk = synsema_core::bytesutil::b64url_decode(&sk).unwrap();
+    let opened = synsema_stdlib::sealed::open_receipt(&receipt, &sk).expect("el auditor lo abre");
+    assert!(
+        opened["entries"].as_array().unwrap().iter().any(|e| e["sealed"] == true && e["entry"]["capability"] == "random"),
+        "{}",
+        opened
+    );
+    assert!(receipt["public"].as_array().unwrap().iter().all(|e| e.get("line") != Some(&serde_json::json!(4))));
+}

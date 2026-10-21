@@ -198,3 +198,37 @@ fn serve_attested_and_watch_are_mutually_exclusive() {
     assert_eq!(code, 2, "{}", err);
     assert!(err.contains("--attested") && err.contains("--watch"), "{}", err);
 }
+
+/// v0.6.46 (E6): con auditor, `run --attest` ata también la pública que firma el recibo sellado
+/// (`sha256(run_pub)` al final de lo atado) y la devuelve en `run_key`: el documento responde por la
+/// clave del recibo, que sale por stderr antes que la salida.
+#[test]
+fn e6_attested_report_data() {
+    let dir = project("e6");
+    std::fs::write(dir.join("p.syn"), SRC).unwrap();
+    let (_, pk) = synsema_stdlib::sealed::generate_keypair();
+    let (code, out, err) = synsema(&dir, &["run", "--attest", "--auditor", &pk, "p.syn", "--", "mundo"], &[("SYNSEMA_ATTEST", Some("mock"))]);
+    assert_eq!(code, 0, "stdout:\n{}\nstderr:\n{}", out, err);
+    let lines: Vec<&str> = out.lines().collect();
+    assert_eq!(&lines[..2], ["2", "hola mundo"]);
+    let j: serde_json::Value = serde_json::from_str(lines[lines.len() - 1]).expect("la última línea es JSON");
+    let receipt: serde_json::Value = err
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .find(|v| v.get("synsema_receipt").is_some())
+        .expect("el recibo en stderr");
+    let header = synsema_stdlib::sealed::verify_receipt(&receipt).expect("el recibo verifica");
+    assert_eq!(header["run_key"]["public"], j["run_key"], "el documento nombra la clave del recibo");
+    assert_eq!(header["config_sha"], j["config_sha"]);
+    let run_pub = synsema_core::bytesutil::b64url_decode(j["run_key"].as_str().unwrap()).unwrap();
+    let cfg = AttestConfig { labels: false, ceiling: Some(synsema_capabilities::model::build_ceiling_deterministic()), tls_key: "none", profile: "pure", drivers: vec!["mock"] };
+    let doc = synsema_core::bytesutil::b64_decode(j["attestation"]["document"].as_str().unwrap()).unwrap();
+    let payload = verify_nitro_document_with_root(&doc, &mock::root_der()).expect("documento válido");
+    let mut bound = Vec::new();
+    bound.extend_from_slice(&program_sha(SRC, "p.syn").unwrap());
+    bound.extend_from_slice(&sha256(b"mundo"));
+    bound.extend_from_slice(&sha256("2\nhola mundo".as_bytes()));
+    bound.extend_from_slice(&cfg.sha());
+    bound.extend_from_slice(&sha256(&run_pub));
+    assert_eq!(payload.get("user_data").unwrap().as_bytes().unwrap(), &sha256(&bound));
+}

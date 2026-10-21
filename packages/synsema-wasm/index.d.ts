@@ -54,6 +54,11 @@ export interface LlmResult {
  * En la API síncrona los hooks deben ser síncronos; en `*Async` pueden devolver Promise.
  */
 export interface Host {
+  /**
+   * v0.6.46: en nativo, un `require net` con comodín sólo llega a IPs públicas (el motor resuelve
+   * y chequea la IP antes de conectar). Acá la conexión es tuya y el motor no ve la IP: si el
+   * programa no es tuyo, negá loopback, red privada y `169.254.169.254` en este hook.
+   */
   http?(req: HttpRequestPayload): HttpResponsePayload | Promise<HttpResponsePayload>;
   kv?: KvStore;
   /**

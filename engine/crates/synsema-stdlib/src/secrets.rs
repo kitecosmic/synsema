@@ -684,8 +684,12 @@ fn iso_now() -> String {
 /// v0.6.45 (ronda 3, M2) — la puerta de una operación que AUDITA, ANTES de todo lo demás: en una rama
 /// decidida por un valor privado no corre, y no deja rastro en ningún lado (ni el audit de
 /// capabilities del `check_cause`, ni el cupo de `SYNSEMA_SIGN_CEILING`, ni su propio log).
+///
+/// v0.6.46 (E6): con el recibo sellado, `sign`, `reveal` y las de wallet corren (su entrada va al
+/// sobre: `write_audit_op`). `spend` no, ni con auditor: gasta un cupo compartido, y después se ve si
+/// alcanza o no (un oráculo de la rama).
 pub fn audited_op_preflight(op: &str) -> Result<(), Control> {
-    if synsema_core::labels::pc_private_now() {
+    if synsema_core::labels::pc_private_now() && (op == "spend" || !synsema_core::sealed::active()) {
         return Err(Control::Error(RuntimeError::new(synsema_core::labels::audited_in_private_branch(op))));
     }
     Ok(())
@@ -802,8 +806,14 @@ fn write_audit_op(
     // entrada concedida ni la denegada): que exista ya revela la rama. La operación falla con
     // `label_violation`. Un recibo sellado de forma fija que audite igual sin revelar nada queda
     // para la versión siguiente.
-    if synsema_core::labels::pc_private_now() {
-        return Err(synsema_core::labels::audited_in_private_branch(op.split(' ').next().unwrap_or(op)));
+    //
+    // v0.6.46 (E6): ese recibo existe. Con el registro sellado activo, la línea va al sobre (nada al
+    // `.log` ni al sink del host durante la corrida) y la operación sigue. `spend` no llega acá en una
+    // rama privada (`audited_op_preflight`).
+    let private = synsema_core::labels::pc_private_now();
+    let op_name = op.split(' ').next().unwrap_or(op);
+    if private && (op_name == "spend" || !synsema_core::sealed::active()) {
+        return Err(synsema_core::labels::audited_in_private_branch(op_name));
     }
     let program = std::path::Path::new(&*loc.file)
         .file_stem()
@@ -822,6 +832,11 @@ fn write_audit_op(
         program,
         tail
     );
+    if private {
+        let entry = serde_json::json!({"kind": "op", "log": file, "line": line.trim_end()});
+        synsema_core::sealed::push_sealed(entry.to_string());
+        return Ok(());
+    }
     // Un host embebedor (wasm-web) puede ser el sink: kv/log del embebedor. Si está
     // instalado y lo ofrece, manda él — no hay filesystem del que hablar.
     if let Some(p) = crate::hostcap::provider() {

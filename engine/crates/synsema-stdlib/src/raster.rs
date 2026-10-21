@@ -687,7 +687,24 @@ pub fn register_raster_builtins_with_caps(
             caps.borrow_mut()
                 .require(&Capability::new(CapabilityType::FileRead, Some(path.clone())), source)
                 .map_err(|v| Control::Error(v.into_error()))?;
-            std::fs::read(&path).map_err(|e| err(format!("{}: cannot read font {}: {}", source, path, e)))
+            // v0.6.46 (E8): sin ventana entre el chequeo y la apertura.
+            let cannot = |e: std::io::Error| err(format!("{}: cannot read font {}: {}", source, path, e));
+            let mut b = Vec::new();
+            use std::io::Read;
+            synsema_capabilities::secure::open_checked(
+                caps,
+                &path,
+                synsema_capabilities::nofollow::OpenFor::READ,
+                &[CapabilityType::FileRead],
+                source,
+            )
+            .map_err(|r| match r {
+                synsema_capabilities::nofollow::Refused::Denied(c) => c,
+                synsema_capabilities::nofollow::Refused::Io(e) => cannot(e),
+            })?
+            .read_to_end(&mut b)
+            .map_err(cannot)?;
+            Ok(b)
         }
     }
     {

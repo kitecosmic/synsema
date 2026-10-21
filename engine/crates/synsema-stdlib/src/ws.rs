@@ -313,6 +313,8 @@ struct DialParams {
     /// Cuándo se abrió la primera conexión: un `attested.now` explícito avanza con el tiempo en
     /// cada reconexión (no se re-verifica días después con la hora de entonces).
     dialed_at: Instant,
+    /// v0.6.46 (E7): las ataduras de los secrets de la URL y los headers (ver `dest_check_with`).
+    bindings: Vec<String>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -610,6 +612,15 @@ fn establish(
         .map_err(|e| err(format!("ws_connect: cannot resolve {}: {}", dial.host, e)))?
         .next()
         .ok_or_else(|| err(format!("ws_connect: cannot resolve host {}", dial.host)))?;
+    // v0.6.46 (E7): la IP que se usa, chequeada antes de conectar, también en cada reconexión.
+    crate::http_common::dest_check_with(
+        &caps.borrow(),
+        &dial.bindings,
+        "ws_connect()",
+        &format!("{}:{}", dial.host.trim_start_matches('[').trim_end_matches(']').to_ascii_lowercase(), dial.port),
+        sa.ip(),
+    )
+    .map_err(err)?;
     let tcp = StdTcp::connect_timeout(&sa, dial.connect_timeout)
         .map_err(|e| err(format!("ws_connect: cannot connect to {}: {}", addr, e)))?;
     let _ = tcp.set_read_timeout(Some(dial.connect_timeout));
@@ -1584,6 +1595,7 @@ fn ws_connect(args: &[SynValue], reg: &Registry) -> Result<SynValue, Control> {
         connect_timeout: opts.timeout,
         tls_check: opts.tls_check,
         dialed_at: Instant::now(),
+        bindings: out.bindings().to_vec(),
     };
     match (&dial.tls_check, dial.tls) {
         (Some(crate::http_common::TlsCheck::Pin(_)), false) => {
@@ -2100,6 +2112,7 @@ pub fn adopt_server_socket(interp: &Interpreter, link: ServerSocketLink) -> Resu
             connect_timeout: Duration::from_secs(0),
             tls_check: None,
             dialed_at: Instant::now(),
+            bindings: Vec::new(),
         },
         negotiated_subprotocol: subprotocol,
         attested: None,

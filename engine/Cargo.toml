@@ -308,6 +308,14 @@ aes = "0.8"
 ctr = "0.9"
 curve25519-dalek = { version = "4", default-features = false }
 tungstenite = { version = "0.26", default-features = false, features = ["handshake"] }
+# v0.6.46 (E6): el sobre del recibo sellado — HPKE (RFC 9180), modo base, DHKEM(X25519,
+# HKDF-SHA256) + HKDF-SHA256 + AES-128-GCM. Una crate en vez de a mano (D5 de la tanda E: "no
+# escribas tu propia cripto"), con los vectores del RFC como test propio (`stdlib/src/sealed.rs`).
+# La 0.13 está sobre la MISMA generación de RustCrypto que ya está en el árbol (`aead` 0.5,
+# `aes-gcm` 0.10, `hkdf` 0.12, `sha2` 0.10, `rand_core` 0.9); la 0.14 trae la siguiente y duplicaría
+# `aead`/`digest`. Sin `p256` (sólo X25519): entran `hpke`, `x25519-dalek`, `chacha20poly1305`,
+# `chacha20` 0.9 y `poly1305`, todas puro-Rust (rozbb y RustCrypto/dalek), CERO `*-sys`/C.
+hpke = { version = "=0.13.0", default-features = false, features = ["alloc", "x25519"] }
 # `groth16_verify` sobre BN254 — verificar una prueba
 # Groth16 de circom/snarkjs (Semaphore, zk-passport, la mayoría de zkTLS) dentro del enclave sin
 # oráculo. SÓLO verificación (sin probador: acordado). arkworks es PURO-Rust y `no_std`; cero

@@ -10,7 +10,7 @@
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use synsema_stdlib::http::{http_request, http_request_bytes};
+use synsema_stdlib::http::host::{http_request, http_request_bytes};
 
 const API_LATEST: &str = "https://api.github.com/repos/kitecosmic/synsema/releases/latest";
 

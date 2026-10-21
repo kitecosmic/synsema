@@ -30,7 +30,8 @@ use serde_json::{json, Map, Value};
 use synsema_llm::provider::{
     LLMProvider, LLMRequest, LLMResponse, LlmStep, LlmStepResponse, ToolSpec,
 };
-use synsema_stdlib::http::{http_request, http_request_stream};
+// v0.6.46 (E7): requests del motor (la configuración del host), fuera de la regla de IPs privadas.
+use synsema_stdlib::http::host::{http_request, http_request_stream};
 use synsema_stdlib::secrets::EnvStore;
 
 const ANTHROPIC_VERSION: &str = "2023-06-01";

@@ -152,6 +152,9 @@ pub struct Outgoing {
     /// sólo fuera de los headers, y un `X-Api-Key` atado seguía un redirect a otro host; el `fetch`
     /// sólo quita `Authorization`). El nativo no sigue redirects.
     forbid_redirects: bool,
+    /// v0.6.46 (E7): los hosts de las ataduras de los secrets que salieron. Con uno atado, una IP
+    /// privada exige además que la atadura la nombre.
+    bindings: Vec<String>,
 }
 
 impl Drop for Outgoing {
@@ -173,7 +176,12 @@ impl Outgoing {
         let scheme = public_url.split_once("://").map(|(s, _)| s.to_ascii_lowercase()).unwrap_or_default();
         let dest = synsema_capabilities::model::net_request_scope(public_url).unwrap_or_default();
         let host = synsema_core::capscope::split_host_port(&dest).0.to_string();
-        Outgoing { who: who.to_string(), scheme, dest, host, sent: Vec::new(), names: Vec::new(), forbid_redirects: false }
+        Outgoing { who: who.to_string(), scheme, dest, host, sent: Vec::new(), names: Vec::new(), forbid_redirects: false, bindings: Vec::new() }
+    }
+
+    /// v0.6.46 (E7): los hosts de las ataduras de lo que salió (ver el campo).
+    pub fn bindings(&self) -> &[String] {
+        &self.bindings
     }
 
     /// ¿Salió algún secret?
@@ -229,6 +237,13 @@ impl Outgoing {
                         self.host,
                         self.scheme
                     )));
+                }
+            }
+        }
+        if let Some(b) = s.bound() {
+            for h in b.iter() {
+                if !self.bindings.contains(h) {
+                    self.bindings.push(h.clone());
                 }
             }
         }
@@ -855,13 +870,18 @@ thread_local! {
 /// capabilities y lo cierra al terminar, también por error. Antes quedaba cargado hasta el próximo
 /// RPC: en wasm toda request posterior pedía `redirect: "error"`, y las copias en claro del secret
 /// vivían en el hilo.
-pub struct RpcCall(());
+pub struct RpcCall(#[allow(dead_code)] NetCallerGuard);
 
 impl RpcCall {
     pub fn open(caps: &Rc<RefCell<CapabilitySet>>) -> Self {
+        Self::open_for(caps, "rpc")
+    }
+
+    /// v0.6.46 (E7): con el nombre del builtin, para el mensaje de una IP privada.
+    pub fn open_for(caps: &Rc<RefCell<CapabilitySet>>, who: &str) -> Self {
         RPC_OUT.with(|o| *o.borrow_mut() = None);
         RPC_CAPS.with(|c| *c.borrow_mut() = Rc::downgrade(caps));
-        RpcCall(())
+        RpcCall(program_request(caps, who, Vec::new()))
     }
 }
 
@@ -870,6 +890,100 @@ impl Drop for RpcCall {
         RPC_OUT.with(|o| *o.borrow_mut() = None);
         RPC_CAPS.with(|c| *c.borrow_mut() = std::rc::Weak::new());
     }
+}
+
+// =============================================================================================
+// v0.6.46 (E7): una conexión a una IP privada. El cliente nativo resuelve una vez y, antes de
+// conectar, pregunta acá por la IP que va a usar. Quién pide la conexión lo dice el contexto del
+// hilo: el PROGRAMA (los builtins de red, con su set de capabilities) o el MOTOR (providers de LLM y
+// del juez, webhooks de aprobación, `synsema update`: la configuración del host, fuera de la regla).
+// Sin contexto se niega una IP privada: un camino del programa que se olvide de abrirlo falla
+// cerrado, no abierto.
+
+enum NetCaller {
+    Host,
+    Program { caps: Rc<RefCell<CapabilitySet>>, who: String, bindings: Vec<String> },
+}
+
+thread_local! {
+    static NET_CALLER: RefCell<Option<NetCaller>> = const { RefCell::new(None) };
+}
+
+/// Restaura el contexto anterior al salir (también por error o pánico).
+pub struct NetCallerGuard(Option<NetCaller>);
+
+impl Drop for NetCallerGuard {
+    fn drop(&mut self) {
+        let prev = self.0.take();
+        NET_CALLER.with(|c| *c.borrow_mut() = prev);
+    }
+}
+
+fn enter_net(caller: NetCaller) -> NetCallerGuard {
+    NetCallerGuard(NET_CALLER.with(|c| c.replace(Some(caller))))
+}
+
+/// Una request del MOTOR (la configuración del host): no pasa por la regla de E7.
+pub fn host_request<T>(f: impl FnOnce() -> T) -> T {
+    let _g = enter_net(NetCaller::Host);
+    f()
+}
+
+/// Una conexión del PROGRAMA mientras viva el guard.
+pub fn program_request(caps: &Rc<RefCell<CapabilitySet>>, who: &str, bindings: Vec<String>) -> NetCallerGuard {
+    enter_net(NetCaller::Program { caps: caps.clone(), who: who.to_string(), bindings })
+}
+
+/// ¿Se puede conectar a `host:port`, que resolvió a `ip`? Lo llama el cliente nativo justo antes de
+/// conectar, con la IP que va a usar.
+pub fn dest_check(host: &str, port: u16, ip: std::net::IpAddr) -> Result<(), String> {
+    if synsema_capabilities::model::is_public_ip(ip) && NET_CALLER.with(|c| !matches!(&*c.borrow(), Some(NetCaller::Program { .. }))) {
+        return Ok(());
+    }
+    NET_CALLER.with(|c| match &*c.borrow() {
+        Some(NetCaller::Host) => Ok(()),
+        Some(NetCaller::Program { caps, who, bindings }) => {
+            let mut all = bindings.clone();
+            RPC_OUT.with(|o| {
+                if let Some((out, _)) = o.borrow().as_ref() {
+                    all.extend(out.bindings().iter().cloned());
+                }
+            });
+            dest_check_with(&caps.borrow(), &all, who, &dest_scope(host, port), ip)
+        }
+        None => Err(format!(
+            "`{}` resolved to {}, a private address, and nothing named it (this connection has no program grants to check)",
+            host,
+            ip.to_canonical()
+        )),
+    })
+}
+
+/// El destino como lo pide `net`: con el puerto siempre (un grant sin puerto cubre cualquiera).
+fn dest_scope(host: &str, port: u16) -> String {
+    let h = host.trim_start_matches('[').trim_end_matches(']').to_ascii_lowercase();
+    if h.contains(':') {
+        format!("[{}]:{}", h, port)
+    } else {
+        format!("{}:{}", h, port)
+    }
+}
+
+/// La decisión de E7 contra un set concreto (TCP y WebSocket la llaman con el suyo): las capas de
+/// `net` (ver `NetLayers::admits`) y, si salió un secret atado, su atadura.
+pub fn dest_check_with(caps: &CapabilitySet, bindings: &[String], who: &str, dest: &str, ip: std::net::IpAddr) -> Result<(), String> {
+    use synsema_capabilities::model::{is_public_ip, net_scope_names, private_dest_message};
+    caps.net_layers().admits(dest, ip).map_err(|cause| private_dest_message(who, dest, ip, &cause))?;
+    if !is_public_ip(ip) && !bindings.is_empty() && !bindings.iter().any(|b| net_scope_names(b, dest, ip)) {
+        return Err(format!(
+            "{}: `{}` resolved to {}, a private address; a secret bound to [{}] goes there only if the binding names it (the host exactly, its address or its CIDR)",
+            who,
+            synsema_capabilities::model::split_net_scope(dest).0,
+            ip.to_canonical(),
+            bindings.join(", ")
+        ));
+    }
+    Ok(())
 }
 
 /// v0.6.46 (E1): la URL de un builtin de RPC: texto, o un secret atado con el host escrito antes
@@ -947,6 +1061,8 @@ pub fn rpc_mask_text(t: &str) -> String {
 /// v0.6.46 (E1): manda la request ya armada: el audit de los secrets que salen, la marca para el
 /// transporte y el eco enmascarado.
 pub fn send(caps: &Rc<RefCell<CapabilitySet>>, out: &Outgoing, f: impl FnOnce() -> HttpResult) -> HttpResult {
+    // v0.6.46 (E7): la conexión es del programa: una IP privada se chequea contra sus grants.
+    let _net = program_request(caps, &out.who, out.bindings().to_vec());
     if !out.carries_secrets() {
         return f();
     }
@@ -1399,5 +1515,50 @@ mod v0646_r1_tests {
         }
         assert!(!request_forbids_redirects());
         assert!(RPC_CAPS.with(|c| c.borrow().upgrade().is_none()));
+    }
+}
+
+#[cfg(test)]
+mod v0646_e7_tests {
+    use super::*;
+
+    fn net(s: Option<&str>) -> Capability {
+        Capability::new(CapabilityType::Net, s.map(str::to_string))
+    }
+
+    /// Un secret atado con glob no va a una IP privada aunque `net` nombre el host: la atadura
+    /// también la tiene que nombrar.
+    #[test]
+    fn a_glob_binding_does_not_reach_a_private_address() {
+        let mut caps = CapabilitySet::new("t");
+        caps.grant(net(Some("a.x.com")));
+        let ip: std::net::IpAddr = "10.0.0.5".parse().unwrap();
+        let e = dest_check_with(&caps, &["*.x.com".to_string()], "http_get()", "a.x.com:443", ip).unwrap_err();
+        assert!(e.contains("a secret bound to [*.x.com]"), "{}", e);
+        assert!(dest_check_with(&caps, &["a.x.com".to_string()], "http_get()", "a.x.com:443", ip).is_ok());
+        let public: std::net::IpAddr = "93.184.216.34".parse().unwrap();
+        assert!(dest_check_with(&caps, &["*.x.com".to_string()], "http_get()", "a.x.com:443", public).is_ok());
+    }
+
+    /// Sin contexto, una IP privada se niega (un camino del programa sin contexto falla cerrado);
+    /// el motor (`host_request`) llega; el programa, según sus grants.
+    #[test]
+    fn the_caller_context_decides() {
+        let lo: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+        assert!(dest_check("localhost", 11434, lo).unwrap_err().contains("nothing named it"));
+        assert!(dest_check("api.x.com", 443, "93.184.216.34".parse().unwrap()).is_ok());
+        assert!(host_request(|| dest_check("localhost", 11434, lo)).is_ok());
+        let caps = Rc::new(RefCell::new(CapabilitySet::new("t")));
+        caps.borrow_mut().grant(net(None));
+        {
+            let _p = program_request(&caps, "http_get()", Vec::new());
+            assert!(dest_check("localhost", 11434, lo).unwrap_err().contains("require net(\"localhost:11434\")"));
+            // El motor adentro de una llamada del programa, y al salir vuelve el del programa.
+            assert!(host_request(|| dest_check("localhost", 11434, lo)).is_ok());
+            assert!(dest_check("localhost", 11434, lo).is_err());
+        }
+        caps.borrow_mut().grant(net(Some("localhost")));
+        let _p = program_request(&caps, "http_get()", Vec::new());
+        assert!(dest_check("localhost", 11434, lo).is_ok());
     }
 }

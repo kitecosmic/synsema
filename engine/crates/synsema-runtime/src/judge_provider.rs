@@ -21,7 +21,8 @@ use synsema_core::judge::{
     argmax_id, JudgeAnswer, JudgeKind, JudgeRequest, JudgeResponse, ESCAPE_DESCRIPTION, ESCAPE_ID,
 };
 use synsema_llm::judge::{JudgeCall, JudgeProvider, MockJudgeProvider};
-use synsema_stdlib::http::http_request;
+// v0.6.46 (E7): requests del motor (la configuración del host), fuera de la regla de IPs privadas.
+use synsema_stdlib::http::host::http_request;
 use synsema_stdlib::secrets::EnvStore;
 
 use crate::llm_providers::resolve_knob;

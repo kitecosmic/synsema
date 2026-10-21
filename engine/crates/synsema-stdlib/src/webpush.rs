@@ -561,13 +561,11 @@ fn push_send(caps: &Rc<RefCell<CapabilitySet>>, args: &[SynValue]) -> Result<Syn
     }
     #[cfg(feature = "native")]
     {
-        let res = crate::http::http_request_with_bytes(
-            "POST",
-            &req.endpoint,
-            Some(&req.headers),
-            req.body.as_deref(),
-            req.timeout_secs,
-        );
+        // v0.6.46 (E7): la conexión es del programa.
+        let res = {
+            let _net = crate::http_common::program_request(caps, "push_send()", Vec::new());
+            crate::http::http_request_with_bytes("POST", &req.endpoint, Some(&req.headers), req.body.as_deref(), req.timeout_secs)
+        };
         if res.status == 0 {
             return Err(err(format!(
                 "push_send: could not reach the push service at {}: {}",

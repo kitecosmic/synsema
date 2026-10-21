@@ -569,7 +569,8 @@ fn fire_approval_webhook(cfg: Arc<ApprovalWebhook>, e: synsema_llm::human::Enque
             if let Some(s) = &cfg.secret {
                 headers.push(("X-Synsema-Signature".to_string(), webhook_signature(s, &body)));
             }
-            let r = synsema_stdlib::http::http_request(
+            // v0.6.46 (E7): el webhook lo configura el host.
+            let r = synsema_stdlib::http::host::http_request(
                 "POST",
                 &cfg.url,
                 Some(&headers),
@@ -622,6 +623,14 @@ pub struct ServeOverrides {
     /// autofirmado emitido con ESA clave (el cliente la pinea). Si la plataforma no responde,
     /// el servidor NO arranca.
     pub attested: bool,
+    /// v0.6.46 (E6-h) — `--auditor` (o `SYNSEMA_AUDITOR_KEY`): la pública X25519 del auditor. Cada
+    /// request que corre código del programa deja un recibo sellado, escrito antes de la respuesta.
+    pub auditor: Option<[u8; 32]>,
+    /// v0.6.46 (E6-h) — `--receipt <ruta|fd:N>`: adónde van los recibos (una línea por request;
+    /// la ruta se abre para agregar). Sin esto, stderr.
+    pub receipt: Option<String>,
+    /// v0.6.46 (E6-h) — `SYNSEMA_RECEIPT_SEALED_BYTES`: el tamaño del texto plano del sobre.
+    pub sealed_bytes: Option<usize>,
 }
 
 impl ServeOverrides {
@@ -1811,6 +1820,11 @@ fn with_serve_interp<R>(
         BaseInterp { interp, caps, originals, _snapshot: snapshot.clone() }
     });
 
+    // v0.6.46 (E6-h): con `serve --auditor`, si este hilo atiende una request, su registro sellado
+    // queda instalado desde acá (auth, handler y handler de error van al mismo recibo).
+    if synsema_stdlib::sealed::serve_receipts_on() {
+        synsema_stdlib::sealed::request_touch();
+    }
     // T5 (ronda 7): el diario del almacén compartido cubre exactamente este request.
     arm_state_journal();
     let out = f(&mut base.interp, &base.caps);
@@ -2021,7 +2035,9 @@ fn proxy_outcome(
                     GiveOutcome::Error(e.to_string_for_client())
                 };
             }
-            GiveOutcome::Proxy(synsema_stdlib::routing::ProxyDest::Url(url))
+            // v0.6.46 (E7): con las capas de `net` del worker, para chequear la IP al conectar.
+            let net = Some(std::sync::Arc::new(caps.borrow().net_layers()));
+            GiveOutcome::Proxy(synsema_stdlib::routing::ProxyDest::Url(url, net))
         }
         ProxyTo::Handle(h) => match synsema_stdlib::ws::take_pipe_for_proxy(interp, h) {
             Some(end) => GiveOutcome::Proxy(synsema_stdlib::routing::ProxyDest::Conn(Box::new(end))),
@@ -2555,6 +2571,7 @@ fn build_host_table(
             // v0.6.42 — un `proxy to` cuyo destino no depende de la request (un literal, una
             // constante, `env(...)`) se evalúa y se chequea UNA vez al arrancar, como siempre; si
             // depende de la request o hay sentencias antes, corre como handler (`proxy_dynamic`).
+            let mut proxy_net = None;
             let proxy_target: Option<String> = if body.len() == 1 {
                 if let Some(target) = static_proxy_target(&body[0], param_names, env) {
                     let url = interp.eval(target, env)?.to_string();
@@ -2589,6 +2606,8 @@ fn build_host_table(
                     ) {
                         return Err(Control::Error(v.into_error()));
                     }
+                    // v0.6.46 (E7): las mismas capas, para chequear la IP en cada conexión.
+                    proxy_net = Some(std::sync::Arc::new(check.net_layers()));
                     Some(url)
                 } else {
                     None
@@ -2680,6 +2699,7 @@ fn build_host_table(
                 socket_handler,
                 timeout: route_timeout,
                 proxy_target,
+                proxy_net,
                 proxy_dynamic,
                 proxy_reads_body,
                 rate_unlimited,
@@ -2904,6 +2924,7 @@ fn build_host_table(
                     socket_handler,
                     timeout: route_timeout,
                     proxy_target: None,
+                    proxy_net: None,
                     proxy_dynamic: mounted_proxy,
                     proxy_reads_body: mounted_proxy && mounted_reads_body,
                     rate_unlimited,
@@ -3711,6 +3732,45 @@ fn make_serve_hook(
             None
         };
         let use_tls = tls_config.is_some() || tls_auto_eff;
+
+        // v0.6.46 (E6-h): `serve --auditor`. El recibo de cada request se escribe antes de su
+        // respuesta; una ruta `stream`/`socket` manda su body mientras corre, antes de que el recibo
+        // exista: con auditor se rechaza al cargar. Firma la clave atestada bajo `--attested`, la de
+        // `SYNSEMA_IDENTITY_KEY` si la hay, o una efímera del proceso (el header dice cuál).
+        if let Some(auditor) = overrides.auditor {
+            for (label, rs) in std::iter::once(("", &routes)).chain(built_vhosts.iter().map(|v| (v.pattern.as_str(), &v.routes))) {
+                if let Some(r) = rs.iter().find(|r| r.streaming || r.socket) {
+                    return Err(Control::Error(RuntimeError::new(format!(
+                        "serve --auditor: route `{} {}`{} is a {} route: its body leaves while it runs, before the request's sealed receipt exists",
+                        r.method,
+                        r.path,
+                        if label.is_empty() { String::new() } else { format!(" (host {})", label) },
+                        if r.socket { "socket" } else { "stream" }
+                    ))));
+                }
+            }
+            if !synsema_stdlib::sealed::serve_receipts_on() {
+                let key = match &attested_identity {
+                    Some(id) => synsema_stdlib::sealed::RunKey::from_attested_scalar(&id.private_scalar)
+                        .map_err(|e| Control::Error(RuntimeError::new(format!("serve --auditor: {}", e))))?,
+                    None => match identity_key_from_env() {
+                        Some(seed) => synsema_stdlib::sealed::RunKey::from_identity_seed(&seed),
+                        None => synsema_stdlib::sealed::RunKey::ephemeral(),
+                    },
+                };
+                let program_sha = synsema_stdlib::attest::current_program_sha().map(|s| synsema_core::bytesutil::hex_encode(&s));
+                let config_sha = attested_identity.as_ref().map(|id| synsema_core::bytesutil::hex_encode(&id.config_sha));
+                synsema_stdlib::sealed::install_serve_receipts(
+                    auditor,
+                    overrides.sealed_bytes.unwrap_or(synsema_stdlib::sealed::DEFAULT_SEALED_BYTES),
+                    key,
+                    program_sha,
+                    config_sha,
+                    overrides.receipt.as_deref(),
+                )
+                .map_err(|e| Control::Error(RuntimeError::new(format!("serve --auditor: {}", e))))?;
+            }
+        }
 
         let n_routes = routes.len();
         let mut runtime = ServeRuntime::new(

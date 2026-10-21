@@ -253,9 +253,60 @@ const MAX_LINK_HOPS: usize = 40;
 #[cfg(not(target_arch = "wasm32"))]
 pub fn physical_path(p: &str) -> Physical {
     match absolute_lexical(p) {
-        Some(abs) => resolve_physical(abs),
+        Some(abs) => match overridden(&abs) {
+            Some(real) => Physical::Path(real),
+            None => resolve_physical(abs),
+        },
         None => Physical::Unresolved,
     }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+thread_local! {
+    /// v0.6.46 (E8): (ruta léxica absoluta, dónde está de verdad) de un archivo YA ABIERTO. Mientras
+    /// dura `with_physical`, el chequeo de siempre juzga esa ruta por la ubicación real del handle,
+    /// no por una segunda resolución del nombre: lo que se juzga es lo que se va a leer o escribir.
+    static PHYSICAL_OVERRIDE: std::cell::RefCell<Option<(String, String)>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn overridden(abs: &str) -> Option<String> {
+    PHYSICAL_OVERRIDE.with(|o| o.borrow().as_ref().filter(|(k, _)| k == abs).map(|(_, v)| v.clone()))
+}
+
+/// v0.6.46 (E8): corre `f` (el chequeo de capabilities) juzgando la ruta `req` por `real`, la
+/// ubicación en disco de un handle ya abierto (sin links: la da el sistema). Restaura lo anterior.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn with_physical<T>(req: &str, real: &str, f: impl FnOnce() -> T) -> T {
+    struct Restore(Option<(String, String)>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let prev = self.0.take();
+            PHYSICAL_OVERRIDE.with(|o| *o.borrow_mut() = prev);
+        }
+    }
+    let key = absolute_lexical(req).unwrap_or_else(|| req.to_string());
+    let prev = PHYSICAL_OVERRIDE.with(|o| o.replace(Some((key, clean_verbatim(real)))));
+    let _r = Restore(prev);
+    f()
+}
+
+/// En wasm no hay disco que juzgar (`absolute_path` es `None` y nunca se llega acá con un handle).
+#[cfg(target_arch = "wasm32")]
+pub fn with_physical<T>(_req: &str, _real: &str, f: impl FnOnce() -> T) -> T {
+    f()
+}
+
+/// v0.6.46 (E8): la ruta absoluta léxica (cwd + ruta normalizada, sin tocar links), con `/`: la
+/// misma forma que juzga el chequeo, para abrirla sin seguir links.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn absolute_path(p: &str) -> Option<String> {
+    absolute_lexical(p)
+}
+
+#[cfg(target_arch = "wasm32")]
+pub fn absolute_path(_p: &str) -> Option<String> {
+    None
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -507,12 +558,23 @@ fn link_below_base(_base: &str, _req: &str) -> Option<bool> {
     Some(false)
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+fn has_override() -> bool {
+    PHYSICAL_OVERRIDE.with(|o| o.borrow().is_some())
+}
+
+#[cfg(target_arch = "wasm32")]
+fn has_override() -> bool {
+    false
+}
+
 /// v0.6.45 — ¿la ruta pedida queda, en disco, dentro del scope? La otra mitad de `path_covers`
 /// (que compara nombres): con un link debajo del scope que lleva afuera, por nombre está dentro y
 /// en disco no. Sin disco (wasm) decide el nombre; si algo no se puede resolver, no.
 pub fn path_within_physically(scope: &str, req: &str) -> bool {
     let (literal, _) = split_scope(scope);
-    if link_below_base(&literal, req) == Some(false) {
+    // v0.6.46 (E8): con la ubicación real de un handle (`with_physical`), sin el atajo por nombre.
+    if !has_override() && link_below_base(&literal, req) == Some(false) {
         return true;
     }
     match (physical_scope_parts(scope), physical_path(req)) {

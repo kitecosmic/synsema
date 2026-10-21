@@ -68,8 +68,9 @@ fn label_to_syn(l: &[Rc<str>]) -> SynValue {
 }
 
 /// `YYYY-MM-DDTHH:MM:SSZ` de un instante unix (calendario proléptico gregoriano; el
-/// algoritmo civil-from-days de Hinnant). Sin dependencia nueva.
-fn rfc3339_utc(secs: i64) -> String {
+/// algoritmo civil-from-days de Hinnant). Sin dependencia nueva. `pub` desde v0.6.46: el header del
+/// recibo sellado (CLI) también lo usa.
+pub fn rfc3339_utc(secs: i64) -> String {
     let days = secs.div_euclid(86_400);
     let sod = secs.rem_euclid(86_400);
     let z = days + 719_468;

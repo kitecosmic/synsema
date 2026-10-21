@@ -455,9 +455,9 @@ impl HostRouter {
                             None => continue,
                         },
                     };
-                    let data = match std::fs::read(&target) {
-                        Ok(d) => d,
-                        Err(_) => continue,
+                    let data = match read_within(base, &target) {
+                        Some(d) => d,
+                        None => continue,
                     };
                     let ct = static_content_type(&target);
                     let etag = etag_for(&target, data.len());
@@ -1727,7 +1727,8 @@ impl ServeRuntime {
         // en sí lo hace el lado async (`proxy_request`) en streaming: SSE, upgrade
         // webSocket (túnel) y bodies grandes pasan a medida que llegan.
         if let Some(target) = &host.routes[idx].proxy_target {
-            return Dispatched::Proxy { target: crate::routing::ProxyDest::Url(target.clone()), headers: rate_headers };
+            let net = host.routes[idx].proxy_net.clone();
+            return Dispatched::Proxy { target: crate::routing::ProxyDest::Url(target.clone(), net), headers: rate_headers };
         }
 
         // Socket entrante (ruta `socket`): ocupa un slot de stream (conexión larga con
@@ -1860,6 +1861,23 @@ fn norm_prefix(prefix: &str) -> String {
 
 fn within(base: &Path, target: &Path) -> bool {
     target == base || target.starts_with(base)
+}
+
+/// v0.6.46 (E8): lee `target` (ya resuelto adentro de `base` por `resolve_in`) sin ventana entre
+/// ese chequeo y la apertura: sin links en el camino se abre exactamente ese archivo, y con un link
+/// (uno que se cambió después de resolver) se juzga dónde quedó abierto.
+fn read_within(base: &Path, target: &Path) -> Option<Vec<u8>> {
+    use std::io::Read;
+    let inside = |real: &str| if within(base, Path::new(real)) { Ok(()) } else { Err(()) };
+    let mut f = synsema_capabilities::nofollow::open_checked(
+        &target.to_string_lossy(),
+        synsema_capabilities::nofollow::OpenFor::READ,
+        &inside,
+    )
+    .ok()?;
+    let mut data = Vec::new();
+    f.read_to_end(&mut data).ok()?;
+    Some(data)
 }
 
 /// Resuelve `rel` a un archivo real dentro de `base` (anti-traversal), o None.
@@ -3389,12 +3407,37 @@ async fn proxy_request(
     type ProxySender = hyper::client::conn::http1::SendRequest<ProxyReqBody>;
     let wait = Duration::from_secs_f64(timeout.filter(|t| t.is_finite() && *t > 0.0).unwrap_or(30.0));
     let (mut sender, authority, base): (ProxySender, String, String) = match plan.target {
-        crate::routing::ProxyDest::Url(url) => {
+        crate::routing::ProxyDest::Url(url, net) => {
             let (addr, authority, base) = match parse_proxy_target(&url) {
                 Ok(x) => x,
                 Err(e) => return proxy_error_response(502, format!("proxy error: {}", e), &extra, cors.as_deref(), hsts),
             };
-            let tcp = match tokio::time::timeout(wait, tokio::net::TcpStream::connect(&addr)).await {
+            // v0.6.46 (E7): se resuelve una vez, la IP se chequea contra las capas de `net` del
+            // programa y se conecta a ésa.
+            let sa = match tokio::time::timeout(wait, tokio::net::lookup_host(addr.clone())).await {
+                Ok(Ok(mut it)) => match it.next() {
+                    Some(sa) => sa,
+                    None => return proxy_error_response(502, format!("proxy error: cannot resolve {}", addr), &extra, cors.as_deref(), hsts),
+                },
+                Ok(Err(e)) => return proxy_error_response(502, format!("proxy error: resolve {}: {}", addr, e), &extra, cors.as_deref(), hsts),
+                Err(_) => {
+                    return proxy_error_response(
+                        504,
+                        format!("gateway timeout: resolving the upstream {} took more than {}s", addr, wait.as_secs_f64()),
+                        &extra,
+                        cors.as_deref(),
+                        hsts,
+                    )
+                }
+            };
+            if let Some(net) = &net {
+                let dest = addr.to_ascii_lowercase();
+                if let Err(cause) = net.admits(&dest, sa.ip()) {
+                    let m = synsema_capabilities::model::private_dest_message("proxy to", &dest, sa.ip(), &cause);
+                    return proxy_error_response(502, format!("proxy error: {}", m), &extra, cors.as_deref(), hsts);
+                }
+            }
+            let tcp = match tokio::time::timeout(wait, tokio::net::TcpStream::connect(sa)).await {
                 Ok(Ok(s)) => s,
                 Ok(Err(e)) => {
                     return proxy_error_response(502, format!("proxy error: connect {}: {}", addr, e), &extra, cors.as_deref(), hsts)
@@ -4191,7 +4234,14 @@ async fn handle_request(
         let bf = body_file.as_ref().map(|p| p.to_string_lossy().into_owned());
         let accept_gzip =
             header_value(&headers, "accept-encoding").to_ascii_lowercase().contains("gzip");
-        let dispatched = rt2.dispatch(
+        // v0.6.46 (E6-h): con `serve --auditor`, el registro de la request nace con el primer código
+        // del programa que corre para ella y su recibo se escribe ANTES de mandar la respuesta. Si no
+        // se pudo escribir, la respuesta no sale: va un 500.
+        let receipts = crate::sealed::serve_receipts_on();
+        if receipts {
+            crate::sealed::request_arm();
+        }
+        let mut dispatched = rt2.dispatch(
             &eff_method,
             &path,
             query,
@@ -4203,6 +4253,16 @@ async fn handle_request(
             cancel_job.clone(),
             body_streamed,
         );
+        if receipts {
+            if let Err(e) = crate::sealed::request_finish() {
+                eprintln!("[serve] {}", e);
+                dispatched = Dispatched::Response {
+                    status: 500,
+                    body: ResponseBody::Json(obj(vec![("error", Json::Str("the sealed receipt could not be delivered".to_string()))])),
+                    headers: vec![],
+                };
+            }
+        }
         match dispatched {
             Dispatched::Response { status, body, headers: extra } => {
                 let mut extra = extra;
@@ -5267,5 +5327,44 @@ mod tests {
         let q = indexmap::IndexMap::new();
         let (st_direct, _) = build_response(Some(&inner), &q).unwrap();
         assert_eq!(st_direct, 201);
+    }
+
+    /// v0.6.46 (E8): el archivo ya resuelto adentro de la carpeta servida, y DESPUÉS una carpeta del
+    /// camino pasa a ser un link afuera: no se sirve lo de afuera. Un link que queda adentro, sí.
+    #[cfg(any(target_os = "linux", windows))]
+    #[test]
+    fn e8_static_read_is_judged_where_it_opened() {
+        fn link_dir(target: &Path, link: &Path) {
+            #[cfg(windows)]
+            assert!(std::process::Command::new("cmd")
+                .args(["/C", "mklink", "/J"])
+                .arg(link.to_string_lossy().replace('/', "\\"))
+                .arg(target.to_string_lossy().replace('/', "\\"))
+                .output()
+                .unwrap()
+                .status
+                .success());
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(target, link).unwrap();
+        }
+        let d = std::env::temp_dir().join(format!("synsema-e8-static-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("public/css")).unwrap();
+        std::fs::create_dir_all(d.join("public/otra")).unwrap();
+        std::fs::create_dir_all(d.join("afuera")).unwrap();
+        std::fs::write(d.join("public/css/a.css"), "adentro").unwrap();
+        std::fs::write(d.join("public/otra/a.css"), "otra").unwrap();
+        std::fs::write(d.join("afuera/a.css"), "SECRETO").unwrap();
+        let base = d.join("public").canonicalize().unwrap();
+        let target = resolve_in(&base, "css/a.css").unwrap();
+        assert_eq!(read_within(&base, &target).unwrap(), b"adentro");
+        std::fs::remove_dir_all(d.join("public/css")).unwrap();
+        link_dir(&d.join("afuera"), &d.join("public/css"));
+        assert!(read_within(&base, &target).is_none(), "sirvió lo de afuera");
+        let _ = std::fs::remove_dir(d.join("public/css"));
+        let _ = std::fs::remove_file(d.join("public/css"));
+        link_dir(&d.join("public/otra"), &d.join("public/css"));
+        assert_eq!(read_within(&base, &target).unwrap(), b"otra");
+        let _ = std::fs::remove_dir_all(&d);
     }
 }

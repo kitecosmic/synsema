@@ -122,7 +122,11 @@ fn app_name() -> &'static str {
 
 /// Techo del programa: sólo `stdout` (los `print` se recogen como logs). Sin `time` ni `random`
 /// ni nada del host: el mismo input da siempre los mismos bytes.
-const CEILING: &str = "stdout";
+///
+/// v0.6.46 (E3): `declassify` es una capability que el techo acota. El único principal de Vela es
+/// `app` (`PRINCIPAL_APP`) y la app publica sus resultados (el código de error, el recibo de un
+/// retiro) con su propio `declassify`: el techo lo nombra. Otro principal no se puede publicar.
+const CEILING: &str = "stdout,declassify=app";
 
 const REQUEST_PROCESS: i32 = 1;
 const REQUEST_DEANONYMIZATION: i32 = 2;

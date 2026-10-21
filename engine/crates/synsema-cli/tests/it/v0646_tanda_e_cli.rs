@@ -789,7 +789,8 @@ fn e3b_trusted_tool_does_not_run_program_code_through_builtins() {
     );
     std::fs::write(dir.join("app.syn"), &app).unwrap();
     std::fs::write(dir.join("w.syn"), tools).unwrap();
-    let (code, out, err) = synsema(&dir, &["run", "--labels", "--cap-set", "stdout,net", "--trusted", "w=w.syn", "app.syn"], None);
+    // v0.6.46 (E7): un techo `net` con comodín ya no llega al loopback; el host lo nombra.
+    let (code, out, err) = synsema(&dir, &["run", "--labels", "--cap-set", "stdout,net=127.0.0.1", "--trusted", "w=w.syn", "app.syn"], None);
     assert!(code != 0 && !out.contains("FUGA-WS") && !err.contains("4111"), "{} {}", out, err);
     assert!(err.contains("a trusted tool cannot run the program's task 'malo'"), "{}", err);
     // Ronda 3 (N1): el error dice la línea del `ws_recv` de la tool, no `<engine>:0:0`.
@@ -857,4 +858,292 @@ print(h.recibo({\"nombre\": \"Ana\", \"tarjeta\": \"4111-1111-1111-1111\"}))
     assert!(out.contains("<b>antes</b>") && out.contains("hola") && out.contains("<b>después</b>"), "{} {}", out, err);
     assert!(code != 0 && err.contains("a trusted tool cannot render templates yet ('recibo.html')"), "{} {}", out, err);
     assert!(!out.contains("4111"), "{} {}", out, err);
+}
+
+// ---------------------------------------------------------------------------------------------
+// E6 — el recibo sellado (`--auditor`).
+// ---------------------------------------------------------------------------------------------
+
+/// Un par de claves de auditor: `(privada, pública)` en base64url.
+fn auditor_keys() -> (String, String) {
+    synsema_stdlib::sealed::generate_keypair()
+}
+
+/// El recibo que `run` escribió en stderr (la última línea JSON con `synsema_receipt`).
+fn receipt_in(stderr: &str) -> serde_json::Value {
+    stderr
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter(|v| v.get("synsema_receipt").is_some())
+        .last()
+        .unwrap_or_else(|| panic!("no hay recibo en stderr:\n{}", stderr))
+}
+
+fn open_receipt(r: &serde_json::Value, sk: &str) -> serde_json::Value {
+    let sk = synsema_core::bytesutil::b64url_decode(sk).unwrap();
+    synsema_stdlib::sealed::open_receipt(r, &sk).expect("el auditor abre el recibo")
+}
+
+const SIGN_PRE: &str = "require secret(\"K\")\nrequire sign(\"K\")\nlet k be secret(\"K\")\nlet p be private(1, [\"cliente\"])\n";
+const K_HEX: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+
+/// Sin auditor, una firma en una rama privada falla como siempre (`e6_without_auditor_nothing_changes`);
+/// con auditor corre, y su línea de audit va al sobre, no al log público.
+#[test]
+fn e6_sign_in_private_branch_goes_to_the_envelope() {
+    let dir = project("e6sign");
+    let audit = dir.join("audit");
+    let audit_s = audit.to_string_lossy().into_owned();
+    std::fs::write(dir.join("p.syn"), format!("{}when p == 1\n    let s be ed25519_sign(\"hola\", k)\nprint(\"listo\")\n", SIGN_PRE)).unwrap();
+    let env = [("K", K_HEX), ("SYNSEMA_AUDIT_DIR", audit_s.as_str())];
+
+    let (code, out, err) = synsema_env(&dir, &["run", "--labels", "p.syn"], None, &env);
+    assert_ne!(code, 0, "sin auditor sigue siendo un error: {}{}", out, err);
+    assert!(!out.contains("listo"));
+    assert!(!audit.join("sign.log").exists());
+
+    let (sk, pk) = auditor_keys();
+    let (code, out, err) = synsema_env(&dir, &["run", "--labels", "--auditor", &pk, "p.syn"], None, &env);
+    assert_eq!(code, 0, "{}", err);
+    assert_eq!(out.trim(), "listo");
+    assert!(!audit.join("sign.log").exists(), "la línea no va al log público");
+    let opened = open_receipt(&receipt_in(&err), &sk);
+    let entries = opened["entries"].as_array().unwrap();
+    assert!(
+        entries.iter().any(|e| e["sealed"] == true && e["entry"]["kind"] == "op" && e["entry"]["log"] == "sign.log"),
+        "{:?}",
+        entries
+    );
+}
+
+/// `spend` no tiene excepción: en una rama privada se rechaza también con auditor.
+#[test]
+fn e6_spend_still_refused() {
+    let dir = project("e6spend");
+    let audit = dir.join("audit");
+    let audit_s = audit.to_string_lossy().into_owned();
+    // Los argumentos se arman fuera de la rama: un literal escrito adentro ya lleva la etiqueta del PC,
+    // y entonces lo rechazaría el chequeo del argumento, no el de `spend`.
+    std::fs::write(
+        dir.join("p.syn"),
+        "require spend(\"E6U\")\nlet a be 1\nlet u be \"E6U\"\nlet why be \"x\"\nlet p be private(1, [\"cliente\"])\nwhen p == 1\n    spend(a, u, why)\nprint(\"paso\")\n",
+    )
+    .unwrap();
+    let (_, pk) = auditor_keys();
+    let (code, out, err) = synsema_env(&dir, &["run", "--labels", "--auditor", &pk, "p.syn"], None, &[("SYNSEMA_AUDIT_DIR", audit_s.as_str())]);
+    assert_ne!(code, 0, "{}{}", out, err);
+    assert!(!out.contains("paso"));
+    assert!(!audit.join("spend.log").exists());
+}
+
+/// El recibo sale antes que la salida: primero en `--format json`, y en el modo normal la salida no
+/// va en vivo (se junta y se imprime después de entregar el recibo).
+#[test]
+fn e6_receipt_before_outputs() {
+    let dir = project("e6order");
+    let (_, pk) = auditor_keys();
+    std::fs::write(dir.join("p.syn"), "print(\"hola\")\n").unwrap();
+    let (code, out, err) = synsema(&dir, &["run", "--format", "json", "--auditor", &pk, "p.syn"], None);
+    assert_eq!(code, 0, "{}", err);
+    assert!(out.trim_start().starts_with("{\"receipt\":"), "{}", &out[..out.len().min(80)]);
+
+    std::fs::write(dir.join("p.syn"), "require stdin\nprint(\"a\")\nlet x be read_line(\"> \")\nprint(x)\n").unwrap();
+    // Sin auditor el `print` sale en vivo (control del método); con auditor, no.
+    let first_chunk = |extra: &[&str]| live_first_chunk(&dir, extra, if extra.is_empty() { 20 } else { 3 });
+    let (seen, mut child, _) = first_chunk(&[]);
+    assert_eq!(seen.as_deref().and_then(|s| s.lines().next()), Some("a"), "sin auditor el print sale en vivo");
+    drop(child.stdin.take());
+    let _ = child.wait();
+
+    let receipt = dir.join("r.json");
+    let receipt_s = receipt.to_string_lossy().into_owned();
+    let (seen, mut child, rx) = first_chunk(&["--auditor", &pk, "--receipt", &receipt_s]);
+    assert_eq!(seen, None, "con auditor nada sale antes del recibo");
+    child.stdin.take().unwrap().write_all(b"b\n").unwrap();
+    assert!(child.wait().unwrap().success());
+    assert!(receipt.exists(), "el recibo quedó escrito");
+    // El prompt también se juntó: sale después del recibo, como una línea más.
+    let out = rx.iter().last().unwrap_or_default();
+    assert_eq!(out.lines().collect::<Vec<_>>(), ["a", "> ", "b"]);
+}
+
+/// `--replay` con el recibo abierto reproduce `random()`, `random_int` y `now()`; un input cambiado
+/// para la corrida y dice cuál.
+#[test]
+fn e6_replay() {
+    let dir = project("e6replay");
+    std::fs::write(dir.join("datos.txt"), "uno").unwrap();
+    std::fs::write(
+        dir.join("p.syn"),
+        "require random\nrequire time\nrequire file.read(\"datos.txt\")\nlet d be read_file(\"datos.txt\")\nprint(d)\nprint(random())\nprint(random_int(1, 1000000))\nprint(now())\n",
+    )
+    .unwrap();
+    let (sk, pk) = auditor_keys();
+    let (code, out1, err) = synsema(&dir, &["run", "--auditor", &pk, "p.syn"], None);
+    assert_eq!(code, 0, "{}", err);
+    let opened = open_receipt(&receipt_in(&err), &sk);
+    std::fs::write(dir.join("opened.json"), opened.to_string()).unwrap();
+    let (code, out2, err) = synsema(&dir, &["run", "--replay", "opened.json", "p.syn"], None);
+    assert_eq!(code, 0, "{}", err);
+    assert_eq!(out1, out2, "la corrida se reproduce idéntica");
+    let (_, out3, _) = synsema(&dir, &["run", "p.syn"], None);
+    assert_ne!(out1, out3, "control: sin replay, otra semilla y otra hora");
+
+    std::fs::write(dir.join("datos.txt"), "dos").unwrap();
+    let (code, _, err) = synsema(&dir, &["run", "--replay", "opened.json", "p.syn"], None);
+    assert_eq!(code, 1);
+    assert!(err.contains("replay: input #") && err.contains("differs"), "{}", err);
+}
+
+/// Corre `synsema run <extra> p.syn` con stdin abierto y devuelve lo primero que salió por stdout dentro
+/// de `secs` (`None`: nada), el hijo (para escribirle stdin) y el canal con lo acumulado.
+fn live_first_chunk(dir: &PathBuf, extra: &[&str], secs: u64) -> (Option<String>, std::process::Child, std::sync::mpsc::Receiver<String>) {
+    let mut args = vec!["run"];
+    args.extend_from_slice(extra);
+    args.push("p.syn");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_synsema"))
+        .args(&args)
+        .current_dir(dir)
+        .env("SYNSEMA_NO_UPDATE_CHECK", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut stdout = child.stdout.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut all = Vec::new();
+        let mut buf = [0u8; 64];
+        loop {
+            match std::io::Read::read(&mut stdout, &mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    all.extend_from_slice(&buf[..n]);
+                    let _ = tx.send(String::from_utf8_lossy(&all).into_owned());
+                }
+            }
+        }
+    });
+    let seen = rx.recv_timeout(std::time::Duration::from_secs(secs)).ok();
+    (seen, child, rx)
+}
+
+/// El prompt de `read_line` es un sumidero público como `print` (con `--labels`): un prompt privado
+/// o uno dentro de una rama privada es `label_violation` y no sale. Leer sin prompt en una rama
+/// privada sigue permitido, y sin etiquetas nada cambia.
+#[test]
+fn read_line_prompt_is_a_public_sink() {
+    let dir = project("prompt");
+    let cases = [
+        ("let p be private(\"pin 4321\", \"app\")\nlet x be read_line(p)\nprint(\"fin\")\n", false),
+        ("let s be private(5, \"app\")\nwhen s > 3\n    let x be read_line(\"rama> \")\nprint(\"fin\")\n", false),
+        ("let s be private(5, \"app\")\nwhen s > 3\n    let x be read_line()\nprint(\"fin\")\n", true),
+    ];
+    for (body, ok) in cases {
+        std::fs::write(dir.join("p.syn"), format!("require stdin\n{}", body)).unwrap();
+        let (code, out, err) = synsema(&dir, &["run", "--labels", "p.syn"], Some("hola\n"));
+        assert_eq!(code == 0, ok, "{}\n{}{}", body, out, err);
+        assert!(!out.contains("4321") && !out.contains("rama>"), "el prompt salió: {}", out);
+        if !ok {
+            assert!(err.contains("label_violation") || err.contains("Runtime error"), "{}", err);
+        }
+    }
+    std::fs::write(dir.join("p.syn"), "require stdin\nlet x be read_line(\"nombre> \")\nprint(x)\n").unwrap();
+    let (code, out, _) = synsema(&dir, &["run", "p.syn"], Some("ana\n"));
+    assert_eq!((code, out.as_str()), (0, "nombre> ana\n"));
+}
+
+/// Con `--labels`, `flush()` y `read_line` no vacían la salida en vivo (como `print`, que con etiquetas
+/// ya no transmite): si no, cuántas líneas salieron antes dependería de la rama. Sin etiquetas, sí.
+#[test]
+fn flush_does_not_drain_under_labels() {
+    let dir = project("flushlab");
+    std::fs::write(dir.join("p.syn"), "require stdin\nprint(\"a\")\nflush()\nlet x be read_line()\nprint(x)\n").unwrap();
+    let (seen, mut child, _) = live_first_chunk(&dir, &[], 20);
+    assert_eq!(seen.as_deref().and_then(|s| s.lines().next()), Some("a"), "sin etiquetas flush vacía");
+    drop(child.stdin.take());
+    let _ = child.wait();
+    let (seen, mut child, rx) = live_first_chunk(&dir, &["--labels"], 3);
+    assert_eq!(seen, None, "con etiquetas nada sale antes de terminar");
+    child.stdin.take().unwrap().write_all(b"b\n").unwrap();
+    assert!(child.wait().unwrap().success());
+    assert_eq!(rx.iter().last().unwrap_or_default().lines().collect::<Vec<_>>(), ["a", "b"]);
+}
+
+/// v0.6.46 (E7): un `net` con comodín sólo llega a IPs públicas. Loopback, link-local (los metadatos
+/// de la nube) y las formas que esconden una (IPv4 mapeada en IPv6, decimal) se niegan antes de
+/// conectar; nombrar el host, la IP o el CIDR las deja.
+#[test]
+fn e7_wildcard_net_reaches_only_public_addresses() {
+    let (port, seen) = recorder();
+    let dir = project("e7-wild");
+    let run = |pre: &str, url: &str, extra: &[&str]| {
+        let body = format!("let r be http_get(\"{}\")\nwhen r.ok\n    print(\"ok\")\notherwise\n    print(r.error)\n", url);
+        std::fs::write(dir.join("p.syn"), format!("{}\n{}", pre, body)).unwrap();
+        let mut args = vec!["run"];
+        args.extend_from_slice(extra);
+        args.push("p.syn");
+        synsema(&dir, &args, None)
+    };
+    let local = format!("http://127.0.0.1:{}/", port);
+    for (pre, url) in [
+        ("require net", local.clone()),
+        ("require net(\"*\")", local.clone()),
+        ("require net", format!("http://localhost:{}/", port)),
+        ("require net", format!("http://[::ffff:127.0.0.1]:{}/", port)),
+        ("require net", "http://169.254.169.254/latest/meta-data/".to_string()),
+    ] {
+        let (code, out, err) = run(pre, &url, &[]);
+        assert_eq!(code, 0, "{}", err);
+        assert!(out.contains("a private address") && out.contains("require net("), "{} {}: {}", pre, url, out);
+    }
+    // Un decimal que el resolver lee como 127.0.0.1: tampoco llega (o no resuelve).
+    let (_, out, _) = run("require net", &format!("http://2130706433:{}/", port), &[]);
+    assert!(!out.trim().is_empty() && out.trim() != "ok", "{}", out);
+    assert!(seen.lock().unwrap().is_empty(), "llegó al servidor: {:?}", seen.lock().unwrap());
+    // Nombrado: el host exacto, la IP o el CIDR junto al comodín.
+    for pre in ["require net(\"127.0.0.1\")", "require net\nrequire net(\"127.0.0.0/8\")"] {
+        let (code, out, err) = run(pre, &local, &[]);
+        assert_eq!((code, out.trim()), (0, "ok"), "{}: {}{}", pre, out, err);
+    }
+    // `localhost` puede resolver primero a `::1` (Windows) y el servidor escucha en IPv4: sólo se
+    // mira que la regla la deja pasar.
+    let (code, out, err) = run(&format!("require net(\"localhost:{}\")", port), &format!("http://localhost:{}/", port), &[]);
+    assert!(code == 0 && !out.contains("a private address"), "{}{}", out, err);
+    let n = seen.lock().unwrap().len();
+    assert!(n == 2 || n == 3, "{}", n);
+    // El techo del host con comodín tampoco: el host la tiene que nombrar.
+    let (_, out, _) = run("require net(\"127.0.0.1\")", &local, &["--cap-set", "net,stdout"]);
+    assert!(out.contains("host ceiling") && out.contains("--cap-set net=127.0.0.1:"), "{}", out);
+    let (_, out, _) = run("require net(\"127.0.0.1\")", &local, &["--cap-set", "net=127.0.0.1,stdout"]);
+    assert_eq!(out.trim(), "ok");
+    assert_eq!(seen.lock().unwrap().len(), n + 1);
+}
+
+/// E7 en los otros clientes del programa: TCP, WebSocket, RPC.
+#[test]
+fn e7_every_client_checks_the_address() {
+    let (port, seen) = recorder();
+    let dir = project("e7-clients");
+    for call in [
+        format!("tcp_connect(\"127.0.0.1\", {})", port),
+        format!("ws_connect(\"ws://127.0.0.1:{}/\")", port),
+        format!("evm_chain_id(\"http://127.0.0.1:{}/\")", port),
+    ] {
+        std::fs::write(dir.join("p.syn"), format!("require net\nlet c be {}\n", call)).unwrap();
+        let (code, _, err) = synsema(&dir, &["run", "p.syn"], None);
+        assert_ne!(code, 0, "{}", call);
+        assert!(err.contains("a private address"), "{}: {}", call, err);
+    }
+    assert!(seen.lock().unwrap().is_empty(), "{:?}", seen.lock().unwrap());
+    // Un secret atado al loopback que `net` nombra, sale (la atadura con glob que no nombra la IP:
+    // test de `http_common`).
+    std::fs::write(
+        dir.join("p.syn"),
+        format!("require net(\"127.0.0.1\")\nrequire secret(\"E1C_KEY\") for net(\"127.0.0.1\")\nlet k be secret(\"E1C_KEY\")\nlet r be http_get(`http://127.0.0.1:{port}/v2/{{k}}`)\nprint(r.body)\n"),
+    )
+    .unwrap();
+    let (code, out, err) = synsema_env(&dir, &["run", "p.syn"], None, &[("E1C_KEY", E1_VALUE)]);
+    assert_eq!((code, out.trim()), (0, "ok"), "{}", err);
 }

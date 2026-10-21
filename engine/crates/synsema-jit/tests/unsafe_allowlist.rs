@@ -23,6 +23,14 @@ const ALLOWED: &[&str] = &[
     "engine/crates/synsema-cli/src/stdio.rs",
     "engine/crates/synsema-stdlib/src/proc.rs",
     "engine/crates/synsema-stdlib/src/attest.rs",
+    // v0.6.46 (E8): abrir un archivo sin seguir links en Windows (`NtCreateFile` con
+    // `OBJ_DONT_REPARSE`, `GetFinalPathNameByHandleW`). Linux va por rustix, sin `unsafe`.
+    "engine/crates/synsema-capabilities/src/nofollow.rs",
+    // v0.6.46 (E6): `--receipt fd:N` en Unix escribe el recibo sellado en un descriptor que pasó el
+    // proceso padre (`File::from_raw_fd` en `ManuallyDrop`, sin cerrarlo), como `--audit fd:N` en
+    // `main.rs`.
+    "engine/crates/synsema-cli/src/sealed_receipt.rs",
+    "engine/crates/synsema-stdlib/src/sealed.rs",
     // Archivos de pesos mapeados en memoria y SIMD de la inferencia local.
     "engine/crates/synsema-infer/src/backend_rust.rs",
     "engine/crates/synsema-infer/src/mapped.rs",

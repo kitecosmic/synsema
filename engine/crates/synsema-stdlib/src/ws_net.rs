@@ -401,7 +401,15 @@ pub(super) fn tcp_connect(i: &mut Interpreter, args: &[SynValue], reg: &Registry
         };
         let mut last = None;
         let mut found = None;
+        // v0.6.46 (E7): cada dirección se chequea antes de probarla; una privada que ninguna capa
+        // nombra no se prueba, y si no queda otra, el error lo dice.
+        let caps = reg.borrow().caps.clone();
+        let mut refused = None;
         for a in addrs {
+            if let Err(m) = crate::http_common::dest_check_with(&caps.borrow(), &[], "tcp_connect()", &scope, a.ip()) {
+                refused.get_or_insert(m);
+                continue;
+            }
             match std::net::TcpStream::connect_timeout(&a, timeout.max(Duration::from_millis(1))) {
                 Ok(s) => {
                     found = Some(s);
@@ -412,6 +420,7 @@ pub(super) fn tcp_connect(i: &mut Interpreter, args: &[SynValue], reg: &Registry
         }
         match found {
             Some(s) => s,
+            None if last.is_none() && refused.is_some() => return Err(err(refused.unwrap_or_default())),
             None => {
                 return Err(err(format!(
                     "{}: cannot connect to {}: {}",

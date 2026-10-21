@@ -1120,6 +1120,11 @@ pub type TrustedScopeHook = Rc<dyn Fn(Option<(&str, &[(String, Option<String>)])
 /// `declassify` (el real variaría con el valor elegido). Sin hook, nada privado llega al modelo.
 pub type LlmDataHook = Rc<dyn Fn(&str, &[Rc<str>], &str, bool) -> bool>;
 
+/// v0.6.46 (E8) — abre un template del disco ya gateado (`raw` como se escribió, `target` la ruta
+/// resuelta bajo el cwd) sin ventana entre el gate y la apertura. Lo cablea el motor (que tiene con
+/// qué abrir sin seguir links); sin él, el template se lee por nombre, como v0.6.45.
+pub type TemplateOpenHook = Rc<dyn Fn(&str, &std::path::Path) -> Result<std::fs::File, RuntimeError>>;
+
 // --- FASE 1 tool-calling: el callback de paso del LLM (tipos PLANOS) ---
 // core NO depende de `synsema-llm` (la dep va al revés vía runtime). Igual que
 // `llm_callback`, el motor cablea este callback con el provider real; core sólo
@@ -1685,6 +1690,8 @@ pub struct Interpreter {
     /// confianza o una tool en curso). Adentro, lo que correría en otro intérprete con los globales
     /// del programa (`spawn`, `parallel_map`, `cron_every`, un módulo de archivo) es error.
     trusted_depth: u32,
+    /// v0.6.46 (E8) — ver [`TemplateOpenHook`].
+    template_open_hook: Option<TemplateOpenHook>,
 }
 
 impl Default for Interpreter {
@@ -1829,6 +1836,7 @@ impl Interpreter {
             llm_data_hook: None,
             trusted_base_env: None,
             trusted_depth: 0,
+            template_open_hook: None,
             blackboard: HashMap::new(),
             agent_definitions: HashMap::new(),
             agent_context: Vec::new(),
@@ -2614,6 +2622,15 @@ impl Interpreter {
         self.template_read_hook = Some(hook);
     }
 
+    /// v0.6.46 (E8): instala la apertura de templates del disco (ver [`TemplateOpenHook`]).
+    pub fn set_template_open_hook(&mut self, hook: TemplateOpenHook) {
+        self.template_open_hook = Some(hook);
+    }
+
+    pub fn template_open_hook(&self) -> Option<TemplateOpenHook> {
+        self.template_open_hook.clone()
+    }
+
     /// Fija los nombres de env que Synsema trata como secretos (los quita de los hijos
     /// de `run()`/`proc_spawn`). Lo cablea el motor con las claves de proveedor + `.env`.
     pub fn set_sensitive_env(&mut self, names: HashSet<String>) {
@@ -2673,6 +2690,13 @@ impl Interpreter {
         if let Ok(v) = &r {
             if bt.meta.lineage_source {
                 self.record_input(&bt.name, args, v);
+                // v0.6.46 (E6): `--replay` corta en la primera entrada que no es la de la corrida
+                // grabada.
+                if crate::sealed::active() {
+                    if let Some(m) = crate::sealed::replay_error() {
+                        return Err(Control::Error(RuntimeError::at(m, loc.clone())));
+                    }
+                }
             }
         }
         // El "missing argument" genérico de `nth` no decía de qué función ni cuántos
@@ -2723,8 +2747,21 @@ impl Interpreter {
         // `label_violation` antes de que el builtin corra.
         if self.label_sinks.contains(bt.name.as_str()) {
             let refs: Vec<&SynValue> = args.iter().collect();
-            self.sink_check(&bt.name, &refs, loc)?;
-            return self.call_builtin_at(&f, args, loc);
+            match self.sink_check(&bt.name, &refs, loc) {
+                Ok(()) => {
+                    // v0.6.46 (E6.4): un sumidero que corre es un momento público; el reloj cercado
+                    // del recibo sellado avanza acá.
+                    if crate::sealed::active() {
+                        crate::sealed::tick_clock(crate::clock::now_secs_f64());
+                    }
+                    return self.call_builtin_at(&f, args, loc);
+                }
+                // v0.6.46 (E6): con el recibo sellado, `reveal` corre en una rama privada (su
+                // entrada de audit va al sobre) y sigue por el despacho genérico: el texto revelado
+                // sale con la etiqueta del PC. Sólo en el camino del error: el feliz no cambia.
+                Err(e) if !sealed_sink_allowed(&bt.name, args) => return Err(e),
+                Err(_) => {}
+            }
         }
         if self.label_aware.contains(bt.name.as_str()) {
             return self.call_builtin_at(&f, args, loc);
@@ -2840,13 +2877,14 @@ impl Interpreter {
     }
 
     fn record_input(&mut self, source: &str, args: &[SynValue], result: &SynValue) {
-        if self.lineage.len() >= MAX_LINEAGE {
-            return;
-        }
         // v0.6.46 (E6.8): una lectura hecha en una rama decidida por un valor privado no entra en
         // el linaje público: cuántas entradas tenía `inputs` en `receipt()` decía qué rama se tomó.
-        // El recibo sellado la registra sin revelarla.
-        if self.labels && self.pc_is_private() {
+        // E6: con auditor, va al sobre del recibo sellado; sin auditor, no se registra.
+        let sealed = self.labels && self.pc_is_private();
+        if sealed && !crate::sealed::active() {
+            return;
+        }
+        if !sealed && self.lineage.len() >= MAX_LINEAGE {
             return;
         }
         // Un recv que venció sin mensaje no trajo nada.
@@ -2953,7 +2991,7 @@ impl Interpreter {
         } else {
             Vec::new()
         };
-        self.lineage.push(LineageEntry {
+        let entry = LineageEntry {
             source: source.to_string(),
             what,
             sha256: sha256_hex(&payload),
@@ -2961,7 +2999,18 @@ impl Interpreter {
             encoding,
             salt,
             secrets,
-        });
+        };
+        if sealed {
+            seal_lineage(&entry, true);
+            return;
+        }
+        // v0.6.46 (E6.4): una lectura de afuera con el PC público también avanza el reloj cercado, y
+        // queda en el registro de la corrida (en orden, para que `--replay` la compare).
+        if crate::sealed::active() {
+            crate::sealed::tick_clock(crate::clock::now_secs_f64());
+            seal_lineage(&entry, false);
+        }
+        self.lineage.push(entry);
     }
 
     /// Linaje de una respuesta de modelo (`reason`, `decide`, `analyze`, `generate`): lo que
@@ -9400,7 +9449,9 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
     /// Sólo actúa en `run` interactivo (`live_output`); bajo `conform`/`test`/`serve` es
     /// no-op → la salida queda en `output` y entra al JSON/respuesta (DE-019).
     fn b_flush(&mut self) -> Result<SynValue, Control> {
-        if self.live_output {
+        // v0.6.46: con etiquetas no se vacía (como `emit_line`, que no transmite): `redact_output_for_host`
+        // tiene que poder retener todo, y un `flush` en una rama privada diría cuántas líneas salieron.
+        if self.live_output && !self.labels {
             self.drain_output();
         }
         Ok(SynValue::Nothing)
@@ -9409,13 +9460,14 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
     /// newline antes de leer. Devuelve el texto sin el `\n`/`\r\n` final; `nothing` en EOF.
     /// Lee stdin crudo → funciona con TTY y con entrada redirigida/pipe (a diferencia de
     /// `ask`, que es un backend de decisión humana).
-    fn b_read_line(&mut self, args: &[SynValue], _loc: &SourceLocation) -> Result<SynValue, Control> {
+    fn b_read_line(&mut self, args: &[SynValue], loc: &SourceLocation) -> Result<SynValue, Control> {
         use std::io::Write;
         // Drena la salida pendiente (respuesta del turno previo) ANTES del prompt, para
         // que un REPL sea interactivo de verdad (DE-018) sin requerir flush() explícito.
         // Sólo en `run` interactivo; bajo conform/test/serve no se drena (DE-019). La
-        // LECTURA de stdin se hace igual en cualquier modo.
-        if self.live_output {
+        // LECTURA de stdin se hace igual en cualquier modo. v0.6.46: con etiquetas tampoco (ver
+        // `b_flush`): vaciar dentro de una rama privada diría cuántas líneas salieron antes.
+        if self.live_output && !self.labels {
             self.drain_output();
         }
         if let Some(p) = args.first() {
@@ -9423,8 +9475,19 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                 // El prompt ES salida: bajo un techo sin `stdout` no debe escaparse por acá
                 // (print/show/log ya lo chequean; read_line era el único hueco).
                 self.ensure_stdout()?;
-                print!("{}", raw_str(p));
-                let _ = std::io::stdout().flush();
+                // v0.6.46: y es un sumidero público como `print`. `read_line` es puro para las
+                // etiquetas, así que el despacho genérico ya empujó al PC la etiqueta del prompt:
+                // este chequeo cubre un prompt privado y uno dentro de una rama privada. Leer sin
+                // prompt en una rama privada sigue permitido.
+                self.stdout_flow_check("read_line prompt", loc)?;
+                if !self.live_output && crate::sealed::active() {
+                    // v0.6.46 (E6): con auditor nada sale antes del recibo; el prompt se junta como
+                    // cualquier salida.
+                    self.output.push(raw_str(p).to_string());
+                } else {
+                    print!("{}", raw_str(p));
+                    let _ = std::io::stdout().flush();
+                }
             }
         }
         let mut line = String::new();
@@ -11020,6 +11083,40 @@ pub struct LineageEntry {
     /// v0.6.46 (E1.7): los secrets que salieron en esa llamada (sus nombres, nunca su valor ni la
     /// URL). Vacío en lo que no es de red.
     pub secrets: Vec<String>,
+}
+
+/// v0.6.46 (E6): ¿un sumidero que falló sólo por el PC privado puede correr igual porque su efecto es
+/// una entrada de audit que va al sobre? Sólo `reveal`, sólo con el registro sellado activo y sólo con
+/// los argumentos sin etiqueta (si alguno la tiene, el error fue por el dato, no por la rama). `spend`
+/// no: gasta un cupo compartido, y después se ve si alcanza (un oráculo de la rama).
+#[cold]
+#[inline(never)]
+fn sealed_sink_allowed(name: &str, args: &[SynValue]) -> bool {
+    name == "reveal" && crate::sealed::active() && args.iter().all(|a| labels::label_deep(a).is_empty())
+}
+
+/// v0.6.46 (E6): una entrada de linaje en el registro de la corrida del recibo sellado. La hecha bajo
+/// un PC privado va al sobre y lleva la sal (el sobre es del auditor, que con ella puede probar qué
+/// consulta fue); la pública va sin sal, como en `receipt()`.
+#[cold]
+#[inline(never)]
+fn seal_lineage(e: &LineageEntry, sealed: bool) {
+    let mut v = serde_json::json!({
+        "kind": "input",
+        "source": e.source,
+        "what": e.what,
+        "sha256": e.sha256,
+        "bytes": e.bytes,
+        "encoding": e.encoding,
+    });
+    if let (true, Some((salt, enc))) = (sealed, &e.salt) {
+        v["salt"] = serde_json::json!(salt);
+        v["salted_encoding"] = serde_json::json!(enc);
+    }
+    if !e.secrets.is_empty() {
+        v["secrets"] = serde_json::json!(e.secrets);
+    }
+    crate::sealed::note_input(v.to_string(), sealed, &e.source, &e.sha256);
 }
 
 /// Builtins que TRAEN datos de afuera (archivos, red, bases, nodos de una cadena, sockets,

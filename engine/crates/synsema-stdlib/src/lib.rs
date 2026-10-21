@@ -107,6 +107,8 @@ pub mod canonical;
 pub mod didkey;
 pub mod integrity;
 pub mod receipt;
+/// v0.6.46 (E6): el sobre HPKE de tamaño fijo del recibo sellado.
+pub mod sealed;
 /// Web Push (RFC 8030/8291/8292): `push_send` gateado por `net(host)` + `push_vapid_keys`
 /// gateado por `random`. El cifrado y VAPID son puros; la red va por `http` (nativo).
 pub mod webpush;

@@ -42,7 +42,29 @@ Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the rele
   `label_violation` that `try`/`recover` cannot catch (whether it passes depends on the real label
   of the value) and its message names the declared set, never the real one. Without `--labels` it is not checked:
   `declassify` stays the identity. `require declassify("P")` is now understood (before it was
-  ignored), and a bare `require declassify` warns like a bare `require sign`.
+  ignored), and a bare `require declassify` warns like a bare `require sign`. The Vela guest
+  (`synsema-vela-guest.wasm`) runs its app under `stdout,declassify=app` for this reason: its only
+  principal is `app`, and the app publishes its outcome codes and withdrawal receipts itself.
+- **A `net` grant with a wildcard reaches only public IP addresses.** `require net` without a
+  scope, `net("*")`, `net("*.x.com")`, a host ceiling `--cap-set net` and a `sandbox under` with a
+  wildcard no longer reach loopback, the private networks (RFC 1918, CGNAT, ULA), link-local (with
+  the cloud metadata endpoint `169.254.169.254`), multicast or the documentation ranges. Before,
+  `net` compared only the name: `127.0.0.1.nip.io` or any name that resolved inside reached it.
+  The client resolves once, checks the address it is going to use and connects to that one (no
+  window for a DNS answer that changes in between); an IPv4 mapped or translated in IPv6 counts as
+  that IPv4. To reach a private address, every layer has to name it: the exact host
+  (`require net("db")`, `net("localhost")`), the address, or a CIDR that contains it
+  (`require net("10.0.0.0/8")`, which also covers a literal address inside it by name). A
+  `deny net("10.0.0.0/8")` now also stops a name that resolves inside. The error names the line
+  to write: ``http_get(): `db` resolved to 10.0.0.5, a private address; a `net` grant with a
+  wildcard reaches only public addresses. Name it: `require net("db:5432")`…``. When the URL comes
+  from the configuration, name it from there: `require net(env("CONTROL_URL"))`. It applies to
+  `http`/`fetch` and the `http_*` builtins, `ws_connect` (and every reconnection), `tcp_connect`,
+  the blockchain RPC builtins, `push_send`, `oidc_verify` and `proxy to` (on every connection). A
+  secret bound to a host goes to a private address only if its binding names it too. The engine's
+  own requests (LLM and judge providers, the approval webhook, `synsema update`, ACME) are the
+  host's configuration and are not affected. In `@synsema/wasm` the connection belongs to the
+  embedder's `http` hook and the engine does not see the address: the hook has to refuse them.
 - **A `require` with a name that does not exist is a load error.** Before, `require nett("x")`
   parsed and granted nothing, with no warning, and the program failed later with an error that
   did not name the typo. Now the error names it and, when there is one, the closest real name:
@@ -73,13 +95,91 @@ Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the rele
   `["b","c"]` by a private index), now the declared set, and a `declassify` inside a private branch
   is left out of the list (and its `[INF] declassify` log line is not written), since how many
   there were told which branch was taken.
+- **The prompt of `read_line(prompt)` is a public sink, like `print`** (with `--labels`). It was
+  printed as is: a private prompt came out in clear (the labelled dispatch hands the builtin its
+  arguments without labels), and so did a prompt inside a branch decided by a private value. Both
+  are a `label_violation` now. `read_line()` without a prompt in a private branch is still allowed.
+- **With `--labels`, `flush()` and `read_line` no longer write the pending output live.** `print`
+  already kept it until the end with labels on, but these two emptied it to stdout, so how many
+  lines came out before a prompt could depend on a private branch. The output now comes out at the
+  end, after the prompts; without `--labels` nothing changes.
+- **In `@synsema/wasm`, a run with `labels` that hits the memory limit reports `steps: null` and
+  `private_seen: true`.** Whether the run ran out of memory can depend on a private value (one bit
+  per run, like any error it causes), so the host treats that result as sensitive, the same as a
+  run that ended with `private_seen`.
 - **An LLM operation under a private branch no longer writes a "granted llm" audit entry before
   failing** (with `--labels`). `reason`/`decide`/`analyze`/`generate`/`judge` checked the
   capability first and the program counter second, so the audit said the call was allowed inside
   a branch decided by a private value, which tells which branch ran. The program counter is
   checked first now, and nothing is written.
+- **A link swapped between the check and the open no longer takes a file operation outside the
+  grant** (on Linux and Windows). v0.6.45 checked the path on disk and then opened it by name, so a
+  folder changed into a link in between was followed. Now the file is opened without following any
+  link (`openat2` with `RESOLVE_NO_SYMLINKS` on Linux, `NtCreateFile` with `OBJ_DONT_REPARSE` on
+  Windows): if it opens, it is the file the check judged. With a link on the way, it is opened
+  following it, without creating or truncating anything, and the same check runs again on where
+  the open file really is; a link that stays inside the grant still works, as in v0.6.45. To
+  replace a file (`write_file`, `edit_file`, `zip_extract`/`tar_extract`), the folder is opened the
+  same way and the temporary file, the rename and the cleanup all go relative to that folder, so the
+  name is never resolved again.
+  - It covers `read_file` (whole or a range of lines), `read_file_bytes`, `edit_file`,
+    `write_file`, `append_file`, `grep`, the files of `zip_create`/`tar_create` and the entries of
+    `zip_extract`/`tar_extract`, `mtls_identity`, the fonts of `svg_to_png`/`svg_to_pdf`, `render`
+    (and its `include`/`layout`) and the files of a `static` route (judged against the served
+    folder).
+  - `zip_extract` and `tar_extract` now write each entry like `write_file`: atomically (no half
+    file if it fails) and, when a link has the entry's name, the link is replaced instead of
+    written through.
+  - Cost, measured in release with the open alone: without a link on the way, +1 to +3 µs on
+    Windows (an open of 25 to 50 µs, depending on the antivirus) and +0.4 to +0.9 µs on Linux (a
+    4.5 µs open); with a link, one more open, the query of the real path and the check again
+    (Windows 66 → 131 µs and Linux 4.3 → 9.5 µs, without the check).
+  - What remains as in v0.6.45: `list_dir`, `file_exists`, `file_info`, `delete_file`,
+    `delete_dir`, the folders `write_file` creates when they are missing, and the PEM files of a
+    `tls cert … key …` block in `serve` (read by the TLS setup after the check); macOS, a Linux
+    kernel without `openat2` (before 5.6) and UNC paths on Windows; and a hard link, which is not
+    visible from its name.
 
 **New.**
+- **Sealed receipts for an auditor: `--auditor <X25519 public key>`** (or `SYNSEMA_AUDITOR_KEY`)
+  on `synsema run` and `synsema serve`, and `auditor` in wasm. With labels on, what a program does
+  in a branch decided by a private value had to be refused (a signature, a `reveal`, an audit line
+  would tell which branch ran). With an auditor the host designates, it runs, and what it leaves
+  goes into an envelope only the auditor can open: HPKE (RFC 9180, X25519 / HKDF-SHA256 /
+  AES-128-GCM) of a **fixed size** (`SYNSEMA_RECEIPT_SEALED_BYTES`, 64 KiB by default), so the
+  receipt is as long after 0 sealed entries as after 50. What does not fit is cut inside and
+  counted.
+  - The receipt is one JSON line: a header (engine, `program_sha`, `config_sha`, the signing key,
+    the auditor, a commitment to the run's seed), the public entries, the envelope, the root of a
+    hash chain over all the entries in run order, and a signature. Anyone can check it with
+    `synsema receipt verify`; the auditor opens it with `synsema receipt open <receipt> --key
+    <private>`, which also checks the chain. `synsema receipt keygen` makes the auditor's keys.
+  - It is signed with the host's `SYNSEMA_IDENTITY_KEY` if there is one, with the attested key
+    under `serve --attested` (P-256; the same key the attestation document names), or with a key
+    made for the run (`"identity": "ephemeral"`: it proves integrity, not who ran it).
+  - **It comes out before the output.** `run` writes it to stderr or to `--receipt <path|fd:N>`
+    and only then prints; with an auditor `print`, `flush()` and the prompt of `read_line` do not go
+    out live. `run --format json` puts it first, as `receipt`; wasm returns it in `receipt`.
+    `serve` writes one per request that runs program code, to stderr or appended to `--receipt`,
+    before the response; if it cannot be written the client gets a 500 instead. A `stream` or
+    `socket` route is a load error with an auditor (its body leaves while it runs).
+  - `reveal`, `sign` and the wallet operations run in a private branch; their audit line goes into
+    the envelope. **`spend` does not** (it spends a shared budget, and whether the next spend fits
+    would tell what the branch did), nor a signature that counts against `SYNSEMA_SIGN_CEILING`.
+  - The run's `random()` and `random_int()` come from a seed recorded in the envelope, and with
+    labels the clock is fenced (two `now()` in a private branch read the same time). `synsema run
+    --replay <opened receipt>` runs the program again with that seed and those clock readings and
+    stops, naming it, at the first input that differs. Keys and tokens (`random_bytes`, `token`,
+    key generation) still come from the OS and are not reproduced.
+  - **`run --attest` with an auditor binds the receipt's key:** `report_data` gets `sha256(run_key)`
+    at the end, and the JSON line carries `run_key`. Without an auditor `report_data` does not
+    change. A verifier of `run --attest` documents has to add it when `run_key` is present.
+  - **What it does not hide:** that the run touched private data (`steps: null` already says so);
+    the wall-clock time of the run (and, in wasm, when each host call arrives); and whether it
+    stopped on a limit (`maxSteps`, `maxMemoryMb`, a handler's `timeout`): one bit per run, or per
+    request. Under `serve`, a cron job or an agent outside a request has no receipt, so an audited
+    operation in a private branch there is still refused; what an agent started by a request writes
+    after the request ends is not in its receipt.
 - **A secret bound to a host: `require secret("K") for net("api.example.com")`.** APIs that take
   the key in the URL (Alchemy, Infura, Telegram, Maps), in the query or in the body (OAuth
   `client_secret_post`) were an error, and the only way out was `reveal()`. A bound secret goes in

@@ -5,4 +5,6 @@
 
 pub mod intent;
 pub mod model;
+/// v0.6.46 (E8): abrir sin ventana entre el chequeo y la apertura.
+pub mod nofollow;
 pub mod secure;

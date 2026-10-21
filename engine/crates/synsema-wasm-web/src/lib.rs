@@ -614,7 +614,18 @@ fn opts_from(req: &Map<String, Value>) -> Result<RunOptions, String> {
         Some(Value::String(s)) => synsema_wasm::parse_ceiling(s).map_err(|e| format!("trusted_ceiling: {}", e))?,
         _ => None,
     };
-    Ok(RunOptions { filename, env, ceiling, no_fs: true, labels, result, input, sources, max_steps, max_memory_mb, trusted, trusted_ceiling })
+    // v0.6.46 (E6): `"auditor": "<pública X25519 en base64url>"` y `"sealed_bytes": n` — el recibo
+    // sellado de la corrida, en `receipt`.
+    let auditor = match req.get("auditor") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(s)) => Some(synsema_stdlib::sealed::parse_auditor_key(s).map_err(|e| format!("auditor: {}", e))?),
+        Some(_) => return Err("auditor must be the X25519 public key in base64url".to_string()),
+    };
+    let sealed_bytes = match req.get("sealed_bytes") {
+        None | Some(Value::Null) => None,
+        Some(v) => Some(synsema_stdlib::sealed::sealed_bytes_from(Some(&v.to_string())).map_err(|e| e.replace("SYNSEMA_RECEIPT_SEALED_BYTES", "sealed_bytes"))?),
+    };
+    Ok(RunOptions { filename, env, ceiling, no_fs: true, labels, result, input, sources, max_steps, max_memory_mb, trusted, trusted_ceiling, auditor, sealed_bytes })
 }
 
 fn install_host(req: &Map<String, Value>) {
@@ -674,6 +685,10 @@ fn dispatch(req: &Map<String, Value>) -> Value {
                 "run" => {
                     let r = synsema_wasm::run(&source, &opts);
                     let mut out = Map::new();
+                    // v0.6.46 (E6): el recibo sellado va primero (el host lo entrega antes que la salida).
+                    if let Some(receipt) = &r.receipt {
+                        out.insert("receipt".into(), receipt.clone());
+                    }
                     out.insert("ok".into(), json!(r.ok));
                     out.insert("output".into(), json!(r.output));
                     out.insert("errors".into(), json!(r.errors));
@@ -760,6 +775,8 @@ pub fn call_json(request: &str) -> String {
     }
     #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
     seed_run_rng();
+    // v0.6.46 (E6.4): en wasip1 (el guest de Vela), el mismo generador por llamada.
+    synsema_stdlib::webauth::begin_call_entropy();
     IN_CALL.with(|c| c.set(true));
     let resp = match serde_json::from_str::<Value>(request) {
         Ok(Value::Object(m)) => dispatch(&m),
@@ -770,6 +787,7 @@ pub fn call_json(request: &str) -> String {
     synsema_core::wasm_limits::disarm();
     #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
     end_run_rng();
+    synsema_stdlib::webauth::end_call_entropy();
     IN_CALL.with(|c| c.set(false));
     fence_clock(false);
     hostcap::install(None);

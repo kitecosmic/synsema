@@ -114,6 +114,12 @@ pub struct RunOptions {
     pub trusted: Vec<(String, String)>,
     /// v0.6.46 (E3b) — el techo de los módulos de confianza (la gramática de `ceiling`).
     pub trusted_ceiling: Option<Vec<Capability>>,
+    /// v0.6.46 (E6) — la pública X25519 del auditor que designa el host: con ella, `Report.receipt`
+    /// trae el recibo sellado de la corrida (lo de una rama privada va cifrado para el auditor, en
+    /// un sobre de tamaño fijo).
+    pub auditor: Option<[u8; 32]>,
+    /// v0.6.46 (E6) — el tamaño del texto plano del sobre (por defecto 64 KiB).
+    pub sealed_bytes: Option<usize>,
 }
 
 impl RunOptions {
@@ -131,6 +137,8 @@ impl RunOptions {
             max_memory_mb: None,
             trusted: Vec::new(),
             trusted_ceiling: None,
+            auditor: None,
+            sealed_bytes: None,
         }
     }
 }
@@ -183,6 +191,9 @@ pub struct Report {
     pub private_seen: bool,
     /// v0.6.42 — el código que pidió `exit(code)`, si lo llamó (`ok` = código 0, sin errores).
     pub exit_code: Option<i32>,
+    /// v0.6.46 (E6) — el recibo sellado, si el host puso un auditor (`RunOptions.auditor`). El host lo
+    /// entrega ANTES que la salida.
+    pub receipt: Option<serde_json::Value>,
 }
 
 /// Un `declassify` ejecutado, en forma plana (`Send`, serializable).
@@ -1198,10 +1209,16 @@ pub fn run(source: &str, opts: &RunOptions) -> Report {
                 declassify: Vec::new(),
                 private_seen: false,
                 exit_code: None,
+                receipt: None,
             }
         }
         Ok(p) => p,
     };
+    // v0.6.46 (E6): el registro de la corrida, en este hilo y mientras dure la corrida (desde el
+    // wiring: los grants ambientales también son entradas).
+    let started = synsema_stdlib::receipt::rfc3339_utc(synsema_core::clock::now_secs());
+    let sealed_log = opts.auditor.map(|_| synsema_stdlib::sealed::new_run_log(opts.sealed_bytes.unwrap_or(synsema_stdlib::sealed::DEFAULT_SEALED_BYTES)));
+    let _sealed = sealed_log.clone().map(synsema_core::sealed::install_thread);
     let (mut interp, caps) = prepare(&program, opts);
     if let Err(e) = bind_input(&interp, opts) {
         disarm_limits(); // ronda 2 (M1): esta salida no pasa por `finish`
@@ -1216,6 +1233,7 @@ pub fn run(source: &str, opts: &RunOptions) -> Report {
             declassify: Vec::new(),
             private_seen: false,
             exit_code: None,
+            receipt: None,
         };
     }
     let result = interp.execute(&program);
@@ -1249,7 +1267,38 @@ pub fn run(source: &str, opts: &RunOptions) -> Report {
         _ => None,
     };
     let r = finish(interp, result);
+    let receipt = match (&sealed_log, opts.auditor) {
+        (Some(log), Some(auditor)) => {
+            let key = synsema_stdlib::sealed::RunKey::ephemeral();
+            let program_sha = Some(synsema_core::bytesutil::hex_encode(&synsema_stdlib::attest::sha256(source.as_bytes())));
+            let log = log.lock().unwrap_or_else(|p| p.into_inner());
+            match synsema_stdlib::sealed::build_receipt(
+                &log,
+                &synsema_stdlib::sealed::ReceiptContext { auditor, key: &key, program_sha, config_sha: None, started },
+            ) {
+                Ok(v) => Some(v),
+                // Sin recibo no hay salida: es lo que el host pidió al poner un auditor.
+                Err(e) => {
+                    return Report {
+                        ok: false,
+                        output: Vec::new(),
+                        errors: vec![format!("the sealed receipt could not be built: {}", e)],
+                        audit: Vec::new(),
+                        llm_tokens: 0,
+                        steps: 0,
+                        result: None,
+                        declassify: Vec::new(),
+                        private_seen,
+                        exit_code: None,
+                        receipt: None,
+                    }
+                }
+            }
+        }
+        _ => None,
+    };
     Report {
+        receipt,
         ok: exit_code.map_or(r.success, |c| c == 0),
         output: r.output,
         // `exit` no es un error: el programa pidió terminar.

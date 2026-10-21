@@ -14,7 +14,7 @@
 
 use std::path::Path;
 
-use synsema_stdlib::http::http_request;
+use synsema_stdlib::http::host::http_request;
 
 use crate::update::{download, gh_headers, sha256_hex};
 

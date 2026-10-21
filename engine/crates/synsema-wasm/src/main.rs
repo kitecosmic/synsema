@@ -43,6 +43,9 @@ fn with_big_stack<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> 
 }
 
 fn main() {
+    // v0.6.46 (E6.4): una sola consulta de entropía al runtime WASI por corrida (ver
+    // `webauth::begin_call_entropy`): `random_bytes(n)` con un `n` privado ya no le dice `n`.
+    synsema_stdlib::webauth::begin_call_entropy();
     let args: Vec<String> = std::env::args().collect();
     const USAGE: &str = "usage: synsema-wasm [--test] [--labels] [--sandbox | --cap-set <list>] [--trusted name=path]... [--trusted-cap-set <list>] <file.syn | ->";
     let mut test_mode = false;
@@ -193,7 +196,7 @@ fn main() {
     };
     // `env: None` → EnvStore::load_default(): el `.env` llega por WASI (`--dir .`) y el
     // environ por `wasmtime --env`, igual que hasta ahora.
-    let opts = RunOptions { filename, env: None, ceiling, no_fs: false, labels, result: None, input: None, sources: Vec::new(), max_steps: None, max_memory_mb: None, trusted, trusted_ceiling };
+    let opts = RunOptions { filename, env: None, ceiling, no_fs: false, labels, result: None, input: None, sources: Vec::new(), max_steps: None, max_memory_mb: None, trusted, trusted_ceiling, auditor: None, sealed_bytes: None };
 
     if test_mode {
         let r = with_big_stack(move || synsema_wasm::test(&source, &opts));

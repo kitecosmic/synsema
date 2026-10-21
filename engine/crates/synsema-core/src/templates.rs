@@ -22,7 +22,7 @@ use std::rc::Rc;
 use std::time::SystemTime;
 
 use crate::ast::Node;
-use crate::interpreter::{env_get, env_set, Control, Environment, Interpreter, RuntimeError};
+use crate::interpreter::{env_get, env_set, Control, Environment, Interpreter, RuntimeError, TemplateOpenHook};
 use crate::parser::{parse_each_clause, parse_expression_source};
 use crate::types::{ServerValue, SynValue};
 
@@ -590,15 +590,30 @@ thread_local! {
 }
 
 /// Carga (con caché) el árbol de un template ya resuelto. `display` es el nombre
-/// que aparece en los errores (file_name, como siempre).
-fn load_template(target: &PathBuf, display: &str, raw_path: &str) -> Result<Rc<Vec<TNode>>, Control> {
+/// que aparece en los errores (file_name, como siempre). v0.6.46 (E8): con `open` (el motor), el
+/// archivo del disco se abre por él, sin ventana con el gate, y la huella y el texto salen de ese
+/// handle.
+fn load_template(
+    target: &PathBuf,
+    display: &str,
+    raw_path: &str,
+    open: Option<TemplateOpenHook>,
+) -> Result<Rc<Vec<TNode>>, Control> {
+    let not_found = || Control::Error(RuntimeError::new(format!("template not found: {}", raw_path)));
     let bundled: Option<&'static [u8]> = crate::bundle::get(&target.to_string_lossy());
+    let mut file = match (bundled, open) {
+        (None, Some(open)) => Some(open(raw_path, target).map_err(Control::Error)?),
+        _ => None,
+    };
     let (mtime, size) = match bundled {
         // Inmutable: la clave del cache es el nombre; el tamaño basta como huella.
         Some(bytes) => (SystemTime::UNIX_EPOCH, bytes.len() as u64),
         None => {
-            let meta = std::fs::metadata(target)
-                .map_err(|_| Control::Error(RuntimeError::new(format!("template not found: {}", raw_path))))?;
+            let meta = match &file {
+                Some(f) => f.metadata(),
+                None => std::fs::metadata(target),
+            }
+            .map_err(|_| not_found())?;
             (meta.modified().unwrap_or(SystemTime::UNIX_EPOCH), meta.len())
         }
     };
@@ -614,10 +629,14 @@ fn load_template(target: &PathBuf, display: &str, raw_path: &str) -> Result<Rc<V
     if let Some(tree) = hit {
         return Ok(tree);
     }
-    let src = match bundled {
-        Some(bytes) => String::from_utf8_lossy(bytes).into_owned(),
-        None => std::fs::read_to_string(target)
-            .map_err(|_| Control::Error(RuntimeError::new(format!("template not found: {}", raw_path))))?,
+    let src = match (bundled, file.as_mut()) {
+        (Some(bytes), _) => String::from_utf8_lossy(bytes).into_owned(),
+        (None, Some(f)) => {
+            let mut s = String::new();
+            std::io::Read::read_to_string(f, &mut s).map_err(|_| not_found())?;
+            s
+        }
+        (None, None) => std::fs::read_to_string(target).map_err(|_| not_found())?,
     };
     let segs = segments(&src, display)?;
     let mut pos = 0;
@@ -733,7 +752,7 @@ fn render_nodes(
                     .file_name()
                     .map(|s| s.to_string_lossy().into_owned())
                     .unwrap_or_else(|| path.clone());
-                let inc_tree = load_template(&target, &inc_name, path)?;
+                let inc_tree = load_template(&target, &inc_name, path, interp.template_open_hook())?;
                 match with_expr {
                     None => {
                         render_nodes(&inc_tree, interp, env, out, &inc_name, slots, depth + 1)?;
@@ -787,7 +806,7 @@ fn render_file(
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| path.to_string());
-    let tree = load_template(&target, &filename, path)?;
+    let tree = load_template(&target, &filename, path, interp.template_open_hook())?;
     let layout_path = tree.iter().find_map(|n| match n {
         TNode::Layout { path } => Some(path.clone()),
         _ => None,
@@ -1323,7 +1342,7 @@ fn validate_template_walk(path: &str, depth: usize, seen: &mut Vec<String>) -> R
             .file_name()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| path.to_string());
-        let tree = load_template(&target, &display, path).map_err(|c| match c {
+        let tree = load_template(&target, &display, path, None).map_err(|c| match c {
             Control::Error(e) => e.into_message(),
             _ => "template error".to_string(),
         })?;

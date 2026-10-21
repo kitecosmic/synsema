@@ -441,7 +441,11 @@ impl Capability {
                         // del host; con puerto, sólo ese.
                         let (gh, gp) = split_net_scope(self_scope);
                         let (rh, rp) = split_net_scope(other_scope);
-                        let host_ok = gh == rh || fnmatch(rh, gh) || self_scope == other_scope;
+                        // v0.6.46 (E7): un CIDR (`net("10.0.0.0/8")`) cubre una IP literal de adentro.
+                        let host_ok = gh == rh
+                            || fnmatch(rh, gh)
+                            || self_scope == other_scope
+                            || rh.parse::<std::net::IpAddr>().is_ok_and(|ip| cidr_contains(gh, ip) == Some(true));
                         host_ok && (gp.is_none() || gp == rp)
                     } else {
                         self_scope == other_scope || fnmatch(other_scope, self_scope)
@@ -534,6 +538,157 @@ pub fn net_request_scope(url: &str) -> Option<String> {
         return None;
     }
     Some(join_net_scope(&host, port.as_deref()))
+}
+
+// =========================================================
+// v0.6.46 (E7): `net` mira la IP a la que conecta (SSRF)
+// =========================================================
+// Un grant con comodín (`require net` sin scope, `"*"`, `"*.x.com"`; un techo o un `sandbox under`
+// igual) sólo llega a IPs PÚBLICAS. Una IP privada (loopback, RFC 1918, CGNAT, link-local con los
+// metadatos de la nube, ULA, multicast, documentación) exige que CADA capa nombre el destino: el
+// host exacto, la IP o un CIDR que la contenga. El cliente resuelve una vez, chequea la IP y conecta
+// a ésa: no queda ventana para un DNS que cambie entre las dos.
+
+/// ¿`ip` es una dirección pública de internet? Una IPv4 mapeada o traducida en IPv6 (`::ffff:a.b.c.d`,
+/// NAT64 `64:ff9b::/96`, 6to4 `2002::/16`) vale lo que valga la IPv4 de adentro.
+pub fn is_public_ip(ip: std::net::IpAddr) -> bool {
+    match ip.to_canonical() {
+        std::net::IpAddr::V4(a) => public_v4(a),
+        std::net::IpAddr::V6(a) => public_v6(a),
+    }
+}
+
+fn public_v4(a: std::net::Ipv4Addr) -> bool {
+    let [b0, b1, b2, _] = a.octets();
+    !(b0 == 0                                             // "esta red"
+        || b0 == 10                                       // RFC 1918
+        || b0 == 127                                      // loopback
+        || b0 >= 224                                      // multicast, reservada, broadcast
+        || (b0 == 100 && (64..128).contains(&b1))         // CGNAT 100.64/10
+        || (b0 == 169 && b1 == 254)                       // link-local (metadatos de la nube)
+        || (b0 == 172 && (16..32).contains(&b1))          // RFC 1918
+        || (b0 == 192 && b1 == 0 && (b2 == 0 || b2 == 2)) // IETF 192.0.0/24, TEST-NET-1
+        || (b0 == 192 && b1 == 88 && b2 == 99)            // relay 6to4
+        || (b0 == 192 && b1 == 168)                       // RFC 1918
+        || (b0 == 198 && (b1 == 18 || b1 == 19))          // benchmarking
+        || (b0 == 198 && b1 == 51 && b2 == 100)           // TEST-NET-2
+        || (b0 == 203 && b1 == 0 && b2 == 113))           // TEST-NET-3
+}
+
+fn public_v6(a: std::net::Ipv6Addr) -> bool {
+    let s = a.segments();
+    // NAT64 (64:ff9b::/96) y 6to4 (2002::/16) llevan una IPv4 adentro.
+    if s[0] == 0x64 && s[1] == 0xff9b && s[2..6] == [0, 0, 0, 0] {
+        return public_v4(std::net::Ipv4Addr::from(((s[6] as u32) << 16) | s[7] as u32));
+    }
+    if s[0] == 0x2002 {
+        return public_v4(std::net::Ipv4Addr::from(((s[1] as u32) << 16) | s[2] as u32));
+    }
+    // Sólo 2000::/3 es unicast global (deja afuera ::1, ::, ULA fc00::/7, fe80::/10, ff00::/8,
+    // 64:ff9b:1::/48, 100::/64). Adentro, lo de la IETF (2001::/23, con Teredo) y documentación.
+    (s[0] & 0xe000) == 0x2000
+        && !(s[0] == 0x2001 && s[1] < 0x200)
+        && !(s[0] == 0x2001 && s[1] == 0xdb8)
+        && !(s[0] == 0x3fff && s[1] < 0x1000)
+}
+
+/// `Some(¿adentro?)` si `scope` es un CIDR (`10.0.0.0/8`, `fd00::/8`); `None` si no lo es.
+fn cidr_contains(scope: &str, ip: std::net::IpAddr) -> Option<bool> {
+    use std::net::IpAddr;
+    let (net, bits) = scope.split_once('/')?;
+    let net: IpAddr = net.trim_start_matches('[').trim_end_matches(']').parse().ok()?;
+    let bits: u32 = bits.parse().ok()?;
+    Some(match (net.to_canonical(), ip.to_canonical()) {
+        (IpAddr::V4(n), IpAddr::V4(i)) if bits <= 32 => {
+            let m = if bits == 0 { 0 } else { u32::MAX << (32 - bits) };
+            u32::from(n) & m == u32::from(i) & m
+        }
+        (IpAddr::V6(n), IpAddr::V6(i)) if bits <= 128 => {
+            let m = if bits == 0 { 0 } else { u128::MAX << (128 - bits) };
+            u128::from(n) & m == u128::from(i) & m
+        }
+        _ => false,
+    })
+}
+
+/// ¿El scope de `net` NOMBRA el destino `dest` (`host` o `host:puerto`) que resolvió a `ip`? Lo
+/// nombra el host exacto, la IP exacta o un CIDR que la contenga, con la regla de puerto de
+/// siempre. Un comodín (sin scope, `*`, `*.x.com`) nunca lo nombra.
+pub fn net_scope_names(scope: &str, dest: &str, ip: std::net::IpAddr) -> bool {
+    let (gh, gp) = split_net_scope(scope);
+    let (rh, rp) = split_net_scope(dest);
+    if gp.is_some() && gp != rp {
+        return false;
+    }
+    if let Some(inside) = cidr_contains(gh, ip) {
+        return inside;
+    }
+    if gh.contains(['*', '?', '[']) {
+        return false;
+    }
+    gh == rh || gh.parse::<std::net::IpAddr>().is_ok_and(|g| g.to_canonical() == ip.to_canonical())
+}
+
+/// Las capas de `net` de un `CapabilitySet` (denegaciones, grants propios y de los padres, techo
+/// del host, techos delegados), en forma OWNED: se manda a otro hilo (el lado async de `proxy to`).
+#[derive(Clone, Debug, Default)]
+pub struct NetLayers {
+    denied: Vec<Capability>,
+    granted: Vec<Capability>,
+    ceiling: Option<Vec<Capability>>,
+    delegated: Vec<Delegation>,
+}
+
+impl NetLayers {
+    /// ¿Se puede conectar a `dest` (`host[:puerto]`), que resolvió a `ip`? A una IP pública, sí (el
+    /// gate por nombre ya pasó); a una privada, sólo si cada capa la nombra.
+    pub fn admits(&self, dest: &str, ip: std::net::IpAddr) -> Result<(), DenyCause> {
+        let names = |c: &Capability| c.scope.as_deref().is_some_and(|g| net_scope_names(g, dest, ip));
+        // Un `deny net("10.0.0.0/8")` alcanza también a un nombre que resuelve adentro.
+        if let Some(d) = self.denied.iter().find(|d| names(d)) {
+            return Err(DenyCause::ExplicitlyDenied(d.clone()));
+        }
+        if is_public_ip(ip) {
+            return Ok(());
+        }
+        if self.ceiling.as_ref().is_some_and(|c| !c.iter().any(names)) {
+            return Err(DenyCause::AboveCeiling);
+        }
+        if let Some(d) = self.delegated.iter().find(|d| !d.caps.iter().any(names)) {
+            return Err(DenyCause::Delegated(d.clone()));
+        }
+        if self.granted.iter().any(names) {
+            Ok(())
+        } else {
+            Err(DenyCause::NoGrant)
+        }
+    }
+}
+
+/// El mensaje de una conexión a una IP privada que alguna capa no nombra.
+pub fn private_dest_message(who: &str, dest: &str, ip: std::net::IpAddr, cause: &DenyCause) -> String {
+    let host = split_net_scope(dest).0;
+    let what = format!("{}: `{}` resolved to {}, a private address", who, host, ip.to_canonical());
+    match cause {
+        DenyCause::ExplicitlyDenied(d) => format!("{}, explicitly denied by {}", what, d),
+        DenyCause::AboveCeiling => format!(
+            "{}; the host ceiling (--sandbox/--cap-set) reaches only public addresses for it. The program cannot fix this; the host must name it: `--cap-set net={}`",
+            what, dest
+        ),
+        DenyCause::Delegated(d) => format!(
+            "{}; the {} reaches only public addresses for it: name it there (`net(\"{}\")`)",
+            what,
+            match &d.source {
+                DelegationSource::Token(id) => format!("delegated ceiling of token {}", id),
+                DelegationSource::Block => "enclosing `sandbox under` block".to_string(),
+            },
+            dest
+        ),
+        DenyCause::NoGrant => format!(
+            "{}; a `net` grant with a wildcard reaches only public addresses. Name it: `require net(\"{}\")`, its address or its CIDR (the scope can come from the configuration: `require net(env(\"…_URL\"))`)",
+            what, dest
+        ),
+    }
 }
 
 /// Canoniza una URL de conexión (Postgres/MySQL/…) a `scheme://host/dbname`:
@@ -717,6 +872,35 @@ pub mod audit_sink {
             "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
             y, m, d, rem / 3600, (rem % 3600) / 60, rem % 60, ms
         )
+    }
+
+    /// v0.6.46 (E6): la entrada en el registro de la corrida del recibo sellado. La pública va sin
+    /// hora (afuera del sobre el recibo sólo dice cuándo empezó la corrida); la sellada, con la hora
+    /// del reloj de la corrida.
+    #[cold]
+    #[inline(never)]
+    pub(super) fn record_run(context: &str, entry: &CapabilityAuditEntry, sealed: bool) {
+        let (file, line) = match synsema_core::audit_loc::current() {
+            Some(loc) => (Some(loc.file.to_string()), Some(loc.line)),
+            None => (None, None),
+        };
+        let mut v = serde_json::json!({
+            "kind": "capability",
+            "context": context,
+            "capability": entry.capability.to_string(),
+            "granted": entry.granted,
+            "source": entry.source,
+            "reason": entry.reason,
+            "origin": entry.origin,
+            "file": file,
+            "line": line,
+        });
+        if sealed {
+            v["ts"] = serde_json::json!(iso8601_millis(synsema_core::clock::now_secs_f64()));
+            synsema_core::sealed::push_sealed(v.to_string());
+        } else {
+            synsema_core::sealed::push_public(v.to_string());
+        }
     }
 
     pub(super) fn emit(context: &str, entry: &CapabilityAuditEntry) {
@@ -914,10 +1098,19 @@ impl CapabilitySet {
         // privado (5 entradas con n=1, 54 con n=50). Lo que audita en serio (`sign`/`spend`/
         // `reveal`/wallet) ya no corre en una rama privada; el recibo sellado de v0.6.46 va a
         // registrar estas entradas sin revelar la rama.
+        //
+        // v0.6.46 (E6): con el recibo sellado, va al sobre (ni al sink del proceso ni al `audit_log`);
+        // la pública queda además en el registro de la corrida, en orden con las selladas.
         if synsema_core::labels::pc_private_now() {
+            if synsema_core::sealed::active() {
+                audit_sink::record_run(&self.name, &entry, true);
+            }
             return;
         }
         audit_sink::emit(&self.name, &entry);
+        if synsema_core::sealed::active() {
+            audit_sink::record_run(&self.name, &entry, false);
+        }
         self.audit_log.push(entry);
     }
 
@@ -1107,6 +1300,32 @@ impl CapabilitySet {
             });
         }
         Err(DenyCause::NoGrant)
+    }
+
+    /// v0.6.46 (E7): las capas de `net` de este set y de sus padres (ver `NetLayers`).
+    pub fn net_layers(&self) -> NetLayers {
+        let net = |c: &&Capability| c.ty == CapabilityType::Net;
+        let mut layers = NetLayers {
+            denied: Vec::new(),
+            granted: Vec::new(),
+            ceiling: self.ceiling.as_ref().map(|c| c.iter().filter(net).cloned().collect()),
+            delegated: self
+                .delegated
+                .iter()
+                .map(|d| Delegation { caps: d.caps.iter().filter(net).cloned().collect(), ..(**d).clone() })
+                .collect(),
+        };
+        let mut collect = |set: &CapabilitySet| {
+            layers.denied.extend(set.denied.iter().filter(net).cloned());
+            layers.granted.extend(set.granted.iter().filter(net).cloned());
+        };
+        collect(self);
+        let mut next = self.parent.clone();
+        while let Some(p) = next {
+            collect(&p.borrow());
+            next = p.borrow().parent.clone();
+        }
+        layers
     }
 
     /// v0.6.45 — ¿un grant la cubre por NOMBRE pero no en disco? Es un link debajo del scope que
@@ -2211,5 +2430,95 @@ mod delegated_ceiling_tests {
         let v2 = cs2.require(&cap("net", None), "fetch()").unwrap_err();
         assert!(!v2.denied_by_token());
         assert!(!v2.into_error().denied_by_token);
+    }
+}
+
+#[cfg(test)]
+mod e7_private_dest {
+    //! v0.6.46 (E7): `net` mira la IP a la que conecta.
+    use super::*;
+    use std::net::IpAddr;
+
+    fn ip(s: &str) -> IpAddr {
+        s.parse().unwrap()
+    }
+
+    fn net(scope: Option<&str>) -> Capability {
+        Capability::new(CapabilityType::Net, scope.map(str::to_string))
+    }
+
+    #[test]
+    fn the_private_ranges() {
+        for p in [
+            "127.0.0.1", "10.1.2.3", "172.16.0.1", "172.31.255.255", "192.168.1.1", "169.254.169.254",
+            "100.64.0.1", "0.0.0.0", "224.0.0.1", "255.255.255.255", "192.0.2.5", "198.18.0.1",
+            "::1", "::", "fd00::1", "fe80::1", "ff02::1", "::ffff:127.0.0.1", "::ffff:10.0.0.5",
+            "64:ff9b::a00:5", "2002:a00:5::1", "2001:db8::1", "2001::1", "::127.0.0.1",
+        ] {
+            assert!(!is_public_ip(ip(p)), "{} es privada", p);
+        }
+        for p in ["8.8.8.8", "1.1.1.1", "172.32.0.1", "100.128.0.1", "2606:4700::1111", "64:ff9b::808:808", "::ffff:8.8.8.8"] {
+            assert!(is_public_ip(ip(p)), "{} es pública", p);
+        }
+    }
+
+    #[test]
+    fn a_wildcard_never_names_a_private_address() {
+        let a = ip("10.0.0.5");
+        assert!(net_scope_names("db", "db:5432", a));
+        assert!(net_scope_names("db:5432", "db:5432", a));
+        assert!(!net_scope_names("db:6379", "db:5432", a));
+        assert!(net_scope_names("10.0.0.5", "db:5432", a));
+        assert!(net_scope_names("10.0.0.0/8", "db:5432", a));
+        assert!(!net_scope_names("10.0.0.0/16", "db:5432", ip("10.1.0.5")));
+        assert!(net_scope_names("fd00::/8", "db:80", ip("fd12::1")));
+        assert!(net_scope_names("127.0.0.1", "x:80", ip("::ffff:127.0.0.1")));
+        for w in ["*", "*.internal", "d?"] {
+            assert!(!net_scope_names(w, "db:5432", a), "{}", w);
+        }
+    }
+
+    #[test]
+    fn every_layer_has_to_name_it() {
+        let a = ip("10.0.0.5");
+        let mut s = CapabilitySet::new("t");
+        s.grant(net(None));
+        assert_eq!(s.net_layers().admits("db:5432", a), Err(DenyCause::NoGrant));
+        assert_eq!(s.net_layers().admits("api.x.com:443", ip("93.184.216.34")), Ok(()));
+        s.grant(net(Some("10.0.0.0/8")));
+        assert_eq!(s.net_layers().admits("db:5432", a), Ok(()));
+        // Un techo con comodín sólo deja lo público.
+        s.ceiling = Some(Rc::new(vec![net(None)]));
+        assert_eq!(s.net_layers().admits("db:5432", a), Err(DenyCause::AboveCeiling));
+        s.ceiling = Some(Rc::new(vec![net(Some("db"))]));
+        assert_eq!(s.net_layers().admits("db:5432", a), Ok(()));
+        // Un `sandbox under` con comodín, igual.
+        s.push_delegation(Delegation::block(vec![net(Some("*"))]));
+        assert!(matches!(s.net_layers().admits("db:5432", a), Err(DenyCause::Delegated(_))));
+        s.pop_delegation();
+        // Los grants de un padre cuentan; un `deny` de CIDR alcanza a un nombre que resuelve adentro.
+        let parent = Rc::new(RefCell::new(CapabilitySet::new("p")));
+        parent.borrow_mut().grant(net(Some("db")));
+        let mut child = CapabilitySet::create_child(&parent, "c");
+        assert_eq!(child.net_layers().admits("db:5432", a), Ok(()));
+        child.deny(net(Some("10.0.0.0/24")));
+        assert!(matches!(child.net_layers().admits("db:5432", a), Err(DenyCause::ExplicitlyDenied(_))));
+    }
+
+    #[test]
+    fn a_cidr_grant_covers_an_ip_literal_by_name() {
+        let mut s = CapabilitySet::new("t");
+        s.grant(net(Some("10.0.0.0/8")));
+        assert!(s.require(&net(Some("10.2.3.4:80")), "t").is_ok());
+        assert!(s.require(&net(Some("11.2.3.4")), "t").is_err());
+        assert!(s.require(&net(Some("db")), "t").is_err());
+    }
+
+    #[test]
+    fn the_message_says_what_to_write() {
+        let m = private_dest_message("http_get()", "db:5432", ip("10.0.0.5"), &DenyCause::NoGrant);
+        assert!(m.contains("`db` resolved to 10.0.0.5, a private address") && m.contains("require net(\"db:5432\")"), "{}", m);
+        let m = private_dest_message("http_get()", "x:80", ip("::ffff:127.0.0.1"), &DenyCause::AboveCeiling);
+        assert!(m.contains("127.0.0.1") && m.contains("--cap-set net=x:80"), "{}", m);
     }
 }

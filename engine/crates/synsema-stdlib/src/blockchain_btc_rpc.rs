@@ -537,7 +537,7 @@ pub(crate) fn register(interp: &Interpreter, caps: Rc<RefCell<CapabilitySet>>) {
             let caps = caps.clone();
             // v0.6.46 (ronda 1, B1): el contexto de secrets del RPC vive lo que la llamada.
             interp.register_builtin($name, $arity, Rc::new(move |_i, a, _l| {
-                let _call = crate::http_common::RpcCall::open(&caps);
+                let _call = crate::http_common::RpcCall::open_for(&caps, concat!($name, "()"));
                 $f(a, &caps)
             }));
         }};

@@ -92,9 +92,53 @@ fn require_random(caps: &Rc<RefCell<CapabilitySet>>, source: &str) -> Result<(),
 /// n bytes del CSPRNG del SO (OsRng — jamás el `rand` no-cripto de `random()`).
 pub(crate) fn os_random(n: usize, who: &str) -> Result<Vec<u8>, Control> {
     let mut out = vec![0u8; n];
+    #[cfg(all(target_arch = "wasm32", not(target_os = "unknown")))]
+    if call_entropy_fill(&mut out) {
+        return Ok(out);
+    }
     rand::RngCore::try_fill_bytes(&mut rand::rngs::OsRng, &mut out)
         .map_err(|_| err(format!("{}: the OS random source is unavailable", who)))?;
     Ok(out)
+}
+
+// v0.6.46 (E6.4; ronda 3 de la Tanda E, N2) — en wasip1 (el guest de Vela, el bin `synsema-wasm`)
+// `OsRng` es un `random_get` del runtime por llamada, y `random_bytes(n)`/`token(n)` le pedían `n`
+// bytes: con un `n` privado, el runtime leía `n`. Como en wasm-web (`seed_run_rng`), cada llamada
+// del host se siembra UNA vez con 32 bytes fijos y lo de adentro sale de ahí. Un `Mutex`, no un
+// thread-local: el bin corre el programa en otro hilo que el que siembra.
+#[cfg(all(target_arch = "wasm32", not(target_os = "unknown")))]
+static CALL_RNG: std::sync::Mutex<Option<rand::rngs::StdRng>> = std::sync::Mutex::new(None);
+
+/// Siembra el generador de la llamada (wasip1). En otros targets no hace nada: nativo usa el SO, y
+/// wasm32-unknown-unknown ya lo hace en `getrandom` (wasm-web).
+pub fn begin_call_entropy() {
+    #[cfg(all(target_arch = "wasm32", not(target_os = "unknown")))]
+    {
+        use rand::SeedableRng;
+        let mut seed = [0u8; 32];
+        let rng = rand::RngCore::try_fill_bytes(&mut rand::rngs::OsRng, &mut seed).is_ok().then(|| rand::rngs::StdRng::from_seed(seed));
+        *CALL_RNG.lock().unwrap_or_else(|p| p.into_inner()) = rng;
+    }
+}
+
+/// Descarta el generador de la llamada (wasip1).
+pub fn end_call_entropy() {
+    #[cfg(all(target_arch = "wasm32", not(target_os = "unknown")))]
+    {
+        *CALL_RNG.lock().unwrap_or_else(|p| p.into_inner()) = None;
+    }
+}
+
+#[cfg(all(target_arch = "wasm32", not(target_os = "unknown")))]
+fn call_entropy_fill(out: &mut [u8]) -> bool {
+    let mut g = CALL_RNG.lock().unwrap_or_else(|p| p.into_inner());
+    match g.as_mut() {
+        Some(rng) => {
+            rand::RngCore::fill_bytes(rng, out);
+            true
+        }
+        None => false,
+    }
 }
 
 /// Unix timestamp actual (segundos). std::time — chrono va sin feature `clock`.

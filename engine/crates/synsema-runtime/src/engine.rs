@@ -896,6 +896,25 @@ pub(crate) fn wire_common_with_state(
                 .require(&Capability::new(CapabilityType::FileRead, Some(path)), "render()")
                 .map_err(|v| v.into_error())
         }));
+        // v0.6.46 (E8): y se abre sin ventana con ese gate. Con un link en el camino, el mismo gate
+        // juzga dónde quedó abierto el template.
+        let caps_open = caps.clone();
+        interp.set_template_open_hook(Rc::new(move |raw: &str, target: &std::path::Path| {
+            use synsema_capabilities::nofollow::{open_checked, OpenFor, Refused};
+            let path = synsema_capabilities::model::normalize_path(raw);
+            let recheck = |real: &str| {
+                synsema_core::capscope::with_physical(&path, real, || {
+                    caps_open
+                        .borrow_mut()
+                        .require(&Capability::new(CapabilityType::FileRead, Some(path.clone())), "render()")
+                        .map_err(|v| v.into_error())
+                })
+            };
+            open_checked(&target.to_string_lossy(), OpenFor::READ, &recheck).map_err(|r| match r {
+                Refused::Denied(e) => e,
+                Refused::Io(_) => RuntimeError::new(format!("template not found: {}", raw)),
+            })
+        }));
     }
     // run_program(source, opts): Synsema ejecutando Synsema en un proceso hijo bajo
     // techo ∩ padre (gateado por `sandbox_run`).
@@ -2145,10 +2164,13 @@ fn spawn_agent(
     let instance_id = swarm.register_new_agent(&agent_name);
     let sw = swarm.clone();
     let id = instance_id.clone();
+    // v0.6.46 (E6): el agente escribe en el registro sellado de la corrida que lo lanzó.
+    let sealed_log = synsema_core::sealed::current();
     let handle = std::thread::Builder::new()
         .name(id.clone())
         .stack_size(INTERP_STACK_SIZE)
         .spawn(move || {
+            let _sealed = sealed_log.map(synsema_core::sealed::install_thread);
             let (mut interp, caps) = match &builder {
                 // Bajo serve: el MISMO wiring que un tick de cron (state_*, DB, approvals,
                 // cron, bus, memoria, techo del host); los hooks se re-cablean con la
@@ -2339,4 +2361,56 @@ pub fn run_swarm_dump_ceiled(source: &str, filename: &str, ceiling: Option<Vec<C
         .map(|(id, st)| (id, st.name().to_string()))
         .collect();
     SwarmDump { result, blackboard, agents }
+}
+
+#[cfg(all(test, any(target_os = "linux", windows)))]
+mod v0646_e8_tests {
+    use super::*;
+
+    fn link_dir(target: &std::path::Path, link: &std::path::Path) {
+        #[cfg(windows)]
+        assert!(std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(link.to_string_lossy().replace('/', "\\"))
+            .arg(target.to_string_lossy().replace('/', "\\"))
+            .output()
+            .unwrap()
+            .status
+            .success());
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(target, link).unwrap();
+    }
+
+    /// v0.6.46 (E8): el template ya gateado, y DESPUÉS su carpeta pasa a ser un link afuera: la
+    /// apertura del motor lo niega con el mensaje del link. Un link que queda adentro, sí.
+    #[test]
+    fn e8_template_open_is_judged_where_it_opened() {
+        let d = std::env::temp_dir().join(format!("synsema-e8-tpl-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("proj/sub")).unwrap();
+        std::fs::create_dir_all(d.join("proj/otra")).unwrap();
+        std::fs::create_dir_all(d.join("afuera")).unwrap();
+        std::fs::write(d.join("proj/sub/t.html"), "adentro").unwrap();
+        std::fs::write(d.join("proj/otra/t.html"), "otra").unwrap();
+        std::fs::write(d.join("afuera/t.html"), "SECRETO").unwrap();
+        let root = d.to_string_lossy().replace('\\', "/");
+        let mut interp = Interpreter::new();
+        let caps = Rc::new(RefCell::new(CapabilitySet::new("t")));
+        caps.borrow_mut().grant(Capability::new(CapabilityType::FileRead, Some(format!("{}/proj/**", root))));
+        wire_common(&mut interp, &caps, false, None, "t");
+        let open = interp.template_open_hook().expect("el motor cablea la apertura de templates");
+        let raw = format!("{}/proj/sub/t.html", root);
+        let target = d.join("proj/sub/t.html");
+        let read = |f: std::fs::File| std::io::read_to_string(f).unwrap();
+        assert_eq!(read(open(&raw, &target).unwrap()), "adentro");
+        std::fs::remove_dir_all(d.join("proj/sub")).unwrap();
+        link_dir(&d.join("afuera"), &d.join("proj/sub"));
+        let e = open(&raw, &target).unwrap_err();
+        assert!(e.message.contains("a link (symlink or junction) on the way leads outside"), "{}", e.message);
+        let _ = std::fs::remove_dir(d.join("proj/sub"));
+        let _ = std::fs::remove_file(d.join("proj/sub"));
+        link_dir(&d.join("proj/otra"), &d.join("proj/sub"));
+        assert_eq!(read(open(&raw, &target).unwrap()), "otra");
+        let _ = std::fs::remove_dir_all(&d);
+    }
 }

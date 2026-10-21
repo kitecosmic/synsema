@@ -10,5 +10,17 @@ synsema-core.workspace = true
 chrono.workspace = true
 indexmap.workspace = true
 rand.workspace = true
+# v0.6.46 (E6): las entradas del registro de la corrida del recibo sellado (ya estaba en el árbol).
+serde_json.workspace = true
+# v0.6.46 (E6.4): el flujo de `random()` de cada hilo se deriva de la semilla de la corrida (ya estaba).
+sha2.workspace = true
 # grep(): matcher RE2 (tiempo lineal, sin ReDoS). Ya dep del workspace (la usa synsema-core).
 regex.workspace = true
+
+# v0.6.46 (E8): abrir sin seguir links (`nofollow.rs`). Las dos ya estaban en el árbol: rustix (Unix,
+# por crossterm/tempfile) y windows-sys 0.52 (stdlib, Job Objects). Sólo se suman features.
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix = { version = "1", features = ["fs"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.52", features = ["Wdk_Foundation", "Wdk_Storage_FileSystem", "Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Kernel", "Win32_System_WindowsProgramming"] }
