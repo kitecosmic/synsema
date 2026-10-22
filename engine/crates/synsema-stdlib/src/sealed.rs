@@ -86,6 +86,9 @@ pub fn parse_auditor_key(b64: &str) -> Result<[u8; 32], String> {
         .try_into()
         .map_err(|_| format!("the auditor key must be an X25519 public key of 32 bytes, got {}", raw.len()))?;
     <X25519HkdfSha256 as hpke::Kem>::PublicKey::from_bytes(&key).map_err(|_| "the auditor key is not a valid X25519 public key".to_string())?;
+    // Ronda 1 (E6-B1): una clave de orden bajo (todos ceros) pasa `from_bytes` y falla recién al
+    // sellar, con el programa ya corrido: se prueba ahora con un sobre mínimo.
+    seal_fixed(&key, b"", LEN_PREFIX, b"probe").map_err(|_| "the auditor key cannot seal (a low-order X25519 point, such as all zeros): ask the auditor for the public key of `synsema receipt keygen`".to_string())?;
     Ok(key)
 }
 
@@ -350,37 +353,57 @@ pub fn build_receipt(log: &RunLog, ctx: &ReceiptContext<'_>) -> Result<Value, St
         "sealed_bytes": size,
     });
     let public_v = Value::Array(public.clone());
-    let mut content = json!({
-        "entries": sealed.iter().map(|(a, e)| json!({"after": a, "entry": e})).collect::<Vec<_>>(),
-        "seed": seed,
-        "clock": log.clock,
-        "truncated": log.truncated,
-    });
-    // Lo que no entra se corta ADENTRO, de las últimas entradas para atrás, y se cuenta: el tamaño de
-    // afuera no cambia nunca. (El registro ya cortó al anotar; esto cubre el reloj, que no cuenta ahí.)
-    let mut kept = sealed.clone();
-    let mut extra_truncated = 0u64;
-    let mut clock = log.clock.clone();
-    loop {
-        let bytes = jcs(&content);
-        if bytes.len() + LEN_PREFIX <= size {
-            break;
+    // Lo que no entra se corta ADENTRO y se cuenta: el tamaño de afuera no cambia nunca. El registro
+    // ya cortó al anotar (el reloj con tope propio); esto cubre lo que la estimación no vio. v0.6.46
+    // (ronda 1, E6-M1): primero el reloj y después las entradas, de las últimas para atrás (son lo que
+    // el auditor necesita ver), en una pasada con los tamaños de cada una: re-serializar en cada vuelta
+    // era cuadrático.
+    let entry_v = |(a, e): &(u64, Value)| json!({"after": a, "entry": e});
+    let entry_sizes: Vec<usize> = sealed.iter().map(|x| jcs(&entry_v(x)).len() + 1).collect();
+    let clock_sizes: Vec<usize> = log.clock.iter().map(|c| jcs(&json!(c)).len() + 1).collect();
+    let empty = json!({"entries": [], "seed": seed, "clock": [], "truncated": u64::MAX, "clock_truncated": u64::MAX});
+    let budget = size.saturating_sub(LEN_PREFIX);
+    let mut total = jcs(&empty).len() + entry_sizes.iter().sum::<usize>() + clock_sizes.iter().sum::<usize>();
+    let (mut n_entries, mut n_clock) = (sealed.len(), log.clock.len());
+    while total > budget && n_clock > 0 {
+        n_clock -= 1;
+        total -= clock_sizes[n_clock];
+    }
+    while total > budget && n_entries > 0 {
+        n_entries -= 1;
+        total -= entry_sizes[n_entries];
+    }
+    let content_of = |n_entries: usize, n_clock: usize| {
+        let mut c = json!({
+            "entries": sealed[..n_entries].iter().map(entry_v).collect::<Vec<_>>(),
+            "seed": seed,
+            "clock": &log.clock[..n_clock],
+            "truncated": log.truncated + (sealed.len() - n_entries) as u64,
+        });
+        let clock_cut = log.clock_dropped + (log.clock.len() - n_clock) as u64;
+        if clock_cut > 0 {
+            c["clock_truncated"] = json!(clock_cut);
         }
-        if kept.pop().is_some() {
-            extra_truncated += 1;
-        } else if clock.pop().is_some() {
-            content["clock_truncated"] = json!(true);
+        c
+    };
+    let mut content = content_of(n_entries, n_clock);
+    // La estimación es por arriba (los contadores con su largo máximo): si igual no entra, se sigue
+    // de a una, como antes.
+    while jcs(&content).len() + LEN_PREFIX > size {
+        if n_clock > 0 {
+            n_clock -= 1;
+        } else if n_entries > 0 {
+            n_entries -= 1;
         } else {
             return Err("the sealed receipt does not fit even empty: raise SYNSEMA_RECEIPT_SEALED_BYTES".to_string());
         }
-        content["entries"] = Value::Array(kept.iter().map(|(a, e)| json!({"after": a, "entry": e})).collect());
-        content["clock"] = json!(clock);
-        content["truncated"] = json!(log.truncated + extra_truncated);
+        content = content_of(n_entries, n_clock);
     }
+    let kept = &sealed[..n_entries];
     let aad = sha(jcs(&header).as_bytes());
     let env = seal_fixed(&ctx.auditor, jcs(&content).as_bytes(), size, &aad)?;
     let env_bytes = env.to_bytes();
-    let root = chain_root(&header, &merged(&public, &kept));
+    let root = chain_root(&header, &merged(&public, kept));
     let msg = signed_message(&header, &public_v, &env_bytes, &root);
     let sig = ctx.key.sign(&msg);
     let mut out = Map::new();
@@ -594,7 +617,9 @@ pub fn request_finish() -> Result<(), String> {
     let Some(req) = REQUEST.with(|r| r.borrow_mut().take()) else { return Ok(()) };
     let Some(r) = SERVE_RECEIPTS.get() else { return Ok(()) };
     let receipt = {
-        let log = req.log.lock().unwrap_or_else(|p| p.into_inner());
+        let mut log = req.log.lock().unwrap_or_else(|p| p.into_inner());
+        // v0.6.46 (ronda 1, E6-M2): un agente que lanzó la request lo sigue teniendo instalado.
+        log.close();
         build_receipt(
             &log,
             &ReceiptContext {
@@ -724,6 +749,30 @@ mod tests {
         assert_eq!(a["public"], b["public"]);
         assert_eq!(a["header"]["public_entries"], json!(2));
         assert_eq!(a["sealed"].as_str().unwrap().len(), b["sealed"].as_str().unwrap().len());
+    }
+
+    /// Ronda 1 (E6-M1): si al armar algo no entra, sale primero el reloj y no lo firmado, y en una
+    /// pasada (el reloj se carga sin el tope del registro, como si la estimación hubiera fallado).
+    #[test]
+    fn e6_build_trims_the_clock_first_in_one_pass() {
+        let (sk, pk) = auditor();
+        let key = RunKey::ephemeral();
+        let log = new_run_log(16 * 1024);
+        {
+            let mut l = log.lock().unwrap();
+            l.push_sealed(json!({"kind": "op", "line": "sign firmado"}).to_string());
+            for i in 0..200_000 {
+                l.clock.push(1_760_000_000.0 + i as f64 / 7.0);
+            }
+        }
+        let t0 = std::time::Instant::now();
+        let l = log.lock().unwrap();
+        let ctx = ReceiptContext { auditor: pk, key: &key, program_sha: None, config_sha: None, started: "2026-10-21T00:00:00Z".into() };
+        let r = build_receipt(&l, &ctx).unwrap();
+        assert!(t0.elapsed() < std::time::Duration::from_secs(20), "{:?}", t0.elapsed());
+        let o = open_receipt(&r, &sk).unwrap();
+        assert!(o["entries"].as_array().unwrap().iter().any(|e| e["entry"]["line"] == "sign firmado"), "{}", o);
+        assert!(o["clock_truncated"].as_u64().unwrap() > 190_000, "{}", o["clock_truncated"]);
     }
 
     #[test]

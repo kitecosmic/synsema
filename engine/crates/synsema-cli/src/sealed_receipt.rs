@@ -47,6 +47,9 @@ pub fn from_flags(cmd: &str, flag: Option<String>, dest: Option<String>) -> Resu
     };
     let key = sealed::parse_auditor_key(&raw).map_err(|e| fail(format!("--auditor: {}", e)))?;
     let size = sealed::sealed_bytes_from(knob("SYNSEMA_RECEIPT_SEALED_BYTES").as_deref()).map_err(fail)?;
+    if let Some(d) = &dest {
+        check_dest(d).map_err(fail)?;
+    }
     // La clave que firma: la de identidad del host si la hay (Ed25519, la de la Agent Card); si no,
     // una efímera de la corrida (integridad, no identidad: el header lo dice).
     let run_key = match knob("SYNSEMA_IDENTITY_KEY") {
@@ -80,9 +83,35 @@ pub fn serve_from_flags(flag: Option<String>, dest: &Option<String>) -> Result<O
     };
     let key = sealed::parse_auditor_key(&raw).map_err(|e| fail(format!("--auditor: {}", e)))?;
     let size = sealed::sealed_bytes_from(knob("SYNSEMA_RECEIPT_SEALED_BYTES").as_deref()).map_err(fail)?;
+    if let Some(d) = dest {
+        check_dest(d).map_err(fail)?;
+    }
     // Que cada entrada diga en qué línea nació (como con `--audit`).
     synsema_core::audit_loc::enable();
     Ok(Some((key, size)))
+}
+
+/// Ronda 1 (E6-B1) — el destino de `--receipt`, antes de correr nada: un error ahí aparecía recién
+/// al final, con los efectos del programa ya hechos y sin recibo. Una ruta se abre para agregar (se
+/// crea si falta, sin vaciarla: si la corrida no llega a empezar, el recibo anterior queda; `run` la
+/// reemplaza al escribir el suyo); `fd:N` sólo en Unix y con N >= 3.
+fn check_dest(dest: &str) -> Result<(), String> {
+    if let Some(n) = dest.strip_prefix("fd:") {
+        if !cfg!(unix) {
+            return Err(format!("--receipt {}: a file descriptor is only available on Unix; pass a path", dest));
+        }
+        return match n.parse::<i32>() {
+            Ok(n) if n >= 3 => Ok(()),
+            Ok(_) => Err("--receipt fd:N needs N >= 3 (0-2 are stdin/stdout/stderr)".to_string()),
+            Err(_) => Err(format!("--receipt: invalid fd '{}'", dest)),
+        };
+    }
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dest)
+        .map(|_| ())
+        .map_err(|e| format!("--receipt: cannot write {}: {}", dest, e))
 }
 
 fn rfc3339_now() -> String {
@@ -106,11 +135,19 @@ impl Auditor {
     /// El recibo de la corrida que terminó.
     pub fn receipt(&self, config_sha: Option<String>) -> Result<serde_json::Value, String> {
         let program_sha = synsema_stdlib::attest::current_program_sha().map(|s| synsema_core::bytesutil::hex_encode(&s));
-        let log = self.log.lock().unwrap_or_else(|p| p.into_inner());
+        let mut log = self.log.lock().unwrap_or_else(|p| p.into_inner());
+        // v0.6.46 (ronda 1, E6-M2): un agente que sigue vivo ya no anota en un recibo armado.
+        log.close();
         sealed::build_receipt(
             &log,
             &sealed::ReceiptContext { auditor: self.key, key: &self.run_key, program_sha, config_sha, started: self.started.clone() },
         )
+    }
+
+    /// ¿Hay un `--receipt`? (Con `--format json` el recibo va en el informe, y además al destino si
+    /// lo hay.)
+    pub fn has_dest(&self) -> bool {
+        self.dest.is_some()
     }
 
     /// Escribe el recibo en su destino (`--receipt <ruta>`, `fd:N`, o stderr).
@@ -147,22 +184,61 @@ impl Auditor {
 
 /// `synsema receipt open <recibo> --key <privada>` / `verify <recibo>` / `keygen`.
 pub fn cmd_receipt(args: &[String]) -> ExitCode {
-    const USAGE: &str = "usage: synsema receipt open <receipt.json> --key <auditor private key | @file>\n       synsema receipt verify <receipt.json>\n       synsema receipt keygen";
+    const USAGE: &str = "usage: synsema receipt open <receipt.json> --key <auditor private key | @file> [--line N]\n       synsema receipt verify <receipt.json>\n       synsema receipt keygen [--out <private key file>]";
     let sub = args.get(2).map(String::as_str);
     match sub {
         Some("keygen") => {
             let (sk, pk) = sealed::generate_keypair();
-            println!("{}", serde_json::json!({"private": sk, "public": pk}));
-            ExitCode::SUCCESS
+            // Ronda 1 (E6-B8): con `--out`, la privada va a un archivo nuevo que sólo lee el dueño
+            // (0600 en Unix) y por stdout sale sólo la pública. Sin `--out`, como antes (redirigida,
+            // queda con la umask).
+            match (args.get(3).map(String::as_str), args.get(4)) {
+                (None, _) => {
+                    println!("{}", serde_json::json!({"private": sk, "public": pk}));
+                    ExitCode::SUCCESS
+                }
+                (Some("--out"), Some(file)) if args.len() == 5 => {
+                    let mut o = std::fs::OpenOptions::new();
+                    o.write(true).create_new(true);
+                    #[cfg(unix)]
+                    std::os::unix::fs::OpenOptionsExt::mode(&mut o, 0o600);
+                    match o.open(file).and_then(|mut f| f.write_all(sk.as_bytes()).and_then(|_| f.flush())) {
+                        Ok(()) => {
+                            println!("{}", serde_json::json!({"public": pk, "private_in": file}));
+                            eprintln!("open receipts with: synsema receipt open <receipt.json> --key @{}", file);
+                            ExitCode::SUCCESS
+                        }
+                        Err(e) => {
+                            eprintln!("synsema receipt keygen: cannot create {} (it must not exist): {}", file, e);
+                            ExitCode::from(1)
+                        }
+                    }
+                }
+                _ => {
+                    eprintln!("{}", USAGE);
+                    ExitCode::from(2)
+                }
+            }
         }
         Some(op @ ("open" | "verify")) => {
             let mut path: Option<&str> = None;
             let mut key: Option<String> = None;
+            let mut line: Option<usize> = None;
             let mut i = 3;
             while i < args.len() {
                 match args[i].as_str() {
                     "--key" => {
                         key = args.get(i + 1).cloned();
+                        i += 1;
+                    }
+                    "--line" if op == "open" => {
+                        match args.get(i + 1).and_then(|n| n.parse::<usize>().ok()) {
+                            Some(n) if n > 0 => line = Some(n),
+                            _ => {
+                                eprintln!("synsema receipt open: --line takes a line number (1, 2, …)\n{}", USAGE);
+                                return ExitCode::from(2);
+                            }
+                        }
                         i += 1;
                     }
                     p if !p.starts_with("--") && path.is_none() => path = Some(p),
@@ -189,16 +265,66 @@ pub fn cmd_receipt(args: &[String]) -> ExitCode {
                     return ExitCode::from(1);
                 }
             };
-            // La línea del recibo: la última línea JSON que sea un recibo (stderr puede traer más).
-            let receipt = text
-                .lines()
-                .rev()
-                .filter_map(|l| serde_json::from_str::<serde_json::Value>(l.trim()).ok())
-                .find(|v| v.get("synsema_receipt").is_some())
-                .or_else(|| serde_json::from_str(&text).ok());
-            let Some(receipt) = receipt else {
+            // Ronda 4: sin el BOM que agrega un editor al guardar (escondía la línea 1: no era JSON ni
+            // empezaba como un recibo, y `verify` contaba uno menos y salía verde).
+            let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
+            // Las líneas con un recibo (stderr de `run` trae otras; el archivo de `serve --receipt`, uno
+            // por request), con su número de línea; si ninguna, el texto entero (un recibo con formato).
+            let mut receipts: Vec<(usize, serde_json::Value)> = Vec::new();
+            // Ronda 2 (R2-B2): una línea que empieza como un recibo y no lo es (cortada, con un byte
+            // cambiado en la sintaxis) falla; antes quedaba afuera y `verify` salía verde. Ronda 3
+            // (R3-B1): que EMPIECE así, no que lo contenga: el stderr de `run` trae también los
+            // `eprint` del programa, y un log que nombra la clave volvía roto un recibo honesto.
+            let mut broken: Vec<usize> = Vec::new();
+            for (n, l) in text.lines().enumerate() {
+                match serde_json::from_str::<serde_json::Value>(l.trim()) {
+                    Ok(v) if v.get("synsema_receipt").is_some() => receipts.push((n + 1, v)),
+                    _ if l.trim_start().starts_with("{\"synsema_receipt\":") => broken.push(n + 1),
+                    _ => {}
+                }
+            }
+            if receipts.is_empty() {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+                    receipts.push((1, v));
+                    broken.clear();
+                }
+            }
+            if receipts.is_empty() {
                 eprintln!("synsema receipt: {} has no sealed receipt", path);
                 return ExitCode::from(1);
+            }
+            // v0.6.46 (ronda 1, E6-M3): con varios recibos, `verify` revisa TODOS (antes sólo el
+            // último: una línea alterada más arriba pasaba) y `open` pide cuál.
+            if op == "verify" && receipts.len() + broken.len() > 1 {
+                let mut bad: Vec<(usize, String)> = receipts
+                    .iter()
+                    .filter_map(|(n, r)| sealed::verify_receipt(r).err().map(|e| (*n, e)))
+                    .collect();
+                bad.extend(broken.iter().map(|n| (*n, "the line names a sealed receipt but is not one (cut or changed)".to_string())));
+                bad.sort();
+                let bad: Vec<serde_json::Value> = bad.into_iter().map(|(n, e)| serde_json::json!({"line": n, "error": e})).collect();
+                println!("{}", serde_json::json!({"ok": bad.is_empty(), "receipts": receipts.len() + broken.len(), "bad": bad}));
+                return if bad.is_empty() { ExitCode::SUCCESS } else { ExitCode::from(1) };
+            }
+            let receipt = match line {
+                Some(n) => match receipts.iter().find(|(l, _)| *l == n) {
+                    Some((_, r)) => r.clone(),
+                    None => {
+                        eprintln!("synsema receipt open: line {} of {} is not a sealed receipt", n, path);
+                        return ExitCode::from(1);
+                    }
+                },
+                None if receipts.len() > 1 => {
+                    let at: Vec<String> = receipts.iter().map(|(l, _)| l.to_string()).collect();
+                    eprintln!(
+                        "synsema receipt open: {} has {} sealed receipts (lines {}): pick one with --line N",
+                        path,
+                        receipts.len(),
+                        at.join(", ")
+                    );
+                    return ExitCode::from(2);
+                }
+                None => receipts.remove(0).1,
             };
             let out = if op == "verify" {
                 sealed::verify_receipt(&receipt).map(|h| serde_json::json!({"ok": true, "header": h}))

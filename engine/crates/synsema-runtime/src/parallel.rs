@@ -219,6 +219,7 @@ fn run_parallel(
     bus: Option<Arc<synsema_agents::bus::Bus>>,
     subject: crate::subject::Subject,
     providers: crate::engine::WiredProviders,
+    sealed: Option<(synsema_core::sealed::SharedLog, Option<String>)>,
 ) -> Result<Vec<(SendValue, Vec<synsema_core::rng::Generator>)>, RuntimeError> {
     let n = items.len();
     if n == 0 {
@@ -238,6 +239,9 @@ fn run_parallel(
             let g = shared.lock().unwrap();
             (g.0.clone(), g.1.clone())
         };
+        // v0.6.46 (ronda 1, E6-A2): el registro de la corrida del llamador también es el de sus
+        // workers (bajo `serve` es el del hilo de la request, que un hilo nuevo no ve).
+        let _sealed = sealed.as_ref().map(|(log, _)| synsema_core::sealed::install_thread(log.clone()));
         loop {
             let i = next.fetch_add(1, Ordering::Relaxed);
             if i >= n || aborted.load(Ordering::Relaxed) {
@@ -254,7 +258,13 @@ fn run_parallel(
                 ItemVal::Send(sv) => from_send(sv),
             };
             let keep = item.clone();
-            match interp.call_task(task_value, vec![item]) {
+            let called = match sealed.as_ref().and_then(|(_, p)| p.as_ref()) {
+                Some(prefix) => synsema_core::sealed::with_stream(format!("{}:{}", prefix, i), || {
+                    interp.call_task(task_value, vec![item])
+                }),
+                None => interp.call_task(task_value, vec![item]),
+            };
+            match called {
                 Ok(v) => {
                     // El estado final de los generadores del item, en orden de recorrido.
                     let mut gens = Vec::new();
@@ -435,6 +445,7 @@ pub(crate) fn register_parallel_builtins(
                 synsema_stdlib::ws::bus_of_interp(i),
                 subject,
                 crate::engine::wired_providers(i),
+                synsema_core::sealed::current().map(|log| (log, synsema_capabilities::secure::run_rng_fork())),
             ) {
                 Ok(results) => {
                     // Lo que cada worker avanzó de SUS generadores vuelve al padre (como con

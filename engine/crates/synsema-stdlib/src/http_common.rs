@@ -960,7 +960,7 @@ pub fn dest_check(host: &str, port: u16, ip: std::net::IpAddr) -> Result<(), Str
 }
 
 /// El destino como lo pide `net`: con el puerto siempre (un grant sin puerto cubre cualquiera).
-fn dest_scope(host: &str, port: u16) -> String {
+pub(crate) fn dest_scope(host: &str, port: u16) -> String {
     let h = host.trim_start_matches('[').trim_end_matches(']').to_ascii_lowercase();
     if h.contains(':') {
         format!("[{}]:{}", h, port)

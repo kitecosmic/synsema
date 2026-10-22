@@ -617,7 +617,8 @@ fn establish(
         &caps.borrow(),
         &dial.bindings,
         "ws_connect()",
-        &format!("{}:{}", dial.host.trim_start_matches('[').trim_end_matches(']').to_ascii_lowercase(), dial.port),
+        // Ronda 1 (E7-M1): con los corchetes de una IPv6, como `http`/`tcp` (`::1:80` no nombraba nada).
+        &crate::http_common::dest_scope(&dial.host, dial.port),
         sa.ip(),
     )
     .map_err(err)?;

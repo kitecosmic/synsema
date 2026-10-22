@@ -510,8 +510,26 @@ fn run_bundled(bundle: synsema_core::bundle::Bundle, program_args: Vec<String>) 
         // v0.6.45 (A5): un `exit(code)` antes de escuchar decide el código, como en `run`.
         return ExitCode::from(run_exit_code(&result));
     }
-    synsema_core::interpreter::LIVE_STDOUT.store(true, std::sync::atomic::Ordering::Relaxed);
-    let result = run_program_ceiled(&source, &filename, ceiling);
+    // Ronda 1 (E6-B6): un bundle en modo `run` también lee `SYNSEMA_AUDITOR_KEY` (los de `serve` ya
+    // lo hacían): con auditor, el recibo sale (a stderr) antes que la salida, como `synsema run`.
+    let auditor = match sealed_receipt::from_flags("run", None, None) {
+        Ok(a) => a,
+        Err(code) => return code,
+    };
+    let result = match &auditor {
+        Some(a) => {
+            a.install();
+            let result = run_program_ceiled_opts(&source, &filename, ceiling, false);
+            if let Err(code) = emit_receipt(a, None) {
+                return code;
+            }
+            result
+        }
+        None => {
+            synsema_core::interpreter::LIVE_STDOUT.store(true, std::sync::atomic::Ordering::Relaxed);
+            run_program_ceiled(&source, &filename, ceiling)
+        }
+    };
     for line in &result.output {
         println!("{}", line);
     }
@@ -1845,6 +1863,14 @@ fn cmd_run(args: &[String]) -> ExitCode {
             let config_sha = report.get("config_sha").and_then(|v| v.as_str()).map(str::to_string);
             match a.receipt(config_sha) {
                 Ok(r) => {
+                    // Ronda 1 (E6-B2): `--receipt` también con `--format json` (se ignoraba).
+                    if a.has_dest() {
+                        if let Err(e) = a.emit(&r) {
+                            eprintln!("synsema run: the sealed receipt could not be delivered: {}", e);
+                            audit::summary(1);
+                            return ExitCode::from(1);
+                        }
+                    }
                     let mut with = serde_json::Map::new();
                     with.insert("receipt".into(), r);
                     for (k, v) in report.as_object().into_iter().flatten() {
@@ -1880,7 +1906,14 @@ fn cmd_run(args: &[String]) -> ExitCode {
                     }
                     Some(Ok(fields))
                 }
-                Err(e) => Some(Err(e)),
+                // Ronda 1 (E6-B4): sin documento la corrida igual pasó: su recibo sale (sin
+                // `config_sha`) antes que la salida, como en el brazo de una corrida que falló.
+                Err(e) => {
+                    if let Err(code) = emit_receipt(a, None) {
+                        return code;
+                    }
+                    Some(Err(e))
+                }
             },
             (Some(a), false) => {
                 if let Err(code) = emit_receipt(a, None) {

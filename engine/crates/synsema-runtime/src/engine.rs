@@ -896,10 +896,13 @@ pub(crate) fn wire_common_with_state(
                 .require(&Capability::new(CapabilityType::FileRead, Some(path)), "render()")
                 .map_err(|v| v.into_error())
         }));
-        // v0.6.46 (E8): y se abre sin ventana con ese gate. Con un link en el camino, el mismo gate
-        // juzga dónde quedó abierto el template.
+        // v0.6.46 (E8): y se abre sin ventana con ese gate: la MISMA ruta que juzgó (la normalizada
+        // de `raw`), no la que `resolve_template_path` resolvió después (ronda 1, E8-A3: entre el
+        // gate y ese `canonicalize` un link podía cambiar, y la ruta resuelta ya no tiene links que
+        // obliguen a re-juzgar). Con un link en el camino, el mismo gate juzga dónde quedó abierto el
+        // template, y además que siga adentro del directorio de trabajo, el otro chequeo de la carga.
         let caps_open = caps.clone();
-        interp.set_template_open_hook(Rc::new(move |raw: &str, target: &std::path::Path| {
+        interp.set_template_open_hook(Rc::new(move |raw: &str| {
             use synsema_capabilities::nofollow::{open_checked, OpenFor, Refused};
             let path = synsema_capabilities::model::normalize_path(raw);
             let recheck = |real: &str| {
@@ -908,9 +911,15 @@ pub(crate) fn wire_common_with_state(
                         .borrow_mut()
                         .require(&Capability::new(CapabilityType::FileRead, Some(path.clone())), "render()")
                         .map_err(|v| v.into_error())
-                })
+                })?;
+                let cwd = std::env::current_dir().and_then(|p| p.canonicalize()).map_err(|e| RuntimeError::new(e.to_string()))?;
+                if std::path::Path::new(real).starts_with(&cwd) {
+                    Ok(())
+                } else {
+                    Err(RuntimeError::new(format!("template path escapes the working directory: '{}'", raw)))
+                }
             };
-            open_checked(&target.to_string_lossy(), OpenFor::READ, &recheck).map_err(|r| match r {
+            open_checked(&path, OpenFor::READ, &recheck).map_err(|r| match r {
                 Refused::Denied(e) => e,
                 Refused::Io(_) => RuntimeError::new(format!("template not found: {}", raw)),
             })
@@ -2381,36 +2390,63 @@ mod v0646_e8_tests {
         std::os::unix::fs::symlink(target, link).unwrap();
     }
 
-    /// v0.6.46 (E8): el template ya gateado, y DESPUÉS su carpeta pasa a ser un link afuera: la
-    /// apertura del motor lo niega con el mensaje del link. Un link que queda adentro, sí.
+    /// Saca el link (una junction en Windows es un directorio; un symlink en Unix, un archivo).
+    fn unlink(link: &std::path::Path) {
+        if std::fs::remove_dir(link).is_err() {
+            std::fs::remove_file(link).unwrap();
+        }
+    }
+
+    /// v0.6.46 (E8): el template ya gateado, y DESPUÉS su carpeta pasa a ser un link afuera del
+    /// grant (pero adentro del cwd): la apertura lo niega con el mensaje del link. En el orden de la
+    /// ejecución real (ronda 1, E8-A3): gate, cambio, el `canonicalize` de `resolve_template_path` (que
+    /// ya no ve links) y recién ahí la apertura. Un link que queda adentro, sí.
     #[test]
     fn e8_template_open_is_judged_where_it_opened() {
-        let d = std::env::temp_dir().join(format!("synsema-e8-tpl-{}", std::process::id()));
+        // Adentro del cwd (el del crate): `render` sólo lee plantillas de ahí.
+        let name = format!(".e8-tpl-test-{}", std::process::id());
+        let d = std::env::current_dir().unwrap().join(&name);
         let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(d.join("proj/sub")).unwrap();
+        // Se limpia aunque falle una aserción: la carpeta vive en el crate, no en temp.
+        struct Limpia(std::path::PathBuf);
+        impl Drop for Limpia {
+            fn drop(&mut self) {
+                let sub = self.0.join("proj/sub");
+                if std::fs::remove_dir(&sub).is_err() {
+                    let _ = std::fs::remove_file(&sub);
+                }
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _limpia = Limpia(d.clone());
+        std::fs::create_dir_all(d.join("proj/real")).unwrap();
         std::fs::create_dir_all(d.join("proj/otra")).unwrap();
         std::fs::create_dir_all(d.join("afuera")).unwrap();
-        std::fs::write(d.join("proj/sub/t.html"), "adentro").unwrap();
+        std::fs::write(d.join("proj/real/t.html"), "adentro").unwrap();
         std::fs::write(d.join("proj/otra/t.html"), "otra").unwrap();
         std::fs::write(d.join("afuera/t.html"), "SECRETO").unwrap();
-        let root = d.to_string_lossy().replace('\\', "/");
+        link_dir(&d.join("proj/real"), &d.join("proj/sub"));
         let mut interp = Interpreter::new();
         let caps = Rc::new(RefCell::new(CapabilitySet::new("t")));
-        caps.borrow_mut().grant(Capability::new(CapabilityType::FileRead, Some(format!("{}/proj/**", root))));
+        caps.borrow_mut().grant(Capability::new(CapabilityType::FileRead, Some(format!("{}/proj/**", name))));
         wire_common(&mut interp, &caps, false, None, "t");
         let open = interp.template_open_hook().expect("el motor cablea la apertura de templates");
-        let raw = format!("{}/proj/sub/t.html", root);
-        let target = d.join("proj/sub/t.html");
+        let raw = format!("{}/proj/sub/t.html", name);
         let read = |f: std::fs::File| std::io::read_to_string(f).unwrap();
-        assert_eq!(read(open(&raw, &target).unwrap()), "adentro");
-        std::fs::remove_dir_all(d.join("proj/sub")).unwrap();
+        let gate = || interp.gate_template_read(&raw).is_ok();
+        assert!(gate());
+        assert_eq!(read(open(&raw).unwrap()), "adentro");
+        // La carrera: el gate pasa con `sub` → `real`, y antes de abrir `sub` lleva afuera.
+        assert!(gate());
+        unlink(&d.join("proj/sub"));
         link_dir(&d.join("afuera"), &d.join("proj/sub"));
-        let e = open(&raw, &target).unwrap_err();
+        let resolved = d.join("proj/sub/t.html").canonicalize().unwrap();
+        assert!(resolved.ends_with("afuera/t.html") || resolved.ends_with("afuera\\t.html"));
+        let e = open(&raw).unwrap_err();
         assert!(e.message.contains("a link (symlink or junction) on the way leads outside"), "{}", e.message);
-        let _ = std::fs::remove_dir(d.join("proj/sub"));
-        let _ = std::fs::remove_file(d.join("proj/sub"));
+        // Un link que queda adentro del grant, sí.
+        unlink(&d.join("proj/sub"));
         link_dir(&d.join("proj/otra"), &d.join("proj/sub"));
-        assert_eq!(read(open(&raw, &target).unwrap()), "otra");
-        let _ = std::fs::remove_dir_all(&d);
+        assert_eq!(read(open(&raw).unwrap()), "otra");
     }
 }

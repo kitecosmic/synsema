@@ -114,6 +114,26 @@ fn build(dir: &PathBuf, extra: &[&str]) -> PathBuf {
     out
 }
 
+/// v0.6.46 (ronda 1, E6-B6): un bundle en modo `run` lee `SYNSEMA_AUDITOR_KEY` (acá del `.env`) y
+/// entrega el recibo sellado antes que la salida, como `synsema run --auditor`. Antes lo ignoraba en
+/// silencio.
+#[test]
+fn bundled_run_honors_the_auditor_key() {
+    let dir = project("auditor");
+    let lamp = build(&dir, &[]);
+    let (_, pk) = synsema_stdlib::sealed::generate_keypair();
+    std::fs::write(dir.join(".env"), format!("SYNSEMA_AUDITOR_KEY={}\n", pk)).unwrap();
+    let (code, out, err) = run(&lamp, &dir, &[]);
+    assert_eq!(code, 0, "{}", err);
+    assert!(out.lines().next().map(str::trim) == Some("42"), "{}", out);
+    let receipt = err
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .find(|v| v.get("synsema_receipt").is_some())
+        .unwrap_or_else(|| panic!("sin recibo en stderr: {}", err));
+    synsema_stdlib::sealed::verify_receipt(&receipt).expect("el recibo verifica");
+}
+
 #[test]
 fn build_hello_and_run_it_without_the_sources_on_disk() {
     let dir = project("hello");

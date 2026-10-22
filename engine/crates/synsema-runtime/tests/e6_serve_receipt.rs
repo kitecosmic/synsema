@@ -16,6 +16,17 @@ use synsema_stdlib::sealed;
 const PROG: &str = r#"require serve(8080)
 require random
 require time
+require secret("K")
+require sign("K")
+require file.write("e6_late_*")
+agent Late
+    sleep(0.5)
+    write_file("e6_late_antes.txt", "x")
+    let k be secret("K")
+    let p be private(1, ["cliente"])
+    when p == 1
+        let s be ed25519_sign("hola", k)
+    write_file("e6_late_despues.txt", "x")
 serve on 8080
     route "GET /r"
         let s be private(5, "app")
@@ -26,6 +37,9 @@ serve on 8080
         give {"a": a}
     route "GET /plain"
         give "hola"
+    route "GET /late"
+        spawn Late
+        give "ok"
 "#;
 
 const STREAM: &str = r#"require serve(8080)
@@ -62,6 +76,7 @@ fn e6_serve_receipt_per_request() {
     assert!(synsema_runtime::host::set_labels(true) || synsema_runtime::host::labels());
     let seed = [0x42u8; 32];
     std::env::set_var("SYNSEMA_IDENTITY_KEY", synsema_core::bytesutil::hex_encode(&seed));
+    std::env::set_var("K", "1111111111111111111111111111111111111111111111111111111111111111");
     let (sk, pk) = sealed::generate_keypair();
     let auditor = sealed::parse_auditor_key(&pk).unwrap();
     let sk = synsema_core::bytesutil::b64url_decode(&sk).unwrap();
@@ -134,5 +149,25 @@ fn e6_serve_receipt_per_request() {
     );
     assert!(entries.iter().any(|e| e["sealed"] == true && e["entry"]["capability"] == "random"));
     assert_eq!(opened["clock"].as_array().map(Vec::len), Some(1));
+
+    // Ronda 1 (E6-M2): un agente que lanzó la request firma en una rama privada DESPUÉS de que el
+    // recibo se armó. Con el registro abierto la firma corría (con auditor va al sobre) y no quedaba
+    // en ningún recibo; cerrado, se niega como sin auditor.
+    let (antes, despues) = (std::path::Path::new("e6_late_antes.txt"), std::path::Path::new("e6_late_despues.txt"));
+    let _ = (std::fs::remove_file(antes), std::fs::remove_file(despues));
+    let resp = http_get(port, "/late");
+    assert!(resp.starts_with("HTTP/1.1 200"), "{}", resp);
+    assert_eq!(lines(&dest).len(), 3);
+    for _ in 0..100 {
+        if antes.exists() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(antes.exists(), "control: el agente corrió");
+    thread::sleep(Duration::from_millis(800));
+    let firmo = despues.exists();
+    let _ = (std::fs::remove_file(antes), std::fs::remove_file(despues));
+    assert!(!firmo, "el agente firmó en una rama privada después del recibo, sin rastro");
     let _ = std::fs::remove_file(&dest);
 }

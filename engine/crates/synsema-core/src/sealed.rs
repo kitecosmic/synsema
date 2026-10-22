@@ -53,6 +53,14 @@ pub struct RunLog {
     pub replay_inputs: Option<(Vec<(String, String)>, usize)>,
     /// La primera entrada que no coincidió (el replay para ahí).
     replay_error: Option<String>,
+    /// v0.6.46 (ronda 1, E6-M1): bytes del sobre que ya ocupa el reloj (también cuentan en `used`),
+    /// y las lecturas que no entraron (se cuentan, no se guardan).
+    clock_used: usize,
+    pub clock_dropped: u64,
+    /// v0.6.46 (ronda 1, E6-M2): el recibo ya se armó. Un agente que lanzó la corrida sigue vivo con
+    /// este registro instalado: lo que anotara después no estaría en ningún recibo, y una operación
+    /// que sin auditor se niega correría sin rastro. Cerrado, el registro no está (`current`).
+    closed: bool,
 }
 
 impl RunLog {
@@ -63,6 +71,16 @@ impl RunLog {
 
     pub fn capacity(&self) -> usize {
         self.capacity
+    }
+
+    /// Lo llama quien arma el recibo, con el registro tomado: desde acá es como si no hubiera auditor.
+    pub fn close(&mut self) {
+        self.closed = true;
+    }
+
+    /// ¿Cerrado? Para quien toma el candado por su cuenta (la semilla de `random()`).
+    pub fn is_closed(&self) -> bool {
+        self.closed
     }
 
     fn seq(&mut self) -> u64 {
@@ -89,6 +107,22 @@ impl RunLog {
         self.used += cost;
         self.sealed.push((s, entry));
     }
+
+    /// v0.6.46 (ronda 1, E6-M1) — una lectura del reloj. Cuenta en el tamaño del sobre, con tope en
+    /// un cuarto: sin tope, muchas `now()` desalojaban al armar el recibo lo que se firmó en una rama
+    /// privada, y el armado era cuadrático. Pasado el tope se cuenta y no se guarda (`--replay` usa
+    /// la hora real para esas).
+    pub fn push_clock(&mut self, v: f64) {
+        // Un f64 en el JSON del sobre (ryu): a lo sumo 24 caracteres, más la coma.
+        const COST: usize = 26;
+        if self.clock_used + COST > self.capacity / 4 || self.used + COST + ENVELOPE_RESERVE > self.capacity {
+            self.clock_dropped += 1;
+            return;
+        }
+        self.clock_used += COST;
+        self.used += COST;
+        self.clock.push(v);
+    }
 }
 
 pub type SharedLog = Arc<Mutex<RunLog>>;
@@ -100,6 +134,31 @@ static PROCESS: Mutex<Option<SharedLog>> = Mutex::new(None);
 
 thread_local! {
     static THREAD: RefCell<Option<SharedLog>> = const { RefCell::new(None) };
+    static STREAM: RefCell<Option<String>> = const { RefCell::new(None) };
+}
+
+/// v0.6.46 (ronda 1, E6-A2) — corre `f` con `name` como flujo de azar de la corrida (lo que sale de
+/// `random()` con un registro). Lo fija `parallel_map` por ítem: sus workers no tienen nombre propio,
+/// y derivar del nombre del hilo daba el mismo número en todos los ítems. Por ítem, no por hilo: qué
+/// hilo toma qué ítem no es determinista, y `--replay` tiene que reproducir la lista.
+pub fn with_stream<T>(name: String, f: impl FnOnce() -> T) -> T {
+    struct Restore(Option<String>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let prev = self.0.take();
+            STREAM.with(|s| *s.borrow_mut() = prev);
+        }
+    }
+    let _restore = Restore(STREAM.with(|s| s.borrow_mut().replace(name)));
+    f()
+}
+
+/// El flujo de azar de este hilo: el que fijó `with_stream`, o el nombre del hilo (el de la corrida,
+/// el de cada agente).
+pub fn stream() -> String {
+    STREAM
+        .with(|s| s.borrow().clone())
+        .unwrap_or_else(|| std::thread::current().name().unwrap_or("").to_string())
 }
 
 /// ¿Hay un registro para la corrida de este hilo?
@@ -108,12 +167,15 @@ pub fn active() -> bool {
     INSTALLED.load(Ordering::Relaxed) != 0 && current().is_some()
 }
 
-/// El registro de la corrida de este hilo: el del hilo, o el del proceso.
+/// El registro de la corrida de este hilo: el del hilo, o el del proceso. Uno cerrado (su recibo ya
+/// se armó) no está, y el del hilo no cae al del proceso.
 pub fn current() -> Option<SharedLog> {
     if INSTALLED.load(Ordering::Relaxed) == 0 {
         return None;
     }
-    THREAD.with(|t| t.borrow().clone()).or_else(|| PROCESS.lock().ok().and_then(|g| g.clone()))
+    let log = THREAD.with(|t| t.borrow().clone()).or_else(|| PROCESS.lock().ok().and_then(|g| g.clone()))?;
+    let closed = log.lock().unwrap_or_else(|p| p.into_inner()).closed;
+    (!closed).then_some(log)
 }
 
 /// Instala el registro del proceso (CLI, wasm). Devuelve el anterior.
@@ -155,12 +217,29 @@ impl Drop for ThreadGuard {
 fn with_log(f: impl FnOnce(&mut RunLog)) -> bool {
     match current() {
         Some(log) => {
+            #[cfg(test)]
+            BETWEEN.with(|b| {
+                if let Some(f) = b.borrow_mut().take() {
+                    f()
+                }
+            });
             let mut g = log.lock().unwrap_or_else(|p| p.into_inner());
+            // Ronda 2 (R2-B1): `closed` otra vez, con el candado con el que se anota: entre el
+            // `current()` y este `lock()` otro hilo pudo cerrar el registro y armar el recibo.
+            if g.closed {
+                return false;
+            }
             f(&mut g);
             true
         }
         None => false,
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Corre una vez entre el `current()` y el `lock()` de `with_log` (el test cierra ahí).
+    static BETWEEN: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
 }
 
 /// Una entrada que sale a la vista. `false` si no hay registro.
@@ -196,7 +275,7 @@ pub fn read_clock(real: f64, fenced: bool) -> Option<f64> {
         } else {
             real
         };
-        l.clock.push(v);
+        l.push_clock(v);
         out = Some(v);
     });
     out
@@ -289,6 +368,20 @@ mod tests {
         assert_eq!(l.truncated, 1);
     }
 
+    /// Ronda 1 (E6-M1): el reloj no pasa de su cuarto del sobre, y lo que entra después sigue
+    /// teniendo lugar.
+    #[test]
+    fn the_clock_keeps_to_its_quarter() {
+        let mut l = RunLog::new(64 * 1024);
+        for i in 0..100_000 {
+            l.push_clock(1_760_000_000.0 + i as f64 / 7.0);
+        }
+        assert!(l.clock.len() < 64 * 1024 / 4 / 20, "{}", l.clock.len());
+        assert_eq!(l.clock.len() as u64 + l.clock_dropped, 100_000);
+        l.push_sealed("x".repeat(30_000));
+        assert_eq!((l.sealed.len(), l.truncated), (1, 0));
+    }
+
     #[test]
     fn the_thread_log_wins_and_is_removed_with_its_guard() {
         assert!(!active());
@@ -301,5 +394,33 @@ mod tests {
         assert!(!active());
         assert!(!push_sealed("{}".into()));
         assert_eq!(a.lock().unwrap().sealed.len(), 1);
+    }
+
+    /// Ronda 1 (E6-M2): cerrado (el recibo ya se armó), el registro no está para nadie que lo tenga
+    /// instalado: nada se anota y lo que se niega sin auditor se niega.
+    #[test]
+    fn a_closed_log_is_not_there() {
+        let a: SharedLog = Arc::new(Mutex::new(RunLog::new(1 << 16)));
+        let _g = install_thread(a.clone());
+        assert!(active());
+        a.lock().unwrap().close();
+        assert!(!active());
+        assert!(current().is_none());
+        assert!(!push_sealed("{\"k\":1}".into()));
+        assert!(!push_public("{}".into()));
+        assert!(a.lock().unwrap().sealed.is_empty());
+    }
+
+    /// Ronda 2 (R2-B1): el registro se cierra entre que `with_log` lo encuentra y lo toma (otro hilo
+    /// armó el recibo en ese hueco): no se anota, y quien llama recibe `false` (la operación se
+    /// niega como sin auditor).
+    #[test]
+    fn a_log_closed_while_writing_is_not_written() {
+        let a: SharedLog = Arc::new(Mutex::new(RunLog::new(1 << 16)));
+        let _g = install_thread(a.clone());
+        let b = a.clone();
+        BETWEEN.with(|h| *h.borrow_mut() = Some(Box::new(move || b.lock().unwrap().close())));
+        assert!(!push_sealed("{\"k\":1}".into()));
+        assert!(a.lock().unwrap().sealed.is_empty());
     }
 }

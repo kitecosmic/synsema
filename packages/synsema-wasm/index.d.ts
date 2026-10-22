@@ -57,7 +57,14 @@ export interface Host {
   /**
    * v0.6.46: en nativo, un `require net` con comodín sólo llega a IPs públicas (el motor resuelve
    * y chequea la IP antes de conectar). Acá la conexión es tuya y el motor no ve la IP: si el
-   * programa no es tuyo, negá loopback, red privada y `169.254.169.254` en este hook.
+   * programa no es tuyo, resolvé el nombre y chequeá la IP a la que vas a conectar (un nombre como
+   * `127.0.0.1.nip.io` resuelve al loopback), y conectá a ésa. Negá loopback (`127.0.0.0/8`,
+   * `::1`), las redes privadas (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, CGNAT
+   * `100.64.0.0/10`, ULA `fc00::/7`), link-local (`169.254.0.0/16` con la metadata de la nube
+   * `169.254.169.254`, `fe80::/10`), multicast y los rangos de documentación; una IPv4 dentro de una
+   * IPv6 (`::ffff:a.b.c.d`) cuenta como esa IPv4. El hook no sabe si el programa nombró el host
+   * (`require net("db")`): si tus programas necesitan llegar a una red privada, nombrá vos esos
+   * destinos en el hook.
    */
   http?(req: HttpRequestPayload): HttpResponsePayload | Promise<HttpResponsePayload>;
   kv?: KvStore;

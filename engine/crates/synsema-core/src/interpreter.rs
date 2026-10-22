@@ -1120,10 +1120,12 @@ pub type TrustedScopeHook = Rc<dyn Fn(Option<(&str, &[(String, Option<String>)])
 /// `declassify` (el real variaría con el valor elegido). Sin hook, nada privado llega al modelo.
 pub type LlmDataHook = Rc<dyn Fn(&str, &[Rc<str>], &str, bool) -> bool>;
 
-/// v0.6.46 (E8) — abre un template del disco ya gateado (`raw` como se escribió, `target` la ruta
-/// resuelta bajo el cwd) sin ventana entre el gate y la apertura. Lo cablea el motor (que tiene con
-/// qué abrir sin seguir links); sin él, el template se lee por nombre, como v0.6.45.
-pub type TemplateOpenHook = Rc<dyn Fn(&str, &std::path::Path) -> Result<std::fs::File, RuntimeError>>;
+/// v0.6.46 (E8) — abre un template del disco ya gateado (`raw`, como se escribió) sin ventana entre
+/// el gate y la apertura. Abre lo que juzgó el gate (la ruta normalizada de `raw`), NO la ruta ya
+/// resuelta con `canonicalize`: ésa se resolvió después del gate y nadie la juzgó (ronda 1, E8-A3).
+/// Lo cablea el motor (que tiene con qué abrir sin seguir links); sin él, el template se lee por
+/// nombre, como v0.6.45.
+pub type TemplateOpenHook = Rc<dyn Fn(&str) -> Result<std::fs::File, RuntimeError>>;
 
 // --- FASE 1 tool-calling: el callback de paso del LLM (tipos PLANOS) ---
 // core NO depende de `synsema-llm` (la dep va al revés vía runtime). Igual que
@@ -2887,6 +2889,18 @@ impl Interpreter {
         if !sealed && self.lineage.len() >= MAX_LINEAGE {
             return;
         }
+        // v0.6.46 (ronda 1, E6-A1): bajo un PC privado lo leído llega etiquetado (`private`), y el
+        // serializador lo redactaba: se sellaba el hash de "[redacted]" (y `--replay` no veía otra
+        // entrada) y avisaba en stderr una vez por lectura, que contaba las lecturas de la rama. Se
+        // hashea el valor sin etiquetas: sólo va dentro del sobre, que es privado por construcción.
+        let (stripped_result, stripped_args);
+        let (result, args): (&SynValue, &[SynValue]) = if sealed {
+            stripped_result = crate::labels::strip_deep(result);
+            stripped_args = args.iter().map(crate::labels::strip_deep).collect::<Vec<_>>();
+            (&stripped_result, &stripped_args)
+        } else {
+            (result, args)
+        };
         // Un recv que venció sin mensaje no trajo nada.
         if matches!(result, SynValue::Nothing)
             && ["ws_", "proc_", "term_", "watch_"].iter().any(|p| source.starts_with(p))

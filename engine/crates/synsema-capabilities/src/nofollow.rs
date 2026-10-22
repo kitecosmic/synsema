@@ -66,14 +66,19 @@ fn plain(path: &str, how: OpenFor) -> io::Result<File> {
     std::fs::OpenOptions::new().read(how.read).write(how.write).append(how.append).create(how.create).open(path)
 }
 
-/// Hay un link en el camino: abrir siguiendo, sin efectos, y juzgar dónde quedó el handle.
+/// Hay un link en el camino: abrir siguiendo y juzgar dónde quedó el handle.
+///
+/// Ronda 1 (E8-B2): se abre primero SIN acceso a los datos (Linux `O_PATH`, Windows sólo atributos),
+/// se juzga la ruta real, y recién entonces se reabre el MISMO objeto con el acceso pedido (Linux
+/// `/proc/self/fd/N`, Windows `ReOpenFile`). Abrir con el acceso pedido antes de juzgar no siempre es
+/// inocuo: un FIFO de afuera del grant bloqueaba la lectura, un dispositivo puede tener efectos al
+/// abrirse, y en Windows se rompían los oplocks de otro proceso.
 fn through_link<E>(abs: &str, how: OpenFor, recheck: &dyn Fn(&str) -> Result<(), E>) -> Result<File, Refused<E>> {
-    let existing = std::fs::OpenOptions::new().read(how.read).write(how.write).append(how.append).open(abs);
-    match existing {
+    match sys::open_path(abs) {
         Ok(f) => {
             let real = sys::real_path(&f).ok_or_else(|| Refused::Io(io::Error::other("cannot tell where the open file is")))?;
             recheck(&real).map_err(Refused::Denied)?;
-            Ok(f)
+            sys::reopen(&f, how).map_err(Refused::Io)
         }
         Err(e) if e.kind() == io::ErrorKind::NotFound && how.create => {
             // No existe: la carpeta padre, siguiendo links; su ubicación real + el nombre se
@@ -202,18 +207,71 @@ mod sys {
     fn map(e: rustix::io::Errno) -> Nf {
         match e {
             rustix::io::Errno::LOOP => Nf::Link,
-            // Sin `openat2` (kernel < 5.6, o el seccomp de un contenedor viejo).
+            // Sin `openat2` (kernel < 5.6, o el seccomp de un contenedor que la conoce y la niega).
             rustix::io::Errno::NOSYS => Nf::Unsupported,
             e => Nf::Io(io::Error::from_raw_os_error(e.raw_os_error())),
         }
     }
 
+    /// Ronda 1 (E8-B1): `openat2` bloqueada por un seccomp viejo (Docker < 20.10 daba EPERM, no
+    /// ENOSYS, a las syscalls que no conocía). Se sabe la primera vez y queda anotado.
+    static OPENAT2_BLOCKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+    /// `openat2` sin seguir links, con el caso de arriba: un EPERM se contrasta abriendo `/` (que
+    /// siempre se puede); si ése también da EPERM, es la syscall la bloqueada y se sigue como v0.6.45.
+    fn openat2_nf(abs: &str, flags: OFlags, mode: Mode) -> Result<File, Nf> {
+        use std::sync::atomic::Ordering;
+        if OPENAT2_BLOCKED.load(Ordering::Relaxed) {
+            return Err(Nf::Unsupported);
+        }
+        match rustix::fs::openat2(CWD, abs, flags, mode, ResolveFlags::NO_SYMLINKS) {
+            Ok(fd) => Ok(File::from(fd)),
+            Err(rustix::io::Errno::PERM) => {
+                let root = rustix::fs::openat2(CWD, "/", OFlags::PATH | OFlags::CLOEXEC, Mode::empty(), ResolveFlags::NO_SYMLINKS);
+                Err(perm_or_blocked(root.map(|_| ()), &OPENAT2_BLOCKED))
+            }
+            Err(e) => Err(map(e)),
+        }
+    }
+
+    /// Un EPERM de `openat2`: si abrir `/` también lo da, la syscall está bloqueada (se anota en
+    /// `blocked`); si no, es el permiso de ese archivo.
+    fn perm_or_blocked(root: Result<(), rustix::io::Errno>, blocked: &std::sync::atomic::AtomicBool) -> Nf {
+        match root {
+            Err(rustix::io::Errno::PERM) => {
+                blocked.store(true, std::sync::atomic::Ordering::Relaxed);
+                Nf::Unsupported
+            }
+            _ => map(rustix::io::Errno::PERM),
+        }
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn a_blocked_openat2_falls_back_and_a_real_eperm_does_not() {
+        let blocked = std::sync::atomic::AtomicBool::new(false);
+        assert!(matches!(perm_or_blocked(Ok(()), &blocked), Nf::Io(e) if e.raw_os_error() == Some(rustix::io::Errno::PERM.raw_os_error())));
+        assert!(!blocked.load(std::sync::atomic::Ordering::Relaxed));
+        assert!(matches!(perm_or_blocked(Err(rustix::io::Errno::PERM), &blocked), Nf::Unsupported));
+        assert!(blocked.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
     pub(super) fn open_nofollow(abs: &str, how: OpenFor) -> Result<File, Nf> {
         // `openat2`, a diferencia de `openat`, da EINVAL con un modo distinto de cero sin O_CREAT.
         let mode = if how.create { Mode::from_raw_mode(0o666) } else { Mode::empty() };
-        rustix::fs::openat2(CWD, abs, flags(how), mode, ResolveFlags::NO_SYMLINKS)
-            .map(File::from)
-            .map_err(map)
+        openat2_nf(abs, flags(how), mode)
+    }
+
+    /// Abre siguiendo links, sin acceso a los datos (`O_PATH`): no abre el FIFO ni el dispositivo.
+    pub(super) fn open_path(abs: &str) -> io::Result<File> {
+        rustix::fs::open(abs, OFlags::PATH | OFlags::CLOEXEC, Mode::empty()).map(File::from).map_err(os)
+    }
+
+    /// Reabre el mismo objeto con el acceso pedido (el link mágico de `/proc/self/fd`).
+    pub(super) fn reopen(f: &File, how: OpenFor) -> io::Result<File> {
+        use std::os::fd::AsRawFd;
+        let how = OpenFor { create: false, ..how };
+        rustix::fs::open(format!("/proc/self/fd/{}", f.as_raw_fd()), flags(how), Mode::empty()).map(File::from).map_err(os)
     }
 
     pub(super) fn real_path(f: &File) -> Option<String> {
@@ -235,9 +293,7 @@ mod sys {
     }
 
     pub(super) fn open_dir_nofollow(abs: &str) -> Result<File, Nf> {
-        rustix::fs::openat2(CWD, abs, OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC, Mode::empty(), ResolveFlags::NO_SYMLINKS)
-            .map(File::from)
-            .map_err(map)
+        openat2_nf(abs, OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC, Mode::empty())
     }
 
     fn os(e: rustix::io::Errno) -> io::Error {
@@ -276,7 +332,7 @@ mod sys {
     use std::os::windows::ffi::OsStringExt;
     use std::os::windows::fs::OpenOptionsExt;
     use std::os::windows::io::{AsRawHandle, FromRawHandle};
-    use std::sync::{Mutex, OnceLock};
+    use std::sync::{Arc, Mutex, OnceLock};
     use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
     use windows_sys::Wdk::Storage::FileSystem::{
         NtCreateFile, NtSetInformationFile, FILE_CREATE, FILE_NON_DIRECTORY_FILE, FILE_OPEN, FILE_OPEN_IF,
@@ -284,34 +340,86 @@ mod sys {
     };
     use windows_sys::Wdk::Storage::FileSystem::FILE_DIRECTORY_FILE;
     use windows_sys::Win32::Foundation::{
-        RtlNtStatusToDosError, HANDLE, STATUS_REPARSE_POINT_ENCOUNTERED, UNICODE_STRING,
+        RtlNtStatusToDosError, HANDLE, INVALID_HANDLE_VALUE, STATUS_REPARSE_POINT_ENCOUNTERED, UNICODE_STRING,
     };
     use windows_sys::Win32::Storage::FileSystem::{
-        FileDispositionInfo, GetFinalPathNameByHandleW, SetFileInformationByHandle,
+        FileDispositionInfo, GetDriveTypeW, GetFinalPathNameByHandleW, QueryDosDeviceW, ReOpenFile, SetFileInformationByHandle,
         DELETE, FILE_APPEND_DATA, FILE_ATTRIBUTE_NORMAL, FILE_DISPOSITION_INFO, FILE_FLAG_BACKUP_SEMANTICS,
         FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_LIST_DIRECTORY, FILE_NAME_NORMALIZED, FILE_READ_ATTRIBUTES,
         FILE_RENAME_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE, SYNCHRONIZE,
         VOLUME_NAME_DOS,
     };
     use windows_sys::Win32::System::Kernel::{OBJ_CASE_INSENSITIVE, OBJ_DONT_REPARSE};
+    use windows_sys::Win32::System::WindowsProgramming::DRIVE_FIXED;
     use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
-    /// El handle de la raíz de cada unidad (`C:\`), abierto una vez: la ruta se abre RELATIVA a él,
-    /// así el nombre no pasa por `\??\C:` (un link del object manager que `OBJ_DONT_REPARSE`
-    /// también rechazaría).
-    fn root(drive: u8) -> io::Result<HANDLE> {
-        static ROOTS: OnceLock<Mutex<HashMap<u8, File>>> = OnceLock::new();
-        let mut m = ROOTS.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(f) = m.get(&drive) {
-            return Ok(f.as_raw_handle() as HANDLE);
+    /// El handle de la raíz de la unidad (`C:\`): la ruta se abre RELATIVA a él, así el nombre no pasa
+    /// por `\??\C:` (un link del object manager que `OBJ_DONT_REPARSE` también rechazaría).
+    ///
+    /// Ronda 1 (E8-M5): queda en caché sólo la de un disco fijo, y se valida en cada apertura con el
+    /// destino de la letra (`QueryDosDeviceW`, ~2 µs): un `subst` o un `mountvol` que la remapea cambia
+    /// ese destino y se reabre (antes se abría en el volumen o la carpeta de antes, distinto del
+    /// juzgado). Una unidad extraíble, de red o de CD se abre cada vez: no queda tomada (el USB se
+    /// puede expulsar) ni muerta si se desmonta; abrirla no toma el candado del caché (ronda 2).
+    fn root(drive: u8) -> io::Result<Arc<File>> {
+        type Roots = HashMap<u8, (Vec<u16>, Option<Arc<File>>)>;
+        static ROOTS: OnceLock<Mutex<Roots>> = OnceLock::new();
+        let open = || -> io::Result<Arc<File>> {
+            #[cfg(test)]
+            if SLOW_ROOT.load(std::sync::atomic::Ordering::Relaxed) == drive {
+                std::thread::sleep(std::time::Duration::from_millis(1500));
+            }
+            let f = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+                .open(format!("{}:\\", drive as char))?;
+            Ok(Arc::new(f))
+        };
+        let target = dos_device(drive)?;
+        let roots = ROOTS.get_or_init(|| Mutex::new(HashMap::new()));
+        // Ronda 2 (R2-B3): el candado sólo para mirar y guardar; la apertura y `GetDriveTypeW` van sin
+        // él (en una unidad de red tardan lo que tarde el servidor, y frenaban las aperturas en `C:`).
+        let known = match roots.lock().unwrap_or_else(|p| p.into_inner()).get(&drive) {
+            Some((t, cached)) if *t == target => Some(cached.clone()),
+            _ => None,
+        };
+        match known {
+            Some(Some(f)) => Ok(f),
+            Some(None) => open(),
+            None => {
+                let root_w: Vec<u16> = format!("{}:\\", drive as char).encode_utf16().chain(Some(0)).collect();
+                // SAFETY: `root_w` es una cadena UTF-16 terminada en cero que vive durante la llamada.
+                let fixed = unsafe { GetDriveTypeW(root_w.as_ptr()) } == DRIVE_FIXED;
+                let f = open()?;
+                // Ronda 3 (N2): si la letra cambió de destino mientras se abría, este handle no es el
+                // de `target`: se usa una vez (el chequeo de después lo juzga) pero no se guarda.
+                if dos_device(drive).ok().as_ref() != Some(&target) {
+                    return Ok(f);
+                }
+                // Dos hilos que llegan juntos abren los dos; queda el último, y el otro handle se
+                // cierra al soltarse su `Arc`.
+                roots.lock().unwrap_or_else(|p| p.into_inner()).insert(drive, (target, fixed.then(|| f.clone())));
+                Ok(f)
+            }
         }
-        let f = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
-            .open(format!("{}:\\", drive as char))?;
-        let h = f.as_raw_handle() as HANDLE;
-        m.insert(drive, f);
-        Ok(h)
+    }
+
+    /// La raíz de esta letra tarda en abrirse (como una unidad de red lenta): el test de R2-B3.
+    #[cfg(test)]
+    pub(super) static SLOW_ROOT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+    /// El destino de la letra en el object manager (`\Device\HarddiskVolume3`, `\??\C:\carpeta` de un
+    /// `subst`).
+    fn dos_device(drive: u8) -> io::Result<Vec<u16>> {
+        let name: Vec<u16> = format!("{}:", drive as char).encode_utf16().chain(Some(0)).collect();
+        let mut buf = vec![0u16; 1024];
+        // SAFETY: `name` está terminada en cero y `buf` tiene `buf.len()` u16 escribibles.
+        let n = unsafe { QueryDosDeviceW(name.as_ptr(), buf.as_mut_ptr(), buf.len() as u32) };
+        if n == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        buf.truncate(n as usize);
+        Ok(buf)
     }
 
     fn access(how: OpenFor) -> u32 {
@@ -387,7 +495,7 @@ mod sys {
 
     /// La raíz de la unidad y el resto de la ruta, para abrirla relativa a la raíz. Sólo una ruta de
     /// unidad local (`C:/…`); UNC y otras, como v0.6.45.
-    fn under_root(abs: &str) -> Result<(HANDLE, String), Nf> {
+    fn under_root(abs: &str) -> Result<(Arc<File>, String), Nf> {
         let b = abs.as_bytes();
         if b.len() < 4 || !b[0].is_ascii_alphabetic() || b[1] != b':' || b[2] != b'/' {
             return Err(Nf::Unsupported);
@@ -401,13 +509,13 @@ mod sys {
 
     pub(super) fn open_nofollow(abs: &str, how: OpenFor) -> Result<File, Nf> {
         let (dir, rest) = under_root(abs)?;
-        nt_open(dir, &rest, how, false)
+        nt_open(dir.as_raw_handle() as HANDLE, &rest, how, false)
     }
 
     pub(super) fn open_dir_nofollow(abs: &str) -> Result<File, Nf> {
         let (dir, rest) = under_root(abs)?;
         let access = SYNCHRONIZE | FILE_READ_ATTRIBUTES | FILE_LIST_DIRECTORY | FILE_TRAVERSE;
-        nt_create(dir, &rest, access, FILE_OPEN, FILE_DIRECTORY_FILE)
+        nt_create(dir.as_raw_handle() as HANDLE, &rest, access, FILE_OPEN, FILE_DIRECTORY_FILE)
     }
 
     fn io(e: Nf) -> io::Error {
@@ -509,6 +617,25 @@ mod sys {
         std::fs::OpenOptions::new().read(true).custom_flags(FILE_FLAG_BACKUP_SEMANTICS).open(path)
     }
 
+    /// Abre siguiendo links, sólo con acceso a los atributos: no toca los datos ni rompe oplocks.
+    pub(super) fn open_path(abs: &str) -> io::Result<File> {
+        use std::os::windows::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new().access_mode(SYNCHRONIZE | FILE_READ_ATTRIBUTES).open(abs)
+    }
+
+    /// Reabre el mismo objeto con el acceso pedido.
+    pub(super) fn reopen(f: &File, how: OpenFor) -> io::Result<File> {
+        // SAFETY: el handle es de `f`, abierto; `ReOpenFile` devuelve uno nuevo (o INVALID_HANDLE_VALUE).
+        let h = unsafe {
+            ReOpenFile(f.as_raw_handle() as HANDLE, access(how), FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, 0)
+        };
+        if h == INVALID_HANDLE_VALUE {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: `h` es un handle nuevo y válido que nadie más posee.
+        Ok(unsafe { File::from_raw_handle(h as _) })
+    }
+
     pub(super) fn create_beneath(dir: &File, name: &str, how: OpenFor) -> Result<File, Nf> {
         nt_open(dir.as_raw_handle() as HANDLE, name, how, false)
     }
@@ -530,6 +657,15 @@ mod sys {
 
     pub(super) fn open_dir(path: &str) -> io::Result<File> {
         File::open(path)
+    }
+
+    // Sin `open_nofollow` no hay link que seguir: no se llaman.
+    pub(super) fn open_path(_abs: &str) -> io::Result<File> {
+        Err(io::Error::from(io::ErrorKind::Unsupported))
+    }
+
+    pub(super) fn reopen(_f: &File, _how: OpenFor) -> io::Result<File> {
+        Err(io::Error::from(io::ErrorKind::Unsupported))
     }
 
     pub(super) fn create_beneath(_dir: &File, _name: &str, _how: OpenFor) -> Result<File, Nf> {
@@ -658,6 +794,117 @@ mod tests {
 
     /// v0.6.46 (E8): lo que cuesta abrir así contra la apertura de antes. Correr con
     /// `cargo test --release -p synsema-capabilities --lib open_cost -- --ignored --nocapture`.
+    /// Ronda 1 (E8-B2): por un link, lo de afuera del grant se juzga ANTES de abrirlo con el acceso
+    /// pedido: un FIFO de afuera se niega en vez de bloquear la lectura para siempre.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_fifo_outside_is_judged_before_it_is_opened() {
+        let d = tmp("fifo");
+        rustix::fs::mknodat(rustix::fs::CWD, d.join("cola"), rustix::fs::FileType::Fifo, rustix::fs::Mode::from_raw_mode(0o600), 0).unwrap();
+        std::os::unix::fs::symlink(d.join("cola"), d.join("link")).unwrap();
+        let path = s(&d.join("link"));
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let r = open_checked::<&str>(&path, OpenFor::READ, &|_| Err("afuera"));
+            let _ = tx.send(matches!(r, Err(Refused::Denied("afuera"))));
+        });
+        let denied = rx.recv_timeout(std::time::Duration::from_secs(5));
+        // Si quedó bloqueado, se destraba abriendo el otro extremo.
+        if denied.is_err() {
+            let _ = std::fs::OpenOptions::new().write(true).open(d.join("cola"));
+        }
+        let _ = std::fs::remove_dir_all(&d);
+        assert_eq!(denied, Ok(true), "la apertura bloqueó (o no se negó) antes de juzgar");
+    }
+
+    /// Ronda 1 (E8-M5): una letra que cambia de destino (`subst`) se abre en el destino nuevo, el que
+    /// juzgó el chequeo. Con la raíz en caché sin validar se abría en la carpeta de antes.
+    #[cfg(windows)]
+    #[test]
+    fn a_remapped_drive_letter_opens_where_it_points_now() {
+        let d = tmp("subst");
+        std::fs::create_dir_all(d.join("a")).unwrap();
+        std::fs::create_dir_all(d.join("b")).unwrap();
+        std::fs::write(d.join("a/f.txt"), "DE_A").unwrap();
+        std::fs::write(d.join("b/f.txt"), "DE_B").unwrap();
+        let subst = |args: &[&str]| std::process::Command::new("subst").args(args).output().map(|o| o.status.success()).unwrap_or(false);
+        let win = |p: &std::path::Path| p.to_string_lossy().replace('/', "\\");
+        // Una letra libre (sin destino en el object manager).
+        let Some(letter) = (b'M'..=b'Y').rev().map(|c| c as char).find(|c| !std::path::Path::new(&format!("{}:\\", c)).exists()) else {
+            eprintln!("sin letra libre: no se prueba");
+            return;
+        };
+        let drive = format!("{}:", letter);
+        struct Quita(String);
+        impl Drop for Quita {
+            fn drop(&mut self) {
+                let _ = std::process::Command::new("subst").args([self.0.as_str(), "/d"]).output();
+            }
+        }
+        let _quita = Quita(drive.clone());
+        assert!(subst(&[&drive, &win(&d.join("a"))]), "subst");
+        let read = || {
+            let mut t = String::new();
+            open_checked::<()>(&format!("{}/f.txt", drive), OpenFor::READ, &|_| Ok(())).unwrap().read_to_string(&mut t).unwrap();
+            t
+        };
+        assert_eq!(read(), "DE_A");
+        assert!(subst(&[&drive, "/d"]));
+        assert!(subst(&[&drive, &win(&d.join("b"))]), "subst");
+        assert_eq!(read(), "DE_B", "se abrió en el destino viejo de la letra");
+        drop(_quita);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Ronda 2 (R2-B3): mientras una letra tarda en abrir su raíz (una unidad de red lenta), una
+    /// apertura en otra unidad no la espera. Antes la raíz se abría con el candado del caché tomado.
+    #[cfg(windows)]
+    #[test]
+    fn a_slow_drive_does_not_hold_the_others() {
+        let d = tmp("slowroot");
+        std::fs::create_dir_all(d.join("a")).unwrap();
+        std::fs::write(d.join("a/f.txt"), "DE_A").unwrap();
+        std::fs::write(d.join("g.txt"), "AQUI").unwrap();
+        let read = |p: &str| {
+            let mut t = String::new();
+            open_checked::<()>(p, OpenFor::READ, &|_| Ok(())).unwrap().read_to_string(&mut t).unwrap();
+            t
+        };
+        let here = s(&d.join("g.txt"));
+        assert_eq!(read(&here), "AQUI");
+        // Otro rango de letras que el test de `subst` de arriba: corren en paralelo.
+        let Some(letter) = (b'G'..=b'L').rev().find(|c| !std::path::Path::new(&format!("{}:\\", *c as char)).exists()) else {
+            eprintln!("sin letra libre: no se prueba");
+            return;
+        };
+        let drive = format!("{}:", letter as char);
+        struct Quita(String);
+        impl Drop for Quita {
+            fn drop(&mut self) {
+                sys::SLOW_ROOT.store(0, std::sync::atomic::Ordering::Relaxed);
+                let _ = std::process::Command::new("subst").args([self.0.as_str(), "/d"]).output();
+            }
+        }
+        let _quita = Quita(drive.clone());
+        let ok = std::process::Command::new("subst")
+            .args([drive.as_str(), &d.join("a").to_string_lossy().replace('/', "\\")])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        assert!(ok, "subst");
+        sys::SLOW_ROOT.store(letter, std::sync::atomic::Ordering::Relaxed);
+        let far = format!("{}/f.txt", drive);
+        let slow = std::thread::spawn(move || read(&far));
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let t = std::time::Instant::now();
+        assert_eq!(read(&here), "AQUI");
+        let waited = t.elapsed();
+        assert_eq!(slow.join().unwrap(), "DE_A");
+        assert!(waited < std::time::Duration::from_millis(900), "la otra unidad esperó {:?}", waited);
+        drop(_quita);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
     #[test]
     #[ignore]
     fn open_cost() {

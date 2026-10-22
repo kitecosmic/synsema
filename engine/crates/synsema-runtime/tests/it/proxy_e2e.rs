@@ -82,3 +82,50 @@ fn proxy_to_parses_and_forwards() {
     // El body viene del upstream y refleja el path forwardeado.
     assert!(resp.contains("upstream saw: GET /up/hello"), "forward body: {}", resp);
 }
+
+/// v0.6.46 (ronda 1, E7-B4/B1): `proxy to` también pasa por E7. Con `net` comodín, un upstream en el
+/// loopback se niega (502) sin que le llegue nada, estático o dinámico; y el 502 no le cuenta al
+/// cliente a qué IP resolvió el nombre (va al log del server).
+#[test]
+fn proxy_to_a_private_upstream_needs_it_named() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let up = listener.local_addr().unwrap().port();
+    let hits = Arc::new(AtomicUsize::new(0));
+    let h = hits.clone();
+    thread::spawn(move || {
+        for s in listener.incoming().flatten() {
+            h.fetch_add(1, Ordering::SeqCst);
+            drop(s);
+        }
+    });
+    let port = free_port();
+    let prog = format!(
+        "require serve({p})\nrequire net\nserve on {p}\n    route \"GET /fijo/*path\"\n        proxy to \"http://127.0.0.1:{up}\"\n    route \"GET /din/*path\"\n        let u be \"http://127.0.0.1:{up}\"\n        proxy to u\n",
+        p = port,
+        up = up
+    );
+    thread::spawn(move || {
+        let _ = run_serve_program(&prog, "proxy_e7.syn", false);
+    });
+    let mut ready = false;
+    for _ in 0..60 {
+        if TcpStream::connect(("127.0.0.1", port)).is_ok() {
+            ready = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(ready, "el server proxy no quedó listo en :{}", port);
+    for path in ["/fijo/x", "/din/x"] {
+        let mut sock = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        sock.write_all(format!("GET {} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n", path).as_bytes()).unwrap();
+        let mut resp = String::new();
+        let _ = sock.read_to_string(&mut resp);
+        assert!(resp.starts_with("HTTP/1.1 502"), "{}: {}", path, resp);
+        assert!(resp.contains("upstream not allowed"), "{}: {}", path, resp);
+        assert!(!resp.contains("resolved to") && !resp.contains("private address"), "el 502 cuenta la IP: {}", resp);
+    }
+    assert_eq!(hits.load(Ordering::SeqCst), 0, "el upstream privado recibió la conexión");
+}

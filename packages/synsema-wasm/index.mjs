@@ -16,7 +16,9 @@
 // No hay estado global: cada `load()` es una instancia (memoria lineal propia).
 //
 // v0.6.46 (E7): la conexión del `http` del host es del embebedor, y el motor no ve a qué IP va. En
-// nativo un `net` con comodín sólo llega a IPs públicas; acá eso lo tiene que hacer tu hook.
+// nativo un `net` con comodín sólo llega a IPs públicas; acá eso lo tiene que hacer tu hook:
+// resolver el nombre, chequear la IP a la que conecta (los rangos están en `Host.http`, en
+// index.d.ts) y conectar a ésa. El hook no sabe si el programa nombró el host.
 
 const te = new TextEncoder();
 const td = new TextDecoder();

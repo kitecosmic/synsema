@@ -602,8 +602,15 @@ fn load_template(
     let not_found = || Control::Error(RuntimeError::new(format!("template not found: {}", raw_path)));
     let bundled: Option<&'static [u8]> = crate::bundle::get(&target.to_string_lossy());
     let mut file = match (bundled, open) {
-        (None, Some(open)) => Some(open(raw_path, target).map_err(Control::Error)?),
+        (None, Some(open)) => Some(open(raw_path).map_err(Control::Error)?),
         _ => None,
+    };
+    // Ronda 2 (R2-N1): la clave del cache nombra lo que se leyó. Con el hook se abre el nombre crudo
+    // (normalizado), no `target` (canonicalizado antes, y un link en el camino pudo cambiar en el
+    // medio): con `target` de clave, otro archivo con la misma fecha y tamaño traía este árbol.
+    let key: PathBuf = match &file {
+        Some(_) => PathBuf::from(crate::capscope::normalize_path(raw_path)),
+        None => target.clone(),
     };
     let (mtime, size) = match bundled {
         // Inmutable: la clave del cache es el nombre; el tamaño basta como huella.
@@ -618,7 +625,7 @@ fn load_template(
         }
     };
     let hit = TPL_CACHE.with(|c| {
-        c.borrow().get(target).and_then(|e| {
+        c.borrow().get(&key).and_then(|e| {
             if e.mtime == mtime && e.size == size {
                 Some(Rc::clone(&e.tree))
             } else {
@@ -646,7 +653,7 @@ fn load_template(
     }
     let tree = Rc::new(tree);
     TPL_CACHE.with(|c| {
-        c.borrow_mut().insert(target.clone(), CachedTpl { mtime, size, tree: Rc::clone(&tree) })
+        c.borrow_mut().insert(key, CachedTpl { mtime, size, tree: Rc::clone(&tree) })
     });
     Ok(tree)
 }
@@ -1416,5 +1423,30 @@ mod v0620_tests {
         }
         assert!(text.contains("[a-z0-9]{4}-?[a-z0-9]{1,40}"), "{}", text);
         assert_eq!(holes, vec!["field".to_string(), "4".to_string()]);
+    }
+
+    /// Ronda 2 (R2-N1): con el hook se lee lo que abre el hook (el nombre crudo), y el cache lo guarda
+    /// con ese nombre: si el hook abrió otro archivo que `target` (un link cambió en el medio), una
+    /// carga legítima de `target` con la misma fecha y tamaño no se lleva ese árbol.
+    #[test]
+    fn the_template_cache_is_keyed_by_what_was_read() {
+        use std::rc::Rc;
+        let d = std::env::temp_dir().join(format!("synsema-tplkey-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let (a, b) = (d.join("a.html"), d.join("b.html"));
+        std::fs::write(&a, "AAAA").unwrap();
+        std::fs::write(&b, "BBBB").unwrap();
+        let t = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        for f in [&a, &b] {
+            std::fs::File::options().write(true).open(f).unwrap().set_modified(t).unwrap();
+        }
+        let hook: crate::interpreter::TemplateOpenHook =
+            Rc::new(|raw: &str| std::fs::File::open(raw).map_err(|e| crate::interpreter::RuntimeError::new(e.to_string())));
+        let (ra, rb) = (a.to_string_lossy().into_owned(), b.to_string_lossy().into_owned());
+        let other = super::load_template(&a, "a.html", &rb, Some(hook.clone())).unwrap_or_else(|_| panic!("b"));
+        let mine = super::load_template(&a, "a.html", &ra, Some(hook)).unwrap_or_else(|_| panic!("a"));
+        assert!(!Rc::ptr_eq(&other, &mine), "la carga de a.html trajo el árbol de b.html");
+        let _ = std::fs::remove_dir_all(&d);
     }
 }

@@ -319,9 +319,24 @@ pub fn atomic_write(
         })
     };
     match crate::nofollow::parent_checked(path, &recheck)? {
-        Some(dir) => dir.replace_with(data).map_err(Refused::Io),
+        Some(dir) => {
+            #[cfg(test)]
+            BETWEEN.with(|b| {
+                if let Some(f) = b.borrow_mut().take() {
+                    f()
+                }
+            });
+            dir.replace_with(data).map_err(Refused::Io)
+        }
         None => atomic_write_by_name(path, data).map_err(Refused::Io),
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Ronda 1 (E8-B3): corre una vez entre `parent_checked` y `replace_with` (el test mueve la carpeta
+    /// ahí): sin esto, "`atomic_write` siempre por nombre" pasaba los tests.
+    static BETWEEN: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
 }
 
 /// La escritura atómica de v0.6.45, por nombre: donde no hay con qué abrir la carpeta sin links.
@@ -1700,11 +1715,15 @@ fn with_run_rng<T>(f: impl FnOnce(&mut rand::rngs::StdRng) -> T) -> Option<T> {
     use rand::SeedableRng;
     use sha2::{Digest, Sha256};
     thread_local! {
-        static RUN_RNG: RefCell<Option<(u64, rand::rngs::StdRng)>> = const { RefCell::new(None) };
+        static RUN_RNG: RefCell<Option<(u64, String, rand::rngs::StdRng)>> = const { RefCell::new(None) };
     }
     let log = synsema_core::sealed::current()?;
     let (id, master) = {
         let mut g = log.lock().unwrap_or_else(|p| p.into_inner());
+        // Ronda 2 (R2-B1): cerrado entre el `current()` y el candado: como sin registro.
+        if g.is_closed() {
+            return None;
+        }
         if g.seed.is_none() {
             let mut s = [0u8; 32];
             rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut s);
@@ -1714,18 +1733,27 @@ fn with_run_rng<T>(f: impl FnOnce(&mut rand::rngs::StdRng) -> T) -> Option<T> {
     };
     RUN_RNG.with(|r| {
         let mut r = r.borrow_mut();
-        if r.as_ref().map(|x| x.0) != Some(id) {
-            let thread = std::thread::current().name().unwrap_or("").to_string();
+        // v0.6.46 (ronda 1, E6-A2): el flujo es el de `sealed::stream()` (el ítem de un
+        // `parallel_map`, o el nombre del hilo); cambia de ítem a ítem en el mismo worker.
+        let stream = synsema_core::sealed::stream();
+        if r.as_ref().map(|x| (x.0, x.1.as_str())) != Some((id, stream.as_str())) {
             let seed: [u8; 32] = Sha256::new()
                 .chain_update(b"synsema-run-rng-v1")
                 .chain_update(master.as_bytes())
-                .chain_update(thread.as_bytes())
+                .chain_update(stream.as_bytes())
                 .finalize()
                 .into();
-            *r = Some((id, rand::rngs::StdRng::from_seed(seed)));
+            *r = Some((id, stream, rand::rngs::StdRng::from_seed(seed)));
         }
-        r.as_mut().map(|x| f(&mut x.1))
+        r.as_mut().map(|x| f(&mut x.2))
     })
+}
+
+/// v0.6.46 (ronda 1, E6-A2) — el prefijo de los flujos de un `parallel_map`: un número del flujo del
+/// llamador, así dos llamadas (o una anidada en un ítem) no comparten flujos y `--replay` lo
+/// reproduce. `None` sin registro de la corrida (y entonces nada cambia).
+pub fn run_rng_fork() -> Option<String> {
+    with_run_rng(|r| format!("{:032x}", rand::Rng::gen::<u128>(r)))
 }
 
 #[cfg(test)]
@@ -1997,6 +2025,22 @@ mod v0646_e8_tests {
         dir.replace_with(b"en la juzgada").unwrap();
         drop(dir);
         assert_eq!(std::fs::read_to_string(d.join("proj/sub_vieja/f.txt")).unwrap(), "en la juzgada");
+        assert_eq!(std::fs::read_to_string(d.join("afuera/f.txt")).unwrap(), "INTACTO");
+        assert_eq!(std::fs::read_dir(d.join("afuera")).unwrap().count(), 1);
+        // Lo mismo por `atomic_write` entera (ronda 1, E8-B3): la carpeta se mueve entre que se abre y
+        // juzga y el reemplazo.
+        let _ = std::fs::remove_dir(d.join("proj/sub"));
+        let _ = std::fs::remove_file(d.join("proj/sub"));
+        std::fs::create_dir_all(d.join("proj/sub")).unwrap();
+        let dd = d.clone();
+        BETWEEN.with(|b| {
+            *b.borrow_mut() = Some(Box::new(move || {
+                std::fs::rename(dd.join("proj/sub"), dd.join("proj/sub_vieja2")).unwrap();
+                link_dir(&dd.join("afuera"), &dd.join("proj/sub"));
+            }))
+        });
+        wrote(atomic_write(&caps, &path, b"en la juzgada 2", &tys, "write_file()"));
+        assert_eq!(std::fs::read_to_string(d.join("proj/sub_vieja2/f.txt")).unwrap(), "en la juzgada 2");
         assert_eq!(std::fs::read_to_string(d.join("afuera/f.txt")).unwrap(), "INTACTO");
         assert_eq!(std::fs::read_dir(d.join("afuera")).unwrap().count(), 1);
         // Un link que queda adentro: reemplaza donde lleva.

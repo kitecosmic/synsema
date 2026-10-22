@@ -916,6 +916,43 @@ fn e6_sign_in_private_branch_goes_to_the_envelope() {
     );
 }
 
+/// Ronda 1 de E6 (M1): muchas `now()` después de firmar en una rama privada no desalojan la firma
+/// del sobre, y armar el recibo no se vuelve cuadrático (con 12 000 lecturas tardaba 15 s y el `op`
+/// ya no estaba).
+#[test]
+fn e6_clock_does_not_evict_what_was_signed() {
+    let dir = project("e6clock");
+    let audit = dir.join("audit");
+    let audit_s = audit.to_string_lossy().into_owned();
+    std::fs::write(
+        dir.join("p.syn"),
+        format!("{}require time
+when p == 1
+    let s be ed25519_sign(\"hola\", k)
+let i be 0
+let t be 0
+while i < 50000
+    set t to now()
+    set i to i + 1
+print(\"listo\")
+", SIGN_PRE),
+    )
+    .unwrap();
+    let env = [("K", K_HEX), ("SYNSEMA_AUDIT_DIR", audit_s.as_str())];
+    let (sk, pk) = auditor_keys();
+    let t0 = std::time::Instant::now();
+    let (code, out, err) = synsema_env(&dir, &["run", "--labels", "--auditor", &pk, "p.syn"], None, &env);
+    let took = t0.elapsed();
+    assert_eq!(code, 0, "{}", err);
+    assert_eq!(out.trim(), "listo");
+    // 50 000 vueltas del intérprete en debug ya llevan unos segundos; cuadrático eran minutos.
+    assert!(took < std::time::Duration::from_secs(30), "{:?}", took);
+    let opened = open_receipt(&receipt_in(&err), &sk);
+    let entries = opened["entries"].as_array().unwrap();
+    assert!(entries.iter().any(|e| e["sealed"] == true && e["entry"]["kind"] == "op"), "la firma salió del sobre: {:?}", entries);
+    assert!(opened["clock_truncated"].as_u64().unwrap_or(0) > 0, "{}", opened);
+}
+
 /// `spend` no tiene excepción: en una rama privada se rechaza también con auditor.
 #[test]
 fn e6_spend_still_refused() {
@@ -993,6 +1030,207 @@ fn e6_replay() {
     let (code, _, err) = synsema(&dir, &["run", "--replay", "opened.json", "p.syn"], None);
     assert_eq!(code, 1);
     assert!(err.contains("replay: input #") && err.contains("differs"), "{}", err);
+}
+
+/// Ronda 1 de E6 (A1): una lectura en una rama privada con auditor se sella con el hash de lo
+/// leído, sin etiqueta: antes se sellaba el de "[redacted]" (y `--replay` no veía otra entrada) y
+/// stderr ganaba un aviso por lectura, que contaba las lecturas de la rama.
+#[test]
+fn e6_private_read_is_hashed_raw_and_silent() {
+    let dir = project("e6privread");
+    std::fs::write(
+        dir.join("p.syn"),
+        "require env
+require stdin
+let n be private(number(env(\"N\")), [\"cliente\"])
+when n > 0
+    let t be read_line()
+print(\"listo\")
+",
+    )
+    .unwrap();
+    let (sk, pk) = auditor_keys();
+    let mut errs = Vec::new();
+    for n in ["0", "1"] {
+        let (code, out, err) = synsema_env(&dir, &["run", "--labels", "--auditor", &pk, "--receipt", &format!("r{}.json", n), "p.syn"], Some("hola
+"), &[("N", n)]);
+        assert_eq!(code, 0, "{}{}", out, err);
+        errs.push(err);
+    }
+    assert_eq!(errs[0], errs[1], "stderr cuenta las lecturas de la rama privada");
+    let r: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.join("r1.json")).unwrap()).unwrap();
+    let opened = open_receipt(&r, &sk);
+    let sealed: Vec<&serde_json::Value> = opened["entries"].as_array().unwrap().iter().filter(|e| e["sealed"] == true).collect();
+    let hola: String = <sha2::Sha256 as sha2::Digest>::digest(b"hola").iter().map(|b| format!("{:02x}", b)).collect();
+    assert!(sealed.iter().any(|e| e["entry"]["sha256"] == hola.as_str()), "lo sellado no es el hash de lo leído: {:?}", sealed);
+    std::fs::write(dir.join("opened.json"), opened.to_string()).unwrap();
+    let (code, _, err) = synsema_env(&dir, &["run", "--labels", "--replay", "opened.json", "p.syn"], Some("hola
+"), &[("N", "1")]);
+    assert_eq!(code, 0, "control: la misma entrada se reproduce: {}", err);
+    let (code, _, err) = synsema_env(&dir, &["run", "--labels", "--replay", "opened.json", "p.syn"], Some("chau
+"), &[("N", "1")]);
+    assert_eq!(code, 1, "--replay no vio otra entrada en la rama privada: {}", err);
+}
+
+/// Ronda 1 de E6 (A2): con auditor, `random()` dentro de `parallel_map` daba el mismo número en
+/// todos los ítems (el flujo salía del nombre del hilo, y los workers no tienen). Ahora cada ítem
+/// tiene su flujo: distintos entre ítems y entre llamadas (también anidadas), y `--replay` los
+/// reproduce aunque otro hilo tome cada ítem.
+#[test]
+fn e6_random_in_parallel_map_differs_per_item_and_replays() {
+    let dir = project("e6pmap");
+    std::fs::write(
+        dir.join("p.syn"),
+        "require random
+task r(x)
+    give random()
+task anid(x)
+    give parallel_map(r, [1, 2])
+print(parallel_map(r, [1, 2, 3, 4, 5, 6, 7, 8]))
+print(parallel_map(r, [1, 2, 3, 4, 5, 6, 7, 8], 3))
+print(parallel_map(anid, [1, 2]))
+",
+    )
+    .unwrap();
+    let (sk, pk) = auditor_keys();
+    let (code, out1, err) = synsema(&dir, &["run", "--auditor", &pk, "p.syn"], None);
+    assert_eq!(code, 0, "{}", err);
+    let nums: Vec<String> = out1
+        .split(|c: char| !(c.is_ascii_digit() || c == '.'))
+        .filter(|t| t.contains('.'))
+        .map(str::to_string)
+        .collect();
+    assert_eq!(nums.len(), 20, "{}", out1);
+    let distinct: std::collections::HashSet<&String> = nums.iter().collect();
+    assert_eq!(distinct.len(), 20, "se repiten números entre ítems o entre llamadas:
+{}", out1);
+    let opened = open_receipt(&receipt_in(&err), &sk);
+    std::fs::write(dir.join("opened.json"), opened.to_string()).unwrap();
+    let (code, out2, err) = synsema(&dir, &["run", "--replay", "opened.json", "p.syn"], None);
+    assert_eq!(code, 0, "{}", err);
+    assert_eq!(out1, out2, "--replay no reproduce los números de parallel_map");
+}
+
+/// Ronda 1 de E6 (M3): el archivo de `serve --receipt` tiene un recibo por línea. `verify` revisa
+/// todos (antes sólo el último, y una línea alterada más arriba daba `ok`) y `open` pide cuál.
+#[test]
+fn e6_verify_checks_every_receipt_in_the_file() {
+    let dir = project("e6verify");
+    std::fs::write(dir.join("p.syn"), "print(\"hola\")\n").unwrap();
+    let (sk, pk) = auditor_keys();
+    let mut rs = Vec::new();
+    for _ in 0..2 {
+        let (code, _, err) = synsema(&dir, &["run", "--auditor", &pk, "p.syn"], None);
+        assert_eq!(code, 0, "{}", err);
+        rs.push(receipt_in(&err));
+    }
+    let mut bad = rs[0].clone();
+    let root = bad["root"].as_str().unwrap().to_string();
+    let flipped = if root.starts_with('0') { format!("1{}", &root[1..]) } else { format!("0{}", &root[1..]) };
+    bad["root"] = serde_json::Value::String(flipped);
+    std::fs::write(dir.join("ok.jsonl"), format!("{}\n{}\n", rs[0], rs[1])).unwrap();
+    std::fs::write(dir.join("bad.jsonl"), format!("{}\n{}\n", bad, rs[1])).unwrap();
+
+    let (code, out, err) = synsema(&dir, &["receipt", "verify", "ok.jsonl"], None);
+    assert_eq!(code, 0, "{}{}", out, err);
+    let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+    assert_eq!((v["ok"].clone(), v["receipts"].clone()), (serde_json::json!(true), serde_json::json!(2)));
+    let (code, out, _) = synsema(&dir, &["receipt", "verify", "bad.jsonl"], None);
+    assert_eq!(code, 1, "una línea alterada pasó: {}", out);
+    let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+    assert_eq!(v["bad"][0]["line"], 1, "{}", v);
+    // Ronda 2 (R2-B2): una línea cortada (el último recibo a medio escribir, o recortado a mano) no
+    // es JSON y antes quedaba afuera: `verify` salía verde con los otros.
+    let r1 = rs[1].to_string();
+    std::fs::write(dir.join("cut.jsonl"), format!("{}\n{}\n", rs[0], &r1[..r1.len() / 2])).unwrap();
+    let (code, out, _) = synsema(&dir, &["receipt", "verify", "cut.jsonl"], None);
+    assert_eq!(code, 1, "una línea cortada pasó: {}", out);
+    let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+    assert_eq!((v["receipts"].clone(), v["bad"][0]["line"].clone()), (serde_json::json!(2), serde_json::json!(2)), "{}", v);
+    // Ronda 4: con el BOM de un editor, la línea 1 cuenta (intacta, o cortada y entonces falla).
+    let r0 = rs[0].to_string();
+    std::fs::write(dir.join("bom.jsonl"), format!("\u{feff}{}\n{}\n", r0, rs[1])).unwrap();
+    let (code, out, _) = synsema(&dir, &["receipt", "verify", "bom.jsonl"], None);
+    assert_eq!(code, 0, "{}", out);
+    assert_eq!(serde_json::from_str::<serde_json::Value>(out.trim()).unwrap()["receipts"], 2, "{}", out);
+    std::fs::write(dir.join("bomcut.jsonl"), format!("\u{feff}{}\n{}\n", &r0[..r0.len() / 2], rs[1])).unwrap();
+    let (code, out, _) = synsema(&dir, &["receipt", "verify", "bomcut.jsonl"], None);
+    assert_eq!(code, 1, "la línea 1 cortada tras un BOM pasó: {}", out);
+    // Ronda 3 (R3-B1): el stderr de una corrida cuyo programa loguea la clave sigue verificando.
+    std::fs::write(dir.join("log.syn"), "eprint(\"log: {\\\"synsema_receipt\\\": pendiente}\")\nprint(\"listo\")\n").unwrap();
+    let (code, _, err) = synsema(&dir, &["run", "--auditor", &pk, "log.syn"], None);
+    assert_eq!(code, 0, "{}", err);
+    assert!(err.contains("log: {\"synsema_receipt\": pendiente}"), "{}", err);
+    std::fs::write(dir.join("stderr.txt"), &err).unwrap();
+    let (code, out, _) = synsema(&dir, &["receipt", "verify", "stderr.txt"], None);
+    assert_eq!(code, 0, "un eprint volvió roto el recibo: {}", out);
+
+    let (code, _, err) = synsema(&dir, &["receipt", "open", "ok.jsonl", "--key", &sk], None);
+    assert_eq!(code, 2);
+    assert!(err.contains("--line N") && err.contains("lines 1, 2"), "{}", err);
+    let (code, out, err) = synsema(&dir, &["receipt", "open", "ok.jsonl", "--key", &sk, "--line", "2"], None);
+    assert_eq!(code, 0, "{}", err);
+    assert_eq!(serde_json::from_str::<serde_json::Value>(out.trim()).unwrap(), open_receipt(&rs[1], &sk));
+}
+
+/// Ronda 1 de E6 (B1): un destino de `--receipt` que no sirve, o una clave de auditor que no sella,
+/// se rechaza ANTES de correr (antes el programa corría, con sus efectos, y fallaba al final).
+#[test]
+fn e6_bad_receipt_destination_or_key_fails_before_running() {
+    let dir = project("e6b1");
+    std::fs::write(dir.join("p.syn"), "require file.write(\"marca.txt\")\nwrite_file(\"marca.txt\", \"x\")\n").unwrap();
+    let (_, pk) = auditor_keys();
+    let zeros = synsema_core::bytesutil::b64url_encode(&[0u8; 32]);
+    let mut cases: Vec<Vec<&str>> = vec![
+        vec!["run", "--auditor", &pk, "--receipt", "no/existe/r.json", "p.syn"],
+        vec!["run", "--auditor", &zeros, "p.syn"],
+    ];
+    if cfg!(windows) {
+        cases.push(vec!["run", "--auditor", &pk, "--receipt", "fd:5", "p.syn"]);
+    }
+    for args in cases {
+        let (code, _, err) = synsema(&dir, &args, None);
+        assert_eq!(code, 2, "{:?}: {}", args, err);
+        assert!(!dir.join("marca.txt").exists(), "{:?} corrió el programa: {}", args, err);
+    }
+    // Ronda 2 (R2-N2): una corrida que no llega a empezar (acá, la clave de identidad, que se lee
+    // después de mirar el destino) no vacía el recibo anterior.
+    std::fs::write(dir.join("r.json"), "ANTERIOR").unwrap();
+    let args = ["run", "--auditor", &pk, "--receipt", "r.json", "p.syn"];
+    let (code, _, err) = synsema_env(&dir, &args, None, &[("SYNSEMA_IDENTITY_KEY", "zz")]);
+    assert_eq!(code, 2, "{}", err);
+    assert!(!dir.join("marca.txt").exists(), "corrió el programa: {}", err);
+    assert_eq!(std::fs::read_to_string(dir.join("r.json")).unwrap(), "ANTERIOR");
+    // Control: con un destino que sirve, corre y el recibo reemplaza al anterior.
+    let (code, _, err) = synsema(&dir, &["run", "--auditor", &pk, "--receipt", "r.json", "p.syn"], None);
+    assert_eq!(code, 0, "{}", err);
+    assert!(dir.join("marca.txt").exists());
+    let r = std::fs::read_to_string(dir.join("r.json")).unwrap();
+    assert!(r.starts_with("{\"synsema_receipt\""), "{}", r);
+}
+
+/// Ronda 1 de E6 (B2 y B8): `--format json` también escribe `--receipt`, y `keygen --out` deja la
+/// privada en un archivo nuevo (no lo pisa) y saca sólo la pública por stdout.
+#[test]
+fn e6_json_report_writes_the_receipt_and_keygen_out() {
+    let dir = project("e6b2");
+    std::fs::write(dir.join("p.syn"), "print(\"hola\")\n").unwrap();
+    let (code, out, err) = synsema(&dir, &["receipt", "keygen", "--out", "k.txt"], None);
+    assert_eq!(code, 0, "{}", err);
+    let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+    assert!(v.get("private").is_none(), "la privada salió por stdout: {}", out);
+    let pk = v["public"].as_str().unwrap().to_string();
+    let sk = std::fs::read_to_string(dir.join("k.txt")).unwrap();
+    let (code, _, _) = synsema(&dir, &["receipt", "keygen", "--out", "k.txt"], None);
+    assert_eq!(code, 1, "pisó un archivo de clave");
+    assert_eq!(std::fs::read_to_string(dir.join("k.txt")).unwrap(), sk);
+
+    let (code, out, err) = synsema(&dir, &["run", "--format", "json", "--auditor", &pk, "--receipt", "r.json", "p.syn"], None);
+    assert_eq!(code, 0, "{}{}", out, err);
+    let r: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.join("r.json")).expect("--receipt no se escribió")).unwrap();
+    let (code, opened, err) = synsema(&dir, &["receipt", "open", "r.json", "--key", "@k.txt"], None);
+    assert_eq!(code, 0, "{}", err);
+    assert_eq!(serde_json::from_str::<serde_json::Value>(opened.trim()).unwrap(), open_receipt(&r, sk.trim()));
 }
 
 /// Corre `synsema run <extra> p.syn` con stdin abierto y devuelve lo primero que salió por stdout dentro
@@ -1119,6 +1357,33 @@ fn e7_wildcard_net_reaches_only_public_addresses() {
     let (_, out, _) = run("require net(\"127.0.0.1\")", &local, &["--cap-set", "net=127.0.0.1,stdout"]);
     assert_eq!(out.trim(), "ok");
     assert_eq!(seen.lock().unwrap().len(), n + 1);
+}
+
+/// Ronda 1 de E7 (M1): `ws_connect` a una IPv6 literal se juzga con los corchetes, como `http` y
+/// `tcp`: el grant `net("[::1]:<puerto>")` la nombra (antes armaba `::1:<puerto>` y la negaba, y
+/// proponía esa misma línea, que tampoco pasaba).
+#[test]
+fn e7_ws_to_an_ipv6_literal_is_named_with_brackets() {
+    let Ok(l) = std::net::TcpListener::bind("[::1]:0") else {
+        eprintln!("sin IPv6 de loopback: no se prueba");
+        return;
+    };
+    let port = l.local_addr().unwrap().port();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        if l.accept().is_ok() {
+            let _ = tx.send(());
+        }
+    });
+    let dir = project("e7-ws6");
+    std::fs::write(
+        dir.join("p.syn"),
+        format!("require net(\"[::1]:{port}\")\nlet c be ws_connect(\"ws://[::1]:{port}/\", {{}}, {{\"timeout\": 1}})\n"),
+    )
+    .unwrap();
+    let (_, out, err) = synsema(&dir, &["run", "p.syn"], None);
+    assert!(!err.contains("a private address") && !out.contains("a private address"), "{}{}", out, err);
+    assert!(rx.recv_timeout(std::time::Duration::from_secs(10)).is_ok(), "no llegó al servidor: {}{}", out, err);
 }
 
 /// E7 en los otros clientes del programa: TCP, WebSocket, RPC.

@@ -46,7 +46,8 @@ Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the rele
   (`synsema-vela-guest.wasm`) runs its app under `stdout,declassify=app` for this reason: its only
   principal is `app`, and the app publishes its outcome codes and withdrawal receipts itself.
 - **A `net` grant with a wildcard reaches only public IP addresses.** `require net` without a
-  scope, `net("*")`, `net("*.x.com")`, a host ceiling `--cap-set net` and a `sandbox under` with a
+  scope, `net("*")`, `net("*.x.com")`, a host ceiling `--cap-set net`, a `sandbox under` and a
+  capability token (`auth with`, `sandbox under verified`, the ceiling of `run_program`) with a
   wildcard no longer reach loopback, the private networks (RFC 1918, CGNAT, ULA), link-local (with
   the cloud metadata endpoint `169.254.169.254`), multicast or the documentation ranges. Before,
   `net` compared only the name: `127.0.0.1.nip.io` or any name that resolved inside reached it.
@@ -55,16 +56,22 @@ Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the rele
   that IPv4. To reach a private address, every layer has to name it: the exact host
   (`require net("db")`, `net("localhost")`), the address, or a CIDR that contains it
   (`require net("10.0.0.0/8")`, which also covers a literal address inside it by name). A
-  `deny net("10.0.0.0/8")` now also stops a name that resolves inside. The error names the line
+  `deny` of a CIDR set by an embedder (`CapabilitySet::deny`) now also stops a name that resolves
+  inside. The error names the line
   to write: ``http_get(): `db` resolved to 10.0.0.5, a private address; a `net` grant with a
   wildcard reaches only public addresses. Name it: `require net("db:5432")`…``. When the URL comes
   from the configuration, name it from there: `require net(env("CONTROL_URL"))`. It applies to
   `http`/`fetch` and the `http_*` builtins, `ws_connect` (and every reconnection), `tcp_connect`,
-  the blockchain RPC builtins, `push_send`, `oidc_verify` and `proxy to` (on every connection). A
-  secret bound to a host goes to a private address only if its binding names it too. The engine's
-  own requests (LLM and judge providers, the approval webhook, `synsema update`, ACME) are the
-  host's configuration and are not affected. In `@synsema/wasm` the connection belongs to the
-  embedder's `http` hook and the engine does not see the address: the hook has to refuse them.
+  the blockchain RPC builtins, `push_send`, `oidc_verify` and `proxy to` (on every connection; the
+  client gets a 502 `proxy error: upstream not allowed` and the reason, with the address, goes to
+  the server's log). A secret bound to a host goes to a private address only if its binding names
+  it too. The engine's own requests (LLM and judge providers, the approval webhook, `synsema
+  update`, ACME) are the host's configuration and are not affected, and neither are the database
+  connections (`postgres`, `mysql`, `mongo`, `redis`), which come from the configuration. In
+  `@synsema/wasm` the connection belongs to the embedder's `http` hook and the engine does not see
+  the address: the hook has to resolve the name, check the address it connects to against the same
+  ranges (listed in `Host.http`) and connect to that one; it does not know whether the program
+  named the host.
 - **A `require` with a name that does not exist is a load error.** Before, `require nett("x")`
   parsed and granted nothing, with no warning, and the program failed later with an error that
   did not name the typo. Now the error names it and, when there is one, the closest real name:
@@ -117,8 +124,10 @@ Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the rele
   folder changed into a link in between was followed. Now the file is opened without following any
   link (`openat2` with `RESOLVE_NO_SYMLINKS` on Linux, `NtCreateFile` with `OBJ_DONT_REPARSE` on
   Windows): if it opens, it is the file the check judged. With a link on the way, it is opened
-  following it, without creating or truncating anything, and the same check runs again on where
-  the open file really is; a link that stays inside the grant still works, as in v0.6.45. To
+  following it but without access to its data (`O_PATH` on Linux, its attributes only on Windows),
+  the same check runs again on where it really is, and only then the same file is reopened with the
+  access asked for: a FIFO or a device outside the grant is refused before it is opened. A link
+  that stays inside the grant still works, as in v0.6.45. To
   replace a file (`write_file`, `edit_file`, `zip_extract`/`tar_extract`), the folder is opened the
   same way and the temporary file, the rename and the cleanup all go relative to that folder, so the
   name is never resolved again.
@@ -137,8 +146,11 @@ Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the rele
   - What remains as in v0.6.45: `list_dir`, `file_exists`, `file_info`, `delete_file`,
     `delete_dir`, the folders `write_file` creates when they are missing, and the PEM files of a
     `tls cert … key …` block in `serve` (read by the TLS setup after the check); macOS, a Linux
-    kernel without `openat2` (before 5.6) and UNC paths on Windows; and a hard link, which is not
-    visible from its name.
+    kernel without `openat2` (before 5.6) or a container whose seccomp refuses it (Docker before
+    20.10), and UNC paths on Windows; and a hard link, which is not visible from its name.
+  - On Windows, a name the Win32 layer used to normalize is now opened as written: `a.txt.` and
+    `a.txt ` (a trailing dot or space) no longer open `a.txt`, and `…/CON` no longer opens the
+    device; they are "not found".
 
 **New.**
 - **Sealed receipts for an auditor: `--auditor <X25519 public key>`** (or `SYNSEMA_AUDITOR_KEY`)
@@ -152,22 +164,38 @@ Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the rele
   - The receipt is one JSON line: a header (engine, `program_sha`, `config_sha`, the signing key,
     the auditor, a commitment to the run's seed), the public entries, the envelope, the root of a
     hash chain over all the entries in run order, and a signature. Anyone can check it with
-    `synsema receipt verify`; the auditor opens it with `synsema receipt open <receipt> --key
-    <private>`, which also checks the chain. `synsema receipt keygen` makes the auditor's keys.
+    `synsema receipt verify` (on the file of `serve --receipt`, one receipt per line, it checks all
+    of them and names the lines that fail, also a line that begins like a receipt and is not one,
+    such as a receipt cut short; each receipt stands alone, so a receipt deleted whole from the
+    file, or cut before its first key, is not noticed); the auditor opens it with `synsema receipt open
+    <receipt> --key <private | @file> [--line N]`, which also checks the chain. `synsema receipt
+    keygen` makes the auditor's keys; with `--out <file>` the private key goes to a new file (0600
+    on Unix) and only the public one is printed.
   - It is signed with the host's `SYNSEMA_IDENTITY_KEY` if there is one, with the attested key
     under `serve --attested` (P-256; the same key the attestation document names), or with a key
-    made for the run (`"identity": "ephemeral"`: it proves integrity, not who ran it).
+    made for the run (`"identity": "ephemeral"`). An ephemeral key only detects accidental damage:
+    whoever can change the receipt can make a new one, envelope and signature included. For tamper
+    evidence, use `SYNSEMA_IDENTITY_KEY`, `run --attest` or `serve --attested`.
   - **It comes out before the output.** `run` writes it to stderr or to `--receipt <path|fd:N>`
     and only then prints; with an auditor `print`, `flush()` and the prompt of `read_line` do not go
-    out live. `run --format json` puts it first, as `receipt`; wasm returns it in `receipt`.
+    out live (`eprint` does: it is a sink, and it goes to stderr as it runs). A `--receipt` that
+    cannot be written, or an auditor key that cannot seal, is an error before the program runs
+    (and a receipt already in that file stays until a run writes its own).
+    `fd:N` is Unix only, and N is a descriptor the parent left open: the program's children
+    (`proc_spawn`, `run`) inherit it too. `run --format json` puts it first, as `receipt` (and also
+    writes it to `--receipt`); wasm returns it in `receipt`. A binary from `synsema build` reads
+    `SYNSEMA_AUDITOR_KEY` too.
     `serve` writes one per request that runs program code, to stderr or appended to `--receipt`,
     before the response; if it cannot be written the client gets a 500 instead. A `stream` or
     `socket` route is a load error with an auditor (its body leaves while it runs).
   - `reveal`, `sign` and the wallet operations run in a private branch; their audit line goes into
     the envelope. **`spend` does not** (it spends a shared budget, and whether the next spend fits
     would tell what the branch did), nor a signature that counts against `SYNSEMA_SIGN_CEILING`.
-  - The run's `random()` and `random_int()` come from a seed recorded in the envelope, and with
-    labels the clock is fenced (two `now()` in a private branch read the same time). `synsema run
+  - The run's `random()` and `random_int()` come from a seed recorded in the envelope (each item
+    of a `parallel_map` has its own stream, also under `--replay`), and with labels the clock is
+    fenced (two `now()` in a private branch read the same time). The clock readings take at most a
+    quarter of the envelope; past that they are counted (`clock_truncated`) and never push out an
+    entry. `synsema run
     --replay <opened receipt>` runs the program again with that seed and those clock readings and
     stops, naming it, at the first input that differs. Keys and tokens (`random_bytes`, `token`,
     key generation) still come from the OS and are not reproduced.
@@ -178,8 +206,8 @@ Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the rele
     the wall-clock time of the run (and, in wasm, when each host call arrives); and whether it
     stopped on a limit (`maxSteps`, `maxMemoryMb`, a handler's `timeout`): one bit per run, or per
     request. Under `serve`, a cron job or an agent outside a request has no receipt, so an audited
-    operation in a private branch there is still refused; what an agent started by a request writes
-    after the request ends is not in its receipt.
+    operation in a private branch there is still refused; so is one that an agent started by a
+    request (or by `run`) attempts after the receipt was built.
 - **A secret bound to a host: `require secret("K") for net("api.example.com")`.** APIs that take
   the key in the URL (Alchemy, Infura, Telegram, Maps), in the query or in the body (OAuth
   `client_secret_post`) were an error, and the only way out was `reveal()`. A bound secret goes in

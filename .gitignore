@@ -65,6 +65,8 @@ engine/crates/synsema-core/examples/explain.rs
 engine/crates/synsema-jit/examples/stats.rs
 **/examples/tmp_*.rs
 **/examples/local_*.rs
+# Carpeta del test de plantillas de E8 (vive en el cwd del crate; un aborto la puede dejar).
+engine/crates/*/.e8-tpl-test-*/
 # Salidas de valgrind/perf/PGO y binarios copiados para comparar.
 callgrind.out.*
 cachegrind.out.*

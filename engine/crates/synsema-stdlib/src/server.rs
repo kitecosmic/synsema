@@ -3433,8 +3433,12 @@ async fn proxy_request(
             if let Some(net) = &net {
                 let dest = addr.to_ascii_lowercase();
                 if let Err(cause) = net.admits(&dest, sa.ip()) {
+                    // Ronda 1 (E7-B1): el motivo (con la IP a la que resolvió) va al log del server; al
+                    // cliente, no: con un proxy dinámico, cualquiera de afuera averiguaba a qué IP
+                    // interna resuelve cada nombre.
                     let m = synsema_capabilities::model::private_dest_message("proxy to", &dest, sa.ip(), &cause);
-                    return proxy_error_response(502, format!("proxy error: {}", m), &extra, cors.as_deref(), hsts);
+                    eprintln!("[serve] proxy error: {}", m);
+                    return proxy_error_response(502, "proxy error: upstream not allowed".to_string(), &extra, cors.as_deref(), hsts);
                 }
             }
             let tcp = match tokio::time::timeout(wait, tokio::net::TcpStream::connect(sa)).await {
