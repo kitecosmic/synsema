@@ -13,6 +13,8 @@ build/
 # Los vectores de prueba embebidos con `include_str!` (groth16/plonk de snarkjs) son fuente:
 # sin esta excepción no entran al repo y `cargo test` NO COMPILA en un clon limpio.
 !engine/crates/**/fixtures/**/*.json
+# El ancla del guardia de rendimiento (engine/perf/guard.py, job perf-guard): sin ella el job falla.
+!engine/perf/baseline.json
 
 # Rust
 target/
