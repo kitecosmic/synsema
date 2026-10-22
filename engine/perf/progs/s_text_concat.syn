@@ -1,0 +1,6 @@
+-- la forma ingenua (`set s to s + …`)
+let n be 20000
+let s be ""
+each i in range(0, n)
+    set s to s + text(i) + ","
+print("check " + text(length(s)))

@@ -75,17 +75,28 @@ fn key_never_materializes() {
     let o = out(&format!(
         r#"let k be as_secret("{KEY1}", "HOT_KEY")
 print(text(k))
-print(json_encode({{"key": k}}))
-print(contains(csv_encode([{{"k": k}}]), "{KEY1}"))
+let j be ""
+try
+    set j to json_encode({{"key": k}})
+recover err
+    set j to err
+print(j)
+let c be ""
+try
+    set c to csv_encode([{{"k": k}}])
+recover err
+    set c to err
+print(contains(c, "{KEY1}"))
 -- derivar la pubkey/dirección es PURO y NO expone la clave
 print(evm_address(k))"#
     ));
-    // text(secret) y json_encode → secret(HOT_KEY)/[redacted], jamás el hex.
+    // text(secret) → secret(HOT_KEY); json_encode/csv_encode → error (v0.6.46, D8). Jamás el hex.
     assert!(o[0].contains("secret(HOT_KEY)"), "text(secret): {}", o[0]);
+    assert!(o[1].contains("json_encode") && o[1].contains("secret(HOT_KEY)"), "json_encode es error: {}", o[1]);
     for line in &o {
         assert!(!line.contains(KEY1), "LEAK de la clave: {}", line);
     }
-    assert!(o[2] == "false", "csv_encode redacta, no filtra: {}", o[2]);
+    assert!(o[2] == "false", "csv_encode no filtra: {}", o[2]);
     // la dirección pública SÍ sale (deriva sin exponer la privada).
     assert_eq!(o[3], ADDR1);
 }

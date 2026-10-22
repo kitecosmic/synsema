@@ -18,6 +18,7 @@
 
 use std::borrow::Cow;
 use std::fmt;
+use std::sync::Arc;
 
 use subtle::ConstantTimeEq;
 use zeroize::Zeroize;
@@ -43,24 +44,35 @@ pub struct SecretInner {
     /// ECDH, firma, AEAD). Es el caso de la clave de identidad de `serve --attested`, que ancla
     /// TLS y el documento de attestation: exportarla anularía lo que la attestation prueba.
     sealed: bool,
+    /// v0.6.46 (E1): los hosts a los que puede ir (`require secret("K") for net("h")`, normalizados
+    /// como un scope de `net`). `None` = no atado: como antes, sólo en un header.
+    bound: Option<Arc<[String]>>,
+    /// v0.6.46 (E1): el texto PÚBLICO que va antes del primer secret de una concatenación
+    /// (`` `https://h/v2/{key}` `` → `https://h/v2/`). Es de donde sale el host de una URL que es
+    /// un secret: el host nunca sale del material.
+    public_prefix: Option<Box<str>>,
+    /// v0.6.46 (E1): los secrets de los que se armó (nombre, texto), en una concatenación o un
+    /// `bearer`/`basic`. El audit los nombra a todos y el eco de una respuesta se enmascara con
+    /// cada uno. Vacío = es él mismo.
+    parts: Vec<(String, String)>,
 }
 
 impl SecretInner {
     /// Construye un secret de TEXTO a partir de su nombre de origen y su plaintext.
     pub fn new(name: impl Into<String>, plaintext: impl Into<String>) -> Self {
-        Self { value: SecretPayload::Text(plaintext.into()), name: name.into(), sealed: false }
+        Self { value: SecretPayload::Text(plaintext.into()), name: name.into(), sealed: false, bound: None, public_prefix: None, parts: Vec::new() }
     }
 
     /// Construye un secret de BYTES (blob binario sellado con `as_secret`).
     pub fn new_bytes(name: impl Into<String>, bytes: Vec<u8>) -> Self {
-        Self { value: SecretPayload::Bytes(bytes), name: name.into(), sealed: false }
+        Self { value: SecretPayload::Bytes(bytes), name: name.into(), sealed: false, bound: None, public_prefix: None, parts: Vec::new() }
     }
 
     /// Construye un secret de BYTES **sellado**: `reveal()` lo rechaza siempre y los bordes
     /// genéricos también (`expose_bytes_checked`, `expose`); sólo los usos legítimos del material
     /// —firma/MAC y ECDH con la clave propia— lo leen por `expose_bytes`. Ver `sealed`.
     pub fn new_bytes_sealed(name: impl Into<String>, bytes: Vec<u8>) -> Self {
-        Self { value: SecretPayload::Bytes(bytes), name: name.into(), sealed: true }
+        Self { value: SecretPayload::Bytes(bytes), name: name.into(), sealed: true, bound: None, public_prefix: None, parts: Vec::new() }
     }
 
     /// `true` si el secret está sellado (no revelable).
@@ -71,6 +83,54 @@ impl SecretInner {
     /// Nombre de origen (para redacción: `secret(NAME)`). NO es el valor.
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// v0.6.46 (E1): el mismo secret con su atadura, su prefijo público y sus partes.
+    pub fn with_binding(mut self, bound: Option<Arc<[String]>>, public_prefix: Option<Box<str>>, parts: Vec<(String, String)>) -> Self {
+        self.bound = bound;
+        self.public_prefix = public_prefix;
+        self.parts = parts;
+        self
+    }
+
+    /// Los hosts a los que puede ir (`None` = no atado).
+    pub fn bound(&self) -> Option<&Arc<[String]>> {
+        self.bound.as_ref()
+    }
+
+    /// El texto público antes del primer secret (ver el campo).
+    pub fn public_prefix(&self) -> Option<&str> {
+        self.public_prefix.as_deref()
+    }
+
+    /// Los secrets de los que se armó, como `(nombre, texto)`: sus partes, o él mismo. Un secret
+    /// sellado o de bytes que no son texto no tiene forma de texto y no aparece.
+    pub fn atoms(&self) -> Vec<(String, String)> {
+        if !self.parts.is_empty() {
+            return self.parts.clone();
+        }
+        match (&self.value, self.sealed) {
+            (SecretPayload::Text(t), false) => vec![(self.name.clone(), t.clone())],
+            (SecretPayload::Bytes(b), false) => match std::str::from_utf8(b) {
+                Ok(t) => vec![(self.name.clone(), t.to_string())],
+                Err(_) => Vec::new(),
+            },
+            _ => Vec::new(),
+        }
+    }
+
+    /// Los nombres de los secrets de los que se armó (para el audit y los mensajes).
+    pub fn names(&self) -> Vec<String> {
+        if self.parts.is_empty() {
+            return vec![self.name.clone()];
+        }
+        let mut out: Vec<String> = Vec::new();
+        for (n, _) in &self.parts {
+            if !out.contains(n) {
+                out.push(n.clone());
+            }
+        }
+        out
     }
 
     /// `true` si el payload es bytes (no texto) — decide el tipo que devuelve `reveal()`.
@@ -170,13 +230,30 @@ impl Drop for SecretInner {
             SecretPayload::Text(s) => s.zeroize(),
             SecretPayload::Bytes(b) => b.zeroize(),
         }
+        for (_, v) in &mut self.parts {
+            v.zeroize();
+        }
     }
+}
+
+thread_local! {
+    /// v0.6.46 (E2): cuántas veces se escribió el marcador `secret(K)` en este hilo. El hueco de un
+    /// template lo lee antes y después de formatear una lista o un mapa: si cambió, adentro había un
+    /// secret. Es más barato que recorrer el contenedor (que el `Display` ya recorre).
+    static PLACEHOLDERS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// v0.6.46 (E2): el contador de marcadores escritos en este hilo (ver `PLACEHOLDERS`).
+#[inline]
+pub fn placeholders_written() -> u32 {
+    PLACEHOLDERS.with(|c| c.get())
 }
 
 /// `Display` redactado — defensa de fondo: ningún `format!`/`to_string()`/log
 /// accidental puede filtrar el valor. Muestra el nombre, nunca el plaintext.
 impl fmt::Display for SecretInner {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        PLACEHOLDERS.with(|c| c.set(c.get().wrapping_add(1)));
         write!(f, "secret({})", self.name)
     }
 }
@@ -196,4 +273,86 @@ pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
         return false;
     }
     a.ct_eq(b).into()
+}
+
+/// v0.6.46 (E2): el nombre del primer secret dentro de un valor, a cualquier profundidad (listas,
+/// mapas, valores privados). Vivía en stdlib (`http_common::secret_inside`); el hueco de un template
+/// la necesita en core. Una lista sin caja (sólo números) no tiene secrets.
+pub fn contains_secret(v: &crate::types::SynValue) -> Option<String> {
+    use crate::types::SynValue;
+    match v {
+        SynValue::Secret(s) => Some(s.name().to_string()),
+        SynValue::List(l) => l.borrow().as_values()?.iter().find_map(contains_secret),
+        SynValue::Map(m) => m.borrow().iter().find_map(|(_, x)| contains_secret(x)),
+        SynValue::Private(p) => contains_secret(&p.value),
+        _ => None,
+    }
+}
+
+/// v0.6.46 (E1.7): los nombres de los secrets que van en los argumentos de una llamada (la URL, los
+/// headers, el body), a cualquier profundidad. Para el linaje: `inputs[].secrets`.
+pub fn secret_names_in(vs: &[crate::types::SynValue]) -> Vec<String> {
+    use crate::types::SynValue;
+    fn walk(v: &SynValue, out: &mut Vec<String>) {
+        match v {
+            SynValue::Secret(s) => {
+                for n in s.names() {
+                    if !out.contains(&n) {
+                        out.push(n);
+                    }
+                }
+            }
+            SynValue::List(l) => {
+                if let Some(xs) = l.borrow().as_values() {
+                    for x in xs {
+                        walk(x, out);
+                    }
+                }
+            }
+            SynValue::Map(m) => {
+                for (_, x) in m.borrow().iter() {
+                    walk(x, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    for v in vs {
+        walk(v, &mut out);
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::types::{syn_list, syn_map, syn_secret, syn_text, Obj, ServerValue, SynMap, SynValue};
+
+    /// v0.6.46 (ronda 1, N1): el chequeo de E2 (un secret en el hueco de un template) cuenta los
+    /// marcadores que escribe el `Display` de un contenedor. Si un cambio en cómo se imprime una
+    /// lista, un mapa o un valor de servidor dejara de pasar por `SecretInner::fmt`, el chequeo se
+    /// apagaría sin que fallara nada; esto lo ata.
+    #[test]
+    fn every_container_prints_its_secrets_through_the_counter() {
+        let s = syn_secret("K", "valor-en-claro");
+        let mut inner = SynMap::new();
+        inner.insert("k", s.clone());
+        let mut outer = SynMap::new();
+        outer.insert("m", syn_map(inner.clone()));
+        let cases = vec![
+            syn_list(vec![syn_text("a"), s.clone()]),
+            syn_map(inner),
+            syn_map(outer),
+            SynValue::Server(Obj::new(ServerValue::Envelope { status: 200, value: syn_list(vec![s.clone()]) })),
+        ];
+        for v in cases {
+            let before = super::placeholders_written();
+            let shown = v.to_string();
+            assert!(
+                super::placeholders_written() != before && shown.contains("secret(K)") && !shown.contains("valor-en-claro"),
+                "{}",
+                shown
+            );
+        }
+    }
 }

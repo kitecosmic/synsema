@@ -267,11 +267,16 @@ impl ProgressManager {
 
     /// Carga el documento de `to_json`. Un JSON inválido se ignora (arranca vacío).
     pub fn load_json(&mut self, json: &str) {
-        if let Ok(map) = serde_json::from_str::<BTreeMap<String, TaskProgress>>(json) {
-            for (k, v) in map {
-                self.tasks.insert(k, v);
-            }
+        let _ = self.try_load_json(json);
+    }
+
+    /// v0.6.46 (ronda 2 de cf1, R2-B3): como `load_json`, pero dice si el texto no se puede leer.
+    pub fn try_load_json(&mut self, json: &str) -> Result<(), String> {
+        let map = serde_json::from_str::<BTreeMap<String, TaskProgress>>(json).map_err(|e| e.to_string())?;
+        for (k, v) in map {
+            self.tasks.insert(k, v);
         }
+        Ok(())
     }
 }
 

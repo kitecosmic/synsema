@@ -96,6 +96,8 @@ aes-gcm.workspace = true
 # v0.6.20 (crypto.rs): ECDH P-521 + HKDF-SHA256 (AES-GCM es el aes-gcm de arriba). Puros.
 p521.workspace = true
 hkdf.workspace = true
+# v0.6.46 (E6, sealed.rs): HPKE del recibo sellado. Ver la justificación en el workspace.
+hpke.workspace = true
 # Attestation (attestation.rs / attest.rs): ES384 + parser X.509 para verificar documentos de
 # attestation (Nitro COSE_Sign1) y para el driver `mock` de `attest`. Ver el workspace.
 p384.workspace = true

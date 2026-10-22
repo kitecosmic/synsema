@@ -30,6 +30,10 @@ pub enum JudgeCall {
 pub trait JudgeProvider: Send + Sync {
     fn judge(&self, request: &JudgeRequest) -> JudgeCall;
     fn name(&self) -> String;
+    /// v0.6.46 (E5): a qué host le llega el pedido (el `@host` de `--cap-set judge=P@host`);
+    /// `local` si no sale del proceso (laya, el mock). Sin default (ronda 1, B3), como el de
+    /// `LLMProvider`.
+    fn endpoint(&self) -> String;
     /// `true` si las probabilidades vienen de un modelo entrenado para calibrarlas. El
     /// adaptador `llm` devuelve `false` y el runtime lo dice en letra grande.
     fn calibrated(&self) -> bool {
@@ -125,6 +129,10 @@ impl MockJudgeProvider {
 }
 
 impl JudgeProvider for MockJudgeProvider {
+    /// v0.6.46 (ronda 1, B3): no sale del proceso.
+    fn endpoint(&self) -> String {
+        "local".to_string()
+    }
     fn judge(&self, request: &JudgeRequest) -> JudgeCall {
         *self.calls.lock().unwrap() += 1;
         if let Some(scripted) = self.scripted.lock().unwrap().pop_front() {

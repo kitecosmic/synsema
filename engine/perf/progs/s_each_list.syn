@@ -1,0 +1,8 @@
+let n be 100000
+let xs be range(0, n)
+let total be 0
+each x in xs
+    when x % 3 == 0
+        set total to total + x
+let evens be where(xs, (x) => x % 2 == 0)
+print("check " + text(total + length(evens)))

@@ -242,6 +242,30 @@ fn err_validation(msg: impl Into<String>, field: Option<String>) -> Control {
 fn err_at(msg: impl Into<String>, loc: &SourceLocation) -> Control {
     Control::Error(RuntimeError::at(msg, loc.clone()))
 }
+/// v0.6.46 (C6): un argumento con nombre que la task o el builtin no tiene. Dice los que tiene (la
+/// firma es dato: es lo que ve un modelo que arma la llamada) y el más cercano si hay uno. Frío:
+/// está en el camino de llamada y sólo corre al fallar.
+#[cold]
+#[inline(never)]
+fn unknown_parameter<'a>(name: &str, params: impl Iterator<Item = &'a str>, loc: &SourceLocation) -> Control {
+    let params: Vec<&str> = params.collect();
+    let mut msg = format!("unknown parameter '{}'", name);
+    let close = params
+        .iter()
+        .map(|p| (crate::capscope::edit_distance(name, p), *p))
+        .min()
+        .filter(|(d, p)| *d <= 2.max(p.len() / 3));
+    if let Some((_, p)) = close {
+        msg.push_str(&format!(" — did you mean '{}'?", p));
+    }
+    if params.is_empty() {
+        msg.push_str("; it takes no named arguments");
+    } else {
+        msg.push_str(&format!("; the parameters are: {}", params.join(", ")));
+    }
+    err_at(msg, loc)
+}
+
 /// El error de leer una variable que no existe (el mismo texto en el tree-walker y en la VM).
 fn undefined_variable(name: &str, loc: &SourceLocation) -> Control {
     // Batch DX (decisión #6): los bindings que serve inyecta SOLO en el
@@ -801,7 +825,11 @@ fn module_rebind(
             format!("module has no export '{}' — a module's names are the ones it exports; add `export let {} be …` in the module", name, name),
             loc,
         )),
-        Some(SynValue::Task(_)) => Err(err_at(format!("cannot replace the module task '{}' from outside the module", name), loc)),
+        // Ronda 1 (A2): se mira también el binding del módulo; una exportación envuelta (o
+        // cualquier otra envoltura) no dice que detrás hay una task.
+        Some(v) if matches!(v, SynValue::Task(_)) || matches!(menv.borrow().bindings.get(name), Some(SynValue::Task(_))) => {
+            Err(err_at(format!("cannot replace the module task '{}' from outside the module", name), loc))
+        }
         Some(_) => {
             let _ = env_update(menv, name, value.clone());
             Ok(value)
@@ -1074,7 +1102,15 @@ pub const PROTECTED_BUILTIN_NAMES: &[&str] = CORE_LABEL_AWARE;
 /// `approve`/`confirm`/`ask`/`reason`/`decide`/`analyze`/`generate`) se comprueban en `exec`.
 /// v0.6.42 — `exit`: el código de salida es un canal público (8 bits) y la llamada misma también;
 /// bajo una rama privada o con un código privado, `label_violation` antes de salir.
-pub const CORE_SINK_BUILTINS: &[&str] = &["llm_step", "llm_stream", "exit"];
+pub const CORE_SINK_BUILTINS: &[&str] = &["exit"];
+
+/// v0.6.46 (E5) — `llm_step` y `llm_stream` dejan de ser sumideros: un sumidero vuelve antes de
+/// la unión de etiquetas y su respuesta no salía etiquetada nunca. Reciben los argumentos
+/// envueltos y hacen su propio chequeo (el PC, el techo `llm=P@<provider>` y la capability), y lo
+/// que devuelven (el mapa de `llm_step` entero, cada fragmento de `llm_stream`) lleva la etiqueta
+/// de lo que se les dio. No son nombres protegidos: un programa puede seguir llamando así a una
+/// task suya.
+pub const CORE_LLM_LABEL_AWARE: &[&str] = &["llm_step", "llm_stream"];
 
 /// Hook que el host (motor) cablea para que `require <tipo>(<scope>)` conceda en
 /// el `CapabilitySet` real (que vive fuera de core, para evitar el ciclo de deps).
@@ -1091,6 +1127,30 @@ pub type SandboxHook = Rc<dyn Fn(bool)>;
 /// Core no conoce `Capability`: el host interpreta el valor.
 pub type CeilingHook = Rc<dyn Fn(Option<&SynValue>) -> Result<(), String>>;
 
+/// v0.6.46 (E3) — el gate de `declassify` del host: recibe los principales que la llamada quita
+/// (`from \ to`) y el conjunto DECLARADO (lo que nombran el mensaje y el audit, nunca la etiqueta
+/// real), y dice si la capability `declassify` los cubre a todos.
+pub type DeclassifyCapHook = Rc<dyn Fn(&[Rc<str>], &str) -> bool>;
+
+/// v0.6.46 (E3b) — el scope de un módulo de confianza: `Some((módulo, requires))` al entrar (al
+/// correr su cuerpo, o una task exportada con sus `require`), `None` al salir. El host cambia el
+/// `CapabilitySet` por lo declarado ∩ el techo de confianza, sin nada del llamador, y lo restaura.
+pub type TrustedScopeHook = Rc<dyn Fn(Option<(&str, &[(String, Option<String>)])>)>;
+
+/// v0.6.46 (E5) — el permiso de mandarle datos privados a un modelo: `(op, principales, conjunto
+/// declarado, judge)` → ¿lo permite el host? El host mira el provider de esta llamada (`judge` = el
+/// del juez) y exige, por cada principal P, un techo con `llm=P@<host del provider>` (`judge=` para
+/// el juez) y el `require llm("P")` del programa. El audit nombra el conjunto DECLARADO, como el de
+/// `declassify` (el real variaría con el valor elegido). Sin hook, nada privado llega al modelo.
+pub type LlmDataHook = Rc<dyn Fn(&str, &[Rc<str>], &str, bool) -> bool>;
+
+/// v0.6.46 (E8) — abre un template del disco ya gateado (`raw`, como se escribió) sin ventana entre
+/// el gate y la apertura. Abre lo que juzgó el gate (la ruta normalizada de `raw`), NO la ruta ya
+/// resuelta con `canonicalize`: ésa se resolvió después del gate y nadie la juzgó (ronda 1, E8-A3).
+/// Lo cablea el motor (que tiene con qué abrir sin seguir links); sin él, el template se lee por
+/// nombre, como v0.6.45.
+pub type TemplateOpenHook = Rc<dyn Fn(&str) -> Result<std::fs::File, RuntimeError>>;
+
 // --- FASE 1 tool-calling: el callback de paso del LLM (tipos PLANOS) ---
 // core NO depende de `synsema-llm` (la dep va al revés vía runtime). Igual que
 // `llm_callback`, el motor cablea este callback con el provider real; core sólo
@@ -1102,12 +1162,19 @@ pub struct StepCatalogEntry {
     pub name: String,
     pub description: String,
     pub params: Vec<String>,
+    /// v0.6.46 (F1): el tipo de cada parámetro (`"nombre: tipo"` en el catálogo), en el orden de
+    /// `params`; `None` = sin tipo (llega como texto, como antes).
+    pub types: Vec<Option<crate::ast::ParamType>>,
+    /// v0.6.46 (F1): los nombres de `optional` (fuera de `required` en el esquema).
+    pub optional: Vec<String>,
 }
 
 /// Resultado que el callback de paso devuelve al builtin `llm_step`.
 pub enum StepResult {
     Final { text: String, tokens: u64 },
-    Tool { name: String, args: Vec<(String, String)>, tokens: u64 },
+    /// v0.6.46 (F1): los argumentos como valores. El motor decodifica los de un parámetro tipado
+    /// del catálogo; los demás llegan como texto, como antes.
+    Tool { name: String, args: Vec<(String, SynValue)>, tokens: u64 },
 }
 
 /// Callback de paso del LLM: `(prompt, catalog, context) -> StepResult`. Lo cablea el
@@ -1117,7 +1184,11 @@ pub type LlmStepCallback =
 
 /// Callback de texto (reason/decide/analyze/generate): `(op, prompt) -> contenido`. El
 /// motor lo cablea con el provider real; sin él, las ops LLM caen a placeholders.
-pub type LlmTextCallback = Rc<dyn Fn(&str, &str) -> String>;
+///
+/// v0.6.46 (E5): recibe también los principales de lo privado que lleva el prompt (vacío con
+/// datos públicos), para el host que lo quiera decidir o auditar, y `Err(texto)` es un error de
+/// ESA llamada (un hook de wasm que lanzó), no una respuesta vacía.
+pub type LlmTextCallback = Rc<dyn Fn(&str, &str, &[Rc<str>]) -> Result<String, String>>;
 
 /// Callback dedicado de `decide` (DE-039): `(prompt, opciones) -> contenido`. Espejo
 /// del de texto, pero con las opciones ESTRUCTURADAS para que el motor pueda forzar la
@@ -1625,6 +1696,51 @@ pub struct Interpreter {
     /// stderr) y no es un destino de la salida como el de un agente o el de serve: `log` lo trata
     /// como si no hubiera hook y, bajo `synsema run`, va a stderr.
     pub log_hook_observes_only: bool,
+    /// v0.6.46 (E4) — la marca de un solo uso de una llamada a `declassify`/`private` POR SU NOMBRE
+    /// (el callee literal, ya chequeado por `check_protected_callee`). La arma el `TaskCall` (y el
+    /// pipe) con las etiquetas encendidas, después de evaluar los argumentos, justo antes de
+    /// despachar; `b_private`/`b_declassify` la consumen. Sin ella (un alias, un contenedor, un
+    /// parámetro, un valor devuelto) no corren: así todo sitio que declasifica es una llamada
+    /// literal y el inventario de `code check --json` es completo. Al final del struct a propósito.
+    label_call_armed: bool,
+    /// v0.6.46 (E3) — el gate de `declassify` (ver [`DeclassifyCapHook`]). Sólo se llama con las
+    /// etiquetas encendidas. Sin él (un host que no cablea capabilities), sin gate. Al final del
+    /// struct a propósito, como `label_call_armed`.
+    declassify_cap_hook: Option<DeclassifyCapHook>,
+    /// v0.6.46 (E3b) — los módulos de confianza que cargó el HOST (`--trusted nombre=ruta`, o
+    /// `trusted` en wasm): nombre → fuente. El programa los importa con `use "trusted:nombre"`;
+    /// no ve la ruta ni puede escribirlos.
+    trusted_sources: HashMap<String, Rc<str>>,
+    /// v0.6.46 (E3b) — ver [`TrustedScopeHook`]. Sin él, `use "trusted:…"` es error.
+    trusted_scope_hook: Option<TrustedScopeHook>,
+    /// v0.6.46 (E5) — ver [`LlmDataHook`]. Al final del struct a propósito (no es camino caliente).
+    llm_data_hook: Option<LlmDataHook>,
+    /// v0.6.46 (ronda 1, A1) — el padre del entorno de un módulo de confianza: los builtins y lo que
+    /// puso el host, tomados antes de que corra el programa. Colgado de `global_env`, la tool
+    /// buscaba `upper` o `length` en los globales del programa y corría lo que éste definiera.
+    trusted_base_env: Option<Rc<RefCell<Environment>>>,
+    /// v0.6.46 (ronda 1, A1) — cuántos scopes de confianza hay abiertos (el cuerpo de un módulo de
+    /// confianza o una tool en curso). Adentro, lo que correría en otro intérprete con los globales
+    /// del programa (`spawn`, `parallel_map`, `cron_every`, un módulo de archivo) es error.
+    trusted_depth: u32,
+    /// v0.6.46 (E8) — ver [`TemplateOpenHook`].
+    template_open_hook: Option<TemplateOpenHook>,
+    /// v0.6.46 (C3) — lo que la corrida escribió (archivos), en orden: el reverso de `lineage`. Lo
+    /// anota el builtin que escribe, con los bytes que escribió (`record_output`), no el despacho.
+    outputs: Vec<LineageEntry>,
+    /// v0.6.46 (ronda 1 de cf1, N1): si se descartó alguna entrada de `lineage` / de `outputs` por
+    /// el tope `MAX_LINEAGE`. El recibo lo marca así, no por el largo: con exactamente el tope no se
+    /// perdió nada.
+    lineage_dropped: [bool; 2],
+}
+
+/// v0.6.46 (ronda 1 de cf1, B2): el linaje que juntó un intérprete hijo (un worker de
+/// `parallel_map`), para sumarlo al del padre con [`Interpreter::absorb_lineage`].
+#[derive(Default)]
+pub struct LineageTaken {
+    inputs: Vec<LineageEntry>,
+    outputs: Vec<LineageEntry>,
+    dropped: [bool; 2],
 }
 
 impl Default for Interpreter {
@@ -1762,6 +1878,16 @@ impl Interpreter {
             output: Vec::new(),
             err_output: Vec::new(),
             log_hook_observes_only: false,
+            label_call_armed: false,
+            declassify_cap_hook: None,
+            trusted_sources: HashMap::new(),
+            trusted_scope_hook: None,
+            llm_data_hook: None,
+            trusted_base_env: None,
+            trusted_depth: 0,
+            template_open_hook: None,
+            outputs: Vec::new(),
+            lineage_dropped: [false; 2],
             blackboard: HashMap::new(),
             agent_definitions: HashMap::new(),
             agent_context: Vec::new(),
@@ -1822,7 +1948,7 @@ impl Interpreter {
             seen_any: false,
             touched: labels::empty(),
             declassify_log: Vec::new(),
-            label_aware: CORE_LABEL_AWARE.iter().map(|s| s.to_string()).collect(),
+            label_aware: CORE_LABEL_AWARE.iter().chain(CORE_LLM_LABEL_AWARE).map(|s| s.to_string()).collect(),
             label_sinks: CORE_SINK_BUILTINS.iter().map(|s| s.to_string()).collect(),
             pattern_label: labels::empty(),
             control_taint: labels::empty(),
@@ -2547,6 +2673,15 @@ impl Interpreter {
         self.template_read_hook = Some(hook);
     }
 
+    /// v0.6.46 (E8): instala la apertura de templates del disco (ver [`TemplateOpenHook`]).
+    pub fn set_template_open_hook(&mut self, hook: TemplateOpenHook) {
+        self.template_open_hook = Some(hook);
+    }
+
+    pub fn template_open_hook(&self) -> Option<TemplateOpenHook> {
+        self.template_open_hook.clone()
+    }
+
     /// Fija los nombres de env que Synsema trata como secretos (los quita de los hijos
     /// de `run()`/`proc_spawn`). Lo cablea el motor con las claves de proveedor + `.env`.
     pub fn set_sensitive_env(&mut self, names: HashSet<String>) {
@@ -2606,6 +2741,13 @@ impl Interpreter {
         if let Ok(v) = &r {
             if bt.meta.lineage_source {
                 self.record_input(&bt.name, args, v);
+                // v0.6.46 (E6): `--replay` corta en la primera entrada que no es la de la corrida
+                // grabada.
+                if crate::sealed::active() {
+                    if let Some(m) = crate::sealed::replay_error() {
+                        return Err(Control::Error(RuntimeError::at(m, loc.clone())));
+                    }
+                }
             }
         }
         // El "missing argument" genérico de `nth` no decía de qué función ni cuántos
@@ -2629,6 +2771,12 @@ impl Interpreter {
                 }
                 Err(Control::Error(e))
             }
+            // v0.6.46 (ronda 3, N1): un error de una task que corrió un builtin (`call_task` no
+            // tiene ubicación) dice la línea del builtin, no `<engine>:0:0`.
+            Err(Control::Error(mut e)) if e.location.as_ref().is_some_and(|l| l.line == 0 && &*l.file == "<engine>") => {
+                e.location = Some(loc.clone());
+                Err(Control::Error(e))
+            }
             other => other,
         }
     }
@@ -2650,8 +2798,21 @@ impl Interpreter {
         // `label_violation` antes de que el builtin corra.
         if self.label_sinks.contains(bt.name.as_str()) {
             let refs: Vec<&SynValue> = args.iter().collect();
-            self.sink_check(&bt.name, &refs, loc)?;
-            return self.call_builtin_at(&f, args, loc);
+            match self.sink_check(&bt.name, &refs, loc) {
+                Ok(()) => {
+                    // v0.6.46 (E6.4): un sumidero que corre es un momento público; el reloj cercado
+                    // del recibo sellado avanza acá.
+                    if crate::sealed::active() {
+                        crate::sealed::tick_clock(crate::clock::now_secs_f64());
+                    }
+                    return self.call_builtin_at(&f, args, loc);
+                }
+                // v0.6.46 (E6): con el recibo sellado, `reveal` corre en una rama privada (su
+                // entrada de audit va al sobre) y sigue por el despacho genérico: el texto revelado
+                // sale con la etiqueta del PC. Sólo en el camino del error: el feliz no cambia.
+                Err(e) if !sealed_sink_allowed(&bt.name, args) => return Err(e),
+                Err(_) => {}
+            }
         }
         if self.label_aware.contains(bt.name.as_str()) {
             return self.call_builtin_at(&f, args, loc);
@@ -2766,10 +2927,96 @@ impl Interpreter {
         &self.lineage
     }
 
-    fn record_input(&mut self, source: &str, args: &[SynValue], result: &SynValue) {
-        if self.lineage.len() >= MAX_LINEAGE {
+    /// v0.6.46 (C3): lo que el programa escribió hasta ahora, en orden (`receipt()` lo publica como
+    /// `outputs`).
+    pub fn outputs(&self) -> &[LineageEntry] {
+        &self.outputs
+    }
+
+    /// v0.6.46 (C3): un builtin que escribió `data` en `what` (la ruta como la pasó el programa) lo
+    /// anota acá, después de escribir bien: el recibo trae el sha256 de lo que quedó, sin que el
+    /// programa lo meta a mano. `encoding` dice qué bytes se hashearon ("text": utf-8, "bytes").
+    /// Lo llama el builtin y no el despacho: `call_builtin` no paga nada por esto. Una escritura
+    /// bajo un PC privado no se anota (ni llega: escribir es un sumidero público).
+    pub fn record_output(&mut self, source: &str, what: &str, data: &[u8], encoding: &'static str) {
+        if self.labels && self.pc_is_private() {
             return;
         }
+        let entry = LineageEntry {
+            source: source.to_string(),
+            what: what.to_string(),
+            sha256: sha256_hex(data),
+            bytes: data.len(),
+            encoding: encoding.to_string(),
+            salt: None,
+            secrets: Vec::new(),
+        };
+        // v0.6.46 (ronda 1 de cf1, B1): con auditor, lo escrito también va al registro sellado de la
+        // corrida, no sólo a `receipt()`.
+        if crate::sealed::active() {
+            seal_output(&entry);
+        }
+        if self.outputs.len() >= MAX_LINEAGE {
+            self.lineage_dropped[1] = true;
+            return;
+        }
+        self.outputs.push(entry);
+    }
+
+    /// v0.6.46 (ronda 1 de cf1, N1): si `lineage()` / `outputs()` perdieron entradas por el tope.
+    pub fn lineage_truncated(&self) -> (bool, bool) {
+        (self.lineage_dropped[0], self.lineage_dropped[1])
+    }
+
+    /// v0.6.46 (ronda 1 de cf1, B2): saca el linaje de este intérprete (un worker que terminó).
+    pub fn take_lineage(&mut self) -> LineageTaken {
+        LineageTaken {
+            inputs: std::mem::take(&mut self.lineage),
+            outputs: std::mem::take(&mut self.outputs),
+            dropped: self.lineage_dropped,
+        }
+    }
+
+    /// v0.6.46 (ronda 1 de cf1, B2): suma lo que leyó y escribió un worker, en el orden en que se
+    /// llama (el de los items). Bajo un PC privado no se suma: igual que una lectura propia, cuántas
+    /// entradas trae `receipt()` diría qué rama se tomó (con auditor, el worker ya lo selló).
+    pub fn absorb_lineage(&mut self, t: LineageTaken) {
+        if self.labels && self.pc_is_private() {
+            return;
+        }
+        for (i, (mine, theirs)) in [(&mut self.lineage, t.inputs), (&mut self.outputs, t.outputs)].into_iter().enumerate() {
+            let room = MAX_LINEAGE.saturating_sub(mine.len());
+            if theirs.len() > room || t.dropped[i] {
+                self.lineage_dropped[i] = true;
+            }
+            mine.extend(theirs.into_iter().take(room));
+        }
+    }
+
+    fn record_input(&mut self, source: &str, args: &[SynValue], result: &SynValue) {
+        // v0.6.46 (E6.8): una lectura hecha en una rama decidida por un valor privado no entra en
+        // el linaje público: cuántas entradas tenía `inputs` en `receipt()` decía qué rama se tomó.
+        // E6: con auditor, va al sobre del recibo sellado; sin auditor, no se registra.
+        let sealed = self.labels && self.pc_is_private();
+        if sealed && !crate::sealed::active() {
+            return;
+        }
+        if !sealed && self.lineage.len() >= MAX_LINEAGE {
+            self.lineage_dropped[0] = true;
+            return;
+        }
+        // v0.6.46 (ronda 1, E6-A1): bajo un PC privado lo leído llega etiquetado (`private`), y el
+        // serializador lo redactaba: se sellaba el hash de "[redacted]" (y `--replay` no veía otra
+        // entrada) y avisaba en stderr una vez por lectura, que contaba las lecturas de la rama. Se
+        // hashea el valor sin etiquetas: sólo va dentro del sobre, que es privado por construcción.
+        let (stripped_result, stripped_args);
+        let (result, args): (&SynValue, &[SynValue]) = if sealed {
+            stripped_result = crate::labels::strip_deep(result);
+            stripped_args = args.iter().map(crate::labels::strip_deep).collect::<Vec<_>>();
+            (&stripped_result, &stripped_args)
+        } else {
+            (result, args)
+        };
         // Un recv que venció sin mensaje no trajo nada.
         if matches!(result, SynValue::Nothing)
             && ["ws_", "proc_", "term_", "watch_"].iter().any(|p| source.starts_with(p))
@@ -2818,7 +3065,7 @@ impl Interpreter {
             }
         };
         let (what, payload): (String, Vec<u8>) = match source {
-            "read_file" | "read_file_bytes" | "list_dir" | "grep" | "parquet_read" | "file_info" => {
+            "read_file" | "read_file_bytes" | "list_dir" | "grep" | "parquet_read" | "parquet_scan" | "file_info" => {
                 (path_what(args.first()), bytes_of(result))
             }
             "read_line" => ("stdin".to_string(), bytes_of(result)),
@@ -2869,31 +3116,84 @@ impl Interpreter {
             }
         };
         let encoding = enc_cell.get().to_string();
-        self.lineage.push(LineageEntry {
+        let secrets = if url_of_connection(source, args).is_some() {
+            crate::secret::secret_names_in(args)
+        } else {
+            Vec::new()
+        };
+        let entry = LineageEntry {
             source: source.to_string(),
             what,
             sha256: sha256_hex(&payload),
             bytes: payload.len(),
             encoding,
             salt,
-        });
+            secrets,
+        };
+        if sealed {
+            seal_lineage(&entry, true);
+            return;
+        }
+        // v0.6.46 (E6.4): una lectura de afuera con el PC público también avanza el reloj cercado, y
+        // queda en el registro de la corrida (en orden, para que `--replay` la compare).
+        if crate::sealed::active() {
+            crate::sealed::tick_clock(crate::clock::now_secs_f64());
+            seal_lineage(&entry, false);
+        }
+        self.lineage.push(entry);
     }
 
     /// Linaje de una respuesta de modelo (`reason`, `decide`, `analyze`, `generate`): lo que
     /// dijo el modelo también es una entrada del programa. Va el hash del prompt, no el prompt.
-    fn record_llm(&mut self, kind: &str, prompt: &str, out: &str) {
+    ///
+    /// v0.6.46 (E5): con datos privados en el prompt (`private`), la respuesta también es privada:
+    /// su hash va con la MISMA sal que el del prompt y su largo no se publica (`bytes: 0`). Sin la
+    /// sal, el hash de una respuesta corta (un sí/no, una opción) se adivina probando.
+    fn record_llm(&mut self, kind: &str, prompt: &str, out: &str, private: bool) {
+        use sha2::{Digest, Sha256};
         if self.lineage.len() >= MAX_LINEAGE {
+            self.lineage_dropped[0] = true;
             return;
         }
-        let (sal, commit) = salted_commitment(prompt.as_bytes());
+        let salt = fresh_salt();
+        let hex = |b: &[u8]| b.iter().map(|x| format!("{:02x}", x)).collect::<String>();
+        let commit = hex(&Sha256::new().chain_update(salt).chain_update(prompt.as_bytes()).finalize());
+        let (what, sha256, bytes) = if private {
+            (
+                format!("{} prompt sha256-salted:{} response sha256-salted", kind, commit),
+                hex(&Sha256::new().chain_update(salt).chain_update(out.as_bytes()).finalize()),
+                0,
+            )
+        } else {
+            (format!("{} prompt sha256-salted:{}", kind, commit), sha256_hex(out.as_bytes()), out.len())
+        };
         self.lineage.push(LineageEntry {
             source: "llm".to_string(),
-            what: format!("{} prompt sha256-salted:{}", kind, commit),
-            sha256: sha256_hex(out.as_bytes()),
-            bytes: out.len(),
+            what,
+            sha256,
+            bytes,
             encoding: "text".to_string(),
-            salt: Some((sal, "text")),
+            salt: Some((hex(&salt), "text")),
+            secrets: Vec::new(),
         });
+    }
+
+    /// v0.6.46 (E5): la respuesta de un modelo lleva la etiqueta de lo que se le dio.
+    #[inline]
+    fn llm_out(lab: &Label, v: SynValue) -> SynValue {
+        if lab.is_empty() {
+            v
+        } else {
+            labels::mark(v, lab.clone())
+        }
+    }
+
+    /// v0.6.46 (E5): llama al callback de texto con el prompt sin redactar, anota el linaje y
+    /// etiqueta la respuesta. Un `Err` del host (un hook de wasm que lanzó) es error de la llamada.
+    fn llm_text_call(&mut self, cb: &LlmTextCallback, op: &str, prompt: &str, lab: &Label, loc: &SourceLocation) -> Result<SynValue, Control> {
+        let out = cb(op, prompt, &lab[..]).map_err(|m| err_at(format!("{}: {}", op, m), loc))?;
+        self.record_llm(op, prompt, &out, !lab.is_empty());
+        Ok(Self::llm_out(lab, syn_text(out)))
     }
 
     /// Lee (y consume) un argumento sólo-por-nombre de la llamada a builtin en curso.
@@ -2999,6 +3299,117 @@ impl Interpreter {
         self.llm_cap_hook = Some(hook);
     }
 
+    /// v0.6.46 (E3): cablea el gate de `declassify` (ver [`DeclassifyCapHook`]).
+    pub fn set_declassify_cap_hook(&mut self, hook: DeclassifyCapHook) {
+        self.declassify_cap_hook = Some(hook);
+    }
+
+    /// v0.6.46 (E5): cablea el permiso de datos privados hacia el modelo (ver [`LlmDataHook`]).
+    pub fn set_llm_data_hook(&mut self, hook: LlmDataHook) {
+        self.llm_data_hook = Some(hook);
+    }
+
+    /// v0.6.46 (E3b): registra un módulo de confianza del host y el hook de su scope. Con alguno,
+    /// el programa corre en el tree-walker: la envoltura de sus tasks es un builtin, y así la VM
+    /// no tiene un caso más que mirar. Ronda 3 (N2): la VM no tiene el chequeo de origen
+    /// (`check_trusted_origin`); por eso `shortcuts` queda en `false`, y la envoltura lo afirma.
+    pub fn set_trusted_module(&mut self, name: &str, source: &str, hook: TrustedScopeHook) {
+        self.trusted_sources.insert(name.to_string(), Rc::from(source));
+        self.trusted_scope_hook = Some(hook);
+        self.shortcuts = false;
+    }
+
+    /// v0.6.46 (ronda 1, A1): ¿corre código de una tool de confianza? Lo miran los builtins que
+    /// mandan una task a otro intérprete (`parallel_map`, `cron_every`): ahí vería los globales del
+    /// programa con las capabilities de la tool.
+    pub fn in_trusted_scope(&self) -> bool {
+        self.trusted_depth > 0
+    }
+
+    /// v0.6.46 (ronda 1, A1): la foto del preludio (builtins, constantes, lo que puso el host) para
+    /// los módulos de confianza, antes de la primera sentencia del programa. Sin módulos de
+    /// confianza no hace nada.
+    fn snapshot_trusted_base(&mut self) {
+        if self.trusted_sources.is_empty() || self.trusted_base_env.is_some() {
+            return;
+        }
+        let base = Environment::root("trusted-base");
+        {
+            let g = self.global_env.borrow();
+            let mut b = base.borrow_mut();
+            for (k, v) in g.bindings.iter() {
+                b.bindings.insert(k.clone(), v.clone());
+            }
+        }
+        self.trusted_base_env = Some(base);
+    }
+
+    /// Ronda 2: ¿la task es de una tool de confianza? Lo es si su entorno, subiendo por los padres,
+    /// llega a la base de confianza (un módulo de confianza, sus lambdas, sus templates); lo que
+    /// cuelga de `global_env` es del programa. Sin base (no debería pasar con un scope abierto), no.
+    #[cold]
+    #[inline(never)]
+    fn check_trusted_origin(&self, task: &SynTaskValue, loc: &SourceLocation) -> Result<(), Control> {
+        let mut cur = task.closure_env.clone();
+        loop {
+            let next = cur.borrow().parent.clone();
+            match next {
+                Some(p) => cur = p,
+                None => break,
+            }
+        }
+        if self.trusted_base_env.as_ref().is_some_and(|b| Rc::ptr_eq(b, &cur)) {
+            return Ok(());
+        }
+        Err(err_at(
+            format!(
+                "a trusted tool cannot run the program's task '{}' — it would run with the tool's capabilities (a callback the program registered, or a name resolved in the program's globals); a trusted tool runs only its own code",
+                task.name
+            ),
+            loc,
+        ))
+    }
+
+    /// v0.6.46 (ronda 2): el padre del entorno de un template. Dentro de una tool de confianza, la
+    /// base de confianza (los builtins): un `{upper(x)}` del template de la tool no llama a lo que el
+    /// programa definió con ese nombre. Ronda 3: hoy no se alcanza (`render` es error dentro de la
+    /// tool, R3-A1); queda para cuando el host le dé a la tool sus templates.
+    pub(crate) fn template_parent(&self) -> Rc<RefCell<Environment>> {
+        if self.trusted_depth > 0 {
+            if let Some(b) = &self.trusted_base_env {
+                return b.clone();
+            }
+        }
+        self.global_env.clone()
+    }
+
+    /// El padre de un módulo de confianza. Si no hubo foto (un intérprete que no entra por
+    /// `execute`, como el de un agente), sólo los builtins con su propio nombre (o el alias
+    /// deprecado de uno): lo que el programa liga a un nombre es una task o un valor, nunca un
+    /// builtin con ese nombre.
+    #[cold]
+    fn trusted_base(&mut self) -> Rc<RefCell<Environment>> {
+        if let Some(b) = &self.trusted_base_env {
+            return b.clone();
+        }
+        let base = Environment::root("trusted-base");
+        {
+            let g = self.global_env.borrow();
+            let mut b = base.borrow_mut();
+            for (k, v) in g.bindings.iter() {
+                if let SynValue::Builtin(bt) = v {
+                    let own = *bt.name == **k
+                        || crate::deprecated::DEPRECATED_NAMES.iter().any(|(old, new)| *old == &**k && *new == &*bt.name);
+                    if own {
+                        b.bindings.insert(k.clone(), v.clone());
+                    }
+                }
+            }
+        }
+        self.trusted_base_env = Some(base.clone());
+        base
+    }
+
     /// Cablea el provider de `judge` (real o mock). Ver [`JudgeCallback`].
     pub fn set_judge_callback(&mut self, cb: JudgeCallback) {
         self.judge_callback = Some(cb);
@@ -3039,7 +3450,7 @@ impl Interpreter {
         opts: &SynValue,
         giv: &SynValue,
         loc: &SourceLocation,
-    ) -> Result<Option<SynValue>, Control> {
+    ) -> Result<Option<(SynValue, String)>, Control> {
         use crate::judge::{syn_to_json, JudgeAnswer, JudgeKind, JudgeOption, JudgeQuestion, JudgeRequest, MAX_OPTIONS};
         let Some(cb) = self.judge_callback.clone() else { return Ok(None) };
         let SynValue::List(l) = opts else { return Ok(None) };
@@ -3069,12 +3480,44 @@ impl Interpreter {
         let req = JudgeRequest { state: syn_to_json(giv), questions: vec![q] };
         match cb(&req) {
             Ok(Some(resp)) => match resp.answers.first() {
-                Some(JudgeAnswer::Choose { choice: Some(c), .. }) => Ok(Some(syn_text(c.as_str()))),
+                Some(JudgeAnswer::Choose { choice: Some(c), .. }) => {
+                    Ok(Some((syn_text(c.as_str()), format!("Decide between {} given {}", opts, giv))))
+                }
                 _ => Ok(None),
             },
             Ok(None) => Ok(None),
             Err(m) => Err(err_at(m, loc)),
         }
+    }
+
+    /// v0.6.46 (E5): el gate de datos de una operación LLM, ANTES de la capability. Con las
+    /// etiquetas encendidas: el PC tiene que ser público (como en todo sumidero, y sin dejar
+    /// entrada de audit de una rama privada), y si lo que se le da al modelo lleva algo privado,
+    /// el host tiene que permitirlo para esos principales y ese provider. Devuelve la etiqueta de
+    /// las entradas: la llamada arma el prompt sin redactar y la respuesta sale con ella.
+    fn llm_data_gate(&mut self, op: &str, judge: bool, inputs: &[&SynValue], loc: &SourceLocation) -> Result<Label, Control> {
+        if !self.labels {
+            return Ok(labels::empty());
+        }
+        if !self.pc_is_empty() {
+            self.sink_check(op, &[], loc)?;
+        }
+        let mut l = labels::empty();
+        for v in inputs {
+            l = labels::union(&l, &labels::label_deep(v));
+        }
+        if l.is_empty() {
+            return Ok(l);
+        }
+        self.note_seen(&l);
+        let ok = match &self.llm_data_hook {
+            Some(h) => h(op, &l[..], &self.safe_label(&l), judge),
+            None => false,
+        };
+        if !ok {
+            return Err(llm_data_not_granted(op, judge, &self.safe_label(&l), loc));
+        }
+        Ok(l)
     }
 
     /// Chequea la capability `llm` (si hay gate). Se llama al inicio de cada op LLM,
@@ -3297,6 +3740,12 @@ impl Interpreter {
         self.request_spend_limits.clear();
         self.stream_emit = None;
         self.recursion_depth = 0;
+        // v0.6.46 (ronda 1 de cf1, M1): el linaje es POR REQUEST. El worker nace vacío (no corre
+        // el top-level), así que todo lo que hay es de requests anteriores, que pueden ser de otros
+        // usuarios: `receipt()` listaba lo que leyeron y escribieron (con su nombre en la ruta).
+        self.lineage.clear();
+        self.outputs.clear();
+        self.lineage_dropped = [false; 2];
         // T5 (ronda 6, B3) — el contador de pasos es POR REQUEST. El serve reusa el intérprete
         // entre requests, así que sin esto el contador acumulaba el trabajo del request
         // ANTERIOR — incluido el privado — y el siguiente lo leía con `touched` ya limpio, o
@@ -3333,6 +3782,15 @@ impl Interpreter {
     /// path resuelto; un import circular es error. No agrega tipo de runtime nuevo:
     /// el módulo es un `SynValue::Map`.
     fn load_module(&mut self, raw_path: &str, importer_file: &str) -> Result<SynValue, Control> {
+        if let Some(name) = raw_path.strip_prefix("trusted:") {
+            return self.load_trusted_module(name);
+        }
+        if self.trusted_depth > 0 {
+            return Err(err(format!(
+                "a trusted module imports only other trusted modules (`use \"trusted:…\"`), not '{}': a file module sees the program's names and would run with the tool's capabilities",
+                raw_path
+            )));
+        }
         let base_dir = Path::new(importer_file).parent().unwrap_or_else(|| Path::new("."));
         // v0.6.20 — la raíz del proyecto acota `../`: la fijó el host o se captura acá, en el
         // primer `use` (siempre el top-level de la entrada; los `use` de un módulo corren
@@ -3359,6 +3817,89 @@ impl Interpreter {
         let module_map = res?;
         self.module_cache.insert(resolved, module_map.clone());
         Ok(module_map)
+    }
+
+    /// v0.6.46 (E3b): `use "trusted:nombre"`. El cuerpo corre bajo el scope de confianza, y cada
+    /// task exportada se entrega envuelta: al llamarla corre con SUS `require` ∩ el techo de
+    /// confianza, no con lo del llamador. Una task común no paga nada: la diferencia está en el
+    /// valor (un builtin), no en una marca que mire cada llamada.
+    #[cold]
+    #[inline(never)]
+    fn load_trusted_module(&mut self, name: &str) -> Result<SynValue, Control> {
+        let key = format!("trusted:{}", name);
+        // Ronda 1 (A2): cada `use` recibe SU copia de las exportaciones: lo que un importador
+        // escribe en ella no lo ve la tool ni otro importador. Ronda 2 (N2): es una segunda defensa
+        // sin test propio (hoy el `set` ya copia el mapa antes de escribirlo, porque el caché es
+        // otro dueño); no sacarla creyendo que sobra.
+        if let Some(SynValue::Map(cached)) = self.module_cache.get(&key) {
+            return Ok(SynValue::Map(cached.borrow().to_ref()));
+        }
+        let (Some(source), Some(hook)) = (self.trusted_sources.get(name).cloned(), self.trusted_scope_hook.clone()) else {
+            return Err(err(format!(
+                "no trusted module named '{}': the host loads it (`synsema run --trusted {}=./file.syn`, or `trusted: {{ {}: source }}` in wasm); a program cannot load one itself",
+                name, name, name
+            )));
+        };
+        if self.loading_modules.contains(&key) {
+            return Err(err(format!("circular import: module '{}' is already being loaded", key)));
+        }
+        let program = parse_source(&source, &key).map_err(|e| err(e.to_string()))?;
+        note_loaded_module(&key, &source, &program);
+        check_protected_names(&program)?;
+        for stmt in &program.statements {
+            match &stmt.kind {
+                NodeKind::ServeBlock { .. } => return Err(err(format!("module '{}' must not contain a 'serve' block", key))),
+                NodeKind::RequireStatement { .. } => {
+                    return Err(err(format!(
+                        "module '{}' must not have a top-level 'require': each exported task declares its own",
+                        key
+                    )))
+                }
+                _ => {}
+            }
+        }
+        self.loading_modules.insert(key.clone());
+        // Ronda 1 (A1): hijo del preludio, no de `global_env`: los nombres libres del módulo son los
+        // builtins, no lo que el programa definió antes o después del `use`.
+        let base = self.trusted_base();
+        let module_env = Environment::child(&base, &format!("module:{}", key));
+        self.exports_collector.push(Vec::new());
+        self.stdout_verdict = None;
+        hook(Some((name, &[])));
+        debug_assert!(!self.shortcuts, "a trusted scope opened with the VM on (it has no origin check)");
+        self.trusted_depth += 1;
+        let exec_res = self.exec_block(&program.statements, &module_env);
+        self.trusted_depth -= 1;
+        hook(None);
+        self.stdout_verdict = None;
+        let names = self.exports_collector.pop().unwrap_or_default();
+        self.loading_modules.remove(&key);
+        exec_res?;
+        let mut exports = SynMap::new();
+        for export in names {
+            if let Some(v) = env_get(&module_env, &export) {
+                let v = match v {
+                    SynValue::Task(t) => {
+                        // Consciente de etiquetas: los argumentos entran con la suya (la política
+                        // del dev decide qué publica) y el PC es el del llamador. El despacho
+                        // genérico los habría desetiquetado y corrido la task bajo su unión.
+                        let w = trusted_wrapper(name, &export, t, hook.clone());
+                        if let SynValue::Builtin(b) = &w {
+                            self.label_aware.insert(b.name.clone());
+                        }
+                        w
+                    }
+                    other => other,
+                };
+                exports.insert(export, v);
+            }
+        }
+        // Ronda 1 (A2): sin `register_module`. La vista de un módulo común se escribe desde afuera
+        // (`set m.X to v` religa su variable); la de uno de confianza es un mapa de datos.
+        let map = exports.into_ref();
+        let copy = map.borrow().to_ref();
+        self.module_cache.insert(key, SynValue::Map(map));
+        Ok(SynValue::Map(copy))
     }
 
     fn load_module_inner(&mut self, raw_path: &str, resolved: &str) -> Result<SynValue, Control> {
@@ -3864,6 +4405,9 @@ impl Interpreter {
                     m.insert("sha256", syn_text(e.sha256.as_str()));
                     m.insert("bytes", syn_int(e.bytes as i64));
                     m.insert("encoding", syn_text(e.encoding.as_str()));
+                    if !e.secrets.is_empty() {
+                        m.insert("secrets", syn_list(e.secrets.iter().map(|n| syn_text(n.as_str())).collect()));
+                    }
                     // Local, nunca en el recibo: con la sal el dueño revela una consulta.
                     if let Some((salt, qenc)) = &e.salt {
                         m.insert("salt", syn_text(salt.as_str()));
@@ -4179,6 +4723,7 @@ impl Interpreter {
 
     fn execute_inner(&mut self, program: &Program) -> Result<SynValue, Control> {
         let g = self.global_env.clone();
+        self.snapshot_trusted_base();
         self.control_taint = self.no_label.clone();
         self.loop_taint = self.no_label.clone();
         self.escaping_taint = self.no_label.clone();
@@ -4234,6 +4779,7 @@ impl Interpreter {
         after_each: &mut dyn FnMut(&str) -> Option<String>,
     ) -> Vec<TestOutcome> {
         let g = self.global_env.clone();
+        self.snapshot_trusted_base();
         // Preámbulo: intent/require al inicio, luego congelar intent (igual que execute).
         let mut split = 0;
         for stmt in &program.statements {
@@ -4892,8 +5438,16 @@ impl Interpreter {
                         }
                     }
                     self.arg_literals = mask;
+                    // v0.6.46 (E4): la llamada literal a `declassify`/`private` arma su marca.
+                    if matches!(name.as_identifier(), Some("declassify" | "private")) {
+                        let out = self.call_label_builtin_by_name(func, &mut args, loc);
+                        self.release_args(args);
+                        return out;
+                    }
                 }
-                check_call_arity(&func, &args, loc)?;
+                if let Err(e) = check_call_arity(&func, &args, loc) {
+                    return Err(arity_error(e, &func, &args, loc));
+                }
                 let out = self.call_value_named(func, &mut args, loc);
                 self.release_args(args);
                 out
@@ -4908,7 +5462,7 @@ impl Interpreter {
                 // nombrados (tienen nombres de param).
                 let lambda_params: Vec<Param> = parameters
                     .iter()
-                    .map(|n| Param { name: n.clone(), default: None })
+                    .map(|n| Param { name: n.clone(), default: None, ty: None })
                     .collect();
                 let task = Rc::new(SynTaskValue {
                     name: "<lambda>".to_string(),
@@ -5074,6 +5628,9 @@ impl Interpreter {
     #[inline(never)]
     fn exec_agent_definition(&mut self, node: &Node, env: &Rc<RefCell<Environment>>) -> Result<SynValue, Control> {
         let NodeKind::AgentDefinition { name, body, .. } = &node.kind else { unreachable!("exec_agent_definition: otro nodo") };
+        if self.trusted_depth > 0 {
+            return Err(err_at(trusted_no_agents(name), &node.location));
+        }
         {
         self.agent_definitions.insert(name.clone(), (body.clone(), env.clone()));
         let mut m = SynMap::new();
@@ -5090,20 +5647,20 @@ impl Interpreter {
         let loc = &node.location;
         let NodeKind::AnalyzeExpression { data, objective } = &node.kind else { unreachable!("exec_analyze_expression: otro nodo") };
         {
-        self.check_llm_cap()?;
         let d = self.exec(data, env)?;
-        // T5 (B7): el prompt va al proveedor LLM — sumidero.
-        if self.labels {
-            self.sink_check("analyze", &[&d], loc)?;
-        }
+        // v0.6.46 (E5): el gate de datos (PC, techo `llm=P@…`) antes que la capability; el prompt
+        // lleva el dato sin redactar y la respuesta sale con su etiqueta.
+        let lab = self.llm_data_gate("analyze", false, &[&d], loc)?;
+        self.check_llm_cap()?;
+        let d = if lab.is_empty() { d } else { labels::strip_deep(&d) };
         match self.llm_callback.clone() {
             Some(cb) => {
                 let prompt = format!("Analyze for {}: {}", objective, d);
-                { let out = cb("analyze", &prompt); self.record_llm("analyze", &prompt, &out); Ok(syn_text(out)) }
+                self.llm_text_call(&cb, "analyze", &prompt, &lab, loc)
             }
             None => {
                 note_llm_offline();
-                Ok(syn_text(format!("[analysis of: {}]", objective)))
+                Ok(Self::llm_out(&lab, syn_text(format!("[analysis of: {}]", objective))))
             }
         }
     }
@@ -5184,7 +5741,6 @@ impl Interpreter {
         let loc = &node.location;
         let NodeKind::DecideExpression { options, given, .. } = &node.kind else { unreachable!("exec_decide_expression: otro nodo") };
         {
-        self.check_llm_cap()?;
         let opts = match options {
             Some(o) => self.exec(o, env)?,
             None => SynValue::Nothing,
@@ -5193,18 +5749,27 @@ impl Interpreter {
             Some(g) => self.exec(g, env)?,
             None => SynValue::Nothing,
         };
-        // T5 (B7): el prompt va al proveedor LLM — sumidero.
-        if self.labels {
-            self.sink_check("decide", &[&opts, &giv], loc)?;
-        }
         // v0.6.26 — `SYNSEMA_JUDGE_DECIDE`: el juez contesta con una de TUS opciones,
         // calibrado y sin normalización ni reintento. Si no aplica o no está disponible,
         // sigue el camino LLM de siempre.
-        if self.decide_via_judge {
-            if let Some(chosen) = self.decide_with_judge(&opts, &giv, loc)? {
-                return Ok(chosen);
+        // v0.6.46 (E5): ese camino se chequea contra el techo del JUEZ (`judge=P@…`).
+        let mut llm_checked = false;
+        if self.decide_via_judge && self.judge_callback.is_some() {
+            let lab = self.llm_data_gate("decide", true, &[&opts, &giv], loc)?;
+            self.check_llm_cap()?;
+            llm_checked = true;
+            let (o, g) = if lab.is_empty() { (opts.clone(), giv.clone()) } else { (labels::strip_deep(&opts), labels::strip_deep(&giv)) };
+            if let Some((chosen, prompt)) = self.decide_with_judge(&o, &g, loc)? {
+                let c = chosen.to_string();
+                self.record_llm("decide", &prompt, &c, !lab.is_empty());
+                return Ok(Self::llm_out(&lab, chosen));
             }
         }
+        let lab = self.llm_data_gate("decide", false, &[&opts, &giv], loc)?;
+        if !llm_checked {
+            self.check_llm_cap()?;
+        }
+        let (opts, giv) = if lab.is_empty() { (opts, giv) } else { (labels::strip_deep(&opts), labels::strip_deep(&giv)) };
         let prompt = format!("Decide between {} given {}", opts, giv);
         // Camino dedicado (DE-039): las opciones viajan ESTRUCTURADAS al motor,
         // que fuerza la elección por tool/enum + normaliza + reintenta. Sólo si
@@ -5214,13 +5779,15 @@ impl Interpreter {
                 SynValue::List(l) => list_values(&l).iter().map(|v| v.to_string()).collect(),
                 _ => Vec::new(),
             };
-            return Ok(syn_text(cb(&prompt, &opt_list)));
+            let out = cb(&prompt, &opt_list);
+            self.record_llm("decide", &prompt, &out, !lab.is_empty());
+            return Ok(Self::llm_out(&lab, syn_text(out)));
         }
         match self.llm_callback.clone() {
-            Some(cb) => { let out = cb("decide", &prompt); self.record_llm("decide", &prompt, &out); Ok(syn_text(out)) },
+            Some(cb) => self.llm_text_call(&cb, "decide", &prompt, &lab, loc),
             None => {
                 note_llm_offline();
-                Ok(syn_text("[decision pending]"))
+                Ok(Self::llm_out(&lab, syn_text("[decision pending]")))
             }
         }
     }
@@ -5313,7 +5880,6 @@ impl Interpreter {
         let loc = &node.location;
         let NodeKind::GenerateExpression { target, given, parameters } = &node.kind else { unreachable!("exec_generate_expression: otro nodo") };
         {
-        self.check_llm_cap()?;
         // Evaluá given/parameters y armalos para el prompt (el LLM los necesita,
         // no sólo el target).
         let giv = match given {
@@ -5324,15 +5890,21 @@ impl Interpreter {
         for (name, v) in parameters {
             param_vals.push((name, self.exec(v, env)?));
         }
-        // T5 (B7): el prompt va al proveedor LLM — sumidero.
-        if self.labels {
+        // v0.6.46 (E5): gate de datos, después la capability; el prompt sin redactar.
+        let lab = {
             let mut refs: Vec<&SynValue> = Vec::new();
             if let Some(g) = &giv {
                 refs.push(g);
             }
             refs.extend(param_vals.iter().map(|(_, v)| v));
-            self.sink_check("generate", &refs, loc)?;
-        }
+            self.llm_data_gate("generate", false, &refs, loc)?
+        };
+        self.check_llm_cap()?;
+        let (giv, param_vals) = if lab.is_empty() {
+            (giv, param_vals)
+        } else {
+            (giv.map(|g| labels::strip_deep(&g)), param_vals.into_iter().map(|(n, v)| (n, labels::strip_deep(&v))).collect())
+        };
         let param_parts: Vec<String> =
             param_vals.iter().map(|(name, v)| format!("{}={}", name, v)).collect();
         match self.llm_callback.clone() {
@@ -5344,11 +5916,11 @@ impl Interpreter {
                 if !param_parts.is_empty() {
                     prompt.push_str(&format!(" with {}", param_parts.join(", ")));
                 }
-                { let out = cb("generate", &prompt); self.record_llm("generate", &prompt, &out); Ok(syn_text(out)) }
+                self.llm_text_call(&cb, "generate", &prompt, &lab, loc)
             }
             None => {
                 note_llm_offline();
-                Ok(syn_text(format!("[generated: {}]", target)))
+                Ok(Self::llm_out(&lab, syn_text(format!("[generated: {}]", target))))
             }
         }
     }
@@ -5403,14 +5975,15 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
             answer_to_value, is_valid_state, options_from_value, syn_to_json,
             validate_question, JudgeQuestion, JudgeRequest,
         };
-        self.check_judge_cap()?;
         let st = self.exec(state, env)?;
-        if !is_valid_state(&st) {
+        // v0.6.46 (E5): un estado privado se valida por lo que lleva adentro (llega al juez si el
+        // techo lo permite).
+        if !is_valid_state(labels::unwrap(&st)) {
             return Err(err_at(
                 format!(
                     "judge: the state must be a text, a map or a list (got {}); the model reads \
                      text, so wrap it with text() if you mean its rendering",
-                    st.type_name()
+                    labels::unwrap(&st).type_name()
                 ),
                 loc,
             ));
@@ -5458,12 +6031,21 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
         // T5: el `state` y las instrucciones cruzan a un tercero — sumidero declarado,
         // igual que `decide`. La respuesta al borde filoso nº 6 del vendor: el contenido
         // adversario entra como dato y el motor sabe que ese dato salió del proceso.
-        if self.labels {
+        // v0.6.46 (E5): con `judge=P@…` en el techo, el dato privado llega al juez sin redactar
+        // (gate de datos antes que la capability) y las respuestas salen con su etiqueta.
+        let lab = {
             let refs: Vec<&SynValue> = crossing.iter().collect();
-            self.sink_check("judge", &refs, loc)?;
+            self.llm_data_gate("judge", true, &refs, loc)?
+        };
+        self.check_judge_cap()?;
+        if !lab.is_empty() {
+            for (q, v) in qs.iter_mut().zip(crossing.iter().skip(1)) {
+                q.instruction = syn_to_json(&labels::strip_deep(v));
+            }
         }
+        let state_json = if lab.is_empty() { syn_to_json(&st) } else { syn_to_json(&labels::strip_deep(&st)) };
         let req = JudgeRequest {
-            state: syn_to_json(&st),
+            state: state_json,
             questions: qs,
         };
         let response = match self.judge_callback.clone() {
@@ -5473,6 +6055,11 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                 None
             }
         };
+        if let Some(r) = &response {
+            let prompt = serde_json::json!({"state": &req.state, "questions": req.questions.iter().map(|q| &q.instruction).collect::<Vec<_>>()}).to_string();
+            let answers = format!("{:?}", r.answers);
+            self.record_llm("judge", &prompt, &answers, !lab.is_empty());
+        }
         // Map plano id → respuesta, en el orden del bloque. Sin metadatos mezclados:
         // una pregunta llamada `usage` no colisiona con nada.
         let mut out: SynMap = SynMap::new();
@@ -5480,7 +6067,7 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
             let a = response.as_ref().and_then(|r| r.answers.get(i));
             out.insert(q.id.clone(), answer_to_value(q, a));
         }
-        Ok(syn_map(out))
+        Ok(Self::llm_out(&lab, syn_map(out)))
     }
     }
 
@@ -5568,7 +6155,6 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
         let loc = &node.location;
         let NodeKind::ReasonExpression { subject, context, .. } = &node.kind else { unreachable!("exec_reason_expression: otro nodo") };
         {
-        self.check_llm_cap()?;
         let subj = match subject {
             Some(s) => self.exec(s, env)?,
             None => SynValue::Nothing,
@@ -5579,12 +6165,18 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
         for (name, v) in context {
             ctx_vals.push((name, self.exec(v, env)?));
         }
-        // T5 (B7): el prompt va al proveedor LLM — sumidero.
-        if self.labels {
+        // v0.6.46 (E5): gate de datos, después la capability; el prompt sin redactar.
+        let lab = {
             let mut refs: Vec<&SynValue> = vec![&subj];
             refs.extend(ctx_vals.iter().map(|(_, v)| v));
-            self.sink_check("reason", &refs, loc)?;
-        }
+            self.llm_data_gate("reason", false, &refs, loc)?
+        };
+        self.check_llm_cap()?;
+        let (subj, ctx_vals) = if lab.is_empty() {
+            (subj, ctx_vals)
+        } else {
+            (labels::strip_deep(&subj), ctx_vals.into_iter().map(|(n, v)| (n, labels::strip_deep(&v))).collect())
+        };
         let ctx_parts: Vec<String> =
             ctx_vals.iter().map(|(name, v)| format!("{}={}", name, v)).collect();
         match self.llm_callback.clone() {
@@ -5594,11 +6186,11 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                 } else {
                     format!("Reason about: {} (context: {})", subj, ctx_parts.join(", "))
                 };
-                { let out = cb("reason", &prompt); self.record_llm("reason", &prompt, &out); Ok(syn_text(out)) }
+                self.llm_text_call(&cb, "reason", &prompt, &lab, loc)
             }
             None => {
                 note_llm_offline();
-                Ok(syn_text(format!("[reasoning about: {}]", subj)))
+                Ok(Self::llm_out(&lab, syn_text(format!("[reasoning about: {}]", subj))))
             }
         }
     }
@@ -5607,7 +6199,7 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
     #[inline(never)]
     fn exec_require_statement(&mut self, node: &Node, env: &Rc<RefCell<Environment>>) -> Result<SynValue, Control> {
         let loc = &node.location;
-        let NodeKind::RequireStatement { capability, scope } = &node.kind else { unreachable!("exec_require_statement: otro nodo") };
+        let NodeKind::RequireStatement { capability, scope, bound_to } = &node.kind else { unreachable!("exec_require_statement: otro nodo") };
         {
         // El scope se evalúa a su str (igual que el oráculo: str(eval(scope))).
         let scope_v = match scope {
@@ -5633,7 +6225,10 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                 loc.clone(),
             )));
         }
-        let scope_val = scope_v.map(|v| v.to_string());
+        let mut scope_val = scope_v.map(|v| v.to_string());
+        if let (Some(hosts), Some(name)) = (bound_to, scope_val.as_deref()) {
+            scope_val = Some(self.bound_secret_scope(name, hosts, env, loc)?);
+        }
         // Dentro de un `sandbox` o del cuerpo de una tool (`call_tool`) NO se
         // conceden capabilities: un `require` ahí es no-op. Si no, se podría
         // re-grantear para escapar del aislamiento / del least-privilege por-tool
@@ -5656,6 +6251,50 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
         }
         Ok(SynValue::Nothing)
     }
+    }
+
+    /// v0.6.46 (E1): el scope de `require secret("K") for net("h1"), net("h2")` como lo lee el
+    /// modelo de capabilities: `K@h1|h2` (la misma forma que el techo `--cap-set secret=K@h`).
+    /// Cada host se normaliza como un scope de `net` y sigue la gramática de una atadura.
+    #[cold]
+    #[inline(never)]
+    fn bound_secret_scope(
+        &mut self,
+        name: &str,
+        hosts: &[Node],
+        env: &Rc<RefCell<Environment>>,
+        loc: &SourceLocation,
+    ) -> Result<String, Control> {
+        if name.is_empty() || name.contains('@') || name.contains('|') {
+            return Err(err_at(
+                format!("require secret({:?}) for net(...): the name of a bound secret cannot be empty or contain '@' or '|'", name),
+                loc,
+            ));
+        }
+        let mut out: Vec<String> = Vec::with_capacity(hosts.len());
+        for h in hosts {
+            let v = self.exec(h, env)?;
+            if self.labels && !labels::label_deep(&v).is_empty() {
+                return Err(Control::Error(RuntimeError::labels(
+                    format!("label_violation: the host of `require secret({:?}) for net(...)` is private; where a secret may go cannot depend on private data", name),
+                    loc.clone(),
+                )));
+            }
+            let SynValue::Text(t) = &v else {
+                return Err(err_at(
+                    format!("require secret({:?}) for net(...): the host must be text, got {}", name, v.type_name()),
+                    loc,
+                ));
+            };
+            let host = crate::capscope::net_host_scope(t);
+            if let Some(e) = crate::capscope::bound_host_error(&host) {
+                return Err(err_at(format!("require secret({:?}) for net(...): {}", name, e), loc));
+            }
+            if !out.contains(&host) {
+                out.push(host);
+            }
+        }
+        Ok(format!("{}@{}", name, out.join("|")))
     }
 
     #[inline(never)]
@@ -5915,6 +6554,9 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
     fn exec_spawn_statement(&mut self, node: &Node, env: &Rc<RefCell<Environment>>) -> Result<SynValue, Control> {
         let loc = &node.location;
         let NodeKind::SpawnStatement { agent_name, arguments } = &node.kind else { unreachable!("exec_spawn_statement: otro nodo") };
+        if self.trusted_depth > 0 {
+            return Err(err_at(trusted_no_agents(agent_name), loc));
+        }
         {
         let def = match self.agent_definitions.get(agent_name) {
             Some(d) => (d.0.clone(), d.1.clone()),
@@ -6001,7 +6643,7 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
         // (R2.5); con `require`, el cuerpo limpio se arma acá.
         let has_requires = body.iter().any(|s| matches!(s.kind, NodeKind::RequireStatement { .. }));
         for stmt in body.iter() {
-            if let NodeKind::RequireStatement { capability, scope } = &stmt.kind {
+            if let NodeKind::RequireStatement { capability, scope, bound_to } = &stmt.kind {
                 let scope_v = match scope {
                     Some(s) => Some(self.exec(s, env)?),
                     None => None,
@@ -6021,7 +6663,11 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                         stmt.location.clone(),
                     )));
                 }
-                required_caps.push((capability.clone(), scope_v.map(|v| v.to_string())));
+                let mut scope_s = scope_v.map(|v| v.to_string());
+                if let (Some(hosts), Some(n)) = (bound_to, scope_s.as_deref()) {
+                    scope_s = Some(self.bound_secret_scope(n, hosts, env, &stmt.location)?);
+                }
+                required_caps.push((capability.clone(), scope_s));
             } else if has_requires {
                 clean_body.push(stmt.clone());
             }
@@ -6461,6 +7107,27 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
         // Python (`xs={xs}` → "xs=[1, 2]"). Un secret sigue por `+` (queda secret y redactado).
         let op = if op == BinOp::InterpConcat {
             if !matches!(right, SynValue::Text(_) | SynValue::Secret(_)) {
+                // v0.6.46 (E2): una lista o un mapa con un secret adentro saldría como
+                // `{k: secret(K)}`, texto común que puede terminar en un header o una URL. Sólo en
+                // contenedores (un hueco escalar no paga nada nuevo), y sin recorrerlos: el `Display`
+                // ya los recorre y cuenta cada marcador que escribe. El error se arma aparte (frío).
+                // Ronda 1: también un valor de servidor (`ok(xs)` se imprime con lo que lleva).
+                if matches!(right, SynValue::List(_) | SynValue::Map(_) | SynValue::Server(_)) {
+                    let before = crate::secret::placeholders_written();
+                    let hole = match &left {
+                        SynValue::Text(l) => Some((true, format!("{}{}", l, right))),
+                        SynValue::Secret(_) => Some((false, right.to_string())),
+                        _ => None,
+                    };
+                    if crate::secret::placeholders_written() != before {
+                        return Err(secret_in_hole_error(&right, loc));
+                    }
+                    match hole {
+                        Some((true, s)) => return Ok(syn_text(s)),
+                        Some((false, h)) => return secret_concat(&left, &syn_text(h), loc),
+                        None => {}
+                    }
+                }
                 match &left {
                     SynValue::Text(l) => return Ok(syn_text(format!("{}{}", l, right))),
                     // v0.6.44 (auditoría A2): después de un hueco con un secret lo acumulado es un
@@ -7280,9 +7947,30 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                 }
             }
             self.arg_literals = mask;
+            // v0.6.46 (E4): como en el `TaskCall`.
+            if matches!(name.as_identifier(), Some("declassify" | "private")) {
+                return self.call_label_builtin_by_name(func, &mut args, loc);
+            }
         }
-        check_call_arity(&func, &args, loc)?;
+        if let Err(e) = check_call_arity(&func, &args, loc) {
+            return Err(arity_error(e, &func, &args, loc));
+        }
         self.call_value_named(func, &mut args, loc)
+    }
+
+    /// v0.6.46 (E4): la llamada a `declassify`/`private` por su nombre, con la marca armada sólo
+    /// mientras dura el despacho (los argumentos ya están evaluados: una llamada anidada en ellos,
+    /// `declassify(g(x), "m")` con `g` alias, no la ve). Frío: no agranda el `TaskCall`.
+    #[cold]
+    #[inline(never)]
+    fn call_label_builtin_by_name(&mut self, func: SynValue, args: &mut CallArgs, loc: &SourceLocation) -> Result<SynValue, Control> {
+        if let Err(e) = check_call_arity(&func, args, loc) {
+            return Err(arity_error(e, &func, args, loc));
+        }
+        self.label_call_armed = true;
+        let out = self.call_value_named(func, args, loc);
+        self.label_call_armed = false;
+        out
     }
 
     /// Llamada con args sólo posicionales (camino de siempre: pipes, apply/where,
@@ -7361,12 +8049,7 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                                             }
                                             slots[idx] = Some(value);
                                         }
-                                        None => {
-                                            return Err(err_at(
-                                                format!("unknown parameter '{}'", n),
-                                                loc,
-                                            ))
-                                        }
+                                        None => return Err(unknown_parameter(&n, names.iter().copied(), loc)),
                                     }
                                 }
                             }
@@ -7396,6 +8079,12 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                 }
             }
             SynValue::Task(task) => {
+                // Ronda 2: dentro de una tool de confianza sólo corre código de la tool. Por acá entra
+                // toda llamada a una task (por nombre, desde un builtin, un template o un callback
+                // guardado), así que un camino nuevo no reabre el agujero. Sin `--trusted`, una lectura.
+                if self.trusted_depth > 0 {
+                    self.check_trusted_origin(&task, loc)?;
+                }
                 let call_env = self.acquire_frame(&task.closure_env, "call");
                 let nparams = task.parameters.len();
                 if args.iter().all(|(n, _)| n.is_none()) {
@@ -7449,7 +8138,7 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                                         slots[idx] = Some(value);
                                     }
                                     None => {
-                                        return Err(err_at(format!("unknown parameter '{}'", n), loc))
+                                        return Err(unknown_parameter(&n, task.parameters.iter().map(|p| &*p.name), loc))
                                     }
                                 }
                             }
@@ -8376,7 +9065,23 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                     .collect();
                 Ok(syn_list(items))
             }
-            other => Err(err(format!("enumerate() requires a list, got {}", other.type_name()))),
+            // v0.6.46 (C1): un array por su primer eje, como `length(a)` y `a[i]` (y `apply`, que ya
+            // lo acepta): cada `item` es un número (1-D) o la fila (un array de una dimensión menos).
+            SynValue::Array(a) if a.ndim() == 0 => {
+                Err(err("enumerate() of a 0-d array: it is a scalar and has no rows — use to_list(a) or the value itself"))
+            }
+            SynValue::Array(a) => {
+                let items = (0..a.shape()[0])
+                    .map(|i| {
+                        let mut m = SynMap::new();
+                        m.insert("index", syn_int(i as i64));
+                        m.insert("item", crate::arrays::index_row(&a, i as i64)?);
+                        Ok(syn_map(m))
+                    })
+                    .collect::<Result<Vec<_>, Control>>()?;
+                Ok(syn_list(items))
+            }
+            other => Err(err(format!("enumerate() requires a list or an array, got {}", other.type_name()))),
         }
     }
 
@@ -8543,8 +9248,12 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
     /// etiquetas apagadas es un error claro: el programa está escrito para `--labels`.
     fn b_private(&mut self, args: &[SynValue], loc: &SourceLocation) -> Result<SynValue, Control> {
         let literals = self.arg_literals;
+        let by_name = std::mem::take(&mut self.label_call_armed);
         if !self.labels {
             return Err(err_labels("private: labels are off; run with --labels or serve --attested", loc));
+        }
+        if !by_name {
+            return Err(not_called_by_name("private", "private(v, \"owner\")", loc));
         }
         if args.len() != 2 {
             return Err(err_labels(
@@ -8583,6 +9292,10 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
     /// Es la identidad; el motivo se valida igual (es parte del programa, no del modo).
     fn b_declassify(&mut self, args: &[SynValue], loc: &SourceLocation) -> Result<SynValue, Control> {
         let literals = self.arg_literals;
+        let by_name = std::mem::take(&mut self.label_call_armed);
+        if self.labels && !by_name {
+            return Err(not_called_by_name("declassify", "declassify(v, \"why\")", loc));
+        }
         if args.len() < 2 || args.len() > 3 {
             return Err(err_labels(
                 format!("declassify: expects 2 or 3 arguments (value, reason, to?), got {}", args.len()),
@@ -8635,13 +9348,27 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                 loc,
             ));
         }
+        // v0.6.46 (E3): publicar es una capability. Se chequea lo que la llamada quita, y si no
+        // está concedido es `label_violation` fatal: que pase o no depende de la etiqueta real
+        // (de qué valor se eligió), así que no se puede atrapar (un bit por corrida, el límite de
+        // `labels.md`) y el mensaje nombra el conjunto declarado, nunca el real.
+        if let Some(hook) = &self.declassify_cap_hook {
+            let removed = labels::difference(&from, &to);
+            if !removed.is_empty() && !hook(&removed[..], &self.safe_label(&from)) {
+                return Err(declassify_not_granted(&self.safe_label(&from), loc));
+            }
+        }
         // T5 (ronda 7) — el `from` que sale al log NO es la etiqueta de ESTE valor. Varía con
         // cuál se seleccionó, igual que la redacción: `declassify(xs[idx_privado], …)` daba
         // `from [app,p0]` o `from [app,p1]` según el índice, o sea el rastro de auditoría
         // publicaba el dato que el `declassify` estaba documentando. Sale el conjunto DECLARADO,
         // constante. El `to` sí es de la etiqueta real: es el literal escrito en ESTE sitio, que
         // no depende del valor. La revisión de verdad es `code check --json`, que es estática.
-        if let Some(hook) = &self.log_hook {
+        // v0.6.46 (E6.8): dentro de una rama privada la línea no sale. Cuántas líneas hubo decía
+        // qué rama se tomó o cuántas vueltas dio un bucle privado, como las entradas de audit
+        // (ronda 4, M5). La entrada queda en el registro interno, marcada.
+        let under_private_pc = self.pc_is_private();
+        if let (Some(hook), false) = (&self.log_hook, under_private_pc) {
             hook(&format!(
                 "[INF] declassify: {} (from [{}] to [{}]) at {}:{}",
                 reason,
@@ -8651,7 +9378,13 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                 loc.line
             ));
         }
-        self.declassify_log.push(DeclassifyEntry { reason, from: from.clone(), to: to.clone(), loc: loc.clone() });
+        self.declassify_log.push(DeclassifyEntry {
+            reason,
+            from: from.clone(),
+            to: to.clone(),
+            loc: loc.clone(),
+            under_private_pc,
+        });
         self.note_seen(&from);
         Ok(labels::mark(labels::strip_deep(v), to))
     }
@@ -8870,7 +9603,9 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
     /// Sólo actúa en `run` interactivo (`live_output`); bajo `conform`/`test`/`serve` es
     /// no-op → la salida queda en `output` y entra al JSON/respuesta (DE-019).
     fn b_flush(&mut self) -> Result<SynValue, Control> {
-        if self.live_output {
+        // v0.6.46: con etiquetas no se vacía (como `emit_line`, que no transmite): `redact_output_for_host`
+        // tiene que poder retener todo, y un `flush` en una rama privada diría cuántas líneas salieron.
+        if self.live_output && !self.labels {
             self.drain_output();
         }
         Ok(SynValue::Nothing)
@@ -8879,13 +9614,14 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
     /// newline antes de leer. Devuelve el texto sin el `\n`/`\r\n` final; `nothing` en EOF.
     /// Lee stdin crudo → funciona con TTY y con entrada redirigida/pipe (a diferencia de
     /// `ask`, que es un backend de decisión humana).
-    fn b_read_line(&mut self, args: &[SynValue], _loc: &SourceLocation) -> Result<SynValue, Control> {
+    fn b_read_line(&mut self, args: &[SynValue], loc: &SourceLocation) -> Result<SynValue, Control> {
         use std::io::Write;
         // Drena la salida pendiente (respuesta del turno previo) ANTES del prompt, para
         // que un REPL sea interactivo de verdad (DE-018) sin requerir flush() explícito.
         // Sólo en `run` interactivo; bajo conform/test/serve no se drena (DE-019). La
-        // LECTURA de stdin se hace igual en cualquier modo.
-        if self.live_output {
+        // LECTURA de stdin se hace igual en cualquier modo. v0.6.46: con etiquetas tampoco (ver
+        // `b_flush`): vaciar dentro de una rama privada diría cuántas líneas salieron antes.
+        if self.live_output && !self.labels {
             self.drain_output();
         }
         if let Some(p) = args.first() {
@@ -8893,8 +9629,19 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                 // El prompt ES salida: bajo un techo sin `stdout` no debe escaparse por acá
                 // (print/show/log ya lo chequean; read_line era el único hueco).
                 self.ensure_stdout()?;
-                print!("{}", raw_str(p));
-                let _ = std::io::stdout().flush();
+                // v0.6.46: y es un sumidero público como `print`. `read_line` es puro para las
+                // etiquetas, así que el despacho genérico ya empujó al PC la etiqueta del prompt:
+                // este chequeo cubre un prompt privado y uno dentro de una rama privada. Leer sin
+                // prompt en una rama privada sigue permitido.
+                self.stdout_flow_check("read_line prompt", loc)?;
+                if !self.live_output && crate::sealed::active() {
+                    // v0.6.46 (E6): con auditor nada sale antes del recibo; el prompt se junta como
+                    // cualquier salida.
+                    self.output.push(raw_str(p).to_string());
+                } else {
+                    print!("{}", raw_str(p));
+                    let _ = std::io::stdout().flush();
+                }
             }
         }
         let mut line = String::new();
@@ -9110,6 +9857,12 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                 ))
             }
         };
+        // v0.6.46 (F1): la frontera valida los tipos declarados.
+        if let SynValue::Task(t) = &func {
+            if t.parameters.iter().any(|p| p.ty.is_some()) {
+                check_typed_args("call", t, &named, loc)?;
+            }
+        }
         self.call_value_named(func, &mut named, loc)
     }
 
@@ -9133,6 +9886,12 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                 ))
             }
         };
+        // v0.6.46 (F1): la frontera valida los tipos declarados, antes de entrar al scope.
+        if let SynValue::Task(t) = &func {
+            if t.parameters.iter().any(|p| p.ty.is_some()) {
+                check_typed_args("call_tool", t, &named, loc)?;
+            }
+        }
         // Las caps que la tool declaró (vacío si no es una task o no declara ninguna).
         let declared: Vec<(String, Option<String>)> = match &func {
             SynValue::Task(t) => t.required_capabilities.clone(),
@@ -9160,17 +9919,44 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
     /// (lista de maps `{name, describe/description, params}`), llama el callback de
     /// paso (o un placeholder si no hay provider cableado) y devuelve un map
     /// `{kind:"final", text, tokens}` | `{kind:"tool", name, args:{…}, tokens}`.
-    fn b_llm_step(&mut self, args: &[SynValue], _loc: &SourceLocation) -> Result<SynValue, Control> {
+    ///
+    /// v0.6.46 (E5): consciente de etiquetas. Con algo privado en los argumentos (y el techo que lo
+    /// permite), el mapa sale etiquetado ENTERO: elegir una herramienta con `r.name` exige un
+    /// `declassify`, que tiene su propio techo. Es la propiedad de CaMeL.
+    fn b_llm_step(&mut self, args: &[SynValue], loc: &SourceLocation) -> Result<SynValue, Control> {
+        let lab = {
+            let refs: Vec<&SynValue> = args.iter().collect();
+            self.llm_data_gate("llm_step", false, &refs, loc)?
+        };
         self.check_llm_cap()?; // GATE por `llm` (mismo hook que reason/decide/…)
+        let stripped: Vec<SynValue>;
+        let args = if self.labels && args.iter().any(labels::has_label_deep) {
+            stripped = args.iter().map(labels::strip_deep).collect();
+            &stripped[..]
+        } else {
+            args
+        };
         let prompt = raw_str(nth(args, 0)?);
-        let catalog = parse_catalog(args.get(1));
+        let catalog = parse_catalog(args.get(1))?;
         let context = match args.get(2) {
             Some(SynValue::Text(s)) => s.to_string(),
             Some(SynValue::Nothing) | None => String::new(),
             Some(v) => v.to_string(),
         };
         let result = match &self.llm_step_callback {
-            Some(cb) => cb(&prompt, &catalog, &context),
+            Some(cb) => {
+                let r = cb(&prompt, &catalog, &context);
+                let out = match &r {
+                    StepResult::Final { text, .. } => text.clone(),
+                    StepResult::Tool { name, args, .. } => {
+                        // La misma vista `(clave, texto)` de antes de F1: el registro no cambia.
+                        let view: Vec<(&str, String)> = args.iter().map(|(k, v)| (k.as_str(), raw_str(v))).collect();
+                        format!("{}{:?}", name, view)
+                    }
+                };
+                self.record_llm("llm_step", &format!("{}\n{}", prompt, context), &out, !lab.is_empty());
+                r
+            }
             // Sin provider cableado (camino `run` normal): placeholder seguro. El
             // programa decide qué hacer; no inventa tool-calls.
             None => {
@@ -9178,7 +9964,7 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                 StepResult::Final { text: "[no llm provider]".to_string(), tokens: 0 }
             }
         };
-        Ok(step_result_to_synvalue(result))
+        Ok(Self::llm_out(&lab, step_result_to_synvalue(result)))
     }
 
     /// `llm_stream(prompt, context, on_chunk)` — genera con el provider configurado
@@ -9189,8 +9975,22 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
     /// `false` al provider) y el error PROPAGA — el stream se desenrolla exactamente
     /// como cualquier `send` fallido de serve. Sin provider cableado: placeholder
     /// `"[no llm provider]"` SIN invocar `on_chunk` (los placeholders no son respuestas).
+    ///
+    /// v0.6.46 (E5): consciente de etiquetas, como `llm_step`: cada fragmento que recibe `on_chunk`
+    /// y el texto completo llevan la etiqueta de lo que se le dio.
     fn b_llm_stream(&mut self, args: &[SynValue], loc: &SourceLocation) -> Result<SynValue, Control> {
+        let lab = {
+            let refs: Vec<&SynValue> = args.iter().collect();
+            self.llm_data_gate("llm_stream", false, &refs, loc)?
+        };
         self.check_llm_cap()?; // GATE por `llm` (mismo hook que reason/decide/…)
+        let stripped: Vec<SynValue>;
+        let args = if self.labels && args.iter().any(labels::has_label_deep) {
+            stripped = args.iter().map(labels::strip_deep).collect();
+            &stripped[..]
+        } else {
+            args
+        };
         let prompt = raw_str(nth(args, 0)?);
         let context = match args.get(1) {
             Some(SynValue::Text(s)) => s.to_string(),
@@ -9202,15 +10002,22 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
             Some(cb) => cb.clone(),
             None => {
                 note_llm_offline();
-                return Ok(syn_text("[no llm provider]"));
+                return Ok(Self::llm_out(&lab, syn_text("[no llm provider]")));
             }
         };
         // El sink invoca la task/lambda del usuario por chunk. Un error ahí no puede
         // atravesar el provider (la firma del sink es `-> bool`), así que se guarda acá
         // y el sink devuelve `false` → el provider corta; al volver, el error propaga.
         let mut chunk_err: Option<Control> = None;
+        // Ronda 1 (A3): con una respuesta privada el callback corre bajo su PC, como el cuerpo de un
+        // `each` sobre una lista privada: CUÁNTOS fragmentos hubo depende de la respuesta, y un
+        // efecto público por fragmento (`print("tick")`) deletreaba su largo.
+        let under = self.labels && !lab.is_empty();
+        if under {
+            self.pc_push(&lab);
+        }
         let full = cb(&prompt, &context, &mut |chunk: &str| {
-            match self.call_value(on_chunk.clone(), vec![syn_text(chunk)], loc) {
+            match self.call_value(on_chunk.clone(), vec![Self::llm_out(&lab, syn_text(chunk))], loc) {
                 Ok(_) => true,
                 Err(e) => {
                     chunk_err = Some(e);
@@ -9218,10 +10025,14 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                 }
             }
         });
+        if under {
+            self.pc_pop();
+        }
         if let Some(e) = chunk_err {
             return Err(e);
         }
-        Ok(syn_text(full))
+        self.record_llm("llm_stream", &format!("{}\n{}", prompt, context), &full, !lab.is_empty());
+        Ok(Self::llm_out(&lab, syn_text(full)))
     }
 
     fn b_where(&mut self, args: &[SynValue], loc: &SourceLocation) -> Result<SynValue, Control> {
@@ -9719,10 +10530,102 @@ pub fn check_protected_names(program: &Program) -> Result<(), Control> {
             }
         });
     }
+    if bad.is_none() {
+        // v0.6.46 (E4): y que `declassify`/`private` no se lean como valor.
+        check_label_builtin_values(program)?;
+    }
     match bad {
         Some((name, loc)) => Err(err_labels(
             format!(
                 "'{}' is a protected builtin and cannot be bound to something callable: the information-flow labels of the whole program are decided by these five builtins, so a program that redefines one could silently un-label its own sources and mislead the audit listing. Binding the name to a plain value (let {} be 5) is fine — it is a soft keyword. This holds with or without --labels, because the same program can be loaded by a host that turns them on",
+                name, name
+            ),
+            &loc,
+        )),
+        None => Ok(()),
+    }
+}
+
+/// v0.6.46 (E4): `declassify`/`private` llamados como valor (un alias, un contenedor, un parámetro,
+/// un valor devuelto) con las etiquetas encendidas.
+#[cold]
+#[inline(never)]
+fn not_called_by_name(name: &str, form: &str, loc: &SourceLocation) -> Control {
+    err_labels(
+        format!(
+            "{} can only be called by its name: `{}`; passing it as a value hides the call from the review (`synsema code check` lists every call by name)",
+            name, form
+        ),
+        loc,
+    )
+}
+
+/// v0.6.46 (E4, capa 2): `declassify`/`private` leídos como VALOR (no como el callee de una
+/// llamada) en un programa que no liga ese nombre en ningún lado son error de carga: es un alias
+/// del builtin (`let d be declassify`, `[declassify][0]`, `f(declassify, t)`). Si el programa liga
+/// el nombre (`let private be 5`, un parámetro, una variable de `each`, un patrón), al cargar no se
+/// sabe a qué se refiere cada lectura sin un análisis de alcance, y decide la marca en ejecución.
+fn check_label_builtin_values(program: &Program) -> Result<(), Control> {
+    const NAMES: [&str; 2] = ["declassify", "private"];
+    let mut bound = [false; 2];
+    let mut bind = |n: &str| {
+        if let Some(i) = NAMES.iter().position(|x| *x == n) {
+            bound[i] = true;
+        }
+    };
+    let mut callees: std::collections::HashSet<*const Node> = std::collections::HashSet::new();
+    let mut patterns: Vec<&Node> = Vec::new();
+    for stmt in &program.statements {
+        crate::ast_api::walk(stmt, &mut |n| match &n.kind {
+            NodeKind::TaskCall { name, .. } => {
+                callees.insert(&**name as *const Node);
+            }
+            NodeKind::LetBinding { name, .. } => bind(name),
+            NodeKind::TaskDefinition { parameters, .. } => parameters.iter().for_each(|p| bind(&p.name)),
+            NodeKind::LambdaExpression { parameters, .. } => parameters.iter().for_each(|p| bind(p)),
+            NodeKind::EachStatement { variable, .. } => bind(variable),
+            NodeKind::ObserveStatement { variable, .. } => bind(variable),
+            NodeKind::WaitForStatement { variable: Some(v), .. } => bind(v),
+            NodeKind::TryRecover { error_variable, .. } => bind(error_variable),
+            NodeKind::RouteDefinition { param_names, .. } => param_names.iter().for_each(|p| bind(p)),
+            NodeKind::UseImport { alias, .. } => bind(alias),
+            NodeKind::ListPattern { rest: Some(Some(r)), .. } => bind(r),
+            NodeKind::MapPattern { fields } => fields.iter().filter(|(_, sub)| sub.is_none()).for_each(|(k, _)| bind(k)),
+            NodeKind::MatchArm { pattern, .. } => patterns.push(pattern),
+            _ => {}
+        });
+    }
+    // Un identificador en un patrón liga (`is private`), no lee.
+    let mut in_pattern: std::collections::HashSet<*const Node> = std::collections::HashSet::new();
+    for p in patterns {
+        crate::ast_api::walk(p, &mut |n| {
+            if let NodeKind::Identifier { name } = &n.kind {
+                bind(name);
+                in_pattern.insert(n as *const Node);
+            }
+        });
+    }
+    if bound.iter().all(|b| *b) {
+        return Ok(());
+    }
+    let mut bad: Option<(&str, SourceLocation)> = None;
+    for stmt in &program.statements {
+        crate::ast_api::walk(stmt, &mut |n| {
+            if bad.is_some() {
+                return;
+            }
+            let NodeKind::Identifier { name } = &n.kind else { return };
+            let Some(i) = NAMES.iter().position(|x| *x == name.as_str()) else { return };
+            let p = n as *const Node;
+            if !bound[i] && !callees.contains(&p) && !in_pattern.contains(&p) {
+                bad = Some((NAMES[i], n.location.clone()));
+            }
+        });
+    }
+    match bad {
+        Some((name, loc)) => Err(err_labels(
+            format!(
+                "'{}' is read as a value here (an alias, a list or map entry, an argument): it can only be called by its name, `{}(…)`, so that every call is in the review (`synsema code check`)",
                 name, name
             ),
             &loc,
@@ -9924,12 +10827,13 @@ fn is_callable(v: &SynValue) -> bool {
 }
 
 /// Parsea el catálogo de tools que el programa pasa a `llm_step`: una lista de maps
-/// `{name, describe|description, params}`. Items mal formados (sin `name` texto) se
-/// saltan (robustez ante data del programa; no se inventa una tool sin nombre).
-fn parse_catalog(arg: Option<&SynValue>) -> Vec<StepCatalogEntry> {
+/// `{name, describe|description, params, optional}`. Items mal formados (sin `name` texto) se
+/// saltan (robustez ante data del programa; no se inventa una tool sin nombre). v0.6.46 (F1): un
+/// parámetro puede ser `"nombre: tipo"`; un tipo desconocido es un error (no un parámetro sin tipo).
+fn parse_catalog(arg: Option<&SynValue>) -> Result<Vec<StepCatalogEntry>, Control> {
     let list = match arg {
         Some(SynValue::List(l)) => l,
-        _ => return Vec::new(),
+        _ => return Ok(Vec::new()),
     };
     let mut out = Vec::new();
     for item in list_values(&list).iter() {
@@ -9946,19 +10850,87 @@ fn parse_catalog(arg: Option<&SynValue>) -> Vec<StepCatalogEntry> {
             Some(SynValue::Text(s)) => s.to_string(),
             _ => String::new(),
         };
-        let params = match m.get("params") {
-            Some(SynValue::List(pl)) => list_values(&pl)
+        let mut params = Vec::new();
+        let mut types = Vec::new();
+        if let Some(SynValue::List(pl)) = m.get("params") {
+            for p in list_values(&pl).iter() {
+                let SynValue::Text(s) = p else { continue };
+                match s.split_once(':') {
+                    Some((n, t)) => match crate::ast::ParamType::parse(t.trim()) {
+                        Some(ty) => {
+                            params.push(n.trim().to_string());
+                            types.push(Some(ty));
+                        }
+                        None => return Err(catalog_type_error(&name, s)),
+                    },
+                    None => {
+                        params.push(s.to_string());
+                        types.push(None);
+                    }
+                }
+            }
+        }
+        let optional = match m.get("optional") {
+            Some(SynValue::List(ol)) => list_values(&ol)
                 .iter()
-                .filter_map(|p| match p {
+                .filter_map(|o| match o {
                     SynValue::Text(s) => Some(s.to_string()),
                     _ => None,
                 })
                 .collect(),
             _ => Vec::new(),
         };
-        out.push(StepCatalogEntry { name, description, params });
+        out.push(StepCatalogEntry { name, description, params, types, optional });
     }
-    out
+    Ok(out)
+}
+
+#[cold]
+#[inline(never)]
+fn catalog_type_error(tool: &str, param: &str) -> Control {
+    err(format!(
+        "llm_step: tool '{}' declares the parameter '{}' with an unknown type: the types are {}",
+        tool,
+        param,
+        crate::ast::ParamType::ALL
+    ))
+}
+
+/// v0.6.46 (F1): `call`/`call_tool` reciben los argumentos como un mapa de datos (de un modelo, de un
+/// JSON): ahí se validan los tipos declarados, estrictos y sin conversiones. Sólo corre si la task
+/// declara alguno; una llamada normal no pasa por acá. Un parámetro tipado sin default que no llegó
+/// es un error (`call` liga a `nothing` lo que falta: el esquema dice que es obligatorio).
+#[cold]
+#[inline(never)]
+fn check_typed_args(op: &str, t: &SynTaskValue, named: &CallArgs, loc: &SourceLocation) -> Result<(), Control> {
+    for p in t.parameters.iter() {
+        let Some(ty) = p.ty else { continue };
+        let Some((_, v)) = named.iter().find(|(k, _)| k.as_deref() == Some(&*p.name)) else {
+            if p.default.is_none() {
+                return Err(err_at(format!("{}({}): missing '{}' ({})", op, t.name, p.name, ty.name()), loc));
+            }
+            continue;
+        };
+        // v0.6.46 (ronda 1 de cf1, N4): `nothing` vale si es el default declarado (`t: text =
+        // nothing`): pasarlo a mano es lo mismo que no pasarlo.
+        if ty.accepts(v)
+            || (matches!(crate::labels::unwrap(v), SynValue::Nothing)
+                && p.default.as_ref().is_some_and(|d| matches!(d.kind, NodeKind::NothingLiteral)))
+        {
+            continue;
+        }
+        let got = crate::labels::unwrap(v).type_name();
+        let hint = if got == "text" {
+            " — a tool call from `llm_step` brings typed arguments only for the parameters the catalog types (`tool_spec(task, describe)` takes them from the signature)"
+        } else {
+            ""
+        };
+        return Err(err_at(
+            format!("{}({}): '{}' must be {}, got {}{}", op, t.name, p.name, ty.name(), got, hint),
+            loc,
+        ));
+    }
+    Ok(())
 }
 
 /// Convierte el `StepResult` del callback al map `{kind, …}` que consume el programa:
@@ -9974,7 +10946,7 @@ fn step_result_to_synvalue(result: StepResult) -> SynValue {
         StepResult::Tool { name, args, tokens } => {
             let mut amap = SynMap::new();
             for (k, v) in args {
-                amap.insert(k, syn_text(v));
+                amap.insert(k, v);
             }
             map.insert("kind", syn_text("tool"));
             map.insert("name", syn_text(name));
@@ -10133,7 +11105,148 @@ fn secret_concat(left: &SynValue, right: &SynValue, loc: &SourceLocation) -> Res
     let (lp, ln) = part(left, right)?;
     let (rp, rn) = part(right, left)?;
     let name = ln.or(rn).unwrap_or_else(|| "derived".to_string());
-    Ok(syn_secret(name, format!("{}{}", lp, rp)))
+    // v0.6.46 (E1): el resultado sólo puede ir adonde pueden ir los dos (intersección de las
+    // ataduras; atado + no atado = la del atado), recuerda el texto público que va antes del primer
+    // secret (de ahí sale el host de una URL secret) y de qué secrets se armó (audit y eco).
+    let sec = |v: &SynValue| match v {
+        SynValue::Secret(s) => Some(s.clone()),
+        _ => None,
+    };
+    let (sl, sr) = (sec(left), sec(right));
+    let bound: Option<std::sync::Arc<[String]>> = match (sl.as_ref().and_then(|s| s.bound()), sr.as_ref().and_then(|s| s.bound())) {
+        (Some(a), Some(b)) => {
+            let i = crate::capscope::intersect_bound(a, b);
+            if i.is_empty() {
+                let who = |s: &Option<crate::types::Obj<crate::secret::SecretInner>>| s.as_ref().map(|s| s.name().to_string()).unwrap_or_default();
+                return Err(err_at(
+                    format!(
+                        "Cannot add secret({}) and secret({}): the first may only go to [{}], the second only to [{}] — no request can carry both",
+                        who(&sl),
+                        who(&sr),
+                        a.join(", "),
+                        b.join(", ")
+                    ),
+                    loc,
+                ));
+            }
+            Some(i.into())
+        }
+        (Some(a), None) | (None, Some(a)) => Some(a.clone()),
+        (None, None) => None,
+    };
+    // El prefijo es texto público: se guarda también sin atadura, para que el error de un secret no
+    // atado en una URL nombre el host (`for net("api.example.com")`).
+    let public_prefix: Option<Box<str>> = match (&sl, &sr) {
+        (Some(s), _) => s.public_prefix().map(Box::from),
+        (None, Some(s)) => Some(format!("{}{}", lp, s.public_prefix().unwrap_or("")).into_boxed_str()),
+        (None, None) => None,
+    };
+    let mut parts: Vec<(String, String)> = Vec::new();
+    for s in [&sl, &sr].into_iter().flatten() {
+        parts.extend(s.atoms());
+    }
+    Ok(SynValue::Secret(crate::types::Obj::new(
+        crate::secret::SecretInner::new(name, format!("{}{}", lp, rp)).with_binding(bound, public_prefix, parts),
+    )))
+}
+
+/// v0.6.46 (E3b): la envoltura de una task exportada por un módulo de confianza. Entra al scope
+/// (lo que la task declaró ∩ el techo de confianza), la llama y sale, también por error. Los
+/// argumentos son datos: un callable adentro correría con las capabilities de la tool (el
+/// "confused deputy"), así que es error.
+fn trusted_wrapper(module: &str, export: &str, task: Rc<SynTaskValue>, hook: TrustedScopeHook) -> SynValue {
+    let module = module.to_string();
+    let label = format!("trusted:{}.{}", module, export);
+    let shown = label.clone();
+    let func: BuiltinFn = Rc::new(move |i: &mut Interpreter, args: &[SynValue], loc: &SourceLocation| {
+        if let Some(kind) = args.iter().find_map(callable_inside) {
+            return Err(err_at(
+                format!(
+                    "{}: a trusted tool takes data, not code — an argument holds a {}, which would run with the tool's capabilities; pass the values it needs instead",
+                    shown, kind
+                ),
+                loc,
+            ));
+        }
+        i.stdout_verdict = None;
+        hook(Some((&module, &task.required_capabilities)));
+        debug_assert!(!i.shortcuts, "a trusted scope opened with the VM on (it has no origin check)");
+        i.trusted_depth += 1;
+        let r = i.call_value(SynValue::Task(task.clone()), args.to_vec(), loc);
+        i.trusted_depth -= 1;
+        hook(None);
+        i.stdout_verdict = None;
+        r
+    });
+    SynValue::Builtin(Rc::new(BuiltinTask::new(label, -1, None, func)))
+}
+
+/// v0.6.46 (ronda 1, A1): un agente corre en otro intérprete, con los globales del programa, y la
+/// tabla de agentes es una sola por nombre (el programa pisaba el agente de la tool).
+#[cold]
+fn trusted_no_agents(name: &str) -> String {
+    format!(
+        "agent '{}': a trusted tool cannot define or spawn agents yet — the agent would run with the tool's capabilities next to the program's names; do the work in the tool's own tasks",
+        name
+    )
+}
+
+/// v0.6.46 (E3b): ¿hay un callable (task, lambda, builtin) en el valor, a cualquier profundidad?
+fn callable_inside(v: &SynValue) -> Option<&'static str> {
+    match labels::unwrap(v) {
+        SynValue::Task(_) => Some("task"),
+        SynValue::Builtin(_) => Some("builtin"),
+        SynValue::List(l) => list_values(l).iter().find_map(callable_inside),
+        SynValue::Map(m) => m.borrow().iter().find_map(|(_, x)| callable_inside(x)),
+        // Ronda 1 (B2): `ok(f)`, `content(f)` y `with_header(f, …)` también guardan un valor.
+        SynValue::Server(s) => match &**s {
+            crate::types::ServerValue::Envelope { value, .. } => callable_inside(value),
+            crate::types::ServerValue::Content(v) | crate::types::ServerValue::WithHeaders { inner: v, .. } => callable_inside(v),
+            crate::types::ServerValue::Node(m) => m.borrow().iter().find_map(|(_, x)| callable_inside(x)),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// v0.6.46 (E5): el host no permite que esta operación le mande al modelo lo privado que lleva.
+#[cold]
+#[inline(never)]
+fn llm_data_not_granted(op: &str, judge: bool, declared: &str, loc: &SourceLocation) -> Control {
+    let cap = if judge { "judge" } else { "llm" };
+    err_labels(
+        format!(
+            "label_violation: {op} would send data private to ({declared}) to the model; the host allows that per principal and provider in its ceiling (`--cap-set {cap}=<principal>@<provider host>`, `@local` for a model in the process, `@embedder` in wasm) and the program declares `require {cap}(\"<principal>\")`. Otherwise declassify(<that value>, \"<why the model may see it>\") the part the model may see"
+        ),
+        loc,
+    )
+}
+
+/// v0.6.46 (E3): el error de un `declassify` que el host no concede (frío, fuera de `b_declassify`).
+#[cold]
+fn declassify_not_granted(declared: &str, loc: &SourceLocation) -> Control {
+    err_labels(
+        format!(
+            "label_violation: declassify is not granted for what this value is private to ({}). With a ceiling the host names what a program may publish (`--cap-set declassify=<principal>`), and inside a `sandbox` only a `sandbox under` that delegates `declassify` allows it",
+            declared
+        ),
+        loc,
+    )
+}
+
+/// v0.6.46 (E2): el error de una lista o un mapa con un secret en el hueco de un template.
+#[cold]
+#[inline(never)]
+fn secret_in_hole_error(v: &SynValue, loc: &SourceLocation) -> Control {
+    let name = crate::secret::contains_secret(v).unwrap_or_default();
+    err_at(
+        format!(
+            "a secret inside a {} cannot go into a text hole (secret({}) would travel as its placeholder): take it out on its own (`creds.k`) or use bearer(...)/basic(...)",
+            v.type_name(),
+            name
+        ),
+        loc,
+    )
 }
 
 /// `str(value.raw)` estilo Python (texto crudo, no el Display de SynValue).
@@ -10206,6 +11319,60 @@ pub struct LineageEntry {
     /// comprometió ("jcs": `canonical_json([args…])`, "json", "text"). Sólo en `lineage()`: el
     /// recibo publica el compromiso, nunca la sal.
     pub salt: Option<(String, &'static str)>,
+    /// v0.6.46 (E1.7): los secrets que salieron en esa llamada (sus nombres, nunca su valor ni la
+    /// URL). Vacío en lo que no es de red.
+    pub secrets: Vec<String>,
+}
+
+/// v0.6.46 (E6): ¿un sumidero que falló sólo por el PC privado puede correr igual porque su efecto es
+/// una entrada de audit que va al sobre? Sólo `reveal`, sólo con el registro sellado activo y sólo con
+/// los argumentos sin etiqueta (si alguno la tiene, el error fue por el dato, no por la rama). `spend`
+/// no: gasta un cupo compartido, y después se ve si alcanza (un oráculo de la rama).
+#[cold]
+#[inline(never)]
+fn sealed_sink_allowed(name: &str, args: &[SynValue]) -> bool {
+    name == "reveal" && crate::sealed::active() && args.iter().all(|a| labels::label_deep(a).is_empty())
+}
+
+/// v0.6.46 (E6): una entrada de linaje en el registro de la corrida del recibo sellado. La hecha bajo
+/// un PC privado va al sobre y lleva la sal (el sobre es del auditor, que con ella puede probar qué
+/// consulta fue); la pública va sin sal, como en `receipt()`.
+#[cold]
+#[inline(never)]
+fn seal_lineage(e: &LineageEntry, sealed: bool) {
+    let mut v = serde_json::json!({
+        "kind": "input",
+        "source": e.source,
+        "what": e.what,
+        "sha256": e.sha256,
+        "bytes": e.bytes,
+        "encoding": e.encoding,
+    });
+    if let (true, Some((salt, enc))) = (sealed, &e.salt) {
+        v["salt"] = serde_json::json!(salt);
+        v["salted_encoding"] = serde_json::json!(enc);
+    }
+    if !e.secrets.is_empty() {
+        v["secrets"] = serde_json::json!(e.secrets);
+    }
+    crate::sealed::note_input(v.to_string(), sealed, &e.source, &e.sha256);
+}
+
+/// v0.6.46 (ronda 1 de cf1, B1): una escritura en el registro de la corrida del recibo sellado. Es
+/// pública (bajo un PC privado escribir se rechaza antes) y no entra en `--replay`, que compara lo
+/// leído.
+#[cold]
+#[inline(never)]
+fn seal_output(e: &LineageEntry) {
+    let v = serde_json::json!({
+        "kind": "output",
+        "source": e.source,
+        "what": e.what,
+        "sha256": e.sha256,
+        "bytes": e.bytes,
+        "encoding": e.encoding,
+    });
+    crate::sealed::push_public(v.to_string());
 }
 
 /// Builtins que TRAEN datos de afuera (archivos, red, bases, nodos de una cadena, sockets,
@@ -10213,7 +11380,7 @@ pub struct LineageEntry {
 /// `evm_send`) no es una entrada.
 pub const LINEAGE_SOURCES: &[&str] = &[
     // archivos y stdin
-    "read_file", "read_file_bytes", "read_line", "list_dir", "file_info", "grep", "parquet_read",
+    "read_file", "read_file_bytes", "read_line", "list_dir", "file_info", "grep", "parquet_read", "parquet_scan",
     "term_recv", "watch_recv",
     // HTTP
     "http", "http_get", "http_post", "http_put", "http_delete", "http_bytes", "fetch",
@@ -10290,7 +11457,15 @@ fn fresh_salt() -> [u8; 16] {
 /// `ws`, `wss`): la clave de redis `"session://TOKEN"`, una categoría de `recall` o un `://` en
 /// medio de una consulta son datos, no hosts, y nunca salen en claro.
 fn url_host(url: Option<&SynValue>) -> String {
-    let Some(SynValue::Text(t)) = url else { return String::new() };
+    // v0.6.46 (E1): de una URL que es un secret atado, el host sale de su parte pública.
+    let t: &str = match url {
+        Some(SynValue::Text(t)) => t,
+        Some(SynValue::Secret(s)) => match s.public_prefix() {
+            Some(p) => return url_host(Some(&syn_text(p))),
+            None => return String::new(),
+        },
+        _ => return String::new(),
+    };
     let t = t.trim();
     let Some((scheme, rest)) = t.split_once("://") else { return String::new() };
     if !matches!(scheme.to_ascii_lowercase().as_str(), "http" | "https" | "ws" | "wss") || t.chars().any(char::is_whitespace) {
@@ -10374,6 +11549,20 @@ fn check_task_arity(
         }
     }
     Ok(())
+}
+
+/// v0.6.46 (C6): la aridad de una llamada a una task falló; si además vino un nombre que la task no
+/// tiene, ése es el error (`page(limt = 1)` decía que faltaba `limit`). Lo llaman los que llaman a
+/// `check_call_arity`, que tienen `func` y `args` vivos de todos modos: hacerlo adentro alargaba su
+/// vida en el camino feliz y costaba +0,1–0,2 % de instrucciones por llamada en el tree-walker.
+#[cold]
+#[inline(never)]
+fn arity_error(e: Control, func: &SynValue, args: &[(Option<String>, SynValue)], loc: &SourceLocation) -> Control {
+    let SynValue::Task(t) = func else { return e };
+    match args.iter().filter_map(|(n, _)| n.as_deref()).find(|n| !t.parameters.iter().any(|p| *p.name == **n)) {
+        Some(n) => unknown_parameter(n, t.parameters.iter().map(|p| &*p.name), loc),
+        None => e,
+    }
 }
 
 fn check_call_arity(

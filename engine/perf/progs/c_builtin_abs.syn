@@ -1,0 +1,6 @@
+let x be 0
+let i be 0
+while i < 90000
+    set x to abs(i)
+    set i to i + 1
+print("ok")

@@ -226,13 +226,8 @@ fn tls_client_config(host: &str, verifier: Option<Arc<dyn rustls::client::danger
 /// ilegible es un fallo de configuración, no algo que se degrade en silencio.
 fn load_client_certs(
     path: &str,
+    file: std::fs::File,
 ) -> Result<Vec<rustls::pki_types::CertificateDer<'static>>, Control> {
-    let file = std::fs::File::open(path).map_err(|e| {
-        Control::Error(RuntimeError::new(format!(
-            "mtls_identity: cannot read the certificate {:?}: {}",
-            path, e
-        )))
-    })?;
     let certs: Vec<_> = rustls_pemfile::certs(&mut std::io::BufReader::new(file))
         .collect::<Result<_, _>>()
         .map_err(|e| {
@@ -252,13 +247,7 @@ fn load_client_certs(
 
 /// Lee la clave privada PEM del cliente (PKCS#8, PKCS#1 o SEC1). El contenido
 /// jamás se loguea ni entra en un mensaje de error.
-fn load_client_key(path: &str) -> Result<rustls::pki_types::PrivateKeyDer<'static>, Control> {
-    let file = std::fs::File::open(path).map_err(|e| {
-        Control::Error(RuntimeError::new(format!(
-            "mtls_identity: cannot read the private key {:?}: {}",
-            path, e
-        )))
-    })?;
+fn load_client_key(path: &str, file: std::fs::File) -> Result<rustls::pki_types::PrivateKeyDer<'static>, Control> {
     rustls_pemfile::private_key(&mut std::io::BufReader::new(file))
         .map_err(|_| {
             Control::Error(RuntimeError::new(format!(
@@ -547,6 +536,8 @@ fn connect_and_send(
         .map_err(|e| e.to_string())?
         .next()
         .ok_or_else(|| format!("could not resolve host: {}", host))?;
+    // v0.6.46 (E7): la IP que se usa, chequeada antes de conectar (no hay segunda resolución).
+    crate::http_common::dest_check(&host, port, sa.ip())?;
     let timeout = Duration::from_secs(timeout_secs);
     let tcp = TcpStream::connect_timeout(&sa, timeout).map_err(|e| e.to_string())?;
     let _ = tcp.set_read_timeout(Some(timeout));
@@ -736,6 +727,44 @@ pub(crate) fn http_request_body_bytes(
 
 /// Respuesta HTTP con body binario: `(status, body_bytes, headers)`.
 pub type BytesResponse = (i64, Vec<u8>, Vec<(String, String)>);
+
+/// v0.6.46 (E7): el cliente de las requests del MOTOR (providers de LLM y del juez, el webhook de
+/// aprobación, `synsema update`): la configuración del host, que llega a una IP privada sin que un
+/// programa la nombre (un modelo local en `localhost`). Las mismas funciones, en contexto de host.
+pub mod host {
+    use super::{BytesResponse, HttpResult};
+
+    pub fn http_request(
+        method: &str,
+        url: &str,
+        headers: Option<&[(String, String)]>,
+        query: Option<&[(String, String)]>,
+        body: Option<&str>,
+        timeout_secs: u64,
+    ) -> HttpResult {
+        crate::http_common::host_request(|| super::http_request(method, url, headers, query, body, timeout_secs))
+    }
+
+    pub fn http_request_stream(
+        method: &str,
+        url: &str,
+        headers: Option<&[(String, String)]>,
+        body: Option<&str>,
+        timeout_secs: u64,
+        on_data: &mut dyn FnMut(&[u8]) -> bool,
+    ) -> Result<(i64, Vec<(String, String)>), String> {
+        crate::http_common::host_request(|| super::http_request_stream(method, url, headers, body, timeout_secs, on_data))
+    }
+
+    pub fn http_request_bytes(
+        method: &str,
+        url: &str,
+        headers: Option<&[(String, String)]>,
+        timeout_secs: u64,
+    ) -> Result<BytesResponse, String> {
+        crate::http_common::host_request(|| super::http_request_bytes(method, url, headers, timeout_secs))
+    }
+}
 
 /// Como `http_request` pero devuelve el body como **bytes crudos** (sin pasar por
 /// `String`, que corrompería un binario). Para descargar release assets. Devuelve
@@ -1006,9 +1035,29 @@ pub fn register_http_builtins(interp: &Interpreter, caps: Rc<RefCell<CapabilityS
                         .map_err(|v| Control::Error(v.into_error()))?;
                 }
                 // v0.6.45 — se abre la ruta normalizada, la que se chequeó (en Unix `link/..` de la
-                // cruda lleva a otro lado).
-                let certs = load_client_certs(&synsema_core::capscope::normalize_path(&cert_path))?;
-                let key = load_client_key(&synsema_core::capscope::normalize_path(&key_path))?;
+                // cruda lleva a otro lado). v0.6.46 (E8): y sin ventana entre el chequeo y la apertura.
+                let open = |raw: &str, what: &str| {
+                    let p = synsema_core::capscope::normalize_path(raw);
+                    synsema_capabilities::secure::open_checked(
+                        &caps,
+                        &p,
+                        synsema_capabilities::nofollow::OpenFor::READ,
+                        &[CapabilityType::FileRead],
+                        "mtls_identity()",
+                    )
+                    .map(|f| (p.clone(), f))
+                    .map_err(|r| match r {
+                        synsema_capabilities::nofollow::Refused::Denied(c) => c,
+                        synsema_capabilities::nofollow::Refused::Io(e) => Control::Error(RuntimeError::new(format!(
+                            "mtls_identity: cannot read the {} {:?}: {}",
+                            what, p, e
+                        ))),
+                    })
+                };
+                let (cp, cf) = open(&cert_path, "certificate")?;
+                let certs = load_client_certs(&cp, cf)?;
+                let (kp, kf) = open(&key_path, "private key")?;
+                let key = load_client_key(&kp, kf)?;
                 match (client_identity().lock(), client_identity_hosts().lock()) {
                     (Ok(mut guard), Ok(mut scope)) => {
                         *guard = Some((certs, key));
@@ -1173,7 +1222,7 @@ mod tests {
         });
         let mut batches: Vec<Vec<u8>> = Vec::new();
         let (status, headers) =
-            http_request_stream("GET", &url, None, None, 5, &mut |bytes| {
+            host::http_request_stream("GET", &url, None, None, 5, &mut |bytes| {
                 batches.push(bytes.to_vec());
                 true
             })
@@ -1198,7 +1247,7 @@ mod tests {
             let _ = sock.write_all(b"5\r\nchau!\r\n0\r\n\r\n");
         });
         let mut seen: Vec<u8> = Vec::new();
-        let (status, _) = http_request_stream("GET", &url, None, None, 5, &mut |bytes| {
+        let (status, _) = host::http_request_stream("GET", &url, None, None, 5, &mut |bytes| {
             seen.extend_from_slice(bytes);
             false
         })
@@ -1217,7 +1266,7 @@ mod tests {
             let _ = sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
         });
         let start = Instant::now();
-        let r = http_request_stream("GET", &url, None, None, 1, &mut |_| true);
+        let r = host::http_request_stream("GET", &url, None, None, 1, &mut |_| true);
         assert!(r.is_err(), "silencio de 3s con timeout 1s debe fallar");
         assert!(
             start.elapsed() < TestDuration::from_secs(3),
@@ -1236,7 +1285,7 @@ mod tests {
             }
         });
         let mut body: Vec<u8> = Vec::new();
-        let (status, _) = http_request_stream("GET", &url2, None, None, 2, &mut |bytes| {
+        let (status, _) = host::http_request_stream("GET", &url2, None, None, 2, &mut |bytes| {
             body.extend_from_slice(bytes);
             true
         })
@@ -1265,6 +1314,7 @@ mod tests {
 
     #[test]
     fn header_pairs_reveal_at_socket_but_map_pairs_redacts() {
+        use crate::http_common::{header_pairs_to, map_pairs_to, Outgoing};
         use synsema_core::types::{syn_secret, syn_text, SynValue};
         let mut m = synsema_core::types::SynMap::new();
         m.insert("Authorization", syn_secret("STRIPE_KEY", "Bearer sk_live_LEAKCANARY"));
@@ -1272,18 +1322,21 @@ mod tests {
         let map = SynValue::Map(m.into_ref());
 
         // headers: el secret se MATERIALIZA (borde del socket) → plaintext real.
-        let hp = header_pairs(Some(&map), "t").ok().unwrap().unwrap();
+        let mut out = Outgoing::for_url("https://api.stripe.com/v1", "t");
+        let hp = header_pairs_to(Some(&map), &mut out).ok().unwrap().unwrap();
         let auth = hp.iter().find(|(k, _)| k == "Authorization").unwrap();
         assert_eq!(auth.1, "Bearer sk_live_LEAKCANARY");
         assert!(hp.iter().any(|(k, v)| k == "X-Trace" && v == "plain"));
 
-        // query params (map_pairs): un secret es ERROR (iría en la URL) — HB4: antes salía la
-        // cadena `secret(STRIPE_KEY)` como si fuera el valor.
-        let e = match map_pairs(Some(&map), "http_get") {
+        // query params: un secret NO atado es ERROR (iría en la URL), y el mensaje dice cómo atarlo
+        // (v0.6.46, E1; antes sólo decía que no había forma).
+        let mut out = Outgoing::for_url("https://api.stripe.com/v1", "http_get");
+        let e = match map_pairs_to(Some(&map), &mut out) {
             Err(synsema_core::interpreter::Control::Error(e)) => e.into_message(),
             _ => panic!("expected an error"),
         };
         assert!(e.contains("query parameter \"Authorization\" is secret(STRIPE_KEY)") && !e.contains("LEAKCANARY"), "{}", e);
+        assert!(e.contains("require secret(\"STRIPE_KEY\") for net(\"api.stripe.com\")"), "{}", e);
     }
 
     /// El certificado de cliente es la identidad del workload: sólo se presenta a

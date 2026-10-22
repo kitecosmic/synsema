@@ -11,6 +11,12 @@ export interface HttpRequestPayload {
   body_base64?: string;
   /** Segundos. */
   timeout: number;
+  /**
+   * v0.6.46: `"error"` cuando la request lleva un secret (en la URL, la query, el body o un header:
+   * `fetch` sólo quita `Authorization` al cambiar de host). Pasalo a `fetch` (`{redirect: req.redirect}`): un redirect no puede llevar la clave
+   * a otro host. Un hook que lo ignore queda fuera de lo que el motor puede imponer.
+   */
+  redirect?: "error";
 }
 
 export interface HttpResponsePayload {
@@ -48,9 +54,26 @@ export interface LlmResult {
  * En la API síncrona los hooks deben ser síncronos; en `*Async` pueden devolver Promise.
  */
 export interface Host {
+  /**
+   * v0.6.46: en nativo, un `require net` con comodín sólo llega a IPs públicas (el motor resuelve
+   * y chequea la IP antes de conectar). Acá la conexión es tuya y el motor no ve la IP: si el
+   * programa no es tuyo, resolvé el nombre y chequeá la IP a la que vas a conectar (un nombre como
+   * `127.0.0.1.nip.io` resuelve al loopback), y conectá a ésa. Negá loopback (`127.0.0.0/8`,
+   * `::1`), las redes privadas (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, CGNAT
+   * `100.64.0.0/10`, ULA `fc00::/7`), link-local (`169.254.0.0/16` con la metadata de la nube
+   * `169.254.169.254`, `fe80::/10`), multicast y los rangos de documentación; una IPv4 dentro de una
+   * IPv6 (`::ffff:a.b.c.d`) cuenta como esa IPv4. El hook no sabe si el programa nombró el host
+   * (`require net("db")`): si tus programas necesitan llegar a una red privada, nombrá vos esos
+   * destinos en el hook.
+   */
   http?(req: HttpRequestPayload): HttpResponsePayload | Promise<HttpResponsePayload>;
   kv?: KvStore;
-  llm?(op: string, prompt: string): string | LlmResult | Promise<string | LlmResult>;
+  /**
+   * `info.principals`: los dueños de lo privado que lleva el prompt (vacío con datos públicos).
+   * Sólo llega al hook si el techo lo permite (`llm=<principal>@embedder`). Un hook que lanza hace
+   * fallar esa llamada con su mensaje.
+   */
+  llm?(op: string, prompt: string, info: { principals: string[] }): string | LlmResult | Promise<string | LlmResult>;
   log?(line: string): void | Promise<void>;
   /** Una función, o `true` para la pausa por defecto (Atomics.wait / setTimeout). */
   sleep?: ((secs: number) => void | Promise<void>) | true;
@@ -99,6 +122,17 @@ export interface RunOptions {
    * Igual que `maxSteps`. Un entero positivo.
    */
   maxMemoryMb?: number;
+  /**
+   * v0.6.46 — módulos de confianza: `{ nombre: fuente }`. El programa los importa con
+   * `use "trusted:nombre" as t` y sólo puede llamar a sus tasks exportadas, que corren con SUS
+   * `require` (acotados por `trustedCeiling`) y nada de lo del programa. Es la forma de dejar que
+   * código escrito por un modelo, bajo un `ceiling` sin `declassify`, publique sólo lo que la
+   * política de una persona publica. Los argumentos de una task de confianza son datos (una task
+   * o una lambda entre ellos es error).
+   */
+  trusted?: Record<string, string>;
+  /** El techo de los módulos de confianza, con la gramática de `ceiling` (`"stdout,declassify=clientes"`). */
+  trustedCeiling?: string;
 }
 
 export interface AuditEntry {

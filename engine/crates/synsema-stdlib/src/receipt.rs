@@ -68,8 +68,9 @@ fn label_to_syn(l: &[Rc<str>]) -> SynValue {
 }
 
 /// `YYYY-MM-DDTHH:MM:SSZ` de un instante unix (calendario proléptico gregoriano; el
-/// algoritmo civil-from-days de Hinnant). Sin dependencia nueva.
-fn rfc3339_utc(secs: i64) -> String {
+/// algoritmo civil-from-days de Hinnant). Sin dependencia nueva. `pub` desde v0.6.46: el header del
+/// recibo sellado (CLI) también lo usa.
+pub fn rfc3339_utc(secs: i64) -> String {
     let days = secs.div_euclid(86_400);
     let sod = secs.rem_euclid(86_400);
     let z = days + 719_468;
@@ -139,20 +140,35 @@ pub fn build_receipt(
         None => Vec::new(),
     };
     subject.insert("identity_spend_totals", syn_list(spend));
+    // v0.6.46 (E6.8): el `from` es el conjunto DECLARADO por el programa, como en la línea `[INF]`
+    // y en el informe del wasm (T5, ronda 7): la etiqueta real de ese valor varía con cuál se
+    // seleccionó (`declassify(xs[i], …)` con `i` privado daba `["a","c"]` o `["b","c"]`). Y no
+    // cuentan las declasificaciones hechas en una rama privada: cuántas hubo decía qué rama se tomó.
+    let declared = syn_list(interp.declared_principals_list().into_iter().map(syn_text).collect());
     let declassified: Vec<SynValue> = interp
         .declassify_log()
         .iter()
+        .filter(|d| !d.under_private_pc)
         .map(|d| {
             let mut m = SynMap::new();
             m.insert("reason", syn_text(d.reason.clone()));
-            m.insert("from", label_to_syn(&d.from));
+            m.insert("from", declared.clone());
             m.insert("to", label_to_syn(&d.to));
             m.insert("line", syn_int(d.loc.line as i64));
             syn_map(m)
         })
         .collect();
     subject.insert("declassified", syn_list(declassified));
-    subject.insert("steps", syn_int(interp.steps() as i64));
+    // v0.6.46 (E6.8): cuántos pasos dio una corrida que tocó un privado depende del dato (un bucle
+    // de 50 vueltas con `when i < n` daba 222 o 378). Sale `nothing`, como el `steps: null` de
+    // `run --format json` y del wasm (el mismo criterio: `private_seen`); quien quiera publicarlo,
+    // `declassify(steps(), "…")`.
+    let steps = if interp.labels_enabled() && interp.private_seen() {
+        syn_nothing()
+    } else {
+        syn_int(interp.steps() as i64)
+    };
+    subject.insert("steps", steps);
     // v0.6.29 (DATOS-17): el LINAJE — cada dato que el programa leyó (archivo, host, consulta,
     // stdin) con el sha256 de lo que recibió. Lo anota el motor, no el programa: con el
     // `program_sha`, el `engine` y el `declared_result_sha256` el recibo dice qué entradas,
@@ -167,13 +183,39 @@ pub fn build_receipt(
             m.insert("sha256", syn_text(e.sha256.clone()));
             m.insert("bytes", syn_int(e.bytes as i64));
             m.insert("encoding", syn_text(e.encoding.clone()));
+            // v0.6.46 (E1.7): qué secrets salieron en esa llamada (los nombres).
+            if !e.secrets.is_empty() {
+                m.insert("secrets", syn_list(e.secrets.iter().map(|n| syn_text(n.clone())).collect()));
+            }
             syn_map(m)
         })
         .collect();
-    let truncated = inputs.len() >= synsema_core::interpreter::MAX_LINEAGE;
+    // v0.6.46 (ronda 1 de cf1, N1): truncado si se descartó algo, no por el largo.
+    let truncated = interp.lineage_truncated().0;
     subject.insert("inputs", syn_list(inputs));
     if truncated {
         subject.insert("inputs_truncated", SynValue::Bool(true));
+    }
+    // v0.6.46 (C3): y lo que ESCRIBIÓ (archivos), con el sha256 de los bytes escritos: un modelo
+    // entrenado y guardado queda en el recibo sin que el programa meta su hash a mano. Lo anota el
+    // builtin que escribe (`record_output`); `append_file` anota el pedazo agregado.
+    let outputs: Vec<SynValue> = interp
+        .outputs()
+        .iter()
+        .map(|e| {
+            let mut m = SynMap::new();
+            m.insert("source", syn_text(e.source.clone()));
+            m.insert("what", syn_text(e.what.clone()));
+            m.insert("sha256", syn_text(e.sha256.clone()));
+            m.insert("bytes", syn_int(e.bytes as i64));
+            m.insert("encoding", syn_text(e.encoding.clone()));
+            syn_map(m)
+        })
+        .collect();
+    let truncated = interp.lineage_truncated().1;
+    subject.insert("outputs", syn_list(outputs));
+    if truncated {
+        subject.insert("outputs_truncated", SynValue::Bool(true));
     }
     subject.insert(
         "program_sha".to_string(),

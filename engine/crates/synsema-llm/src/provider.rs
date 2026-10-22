@@ -49,11 +49,31 @@ pub struct LLMResponse {
 }
 
 /// Una tool ofrecida al LLM (la arma el programa como dato; ver el loop seguro).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct ToolSpec {
     pub name: String,
     pub description: String,
     pub params: Vec<String>,
+    /// v0.6.46 (F1): el tipo JSON Schema de cada parámetro, en el orden de `params`; vacío = sin
+    /// tipo declarado (se publica `string`, como antes).
+    pub types: Vec<String>,
+    /// v0.6.46 (F1): los parámetros que no van en `required`.
+    pub optional: Vec<String>,
+}
+
+impl ToolSpec {
+    /// El tipo JSON Schema del parámetro `i` (`string` si no declara uno).
+    pub fn schema_type(&self, i: usize) -> &str {
+        match self.types.get(i) {
+            Some(t) if !t.is_empty() => t,
+            _ => "string",
+        }
+    }
+
+    /// Los parámetros obligatorios (todos menos `optional`).
+    pub fn required(&self) -> Vec<String> {
+        self.params.iter().filter(|p| !self.optional.contains(p)).cloned().collect()
+    }
 }
 
 /// El paso que decide el LLM: respuesta final O una tool-call estructurada.
@@ -75,6 +95,12 @@ pub struct LlmStepResponse {
 pub trait LLMProvider: Send + Sync {
     fn call(&self, request: &LLMRequest) -> LLMResponse;
     fn name(&self) -> String;
+    /// v0.6.46 (E5): a qué host le llega el prompt (el `@host` de `--cap-set llm=P@host`). `local`
+    /// si no sale del proceso (el modelo embebido, el mock). Se consulta por llamada: un provider
+    /// que se recarga puede cambiar de host. `name()` no sirve: Ollama por `SYNSEMA_LLM_BASE_URL`
+    /// dice `openai:…`. Sin default (ronda 1, B3): un provider de red nuevo que se olvidara de
+    /// decirlo quedaba autorizado por un techo `llm=P@local`.
+    fn endpoint(&self) -> String;
     /// Paso estructurado (tool-aware). Default: envuelve `call()` como `Final` con 0
     /// tokens, así `NetworkProvider` y cualquier provider viejo siguen andando sin
     /// cambios (no rompe los providers existentes).
@@ -147,6 +173,10 @@ impl MockProvider {
 }
 
 impl LLMProvider for MockProvider {
+    /// v0.6.46 (ronda 1, B3): no sale del proceso.
+    fn endpoint(&self) -> String {
+        "local".to_string()
+    }
     fn call(&self, request: &LLMRequest) -> LLMResponse {
         self.call_log.lock().unwrap().push(request.clone());
         let content = self
@@ -183,6 +213,10 @@ pub struct NetworkProvider {
 }
 
 impl LLMProvider for NetworkProvider {
+    /// v0.6.46 (ronda 1, B3): sólo identidad, no llama a nadie: nada sale del proceso.
+    fn endpoint(&self) -> String {
+        "local".to_string()
+    }
     fn call(&self, _request: &LLMRequest) -> LLMResponse {
         LLMResponse {
             content: format!("[{} provider: real calls not implemented yet]", self.prefix),

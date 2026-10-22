@@ -42,7 +42,7 @@ impl Node {
 }
 
 /// v0.6.42 — certificados automáticos (ACME) del bloque `serve`, aparte del nodo para no
-/// agrandar `NodeKind` (lo mide `tests/type_sizes.rs`): `tls auto [<email>]`, `domain <expr>`,
+/// agrandar `NodeKind` (lo mide `tests/it/type_sizes.rs`): `tls auto [<email>]`, `domain <expr>`,
 /// `domain ask <task>` (emisión bajo demanda: la task aprueba cada nombre nuevo) y
 /// `tls dns <task>` (reto DNS-01 publicado por el programa; lo exige un `*.` en `domain`).
 #[derive(Clone, Debug, PartialEq, Default)]
@@ -62,6 +62,72 @@ pub struct Param {
     /// de copiar el nombre (F2a de specs/compute-rendimiento.md). `Arc` porque el AST cruza hilos.
     pub name: Arc<str>,
     pub default: Option<Node>,
+    /// v0.6.46 (F1): `nombre: tipo`. Es metadato: lo validan sólo `call` y `call_tool`, la frontera
+    /// donde los argumentos llegan como datos (de un modelo, de un JSON); una llamada normal no lo mira.
+    pub ty: Option<ParamType>,
+}
+
+/// v0.6.46 (F1): el tipo declarado de un parámetro de task. Los cinco de `expect body`, con el mismo
+/// nombre que da `type_name()`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ParamType {
+    Text,
+    Number,
+    Bool,
+    List,
+    Map,
+}
+
+impl ParamType {
+    /// Para los mensajes de error.
+    pub const ALL: &'static str = "text, number, bool, list or map";
+
+    pub fn parse(name: &str) -> Option<ParamType> {
+        Some(match name {
+            "text" => ParamType::Text,
+            "number" => ParamType::Number,
+            "bool" => ParamType::Bool,
+            "list" => ParamType::List,
+            "map" => ParamType::Map,
+            _ => return None,
+        })
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            ParamType::Text => "text",
+            ParamType::Number => "number",
+            ParamType::Bool => "bool",
+            ParamType::List => "list",
+            ParamType::Map => "map",
+        }
+    }
+
+    /// El tipo de JSON Schema: lo que ve el modelo y lo que publica `code outline`.
+    pub fn json_schema(self) -> &'static str {
+        match self {
+            ParamType::Text => "string",
+            ParamType::Number => "number",
+            ParamType::Bool => "boolean",
+            ParamType::List => "array",
+            ParamType::Map => "object",
+        }
+    }
+
+    /// ¿`v` es de este tipo? Estricto, sin conversiones: un número es `number` (decimal incluido),
+    /// un secret cuenta como `text` (y sigue opaco), `nothing` no es de ninguno. Un valor etiquetado
+    /// se mira por dentro.
+    pub fn accepts(self, v: &crate::types::SynValue) -> bool {
+        use crate::types::SynValue as V;
+        matches!(
+            (self, crate::labels::unwrap(v)),
+            (ParamType::Text, V::Text(_) | V::Secret(_))
+                | (ParamType::Number, V::Number(_))
+                | (ParamType::Bool, V::Bool(_))
+                | (ParamType::List, V::List(_))
+                | (ParamType::Map, V::Map(_))
+        )
+    }
 }
 
 /// Argumento de una llamada a `task` (Batch 2): valor + nombre opcional. `name = None`
@@ -421,6 +487,10 @@ pub enum NodeKind {
     RequireStatement {
         capability: String,
         scope: Option<Box<Node>>,
+        /// v0.6.46 (E1): `require secret("K") for net("h1"), net("h2")` — las expresiones de los
+        /// hosts a los que el secret puede ir. En una caja (8 bytes) para no pasar el tope de
+        /// `NodeKind`.
+        bound_to: Option<Box<Vec<Node>>>,
     },
     SandboxBlock {
         body: Vec<Node>,
@@ -616,6 +686,11 @@ pub enum NodeKind {
         private: bool,
         /// `docs off`: apaga la página `/docs` sin esconder `/openapi.json` (discovery).
         docs_off: bool,
+        /// v0.6.46 (C5) `discovery off`: el serve no genera ninguna URL de discovery (`/llms.txt`,
+        /// `/openapi.json`, `/sitemap.xml`, `/robots.txt`, `/docs`, las Agent Cards,
+        /// `/.well-known/synsema-auth`); las atiende el programa como a cualquier otra (un edge
+        /// que es sólo `proxy to`). `/.well-known/attestation` no es discovery: no cambia.
+        discovery_off: bool,
         routes: Vec<Node>, // RouteDefinition
         // A2 stack web: `tls cert <expr> key <expr>` + `redirect https`.
         tls_cert: Option<Box<Node>>,

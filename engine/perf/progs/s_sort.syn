@@ -1,0 +1,8 @@
+let n be 5000
+let xs be []
+let x be 42
+each i in range(0, n)
+    set x to (x * 48271) % 2147483647
+    set xs to append(xs, x)
+let s be sort(xs)
+print("check " + text(s[0] + s[n // 2] + s[n - 1]))

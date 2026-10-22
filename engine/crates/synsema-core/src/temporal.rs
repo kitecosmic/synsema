@@ -975,7 +975,15 @@ pub fn in_units(args: &[SynValue]) -> Result<SynValue, Control> {
             Temporal::Duration(d) => (*d, u.to_string()),
             other => return Err(err(format!("in_units() takes a duration, got {}", other.type_name()))),
         },
-        _ => return Err(err("in_units(duration, unit): unit is \"days\", \"hours\", \"minutes\", \"seconds\" or \"milliseconds\"")),
+        // v0.6.46 (C2): un número no dice en qué unidad está; la pista arma la duración.
+        (Some(n @ SynValue::Number(_)), _) => {
+            return Err(err(format!(
+                "in_units() takes a duration, got {} — make one first: in_units(duration(seconds = {}), \"minutes\")",
+                n.type_name(),
+                n
+            )))
+        }
+        _ => return Err(err("in_units(duration, unit): unit is \"weeks\", \"days\", \"hours\", \"minutes\", \"seconds\" or \"milliseconds\"")),
     };
     let secs = secs_f64(&d);
     let per = match unit.as_str() {

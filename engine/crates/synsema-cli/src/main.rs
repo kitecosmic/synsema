@@ -38,8 +38,9 @@ mod stdio;
 mod synfide;
 mod update;
 mod code;
+mod sealed_receipt;
 
-const USAGE: &str = "uso: synsema <conform [--swarm] [--flat] | serve [--secure] [--watch] [--port N] [--domain d1,d2] [--tls-auto <email> | --tls-cert <p> --tls-key <p>] [--bind addr] [--trust-proxy ip,cidr] [--health <path>] [--attested] | run [--flat] [--explain] [--format human|json] [--provider <name>] [--attest] <archivo.syn | -> [-- args...] | test [-v] <archivo|dir> | build <main.syn> -o <salida> [--include <p>]... [--engine-binary <ruta>] [--serve [--bind addr] ...] [--no-console] [--icon <svg|png|ico>] [--bundle [--name <n>] [--id <id>]] | check | code <outline|symbol|refs|routes|caps|check|search|deps> [--json] | code --mcp | openapi [--out f] [--base-url URL] | tokens | ast | repl | daemon | init [dir] [--synfide | --pwa | --desktop] | llm status [--json] | version | update> [--sandbox | --cap-set <list> | --deterministic] [--labels] [--jitless] [--profile native|pure] [--audit json|<ruta>|fd:N|unix:<ruta>] [--env-file <path> | --no-env-file] <archivo.syn>";
+const USAGE: &str = "uso: synsema <conform [--swarm] [--flat] | serve [--secure] [--watch] [--port N] [--domain d1,d2] [--tls-auto <email> | --tls-cert <p> --tls-key <p>] [--bind addr] [--trust-proxy ip,cidr] [--health <path>] [--attested] [--auditor <X25519 public key> [--receipt <ruta|fd:N>]] | run [--flat] [--explain] [--format human|json] [--provider <name>] [--attest] [--auditor <X25519 public key> [--receipt <ruta|fd:N>] | --replay <recibo abierto>] <archivo.syn | -> [-- args...] | receipt <open <recibo> --key <privada> | verify <recibo> | keygen> | test [-v] <archivo|dir> | build <main.syn> -o <salida> [--include <p>]... [--engine-binary <ruta>] [--serve [--bind addr] ...] [--no-console] [--icon <svg|png|ico>] [--bundle [--name <n>] [--id <id>]] | check | code <outline|symbol|refs|routes|caps|check|search|deps> [--json] | code --mcp | openapi [--out f] [--base-url URL] | tokens | ast | repl | daemon | init [dir] [--synfide | --pwa | --desktop] | llm status [--json] | version | update> [--sandbox | --cap-set <list> | --deterministic] [--labels] [--jitless] [--profile native|pure] [--audit json|<ruta>|fd:N|unix:<ruta>] [--env-file <path> | --no-env-file] <archivo.syn>";
 
 // `build_ceiling` (--sandbox/--cap-set → techo) vive en synsema-capabilities: lo comparten
 // este binario y `synsema-wasm` (mismas flags, misma semántica en los dos front-ends).
@@ -70,6 +71,10 @@ pub(crate) struct HostFlags {
     /// F4.2: `--jitless` (como `node --jitless`): sin el nivel nativo, todo en la VM. No apaga
     /// ningún chequeo; lo decide `main` antes de instalar el nivel (ver `jitless_requested`).
     pub jitless: bool,
+    /// v0.6.46 (E3b): `--trusted nombre=ruta` (repetible), los módulos de confianza que el
+    /// programa importa con `use "trusted:nombre"`, y `--trusted-cap-set`, su techo.
+    pub trusted: Vec<(String, String)>,
+    pub trusted_cap_set: Option<String>,
     pub filename: Option<String>,
     pub program_args: Vec<String>,
     pub rest: Vec<String>,
@@ -111,7 +116,51 @@ impl HostFlags {
         if self.labels {
             host::set_labels(true);
         }
+        self.apply_trusted(cmd)?;
         Ok(p)
+    }
+
+    /// v0.6.46 (E3b): lee los módulos de `--trusted` (el programa no ve la ruta) y fija su techo.
+    fn apply_trusted(&self, cmd: &str) -> Result<(), ExitCode> {
+        if self.trusted.is_empty() {
+            if self.trusted_cap_set.is_some() {
+                eprintln!("synsema {}: --trusted-cap-set bounds the modules of --trusted; pass --trusted name=./file.syn too", cmd);
+                return Err(ExitCode::from(2));
+            }
+            return Ok(());
+        }
+        // Ronda 1 (A1): bajo `serve` cada worker reconstruye los módulos colgados de los globales del
+        // programa; ahí una tool de confianza no quedaría aislada.
+        if cmd != "run" && cmd != "test" {
+            eprintln!("synsema {}: --trusted runs under `synsema run` and `synsema test` for now (a trusted tool is not isolated in the workers of `{}` yet)", cmd, cmd);
+            return Err(ExitCode::from(2));
+        }
+        let mut modules: Vec<(String, String)> = Vec::new();
+        for (name, path) in &self.trusted {
+            if modules.iter().any(|(n, _)| n == name) {
+                eprintln!("synsema {}: --trusted {}: the name is given twice", cmd, name);
+                return Err(ExitCode::from(2));
+            }
+            match std::fs::read_to_string(path) {
+                Ok(src) => modules.push((name.clone(), src)),
+                Err(e) => {
+                    eprintln!("synsema {}: --trusted {}: cannot read {}: {}", cmd, name, path, e);
+                    return Err(ExitCode::from(2));
+                }
+            }
+        }
+        let ceiling = match self.trusted_cap_set.as_deref() {
+            None => None,
+            Some(spec) => match build_ceiling(false, Some(spec)) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("synsema {}: --trusted-cap-set: {}", cmd, e.trim_start_matches("--cap-set: "));
+                    return Err(ExitCode::from(2));
+                }
+            },
+        };
+        host::set_trusted(host::Trusted { modules, ceiling });
+        Ok(())
     }
 
     /// Instala el sink de audit (`--audit`), y el colector si el subcomando va a emitir
@@ -160,6 +209,23 @@ pub(crate) fn take_host_flags(cmd: &str, args: &[String]) -> Result<HostFlags, E
             "--sandbox" => h.sandbox = true,
             "--deterministic" => h.deterministic = true,
             "--labels" => h.labels = true,
+            "--trusted" => {
+                let v = need_value("--trusted", args.get(i + 1))?;
+                match v.split_once('=') {
+                    Some((n, p)) if !n.is_empty() && !p.is_empty() && n.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') => {
+                        h.trusted.push((n.to_string(), p.to_string()))
+                    }
+                    _ => {
+                        eprintln!("synsema {}: --trusted takes name=path (a name of letters, digits, '_' or '-'), e.g. --trusted tools=./tools.syn", cmd);
+                        return Err(ExitCode::from(2));
+                    }
+                }
+                i += 1;
+            }
+            "--trusted-cap-set" => {
+                h.trusted_cap_set = Some(need_value("--trusted-cap-set", args.get(i + 1))?);
+                i += 1;
+            }
             "--jitless" => h.jitless = true,
             "--cap-set" => {
                 h.cap_set = Some(need_value("--cap-set", args.get(i + 1))?);
@@ -415,7 +481,20 @@ fn run_bundled(bundle: synsema_core::bundle::Bundle, program_args: Vec<String>) 
             trust_proxy: None,
             ceiling: None,
             attested: false,
+            auditor: None,
+            receipt: None,
+            sealed_bytes: None,
         };
+        // v0.6.46 (E6-h): el auditor no se hornea; el binario lo toma de `SYNSEMA_AUDITOR_KEY`, como
+        // `synsema serve` (si el host lo puso, que no se ignore en silencio).
+        match sealed_receipt::serve_from_flags(None, &None) {
+            Ok(Some((key, size))) => {
+                ov.auditor = Some(key);
+                ov.sealed_bytes = Some(size);
+            }
+            Ok(None) => {}
+            Err(code) => return code,
+        }
         // Igual que `synsema serve --sandbox`: un server necesita `serve` además del techo.
         ov.ceiling = match (ceiling, manifest.ceiling.as_deref()) {
             (Some(mut c), Some("sandbox")) => {
@@ -431,8 +510,26 @@ fn run_bundled(bundle: synsema_core::bundle::Bundle, program_args: Vec<String>) 
         // v0.6.45 (A5): un `exit(code)` antes de escuchar decide el código, como en `run`.
         return ExitCode::from(run_exit_code(&result));
     }
-    synsema_core::interpreter::LIVE_STDOUT.store(true, std::sync::atomic::Ordering::Relaxed);
-    let result = run_program_ceiled(&source, &filename, ceiling);
+    // Ronda 1 (E6-B6): un bundle en modo `run` también lee `SYNSEMA_AUDITOR_KEY` (los de `serve` ya
+    // lo hacían): con auditor, el recibo sale (a stderr) antes que la salida, como `synsema run`.
+    let auditor = match sealed_receipt::from_flags("run", None, None) {
+        Ok(a) => a,
+        Err(code) => return code,
+    };
+    let result = match &auditor {
+        Some(a) => {
+            a.install();
+            let result = run_program_ceiled_opts(&source, &filename, ceiling, false);
+            if let Err(code) = emit_receipt(a, None) {
+                return code;
+            }
+            result
+        }
+        None => {
+            synsema_core::interpreter::LIVE_STDOUT.store(true, std::sync::atomic::Ordering::Relaxed);
+            run_program_ceiled(&source, &filename, ceiling)
+        }
+    };
     for line in &result.output {
         println!("{}", line);
     }
@@ -510,6 +607,8 @@ fn main() -> ExitCode {
         },
         Some("serve") => cmd_serve(&args),
         Some("run") => cmd_run(&args),
+        // v0.6.46 (E6): abrir/verificar un recibo sellado y crear las claves de un auditor.
+        Some("receipt") => sealed_receipt::cmd_receipt(&args),
         Some("test") => cmd_test(&args),
         Some("check") => cmd_check(&args),
         Some("code") => code::cmd_code(&args),
@@ -1318,6 +1417,8 @@ fn cmd_serve(args: &[String]) -> ExitCode {
     let mut watch = false;
     let mut path: Option<String> = None;
     let mut ov = ServeOverrides::default();
+    // v0.6.46 (E6-h): el recibo sellado por request (`--auditor <pública X25519>`, `--receipt <ruta|fd:N>`).
+    let mut auditor_flag: Option<String> = None;
     let mut i = 0;
     while i < args.len() {
         // Toma el valor del flag siguiente, o error claro (fail-loud).
@@ -1373,6 +1474,8 @@ fn cmd_serve(args: &[String]) -> ExitCode {
             "--tls-cert" => ov.tls_cert = Some(next_val!("--tls-cert")),
             "--tls-key" => ov.tls_key = Some(next_val!("--tls-key")),
             "--bind" => ov.bind = Some(next_val!("--bind")),
+            "--auditor" => auditor_flag = Some(next_val!("--auditor")),
+            "--receipt" => ov.receipt = Some(next_val!("--receipt")),
             // v0.6.42 — proxys de confianza (IPs o CIDRs separados por coma).
             "--trust-proxy" => {
                 let v = next_val!("--trust-proxy");
@@ -1412,6 +1515,14 @@ fn cmd_serve(args: &[String]) -> ExitCode {
     if ov.attested && watch {
         eprintln!("synsema serve: --attested and --watch are mutually exclusive (a restart would change the attested identity)");
         return ExitCode::from(2);
+    }
+    match sealed_receipt::serve_from_flags(auditor_flag, &ov.receipt) {
+        Ok(Some((key, size))) => {
+            ov.auditor = Some(key);
+            ov.sealed_bytes = Some(size);
+        }
+        Ok(None) => {}
+        Err(code) => return code,
     }
     ov.ceiling = match build_ceiling(serve_sandbox, serve_cap_set.as_deref()) {
         // `--sandbox` = [stdout, time] como en `run`; un serve necesita además `serve`
@@ -1482,11 +1593,31 @@ fn cmd_run(args: &[String]) -> ExitCode {
     let mut fmt_json = false; // --format json: con --explain, diagnóstico JSON; sin él, el INFORME
     let mut path: Option<String> = None;
     let mut program_args = host.program_args.clone();
+    // v0.6.46 (E6): el recibo sellado (`--auditor <pública X25519>`, `--receipt <ruta|fd:N>`).
+    let mut auditor_flag: Option<String> = None;
+    let mut receipt_flag: Option<String> = None;
+    let mut replay_flag: Option<String> = None;
     let rest = &host.rest;
     let mut i = 0;
     while i < rest.len() {
         match rest[i].as_str() {
             "--flat" => flat = true,
+            flag @ ("--auditor" | "--receipt" | "--replay") => match rest.get(i + 1) {
+                Some(v) if !v.starts_with("--") => {
+                    match flag {
+                        "--auditor" => auditor_flag = Some(v.clone()),
+                        "--receipt" => receipt_flag = Some(v.clone()),
+                        _ => replay_flag = Some(v.clone()),
+                    }
+                    i += 1;
+                }
+                _ => {
+                    eprintln!("synsema run: {} requires a value", flag);
+                    return ExitCode::from(2);
+                }
+            },
+            p if p.starts_with("--auditor=") => auditor_flag = Some(p["--auditor=".len()..].to_string()),
+            p if p.starts_with("--receipt=") => receipt_flag = Some(p["--receipt=".len()..].to_string()),
             "--explain" => explain = true,
             // Corre bajo --deterministic y cierra con una línea JSON
             // `{output_sha, steps, state_root, program_sha, input_sha, attestation}` cuyo
@@ -1549,7 +1680,7 @@ fn cmd_run(args: &[String]) -> ExitCode {
     let path = match path {
         Some(p) => p,
         None => {
-            eprintln!("uso: synsema run [--flat] [--explain] [--format human|json] [--provider <name>] [--attest] [--sandbox | --cap-set <list> | --deterministic] [--profile native|pure] [--audit json|<ruta>|fd:N] <archivo.syn | -> [-- args...]");
+            eprintln!("uso: synsema run [--flat] [--explain] [--format human|json] [--provider <name>] [--attest] [--auditor <X25519 public key> [--receipt <ruta|fd:N>]] [--sandbox | --cap-set <list> | --deterministic] [--profile native|pure] [--audit json|<ruta>|fd:N] <archivo.syn | -> [-- args...]");
             return ExitCode::from(2);
         }
     };
@@ -1569,6 +1700,18 @@ fn cmd_run(args: &[String]) -> ExitCode {
         host.deterministic = true;
     }
     let report_mode = fmt_json && !explain;
+    let auditor = match sealed_receipt::from_flags("run", auditor_flag, receipt_flag) {
+        Ok(a) => a,
+        Err(code) => return code,
+    };
+    if auditor.is_some() && explain {
+        eprintln!("synsema run: --auditor and --explain are mutually exclusive (the receipt goes before the output, and --explain prints a diagnostic)");
+        return ExitCode::from(2);
+    }
+    if replay_flag.is_some() && (auditor.is_some() || explain || report_mode || attest) {
+        eprintln!("synsema run: --replay runs the program again against an opened receipt; drop --auditor/--explain/--format json/--attest");
+        return ExitCode::from(2);
+    }
     let (mut source, filename) = if path == "-" {
         use std::io::Read;
         let mut buf = String::new();
@@ -1628,6 +1771,16 @@ fn cmd_run(args: &[String]) -> ExitCode {
         }
     }
     host::set_program_args(program_args);
+    if let Some(a) = &auditor {
+        a.install();
+    }
+    if let Some(path) = &replay_flag {
+        if let Err(e) = sealed_receipt::install_replay(path) {
+            eprintln!("synsema run: {}", e);
+            return ExitCode::from(2);
+        }
+    }
+    let run_pub = auditor.as_ref().map(|a| a.run_public());
 
     // Camino opt-in: diagnóstico rico. Reusa la API pública del runtime; el default
     // (línea corta) queda intacto más abajo para no romper scripting/CI.
@@ -1692,7 +1845,7 @@ fn cmd_run(args: &[String]) -> ExitCode {
         // `--attest --format json`: la attestation va DENTRO del informe (sólo si el run
         // fue bien; no se atesta una salida fallida).
         if let (Some(input), true) = (&attest_input, result.success) {
-            match attest_run(&source, &filename, input, &result.output, &attest_drivers) {
+            match attest_run(&source, &filename, input, &result.output, &attest_drivers, run_pub) {
                 Ok(fields) => {
                     for (k, v) in fields.as_object().into_iter().flatten() {
                         report[k] = v.clone();
@@ -1700,6 +1853,33 @@ fn cmd_run(args: &[String]) -> ExitCode {
                 }
                 Err(e) => {
                     eprintln!("synsema run --attest: {}", e);
+                    audit::summary(1);
+                    return ExitCode::from(1);
+                }
+            }
+        }
+        // v0.6.46 (E6): el recibo sellado, primero en el informe.
+        if let Some(a) = &auditor {
+            let config_sha = report.get("config_sha").and_then(|v| v.as_str()).map(str::to_string);
+            match a.receipt(config_sha) {
+                Ok(r) => {
+                    // Ronda 1 (E6-B2): `--receipt` también con `--format json` (se ignoraba).
+                    if a.has_dest() {
+                        if let Err(e) = a.emit(&r) {
+                            eprintln!("synsema run: the sealed receipt could not be delivered: {}", e);
+                            audit::summary(1);
+                            return ExitCode::from(1);
+                        }
+                    }
+                    let mut with = serde_json::Map::new();
+                    with.insert("receipt".into(), r);
+                    for (k, v) in report.as_object().into_iter().flatten() {
+                        with.insert(k.clone(), v.clone());
+                    }
+                    report = serde_json::Value::Object(with);
+                }
+                Err(e) => {
+                    eprintln!("synsema run: the sealed receipt could not be built: {}", e);
                     audit::summary(1);
                     return ExitCode::from(1);
                 }
@@ -1715,6 +1895,34 @@ fn cmd_run(args: &[String]) -> ExitCode {
     // plataforma de attestation → error y exit ≠ 0 (nunca una salida "atestada" sin documento).
     if let Some(input) = &attest_input {
         let result = run_program_ceiled_opts(&source, &filename, ceiling, false);
+        // v0.6.46 (E6): con auditor, el documento se pide antes, para que el recibo (que lleva su
+        // `config_sha`) salga antes que la salida.
+        let early = match (&auditor, result.success) {
+            (Some(a), true) => match attest_run(&source, &filename, input, &result.output, &attest_drivers, run_pub) {
+                Ok(fields) => {
+                    let config_sha = fields.get("config_sha").and_then(|v| v.as_str()).map(str::to_string);
+                    if let Err(code) = emit_receipt(a, config_sha) {
+                        return code;
+                    }
+                    Some(Ok(fields))
+                }
+                // Ronda 1 (E6-B4): sin documento la corrida igual pasó: su recibo sale (sin
+                // `config_sha`) antes que la salida, como en el brazo de una corrida que falló.
+                Err(e) => {
+                    if let Err(code) = emit_receipt(a, None) {
+                        return code;
+                    }
+                    Some(Err(e))
+                }
+            },
+            (Some(a), false) => {
+                if let Err(code) = emit_receipt(a, None) {
+                    return code;
+                }
+                None
+            }
+            _ => None,
+        };
         for line in &result.output {
             println!("{}", line);
         }
@@ -1726,7 +1934,11 @@ fn cmd_run(args: &[String]) -> ExitCode {
             audit::summary(code as i32);
             return ExitCode::from(code);
         }
-        match attest_run(&source, &filename, input, &result.output, &attest_drivers) {
+        let attested = match early {
+            Some(r) => r,
+            None => attest_run(&source, &filename, input, &result.output, &attest_drivers, run_pub),
+        };
+        match attested {
             Ok(fields) => println!("{}", fields),
             Err(e) => {
                 eprintln!("synsema run --attest: {}", e);
@@ -1741,17 +1953,53 @@ fn cmd_run(args: &[String]) -> ExitCode {
     // Camino normal: swarm real (DE-011). Los `spawn` corren en hilos aislados; un agente
     // que falla NO tumba el main ni trunca su salida. Sale ≠0 si el main falla o si algún
     // agente terminó en ERROR. El techo del host (si hay) se propaga a los agentes.
-    synsema_core::interpreter::LIVE_STDOUT.store(true, std::sync::atomic::Ordering::Relaxed);
-    let result = run_program_ceiled(&source, &filename, ceiling);
+    // v0.6.46 (E6): con auditor la salida NO va en vivo (ni `print`, ni el vaciado de `flush` y
+    // `read_line`): se junta y sale después del recibo.
+    let result = if auditor.is_none() {
+        synsema_core::interpreter::LIVE_STDOUT.store(true, std::sync::atomic::Ordering::Relaxed);
+        run_program_ceiled(&source, &filename, ceiling)
+    } else {
+        run_program_ceiled_opts(&source, &filename, ceiling, false)
+    };
+    if let Some(a) = &auditor {
+        if let Err(code) = emit_receipt(a, None) {
+            return code;
+        }
+    }
     for line in &result.output {
         println!("{}", line);
     }
     for e in &result.errors {
         eprintln!("{}", e);
     }
-    let code = run_exit_code(&result);
+    let mut code = run_exit_code(&result);
+    if replay_flag.is_some() {
+        match sealed_receipt::replay_verdict() {
+            Ok(m) => eprintln!("{}", m),
+            Err(m) => {
+                // Si el corte ya salió como el error de la corrida, no se repite.
+                if !result.errors.iter().any(|e| e.contains(&m)) {
+                    eprintln!("{}", m);
+                }
+                code = code.max(1);
+            }
+        }
+    }
     audit::summary(code as i32);
     ExitCode::from(code)
+}
+
+/// v0.6.46 (E6): arma y entrega el recibo sellado. Sin recibo no sale la salida: es lo que el host
+/// pidió al poner un auditor.
+fn emit_receipt(a: &sealed_receipt::Auditor, config_sha: Option<String>) -> Result<(), ExitCode> {
+    match a.receipt(config_sha).and_then(|r| a.emit(&r)) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            eprintln!("synsema run: the sealed receipt could not be delivered: {}", e);
+            audit::summary(1);
+            Err(ExitCode::from(1))
+        }
+    }
 }
 
 /// El campo `steps` de un informe JSON: el contador, o `null` si la corrida tocó datos privados.
@@ -1782,7 +2030,11 @@ fn steps_field() -> serde_json::Value {
 /// bajo qué modo corrió el programa, no sólo cuál. Con varios drivers (`SYNSEMA_ATTEST=tsm,nitro-tpm`)
 /// cada uno firma el MISMO `report_data`; `attestation` es el del primero y `attestations` los trae
 /// todos. Si uno falla, no hay artefacto.
-fn attest_run(source: &str, filename: &str, input: &[u8], output: &[String], drivers: &[synsema_stdlib::attest::Driver]) -> Result<serde_json::Value, String> {
+///
+/// v0.6.46 (E6): con auditor, `run_pub` (la pública que firma el recibo sellado) entra al
+/// `report_data` como `sha256(run_pub)` al final de lo atado, y el JSON la trae en `run_key`: el
+/// documento de la plataforma responde por la clave que firmó el recibo. Sin auditor, nada cambia.
+fn attest_run(source: &str, filename: &str, input: &[u8], output: &[String], drivers: &[synsema_stdlib::attest::Driver], run_pub: Option<[u8; 32]>) -> Result<serde_json::Value, String> {
     use synsema_core::bytesutil::{b64_encode, hex_encode};
     use synsema_stdlib::attest::{attest_documents_with, current_program_sha, document_json, keccak256, program_sha, sha256, AttestConfig, AttestRequest};
     let joined = output.join("\n");
@@ -1809,6 +2061,9 @@ fn attest_run(source: &str, filename: &str, input: &[u8], output: &[String], dri
     bound.extend_from_slice(&input_sha);
     bound.extend_from_slice(&output_sha);
     bound.extend_from_slice(&config_sha);
+    if let Some(pk) = &run_pub {
+        bound.extend_from_slice(&sha256(pk));
+    }
     let report_data = sha256(&bound);
     let all = attest_documents_with(&drivers, &AttestRequest { report_data: report_data.to_vec(), nonce: None, public_key: None })?;
     let res = &all[0];
@@ -1829,7 +2084,7 @@ fn attest_run(source: &str, filename: &str, input: &[u8], output: &[String], dri
     if let Some(root) = &res.root {
         attestation["root"] = serde_json::Value::String(b64_encode(root));
     }
-    Ok(serde_json::json!({
+    let mut out = serde_json::json!({
         "output_sha": hex_encode(&output_sha),
         // T5 (ronda 5): `null` si la corrida tocó privados — ver `steps_field`. Acá pesa el
         // doble: el documento atestado es el artefacto cuyo propósito es que un tercero lo
@@ -1843,7 +2098,11 @@ fn attest_run(source: &str, filename: &str, input: &[u8], output: &[String], dri
         "config_sha": hex_encode(&config_sha),
         "attestation": attestation,
         "attestations": all.iter().map(document_json).collect::<Vec<_>>(),
-    }))
+    });
+    if let Some(pk) = &run_pub {
+        out["run_key"] = serde_json::json!(synsema_core::bytesutil::b64url_encode(pk));
+    }
+    Ok(out)
 }
 
 /// Test [-v] [--flat] <archivo.syn | dir>: corre los bloques `test` y reporta ✓/✗.
@@ -2123,12 +2382,142 @@ fn deprecated_fetch_warnings(program: &synsema_core::ast::Program, path: &str) -
 /// nombre (`http_get(url, headers, query, timeout = 10)`). Cada fila: (builtin, obligatorios,
 /// nombres de todos los parámetros en orden).
 const NAMED_AFTER_TWO: &[(&str, usize, &[&str])] = &[
-    ("http", 2, &["method", "url", "headers", "query", "body", "timeout"]),
-    ("http_bytes", 2, &["method", "url", "headers", "query", "body", "timeout"]),
+    ("http", 2, &["method", "url", "headers", "query", "body", "timeout", "form"]),
+    ("http_bytes", 2, &["method", "url", "headers", "query", "body", "timeout", "form"]),
     ("http_get", 1, &["url", "headers", "query", "timeout"]),
-    ("http_post", 1, &["url", "body", "headers", "timeout"]),
-    ("http_put", 1, &["url", "body", "headers", "timeout"]),
+    ("http_post", 1, &["url", "body", "headers", "timeout", "form"]),
+    ("http_put", 1, &["url", "body", "headers", "timeout", "form"]),
 ];
+
+/// v0.6.46 (E1.8) — un `require secret("K")` sin `for` cuando K va en la URL, la query, el body o
+/// el form de una request: en runtime es error (un secret no atado sólo va en un header), y acá se
+/// avisa antes con la línea a escribir. Se sigue `secret("K")` escrito en el argumento o por una
+/// variable (`let k be secret("K")`); los headers no cuentan. Aviso, no error.
+fn unbound_secret_warnings(program: &synsema_core::ast::Program, path: &str) -> Vec<String> {
+    use std::collections::{HashMap, HashSet};
+    use synsema_core::ast::{Node, NodeKind as NK};
+    fn lit(n: &Node) -> Option<&str> {
+        match &n.kind {
+            NK::TextLiteral { value } => Some(value.as_str()),
+            _ => None,
+        }
+    }
+    fn secret_call(n: &Node) -> Option<&str> {
+        match &n.kind {
+            NK::TaskCall { name, arguments } if matches!(&name.kind, NK::Identifier { name } if name == "secret") => {
+                arguments.first().and_then(|a| lit(&a.value))
+            }
+            _ => None,
+        }
+    }
+    let mut unbound: HashSet<String> = HashSet::new();
+    let mut bound: HashSet<String> = HashSet::new();
+    let mut vars: HashMap<String, String> = HashMap::new();
+    for stmt in &program.statements {
+        synsema_core::ast_api::walk(stmt, &mut |n| match &n.kind {
+            NK::RequireStatement { capability, scope: Some(sc), bound_to } if capability == "secret" => {
+                if let Some(k) = lit(sc) {
+                    if bound_to.is_some() {
+                        bound.insert(k.to_string());
+                    } else {
+                        unbound.insert(k.to_string());
+                    }
+                }
+            }
+            NK::LetBinding { name, value, .. } => {
+                if let Some(k) = secret_call(value) {
+                    vars.insert(name.to_string(), k.to_string());
+                }
+            }
+            _ => {}
+        });
+    }
+    let unbound: HashSet<String> = unbound.difference(&bound).cloned().collect();
+    if unbound.is_empty() {
+        return Vec::new();
+    }
+    // (builtin, posición y nombre de la URL, la query, el body y el form; un `Arg` con nombre
+    // cuenta igual).
+    const PLACES: &[(&str, &[(usize, &str)])] = &[
+        ("http", &[(1, "url"), (3, "query"), (4, "body"), (6, "form")]),
+        ("http_bytes", &[(1, "url"), (3, "query"), (4, "body"), (6, "form")]),
+        ("http_get", &[(0, "url"), (2, "query")]),
+        ("http_post", &[(0, "url"), (1, "body"), (4, "form")]),
+        ("http_put", &[(0, "url"), (1, "body"), (4, "form")]),
+        ("http_delete", &[(0, "url")]),
+        ("fetch", &[(0, "url"), (3, "body")]),
+        ("ws_connect", &[(0, "url")]),
+    ];
+    let mentions = |n: &Node| -> Vec<String> {
+        let mut found: Vec<String> = Vec::new();
+        synsema_core::ast_api::walk(n, &mut |m| {
+            let k = match &m.kind {
+                NK::Identifier { name } => vars.get(name.as_str()).cloned(),
+                _ => secret_call(m).map(str::to_string),
+            };
+            if let Some(k) = k {
+                if unbound.contains(&k) && !found.contains(&k) {
+                    found.push(k);
+                }
+            }
+        });
+        found
+    };
+    // El host escrito antes del primer hueco de la URL (`https://api.x.com/v2/{k}`).
+    let host_of = |n: &Node| -> Option<String> {
+        let mut first: Option<String> = None;
+        synsema_core::ast_api::walk(n, &mut |m| {
+            if first.is_none() {
+                first = lit(m).map(str::to_string);
+            }
+        });
+        let t = first?;
+        let rest = t.split_once("://")?.1;
+        let host = &rest[..rest.find(['/', '?', '#'])?];
+        (!host.is_empty() && !host.contains('@')).then(|| host.to_string())
+    };
+    let mut out = Vec::new();
+    for stmt in &program.statements {
+        synsema_core::ast_api::walk(stmt, &mut |n| {
+            let NK::TaskCall { name, arguments } = &n.kind else { return };
+            let NK::Identifier { name: callee } = &name.kind else { return };
+            let Some((f, places)) = PLACES.iter().find(|(f, _)| *f == callee.as_str()) else { return };
+            let positional: Vec<&Node> = arguments.iter().filter(|a| a.name.is_none()).map(|a| &a.value).collect();
+            let mut hits: Vec<(&str, &Node)> = Vec::new();
+            for &(i, what) in places.iter() {
+                if let Some(v) = positional.get(i) {
+                    hits.push((what, *v));
+                }
+                for a in arguments.iter().filter(|a| a.name.as_deref() == Some(what)) {
+                    hits.push((what, &a.value));
+                }
+            }
+            // `fetch(url, {"body": …, "form": …})`: las claves del mapa de opciones.
+            if *f == "fetch" {
+                if let Some(Node { kind: NK::MapLiteral { pairs }, .. }) = positional.get(1).copied() {
+                    for (k, v) in pairs {
+                        match lit(k) {
+                            Some("body") => hits.push(("body", v)),
+                            Some("form") => hits.push(("form", v)),
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            let url = hits.iter().find(|(w, _)| *w == "url").map(|(_, v)| *v);
+            let host = url.and_then(host_of).unwrap_or_else(|| "<the host>".to_string());
+            for (what, v) in &hits {
+                for k in mentions(v) {
+                    out.push(format!(
+                        "{}:{}: warning: secret(\"{}\") goes in the {} of {}() but is not bound to a host, and an unbound secret only goes in a header: write `require secret(\"{}\") for net(\"{}\")`",
+                        path, n.location.line, k, what, f, k, host
+                    ));
+                }
+            }
+        });
+    }
+    out
+}
 
 fn positional_beyond_two_warnings(program: &synsema_core::ast::Program, path: &str) -> Vec<String> {
     use synsema_core::ast::NodeKind as NK;
@@ -2260,6 +2649,16 @@ fn undefined_call_warnings(program: &synsema_core::ast::Program, path: &str) -> 
     out
 }
 
+/// v0.6.46: los avisos del CLI para `synsema code check` y la tool `check` del MCP, los mismos que
+/// imprime `synsema check`.
+pub(crate) fn cli_lints(program: &synsema_core::ast::Program, path: &str) -> Vec<String> {
+    let mut out = undefined_call_warnings(program, path);
+    out.extend(deprecated_fetch_warnings(program, path));
+    out.extend(positional_beyond_two_warnings(program, path));
+    out.extend(unbound_secret_warnings(program, path));
+    out
+}
+
 fn capability_warnings(path: &str) -> Vec<String> {
     use synsema_core::codeintel::{caps, Root};
     let p = std::path::Path::new(path);
@@ -2351,13 +2750,7 @@ fn cmd_check(args: &[String]) -> ExitCode {
                     for w in &warnings {
                         eprintln!("{}", w);
                     }
-                    for w in undefined_call_warnings(&program, &path) {
-                        eprintln!("{}", w);
-                    }
-                    for w in deprecated_fetch_warnings(&program, &path) {
-                        eprintln!("{}", w);
-                    }
-                    for w in positional_beyond_two_warnings(&program, &path) {
+                    for w in cli_lints(&program, &path) {
                         eprintln!("{}", w);
                     }
                     // T1 (DX, §10.3 del spec de identidad): lo que el programa —o una task de un

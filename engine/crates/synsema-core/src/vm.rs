@@ -4539,7 +4539,9 @@ impl Interpreter {
             cargs.push((name, std::mem::replace(&mut self.vm_regs[first + i], SynValue::Nothing)));
         }
         if s.checked {
-            check_call_arity(&f, &cargs, loc)?;
+            if let Err(e) = check_call_arity(&f, &cargs, loc) {
+                return Err(arity_error(e, &f, &cargs, loc));
+            }
         }
         let out = self.call_value_named(f, &mut cargs, loc);
         self.release_args(cargs);

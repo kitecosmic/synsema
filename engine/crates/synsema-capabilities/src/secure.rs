@@ -26,6 +26,29 @@ pub fn set_child_no_window(on: bool) {
     CHILD_NO_WINDOW.store(on, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// v0.6.46: el comando de `run`/`proc_spawn` con `cwd`: `(scope, programa)`. Un comando relativo con
+/// separador (`./tool`) se resuelve contra el `cwd` del hijo, como en un shell (`cd sub && ./tool`), y
+/// eso es lo que se pide: `exec("./sub/tool")`. Antes se pedía `exec("./tool")` tal cual y el archivo
+/// que corría dependía de la plataforma (Unix lo buscaba en el `cwd` nuevo, Windows en el del
+/// programa): el grant no decía qué archivo autorizaba. El programa se pasa absoluto, así no hay
+/// segunda resolución. Sin `cwd`, sin separador (se busca en el `PATH`) o absoluto: tal cual.
+pub fn exec_target(cmd: &str, cwd: Option<&str>) -> (String, String) {
+    let Some(dir) = cwd else { return (cmd.to_string(), cmd.to_string()) };
+    let has_sep = cmd.contains('/') || cmd.contains('\\');
+    if !has_sep || std::path::Path::new(cmd).is_absolute() || cmd.starts_with('/') {
+        return (cmd.to_string(), cmd.to_string());
+    }
+    let joined = crate::model::normalize_path(&format!("{}/{}", dir.trim_end_matches(['/', '\\']), cmd));
+    let rooted = std::path::Path::new(&joined).is_absolute() || joined.starts_with('/');
+    let scope = if rooted || joined.starts_with("../") { joined.clone() } else { format!("./{}", joined) };
+    let program = if rooted {
+        joined
+    } else {
+        std::env::current_dir().map(|h| h.join(&joined).to_string_lossy().into_owned()).unwrap_or(joined)
+    };
+    (scope, program)
+}
+
 /// v0.6.45 (A9) — las variables que un hijo con `env_clean` conserva: en Windows `SystemRoot`, sin
 /// la cual el CRT y WinSock no arrancan (la misma única excepción que `run_program`). Todo lo demás
 /// lo pasa el programa explícito por `env`.
@@ -209,6 +232,59 @@ fn require(caps: &Rc<RefCell<CapabilitySet>>, cap: Capability, source: &str) -> 
         .map_err(|v| Control::Error(v.into_error()))
 }
 
+/// v0.6.46 (E8): abre `path`, que ya pasó `require` con cada uno de `tys`, sin ventana entre el
+/// chequeo y la apertura (ver `nofollow`). Con un link en el camino, el chequeo se repite juzgando la
+/// ubicación real del handle. Público para los builtins de otros crates que abren un archivo
+/// chequeado (`zip_create`, `mtls_identity`, las fuentes de `raster`).
+pub fn open_checked(
+    caps: &Rc<RefCell<CapabilitySet>>,
+    path: &str,
+    how: crate::nofollow::OpenFor,
+    tys: &[CapabilityType],
+    source: &str,
+) -> Result<std::fs::File, crate::nofollow::Refused<Control>> {
+    let recheck = |real: &str| {
+        synsema_core::capscope::with_physical(path, real, || {
+            tys.iter().try_for_each(|ty| require(caps, Capability::new(*ty, Some(path.to_string())), source))
+        })
+    };
+    crate::nofollow::open_checked(path, how, &recheck)
+}
+
+/// v0.6.46 (E8): `open_checked` para leer, con el error de lectura de siempre.
+fn open_read(caps: &Rc<RefCell<CapabilitySet>>, path: &str, source: &str) -> Result<std::fs::File, Control> {
+    open_checked(caps, path, crate::nofollow::OpenFor::READ, &[CapabilityType::FileRead], source).map_err(|r| match r {
+        crate::nofollow::Refused::Io(e) => read_error(path, &e),
+        crate::nofollow::Refused::Denied(c) => c,
+    })
+}
+
+/// v0.6.46 (C4) — un archivo abierto para leerlo por partes: en disco (con el chequeo y la apertura
+/// en un paso de E8) o embebido en el bundle.
+pub enum OpenedForRead {
+    Disk(String, std::fs::File),
+    Bundled(String, &'static [u8]),
+}
+
+/// v0.6.46 (C4) — lo mismo que hace `read_file_bytes` antes de leer (bundle, `file.read`, apertura
+/// sin carrera), para un builtin de stdlib que lee el archivo por partes (`parquet_scan`).
+pub fn open_for_read(caps: &Rc<RefCell<CapabilitySet>>, raw: &str, source: &str) -> Result<OpenedForRead, Control> {
+    match locate_for_read(caps, raw, source)? {
+        Located::Bundled(p, b) => Ok(OpenedForRead::Bundled(p, b)),
+        Located::Disk(p) => {
+            let f = open_read(caps, &p, source)?;
+            Ok(OpenedForRead::Disk(p, f))
+        }
+    }
+}
+
+/// Lee todo un archivo abierto como texto (UTF-8 estricto, como `read_to_string`).
+fn read_text(mut f: std::fs::File) -> std::io::Result<String> {
+    let mut s = String::new();
+    f.read_to_string(&mut s)?;
+    Ok(s)
+}
+
 /// Hostname de un URL, como `urlparse().hostname` de Python: minúsculas, sin
 /// userinfo ni puerto. `None` si no hay esquema `scheme://`.
 pub fn url_hostname(url: &str) -> Option<String> {
@@ -263,11 +339,50 @@ fn arg_i64(v: &SynValue) -> Result<i64, Control> {
 
 /// Escritura ATÓMICA: temp en el mismo dir (rename intra-FS, sin cross-device) + rename.
 /// Crea los dirs padre si faltan. Limpia el temp si el rename falla. Reusado por
-/// `write_file` y `edit_file`.
-fn atomic_write(path: &str, data: &[u8]) -> std::io::Result<()> {
+/// `write_file` y `edit_file`, con `path` ya chequeado con cada uno de `tys`.
+///
+/// v0.6.46 (E8): la carpeta se abre sin ventana con el chequeo (ver `nofollow::parent_checked`) y
+/// el temporal, el rename y la limpieza van relativos a su handle. Las carpetas que faltan se
+/// siguen creando por nombre, como v0.6.45.
+pub fn atomic_write(
+    caps: &Rc<RefCell<CapabilitySet>>,
+    path: &str,
+    data: &[u8],
+    tys: &[CapabilityType],
+    source: &str,
+) -> Result<(), crate::nofollow::Refused<Control>> {
+    use crate::nofollow::Refused;
     if let Some(parent) = Path::new(path).parent() {
         let _ = std::fs::create_dir_all(parent);
     }
+    let recheck = |real: &str| {
+        synsema_core::capscope::with_physical(path, real, || {
+            tys.iter().try_for_each(|ty| require(caps, Capability::new(*ty, Some(path.to_string())), source))
+        })
+    };
+    match crate::nofollow::parent_checked(path, &recheck)? {
+        Some(dir) => {
+            #[cfg(test)]
+            BETWEEN.with(|b| {
+                if let Some(f) = b.borrow_mut().take() {
+                    f()
+                }
+            });
+            dir.replace_with(data).map_err(Refused::Io)
+        }
+        None => atomic_write_by_name(path, data).map_err(Refused::Io),
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Ronda 1 (E8-B3): corre una vez entre `parent_checked` y `replace_with` (el test mueve la carpeta
+    /// ahí): sin esto, "`atomic_write` siempre por nombre" pasaba los tests.
+    static BETWEEN: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+}
+
+/// La escritura atómica de v0.6.45, por nombre: donde no hay con qué abrir la carpeta sin links.
+fn atomic_write_by_name(path: &str, data: &[u8]) -> std::io::Result<()> {
     // v0.6.45 — el temporal no se chequea contra el scope (es un nombre nuestro), así que no puede
     // seguir links: antes era `<ruta>.synsema.tmp` (predecible) con `fs::write`, y un link plantado
     // con ese nombre hacía escribir fuera del scope. Ahora lleva un sufijo al azar y se crea con
@@ -374,8 +489,7 @@ fn grep_collect(path: &str, glob: &Option<String>, out: &mut Vec<String>) -> Res
 
 /// Lee un archivo como líneas SIN el EOL (para el campo `text` de `grep`). Streamea por
 /// línea (`read_until`); líneas no-UTF-8 se leen lossy (no se saltean en silencio).
-fn grep_lines(path: &str) -> std::io::Result<Vec<String>> {
-    let f = std::fs::File::open(path)?;
+fn grep_lines(f: std::fs::File) -> std::io::Result<Vec<String>> {
     let mut r = BufReader::new(f);
     let mut buf = Vec::new();
     let mut lines = Vec::new();
@@ -397,8 +511,7 @@ fn grep_lines(path: &str) -> std::io::Result<Vec<String>> {
 /// línea con `read_until(b'\n')` (no carga el archivo entero ni corta multibyte: UTF-8
 /// es auto-sincronizante en `\n`; `from_utf8_lossy` es por robustez). `limit=None` → hasta
 /// el fin del archivo.
-fn read_lines_range(path: &str, offset: usize, limit: Option<usize>) -> std::io::Result<String> {
-    let f = std::fs::File::open(path)?;
+fn read_lines_range(f: std::fs::File, offset: usize, limit: Option<usize>) -> std::io::Result<String> {
     let mut reader = BufReader::new(f);
     let start = offset.saturating_sub(1); // 1-based → 0-based inclusivo
     let end = limit.map(|n| start.saturating_add(n)); // exclusivo
@@ -594,7 +707,7 @@ pub fn register_secure_builtins(interp: &Interpreter, caps: Rc<RefCell<Capabilit
                     if let Some(bytes) = bundled {
                         return Ok(syn_text(String::from_utf8_lossy(bytes).into_owned()));
                     }
-                    return match std::fs::read_to_string(&path) {
+                    return match read_text(open_read(&caps, &path, "read_file()")?) {
                         Ok(c) => Ok(syn_text(c)),
                         Err(e) => Err(read_error(&path, &e)),
                     };
@@ -629,7 +742,7 @@ pub fn register_secure_builtins(interp: &Interpreter, caps: Rc<RefCell<Capabilit
                 if let Some(bytes) = bundled {
                     return Ok(syn_text(lines_range_str(&String::from_utf8_lossy(bytes), offset as usize, limit)));
                 }
-                match read_lines_range(&path, offset as usize, limit) {
+                match read_lines_range(open_read(&caps, &path, "read_file()")?, offset as usize, limit) {
                     Ok(s) => Ok(syn_text(s)),
                     Err(e) => Err(read_error(&path, &e)),
                 }
@@ -893,7 +1006,12 @@ pub fn register_secure_builtins(interp: &Interpreter, caps: Rc<RefCell<Capabilit
                 let mut out_matches: Vec<SynValue> = Vec::new();
                 let mut truncated = false;
                 'files: for f in &files {
-                    let lines = match grep_lines(f) {
+                    // v0.6.46 (E8): cada archivo se abre sin ventana; un link que ahora lleva afuera
+                    // se saltea, como el que ya llevaba afuera al recorrer.
+                    let Ok(file) = open_checked(&caps, f, crate::nofollow::OpenFor::READ, &[CapabilityType::FileRead], "grep()") else {
+                        continue;
+                    };
+                    let lines = match grep_lines(file) {
                         Ok(l) => l,
                         Err(_) => continue,
                     };
@@ -949,8 +1067,9 @@ pub fn register_secure_builtins(interp: &Interpreter, caps: Rc<RefCell<Capabilit
                     Located::Bundled(_, bytes) => return Ok(syn_bytes(bytes.to_vec())),
                     Located::Disk(p) => p,
                 };
-                match std::fs::read(&path) {
-                    Ok(b) => Ok(syn_bytes(b)),
+                let mut b = Vec::new();
+                match open_read(&caps, &path, "read_file_bytes()")?.read_to_end(&mut b) {
+                    Ok(_) => Ok(syn_bytes(b)),
                     Err(e) => Err(read_error(&path, &e)),
                 }
             }),
@@ -1107,8 +1226,9 @@ pub fn register_secure_builtins(interp: &Interpreter, caps: Rc<RefCell<Capabilit
         interp.register_builtin(
             "write_file",
             2,
-            Rc::new(move |_i, args, _loc| {
-                let path = normalize_path(&raw_str(arg(args, 0)?));
+            Rc::new(move |interp, args, _loc| {
+                let raw_path = raw_str(arg(args, 0)?);
+                let path = normalize_path(&raw_path);
                 require(
                     &caps,
                     Capability::new(CapabilityType::FileWrite, Some(path.clone())),
@@ -1116,13 +1236,23 @@ pub fn register_secure_builtins(interp: &Interpreter, caps: Rc<RefCell<Capabilit
                 )?;
                 reject_bundled_write(&path)?;
                 // Escritura atómica (temp+rename); crea dirs padre. Despacha por tipo.
-                let result = match arg(args, 1)? {
-                    SynValue::Bytes(b) => atomic_write(&path, &b[..]),
-                    other => atomic_write(&path, raw_str(other).as_bytes()),
+                let tys = [CapabilityType::FileWrite];
+                // v0.6.46 (C3): lo escrito queda en los `outputs` del recibo.
+                let text;
+                let (data, enc): (&[u8], &'static str) = match arg(args, 1)? {
+                    SynValue::Bytes(b) => (&b[..], "bytes"),
+                    other => {
+                        text = raw_str(other);
+                        (text.as_bytes(), "text")
+                    }
                 };
-                match result {
-                    Ok(_) => Ok(syn_bool(true)),
-                    Err(e) => Err(Control::Error(RuntimeError::new(format!(
+                match atomic_write(&caps, &path, data, &tys, "write_file()") {
+                    Ok(_) => {
+                        interp.record_output("write_file", &raw_path, data, enc);
+                        Ok(syn_bool(true))
+                    }
+                    Err(crate::nofollow::Refused::Denied(c)) => Err(c),
+                    Err(crate::nofollow::Refused::Io(e)) => Err(Control::Error(RuntimeError::new(format!(
                         "Cannot write file {}: {}",
                         path, e
                     )))),
@@ -1140,8 +1270,9 @@ pub fn register_secure_builtins(interp: &Interpreter, caps: Rc<RefCell<Capabilit
         interp.register_builtin(
             "edit_file",
             -1,
-            Rc::new(move |_i, args, _loc| {
-                let path = normalize_path(&raw_str(arg(args, 0)?));
+            Rc::new(move |interp, args, _loc| {
+                let raw_path = raw_str(arg(args, 0)?);
+                let path = normalize_path(&raw_path);
                 let old = raw_str(arg(args, 1)?);
                 let new = raw_str(arg(args, 2)?);
                 let replace_all = matches!(args.get(3), Some(SynValue::Bool(true)));
@@ -1162,7 +1293,18 @@ pub fn register_secure_builtins(interp: &Interpreter, caps: Rc<RefCell<Capabilit
                 if old.is_empty() {
                     return Err(Control::Error(RuntimeError::new("edit_file: empty pattern")));
                 }
-                let content = std::fs::read_to_string(&path).map_err(|e| read_error(&path, &e))?;
+                let f = open_checked(
+                    &caps,
+                    &path,
+                    crate::nofollow::OpenFor::READ,
+                    &[CapabilityType::FileWrite, CapabilityType::FileRead],
+                    "edit_file()",
+                )
+                .map_err(|r| match r {
+                    crate::nofollow::Refused::Io(e) => read_error(&path, &e),
+                    crate::nofollow::Refused::Denied(c) => c,
+                })?;
+                let content = read_text(f).map_err(|e| read_error(&path, &e))?;
                 let count = content.matches(&old).count();
                 if count == 0 {
                     return Err(Control::Error(RuntimeError::new("edit_file: pattern not found")));
@@ -1178,9 +1320,21 @@ pub fn register_secure_builtins(interp: &Interpreter, caps: Rc<RefCell<Capabilit
                 } else {
                     (content.replacen(&old, &new, 1), 1)
                 };
-                atomic_write(&path, updated.as_bytes()).map_err(|e| {
-                    Control::Error(RuntimeError::new(format!("Cannot write file {}: {}", path, e)))
+                atomic_write(
+                    &caps,
+                    &path,
+                    updated.as_bytes(),
+                    &[CapabilityType::FileWrite, CapabilityType::FileRead],
+                    "edit_file()",
+                )
+                .map_err(|r| match r {
+                    crate::nofollow::Refused::Io(e) => {
+                        Control::Error(RuntimeError::new(format!("Cannot write file {}: {}", path, e)))
+                    }
+                    crate::nofollow::Refused::Denied(c) => c,
                 })?;
+                // v0.6.46 (C3): el archivo entero como quedó.
+                interp.record_output("edit_file", &raw_path, updated.as_bytes(), "text");
                 let mut m = SynMap::new();
                 m.insert("replaced", syn_int(replaced as i64));
                 Ok(syn_map(m))
@@ -1196,8 +1350,9 @@ pub fn register_secure_builtins(interp: &Interpreter, caps: Rc<RefCell<Capabilit
         interp.register_builtin(
             "append_file",
             2,
-            Rc::new(move |_i, args, _loc| {
-                let path = normalize_path(&raw_str(arg(args, 0)?));
+            Rc::new(move |interp, args, _loc| {
+                let raw_path = raw_str(arg(args, 0)?);
+                let path = normalize_path(&raw_path);
                 require(
                     &caps,
                     Capability::new(CapabilityType::FileWrite, Some(path.clone())),
@@ -1207,23 +1362,27 @@ pub fn register_secure_builtins(interp: &Interpreter, caps: Rc<RefCell<Capabilit
                 if let Some(parent) = Path::new(&path).parent() {
                     let _ = std::fs::create_dir_all(parent);
                 }
-                let mut f = std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(&path)
-                    .map_err(|e| {
-                        Control::Error(RuntimeError::new(format!(
-                            "Cannot write file {}: {}",
-                            path, e
-                        )))
+                // v0.6.46 (E8): sin ventana entre el chequeo y la apertura (ver `nofollow`).
+                let mut f = open_checked(&caps, &path, crate::nofollow::OpenFor::APPEND, &[CapabilityType::FileWrite], "append_file()")
+                    .map_err(|r| match r {
+                        crate::nofollow::Refused::Io(e) => {
+                            Control::Error(RuntimeError::new(format!("Cannot write file {}: {}", path, e)))
+                        }
+                        crate::nofollow::Refused::Denied(c) => c,
                     })?;
-                let res = match arg(args, 1)? {
-                    SynValue::Bytes(b) => f.write_all(&b[..]),
-                    other => f.write_all(raw_str(other).as_bytes()),
+                let text;
+                let (data, enc): (&[u8], &'static str) = match arg(args, 1)? {
+                    SynValue::Bytes(b) => (&b[..], "bytes"),
+                    other => {
+                        text = raw_str(other);
+                        (text.as_bytes(), "text")
+                    }
                 };
-                res.map_err(|e| {
+                f.write_all(data).map_err(|e| {
                     Control::Error(RuntimeError::new(format!("Cannot write file {}: {}", path, e)))
                 })?;
+                // v0.6.46 (C3): el pedazo agregado (no el archivo entero: no se relee).
+                interp.record_output("append_file", &raw_path, data, enc);
                 Ok(syn_bool(true))
             }),
         );
@@ -1249,13 +1408,6 @@ pub fn register_secure_builtins(interp: &Interpreter, caps: Rc<RefCell<Capabilit
                         return Err(Control::Error(RuntimeError::new("run: args must be a list")))
                     }
                 };
-                // capability: scope = cmd tal como se pasa (pre-PATH).
-                require(
-                    &caps,
-                    Capability::new(CapabilityType::Exec, Some(cmd.clone())),
-                    "run()",
-                )?;
-
                 // timeout (default 120s).
                 let timeout_secs = match args.get(2) {
                     Some(SynValue::Nothing) | None => 120.0,
@@ -1272,6 +1424,9 @@ pub fn register_secure_builtins(interp: &Interpreter, caps: Rc<RefCell<Capabilit
                     Some(SynValue::Text(s)) => Some(s.to_string()),
                     _ => None,
                 };
+                // capability: scope = cmd tal como se pasa (pre-PATH); con `cwd`, resuelto contra él.
+                let (scope, cmd) = exec_target(&cmd, cwd.as_deref());
+                require(&caps, Capability::new(CapabilityType::Exec, Some(scope)), "run()")?;
                 let stdin_data: Option<Vec<u8>> = match opt("stdin") {
                     Some(SynValue::Bytes(b)) => Some(b[..].to_vec()),
                     Some(SynValue::Text(s)) => Some(s.as_bytes().to_vec()),
@@ -1401,9 +1556,17 @@ pub fn register_secure_builtins(interp: &Interpreter, caps: Rc<RefCell<Capabilit
         interp.register_builtin(
             "now",
             0,
-            Rc::new(move |_i, _args, _loc| {
+            Rc::new(move |i, _args, _loc| {
                 require(&caps, Capability::new(CapabilityType::Time, None), "now()")?;
-                Ok(syn_float(synsema_core::clock::now_secs_f64()))
+                let real = synsema_core::clock::now_secs_f64();
+                // v0.6.46 (E6.4): con el recibo sellado, la lectura queda en el sobre (y con
+                // etiquetas, el reloj está cercado).
+                if synsema_core::sealed::active() {
+                    if let Some(v) = synsema_core::sealed::read_clock(real, i.labels_enabled()) {
+                        return Ok(syn_float(v));
+                    }
+                }
+                Ok(syn_float(real))
             }),
         );
     }
@@ -1520,6 +1683,11 @@ pub fn register_secure_builtins(interp: &Interpreter, caps: Rc<RefCell<Capabilit
                     return Ok(syn_float(synsema_core::rng::uniform(i, g, "random", loc)?));
                 }
                 require(&caps, Capability::new(CapabilityType::Random, None), "random()")?;
+                if synsema_core::sealed::active() {
+                    if let Some(x) = with_run_rng(|r| rand::Rng::gen::<f64>(r)) {
+                        return Ok(syn_float(x));
+                    }
+                }
                 Ok(syn_float(rand::random::<f64>()))
             }),
         );
@@ -1560,6 +1728,11 @@ pub fn register_secure_builtins(interp: &Interpreter, caps: Rc<RefCell<Capabilit
                         lo, hi
                     ))));
                 }
+                if synsema_core::sealed::active() {
+                    if let Some(x) = with_run_rng(|r| rand::Rng::gen_range(r, lo..=hi)) {
+                        return Ok(syn_int(x));
+                    }
+                }
                 // En nativo, `thread_rng` (ChaCha que se resiembra solo; ronda 4, B3: con `OsRng` era
                 // una syscall por llamada, un 19 % más lento en un bucle). En wasm, `OsRng` (el
                 // generador de la corrida, sembrado por llamada) con un error claro sin entropía.
@@ -1587,6 +1760,57 @@ pub fn register_secure_builtins(interp: &Interpreter, caps: Rc<RefCell<Capabilit
             }),
         );
     }
+}
+
+/// v0.6.46 (E6.4) — con el recibo sellado, `random()` y `random_int()` sin generador salen de un
+/// ChaCha12 sembrado UNA vez por corrida: la semilla va al sobre, y con ella `--replay` reproduce los
+/// mismos números. Cada hilo (el de la corrida, el de cada agente) tiene su flujo, derivado de la
+/// semilla y del nombre del hilo, para que dos agentes no saquen la misma secuencia. `random_bytes`,
+/// `token` y la generación de claves NO salen de acá (siguen con la entropía del SO): el auditor recibe
+/// la semilla, y con ella reproduciría claves y tokens de sesión. `None` sin registro.
+fn with_run_rng<T>(f: impl FnOnce(&mut rand::rngs::StdRng) -> T) -> Option<T> {
+    use rand::SeedableRng;
+    use sha2::{Digest, Sha256};
+    thread_local! {
+        static RUN_RNG: RefCell<Option<(u64, String, rand::rngs::StdRng)>> = const { RefCell::new(None) };
+    }
+    let log = synsema_core::sealed::current()?;
+    let (id, master) = {
+        let mut g = log.lock().unwrap_or_else(|p| p.into_inner());
+        // Ronda 2 (R2-B1): cerrado entre el `current()` y el candado: como sin registro.
+        if g.is_closed() {
+            return None;
+        }
+        if g.seed.is_none() {
+            let mut s = [0u8; 32];
+            rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut s);
+            g.seed = Some(synsema_core::bytesutil::hex_encode(&s));
+        }
+        (g.id, g.seed.clone().unwrap_or_default())
+    };
+    RUN_RNG.with(|r| {
+        let mut r = r.borrow_mut();
+        // v0.6.46 (ronda 1, E6-A2): el flujo es el de `sealed::stream()` (el ítem de un
+        // `parallel_map`, o el nombre del hilo); cambia de ítem a ítem en el mismo worker.
+        let stream = synsema_core::sealed::stream();
+        if r.as_ref().map(|x| (x.0, x.1.as_str())) != Some((id, stream.as_str())) {
+            let seed: [u8; 32] = Sha256::new()
+                .chain_update(b"synsema-run-rng-v1")
+                .chain_update(master.as_bytes())
+                .chain_update(stream.as_bytes())
+                .finalize()
+                .into();
+            *r = Some((id, stream, rand::rngs::StdRng::from_seed(seed)));
+        }
+        r.as_mut().map(|x| f(&mut x.2))
+    })
+}
+
+/// v0.6.46 (ronda 1, E6-A2) — el prefijo de los flujos de un `parallel_map`: un número del flujo del
+/// llamador, así dos llamadas (o una anidada en un ítem) no comparten flujos y `--replay` lo
+/// reproduce. `None` sin registro de la corrida (y entonces nada cambia).
+pub fn run_rng_fork() -> Option<String> {
+    with_run_rng(|r| format!("{:032x}", rand::Rng::gen::<u128>(r)))
 }
 
 #[cfg(test)]
@@ -1622,6 +1846,36 @@ mod v0620_tests {
             Err(Control::Error(e)) => Err(e.to_string()),
             Err(_) => Err("control flow escaped the program".to_string()),
         }
+    }
+
+    /// v0.6.46 (backlog §10): con `cwd`, un comando relativo se pedía y se corría tal cual: el grant
+    /// `exec("./tool")` autorizaba el `./tool` de cualquier carpeta, y cuál corría dependía de la
+    /// plataforma. Ahora se resuelve contra el `cwd` y eso es lo que se pide.
+    #[test]
+    fn run_resolves_a_relative_command_against_cwd() {
+        assert_eq!(exec_target("./tool", Some("sub")), ("./sub/tool".to_string(), exec_target("./tool", Some("sub")).1));
+        assert_eq!(exec_target("./tool", None).0, "./tool");
+        assert_eq!(exec_target("git", Some("sub")).0, "git", "sin separador: el PATH");
+        assert_eq!(exec_target("../bin/t", Some("./a/b")).0, "./a/bin/t");
+        assert!(std::path::Path::new(&exec_target("./tool", Some("sub")).1).is_absolute(), "se corre absoluto");
+
+        let d = scratch("exec-cwd");
+        std::fs::create_dir_all(d.join("sub")).unwrap();
+        let name = if cfg!(windows) { "tool.cmd" } else { "tool" };
+        let body = if cfg!(windows) { "@echo off\r\necho from-sub\r\n" } else { "#!/bin/sh\necho from-sub\n" };
+        std::fs::write(d.join("sub").join(name), body).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(d.join("sub").join(name), std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let sub = slash(&d.join("sub"));
+        let src = format!("let r be run(\"./{}\", [], 20, {{\"cwd\": \"{}\"}})\nprint(trim(r.stdout))", name, sub);
+        let denied = run(&[(CapabilityType::Exec, Some(format!("./{}", name)))], &src).unwrap_err();
+        assert!(denied.contains(&format!("{}/{}", sub, name)), "pide el archivo que corre: {}", denied);
+        let out = run(&[(CapabilityType::Exec, Some(format!("{}/{}", sub, name)))], &src).unwrap();
+        assert_eq!(out, vec!["from-sub".to_string()]);
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]
@@ -1742,6 +1996,152 @@ mod v0620_tests {
         std::fs::write(sub.join("one.txt"), "1").unwrap();
         let out = run(&g, &format!("print(length(list_dir(\"{}\")))", slash(&sub))).unwrap();
         assert_eq!(out, vec!["1"]);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
+#[cfg(all(test, any(target_os = "linux", windows)))]
+mod v0646_e8_tests {
+    use super::*;
+
+    fn link_dir(target: &Path, link: &Path) {
+        #[cfg(windows)]
+        assert!(Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(link.to_string_lossy().replace('/', "\\"))
+            .arg(target.to_string_lossy().replace('/', "\\"))
+            .output()
+            .unwrap()
+            .status
+            .success());
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(target, link).unwrap();
+    }
+
+    /// La carrera con el chequeo de verdad: `require` pasa con `proj/sub` como carpeta, y antes de
+    /// abrir alguien la cambia por un link a otro lado. `open_read` juzga dónde quedó el handle y
+    /// niega con el mensaje del link; un link que queda adentro sigue valiendo.
+    #[test]
+    fn the_open_is_judged_where_the_handle_really_is() {
+        let d = std::env::temp_dir().join(format!("synsema-e8-secure-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("proj/sub")).unwrap();
+        std::fs::create_dir_all(d.join("proj/otra")).unwrap();
+        std::fs::create_dir_all(d.join("afuera")).unwrap();
+        std::fs::write(d.join("proj/sub/f.txt"), "adentro").unwrap();
+        std::fs::write(d.join("proj/otra/f.txt"), "otra").unwrap();
+        std::fs::write(d.join("afuera/f.txt"), "SECRETO").unwrap();
+        let root = d.to_string_lossy().replace('\\', "/");
+        let caps = Rc::new(RefCell::new(CapabilitySet::new("t")));
+        caps.borrow_mut().grant(Capability::new(CapabilityType::FileRead, Some(format!("{}/proj/**", root))));
+        let path = format!("{}/proj/sub/f.txt", root);
+        assert!(require(&caps, Capability::new(CapabilityType::FileRead, Some(path.clone())), "read_file()").is_ok());
+        std::fs::remove_dir_all(d.join("proj/sub")).unwrap();
+        link_dir(&d.join("afuera"), &d.join("proj/sub"));
+        let e = match open_read(&caps, &path, "read_file()") {
+            Err(Control::Error(e)) => e.message.clone(),
+            Ok(_) => panic!("abrió el archivo de afuera"),
+            Err(_) => panic!("otro control"),
+        };
+        assert!(e.contains("a link (symlink or junction) on the way leads outside"), "{}", e);
+        // Un link que queda adentro del grant, sí.
+        std::fs::remove_dir_all(d.join("proj/sub")).ok();
+        let _ = std::fs::remove_file(d.join("proj/sub"));
+        link_dir(&d.join("proj/otra"), &d.join("proj/sub"));
+        let Ok(f) = open_read(&caps, &path, "read_file()") else { panic!("un link que queda adentro se negó") };
+        let t = read_text(f).unwrap();
+        assert_eq!(t, "otra");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    fn denied_message(r: Result<(), crate::nofollow::Refused<Control>>) -> String {
+        match r {
+            Err(crate::nofollow::Refused::Denied(Control::Error(ref e))) => e.message.clone(),
+            Err(crate::nofollow::Refused::Io(e)) => panic!("se esperaba una negación, fue de E/S: {}", e),
+            _ => panic!("se esperaba una negación"),
+        }
+    }
+
+    fn wrote(r: Result<(), crate::nofollow::Refused<Control>>) {
+        match r {
+            Ok(()) => {}
+            Err(crate::nofollow::Refused::Io(e)) => panic!("no escribió: {}", e),
+            Err(_) => panic!("no escribió: negado"),
+        }
+    }
+
+    /// Lo mismo para reemplazar (`write_file`, `edit_file`): con la carpeta cambiada por un link
+    /// afuera después del chequeo, no se escribe nada afuera; un link que queda adentro reemplaza
+    /// donde lleva, y no deja temporales.
+    #[test]
+    fn the_replace_is_judged_where_the_folder_really_is() {
+        let d = std::env::temp_dir().join(format!("synsema-e8-write-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("proj/sub")).unwrap();
+        std::fs::create_dir_all(d.join("proj/otra")).unwrap();
+        std::fs::create_dir_all(d.join("afuera")).unwrap();
+        std::fs::write(d.join("proj/sub/f.txt"), "viejo").unwrap();
+        std::fs::write(d.join("afuera/f.txt"), "INTACTO").unwrap();
+        let root = d.to_string_lossy().replace('\\', "/");
+        let caps = Rc::new(RefCell::new(CapabilitySet::new("t")));
+        caps.borrow_mut().grant(Capability::new(CapabilityType::FileWrite, Some(format!("{}/proj/**", root))));
+        let path = format!("{}/proj/sub/f.txt", root);
+        let tys = [CapabilityType::FileWrite];
+        // Sin link: reemplaza, y no queda ningún temporal.
+        wrote(atomic_write(&caps, &path, b"nuevo", &tys, "write_file()"));
+        assert_eq!(std::fs::read_to_string(d.join("proj/sub/f.txt")).unwrap(), "nuevo");
+        assert_eq!(std::fs::read_dir(d.join("proj/sub")).unwrap().count(), 1);
+        // La carrera: pasó el chequeo y la carpeta pasa a ser un link afuera.
+        assert!(require(&caps, Capability::new(CapabilityType::FileWrite, Some(path.clone())), "write_file()").is_ok());
+        std::fs::remove_dir_all(d.join("proj/sub")).unwrap();
+        link_dir(&d.join("afuera"), &d.join("proj/sub"));
+        let m = denied_message(atomic_write(&caps, &path, b"PISADO", &tys, "write_file()"));
+        assert!(m.contains("a link (symlink or junction) on the way leads outside"), "{}", m);
+        assert_eq!(std::fs::read_to_string(d.join("afuera/f.txt")).unwrap(), "INTACTO");
+        assert_eq!(std::fs::read_dir(d.join("afuera")).unwrap().count(), 1);
+        // La carrera más fina: la carpeta ya se abrió y juzgó, y DESPUÉS se la mueve y en su lugar
+        // queda un link afuera. El reemplazo va relativo al handle: cae en la carpeta juzgada (ahora
+        // `sub_vieja`), no afuera.
+        std::fs::remove_dir_all(d.join("proj/sub")).ok();
+        let _ = std::fs::remove_file(d.join("proj/sub"));
+        std::fs::create_dir_all(d.join("proj/sub")).unwrap();
+        let recheck = |_: &str| -> Result<(), Control> { panic!("sin link no se vuelve a juzgar") };
+        let Ok(Some(dir)) = crate::nofollow::parent_checked(&path, &recheck) else { panic!("no abrió la carpeta") };
+        std::fs::rename(d.join("proj/sub"), d.join("proj/sub_vieja")).unwrap();
+        link_dir(&d.join("afuera"), &d.join("proj/sub"));
+        dir.replace_with(b"en la juzgada").unwrap();
+        drop(dir);
+        assert_eq!(std::fs::read_to_string(d.join("proj/sub_vieja/f.txt")).unwrap(), "en la juzgada");
+        assert_eq!(std::fs::read_to_string(d.join("afuera/f.txt")).unwrap(), "INTACTO");
+        assert_eq!(std::fs::read_dir(d.join("afuera")).unwrap().count(), 1);
+        // Lo mismo por `atomic_write` entera (ronda 1, E8-B3): la carpeta se mueve entre que se abre y
+        // juzga y el reemplazo.
+        let _ = std::fs::remove_dir(d.join("proj/sub"));
+        let _ = std::fs::remove_file(d.join("proj/sub"));
+        std::fs::create_dir_all(d.join("proj/sub")).unwrap();
+        let dd = d.clone();
+        BETWEEN.with(|b| {
+            *b.borrow_mut() = Some(Box::new(move || {
+                std::fs::rename(dd.join("proj/sub"), dd.join("proj/sub_vieja2")).unwrap();
+                link_dir(&dd.join("afuera"), &dd.join("proj/sub"));
+            }))
+        });
+        wrote(atomic_write(&caps, &path, b"en la juzgada 2", &tys, "write_file()"));
+        assert_eq!(std::fs::read_to_string(d.join("proj/sub_vieja2/f.txt")).unwrap(), "en la juzgada 2");
+        assert_eq!(std::fs::read_to_string(d.join("afuera/f.txt")).unwrap(), "INTACTO");
+        assert_eq!(std::fs::read_dir(d.join("afuera")).unwrap().count(), 1);
+        // Un link que queda adentro: reemplaza donde lleva.
+        let _ = std::fs::remove_dir(d.join("proj/sub"));
+        let _ = std::fs::remove_file(d.join("proj/sub"));
+        link_dir(&d.join("proj/otra"), &d.join("proj/sub"));
+        wrote(atomic_write(&caps, &path, b"por el link", &tys, "write_file()"));
+        assert_eq!(std::fs::read_to_string(d.join("proj/otra/f.txt")).unwrap(), "por el link");
+        assert_eq!(std::fs::read_dir(d.join("proj/otra")).unwrap().count(), 1);
+        // Reemplazar un archivo abierto por otro (lectores sin compartir borrado no lo traban).
+        let held = std::fs::File::open(d.join("proj/otra/f.txt")).unwrap();
+        wrote(atomic_write(&caps, &path, b"con un lector", &tys, "write_file()"));
+        drop(held);
+        assert_eq!(std::fs::read_to_string(d.join("proj/otra/f.txt")).unwrap(), "con un lector");
         let _ = std::fs::remove_dir_all(&d);
     }
 }

@@ -1,0 +1,9 @@
+let x be 0
+let i be 0
+while i < 90000
+    set x to 5
+    set x to 5
+    set x to 5
+    set x to 5
+    set i to i + 1
+print("ok")

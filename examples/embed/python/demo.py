@@ -45,7 +45,13 @@ class FileKv:
 
 
 def http(req):
-    """El `http` del host: urllib síncrono. El programa ya pasó el gate `require net`."""
+    """El `http` del host: urllib síncrono. El programa ya pasó el gate `require net`.
+
+    v0.6.46: en nativo, un `net` con comodín sólo llega a IPs públicas; acá la conexión es del host y
+    el motor no ve la IP. Si el programa no es tuyo, resolvé el nombre, negá loopback, redes privadas
+    y `169.254.169.254` (la lista está en `Host.http` de packages/synsema-wasm/index.d.ts) y conectá
+    a la IP que chequeaste. Este demo no lo hace: corre un programa propio.
+    """
     data = req.get("body")
     r = urllib.request.Request(req["url"], method=req["method"], data=data.encode() if data else None)
     for k, v in req["headers"]:

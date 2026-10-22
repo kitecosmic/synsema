@@ -534,8 +534,10 @@ pub fn parse_multipart(boundary: &str, body: &[u8]) -> Vec<FormPart> {
 
 /// v0.6.42 — destino de un `proxy to` que la ruta decidió al correr.
 pub enum ProxyDest {
-    /// `http://host[:puerto][/base]` (el `net` ya se chequeó por request).
-    Url(String),
+    /// `http://host[:puerto][/base]` (el `net` ya se chequeó por request). v0.6.46 (E7): con las
+    /// capas de `net` del programa, la IP resuelta se chequea al conectar; `None` es una ruta que
+    /// armó el host en Rust (su configuración, fuera de la regla).
+    Url(String, Option<std::sync::Arc<synsema_capabilities::model::NetLayers>>),
     /// Un extremo de `pipe()`, ya sacado del hub del worker (en el server nativo es un
     /// `synsema_stdlib::pipe::PipeEnd`; type-erased para que este módulo siga siendo puro).
     Conn(Box<dyn std::any::Any + Send>),
@@ -605,6 +607,8 @@ pub struct RouteSpec {
     pub timeout: Option<f64>,
     /// Lote 2 — reverse proxy: si está, la route forwardea al upstream (URL base).
     pub proxy_target: Option<String>,
+    /// v0.6.46 (E7): las capas de `net` del programa para `proxy_target` (ver `ProxyDest::Url`).
+    pub proxy_net: Option<std::sync::Arc<synsema_capabilities::model::NetLayers>>,
     /// v0.6.42 — el cuerpo tiene un `proxy to` que se decide al correr (destino por request,
     /// o un `proxy to` después de otras sentencias): la ruta es de proxy para el transporte
     /// (reserva el upgrade de WebSocket), pero corre su handler.

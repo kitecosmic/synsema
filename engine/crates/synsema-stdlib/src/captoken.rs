@@ -50,7 +50,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 
-use synsema_capabilities::model::{capability_type_from_name, is_process_local, Capability, CapabilitySet, Delegation};
+use synsema_capabilities::model::{capability_type_from_name, is_process_local, Capability, CapabilitySet, CapabilityType, Delegation};
 use synsema_core::bytesutil::{b64url_decode, b64url_encode};
 use synsema_core::interpreter::{Control, Interpreter, RuntimeError};
 use synsema_core::secret::constant_time_eq;
@@ -1313,6 +1313,94 @@ pub fn install_ceiling_hook(interp: &mut Interpreter, caps: Rc<RefCell<Capabilit
             Ok(())
         }
     }));
+}
+
+/// v0.6.46 (E3): `declassify` como capability, igual en el nativo y en wasm. Concede la de
+/// ambiente (sin techo, sin scope; con techo, lo que el techo nombra) y cablea el gate: cada
+/// principal que la llamada quita tiene que estar cubierto por `declassify(P)`. La entrada de
+/// audit nombra el conjunto DECLARADO (el real variaría con el valor elegido); bajo una rama
+/// privada `push_audit` la descarta, como a toda entrada.
+pub fn install_declassify_hook(interp: &mut Interpreter, caps: Rc<RefCell<CapabilitySet>>) {
+    caps.borrow_mut().grant_ambient_declassify();
+    interp.set_declassify_cap_hook(Rc::new(move |removed, declared| {
+        let mut cs = caps.borrow_mut();
+        let ok = removed
+            .iter()
+            .all(|p| cs.check_silent(&Capability::new(CapabilityType::Declassify, Some(p.to_string()))));
+        cs.push_audit(synsema_capabilities::model::CapabilityAuditEntry {
+            capability: Capability::new(CapabilityType::Declassify, Some(declared.to_string())),
+            granted: ok,
+            source: "declassify()".to_string(),
+            reason: if ok { "Granted (declared set)".to_string() } else { "declassify is not granted".to_string() },
+            origin: "program",
+        });
+        ok
+    }));
+}
+
+/// v0.6.46 (E5): el permiso de mandarle datos privados a un modelo, igual en el nativo y en wasm.
+/// `endpoint(judge)` dice a qué host va ESTA llamada (`local`, `embedder` o el host del provider;
+/// `judge` = el provider del juez). Por cada principal P, el techo del host tiene que nombrar
+/// `llm=P@<host>` (`judge=` para el juez; sin techo, no) y el programa tener `llm(P)`, que los
+/// `sandbox under` y un `sandbox` acotan como a todo grant. Una entrada de audit por llamada, con
+/// el conjunto declarado y el host; bajo una rama privada no hay llamada (el core la corta antes).
+pub fn install_llm_data_hook(
+    interp: &mut Interpreter,
+    caps: Rc<RefCell<CapabilitySet>>,
+    endpoint: Rc<dyn Fn(bool) -> String>,
+) {
+    interp.set_llm_data_hook(Rc::new(move |op, principals, declared, judge| {
+        let ty = if judge { CapabilityType::Judge } else { CapabilityType::Llm };
+        let host = endpoint(judge);
+        let mut cs = caps.borrow_mut();
+        let ok = principals.iter().all(|p| {
+            let c = Capability::new(ty, Some(format!("{}@{}", p, host)));
+            cs.ceiling_names(&c) && cs.check_silent(&c)
+        });
+        cs.push_audit(synsema_capabilities::model::CapabilityAuditEntry {
+            capability: Capability::new(ty, Some(format!("{}@{}", declared, host))),
+            granted: ok,
+            source: "llm-data".to_string(),
+            reason: if ok { op.to_string() } else { format!("{}: not in the host ceiling or not required", op) },
+            origin: "program",
+        });
+        ok
+    }));
+}
+
+/// v0.6.46 (E3b): registra los módulos de confianza del host (nombre, fuente) y el hook de su
+/// scope, igual en el nativo y en wasm. `ceiling` es el techo de confianza (`--trusted-cap-set`);
+/// sin él, una task de confianza tiene lo que declara. El scope se apila: una tool de confianza
+/// que llama a otra entra y sale en orden.
+pub fn install_trusted_modules(
+    interp: &mut Interpreter,
+    caps: Rc<RefCell<CapabilitySet>>,
+    modules: &[(String, String)],
+    ceiling: Option<Vec<Capability>>,
+) {
+    let ceiling = ceiling.map(Rc::new);
+    let saved: Rc<RefCell<Vec<synsema_capabilities::model::TrustedSaved>>> = Rc::new(RefCell::new(Vec::new()));
+    let hook: synsema_core::interpreter::TrustedScopeHook = Rc::new(move |enter| {
+        let mut cs = caps.borrow_mut();
+        match enter {
+            Some((module, declared)) => {
+                let declared: Vec<Capability> = declared
+                    .iter()
+                    .filter_map(|(n, s)| capability_type_from_name(n).map(|ty| Capability::new(ty, s.clone())))
+                    .collect();
+                let s = cs.enter_trusted_scope(module, ceiling.clone(), &declared);
+                saved.borrow_mut().push(s);
+            }
+            None => {
+                if let Some(s) = saved.borrow_mut().pop() {
+                    cs.leave_trusted_scope(s);
+                }
+            }
+        }
+    });
+    for (name, source) in modules {
+        interp.set_trusted_module(name, source, hook.clone());
+    }
 }
 
 #[cfg(test)]

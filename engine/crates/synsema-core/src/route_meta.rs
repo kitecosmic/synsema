@@ -91,6 +91,8 @@ pub struct ServeInfoStatic {
     pub bind: Option<String>,
     pub private: bool,
     pub docs_off: bool,
+    /// v0.6.46 (C5): `discovery off`.
+    pub discovery_off: bool,
     pub has_auth_handler: bool,
 }
 
@@ -168,6 +170,7 @@ pub const BUILTIN_CAPS: &[(&str, &str)] = &[
     ("delete_file", "file.write"), ("delete_dir", "file.write"),
     ("zip_extract", "file.write"), ("tar_extract", "file.write"),
     ("zip_create", "file.read"), ("tar_create", "file.read"), ("cwd", "file.read"),
+    ("parquet_scan", "file.read"),
     ("run", "exec"), ("proc_spawn", "exec"),
     // tiempo y azar
     ("now", "time"), ("sleep", "time"),
@@ -179,6 +182,8 @@ pub const BUILTIN_CAPS: &[(&str, &str)] = &[
     ("llm_step", "llm"),
     // entorno y secretos
     ("env", "env"), ("secret", "secret"), ("reveal", "reveal"),
+    // v0.6.46 (E3): publicar un dato privado es una capability (sólo se chequea con etiquetas)
+    ("declassify", "declassify"),
     // memoria persistente del agente
     ("remember", "memory"), ("recall", "memory"), ("memory_summary", "memory"),
     ("add_rule", "memory"), ("check_rules", "memory"), ("get_rules", "memory"),
@@ -327,7 +332,7 @@ fn collect_caps(
 ) {
     let mut calls: Vec<String> = Vec::new();
     for stmt in body {
-        if let NodeKind::RequireStatement { capability, scope } = &stmt.kind {
+        if let NodeKind::RequireStatement { capability, scope, .. } = &stmt.kind {
             out.push(require_pair(capability, scope));
         }
         walk(stmt, &mut |n: &Node| match &n.kind {
@@ -413,7 +418,7 @@ fn task_table(program: &Program) -> HashMap<String, TaskSrc> {
             let requires = body
                 .iter()
                 .filter_map(|s| match &s.kind {
-                    NodeKind::RequireStatement { capability, scope } => Some(require_pair(capability, scope)),
+                    NodeKind::RequireStatement { capability, scope, .. } => Some(require_pair(capability, scope)),
                     _ => None,
                 })
                 .collect();
@@ -437,6 +442,10 @@ impl StaticProgram {
         let mut modules = HashMap::new();
         for stmt in &main.statements {
             if let NodeKind::UseImport { path, alias } = &stmt.kind {
+                // v0.6.46 (E3b): un módulo de confianza es del host (`--trusted`), no un archivo del proyecto.
+                if path.starts_with("trusted:") {
+                    continue;
+                }
                 let resolved = crate::templates::resolve_module_path(path, &base_dir, Some(&base_dir))
                     .map_err(|e| format!("{}: {}", file_path, e))?;
                 let src = match crate::bundle::get(&resolved) {
@@ -598,7 +607,7 @@ pub fn api_routes_static(sp: &StaticProgram) -> Result<Option<(ServeInfoStatic, 
     let serve = sp.main.statements.iter().find(|s| matches!(s.kind, NodeKind::ServeBlock { .. }));
     let Some(serve) = serve else { return Ok(None) };
     let NodeKind::ServeBlock {
-        auth_handler, rate_limit, describe, private, docs_off, routes, acme, bind, mounts, ..
+        auth_handler, rate_limit, describe, private, docs_off, discovery_off, routes, acme, bind, mounts, ..
     } = &serve.kind
     else {
         return Ok(None);
@@ -607,6 +616,7 @@ pub fn api_routes_static(sp: &StaticProgram) -> Result<Option<(ServeInfoStatic, 
     let mut info = ServeInfoStatic {
         private: *private,
         docs_off: *docs_off,
+        discovery_off: *discovery_off,
         has_auth_handler: auth_handler.is_some(),
         domain: text_of(acme.as_ref().and_then(|a| a.domain.as_deref())),
         bind: text_of(bind.as_deref()),

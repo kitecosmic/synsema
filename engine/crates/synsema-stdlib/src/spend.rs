@@ -268,6 +268,15 @@ pub fn sign_ceiling_reserve(
     let Some(&ceiling) = sign_ceilings().get(name) else {
         return Ok(());
     };
+    // v0.6.46 (E6): con el recibo sellado una firma corre en una rama privada, pero no una con techo
+    // de cantidad: el contador es del proceso, y que la próxima firma pública alcance o no diría
+    // cuántas se hicieron en la rama (el mismo oráculo que `spend`).
+    if synsema_core::labels::pc_private_now() {
+        return Err(Control::Error(RuntimeError::new(format!(
+            "label_violation: sign(\"{}\") counts against SYNSEMA_SIGN_CEILING, and here it runs in a branch decided by a private value — whether the next signature still fits would tell how many were made in the branch; decide with a public value, or declassify(<the condition>, \"<why it may be published>\") it first",
+            name
+        ))));
+    }
     let mut counts = lock_unpoisoned(sign_counts());
     let used = counts.get(name).copied().unwrap_or(0);
     if used + 1 > ceiling {

@@ -30,13 +30,26 @@ fn reject_code(v: &SynValue, who: &str, path: &str) -> Result<(), Control> {
             path,
             synsema_core::rng::code_noun(v)
         ))),
+        // v0.6.46 (E2, D8): un secret no se serializa a texto. Antes salía `"[redacted]"`: nunca
+        // filtraba el material, pero el programa recibía un marcador que podía mandar como si fuera
+        // el dato (el mismo principio de HB4; como `secrecy` en Rust, que no serializa un secreto
+        // sin un opt-in). El único borde que lo pone es el motor, en el socket.
+        SynValue::Secret(s) => Err(err(format!(
+            "{}: {} is secret({}), and a secret is never written as text — pass the value to the request \
+             itself (in a header; in the body or the URL once it is bound: `require secret(\"{}\") for \
+             net(\"host\")`) and the engine writes it at the socket, or leave it out of what you encode",
+            who,
+            path,
+            s.name(),
+            s.name()
+        ))),
         SynValue::List(l) => {
             // Una lista sin caja tiene números, no código: leerla con `list_values` la pasaba a
             // valores para siempre (×3 de memoria) antes de escribir nada.
             let b = l.borrow();
             let Some(xs) = b.as_values() else { return Ok(()) };
             for (i, x) in xs.iter().enumerate() {
-                if matches!(x, SynValue::Task(_) | SynValue::Builtin(_) | SynValue::List(_) | SynValue::Map(_)) {
+                if matches!(x, SynValue::Task(_) | SynValue::Builtin(_) | SynValue::Secret(_) | SynValue::List(_) | SynValue::Map(_)) {
                     reject_code(x, who, &format!("{}[{}]", path, i))?;
                 }
             }
@@ -44,7 +57,7 @@ fn reject_code(v: &SynValue, who: &str, path: &str) -> Result<(), Control> {
         }
         SynValue::Map(m) => {
             for (k, x) in m.borrow().iter() {
-                if matches!(x, SynValue::Task(_) | SynValue::Builtin(_) | SynValue::List(_) | SynValue::Map(_)) {
+                if matches!(x, SynValue::Task(_) | SynValue::Builtin(_) | SynValue::Secret(_) | SynValue::List(_) | SynValue::Map(_)) {
                     reject_code(x, who, &format!("{}[{:?}]", path, k))?;
                 }
             }
@@ -59,8 +72,8 @@ fn reject_code(v: &SynValue, who: &str, path: &str) -> Result<(), Control> {
 /// Wired desde wire_common_with_state (runtime) y desde synsema-wasm.
 pub fn register_json_builtins(interp: &Interpreter) {
     // json_encode(value) → text: serializa CUALQUIER valor a un string JSON. Mismo
-    // mapeo que los bodies de serve: secrets → "[redacted]" (seguro), bytes →
-    // base64, decimal exacto.
+    // mapeo que los bodies de serve, salvo los secrets: aquí son error (v0.6.46, D8);
+    // bytes → base64, decimal exacto.
     interp.register_builtin(
         "json_encode",
         1,

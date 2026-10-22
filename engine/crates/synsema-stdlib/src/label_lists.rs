@@ -22,7 +22,7 @@ pub const WASM_EXTRA_SINK_BUILTINS: &[&str] = &["sleep"];
 pub const LABEL_SINK_BUILTINS: &[&str] = &[
     // Archivos y procesos (synsema-capabilities/secure.rs, stdlib/proc.rs, watch.rs, term.rs)
     "write_file", "append_file", "edit_file", "delete_file", "delete_dir", "read_file", "read_file_bytes",
-    "list_dir", "file_exists", "file_info", "grep", "run", "run_program",
+    "list_dir", "file_exists", "file_info", "grep", "run", "run_program", "parquet_scan",
     "proc_spawn", "proc_send", "proc_close_stdin", "proc_kill", "proc_resize", "proc_wait", "proc_close",
     "watch", "watch_close", "term_open", "term_write", "term_close", "shutdown",
     // Red (stdlib/http.rs, ws.rs, webpush.rs, oidc.rs, blockchain_*_rpc.rs). `http` (el verbo
@@ -156,7 +156,7 @@ pub const LABEL_PURE_BUILTINS: &[&str] = &[
     "round_to", "rsa_verify_sha256", "schnorr_verify", "secp256k1_verify", "sha256", "sha512", "sha512_256",
     "shape", "sign", "sin", "sinh", "size", "slice", "solana_message", "solana_pda", "solana_tx", "solve",
     "spl_ata", "spl_transfer_checked_data", "spl_transfer_data", "split", "sqrt", "starts_with", "std",
-    "strip_ansi", "sum", "svd", "tan", "tanh", "text", "to_list", "toml_encode", "toml_parse", "totp",
+    "strip_ansi", "sum", "svd", "tan", "tanh", "text", "to_list", "toml_encode", "toml_parse", "tool_spec", "totp",
     "totp_verify", "trace", "transpose", "trim", "trunc", "tx_eip1559", "tx_eip1559_raw", "type_of", "unique",
     "upper", "values", "var", "verify_hmac", "webauthn_register", "webauthn_verify", "xml_parse", "zeros",
     "did_key_decode", "did_key_document", "did_key_encode", "document_sign", "document_verify",

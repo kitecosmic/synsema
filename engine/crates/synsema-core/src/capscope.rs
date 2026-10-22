@@ -2,6 +2,50 @@
 //! runtime (`synsema-capabilities`, `Capability::covers`) decide si un grant cubre una ruta.
 //! Viven acá para que `synsema check` (`codeintel`) use exactamente el mismo matcher.
 
+/// v0.6.46 (D4): los nombres que entiende un `require` (y `--cap-set`). Es la única lista: la de
+/// `synsema-capabilities` (`KNOWN_CAPABILITY_NAMES`) es esta misma, y su test exige que cada nombre
+/// tenga su `CapabilityType` y cada tipo su nombre acá.
+pub const KNOWN_CAPABILITY_NAMES: &str = "net, file, file.read, file.write, exec, env, time, random, stdout, stdin, llm, judge, db, serve, secret, reveal, sign, wallet, spend, memory, sandbox_run, attest, declassify";
+
+/// v0.6.46 (D4): ¿lo entiende un `require`? También `file_read`/`file_write`, la forma en que el
+/// audit los imprime.
+pub fn is_capability_name(name: &str) -> bool {
+    name == "file_read" || name == "file_write" || KNOWN_CAPABILITY_NAMES.split(", ").any(|k| k == name)
+}
+
+/// v0.6.46 (D4): el error de un `require` con un nombre que no existe, con el más cercano por
+/// distancia de edición si lo hay. Antes se ignoraba: `require nett("x")` no concedía nada y el
+/// programa fallaba lejos, con un error que no nombraba el typo.
+pub fn unknown_capability_error(name: &str) -> Option<String> {
+    if is_capability_name(name) {
+        return None;
+    }
+    let close = KNOWN_CAPABILITY_NAMES
+        .split(", ")
+        .map(|k| (edit_distance(name, k), k))
+        .min()
+        .filter(|(d, k)| *d <= 2.max(k.len() / 3));
+    let hint = close.map(|(_, k)| format!(" — did you mean `require {}`?", k)).unwrap_or_default();
+    Some(format!(
+        "unknown capability `{}` in `require`{}; a name that does not exist grants nothing. Known: {}",
+        name, hint, KNOWN_CAPABILITY_NAMES
+    ))
+}
+
+/// Distancia de Levenshtein por caracteres (para sugerir un nombre cercano).
+pub(crate) fn edit_distance(a: &str, b: &str) -> usize {
+    let b: Vec<char> = b.chars().collect();
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    for (i, ca) in a.chars().enumerate() {
+        let mut cur = vec![i + 1; b.len() + 1];
+        for (j, cb) in b.iter().enumerate() {
+            cur[j + 1] = (prev[j] + usize::from(ca != *cb)).min(prev[j + 1] + 1).min(cur[j] + 1);
+        }
+        prev = cur;
+    }
+    prev[b.len()]
+}
+
 /// `fnmatch` estilo Unix (case-sensitive, como el oráculo en Linux). Soporta `*`
 /// (cero o más) y `?` (uno). Los corchetes `[...]` se tratan literales (no aparecen
 /// en scopes de capability; el contrato sólo exige `*`). `pub` para reusar en el filtro
@@ -209,9 +253,60 @@ const MAX_LINK_HOPS: usize = 40;
 #[cfg(not(target_arch = "wasm32"))]
 pub fn physical_path(p: &str) -> Physical {
     match absolute_lexical(p) {
-        Some(abs) => resolve_physical(abs),
+        Some(abs) => match overridden(&abs) {
+            Some(real) => Physical::Path(real),
+            None => resolve_physical(abs),
+        },
         None => Physical::Unresolved,
     }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+thread_local! {
+    /// v0.6.46 (E8): (ruta léxica absoluta, dónde está de verdad) de un archivo YA ABIERTO. Mientras
+    /// dura `with_physical`, el chequeo de siempre juzga esa ruta por la ubicación real del handle,
+    /// no por una segunda resolución del nombre: lo que se juzga es lo que se va a leer o escribir.
+    static PHYSICAL_OVERRIDE: std::cell::RefCell<Option<(String, String)>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn overridden(abs: &str) -> Option<String> {
+    PHYSICAL_OVERRIDE.with(|o| o.borrow().as_ref().filter(|(k, _)| k == abs).map(|(_, v)| v.clone()))
+}
+
+/// v0.6.46 (E8): corre `f` (el chequeo de capabilities) juzgando la ruta `req` por `real`, la
+/// ubicación en disco de un handle ya abierto (sin links: la da el sistema). Restaura lo anterior.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn with_physical<T>(req: &str, real: &str, f: impl FnOnce() -> T) -> T {
+    struct Restore(Option<(String, String)>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let prev = self.0.take();
+            PHYSICAL_OVERRIDE.with(|o| *o.borrow_mut() = prev);
+        }
+    }
+    let key = absolute_lexical(req).unwrap_or_else(|| req.to_string());
+    let prev = PHYSICAL_OVERRIDE.with(|o| o.replace(Some((key, clean_verbatim(real)))));
+    let _r = Restore(prev);
+    f()
+}
+
+/// En wasm no hay disco que juzgar (`absolute_path` es `None` y nunca se llega acá con un handle).
+#[cfg(target_arch = "wasm32")]
+pub fn with_physical<T>(_req: &str, _real: &str, f: impl FnOnce() -> T) -> T {
+    f()
+}
+
+/// v0.6.46 (E8): la ruta absoluta léxica (cwd + ruta normalizada, sin tocar links), con `/`: la
+/// misma forma que juzga el chequeo, para abrirla sin seguir links.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn absolute_path(p: &str) -> Option<String> {
+    absolute_lexical(p)
+}
+
+#[cfg(target_arch = "wasm32")]
+pub fn absolute_path(_p: &str) -> Option<String> {
+    None
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -463,12 +558,23 @@ fn link_below_base(_base: &str, _req: &str) -> Option<bool> {
     Some(false)
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+fn has_override() -> bool {
+    PHYSICAL_OVERRIDE.with(|o| o.borrow().is_some())
+}
+
+#[cfg(target_arch = "wasm32")]
+fn has_override() -> bool {
+    false
+}
+
 /// v0.6.45 — ¿la ruta pedida queda, en disco, dentro del scope? La otra mitad de `path_covers`
 /// (que compara nombres): con un link debajo del scope que lleva afuera, por nombre está dentro y
 /// en disco no. Sin disco (wasm) decide el nombre; si algo no se puede resolver, no.
 pub fn path_within_physically(scope: &str, req: &str) -> bool {
     let (literal, _) = split_scope(scope);
-    if link_below_base(&literal, req) == Some(false) {
+    // v0.6.46 (E8): con la ubicación real de un handle (`with_physical`), sin el atajo por nombre.
+    if !has_override() && link_below_base(&literal, req) == Some(false) {
         return true;
     }
     match (physical_scope_parts(scope), physical_path(req)) {
@@ -572,5 +678,126 @@ mod physical_tests {
         println!("read_to_string {:.1} us | check depth 1 {:.1} us | check depth 2 {:.1} us", read, check1, check2);
         println!("depth 3 {:.1} us | depth 4 {:.1} us | depth 5 (camino lento) {:.1} us", c3, c4, c5);
         let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// v0.6.46 (E1): los hosts de un secret atado (`require secret("K") for net("h")`). Viven acá, con
+// el resto de los scopes, porque los usan core (`+` de dos secrets atados), el modelo de
+// capabilities (el techo `secret=K@h`) y stdlib (cada request).
+
+/// `host` o `host:puerto` → `(host, puerto)`; `[::1]:8545` lleva puerto y `::1` no. La misma
+/// partición que `split_net_scope` del modelo.
+pub fn split_host_port(scope: &str) -> (&str, Option<&str>) {
+    if let Some(inner) = scope.strip_prefix('[') {
+        if let Some((h, after)) = inner.split_once(']') {
+            return (h, after.strip_prefix(':').filter(|p| !p.is_empty()));
+        }
+    }
+    match scope.rsplit_once(':') {
+        Some((h, p)) if !h.contains(':') && !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()) => (h, Some(p)),
+        _ => (scope, None),
+    }
+}
+
+/// El scope de `net` que nombra un texto, como lo guarda `Capability::new`: de una URL, su host (y
+/// el puerto si lo escribe), sin credenciales, ruta ni query; un host suelto, en minúsculas.
+pub fn net_host_scope(s: &str) -> String {
+    if let Some((_, rest)) = s.split_once("://") {
+        let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+        let hostport = authority.rsplit('@').next().unwrap_or("");
+        let (h, p) = split_host_port(hostport);
+        let h = h.to_lowercase();
+        if h.is_empty() {
+            return "<no host>".to_string();
+        }
+        return match p {
+            Some(p) if h.contains(':') => format!("[{}]:{}", h, p),
+            Some(p) => format!("{}:{}", h, p),
+            None => h,
+        };
+    }
+    if s.starts_with('[') && s.ends_with(']') {
+        return s[1..s.len() - 1].to_lowercase();
+    }
+    s.to_lowercase()
+}
+
+/// ¿El host de una atadura (`api.x.com`, `*.x.com`, con puerto opcional) cubre el destino
+/// `host[:puerto]`? El destino también puede ser un patrón (al intersectar dos ataduras o
+/// comparar con el techo): `*.x.com` cubre `*.y.x.com`. Sin puerto en la atadura, cualquier
+/// puerto; con puerto, sólo ese.
+pub fn bound_host_covers(pattern: &str, dest: &str) -> bool {
+    let (ph, pp) = split_host_port(pattern);
+    let (dh, dp) = split_host_port(dest);
+    let host_ok = ph == dh || (ph.starts_with("*.") && dh.len() > ph.len() - 1 && dh.ends_with(&ph[1..]));
+    host_ok && (pp.is_none() || pp == dp)
+}
+
+/// La gramática de un host de atadura, más estricta que la de `net`: un host exacto o
+/// `*.dominio` (el `*` sólo como primera etiqueta entera), con puerto opcional. `None` si vale.
+pub fn bound_host_error(h: &str) -> Option<String> {
+    let (host, _) = split_host_port(h);
+    if host.is_empty() || host == "<no host>" {
+        return Some(format!("{:?} has no host", h));
+    }
+    if host == "*" || host == "*." {
+        return Some("binding a secret to every host is not binding it: name the host it goes to".to_string());
+    }
+    let rest = host.strip_prefix("*.").unwrap_or(host);
+    if rest.contains('*') || rest.contains('?') || rest.contains('[') {
+        return Some(format!(
+            "{:?}: a `*` may only be the whole first label (`*.example.com`), and nowhere else",
+            h
+        ));
+    }
+    if host.starts_with("*.") && !rest.contains('.') {
+        return Some(format!("{:?}: `*.{}` would cover a whole top-level domain; name the domain", h, rest));
+    }
+    None
+}
+
+/// Los destinos que cubren las dos ataduras a la vez (para `+` de dos secrets atados): un host de
+/// una que la otra cubre. Vacío = ninguna request puede llevar a los dos.
+pub fn intersect_bound(a: &[String], b: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for h in a.iter().filter(|h| b.iter().any(|p| bound_host_covers(p, h))) {
+        if !out.contains(h) {
+            out.push(h.clone());
+        }
+    }
+    for h in b.iter().filter(|h| a.iter().any(|p| bound_host_covers(p, h))) {
+        if !out.contains(h) {
+            out.push(h.clone());
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod bound_tests {
+    use super::*;
+
+    #[test]
+    fn bound_hosts_cover_and_intersect() {
+        assert!(bound_host_covers("api.x.com", "api.x.com"));
+        assert!(!bound_host_covers("api.x.com", "evil.com"));
+        assert!(!bound_host_covers("api.x.com", "api.x.com.evil.com"));
+        assert!(bound_host_covers("*.x.com", "a.b.x.com"));
+        assert!(!bound_host_covers("*.x.com", "x.com"));
+        assert!(!bound_host_covers("*.x.com", "evilx.com"));
+        assert!(bound_host_covers("localhost:8545", "localhost:8545"));
+        assert!(!bound_host_covers("localhost:8545", "localhost:9000"));
+        assert!(bound_host_covers("localhost", "localhost:9000"));
+        assert!(bound_host_covers("*.x.com", "*.y.x.com"));
+        assert!(!bound_host_covers("a.x.com", "*.x.com"));
+        let v = |xs: &[&str]| xs.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(intersect_bound(&v(&["a.x.com", "b.com"]), &v(&["*.x.com"])), v(&["a.x.com"]));
+        assert!(intersect_bound(&v(&["a.com"]), &v(&["b.com"])).is_empty());
+        assert!(bound_host_error("*").is_some());
+        assert!(bound_host_error("a*.x.com").is_some());
+        assert!(bound_host_error("*.com").is_some());
+        assert!(bound_host_error("*.x.com").is_none());
+        assert!(bound_host_error("api.x.com:443").is_none());
     }
 }

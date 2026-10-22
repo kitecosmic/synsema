@@ -83,9 +83,12 @@ fn memoized(inner: usvg::FallbackSelectionFn<'static>) -> usvg::FallbackSelectio
     })
 }
 
-/// La clave de una copia: SHA-256 de la principal, su índice, SHA-256 del respaldo y de los
-/// caracteres consultados. Con un hash que resiste colisiones: en un `serve` con fuentes de
-/// usuarios, una colisión hacía que el render de otro usara la copia de un atacante (ronda 2, B3).
+/// La clave de una copia: SHA-256 de la principal, su índice, SHA-256 del respaldo y de lo que la
+/// copia lleva (los pares carácter → glifo de su `cmap`). Con un hash que resiste colisiones: en un
+/// `serve` con fuentes de usuarios, una colisión hacía que el render de otro usara la copia de un
+/// atacante (ronda 2, B3). v0.6.46: antes la clave llevaba TODOS los caracteres del SVG (texto y
+/// marcado), así que cada request con otro texto rearmaba la copia aunque le faltaran los mismos
+/// glifos; ahora dos textos a los que les falta lo mismo comparten la copia.
 type Key = ([u8; 32], u32, [u8; 32], [u8; 32]);
 
 struct Copies {
@@ -107,7 +110,6 @@ fn sha(data: &[u8]) -> [u8; 32] {
 /// 1,1 M de consultas por par, y con una fuente armada cada consulta podía costar 65 535 lecturas).
 pub fn selector(chars: Arc<BTreeSet<char>>) -> usvg::FallbackSelectionFn<'static> {
     let default = memoized(usvg::FontResolver::default_fallback_selector());
-    let chars_sha = sha(chars.iter().collect::<String>().as_bytes());
     // (principal, respaldo) → la copia ya cargada en ESTA base; las copias, que nunca son
     // candidatas; y el SHA-256 de cada fuente (se calcula una vez por render).
     #[derive(Default)]
@@ -144,8 +146,7 @@ pub fn selector(chars: Arc<BTreeSet<char>>) -> usvg::FallbackSelectionFn<'static
         };
         let (Some(hb), Some(hf)) = (sha_of(base), sha_of(found)) else { return Some(found) };
         let Some(bi) = db.face(base).map(|f| f.index) else { return Some(found) };
-        let key: Key = (hb, bi, hf, chars_sha);
-        let Some(restricted) = restricted_copy(db, base, found, key, &chars) else {
+        let Some(restricted) = restricted_copy(db, base, found, (hb, bi, hf), &chars) else {
             // Ronda 4 (B3): el "no se copia" también se recuerda en este render (si no, cada consulta
             // volvía a parsear las dos fuentes).
             l.copies.insert((base, found), found);
@@ -166,12 +167,22 @@ pub fn selector(chars: Arc<BTreeSet<char>>) -> usvg::FallbackSelectionFn<'static
     })
 }
 
-/// La copia restringida de `found` frente a `base`, de la caché del proceso o armada ahora.
-fn restricted_copy(db: &Database, base: ID, found: ID, key: Key, chars: &BTreeSet<char>) -> Option<Arc<Vec<u8>>> {
+/// La copia restringida de `found` frente a `base`, de la caché del proceso o armada ahora. `fonts`
+/// es (SHA-256 de la principal, su índice, SHA-256 del respaldo). La cobertura (qué caracteres le
+/// faltan a la principal y tiene el respaldo) se consulta siempre —son a lo sumo `MAX_CHARS`
+/// búsquedas—; lo caro, reescribir la fuente, sólo sin copia guardada.
+pub(crate) fn restricted_copy(db: &Database, base: ID, found: ID, fonts: ([u8; 32], u32, [u8; 32]), chars: &BTreeSet<char>) -> Option<Arc<Vec<u8>>> {
+    let pairs = restricted_pairs(db, base, found, chars)?;
+    let mut h = Sha256::new();
+    for (cp, g) in &pairs {
+        h.update(cp.to_be_bytes());
+        h.update(g.to_be_bytes());
+    }
+    let key: Key = (fonts.0, fonts.1, fonts.2, h.finalize().into());
     if let Some(hit) = copies().lock().ok()?.map.get(&key).cloned() {
         return Some(hit);
     }
-    let bytes = Arc::new(restrict(db, base, found, chars)?);
+    let bytes = Arc::new(db.with_face_data(found, |data, _| replace_tables(data, &[(*b"cmap", cmap_format12(&pairs))]))??);
     if bytes.len() > CACHE_BYTES {
         return Some(bytes); // ronda 3 (B5): una copia más grande que el tope no se guarda
     }
@@ -245,7 +256,16 @@ fn cmap_is_sane(face: &ttf_parser::Face<'_>) -> bool {
 /// La fuente `found` con un `cmap` de sólo los caracteres de `chars` que `base` no tiene. Lo que el
 /// archivo DECLARA no se enumera (un grupo armado del formato 12 pedía miles de millones de
 /// vueltas), y una fuente con un cmap armado (demasiadas subtablas) no se copia.
+#[cfg(test)]
 pub(crate) fn restrict(db: &Database, base: ID, found: ID, chars: &BTreeSet<char>) -> Option<Vec<u8>> {
+    let pairs = restricted_pairs(db, base, found, chars)?;
+    db.with_face_data(found, |data, _| replace_tables(data, &[(*b"cmap", cmap_format12(&pairs))]))?
+}
+
+/// Lo que va en el `cmap` de la copia: los caracteres de `chars` que a `base` le faltan y `found`
+/// tiene, con su glifo en `found`. `None` si no se copia (colección, cmap insano, demasiados
+/// caracteres o nada que aportar).
+fn restricted_pairs(db: &Database, base: ID, found: ID, chars: &BTreeSet<char>) -> Option<Vec<(u32, u16)>> {
     db.with_face_data(base, |base_data, base_index| {
         let base_face = ttf_parser::Face::parse(base_data, base_index).ok()?;
         if chars.len() > MAX_CHARS || !cmap_is_sane(&base_face) {
@@ -271,7 +291,7 @@ pub(crate) fn restrict(db: &Database, base: ID, found: ID, chars: &BTreeSet<char
             if pairs.is_empty() {
                 return None;
             }
-            replace_tables(data, &[(*b"cmap", cmap_format12(&pairs))])
+            Some(pairs)
         })?
     })?
 }

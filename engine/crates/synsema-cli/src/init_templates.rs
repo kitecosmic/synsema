@@ -322,6 +322,17 @@ pub const ENV_EXAMPLE: &str = r#"# Config del proyecto — Synsema auto-carga el
 # Vale tambien dentro de un binario de `synsema build`; el flag --audit le gana:
 # SYNSEMA_AUDIT=json
 
+# Recibo SELLADO de `synsema run` y `synsema serve` (como --auditor): la publica X25519
+# (base64url) del auditor que designa el host. Con ella, lo que el programa hizo en una rama
+# decidida por un valor privado (firmas, reveal, chequeos de capability, lecturas) queda en un
+# sobre cifrado para el auditor, de tamano fijo, y el recibo sale ANTES que la salida (a stderr,
+# o a --receipt); bajo serve, uno por request, antes de la respuesta. Las claves se crean con
+# `synsema receipt keygen`; el auditor lo abre con `synsema receipt open`:
+# SYNSEMA_AUDITOR_KEY=
+# Bytes del texto plano del sobre (por defecto 65536). Lo que no entra se corta ADENTRO y se
+# cuenta; el tamano de afuera no cambia nunca:
+# SYNSEMA_RECEIPT_SEALED_BYTES=65536
+
 # ══ Attestation (TEEs) — `synsema serve --attested` / `synsema run --attest` / attest() ══
 
 # Driver de attestation: uno o una lista separada por comas (p. ej. `tsm,nitro-tpm`: un documento
@@ -417,6 +428,8 @@ const HELLO_SYN_PAST: &[&str] = &[
 
 /// sha256 de cada contenido histórico de `.env.example` (ver `InitFile::past`).
 const ENV_EXAMPLE_PAST: &[&str] = &[
+    // v0.6.46 (E6): antes de SYNSEMA_AUDITOR_KEY y SYNSEMA_RECEIPT_SEALED_BYTES (el recibo sellado).
+    "799983d1cb05caee3d92f6c37cdeec0756039bb6f780b58b1e353c55d0a692aa",
     // v0.6.43 (rama, tras la auditoria): SYNSEMA_ATTEST sin `nitro-tpm` ni la lista de drivers.
     "777291778c99d83e532e1b6ba08d0f5fbf9851b62652ab0904d9facc374952c5",
     // v0.6.42 (rama, tras la auditoria): decia que los hilos extra se retiran a los 60 s (se
@@ -1407,6 +1420,7 @@ mod tests {
             .chain(synsema_runtime::run_program::RUN_PROGRAM_ENV_VARS.iter())
             .chain(synsema_runtime::judge_provider::JUDGE_ENV_VARS.iter())
             .chain(crate::audit::HOST_ENV_VARS.iter())
+            .chain(crate::sealed_receipt::RECEIPT_ENV_VARS.iter())
             .copied()
             .collect();
         let mentioned = mentioned_vars(ENV_EXAMPLE);

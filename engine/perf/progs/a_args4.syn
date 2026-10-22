@@ -1,0 +1,9 @@
+task f(p0, p1, p2, p3)
+    give 1
+let x be 0
+let i be 0
+while i < 90000
+    set x to f(1, 1, 1, 1)
+    set x to f(1, 1, 1, 1)
+    set i to i + 1
+print("ok")

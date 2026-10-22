@@ -27,6 +27,7 @@ use std::rc::Rc;
 
 
 use synsema_capabilities::model::{normalize_path, Capability, CapabilitySet, CapabilityType};
+use synsema_capabilities::nofollow::{OpenFor, Refused};
 use synsema_core::interpreter::{Control, Interpreter, RuntimeError};
 use synsema_core::types::{syn_bytes, syn_list, syn_text, SynValue};
 
@@ -119,8 +120,15 @@ fn entries_arg(caps: &Rc<RefCell<CapabilitySet>>, v: Option<&SynValue>, who: &st
                     synsema_capabilities::secure::bundled_audit(caps, CapabilityType::FileRead, &path, &format!("{}()", who));
                     b.to_vec()
                 } else {
-                    require(caps, CapabilityType::FileRead, &path, &format!("{}()", who))?;
-                    std::fs::read(&path).map_err(|e| err(format!("{}: cannot read {}: {}", who, path, e)))?
+                    let source = format!("{}()", who);
+                    require(caps, CapabilityType::FileRead, &path, &source)?;
+                    // v0.6.46 (E8): sin ventana entre el chequeo y la apertura.
+                    let mut b = Vec::new();
+                    synsema_capabilities::secure::open_checked(caps, &path, OpenFor::READ, &[CapabilityType::FileRead], &source)
+                        .map_err(|r| refused(r, |e| format!("{}: cannot read {}: {}", who, path, e)))?
+                        .read_to_end(&mut b)
+                        .map_err(|e| err(format!("{}: cannot read {}: {}", who, path, e)))?;
+                    b
                 }
             }
             (None, Some(other)) => {
@@ -230,8 +238,17 @@ fn tar_create(caps: &Rc<RefCell<CapabilitySet>>, args: &[SynValue]) -> Result<Sy
 
 struct Extract {
     dest: PathBuf,
+    /// v0.6.46 (ronda 1 de cf1, N2): `dest` como lo escribió el programa: los `outputs` del recibo
+    /// nombran cada archivo así, igual que `write_file` (antes, la ruta normalizada y absoluta).
+    raw_dest: String,
     max_entries: u64,
     max_bytes: u64,
+}
+
+impl Extract {
+    fn as_written(&self, name: &str) -> String {
+        format!("{}/{}", self.raw_dest.trim_end_matches(['/', '\\']), name)
+    }
 }
 
 fn extract_args(args: &[SynValue], who: &str) -> Result<(Vec<u8>, Extract), Control> {
@@ -243,8 +260,8 @@ fn extract_args(args: &[SynValue], who: &str) -> Result<(Vec<u8>, Extract), Cont
         Some(other) => return Err(err(format!("{}: the archive must be bytes, got {}", who, other.type_name()))),
         None => unreachable!(),
     };
-    let dest = match args.get(1) {
-        Some(SynValue::Text(s)) if !s.trim().is_empty() => normalize_path(s.trim()),
+    let (dest, raw_dest) = match args.get(1) {
+        Some(SynValue::Text(s)) if !s.trim().is_empty() => (normalize_path(s.trim()), s.trim().to_string()),
         _ => return Err(err(format!("{}: dest must be a non-empty directory path", who))),
     };
     let opts = opts_arg(args.get(2), who, &["max_entries", "max_bytes"])?;
@@ -255,6 +272,7 @@ fn extract_args(args: &[SynValue], who: &str) -> Result<(Vec<u8>, Extract), Cont
         data,
         Extract {
             dest: PathBuf::from(dest),
+            raw_dest,
             max_entries: opt_limit(&opts, "max_entries", DEFAULT_MAX_ENTRIES, who)?,
             max_bytes: opt_limit(&opts, "max_bytes", DEFAULT_MAX_BYTES, who)?,
         },
@@ -294,14 +312,33 @@ fn read_capped<R: Read>(r: &mut R, remaining: u64, name: &str, who: &str, max_by
     Ok(buf)
 }
 
-fn write_entry(path: &Path, data: &[u8], who: &str) -> Result<(), Control> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| err(format!("{}: {}: {}", who, parent.display(), e)))?;
-    }
-    std::fs::write(path, data).map_err(|e| err(format!("{}: {}: {}", who, path.display(), e)))
+/// v0.6.46 (E8): como `write_file`: reemplazo atómico relativo a la carpeta ya juzgada (sin ventana
+/// entre el chequeo de `target_of` y la escritura, y un link con el nombre de la entrada se
+/// reemplaza, no se sigue).
+fn write_entry(caps: &Rc<RefCell<CapabilitySet>>, path: &Path, data: &[u8], who: &str) -> Result<(), Control> {
+    let p = normalize_path(&path.to_string_lossy());
+    synsema_capabilities::secure::atomic_write(caps, &p, data, &[CapabilityType::FileWrite], &format!("{}()", who))
+        .map_err(|r| refused(r, |e| format!("{}: {}: {}", who, path.display(), e)))
 }
 
+/// El error de una apertura chequeada: la negación tal cual, o el de E/S con el formato del builtin.
+fn refused(r: Refused<Control>, io: impl FnOnce(std::io::Error) -> String) -> Control {
+    match r {
+        Refused::Denied(c) => c,
+        Refused::Io(e) => err(io(e)),
+    }
+}
+
+/// Cada archivo que escribe una extracción (la ruta normalizada y los bytes), para los `outputs`
+/// del recibo (v0.6.46, C3).
+type Wrote<'a> = &'a mut dyn FnMut(&str, &[u8]);
+
+#[cfg(test)]
 fn zip_extract(caps: &Rc<RefCell<CapabilitySet>>, args: &[SynValue]) -> Result<SynValue, Control> {
+    zip_extract_to(caps, args, &mut |_, _| {})
+}
+
+fn zip_extract_to(caps: &Rc<RefCell<CapabilitySet>>, args: &[SynValue], wrote: Wrote) -> Result<SynValue, Control> {
     const F: &str = "zip_extract";
     let (data, x) = extract_args(args, F)?;
     let mut archive = zip::ZipArchive::new(Cursor::new(data)).map_err(|e| err(format!("{}: not a zip: {}", F, e)))?;
@@ -336,13 +373,19 @@ fn zip_extract(caps: &Rc<RefCell<CapabilitySet>>, args: &[SynValue]) -> Result<S
             std::fs::create_dir_all(&target).map_err(|e| err(format!("{}: {}: {}", F, target.display(), e)))?;
             continue;
         }
-        write_entry(&target, &buf, F)?;
+        write_entry(caps, &target, &buf, F)?;
+        wrote(&x.as_written(&name), &buf);
         written.push(syn_text(name));
     }
     Ok(syn_list(written))
 }
 
+#[cfg(test)]
 fn tar_extract(caps: &Rc<RefCell<CapabilitySet>>, args: &[SynValue]) -> Result<SynValue, Control> {
+    tar_extract_to(caps, args, &mut |_, _| {})
+}
+
+fn tar_extract_to(caps: &Rc<RefCell<CapabilitySet>>, args: &[SynValue], wrote: Wrote) -> Result<SynValue, Control> {
     const F: &str = "tar_extract";
     let (data, x) = extract_args(args, F)?;
     let raw: Vec<u8> = if data.len() >= 2 && data[0] == 0x1f && data[1] == 0x8b {
@@ -397,7 +440,8 @@ fn tar_extract(caps: &Rc<RefCell<CapabilitySet>>, args: &[SynValue]) -> Result<S
         if is_dir {
             std::fs::create_dir_all(&target).map_err(|e| err(format!("{}: {}: {}", F, target.display(), e)))?;
         } else {
-            write_entry(&target, &buf, F)?;
+            write_entry(caps, &target, &buf, F)?;
+            wrote(&x.as_written(&name), &buf);
             written.push(syn_text(name));
         }
     }
@@ -411,13 +455,21 @@ pub fn register_archive_builtins(interp: &Interpreter, caps: Rc<RefCell<Capabili
     }
     {
         let caps = caps.clone();
-        interp.register_builtin("zip_extract", -1, Rc::new(move |_i, a, _l| zip_extract(&caps, a)));
+        interp.register_builtin(
+            "zip_extract",
+            -1,
+            Rc::new(move |i, a, _l| zip_extract_to(&caps, a, &mut |p, d| i.record_output("zip_extract", p, d, "bytes"))),
+        );
     }
     {
         let caps = caps.clone();
         interp.register_builtin("tar_create", -1, Rc::new(move |_i, a, _l| tar_create(&caps, a)));
     }
-    interp.register_builtin("tar_extract", -1, Rc::new(move |_i, a, _l| tar_extract(&caps, a)));
+    interp.register_builtin(
+        "tar_extract",
+        -1,
+        Rc::new(move |i, a, _l| tar_extract_to(&caps, a, &mut |p, d| i.record_output("tar_extract", p, d, "bytes"))),
+    );
 }
 
 #[cfg(test)]

@@ -21,7 +21,8 @@ use synsema_core::judge::{
     argmax_id, JudgeAnswer, JudgeKind, JudgeRequest, JudgeResponse, ESCAPE_DESCRIPTION, ESCAPE_ID,
 };
 use synsema_llm::judge::{JudgeCall, JudgeProvider, MockJudgeProvider};
-use synsema_stdlib::http::http_request;
+// v0.6.46 (E7): requests del motor (la configuración del host), fuera de la regla de IPs privadas.
+use synsema_stdlib::http::host::http_request;
 use synsema_stdlib::secrets::EnvStore;
 
 use crate::llm_providers::resolve_knob;
@@ -286,6 +287,11 @@ impl WiredJudgeProvider {
         self.inner.calibrated()
     }
 
+    /// v0.6.46 (E5): el host del backend (ver [`JudgeProvider::endpoint`]).
+    pub fn endpoint(&self) -> String {
+        self.inner.endpoint()
+    }
+
     pub fn judge_for_interpreter(&self, req: &JudgeRequest) -> Result<Option<JudgeResponse>, String> {
         if let Some(cap) = self.budget {
             if judge_tokens_total() >= cap {
@@ -326,7 +332,9 @@ pub struct TypeSafeJudgeProvider {
 }
 
 impl TypeSafeJudgeProvider {
-    fn endpoint(&self) -> String {
+    /// La URL del pedido (no el host de [`JudgeProvider::endpoint`]; ronda 1, B3: tenían el mismo
+    /// nombre).
+    fn systemone_url(&self) -> String {
         format!("{}/v1/systemone", self.base_url)
     }
 
@@ -341,7 +349,7 @@ impl TypeSafeJudgeProvider {
 impl JudgeProvider for TypeSafeJudgeProvider {
     fn judge(&self, request: &JudgeRequest) -> JudgeCall {
         let body = build_body(request, &self.model).to_string();
-        let url = self.endpoint();
+        let url = self.systemone_url();
         let headers = self.headers();
         let mut attempt = 0u32;
         loop {
@@ -388,6 +396,10 @@ impl JudgeProvider for TypeSafeJudgeProvider {
 
     fn name(&self) -> String {
         "typesafe".to_string()
+    }
+
+    fn endpoint(&self) -> String {
+        crate::llm_providers::endpoint_host(&self.base_url)
     }
 }
 

@@ -6,6 +6,437 @@ Each says what changed, why, and what to write instead.
 
 Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the release date.
 
+## v0.6.46 — 2026-10-22
+
+**Behavior changes (read these first).**
+- **`json_encode`, `jsonl_encode`, `json_for_script` and `csv_encode` of a secret are an error.**
+  Before, the secret came out as `"[redacted]"`: the key never leaked, but the program got a
+  marker it could send on as if it were the data (in a body, in a file, to another agent). The
+  error names the secret and where it is (`json_encode: the value["auth"]["key"] is secret(K)…`).
+  Pass the secret to the request itself (a header, or the body or the URL once it is bound, see
+  New) and the engine writes it at the socket; or leave it out of what you encode.
+- **A list or a map with a secret inside, in a template hole, is an error.** `` `creds={creds}` ``
+  with `creds = {"k": secret(...)}` gave the text `creds={k: secret(K)}`: plain text that could end
+  up in a header or a URL with the placeholder instead of the key. Take the secret out on its own
+  (`` `{creds.k}` ``, which stays a secret) or use `bearer(...)`/`basic(...)`. A secret on its own
+  in a hole is unchanged.
+- **`declassify` and `private` can only be called by their name.** Reading them as a value is a
+  load error: an alias (`let d be declassify`), a list or map entry (`[declassify][0]`,
+  `{"k": declassify}`), an argument (`f(declassify, x)`), a returned value or a pipe through an
+  alias. Before, all of these published for real while `synsema code check --json` listed none of
+  them, so the review missed the call. A program that binds the name to a value
+  (`let private be 5`, a parameter called `private`) still loads; there, with labels on, a call
+  that does not use the name (`g(x, "why")` with `g` the builtin) fails at the call. The
+  `code check --json` inventory is now complete, and its `declassify_static_only` field is gone.
+  A bare key with one of these names (`{private: 1}`) is a load error too: a bare key evaluates the
+  name (v0.6.45 printed `{builtin:private: 1}`); write it quoted, `{"private": 1}`.
+- **`declassify` is a capability, and a host ceiling bounds it** (with `--labels`). Without a
+  ceiling nothing changes: the runtime grants it, like `unsafe` in your own Rust crate (explicit,
+  with its mandatory reason, and listed in full by `synsema code check --json`). With a ceiling
+  (`--cap-set`, `ceiling` in wasm) only the principals the ceiling names can be published:
+  `--cap-set stdout,declassify=clientes` lets `declassify` remove `clientes` and nothing else
+  (globs work, as for `secret`). **This breaks a program that runs under `--cap-set`, `--sandbox`
+  or `--deterministic` with `--labels` and declassifies:** add `declassify=<principal>` to the
+  ceiling (`--sandbox` and `--deterministic` never grant it). Inside a `sandbox` there is no
+  `declassify` unless `sandbox under {"declassify": "…"}` delegates it. A refusal is a
+  `label_violation` that `try`/`recover` cannot catch (whether it passes depends on the real label
+  of the value) and its message names the declared set, never the real one. Without `--labels` it is not checked:
+  `declassify` stays the identity. `require declassify("P")` is now understood (before it was
+  ignored), and a bare `require declassify` warns like a bare `require sign`. The Vela guest
+  (`synsema-vela-guest.wasm`) runs its app under `stdout,declassify=app` for this reason: its only
+  principal is `app`, and the app publishes its outcome codes and withdrawal receipts itself.
+- **A `net` grant with a wildcard reaches only public IP addresses.** `require net` without a
+  scope, `net("*")`, `net("*.x.com")`, a host ceiling `--cap-set net`, a `sandbox under` and a
+  capability token (`auth with`, `sandbox under verified`, the ceiling of `run_program`) with a
+  wildcard no longer reach loopback, the private networks (RFC 1918, CGNAT, ULA), link-local (with
+  the cloud metadata endpoint `169.254.169.254`), multicast or the documentation ranges. Before,
+  `net` compared only the name: `127.0.0.1.nip.io` or any name that resolved inside reached it.
+  The client resolves once, checks the address it is going to use and connects to that one (no
+  window for a DNS answer that changes in between); an IPv4 mapped or translated in IPv6 counts as
+  that IPv4. To reach a private address, every layer has to name it: the exact host
+  (`require net("db")`, `net("localhost")`), the address, or a CIDR that contains it
+  (`require net("10.0.0.0/8")`, which also covers a literal address inside it by name). A
+  `deny` of a CIDR set by an embedder (`CapabilitySet::deny`) now also stops a name that resolves
+  inside. The error names the line
+  to write: ``http_get(): `db` resolved to 10.0.0.5, a private address; a `net` grant with a
+  wildcard reaches only public addresses. Name it: `require net("db:5432")`…``. When the URL comes
+  from the configuration, name it from there: `require net(env("CONTROL_URL"))`. It applies to
+  `http`/`fetch` and the `http_*` builtins, `ws_connect` (and every reconnection), `tcp_connect`,
+  the blockchain RPC builtins, `push_send`, `oidc_verify` and `proxy to` (on every connection; the
+  client gets a 502 `proxy error: upstream not allowed` and the reason, with the address, goes to
+  the server's log). A secret bound to a host goes to a private address only if its binding names
+  it too. The engine's own requests (LLM and judge providers, the approval webhook, `synsema
+  update`, ACME) are the host's configuration and are not affected, and neither are the database
+  connections (`postgres`, `mysql`, `mongo`, `redis`), which come from the configuration. In
+  `@synsema/wasm` the connection belongs to the embedder's `http` hook and the engine does not see
+  the address: the hook has to resolve the name, check the address it connects to against the same
+  ranges (listed in `Host.http`) and connect to that one; it does not know whether the program
+  named the host.
+- **A `require` with a name that does not exist is a load error.** Before, `require nett("x")`
+  parsed and granted nothing, with no warning, and the program failed later with an error that
+  did not name the typo. Now the error names it and, when there is one, the closest real name:
+  ``unknown capability `nett` in `require` — did you mean `require net`?``, followed by the list
+  of known names. The same holds for a dotted name (`require file.raed(...)`) and for a `require`
+  inside a task or an agent. The audit form (`file_read`, `file_write`) still loads.
+- **The `http`, `http_bytes`, `http_post` and `http_put` builtins take one more optional argument,
+  `form`** (see New); a program never passed it, so nothing breaks, but a host that embeds the
+  engine and implements `http` receives a new field, **`redirect: "error"`, when the request carries
+  a secret** (in the URL, the query, the body or a header). A redirect would carry it to a host the
+  program never named (a cross-origin redirect in `fetch` drops `Authorization`, but not `X-Api-Key`
+  or any other header), and the native runtime does not follow redirects either; honor the field
+  (the browser `fetch` option of the same name does) or the protection is lost on that host. `examples/embed/node/demo.mjs` and `@synsema/wasm`'s types show
+  it.
+- **In wasm, `judge` checks its capability, and a `llm` hook that throws is an error.** A `judge`
+  block ran even when the `ceiling` did not grant `judge` (the native runtime always refused it);
+  now it is refused the same way. A host `llm` hook that threw gave the program an empty answer
+  with `ok: true`; now that call fails with the hook's message (or `the host's llm hook threw`;
+  redacted like any error when the call carried private data). The hook receives a third
+  argument, `{principals}` (see New).
+- **A recursive `watch` needs `file.read("<folder>/**")`, like `grep` and `static`.** A program that
+  watched a folder with `file.read("src")` (or `"src/*"`) no longer starts the watch: grant
+  `"src/**"` or pass `{"recursive": false}`. The grant was checked only on the root, so it reported
+  the names of files under `src/sub/`, which the program cannot read. A non-recursive `watch` still
+  needs only the folder (like `list_dir`). A root that is a file when the watch starts, without
+  the tree granted, is watched as `recursive: false`: if a folder replaces it, only its first level
+  is seen (before, the whole tree). A root that does not exist is an error, as before. A `deny`
+  the host sets inside the tree takes that part out of the watch: no entries and no events from
+  there.
+- **`run` and `proc_spawn` with `cwd` resolve a relative command against that folder, and that is
+  what the grant must name.** `run("./tool", [], 60, {"cwd": "sub"})` asks for `exec("./sub/tool")`
+  and runs that file, as `cd sub && ./tool` would. Before, it asked for `exec("./tool")` and which
+  file ran depended on the platform (the one in `sub` on Unix, the one next to the program on
+  Windows), so the grant did not say which file it allowed. A command without a separator (looked
+  up in `PATH`) or an absolute path is unchanged. **Breaking:** a grant written for the old form
+  has to name the path inside `cwd`. With `pty: true` on Windows, a path that does not exist as
+  written is an error: before, the terminal layer tried the `PATHEXT` extensions, so a grant for
+  `notes.txt` could run `notes.bat`, and an absolute path without an extension (`C:/x/node`) ran
+  `node.exe`; now name the file with its extension. A command without a separator (`notes`) is
+  still looked up with `PATHEXT`, and so is a path that disappears between the check and the
+  start.
+- **In `@synsema/wasm`, a host `kv` that fails or answers something else is an error, not "the key
+  is not there".** Before, each of these read as an absent key, and the next write replaced what the
+  host had stored:
+  - a `kv.get` that throws, or that returns something other than a string or `null` (a number, an
+    object already parsed);
+  - a stored value that is not JSON (cut half-way, or written by something else): `state_incr` over
+    it gave 1;
+  - a `kv.list` that throws or that returns something other than a list of strings (the
+    `{keys: [{name}]}` form of Cloudflare KV, a list of `{name}`, `undefined`): `state_all` gave
+    `{}`.
+
+  `state_get`, `state_incr`, `state_all`, `state_merge` and `state_cas` fail and say why. A
+  declared `memory` whose load fails, or whose stored memory or progress is not readable, is not
+  opened: its builtins fail and say why (before, it opened empty and the first `remember` replaced
+  it). The audit log of `reveal`, `sign`, `wallet` and `spend` is not written over either: if
+  reading it fails, the operation is refused (before, the log was replaced by one line and the
+  operation went on). **Breaking** for a host whose `kv.get` returns numbers or objects, or whose
+  `kv.list` returns another shape: return the stored text, and the list of key names. For an
+  embedder written in Rust, `HostProvider::kv_get` now returns
+  `Option<Result<Option<String>, String>>` and `kv_list` `Option<Result<Vec<String>, String>>`.
+
+**Security.**
+- **Dependencies with advisories updated:** `rustls-webpki` 0.103.16 (RUSTSEC-2026-0382, a
+  certificate chain could be accepted through a distrusted intermediate), and `webpki-roots` and
+  `webpki-root-certs` 1.0.10 (RUSTSEC-2026-0381 and 0383, distrusted emSign intermediates in the
+  bundled roots). `cargo audit` is clean.
+- **`receipt()` no longer publishes what depended on a private value** (with `--labels`). Three
+  leaks, all with the program counter public and no `label_violation`: `steps` was the raw count
+  (a loop with `when i < n` over a private `n` gave 222 or 378), now `nothing` once a private value
+  was seen; `inputs` counted the reads made in a branch decided by a private value, which are now
+  left out of the public lineage; and `declassified[].from` was the real label (`["a","c"]` or
+  `["b","c"]` by a private index), now the declared set, and a `declassify` inside a private branch
+  is left out of the list (and its `[INF] declassify` log line is not written), since how many
+  there were told which branch was taken.
+- **The prompt of `read_line(prompt)` is a public sink, like `print`** (with `--labels`). It was
+  printed as is: a private prompt came out in clear (the labelled dispatch hands the builtin its
+  arguments without labels), and so did a prompt inside a branch decided by a private value. Both
+  are a `label_violation` now. `read_line()` without a prompt in a private branch is still allowed.
+- **With `--labels`, `flush()` and `read_line` no longer write the pending output live.** `print`
+  already kept it until the end with labels on, but these two emptied it to stdout, so how many
+  lines came out before a prompt could depend on a private branch. The output now comes out at the
+  end, after the prompts; without `--labels` nothing changes.
+- **In `@synsema/wasm`, a run with `labels` that hits the memory limit reports `steps: null` and
+  `private_seen: true`.** Whether the run ran out of memory can depend on a private value (one bit
+  per run, like any error it causes), so the host treats that result as sensitive, the same as a
+  run that ended with `private_seen`.
+- **An LLM operation under a private branch no longer writes a "granted llm" audit entry before
+  failing** (with `--labels`). `reason`/`decide`/`analyze`/`generate`/`judge` checked the
+  capability first and the program counter second, so the audit said the call was allowed inside
+  a branch decided by a private value, which tells which branch ran. The program counter is
+  checked first now, and nothing is written.
+- **A link swapped between the check and the open no longer takes a file operation outside the
+  grant** (on Linux and Windows). v0.6.45 checked the path on disk and then opened it by name, so a
+  folder changed into a link in between was followed. Now the file is opened without following any
+  link (`openat2` with `RESOLVE_NO_SYMLINKS` on Linux, `NtCreateFile` with `OBJ_DONT_REPARSE` on
+  Windows): if it opens, it is the file the check judged. With a link on the way, it is opened
+  following it but without access to its data (`O_PATH` on Linux, its attributes only on Windows),
+  the same check runs again on where it really is, and only then the same file is reopened with the
+  access asked for: a FIFO or a device outside the grant is refused before it is opened. A link
+  that stays inside the grant still works, as in v0.6.45. To
+  replace a file (`write_file`, `edit_file`, `zip_extract`/`tar_extract`), the folder is opened the
+  same way and the temporary file, the rename and the cleanup all go relative to that folder, so the
+  name is never resolved again.
+  - It covers `read_file` (whole or a range of lines), `read_file_bytes`, `edit_file`,
+    `write_file`, `append_file`, `grep`, the files of `zip_create`/`tar_create` and the entries of
+    `zip_extract`/`tar_extract`, `mtls_identity`, the fonts of `svg_to_png`/`svg_to_pdf`, `render`
+    (and its `include`/`layout`) and the files of a `static` route (judged against the served
+    folder).
+  - `zip_extract` and `tar_extract` now write each entry like `write_file`: atomically (no half
+    file if it fails) and, when a link has the entry's name, the link is replaced instead of
+    written through.
+  - Cost, measured in release with the open alone: without a link on the way, +1 to +3 µs on
+    Windows (an open of 25 to 50 µs, depending on the antivirus) and +0.4 to +0.9 µs on Linux (a
+    4.5 µs open); with a link, one more open, the query of the real path and the check again
+    (Windows 66 → 131 µs and Linux 4.3 → 9.5 µs, without the check).
+  - What remains as in v0.6.45: `list_dir`, `file_exists`, `file_info`, `delete_file`,
+    `delete_dir`, the folders `write_file` creates when they are missing, and the PEM files of a
+    `tls cert … key …` block in `serve` (read by the TLS setup after the check); macOS, a Linux
+    kernel without `openat2` (before 5.6) or a container whose seccomp refuses it (Docker before
+    20.10), and UNC paths on Windows; and a hard link, which is not visible from its name.
+  - On Windows, a name the Win32 layer used to normalize is now opened as written: `a.txt.` and
+    `a.txt ` (a trailing dot or space) no longer open `a.txt`, and `…/CON` no longer opens the
+    device; they are "not found".
+- **A `static` route honours a `deny` the host sets.** A file under a denied path is a 404, and a
+  `deny` on the served folder itself (or on all of it) stops the server at start with a message.
+  Before, only the `file.read("<dir>/**")` grant was checked. The `deny` is judged again where the
+  file was opened, so a link swapped in between does not serve it. To deny a folder's content, deny
+  `<folder>/**` (as everywhere in the engine, `<folder>` alone names only the folder).
+- **`serve` checks the literal `render("…")` templates at start only with what the run may read.**
+  The check read and parsed each template and its `include`/`layout` files from the working
+  directory without the grant, so the start read files `render()` could not. Now each file passes
+  the same check as `render()` before it is opened. One the start cannot read yet (its
+  `require file.read` is inside the route) is not opened: a `note:` on stderr says so, and
+  `render()` checks it when the route runs, as before. A template inside the bundle of
+  `synsema build` does not need the grant. `synsema check` and `synsema build` still read them, as
+  tools of the project.
+- **`synsema code check` (and the `check` tool of `synsema-code` over MCP) shows the warnings of
+  `synsema check`**, with file and line: a call to a name that does not exist, a positional
+  `fetch(url, method, …)`, a third optional argument by position, a secret in a URL or body that is
+  not bound to a host, and the warnings of the static check (an alias that hides a module, a missing
+  export, a route that captures a reserved URL). Before, it only listed missing capabilities.
+- **SQLite says why it refuses `ATTACH` and `VACUUM INTO` a file.** The message now explains that a
+  query cannot open a database the program did not declare, and to use `db_open` (which needs
+  `require db(...)`). Before, it was SQLite's `not authorized`.
+- **`svg_to_png`/`svg_to_pdf` with `opts.fonts` reuse the restricted fallback copy across texts.**
+  The cache key had every character of the SVG (text and markup), so a server rendering a different
+  text per request rebuilt the copy each time. The key is now what the copy carries: two texts that
+  miss the same glyphs share it.
+- **A `serve` process sweeps the request-body spill folders that dead processes left in the temp
+  folder** (`synsema-spill-*`, after a kill or a crash), once, when it first spills a body. Only
+  real folders (not links), untouched for a day, with only files as old; on Unix, also of the same
+  owner and with mode `0700` (on Windows the temp folder is per user and neither is checked). The temporary
+  files of an atomic write (`<name>.<random>.synsema.tmp`) that a crash leaves next to the file are
+  not swept (it would cost a folder listing per write); they can be deleted.
+
+**New.**
+- **Sealed receipts for an auditor: `--auditor <X25519 public key>`** (or `SYNSEMA_AUDITOR_KEY`)
+  on `synsema run` and `synsema serve`, and `auditor` in wasm. With labels on, what a program does
+  in a branch decided by a private value had to be refused (a signature, a `reveal`, an audit line
+  would tell which branch ran). With an auditor the host designates, it runs, and what it leaves
+  goes into an envelope only the auditor can open: HPKE (RFC 9180, X25519 / HKDF-SHA256 /
+  AES-128-GCM) of a **fixed size** (`SYNSEMA_RECEIPT_SEALED_BYTES`, 64 KiB by default), so the
+  receipt is as long after 0 sealed entries as after 50. What does not fit is cut inside and
+  counted.
+  - The receipt is one JSON line: a header (engine, `program_sha`, `config_sha`, the signing key,
+    the auditor, a commitment to the run's seed), the public entries, the envelope, the root of a
+    hash chain over all the entries in run order, and a signature. Anyone can check it with
+    `synsema receipt verify` (on the file of `serve --receipt`, one receipt per line, it checks all
+    of them and names the lines that fail, also a line that begins like a receipt and is not one,
+    such as a receipt cut short; each receipt stands alone, so a receipt deleted whole from the
+    file, or cut before its first key, is not noticed); the auditor opens it with `synsema receipt open
+    <receipt> --key <private | @file> [--line N]`, which also checks the chain. `synsema receipt
+    keygen` makes the auditor's keys; with `--out <file>` the private key goes to a new file (0600
+    on Unix) and only the public one is printed.
+  - It is signed with the host's `SYNSEMA_IDENTITY_KEY` if there is one, with the attested key
+    under `serve --attested` (P-256; the same key the attestation document names), or with a key
+    made for the run (`"identity": "ephemeral"`). An ephemeral key only detects accidental damage:
+    whoever can change the receipt can make a new one, envelope and signature included. For tamper
+    evidence, use `SYNSEMA_IDENTITY_KEY`, `run --attest` or `serve --attested`.
+  - **It comes out before the output.** `run` writes it to stderr or to `--receipt <path|fd:N>`
+    and only then prints; with an auditor `print`, `flush()` and the prompt of `read_line` do not go
+    out live (`eprint` does: it is a sink, and it goes to stderr as it runs). A `--receipt` that
+    cannot be written, or an auditor key that cannot seal, is an error before the program runs
+    (and a receipt already in that file stays until a run writes its own).
+    `fd:N` is Unix only, and N is a descriptor the parent left open: the program's children
+    (`proc_spawn`, `run`) inherit it too. `run --format json` puts it first, as `receipt` (and also
+    writes it to `--receipt`); wasm returns it in `receipt`. A binary from `synsema build` reads
+    `SYNSEMA_AUDITOR_KEY` too.
+    `serve` writes one per request that runs program code, to stderr or appended to `--receipt`,
+    before the response; if it cannot be written the client gets a 500 instead. A `stream` or
+    `socket` route is a load error with an auditor (its body leaves while it runs).
+  - `reveal`, `sign` and the wallet operations run in a private branch; their audit line goes into
+    the envelope. **`spend` does not** (it spends a shared budget, and whether the next spend fits
+    would tell what the branch did), nor a signature that counts against `SYNSEMA_SIGN_CEILING`.
+  - The run's `random()` and `random_int()` come from a seed recorded in the envelope (each item
+    of a `parallel_map` has its own stream, also under `--replay`), and with labels the clock is
+    fenced (two `now()` in a private branch read the same time). The clock readings take at most a
+    quarter of the envelope; past that they are counted (`clock_truncated`) and never push out an
+    entry. Each reading is stored as text (`"1792711237.7256045"`), so it comes back bit for bit.
+    `synsema run --replay <opened receipt>` runs the program again with that seed and those clock
+    readings and stops, naming it, at the first input that differs. Keys and tokens
+    (`random_bytes`, `token`, key generation) still come from the OS and are not reproduced.
+  - **`run --attest` with an auditor binds the receipt's key:** `report_data` gets `sha256(run_key)`
+    at the end, and the JSON line carries `run_key`. Without an auditor `report_data` does not
+    change. A verifier of `run --attest` documents has to add it when `run_key` is present.
+  - **What it does not hide:** that the run touched private data (`steps: null` already says so);
+    the wall-clock time of the run (and, in wasm, when each host call arrives); and whether it
+    stopped on a limit (`maxSteps`, `maxMemoryMb`, a handler's `timeout`): one bit per run, or per
+    request. Under `serve`, a cron job or an agent outside a request has no receipt, so an audited
+    operation in a private branch there is still refused; so is one that an agent started by a
+    request (or by `run`) attempts after the receipt was built.
+- **A secret bound to a host: `require secret("K") for net("api.example.com")`.** APIs that take
+  the key in the URL (Alchemy, Infura, Telegram, Maps), in the query or in the body (OAuth
+  `client_secret_post`) were an error, and the only way out was `reveal()`. A bound secret goes in
+  the URL (`` `https://h/v2/{k}` ``), the query, a JSON body at any depth, a form or a header, only
+  to the hosts it names (several: `for net("a.x.com"), net("b.x.com")`; a subdomain wildcard
+  `*.x.com`), and only over https or wss (http and ws only to `127.0.0.1`, `localhost`, `::1`).
+  - The host of a request never comes from a secret: in a URL that is a secret, the scheme and
+    host have to be written out before it (`https://{k}.evil/`, `https://{k}@h/` and
+    `https://h{k}/` are errors).
+  - Adding two bound secrets keeps the hosts both allow (none in common is an error); `bearer`,
+    `basic` and `oauth_basic` keep the binding of what they wrap.
+  - An unbound secret still goes only in a header; in the URL, the query or the body the error now
+    gives the exact line, with the host: `require secret("K") for net("api.example.com")`.
+  - What the server echoes back (the body, the headers and the error of the response, a WebSocket
+    text frame, a JSON-RPC error) is masked: each secret that went out, as is, percent-encoded,
+    JSON-escaped or in base64, becomes `[secret K]`. It is a defense against an accidental echo,
+    not against a hostile server; the guarantee is the binding.
+  - The audit gets one entry per bound secret sent, `secret(K) → host` (source `bound-send`), and
+    `lineage()` (and the receipt's `inputs`) names the secrets of each request in `secrets`; never
+    the URL nor the value.
+  - The host ceiling can bind too: `--cap-set secret=K@api.example.com` (or a delegated ceiling,
+    `run_program`'s `ceiling`). A program that asks for `K` unbound, or bound to another host, gets
+    the line to write. A child whose ceiling asks for `K` unbound gets nothing above its parent's
+    binding.
+  - `evm_rpc` and the other JSON-RPC builtins, `algod`, `btc_rpc` and `ws_connect` take a bound
+    URL.
+  - `synsema check` warns an unbound secret that goes in the URL, the query, the body or the form of
+    a request, with the line to write.
+  - A secret derived from a bound one (`hkdf_sha256`, `hd_derive`) is a new secret and is not
+    bound; `as_secret` makes an unbound secret.
+- **Private data can reach a model the host chose, and the answer stays private** (with
+  `--labels`). Until now any private value in `reason`, `analyze`, `decide`, `generate`, `judge`,
+  `llm_step` or `llm_stream` was a `label_violation`. Now the program declares whose data it may
+  send (`require llm("customers")`, `require judge("customers")`) and the host allows it per
+  principal and per provider in its ceiling: `--cap-set "llm=customers@api.anthropic.com"` (the
+  host of `SYNSEMA_LLM_BASE_URL`, or the provider's default), `llm=customers@local` for a model in
+  the process (`SYNSEMA_LLM_PROVIDER=local`, the judge `laya`), `llm=customers@embedder` in wasm
+  (the host's `llm` hook). An item without a provider (`llm=customers`, `llm=*`) does not allow
+  private data; `llm=customers@*` allows any provider, written on purpose. An item with a scope
+  also allows the calls with public data, to whichever provider is configured. The program does not name the provider: the host picks it, and the
+  check follows the provider of each call (one that reloads its `.env` and changes host is checked
+  against the new one). A `decide` answered by the judge (`SYNSEMA_JUDGE_DECIDE`) is checked
+  against `judge=`. Without the ceiling item, or under a private branch, it is still a
+  `label_violation` and nothing is sent. With it, the prompt carries the data itself (before, the
+  few cases that got through sent `private(customers)`), the answer carries the label of what went
+  in (the whole map of `llm_step`, so choosing a tool with `r.name` needs a `declassify`, which
+  has its own ceiling; each chunk of `llm_stream`, whose callback runs under the label of the answer,
+  like the body of an `each` over a private list: how many chunks there were is private too, so a
+  public effect in it is a `label_violation`), and each call writes an audit entry
+  (`llm("customers@api.anthropic.com")`, source `llm-data`). In the receipt's lineage the answer
+  to a private prompt is hashed with the prompt's salt and its length is left out. A bare
+  `require llm` still means public data only, and `require llm("P")` now also covers public data
+  (before it broke every LLM operation). In wasm the `llm` hook gets a third argument,
+  `{principals}`, the owners of the private data in the prompt. **What this does not give:** the
+  provider sees the data (this allows a provider the host trusts; it does not protect the data
+  from it); what the model answers is private but not trusted (a `declassify` with its ceiling is
+  what stands between it and a sink); and the size of the prompt is visible on the network, as in
+  any `https` request.
+- **Trusted tools: the host loads a module of its own, and code it does not trust can only call
+  it.** `synsema run --trusted tools=./tools.syn app.syn` (repeatable; `trusted: {tools: source}`
+  in wasm) and, in the program, `use "trusted:tools" as t`. Each exported task of a trusted module
+  runs with **its own** `require` (bounded by `--trusted-cap-set`, `trusted_ceiling` in wasm, if
+  the host gives one) and nothing from the caller: not its grants, not its ceiling, not a
+  `sandbox`. So a program written by a model, under a ceiling without `declassify`, cannot publish
+  a customer's data, but it can call `t.reply(customer, text)`, whose policy (written by a person)
+  declassifies only the customer's own address. With `--trusted-cap-set`, a trusted task gets what
+  it declares (`require declassify("customers")`, `require net("mail.example.com")`) within that
+  ceiling; without it, it declassifies like a program without a ceiling (any principal), so give
+  the trusted modules a ceiling. Its arguments are data: a task, a lambda or a builtin among them
+  (also inside `ok(...)` or `content(...)`) is an error, since it would run with the tool's
+  capabilities. A trusted module sees the builtins and its own names, never the program's: a
+  program that defines `upper` before or after the `use` does not change what the tool runs. A
+  task of the program that would still run inside a tool (a callback such as the `on_reconnect` of
+  a WebSocket the program opened and passed to the tool) is an error there, not a call with the
+  tool's capabilities. And a
+  program cannot change a trusted module: `set t.x to …` changes only its own copy of the module's
+  exports, and another `use` sees the original. Its audit entries carry the module's name
+  (`trusted:tools`). A program cannot load a trusted module itself: the name comes only from the
+  host (an unknown one is a load error), and the program never sees the path. **What it does not
+  do yet:** inside a trusted tool, what would run in another interpreter next to the program's
+  names is an error (defining or spawning an agent, `parallel_map`, `cron_every`/`cron_after`, a
+  `use` of a file module; a trusted module can `use` another trusted one); so is `render` (with its
+  `include`s and layouts), since the template file lives where the program can write it and it would
+  run with the tool's capabilities: a tool builds its text itself. `--trusted` runs
+  under `synsema run` and `synsema test`, not `serve`. With trusted modules the whole program runs
+  on the tree-walker, without the bytecode VM.
+- **`form = {...}` in `http`, `http_bytes`, `http_post`, `http_put` and `fetch`** sends an
+  `application/x-www-form-urlencoded` body (the encoder of `oauth_basic`). Fields are text, a
+  number, a bool or a bound secret; `body` and `form` together are an error.
+- **`enumerate` takes an array** and walks its first axis, like `length(a)` and `a[i]`: each `item`
+  is a number (1-D) or the row. A 0-d array is an error that says so.
+- **Clearer errors.** `log(x)` says which logarithm to use (`ln`, `log10`, `log2`, `log_base`) and
+  that `log "message"` is the log statement; `in_units` with a number shows how to make the
+  duration (`in_units(duration(seconds = 90), "minutes")`). A named argument that a task or a
+  builtin does not have lists the ones it has and the closest one (`unknown parameter 'limt' —
+  did you mean 'limit'?; the parameters are: limit, offset`); before, a misspelled name on a task
+  said that the right one was missing.
+- **The receipt names what the run wrote.** `credentialSubject.outputs` lists each `write_file`,
+  `append_file`, `edit_file`, `zip_extract` and `tar_extract` with `source`, `what` (the path),
+  `sha256`, `bytes` and `encoding`, in order: a trained model written to disk is in the receipt
+  without hashing it by hand. `what` is the path as the program wrote it (for an extraction, the
+  destination as written plus the entry's name). `append_file` records the appended chunk;
+  `edit_file`, the file as it was left. What the workers of `parallel_map` read and write is
+  included, in the order of the items (their `inputs` were missing too), also when an item fails:
+  what the workers read and wrote until then stays in the receipt. Under `serve`, `inputs` and
+  `outputs` are those of the request (before, `inputs` also listed what earlier requests of the
+  same worker read, which could be another user's). The same in the handler mode of
+  `@synsema/wasm`: what the top-level read is no longer in the first request's receipt. The same cap as `inputs`, 10 000 entries;
+  `inputs_truncated`/`outputs_truncated` now mean that an entry was dropped (they were `true` with
+  exactly 10 000). With `--auditor`, each write also goes to the sealed receipt (`kind: "output"`),
+  in the order it happened: the writes of `parallel_map` workers, in the order they were made, not
+  of the items (as their `capability` entries).
+  A write under a private context is refused (writing is a public sink), so it never reaches
+  `outputs`. The `sha256` has no salt, as for `inputs`: after a `declassify`, the hash of a short
+  value (a PIN) can be guessed by trying. An `append_file` that fails half-way can leave bytes on
+  disk that are not listed.
+- **`parquet_scan(path, opts)`** reads a Parquet file from disk by parts: only the footer, the
+  row groups and the columns that `opts` asks for (`columns`, `row_groups`, `limit`, the same
+  options and the same checks against hostile files as `parquet_read`). It needs `file.read` and
+  is a lineage input with the path. `parquet_read(bytes)` is unchanged.
+- **`discovery off` in a `serve` block**, for an edge that only forwards with `proxy to`: the
+  server generates none of `/llms.txt`, `/openapi.json`, `/sitemap.xml`, `/robots.txt`, `/docs`,
+  the Agent Cards and `/.well-known/synsema-auth`, and they reach the program's routes like any
+  other URL (a `GET /*path` forwards them; without a route they are 404). Before, an edge had to
+  declare each reserved URL as a literal route, and every new one the engine added published the
+  edge's own page in silence. `private` keeps its meaning (it still answers `/robots.txt` and hides
+  `/.well-known/synsema-auth`). `/.well-known/attestation` is identity, not discovery: under
+  `--attested` it is still served and a route still cannot take it. Under `--attested`, a literal
+  route on a reserved URL is still a load error (a `GET /*path` does receive them).
+  `synsema openapi` still describes the routes: it is an offline tool you ask for.
+- **Types on task parameters: `task estado(id: text, items: bool = false)`.** The same five types as
+  `expect body` (`text`, `number`, `bool`, `list`, `map`); an unknown type, or a literal default of
+  another type, is a load error. They are metadata, checked only where arguments arrive as data:
+  `call(task, map)` and `call_tool(task, map)` reject a value of the wrong type or a missing typed
+  parameter without a default (`call_tool(add): 'a' must be number, got text`), strictly, without
+  converting; a normal call does not check them and costs nothing. A secret counts as `text`.
+  - `tool_spec(task, describe)` builds the `llm_step` catalog entry from the signature
+    (`{name, describe, params: ["a: number", …], optional: [...]}`), so the catalog is no longer
+    written by hand. A catalog parameter can be `"name: type"`, and `optional` takes names out of
+    `required`. The hosted providers (Anthropic, OpenAI-compatible) send each declared type in the
+    tool's JSON Schema; the `local` provider lists them in its prompt (`a (number)`,
+    `[optional]`). An argument the model returns for a typed parameter comes back with its type when
+    it decodes to that type (`2` and `"2"` both give the number 2; an argument for a `text`
+    parameter stays text); one that does not decode stays text and `call_tool` rejects it. A `null`
+    for an optional parameter, or for a typed one other than `text`, counts as not passed (the
+    default runs, or `call_tool` says it is missing). The model's JSON `null` and the text `"null"`
+    arrive the same, so `"null"` for an optional `text` parameter also runs the default. From the
+    program, `call_tool(f, {"n": nothing})` is still an error unless the default is `nothing`. Before, every argument arrived as text;
+    parameters without a type still do. A parameter whose default is `nothing` accepts `nothing`
+    in `call` and `call_tool`, and its `input_schema` has no `default`.
+  - `synsema code outline --json` publishes, per task, `parameters` (name, type, required, literal
+    default) and `input_schema` (the signature as JSON Schema); `params` is unchanged.
+
 ## v0.6.45 — 2026-10-20
 
 **Behavior changes (read these first).**

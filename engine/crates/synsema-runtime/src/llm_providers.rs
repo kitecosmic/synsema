@@ -30,7 +30,8 @@ use serde_json::{json, Map, Value};
 use synsema_llm::provider::{
     LLMProvider, LLMRequest, LLMResponse, LlmStep, LlmStepResponse, ToolSpec,
 };
-use synsema_stdlib::http::{http_request, http_request_stream};
+// v0.6.46 (E7): requests del motor (la configuración del host), fuera de la regla de IPs privadas.
+use synsema_stdlib::http::host::{http_request, http_request_stream};
 use synsema_stdlib::secrets::EnvStore;
 
 const ANTHROPIC_VERSION: &str = "2023-06-01";
@@ -102,11 +103,12 @@ fn stringify_json(v: &Value) -> String {
     }
 }
 
-/// `properties` de un input-schema: cada param → `{"type":"string"}`.
-fn string_properties(params: &[String]) -> Value {
+/// `properties` de un input-schema: cada param → `{"type": <su tipo>}` (`string` si el catálogo no
+/// declara uno; v0.6.46, F1).
+fn tool_properties(t: &ToolSpec) -> Value {
     let mut props = Map::new();
-    for p in params {
-        props.insert(p.clone(), json!({ "type": "string" }));
+    for (i, p) in t.params.iter().enumerate() {
+        props.insert(p.clone(), json!({ "type": t.schema_type(i) }));
     }
     Value::Object(props)
 }
@@ -253,8 +255,8 @@ pub fn build_anthropic_body(
                     "description": t.description,
                     "input_schema": {
                         "type": "object",
-                        "properties": string_properties(&t.params),
-                        "required": t.params,
+                        "properties": tool_properties(t),
+                        "required": t.required(),
                     }
                 })
             })
@@ -637,6 +639,10 @@ impl LLMProvider for AnthropicProvider {
         format!("anthropic:{}", self.model)
     }
 
+    fn endpoint(&self) -> String {
+        endpoint_host(&self.base_url)
+    }
+
     fn call_step(&self, request: &LLMRequest) -> LlmStepResponse {
         let prompt = request.data.get("prompt").cloned().unwrap_or_default();
         let context = request.data.get("context").cloned().unwrap_or_default();
@@ -739,8 +745,8 @@ pub fn build_openai_body(
                         "description": t.description,
                         "parameters": {
                             "type": "object",
-                            "properties": string_properties(&t.params),
-                            "required": t.params,
+                            "properties": tool_properties(t),
+                            "required": t.required(),
                         }
                     }
                 })
@@ -1113,6 +1119,10 @@ impl LLMProvider for OpenAIProvider {
 
     fn name(&self) -> String {
         format!("openai:{}", self.model)
+    }
+
+    fn endpoint(&self) -> String {
+        endpoint_host(&self.base_url)
     }
 
     fn call_step(&self, request: &LLMRequest) -> LlmStepResponse {
@@ -1613,6 +1623,9 @@ impl LLMProvider for ReloadingProvider {
     fn name(&self) -> String {
         self.current().name()
     }
+    fn endpoint(&self) -> String {
+        self.current().endpoint()
+    }
     fn call_step(&self, request: &LLMRequest) -> LlmStepResponse {
         self.current().call_step(request)
     }
@@ -1746,6 +1759,10 @@ impl LLMProvider for MeteredProvider {
         self.inner.name()
     }
 
+    fn endpoint(&self) -> String {
+        self.inner.endpoint()
+    }
+
     fn call_step(&self, request: &LLMRequest) -> LlmStepResponse {
         let _slot = match self.budget_slot() {
             Ok(s) => s,
@@ -1809,6 +1826,12 @@ fn resolve_llm_budget(store: &EnvStore) -> Option<u64> {
 // =========================================================
 // factory + selección por env
 // =========================================================
+
+/// v0.6.46 (E5): el host al que va un provider de red (sin esquema, userinfo ni puerto, en
+/// minúsculas). Un `base_url` sin host da `?`, que ningún techo con host nombra.
+pub(crate) fn endpoint_host(base_url: &str) -> String {
+    synsema_capabilities::secure::url_hostname(base_url).filter(|h| !h.is_empty()).unwrap_or_else(|| "?".to_string())
+}
 
 /// Construye un provider real por nombre (puro, testeable). `base_url=None` → el base
 /// oficial del provider. `None` si el nombre no es un provider soportado.
@@ -2424,6 +2447,27 @@ mod tests {
         );
     }
 
+    /// v0.6.46 (F1): el catálogo tipado llega al modelo como JSON Schema: cada tipo declarado, y
+    /// `required` sin los opcionales. Un parámetro sin tipo sigue siendo `string`.
+    #[test]
+    fn a_typed_catalog_publishes_its_schema() {
+        let tools = vec![ToolSpec {
+            name: "add".to_string(),
+            description: "adds".to_string(),
+            params: vec!["a".to_string(), "b".to_string(), "note".to_string()],
+            types: vec!["number".to_string(), "array".to_string(), String::new()],
+            optional: vec!["b".to_string()],
+        }];
+        let a: Value = serde_json::from_str(&build_anthropic_body("m", 64, "q", "", &tools, false)).unwrap();
+        let o: Value = serde_json::from_str(&build_openai_body("m", 64, "q", "", &tools, false)).unwrap();
+        for schema in [&a["tools"][0]["input_schema"], &o["tools"][0]["function"]["parameters"]] {
+            assert_eq!(schema["properties"]["a"]["type"], "number");
+            assert_eq!(schema["properties"]["b"]["type"], "array");
+            assert_eq!(schema["properties"]["note"]["type"], "string");
+            assert_eq!(schema["required"], serde_json::json!(["a", "note"]));
+        }
+    }
+
     // -- Anthropic: build_body --
 
     #[test]
@@ -2432,6 +2476,7 @@ mod tests {
             name: "get_weather".to_string(),
             description: "get the weather".to_string(),
             params: vec!["city".to_string()],
+            ..Default::default()
         }];
         let body =
             build_anthropic_body("claude-opus-4-8", 512, "What's the weather?", "", &tools, false);
@@ -2545,6 +2590,7 @@ mod tests {
             name: "get_weather".to_string(),
             description: "get the weather".to_string(),
             params: vec!["city".to_string()],
+            ..Default::default()
         }];
         let body = build_openai_body("gpt-4o", 256, "What's the weather?", "", &tools, false);
         let v: Value = serde_json::from_str(&body).unwrap();

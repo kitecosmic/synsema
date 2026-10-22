@@ -313,6 +313,8 @@ struct DialParams {
     /// Cuándo se abrió la primera conexión: un `attested.now` explícito avanza con el tiempo en
     /// cada reconexión (no se re-verifica días después con la hora de entonces).
     dialed_at: Instant,
+    /// v0.6.46 (E7): las ataduras de los secrets de la URL y los headers (ver `dest_check_with`).
+    bindings: Vec<String>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -366,6 +368,9 @@ struct Conn {
     /// Socket ENTRANTE (ruta `socket` de serve): sin reconexión posible (el peer es
     /// quien reconecta), `ws_stats.role = "server"`.
     server_side: bool,
+    /// v0.6.46 (E1): los secrets que salieron al conectar; un frame de texto que los ecoa llega
+    /// enmascarado.
+    mask: Option<Box<crate::http_common::Outgoing>>,
 }
 
 impl Conn {
@@ -607,6 +612,16 @@ fn establish(
         .map_err(|e| err(format!("ws_connect: cannot resolve {}: {}", dial.host, e)))?
         .next()
         .ok_or_else(|| err(format!("ws_connect: cannot resolve host {}", dial.host)))?;
+    // v0.6.46 (E7): la IP que se usa, chequeada antes de conectar, también en cada reconexión.
+    crate::http_common::dest_check_with(
+        &caps.borrow(),
+        &dial.bindings,
+        "ws_connect()",
+        // Ronda 1 (E7-M1): con los corchetes de una IPv6, como `http`/`tcp` (`::1:80` no nombraba nada).
+        &crate::http_common::dest_scope(&dial.host, dial.port),
+        sa.ip(),
+    )
+    .map_err(err)?;
     let tcp = StdTcp::connect_timeout(&sa, dial.connect_timeout)
         .map_err(|e| err(format!("ws_connect: cannot connect to {}: {}", addr, e)))?;
     let _ = tcp.set_read_timeout(Some(dial.connect_timeout));
@@ -833,7 +848,11 @@ impl WsRegistry {
                 Ok(Message::Text(t)) => {
                     let mut m = SynMap::new();
                     m.insert("type", syn_text("text"));
-                    m.insert("data", syn_text(t.as_str()));
+                    let data = match self.conns.get(&handle).and_then(|c| c.mask.as_ref()) {
+                        Some(o) => o.mask_text(t.as_str()),
+                        None => t.as_str().to_string(),
+                    };
+                    m.insert("data", syn_text(data));
                     if !self.enqueue(handle, syn_map(m)) {
                         self.overflow_fail(handle);
                         return false;
@@ -1526,17 +1545,14 @@ fn parse_connect_opts(v: Option<&SynValue>, fname: &str) -> Result<ConnectOpts, 
 // Builtins
 // =========================================================
 
-fn parse_headers(v: Option<&SynValue>, fname: &str) -> Result<Vec<(String, String)>, Control> {
+fn parse_headers(v: Option<&SynValue>, fname: &str, out: &mut crate::http_common::Outgoing) -> Result<Vec<(String, String)>, Control> {
     match v {
         None | Some(SynValue::Nothing) => Ok(Vec::new()),
-        Some(SynValue::Map(m)) => {
+        Some(SynValue::Map(_)) => {
             // Un secret (p.ej. bearer()) se materializa SÓLO en el borde del socket. HB4: sellado,
             // bytes no UTF-8, `nothing`, bytes, listas y mapas → error (no su forma impresa).
-            let mut out = Vec::new();
-            for (k, v) in m.borrow().iter() {
-                out.push((k.to_string(), crate::secrets::edge_text(v, fname, &format!("header {:?}", k.to_string()))?));
-            }
-            Ok(out)
+            // v0.6.46 (E1): uno atado, sólo a su host (`Outgoing::admit`).
+            Ok(crate::http_common::header_pairs_to(v, out)?.unwrap_or_default())
         }
         Some(other) => Err(err(format!("{}: headers must be a map, got {}", fname, other.type_name()))),
     }
@@ -1544,8 +1560,12 @@ fn parse_headers(v: Option<&SynValue>, fname: &str) -> Result<Vec<(String, Strin
 
 fn ws_connect(args: &[SynValue], reg: &Registry) -> Result<SynValue, Control> {
     const F: &str = "ws_connect";
-    let url = match args.first() {
-        Some(SynValue::Text(s)) => s.to_string(),
+    // v0.6.46 (E1): la URL es texto, o un secret atado con el host escrito antes (`wss://h/{key}`).
+    let (url, mut out) = match args.first() {
+        Some(v @ SynValue::Text(_)) | Some(v @ SynValue::Secret(_)) => {
+            let (_public, real, out) = crate::http_common::request_url(v, F)?;
+            (real, out)
+        }
         Some(other) => return Err(err(format!("{}: the URL must be text, got {}", F, other.type_name()))),
         None => return Err(err(format!("{}: missing the URL", F))),
     };
@@ -1562,7 +1582,7 @@ fn ws_connect(args: &[SynValue], reg: &Registry) -> Result<SynValue, Control> {
         }
     }
     let (host, port, tls) = parse_ws_url(&url, F)?;
-    let headers = parse_headers(args.get(1), F)?;
+    let headers = parse_headers(args.get(1), F, &mut out)?;
     let opts = parse_connect_opts(args.get(2), F)?;
 
     let dial = DialParams {
@@ -1576,6 +1596,7 @@ fn ws_connect(args: &[SynValue], reg: &Registry) -> Result<SynValue, Control> {
         connect_timeout: opts.timeout,
         tls_check: opts.tls_check,
         dialed_at: Instant::now(),
+        bindings: out.bindings().to_vec(),
     };
     match (&dial.tls_check, dial.tls) {
         (Some(crate::http_common::TlsCheck::Pin(_)), false) => {
@@ -1589,6 +1610,13 @@ fn ws_connect(args: &[SynValue], reg: &Registry) -> Result<SynValue, Control> {
     // establish() re-chequea net(host) (G21) y hace el handshake.
     let caps = reg.borrow().caps.clone();
     let (ws, negotiated, attested) = establish(&dial, &caps)?;
+    // v0.6.46 (E1): el audit de los secrets que salieron, y el eco enmascarado en los frames de texto.
+    let mask = if out.carries_secrets() {
+        out.audit(&caps);
+        Some(Box::new(out))
+    } else {
+        None
+    };
 
     let mut r = reg.borrow_mut();
     r.next_id += 1;
@@ -1622,6 +1650,7 @@ fn ws_connect(args: &[SynValue], reg: &Registry) -> Result<SynValue, Control> {
         closed_emitted: false,
         last_error: None,
         server_side,
+        mask,
     };
     r.conns.insert(handle, conn);
     r.token_to_handle.insert(token.0, handle);
@@ -1690,6 +1719,8 @@ fn run_pending(interp: &mut Interpreter, reg: &Registry, pending: Vec<PendingRec
         if reg.borrow().conns.contains_key(&p.handle) {
             // La task del usuario corre con permiso de CPU aunque estemos dentro de una espera.
             let _r = synsema_core::waiting::resumed();
+            // v0.6.46 (ronda 2): si el `ws_recv` corre dentro de una tool de confianza, una task
+            // que registró el programa es error acá (el chequeo de origen de `call_value`).
             interp.call_task(p.task, vec![syn_int(p.handle)])?;
         }
     }
@@ -2082,6 +2113,7 @@ pub fn adopt_server_socket(interp: &Interpreter, link: ServerSocketLink) -> Resu
             connect_timeout: Duration::from_secs(0),
             tls_check: None,
             dialed_at: Instant::now(),
+            bindings: Vec::new(),
         },
         negotiated_subprotocol: subprotocol,
         attested: None,
@@ -2104,6 +2136,7 @@ pub fn adopt_server_socket(interp: &Interpreter, link: ServerSocketLink) -> Resu
         closed_emitted: false,
         last_error: None,
         server_side: true,
+        mask: None,
     };
     r.conns.insert(handle, conn);
     r.token_to_handle.insert(token.0, handle);
@@ -2578,11 +2611,20 @@ fn proc_spawn(i: &Interpreter, args: &[SynValue], reg: &Registry) -> Result<SynV
             .collect::<Result<Vec<_>, _>>()?,
         Some(_) => return Err(err(format!("{}: args must be a list", F))),
     };
-    // Gate: exec(cmd) — el MISMO de run(); sandbox lo deniega.
+    // Gate: exec(cmd) — el MISMO de run(); sandbox lo deniega. Con `cwd`, el comando relativo se
+    // resuelve contra él (`exec_target`): el gate va después de leer las opciones.
+    let cwd_opt = match opt_map(args.get(2), F)? {
+        Some(m) => match m.get("cwd") {
+            Some(SynValue::Text(d)) => Some(d.to_string()),
+            _ => None,
+        },
+        None => None,
+    };
+    let (scope, cmd) = synsema_capabilities::secure::exec_target(&cmd, cwd_opt.as_deref());
     {
         let caps = reg.borrow().caps.clone();
         caps.borrow_mut()
-            .require(&Capability::new(CapabilityType::Exec, Some(cmd.clone())), "proc_spawn()")
+            .require(&Capability::new(CapabilityType::Exec, Some(scope)), "proc_spawn()")
             .map_err(|v| Control::Error(v.into_error()))?;
     }
     {
@@ -2671,6 +2713,14 @@ fn proc_spawn(i: &Interpreter, args: &[SynValue], reg: &Registry) -> Result<SynV
     }
     // F3: el hijo NO hereda los secretos de Synsema (mismo criterio que run()).
     opts.strip_env = i.sensitive_env().iter().cloned().collect();
+    // v0.6.46 (ronda 1 de cf1, B4): en Windows, `portable-pty` prueba las extensiones de `PATHEXT`
+    // cuando la ruta no existe tal cual: el gate juzgaba `notes.txt` y corría `notes.bat`. Una ruta
+    // (absoluta, o relativa ya resuelta por `exec_target`) tiene que existir exactamente, como en
+    // `run`.
+    #[cfg(windows)]
+    if opts.pty && cmd.contains(['/', '\\']) && !std::path::Path::new(&cmd).is_file() {
+        return Err(err(format!("{}: cannot start \"{}\": no such file (with pty, the exact name is run; no PATHEXT extension is added)", F, cmd)));
+    }
     let live = LiveProc::spawn(&cmd, &arg_list, opts).map_err(|e| err(format!("{}: {}", F, e)))?;
     let mut r = reg.borrow_mut();
     let w = r.waker.clone();
@@ -3059,6 +3109,31 @@ fn watch_open(args: &[SynValue], reg: &Registry) -> Result<SynValue, Control> {
         }
         if let Some(n) = opt_usize(&m, "max_queue", F)? {
             opts.max_queue = n;
+        }
+    }
+    // v0.6.46: mirar un árbol recursivo es leerlo entero, como `grep` y `static`: hace falta
+    // `file.read("<carpeta>/**")` (con el glob por segmentos, `file.read("src")` + `"src/*"` dejaba
+    // ver los eventos de `src/sub/`). Y un `deny` de adentro saca esa parte de la foto.
+    {
+        let caps = reg.borrow().caps.clone();
+        if opts.recursive {
+            let tree = Capability::new(CapabilityType::FileRead, Some(format!("{}/**", path.trim_end_matches('/'))));
+            if std::fs::metadata(&path).map(|m| m.is_dir()).unwrap_or(false) {
+                caps.borrow_mut().require(&tree, "watch()").map_err(|v| Control::Error(v.into_error()))?;
+            } else if !caps.borrow_mut().check_silent(&tree) {
+                // v0.6.46 (ronda 1 de cf1, B5): una raíz que hoy es un archivo puede ser una carpeta
+                // mañana. Sin el árbol concedido, se mira como `recursive: false` (lo que da
+                // `file.read("<ruta>")`, como `list_dir`): antes se recorría entera. Una raíz que no
+                // existe da error más abajo, al abrir (ronda 2, N1).
+                opts.recursive = false;
+            }
+        }
+        let denied = caps.borrow().denied_snapshot();
+        if !denied.is_empty() {
+            opts.skip = Some(Arc::new(move |p: &str| {
+                let c = Capability::new(CapabilityType::FileRead, Some(p.to_string()));
+                denied.iter().any(|d| d.covers_by_name(&c) || d.reaches_physically(&c))
+            }));
         }
     }
     let w = Watch::start(&path, opts).map_err(|e| err(format!("{}: {}", F, e)))?;

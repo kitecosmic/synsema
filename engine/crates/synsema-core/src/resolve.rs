@@ -295,7 +295,12 @@ impl Collector {
         // en el cuerpo (`exec_task_definition`).
         for stmt in body {
             match &stmt.kind {
-                NodeKind::RequireStatement { scope, .. } if kind == UnitKind::Task => self.opt(scope, cur, outer_unit),
+                NodeKind::RequireStatement { scope, bound_to, .. } if kind == UnitKind::Task => {
+                    self.opt(scope, cur, outer_unit);
+                    for h in bound_to.iter().flat_map(|v| v.iter()) {
+                        self.node(h, cur, outer_unit);
+                    }
+                }
                 _ => self.node(stmt, Some(s), unit),
             }
         }
@@ -463,7 +468,12 @@ impl Collector {
                     self.bind(cur, v);
                 }
             }
-            K::RequireStatement { scope, .. } => self.opt(scope, cur, unit),
+            K::RequireStatement { scope, bound_to, .. } => {
+                self.opt(scope, cur, unit);
+                for h in bound_to.iter().flat_map(|v| v.iter()) {
+                    self.node(h, cur, unit);
+                }
+            }
             K::SandboxBlock { body, under } => {
                 self.opt(under, cur, unit);
                 let s = self.new_scope(ScopeKind::Sandbox, cur, unit);
@@ -822,9 +832,12 @@ impl Resolver<'_> {
     fn function(&mut self, node: &Node, nparams: usize, body: &[Node], cur: Option<ScopeId>, is_task: bool) {
         let s = self.opened_by(node);
         for stmt in body {
-            if let NodeKind::RequireStatement { scope, .. } = &stmt.kind {
+            if let NodeKind::RequireStatement { scope, bound_to, .. } = &stmt.kind {
                 if is_task {
                     self.opt(scope, cur);
+                    for h in bound_to.iter().flat_map(|v| v.iter()) {
+                        self.node(h, cur);
+                    }
                 }
             }
         }
@@ -1004,7 +1017,12 @@ impl Resolver<'_> {
                     self.mark_bound(cur, v);
                 }
             }
-            K::RequireStatement { scope, .. } => self.opt(scope, cur),
+            K::RequireStatement { scope, bound_to, .. } => {
+                self.opt(scope, cur);
+                for h in bound_to.iter().flat_map(|v| v.iter()) {
+                    self.node(h, cur);
+                }
+            }
             K::SandboxBlock { body, under } => {
                 self.opt(under, cur);
                 let s = self.opened_by(n);

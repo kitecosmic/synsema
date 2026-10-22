@@ -114,7 +114,11 @@ fn fetch_jwks(
                 url
             )));
         }
-        let res = crate::http::http_request("GET", url, None, None, None, 10);
+        // v0.6.46 (E7): la conexión es del programa.
+        let res = {
+            let _net = crate::http_common::program_request(caps, "oidc_verify()", Vec::new());
+            crate::http::http_request("GET", url, None, None, None, 10)
+        };
         if !res.ok {
             return Err(err(format!(
                 "oidc_verify: could not fetch the JWKS from {} (status {}). The token was NOT verified.",

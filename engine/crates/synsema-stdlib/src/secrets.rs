@@ -310,9 +310,44 @@ pub(crate) fn edge_text(v: &SynValue, who: &str, what: &str) -> Result<String, C
     }
 }
 
+/// v0.6.46 (E1): un secret armado a partir de otros (`bearer`, `basic`): va sólo adonde pueden ir
+/// todos sus orígenes (la intersección de sus ataduras) y recuerda de qué secrets se armó (el
+/// audit y el eco los nombran).
+fn derived_secret(
+    name: String,
+    plaintext: String,
+    sources: &[&synsema_core::secret::SecretInner],
+    who: &str,
+) -> Result<SynValue, Control> {
+    let mut bound: Option<Vec<String>> = None;
+    for s in sources {
+        if let Some(b) = s.bound() {
+            bound = Some(match bound {
+                None => b.to_vec(),
+                Some(prev) => {
+                    let i = synsema_core::capscope::intersect_bound(&prev, b);
+                    if i.is_empty() {
+                        return Err(Control::Error(RuntimeError::new(format!(
+                            "{}: its secrets are bound to different hosts ([{}] and [{}]); no request can carry both",
+                            who,
+                            prev.join(", "),
+                            b.join(", ")
+                        ))));
+                    }
+                    i
+                }
+            });
+        }
+    }
+    let parts: Vec<(String, String)> = sources.iter().flat_map(|s| s.atoms()).collect();
+    Ok(SynValue::Secret(synsema_core::types::Obj::new(
+        synsema_core::secret::SecretInner::new(name, plaintext).with_binding(bound.map(Into::into), None, parts),
+    )))
+}
+
 /// `application/x-www-form-urlencoded` de un texto (RFC 6749 apéndice B / HTML): alfanuméricos y
 /// `*-._` tal cual, espacio → `+`, el resto `%XX` en mayúsculas sobre sus bytes UTF-8.
-fn form_urlencode(t: &str) -> String {
+pub(crate) fn form_urlencode(t: &str) -> String {
     let mut out = String::with_capacity(t.len());
     for b in t.bytes() {
         match b {
@@ -358,7 +393,14 @@ fn basic_header(args: &[SynValue], who: &str, oauth: bool) -> Result<SynValue, C
         ))));
     }
     let token = synsema_core::bytesutil::b64_encode(format!("{}:{}", user, password).as_bytes());
-    Ok(syn_secret(name.unwrap_or_else(|| who.to_string()), format!("Basic {}", token)))
+    let sources: Vec<&synsema_core::secret::SecretInner> = [arg(args, 0)?, arg(args, 1)?]
+        .into_iter()
+        .filter_map(|v| match v {
+            SynValue::Secret(s) => Some(&**s),
+            _ => None,
+        })
+        .collect();
+    derived_secret(name.unwrap_or_else(|| who.to_string()), format!("Basic {}", token), &sources, who)
 }
 
 /// Resuelve una variable: environ del proceso > `.env` > default (§2). `None` si
@@ -395,13 +437,22 @@ fn nothing_default(default: Option<&SynValue>) -> bool {
 /// sin `require` → el programa lo agrega (incl. el prefijo); declarada pero sobre el
 /// techo del host → lo dice, porque agregar el `require` que ya está no arregla nada
 /// (un agente que se auto-repara con el mensaje viejo entraba en loop).
-fn cap_denied(kind: &str, name: &str, cause: DenyCause) -> Control {
+fn cap_denied(kind: &str, name: &str, cause: DenyCause, bound_in_ceiling: Option<String>) -> Control {
     if let DenyCause::Delegated(_) = &cause {
         let ty = if kind == "env" { CapabilityType::Env } else { CapabilityType::Secret };
         let cap = Capability::new(ty, Some(name.to_string()));
         return Control::Error(CapabilitySet::violation(&cap, cause, "secret-builtin").into_error());
     }
     if cause == DenyCause::AboveCeiling {
+        // v0.6.46 (E1): el techo ata el secret a un host y el programa no lo ató (o lo ató a otro):
+        // esto sí lo arregla el programa, con la línea exacta.
+        if let Some(hosts) = bound_in_ceiling {
+            let nets = hosts.split('|').map(|h| format!("net(\"{}\")", h)).collect::<Vec<_>>().join(", ");
+            return Control::Error(RuntimeError::new(format!(
+                "{kind}(\"{name}\") not permitted: the host binds {name} to {hosts}; write `require secret(\"{name}\") for {nets}`",
+                hosts = hosts.replace('|', ", ")
+            )));
+        }
         return Control::Error(RuntimeError::new(format!(
             "{kind}(\"{name}\") not permitted: declared but above the host ceiling (--sandbox/--cap-set). The program cannot fix this; the host must widen the ceiling"
         )));
@@ -633,8 +684,12 @@ fn iso_now() -> String {
 /// v0.6.45 (ronda 3, M2) — la puerta de una operación que AUDITA, ANTES de todo lo demás: en una rama
 /// decidida por un valor privado no corre, y no deja rastro en ningún lado (ni el audit de
 /// capabilities del `check_cause`, ni el cupo de `SYNSEMA_SIGN_CEILING`, ni su propio log).
+///
+/// v0.6.46 (E6): con el recibo sellado, `sign`, `reveal` y las de wallet corren (su entrada va al
+/// sobre: `write_audit_op`). `spend` no, ni con auditor: gasta un cupo compartido, y después se ve si
+/// alcanza o no (un oráculo de la rama).
 pub fn audited_op_preflight(op: &str) -> Result<(), Control> {
-    if synsema_core::labels::pc_private_now() {
+    if synsema_core::labels::pc_private_now() && (op == "spend" || !synsema_core::sealed::active()) {
         return Err(Control::Error(RuntimeError::new(synsema_core::labels::audited_in_private_branch(op))));
     }
     Ok(())
@@ -751,8 +806,14 @@ fn write_audit_op(
     // entrada concedida ni la denegada): que exista ya revela la rama. La operación falla con
     // `label_violation`. Un recibo sellado de forma fija que audite igual sin revelar nada queda
     // para la versión siguiente.
-    if synsema_core::labels::pc_private_now() {
-        return Err(synsema_core::labels::audited_in_private_branch(op.split(' ').next().unwrap_or(op)));
+    //
+    // v0.6.46 (E6): ese recibo existe. Con el registro sellado activo, la línea va al sobre (nada al
+    // `.log` ni al sink del host durante la corrida) y la operación sigue. `spend` no llega acá en una
+    // rama privada (`audited_op_preflight`).
+    let private = synsema_core::labels::pc_private_now();
+    let op_name = op.split(' ').next().unwrap_or(op);
+    if private && (op_name == "spend" || !synsema_core::sealed::active()) {
+        return Err(synsema_core::labels::audited_in_private_branch(op_name));
     }
     let program = std::path::Path::new(&*loc.file)
         .file_stem()
@@ -771,6 +832,11 @@ fn write_audit_op(
         program,
         tail
     );
+    if private {
+        let entry = serde_json::json!({"kind": "op", "log": file, "line": line.trim_end()});
+        synsema_core::sealed::push_sealed(entry.to_string());
+        return Ok(());
+    }
     // Un host embebedor (wasm-web) puede ser el sink: kv/log del embebedor. Si está
     // instalado y lo ofrece, manda él — no hay filesystem del que hablar.
     if let Some(p) = crate::hostcap::provider() {
@@ -817,7 +883,7 @@ pub fn register_secret_builtins(
             Rc::new(move |_i, args, _loc| {
                 let name = raw_str(arg(args, 0)?);
                 if let Err(cause) = check_cap(&caps, Capability::new(CapabilityType::Env, Some(name.clone()))) {
-                    return Err(cap_denied("env", &name, cause));
+                    return Err(cap_denied("env", &name, cause, None));
                 }
                 match resolve(&env, &name, args.get(1)) {
                     Some(v) => Ok(syn_text(v)),
@@ -837,11 +903,27 @@ pub fn register_secret_builtins(
             -1,
             Rc::new(move |_i, args, _loc| {
                 let name = raw_str(arg(args, 0)?);
-                if let Err(cause) = check_cap(&caps, Capability::new(CapabilityType::Secret, Some(name.clone()))) {
-                    return Err(cap_denied("secret", &name, cause));
+                // v0.6.46 (E1): si el programa ató el secret (`require secret("K") for net(…)`), se
+                // pide con su atadura (es lo que el techo tiene que cubrir) y el valor la lleva.
+                let binding = caps.borrow().secret_binding(&name);
+                let scope = match &binding {
+                    Some(h) => format!("{}@{}", name, h),
+                    None => name.clone(),
+                };
+                if let Err(cause) = check_cap(&caps, Capability::new(CapabilityType::Secret, Some(scope))) {
+                    let in_ceiling = caps.borrow().ceiling_binding(&name);
+                    return Err(cap_denied("secret", &name, cause, in_ceiling));
                 }
                 match resolve(&env, &name, args.get(1)) {
-                    Some(v) => Ok(syn_secret(name, v)),
+                    Some(v) => Ok(match binding {
+                        None => syn_secret(name, v),
+                        Some(h) => {
+                            let hosts: Vec<String> = h.split('|').map(str::to_string).collect();
+                            SynValue::Secret(synsema_core::types::Obj::new(
+                                synsema_core::secret::SecretInner::new(name, v).with_binding(Some(hosts.into()), None, Vec::new()),
+                            ))
+                        }
+                    }),
                     None if nothing_default(args.get(1)) => Ok(SynValue::Nothing),
                     None => Err(undefined_var("secret", &name)),
                 }
@@ -956,7 +1038,10 @@ pub fn register_secret_builtins(
             // error: antes salía `Bearer None` / `Bearer bytes(…)` sin aviso. Un secret sellado o
             // de bytes que no son UTF-8 también es error, no `Bearer secret(NAME)`.
             let (name, plaintext) = match arg(args, 0)? {
-                SynValue::Secret(s) => (s.name().to_string(), format!("Bearer {}", secret_text(s, "bearer", "the token")?)),
+                SynValue::Secret(s) => {
+                    let p = format!("Bearer {}", secret_text(s, "bearer", "the token")?);
+                    return derived_secret(s.name().to_string(), p, &[&**s], "bearer");
+                }
                 SynValue::Text(t) => ("bearer".to_string(), format!("Bearer {}", t)),
                 SynValue::Nothing => {
                     return Err(Control::Error(RuntimeError::new(

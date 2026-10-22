@@ -50,7 +50,7 @@ use crate::blockchain::{arg, arg_bytes, arg_bytes_len, eip55, err, rlp_encode_va
 use crate::blockchain_abi::addr20;
 use crate::blockchain_algorand::address_to_pubkey;
 use crate::blockchain_solana::{ata_address, pubkey32, token_program_default};
-use crate::http::{header_pairs, http_request, http_request_body_bytes, HttpResult};
+use crate::http::{http_request, http_request_body_bytes, HttpResult};
 use crate::json::{dumps, json_to_syn, Json};
 
 /// Timeout HTTP de cada request RPC individual (mismo default que `http_*`).
@@ -104,10 +104,9 @@ pub(crate) fn host_of(url: &str) -> String {
 }
 
 pub(crate) fn url_arg(v: &SynValue, fname: &str) -> Result<String, Control> {
-    match v {
-        SynValue::Text(s) => Ok(s.to_string()),
-        other => Err(err(format!("{}: the URL must be text, got {}", fname, other.type_name()))),
-    }
+    // v0.6.46 (E1): también un secret atado con el host escrito antes (Alchemy, Infura: la clave
+    // va en la ruta). Abre el contexto de la llamada (audit y eco: `http_common::rpc_finish`).
+    crate::http_common::rpc_url(v, fname)
 }
 
 pub(crate) fn text_arg(v: &SynValue, what: &str, fname: &str) -> Result<String, Control> {
@@ -259,7 +258,8 @@ pub(crate) fn jsonrpc_call_headers_classified(
     ]));
     let mut headers = vec![("Content-Type".to_string(), "application/json".to_string())];
     headers.extend_from_slice(extra_headers);
-    let r = http_request("POST", url, Some(&headers), None, Some(&body), timeout_secs);
+    let mut r = http_request("POST", url, Some(&headers), None, Some(&body), timeout_secs);
+    crate::http_common::rpc_finish(&mut r);
     let v = http_result_to_json_classified(r, url, fname)?;
     let obj = v.as_object().ok_or_else(|| {
         PollError::Definitive(err(format!(
@@ -2107,8 +2107,9 @@ fn algod_get_classified(
     timeout_secs: u64,
 ) -> Result<serde_json::Value, PollError> {
     let url = algod_url(base, path);
-    let hs = header_pairs(headers, fname).map_err(PollError::Definitive)?;
-    let r = http_request("GET", &url, hs.as_deref(), None, None, timeout_secs);
+    let hs = crate::http_common::rpc_header_pairs(headers, &url, fname).map_err(PollError::Definitive)?;
+    let mut r = http_request("GET", &url, hs.as_deref(), None, None, timeout_secs);
+    crate::http_common::rpc_finish(&mut r);
     http_result_to_json_classified(r, &url, fname)
 }
 
@@ -2185,11 +2186,12 @@ fn algorand_send(args: &[SynValue], caps: &Rc<RefCell<CapabilitySet>>) -> Result
     let full = algod_url(&url, "/v2/transactions");
     // El Content-Type del protocolo SIEMPRE gana: un caller que puso el suyo en
     // los headers duplicaría el header (un algod estricto rechaza el request).
-    let mut hs = header_pairs(args.get(2), F)?.unwrap_or_default();
+    let mut hs = crate::http_common::rpc_header_pairs(args.get(2), &full, F)?.unwrap_or_default();
     hs.retain(|(k, _)| !k.eq_ignore_ascii_case("content-type"));
     hs.push(("Content-Type".to_string(), "application/x-binary".to_string()));
     // Body BINARIO (el SignedTxn msgpack) — por eso no alcanza http_post.
-    let r = http_request_body_bytes("POST", &full, Some(&hs), tx, RPC_HTTP_TIMEOUT_SECS);
+    let mut r = http_request_body_bytes("POST", &full, Some(&hs), tx, RPC_HTTP_TIMEOUT_SECS);
+    crate::http_common::rpc_finish(&mut r);
     let v = http_result_to_json(r, &full, F)?;
     let obj = as_obj(&v, "the send response", F)?;
     let txid = get_str(obj, "txId", "the send response", F)?;
@@ -2267,7 +2269,11 @@ pub(crate) fn register(interp: &Interpreter, caps: Rc<RefCell<CapabilitySet>>) {
     macro_rules! net_builtin {
         ($name:literal, $arity:expr, $f:ident) => {{
             let caps = caps.clone();
-            interp.register_builtin($name, $arity, Rc::new(move |_i, a, _l| $f(a, &caps)));
+            // v0.6.46 (ronda 1, B1): el contexto de secrets del RPC vive lo que la llamada.
+            interp.register_builtin($name, $arity, Rc::new(move |_i, a, _l| {
+                let _call = crate::http_common::RpcCall::open_for(&caps, concat!($name, "()"));
+                $f(a, &caps)
+            }));
         }};
     }
     // -- EVM --

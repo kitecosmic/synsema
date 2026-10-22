@@ -39,9 +39,12 @@ console.log(`== synsema-wasm-web ${syn.version()} — everyday probe`);
 
 // 1. Secretos.
 {
-  const r = syn.run(`require secret("STRIPE_KEY")\nlet k be secret("STRIPE_KEY")\nprint(k)\nprint(json_encode({"k": k}))\nprint(type_of(k))\nprint(text(k))`, { env: { STRIPE_KEY: "sk_live_SECRETO" } });
+  const r = syn.run(`require secret("STRIPE_KEY")\nlet k be secret("STRIPE_KEY")\nprint(k)\nprint(type_of(k))\nprint(text(k))`, { env: { STRIPE_KEY: "sk_live_SECRETO" } });
   const joined = r.output.join("\n");
-  check("secret nunca se imprime ni serializa", r.ok && !joined.includes("SECRETO"), r);
+  check("secret nunca se imprime", r.ok && !joined.includes("SECRETO"), r);
+  // v0.6.46 (D8): serializarlo es error (antes salía "[redacted]", un marcador que se mandaba como dato).
+  const rj = syn.run(`require secret("STRIPE_KEY")\nprint(json_encode({"k": secret("STRIPE_KEY")}))`, { env: { STRIPE_KEY: "sk_live_SECRETO" } });
+  check("json_encode de un secret es error y no lo escribe", !rj.ok && rj.errors[0].includes("json_encode") && !JSON.stringify(rj).includes("SECRETO"), rj);
   check("secret sigue siendo un secret al pasar por text()", joined.includes("secret"), r.output);
   const rv = syn.run(`require secret("STRIPE_KEY")\nprint(reveal(secret("STRIPE_KEY")))`, { env: { STRIPE_KEY: "x" } });
   check("reveal sin `require reveal` → denegado con la línea a agregar", !rv.ok && rv.errors[0].includes("reveal() not permitted") && rv.errors[0].includes("require reveal"), rv);

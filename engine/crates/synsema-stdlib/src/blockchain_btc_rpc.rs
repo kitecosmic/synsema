@@ -100,7 +100,8 @@ fn esplora_get_json(
     timeout_secs: u64,
 ) -> Result<serde_json::Value, Control> {
     let url = esplora_url(base, path);
-    let r = http_request("GET", &url, None, None, None, timeout_secs);
+    let mut r = http_request("GET", &url, None, None, None, timeout_secs);
+    crate::http_common::rpc_finish(&mut r);
     http_result_to_json_classified(r, &url, fname).map_err(PollError::into_control)
 }
 
@@ -111,7 +112,8 @@ fn esplora_get_text(
     timeout_secs: u64,
 ) -> Result<String, Control> {
     let url = esplora_url(base, path);
-    let r = http_request("GET", &url, None, None, None, timeout_secs);
+    let mut r = http_request("GET", &url, None, None, None, timeout_secs);
+    crate::http_common::rpc_finish(&mut r);
     esplora_text_classified(r, &url, fname).map_err(PollError::into_control)
 }
 
@@ -337,7 +339,8 @@ fn btc_send(args: &[SynValue], caps: &Rc<RefCell<CapabilitySet>>) -> Result<SynV
     let full = esplora_url(&url, "/tx");
     let headers = vec![("Content-Type".to_string(), "text/plain".to_string())];
     let hex_body = hex_encode(raw);
-    let r = http_request("POST", &full, Some(&headers), None, Some(&hex_body), RPC_HTTP_TIMEOUT_SECS);
+    let mut r = http_request("POST", &full, Some(&headers), None, Some(&hex_body), RPC_HTTP_TIMEOUT_SECS);
+    crate::http_common::rpc_finish(&mut r);
     let body = esplora_text_classified(r, &full, F).map_err(PollError::into_control)?;
     let txid = txid_text(&body, "the returned txid", F)?;
     // El nodo debe devolver EL MISMO txid que estos bytes hashean (G23): otro
@@ -381,7 +384,8 @@ fn btc_wait(args: &[SynValue], caps: &Rc<RefCell<CapabilitySet>>) -> Result<SynV
     let mut last_transient: Option<Control> = None;
     loop {
         let full = esplora_url(&url, &path);
-        let r = http_request("GET", &full, None, None, None, poll_http_timeout(deadline));
+        let mut r = http_request("GET", &full, None, None, None, poll_http_timeout(deadline));
+        crate::http_common::rpc_finish(&mut r);
         // 404 = la tx aún no está en el mempool del nodo — "todavía no", se
         // sigue esperando (el equivalente al receipt null de EVM).
         let not_found = r.error.is_none() && r.status == 404;
@@ -466,7 +470,7 @@ fn btc_wait(args: &[SynValue], caps: &Rc<RefCell<CapabilitySet>>) -> Result<SynV
 
 /// `auth` = `{user, pass}`; `pass` puede ser un `secret` — se materializa SOLO
 /// acá, en el borde del socket, como Basic auth (patrón headers de algod).
-fn basic_auth_header(v: Option<&SynValue>, fname: &str) -> Result<Vec<(String, String)>, Control> {
+fn basic_auth_header(v: Option<&SynValue>, url: &str, fname: &str) -> Result<Vec<(String, String)>, Control> {
     let m = match v {
         None | Some(SynValue::Nothing) => return Ok(Vec::new()),
         Some(SynValue::Map(m)) => m.borrow().to_map(),
@@ -491,7 +495,8 @@ fn basic_auth_header(v: Option<&SynValue>, fname: &str) -> Result<Vec<(String, S
         _ => return Err(err(format!("{}: auth needs a text \"user\"", fname))),
     };
     let pass = match m.get("pass") {
-        Some(SynValue::Secret(inner)) => crate::secrets::secret_text(inner, fname, "auth.pass")?,
+        // v0.6.46 (E1): un pass atado sólo va a su host.
+        Some(SynValue::Secret(inner)) => crate::http_common::rpc_admit_header(inner, url, fname, "auth.pass")?,
         Some(SynValue::Text(s)) => s.to_string(),
         _ => {
             return Err(err(format!(
@@ -513,7 +518,7 @@ fn btc_rpc(args: &[SynValue], caps: &Rc<RefCell<CapabilitySet>>) -> Result<SynVa
     require_net(caps, &url, "btc_rpc()")?;
     let method = text_arg(arg(args, 1, F)?, "the method", F)?;
     let params = params_arg(args.get(2), F, syn_to_plain_json)?;
-    let headers = basic_auth_header(args.get(3), F)?;
+    let headers = basic_auth_header(args.get(3), &url, F)?;
     let result =
         jsonrpc_call_headers_classified(&url, &method, params, F, RPC_HTTP_TIMEOUT_SECS, &headers)
             .map_err(PollError::into_control)?;
@@ -530,7 +535,11 @@ pub(crate) fn register(interp: &Interpreter, caps: Rc<RefCell<CapabilitySet>>) {
     macro_rules! net_builtin {
         ($name:literal, $arity:expr, $f:ident) => {{
             let caps = caps.clone();
-            interp.register_builtin($name, $arity, Rc::new(move |_i, a, _l| $f(a, &caps)));
+            // v0.6.46 (ronda 1, B1): el contexto de secrets del RPC vive lo que la llamada.
+            interp.register_builtin($name, $arity, Rc::new(move |_i, a, _l| {
+                let _call = crate::http_common::RpcCall::open_for(&caps, concat!($name, "()"));
+                $f(a, &caps)
+            }));
         }};
     }
     net_builtin!("btc_utxos", 2, btc_utxos);

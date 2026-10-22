@@ -96,7 +96,7 @@ fn run_tool(root: &Root, name: &str, args: &Value) -> Result<Value, String> {
         "refs" => codeintel::refs(root, &name_arg(args)?, path),
         "routes" => codeintel::routes(root, path),
         "caps" => codeintel::caps(root, path),
-        "check" => codeintel::check(root, path),
+        "check" => codeintel::check_with(root, path, &crate::cli_lints),
         "deps" => codeintel::deps(root, path),
         "sha" => program_sha_json(root, path.ok_or_else(|| "missing required argument `path`".to_string())?)?,
         "search" => {

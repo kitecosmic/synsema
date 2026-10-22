@@ -260,6 +260,18 @@ fn json_to_pairs(v: Option<&Value>) -> Vec<(String, String)> {
     out
 }
 
+/// El tipo JSON de un valor, para un mensaje.
+fn json_kind(v: &Value) -> &'static str {
+    match v {
+        Value::Null => "null",
+        Value::Bool(_) => "a boolean",
+        Value::Number(_) => "a number",
+        Value::String(_) => "a string",
+        Value::Array(_) => "an array",
+        Value::Object(_) => "an object",
+    }
+}
+
 fn str_of(v: &Value) -> String {
     match v {
         Value::String(s) => s.clone(),
@@ -275,11 +287,13 @@ impl HostProvider for WebHost {
         if !self.offers("kv") {
             return None;
         }
-        let prev = host_call_json("kv_get", &json!({"ns": "audit", "key": log}))?
-            .get("value")
-            .and_then(Value::as_str)
-            .map(|s| s.to_string())
-            .unwrap_or_default();
+        // v0.6.46 (ronda 1 de cf1, M2): lo anterior se lee por `kv_get`, que dice si la lectura
+        // falló. Antes un `kv.get` que lanzaba contaba como "no hay log": se pisaba el log entero con
+        // una línea y la operación seguía autorizada. Ahora se niega, como cuando falla el `kv_set`.
+        let prev = match self.kv_get("audit", log)? {
+            Ok(prev) => prev.unwrap_or_default(),
+            Err(e) => return Some(Err(format!("reading the audit log failed: {}", e))),
+        };
         let r = host_call_json("kv_set", &json!({"ns": "audit", "key": log, "value": format!("{}{}", prev, line)}))?;
         Some(match r.get("error").and_then(Value::as_str) {
             Some(e) if !e.is_empty() => Err(e.to_string()),
@@ -299,6 +313,10 @@ impl HostProvider for WebHost {
         payload.insert("url".into(), json!(req.url));
         payload.insert("headers".into(), pairs_to_json(req.headers));
         payload.insert("timeout".into(), json!(req.timeout_secs));
+        // v0.6.46 (E1): con un secret en la request, el glue de JS pasa esto a `fetch`.
+        if req.forbid_redirects {
+            payload.insert("redirect".into(), json!("error"));
+        }
         match req.body {
             None => {
                 payload.insert("body".into(), Value::Null);
@@ -342,12 +360,23 @@ impl HostProvider for WebHost {
         }))
     }
 
-    fn kv_get(&self, ns: &str, key: &str) -> Option<Option<String>> {
+    fn kv_get(&self, ns: &str, key: &str) -> Option<Result<Option<String>, String>> {
         if !self.offers("kv") {
             return None;
         }
         let r = host_call_json("kv_get", &json!({"ns": ns, "key": key}))?;
-        Some(r.get("value").and_then(Value::as_str).map(|s| s.to_string()))
+        // v0.6.46: un hook que lanza llega como `{error}` (como en `kv_set`): es un error, no "no está".
+        if let Some(e) = r.get("error").and_then(Value::as_str).filter(|e| !e.is_empty()) {
+            return Some(Err(e.to_string()));
+        }
+        // v0.6.46 (ronda 1 de cf1, B7): un valor que no es texto ni `null` (un número, un objeto ya
+        // parseado) también es un error del host: contarlo como "no está" hacía que `state_incr`
+        // arrancara de 0 y que la memoria cargara vacía y pisara la guardada.
+        Some(match r.get("value") {
+            None | Some(Value::Null) => Ok(None),
+            Some(Value::String(s)) => Ok(Some(s.clone())),
+            Some(other) => Err(format!("kv.get must return a string or null, got {}", json_kind(other))),
+        })
     }
     fn kv_set(&self, ns: &str, key: &str, value: &str) -> Option<Result<(), String>> {
         if !self.offers("kv") {
@@ -384,29 +413,42 @@ impl HostProvider for WebHost {
             },
         })
     }
-    fn kv_list(&self, ns: &str) -> Option<Vec<String>> {
+    fn kv_list(&self, ns: &str) -> Option<Result<Vec<String>, String>> {
         if !self.offers("kv") {
             return None;
         }
         let r = host_call_json("kv_list", &json!({"ns": ns}))?;
-        Some(
-            r.get("keys")
-                .and_then(Value::as_array)
-                .map(|a| a.iter().map(str_of).collect())
-                .unwrap_or_default(),
-        )
+        // v0.6.46 (ronda 1 de cf1): un hook que lanza es un error, no "no hay claves".
+        if let Some(e) = r.get("error").and_then(Value::as_str).filter(|e| !e.is_empty()) {
+            return Some(Err(e.to_string()));
+        }
+        // v0.6.46 (ronda 2 de cf1, R2-B2): como en `kv_get` (B7), lo que no es una lista de textos (la
+        // forma `{keys: [{name}]}` de Cloudflare KV, `undefined`, un número) es un error del host: se
+        // leía como "no hay claves" y `state_all()` daba `{}`.
+        Some(match r.get("keys") {
+            Some(Value::Array(a)) if a.iter().all(Value::is_string) => Ok(a.iter().map(str_of).collect()),
+            Some(Value::Array(_)) => Err("kv.list must return a list of strings, got a list with other values".to_string()),
+            Some(other) => Err(format!("kv.list must return a list of strings, got {}", json_kind(other))),
+            None => Err("kv.list must return a list of strings, got nothing".to_string()),
+        })
     }
-    fn llm(&self, op: &str, prompt: &str) -> Option<HostLlmResult> {
+    fn llm(&self, op: &str, prompt: &str, principals: &[String]) -> Option<Result<HostLlmResult, String>> {
         if !self.offers("llm") {
             return None;
         }
-        let r = host_call_json("llm", &json!({"op": op, "prompt": prompt}))?;
+        let r = host_call_json("llm", &json!({"op": op, "prompt": prompt, "principals": principals}))?;
+        // v0.6.46 (E5, §0.13): un hook que lanza vuelve como `{error}`; antes contaba como una
+        // respuesta vacía con `ok: true`.
+        if let Some(e) = r.get("error") {
+            let m = str_of(e);
+            return Some(Err(if m.is_empty() { "the host's llm hook threw".to_string() } else { m }));
+        }
         let content = match &r {
             Value::String(s) => s.clone(),
             other => other.get("content").map(str_of).unwrap_or_default(),
         };
         let tokens = r.get("tokens").and_then(Value::as_u64).unwrap_or(0);
-        Some(HostLlmResult { content, tokens })
+        Some(Ok(HostLlmResult { content, tokens }))
     }
     fn log(&self, line: &str) -> bool {
         if !self.offers("log") {
@@ -591,7 +633,31 @@ fn opts_from(req: &Map<String, Value>) -> Result<RunOptions, String> {
     };
     let max_steps = limit("max_steps")?;
     let max_memory_mb = limit("max_memory_mb")?;
-    Ok(RunOptions { filename, env, ceiling, no_fs: true, labels, result, input, sources, max_steps, max_memory_mb })
+    // v0.6.46 (E3b): `"trusted": {"nombre": "fuente"}` y `"trusted_ceiling": "<cap-set>"`.
+    let trusted: Vec<(String, String)> = match req.get("trusted") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(Value::Object(m)) => m
+            .iter()
+            .map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())).ok_or_else(|| format!("trusted.{}: expected the module source as text", k)))
+            .collect::<Result<_, _>>()?,
+        Some(_) => return Err("trusted must be an object {name: source}".to_string()),
+    };
+    let trusted_ceiling = match req.get("trusted_ceiling") {
+        Some(Value::String(s)) => synsema_wasm::parse_ceiling(s).map_err(|e| format!("trusted_ceiling: {}", e))?,
+        _ => None,
+    };
+    // v0.6.46 (E6): `"auditor": "<pública X25519 en base64url>"` y `"sealed_bytes": n` — el recibo
+    // sellado de la corrida, en `receipt`.
+    let auditor = match req.get("auditor") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(s)) => Some(synsema_stdlib::sealed::parse_auditor_key(s).map_err(|e| format!("auditor: {}", e))?),
+        Some(_) => return Err("auditor must be the X25519 public key in base64url".to_string()),
+    };
+    let sealed_bytes = match req.get("sealed_bytes") {
+        None | Some(Value::Null) => None,
+        Some(v) => Some(synsema_stdlib::sealed::sealed_bytes_from(Some(&v.to_string())).map_err(|e| e.replace("SYNSEMA_RECEIPT_SEALED_BYTES", "sealed_bytes"))?),
+    };
+    Ok(RunOptions { filename, env, ceiling, no_fs: true, labels, result, input, sources, max_steps, max_memory_mb, trusted, trusted_ceiling, auditor, sealed_bytes })
 }
 
 fn install_host(req: &Map<String, Value>) {
@@ -651,6 +717,10 @@ fn dispatch(req: &Map<String, Value>) -> Value {
                 "run" => {
                     let r = synsema_wasm::run(&source, &opts);
                     let mut out = Map::new();
+                    // v0.6.46 (E6): el recibo sellado va primero (el host lo entrega antes que la salida).
+                    if let Some(receipt) = &r.receipt {
+                        out.insert("receipt".into(), receipt.clone());
+                    }
                     out.insert("ok".into(), json!(r.ok));
                     out.insert("output".into(), json!(r.output));
                     out.insert("errors".into(), json!(r.errors));
@@ -737,6 +807,8 @@ pub fn call_json(request: &str) -> String {
     }
     #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
     seed_run_rng();
+    // v0.6.46 (E6.4): en wasip1 (el guest de Vela), el mismo generador por llamada.
+    synsema_stdlib::webauth::begin_call_entropy();
     IN_CALL.with(|c| c.set(true));
     let resp = match serde_json::from_str::<Value>(request) {
         Ok(Value::Object(m)) => dispatch(&m),
@@ -747,6 +819,7 @@ pub fn call_json(request: &str) -> String {
     synsema_core::wasm_limits::disarm();
     #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
     end_run_rng();
+    synsema_stdlib::webauth::end_call_entropy();
     IN_CALL.with(|c| c.set(false));
     fence_clock(false);
     hostcap::install(None);
@@ -858,7 +931,7 @@ mod tests {
         let src = "let s be private({\"amount\": 5, \"note\": \"x\"}, \"app\")
 let out be {\"state\": s, \"fee\": 3, \"pub\": declassify(s[\"amount\"] + 1, \"fee is public\")}
 print(s)";
-        let req = json!({"op":"run","source":src,"labels":true,"result":"out","ceiling":"stdout"});
+        let req = json!({"op":"run","source":src,"labels":true,"result":"out","ceiling":"stdout,declassify=app"});
         let v: Value = serde_json::from_str(&call_json(&req.to_string())).unwrap();
         assert_eq!(v["ok"], json!(true), "{}", v);
         assert_eq!(v["output"][0], json!("private(app)"));

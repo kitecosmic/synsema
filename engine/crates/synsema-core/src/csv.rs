@@ -10,8 +10,8 @@
 //! - Default **lossless**: todo campo queda texto (`"00123"` NO se convierte en 123);
 //!   `{"numbers": true}` convierte los campos que parsean como número.
 //! - `csv_encode`: quoting mínimo, números como `text()` (enteros sin decimales,
-//!   `decimal` exacto), `nothing` → vacío, `bytes` → base64, `secret` → `[redacted]`
-//!   (G8, espeja `json_encode`), anidados → error claro orientando a `json_encode`.
+//!   `decimal` exacto), `nothing` → vacío, `bytes` → base64, `secret` → error
+//!   (G8; v0.6.46 D8, espeja `json_encode`), anidados → error claro orientando a `json_encode`.
 //! - Errores en inglés, autocontenidos, SIEMPRE con línea/fila cuando aplica (G5) y
 //!   atrapables con `try`/`recover` (G10) — jamás `unwrap()`/panic sobre input.
 //!
@@ -571,8 +571,16 @@ fn write_scalar(v: &SynValue, out: &mut String, row: usize, col: &dyn Fn() -> St
             let _ = write!(out, "{}", t);
         }
         SynValue::Bytes(b) => out.push_str(&b64_encode(b)),
-        // G8: un secret JAMÁS se filtra a un CSV (espeja json_encode).
-        SynValue::Secret(_) => out.push_str("[redacted]"),
+        // G8: un secret JAMÁS se filtra a un CSV (espeja json_encode). v0.6.46 (E2, D8): tampoco
+        // sale un marcador `[redacted]` que el programa pueda mandar como si fuera el dato: es error.
+        SynValue::Secret(s) => {
+            return Err(err(format!(
+                "csv_encode: row {}, column {}: secret({}) is never written as text — leave it out of the rows",
+                row,
+                col(),
+                s.name()
+            )))
+        }
         SynValue::List(_) | SynValue::Map(_) => {
             return Err(err(format!(
                 "csv_encode: row {}, column {}: nested {} values cannot be a CSV field; encode the field first with json_encode(...)",
@@ -915,14 +923,18 @@ mod tests {
     }
 
     #[test]
-    fn secret_redacted_and_bytes_b64() {
+    fn secret_is_an_error_and_bytes_b64() {
+        // v0.6.46 (D8): un secret es error (antes `[redacted]`), y el error no lleva el material.
         let mut m = SynMap::new();
         m.insert("k", syn_secret("API_KEY", "hunter2"));
+        m.insert("n", syn_int(42));
+        let e = msg(csv_encode(&[syn_list(vec![syn_map(m)])]));
+        assert!(e.contains("secret(API_KEY)"), "{}", e);
+        assert!(!e.contains("hunter2"), "plaintext leaked: {}", e);
+        let mut m = SynMap::new();
         m.insert("b", syn_bytes(b"foo".to_vec()));
         m.insert("n", syn_int(42));
         let out = encode(syn_list(vec![syn_map(m)]));
-        assert!(out.contains("[redacted]"), "{}", out);
-        assert!(!out.contains("hunter2"), "plaintext leaked: {}", out);
         assert!(out.contains("Zm9v"), "{}", out);
         assert!(out.contains("42"), "{}", out);
     }

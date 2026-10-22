@@ -301,6 +301,10 @@ fn serve_settings_from_flags(flags: &[(String, String)], secure: bool) -> Result
         ceiling: None,
         // `--attested` no se hornea en el binario: se decide donde corre (como el techo).
         attested: false,
+        // v0.6.46 (E6-h): el auditor tampoco: el binario lo lee de `SYNSEMA_AUDITOR_KEY` al correr.
+        auditor: None,
+        receipt: None,
+        sealed_bytes: None,
     };
     ov.validate()?;
     Ok(s)

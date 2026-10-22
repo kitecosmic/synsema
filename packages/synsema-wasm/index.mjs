@@ -14,6 +14,11 @@
 //    En el navegador requiere cross-origin isolation (COOP/COEP) para SharedArrayBuffer.
 //
 // No hay estado global: cada `load()` es una instancia (memoria lineal propia).
+//
+// v0.6.46 (E7): la conexión del `http` del host es del embebedor, y el motor no ve a qué IP va. En
+// nativo un `net` con comodín sólo llega a IPs públicas; acá eso lo tiene que hacer tu hook:
+// resolver el nombre, chequear la IP a la que conecta (los rangos están en `Host.http`, en
+// index.d.ts) y conectar a ésa. El hook no sabe si el programa nombró el host.
 
 const te = new TextEncoder();
 const td = new TextDecoder();
@@ -122,7 +127,7 @@ export function dispatchHostSync(host, kind, payload) {
         ? casReply(syncOnly("kv.cas", host.kv.cas(payload.ns, payload.key, payload.expected ?? null, payload.value)))
         : undefined;
     case "llm":
-      return typeof host.llm === "function" ? normalizeLlm(syncOnly("llm", host.llm(payload.op, payload.prompt))) : undefined;
+      return typeof host.llm === "function" ? normalizeLlm(syncOnly("llm", host.llm(payload.op, payload.prompt, { principals: payload.principals ?? [] }))) : undefined;
     case "log":
       if (typeof host.log !== "function") return undefined;
       syncOnly("log", host.log(payload.line));
@@ -165,7 +170,7 @@ export async function dispatchHostAsync(host, kind, payload) {
         ? casReply(await host.kv.cas(payload.ns, payload.key, payload.expected ?? null, payload.value))
         : undefined;
     case "llm":
-      return typeof host.llm === "function" ? normalizeLlm(await host.llm(payload.op, payload.prompt)) : undefined;
+      return typeof host.llm === "function" ? normalizeLlm(await host.llm(payload.op, payload.prompt, { principals: payload.principals ?? [] })) : undefined;
     case "log":
       if (typeof host.log !== "function") return undefined;
       await host.log(payload.line);
@@ -344,7 +349,15 @@ function limitResult(request) {
     };
   }
   if (request.op === "test") return { ok: false, passed: 0, failed: 0, lines: [MEMORY_LIMIT], audit: [] };
-  return { ok: false, output: [], errors: [MEMORY_LIMIT], audit: [], llm_tokens: 0, exit: 1 };
+  const r = { ok: false, output: [], errors: [MEMORY_LIMIT], audit: [], llm_tokens: 0, exit: 1 };
+  // v0.6.46 (E6): con etiquetas, que la corrida se haya cortado por memoria puede depender de un
+  // valor privado (un bit por corrida, como cualquier error suyo): el host lo trata como sensible,
+  // igual que una corrida que terminó con `private_seen`. Sin saber si tocó algo privado, sí.
+  if (request.labels) {
+    r.steps = null;
+    r.private_seen = true;
+  }
+  return r;
 }
 
 /**
@@ -370,6 +383,9 @@ function requestOf(op, source, opts = {}) {
   // se descartaba por falsy y la corrida quedaba sin límite.
   if (opts.maxSteps != null) r.max_steps = opts.maxSteps;
   if (opts.maxMemoryMb != null) r.max_memory_mb = opts.maxMemoryMb;
+  // v0.6.46 (E3b): módulos de confianza del embebedor y su techo.
+  if (opts.trusted) r.trusted = opts.trusted;
+  if (opts.trustedCeiling) r.trusted_ceiling = opts.trustedCeiling;
   return r;
 }
 

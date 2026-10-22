@@ -22,7 +22,7 @@ use std::rc::Rc;
 use std::time::SystemTime;
 
 use crate::ast::Node;
-use crate::interpreter::{env_get, env_set, Control, Environment, Interpreter, RuntimeError};
+use crate::interpreter::{env_get, env_set, Control, Environment, Interpreter, RuntimeError, TemplateOpenHook};
 use crate::parser::{parse_each_clause, parse_expression_source};
 use crate::types::{ServerValue, SynValue};
 
@@ -590,20 +590,42 @@ thread_local! {
 }
 
 /// Carga (con caché) el árbol de un template ya resuelto. `display` es el nombre
-/// que aparece en los errores (file_name, como siempre).
-fn load_template(target: &PathBuf, display: &str, raw_path: &str) -> Result<Rc<Vec<TNode>>, Control> {
+/// que aparece en los errores (file_name, como siempre). v0.6.46 (E8): con `open` (el motor), el
+/// archivo del disco se abre por él, sin ventana con el gate, y la huella y el texto salen de ese
+/// handle.
+fn load_template(
+    target: &PathBuf,
+    display: &str,
+    raw_path: &str,
+    open: Option<TemplateOpenHook>,
+) -> Result<Rc<Vec<TNode>>, Control> {
+    let not_found = || Control::Error(RuntimeError::new(format!("template not found: {}", raw_path)));
     let bundled: Option<&'static [u8]> = crate::bundle::get(&target.to_string_lossy());
+    let mut file = match (bundled, open) {
+        (None, Some(open)) => Some(open(raw_path).map_err(Control::Error)?),
+        _ => None,
+    };
+    // Ronda 2 (R2-N1): la clave del cache nombra lo que se leyó. Con el hook se abre el nombre crudo
+    // (normalizado), no `target` (canonicalizado antes, y un link en el camino pudo cambiar en el
+    // medio): con `target` de clave, otro archivo con la misma fecha y tamaño traía este árbol.
+    let key: PathBuf = match &file {
+        Some(_) => PathBuf::from(crate::capscope::normalize_path(raw_path)),
+        None => target.clone(),
+    };
     let (mtime, size) = match bundled {
         // Inmutable: la clave del cache es el nombre; el tamaño basta como huella.
         Some(bytes) => (SystemTime::UNIX_EPOCH, bytes.len() as u64),
         None => {
-            let meta = std::fs::metadata(target)
-                .map_err(|_| Control::Error(RuntimeError::new(format!("template not found: {}", raw_path))))?;
+            let meta = match &file {
+                Some(f) => f.metadata(),
+                None => std::fs::metadata(target),
+            }
+            .map_err(|_| not_found())?;
             (meta.modified().unwrap_or(SystemTime::UNIX_EPOCH), meta.len())
         }
     };
     let hit = TPL_CACHE.with(|c| {
-        c.borrow().get(target).and_then(|e| {
+        c.borrow().get(&key).and_then(|e| {
             if e.mtime == mtime && e.size == size {
                 Some(Rc::clone(&e.tree))
             } else {
@@ -614,10 +636,14 @@ fn load_template(target: &PathBuf, display: &str, raw_path: &str) -> Result<Rc<V
     if let Some(tree) = hit {
         return Ok(tree);
     }
-    let src = match bundled {
-        Some(bytes) => String::from_utf8_lossy(bytes).into_owned(),
-        None => std::fs::read_to_string(target)
-            .map_err(|_| Control::Error(RuntimeError::new(format!("template not found: {}", raw_path))))?,
+    let src = match (bundled, file.as_mut()) {
+        (Some(bytes), _) => String::from_utf8_lossy(bytes).into_owned(),
+        (None, Some(f)) => {
+            let mut s = String::new();
+            std::io::Read::read_to_string(f, &mut s).map_err(|_| not_found())?;
+            s
+        }
+        (None, None) => std::fs::read_to_string(target).map_err(|_| not_found())?,
     };
     let segs = segments(&src, display)?;
     let mut pos = 0;
@@ -627,7 +653,7 @@ fn load_template(target: &PathBuf, display: &str, raw_path: &str) -> Result<Rc<V
     }
     let tree = Rc::new(tree);
     TPL_CACHE.with(|c| {
-        c.borrow_mut().insert(target.clone(), CachedTpl { mtime, size, tree: Rc::clone(&tree) })
+        c.borrow_mut().insert(key, CachedTpl { mtime, size, tree: Rc::clone(&tree) })
     });
     Ok(tree)
 }
@@ -733,7 +759,7 @@ fn render_nodes(
                     .file_name()
                     .map(|s| s.to_string_lossy().into_owned())
                     .unwrap_or_else(|| path.clone());
-                let inc_tree = load_template(&target, &inc_name, path)?;
+                let inc_tree = load_template(&target, &inc_name, path, interp.template_open_hook())?;
                 match with_expr {
                     None => {
                         render_nodes(&inc_tree, interp, env, out, &inc_name, slots, depth + 1)?;
@@ -749,7 +775,7 @@ fn render_nodes(
                                 ))));
                             }
                         };
-                        let child = Environment::child_scope(&interp.global_env, "template:include");
+                        let child = Environment::child_scope(&interp.template_parent(), "template:include");
                         for (k, v) in m.borrow().iter() {
                             env_set(&child, k, v.clone());
                         }
@@ -787,12 +813,12 @@ fn render_file(
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| path.to_string());
-    let tree = load_template(&target, &filename, path)?;
+    let tree = load_template(&target, &filename, path, interp.template_open_hook())?;
     let layout_path = tree.iter().find_map(|n| match n {
         TNode::Layout { path } => Some(path.clone()),
         _ => None,
     });
-    let env = Environment::child(&interp.global_env, &format!("template:{}", filename));
+    let env = Environment::child(&interp.template_parent(), &format!("template:{}", filename));
     if let Some(SynValue::Map(m)) = data {
         for (k, v) in m.borrow().iter() {
             env_set(&env, k, v.clone());
@@ -830,6 +856,17 @@ pub fn render_template(
     path: &str,
     data: Option<&SynValue>,
 ) -> Result<String, Control> {
+    // v0.6.46 (ronda 3, R3-A1): un template es código que se lee del directorio de trabajo en cada
+    // llamada, donde el programa puede escribirlo (él, una corrida anterior o un proceso suyo), y
+    // correría con las capabilities de la tool. Hasta que el host le dé a la tool sus templates
+    // (como le da la fuente), dentro de una tool es error. Es la única entrada: `include` y los
+    // layouts se resuelven desde acá.
+    if interp.in_trusted_scope() {
+        return Err(Control::Error(RuntimeError::new(format!(
+            "render: a trusted tool cannot render templates yet ('{}'): the template file lives where the program can write it, and it would run with the tool's capabilities; build the text in the tool",
+            path
+        ))));
+    }
     let named = HashMap::new();
     let slots = Slots { default: "", named: &named };
     render_file(interp, path, data, &slots, 0)
@@ -1186,6 +1223,10 @@ fn check_program_static_inner(
         // módulo que importa: `../` sube mientras quede bajo ella.
         let project_root = project_root_of(stack.first().map(String::as_str).unwrap_or(file_path));
         for raw in uses {
+            // v0.6.46 (E3b): un módulo de confianza es del host (`--trusted`), no un archivo del proyecto.
+            if raw.starts_with("trusted:") {
+                continue;
+            }
             let resolved = resolve_module_path(&raw, &base_dir, project_root.as_deref())
                 .map_err(|e| format!("{}: {}", file_path, e))?;
             if stack.contains(&resolved) {
@@ -1252,6 +1293,10 @@ pub fn module_walk(uses: Vec<String>, file_path: &str, load: SourceLoader<'_>) -
     ) -> Result<(), String> {
         let base_dir = Path::new(importer).parent().map(|p| p.to_path_buf()).unwrap_or_default();
         for raw in uses {
+            // v0.6.46 (E3b): un módulo de confianza es del host (`--trusted`), no un archivo del proyecto.
+            if raw.starts_with("trusted:") {
+                continue;
+            }
             let resolved = resolve_module_path(&raw, &base_dir, root).map_err(|e| format!("{}: {}", importer, e))?;
             if stack.contains(&resolved) {
                 return Err(format!("circular import: module '{}' is already being loaded", raw));
@@ -1279,7 +1324,7 @@ pub fn module_walk(uses: Vec<String>, file_path: &str, load: SourceLoader<'_>) -
 /// crudos, relativos al working dir — las claves del bundle).
 pub fn template_closure(path: &str) -> Result<Vec<String>, String> {
     let mut seen = Vec::new();
-    validate_template_walk(path, 0, &mut seen)?;
+    validate_template_walk(path, 0, &mut seen, None, &mut Vec::new())?;
     Ok(seen)
 }
 
@@ -1287,11 +1332,36 @@ pub fn template_closure(path: &str) -> Result<Vec<String>, String> {
 /// Lo usa la validación al arranque de `serve` y `synsema check` — un typo en un
 /// `render("literal.html")` debe fallar ANTES del primer request.
 pub fn validate_template(path: &str) -> Result<(), String> {
-    validate_template_walk(path, 0, &mut Vec::new())
+    validate_template_walk(path, 0, &mut Vec::new(), None, &mut Vec::new())
 }
 
-fn validate_template_walk(path: &str, depth: usize, seen: &mut Vec<String>) -> Result<(), String> {
-    fn walk(path: &str, depth: usize, seen: &mut Vec<String>) -> Result<(), String> {
+/// v0.6.46: la validación de `serve` al arrancar, con el permiso de la corrida. Antes leía y
+/// parseaba cada template (y sus `include`/`layout`) del cwd sin `file.read`: el arranque leía lo
+/// que `render()` no habría podido. Ahora cada archivo pasa por el mismo gate que `render()`
+/// antes de abrirse (uno del bundle no lo pide). Ronda 1 de cf1 (M3): un rechazo NO es el error del
+/// arranque: el `require file.read` puede estar dentro de la ruta, y entonces vale recién en el
+/// request (en v0.6.45 eso arrancaba y respondía). Ese template (y lo que incluye) no se lee ni se
+/// valida acá: lo chequea `render()`. Devuelve `(template, por qué)` de cada uno que quedó sin ver.
+pub fn validate_template_gated(path: &str, interp: &Interpreter) -> Result<Vec<(String, String)>, String> {
+    let mut skipped = Vec::new();
+    validate_template_walk(path, 0, &mut Vec::new(), Some(interp), &mut skipped)?;
+    Ok(skipped)
+}
+
+fn validate_template_walk(
+    path: &str,
+    depth: usize,
+    seen: &mut Vec<String>,
+    gate: Option<&Interpreter>,
+    skipped: &mut Vec<(String, String)>,
+) -> Result<(), String> {
+    fn walk(
+        path: &str,
+        depth: usize,
+        seen: &mut Vec<String>,
+        gate: Option<&Interpreter>,
+        skipped: &mut Vec<(String, String)>,
+    ) -> Result<(), String> {
         if depth > 50 {
             return Err(format!("template nesting too deep ({})", path));
         }
@@ -1299,12 +1369,22 @@ fn validate_template_walk(path: &str, depth: usize, seen: &mut Vec<String>) -> R
             return Ok(());
         }
         seen.push(path.to_string());
+        if let Some(interp) = gate {
+            if let Err(c) = gate_nested_template(interp, path) {
+                let why = match c {
+                    Control::Error(e) => e.into_message(),
+                    _ => "template error".to_string(),
+                };
+                skipped.push((path.to_string(), why));
+                return Ok(());
+            }
+        }
         let target = resolve_template_path(path)?;
         let display = target
             .file_name()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| path.to_string());
-        let tree = load_template(&target, &display, path).map_err(|c| match c {
+        let tree = load_template(&target, &display, path, None).map_err(|c| match c {
             Control::Error(e) => e.into_message(),
             _ => "template error".to_string(),
         })?;
@@ -1328,11 +1408,11 @@ fn validate_template_walk(path: &str, depth: usize, seen: &mut Vec<String>) -> R
         let mut children = Vec::new();
         refs(&tree, &mut children);
         for child in children {
-            walk(&child, depth + 1, seen)?;
+            walk(&child, depth + 1, seen, gate, skipped)?;
         }
         Ok(())
     }
-    walk(path, depth, seen)
+    walk(path, depth, seen, gate, skipped)
 }
 
 #[cfg(test)]
@@ -1378,5 +1458,30 @@ mod v0620_tests {
         }
         assert!(text.contains("[a-z0-9]{4}-?[a-z0-9]{1,40}"), "{}", text);
         assert_eq!(holes, vec!["field".to_string(), "4".to_string()]);
+    }
+
+    /// Ronda 2 (R2-N1): con el hook se lee lo que abre el hook (el nombre crudo), y el cache lo guarda
+    /// con ese nombre: si el hook abrió otro archivo que `target` (un link cambió en el medio), una
+    /// carga legítima de `target` con la misma fecha y tamaño no se lleva ese árbol.
+    #[test]
+    fn the_template_cache_is_keyed_by_what_was_read() {
+        use std::rc::Rc;
+        let d = std::env::temp_dir().join(format!("synsema-tplkey-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let (a, b) = (d.join("a.html"), d.join("b.html"));
+        std::fs::write(&a, "AAAA").unwrap();
+        std::fs::write(&b, "BBBB").unwrap();
+        let t = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        for f in [&a, &b] {
+            std::fs::File::options().write(true).open(f).unwrap().set_modified(t).unwrap();
+        }
+        let hook: crate::interpreter::TemplateOpenHook =
+            Rc::new(|raw: &str| std::fs::File::open(raw).map_err(|e| crate::interpreter::RuntimeError::new(e.to_string())));
+        let (ra, rb) = (a.to_string_lossy().into_owned(), b.to_string_lossy().into_owned());
+        let other = super::load_template(&a, "a.html", &rb, Some(hook.clone())).unwrap_or_else(|_| panic!("b"));
+        let mine = super::load_template(&a, "a.html", &ra, Some(hook)).unwrap_or_else(|_| panic!("a"));
+        assert!(!Rc::ptr_eq(&other, &mine), "la carga de a.html trajo el árbol de b.html");
+        let _ = std::fs::remove_dir_all(&d);
     }
 }

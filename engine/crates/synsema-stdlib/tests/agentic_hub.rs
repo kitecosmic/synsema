@@ -831,11 +831,20 @@ impl Drop for TempDir {
 }
 
 fn interp_fs(dir: &TempDir) -> Interpreter {
+    interp_fs_with(dir, "**", &[])
+}
+
+/// v0.6.46: `tree` es el glob de los grants de abajo de la carpeta (`*` o `**`) y `deny` lo que se
+/// niega (relativo a la carpeta).
+fn interp_fs_with(dir: &TempDir, tree: &str, deny: &[&str]) -> Interpreter {
     let interp = Interpreter::new();
     let caps = Rc::new(RefCell::new(CapabilitySet::new("test")));
     caps.borrow_mut().grant(Capability::new(CapabilityType::Exec, Some(shell().to_string())));
     caps.borrow_mut().grant(Capability::new(CapabilityType::FileRead, Some(dir.path())));
-    caps.borrow_mut().grant(Capability::new(CapabilityType::FileRead, Some(format!("{}/*", dir.path()))));
+    caps.borrow_mut().grant(Capability::new(CapabilityType::FileRead, Some(format!("{}/{}", dir.path(), tree))));
+    for d in deny {
+        caps.borrow_mut().deny(Capability::new(CapabilityType::FileRead, Some(format!("{}/{}", dir.path(), d))));
+    }
     register_ws_builtins(&interp, caps);
     attach_bus(&interp, Arc::new(Bus::new()));
     interp
@@ -974,6 +983,101 @@ fn watch_needs_file_read_and_an_existing_path() {
     let ev = next_ev(&mut i, w);
     assert_eq!(text(&get(&ev, "type")), "modify");
     assert!(path_ends_with(&ev, "/one.txt"));
+}
+
+#[test]
+fn watch_recursive_needs_the_whole_tree_and_honours_deny() {
+    // v0.6.46 (backlog §10): el permiso se miraba sólo en la raíz. Con `file.read("d")` +
+    // `file.read("d/*")`, un watch recursivo informaba los nombres de `d/sub/`, que el programa no
+    // puede leer; y un `deny` de adentro no sacaba nada de los eventos.
+    let _g = serial();
+    let d = TempDir::new("tree");
+    std::fs::create_dir(d.file("sub")).unwrap();
+    let mut shallow = interp_fs_with(&d, "*", &[]);
+    let e = err_msg(call(&mut shallow, "watch", vec![syn_text(d.path()), fast_opts(&[])]));
+    assert!(e.contains("/**"), "pide el árbol entero: {}", e);
+    // Sin recursión alcanza con la carpeta (lo mismo que `list_dir`).
+    ok(call(&mut shallow, "watch", vec![syn_text(d.path()), fast_opts(&[("recursive", SynValue::Bool(false))])]));
+
+    std::fs::create_dir(d.file("secret")).unwrap();
+    std::fs::write(d.file("secret/old.txt"), "x").unwrap();
+    let mut i = interp_fs_with(&d, "**", &["secret"]);
+    let w = int(&ok(call(&mut i, "watch", vec![syn_text(d.path()), fast_opts(&[])])));
+    let st = ok(call(&mut i, "watch_stats", vec![syn_int(w)]));
+    assert_eq!(int(&get(&st, "entries")), 2, "raíz + sub, sin secret ni lo de adentro");
+    std::fs::write(d.file("secret/new.txt"), "x").unwrap();
+    std::fs::write(d.file("secret/old.txt"), "xy").unwrap();
+    assert!(
+        matches!(ok(call(&mut i, "watch_recv", vec![syn_int(w), num(0.4)])), SynValue::Nothing),
+        "lo negado no produce eventos"
+    );
+    std::fs::write(d.file("sub/ok.txt"), "x").unwrap();
+    let ev = next_ev(&mut i, w);
+    assert!(path_ends_with(&ev, "/sub/ok.txt"), "{}", text(&get(&ev, "path")));
+}
+
+/// v0.6.46 (ronda 1 de cf1, B4): con `pty: true`, `portable-pty` le probaba a una ruta que no existe
+/// las extensiones de `PATHEXT`: el grant `exec(".../notes.txt")` corría `notes.bat`.
+#[cfg(windows)]
+#[test]
+fn pty_runs_exactly_the_granted_file() {
+    let _g = serial();
+    let d = TempDir::new("ptyext");
+    std::fs::create_dir(d.file("sub")).unwrap();
+    let marker = d.file("sub/ran.txt");
+    std::fs::write(d.file("sub/notes.bat"), format!("@echo x > \"{}\"\r\n", marker.display())).unwrap();
+    let interp = Interpreter::new();
+    let caps = Rc::new(RefCell::new(CapabilitySet::new("test")));
+    caps.borrow_mut().grant(Capability::new(CapabilityType::Exec, Some(format!("{}/sub/notes.txt", d.path()))));
+    register_ws_builtins(&interp, caps);
+    attach_bus(&interp, Arc::new(Bus::new()));
+    let mut i = interp;
+    let mut opts = SynMap::new();
+    opts.insert("cwd", syn_text(format!("{}/sub", d.path())));
+    opts.insert("pty", SynValue::Bool(true));
+    let e = err_msg(call(&mut i, "proc_spawn", vec![syn_text("./notes.txt"), list(vec![]), syn_map(opts)]));
+    assert!(e.contains("no such file"), "{}", e);
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    assert!(!marker.exists(), "corrió notes.bat");
+}
+
+#[test]
+fn watch_on_a_file_that_becomes_a_folder_does_not_walk_it() {
+    // v0.6.46 (ronda 1 de cf1, B5): el `/**` se pedía sólo si la raíz ya era una carpeta. Un watch
+    // sobre un archivo que después reemplaza una carpeta informaba todo el árbol con sólo
+    // `file.read("<ruta>")`. Sin el árbol concedido se mira como `recursive: false`.
+    let _g = serial();
+    let d = TempDir::new("file2dir");
+    std::fs::write(d.file("data"), "x").unwrap();
+    let mut i = interp_fs_with(&d, "*", &[]);
+    let root = format!("{}/data", d.path());
+    let w = int(&ok(call(&mut i, "watch", vec![syn_text(root.clone()), fast_opts(&[])])));
+    std::fs::remove_file(d.file("data")).unwrap();
+    std::fs::create_dir_all(d.file("data/sub")).unwrap();
+    std::fs::write(d.file("data/sub/hidden.txt"), "x").unwrap();
+    let mut seen = Vec::new();
+    while let SynValue::Map(_) = {
+        let ev = ok(call(&mut i, "watch_recv", vec![syn_int(w), num(0.4)]));
+        if let SynValue::Map(_) = &ev {
+            seen.push(text(&get(&ev, "path")));
+        }
+        ev
+    } {}
+    assert!(seen.iter().any(|p| p.ends_with("/data/sub")), "el primer nivel sí se ve: {:?}", seen);
+    assert!(!seen.iter().any(|p| p.contains("hidden")), "no recorre lo que no se concedió: {:?}", seen);
+}
+
+#[test]
+fn proc_spawn_resolves_a_relative_command_against_cwd() {
+    // v0.6.46 (backlog §10): el mismo gate que `run`: con `cwd`, `./tool` es el de esa carpeta y es
+    // lo que se pide (`exec("<cwd>/tool")`), no el nombre tal cual.
+    let _g = serial();
+    let d = TempDir::new("cwdexec");
+    let mut i = interp_fs(&d);
+    let mut opts = SynMap::new();
+    opts.insert("cwd", syn_text(d.path()));
+    let e = err_msg(call(&mut i, "proc_spawn", vec![syn_text("./tool"), list(vec![]), syn_map(opts)]));
+    assert!(e.contains(&format!("{}/tool", d.path())), "{}", e);
 }
 
 #[test]

@@ -323,6 +323,9 @@ fn prepare_app(source: &str, opts: &RunOptions) -> Result<(), Vec<String>> {
     let granted = caps.borrow().granted.clone();
     let globals = snapshot_globals(&interp);
     let agents = interp.agent_definitions.clone();
+    // v0.6.46 (ronda 2 de cf1, N8): lo que leyó y escribió el top-level no es del primer request
+    // (los siguientes ya arrancan vacíos por `reset_for_request`). Como el worker de `serve`.
+    let _ = interp.take_lineage();
     APP.with(|a| *a.borrow_mut() = Some(App { key, interp, caps, captured, granted, globals, agents }));
     Ok(())
 }

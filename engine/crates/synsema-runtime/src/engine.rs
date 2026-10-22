@@ -191,7 +191,7 @@ pub(crate) fn declared_memory_name(
     use synsema_core::ast::NodeKind;
     let mut found: Option<String> = None;
     for stmt in statements {
-        if let NodeKind::RequireStatement { capability, scope } = &stmt.kind {
+        if let NodeKind::RequireStatement { capability, scope, .. } = &stmt.kind {
             if capability != "memory" {
                 continue;
             }
@@ -572,6 +572,32 @@ pub(crate) fn wire_common_with_state(
         // derechos distintos).
         caps.borrow_mut().grant_ambient(Capability::new(CapabilityType::Judge, None));
     }
+    // v0.6.46 (E3): `declassify` es una capability (D3, el `unsafe` de Rust): de ambiente sin
+    // techo, también bajo secure/serve; con techo, sólo lo que el techo nombra.
+    synsema_stdlib::captoken::install_declassify_hook(interp, caps.clone());
+    // v0.6.46 (E5): datos privados hacia el modelo, sólo con `llm=P@<host>` en el techo. El host
+    // sale del provider cableado en ESTE intérprete al momento de la llamada (se cablea después,
+    // y uno que se recarga puede cambiar de host); sin provider, nada sale del proceso: `local`.
+    {
+        let cell = provider_cell(interp);
+        synsema_stdlib::captoken::install_llm_data_hook(
+            interp,
+            caps.clone(),
+            Rc::new(move |judge| {
+                let w = cell.borrow();
+                let ep = if judge {
+                    w.judge.as_ref().map(|(p, _)| p.endpoint())
+                } else {
+                    w.llm.as_ref().map(|p| p.endpoint())
+                };
+                ep.unwrap_or_else(|| "local".to_string())
+            }),
+        );
+    }
+    // v0.6.46 (E3b): los módulos de confianza del host (`--trusted`), para `use "trusted:…"`.
+    if let Some(t) = crate::host::trusted() {
+        synsema_stdlib::captoken::install_trusted_modules(interp, caps.clone(), &t.modules, t.ceiling.clone());
+    }
     register_secure_builtins(interp, caps.clone());
     // Secretos/env: carga el `.env` (antes de evaluar require/serve) y registra
     // env/secret/reveal/bearer/crypto. Deny-by-default: env()/secret()/reveal() exigen
@@ -615,6 +641,7 @@ pub(crate) fn wire_common_with_state(
     synsema_stdlib::webauthn::register_webauthn_builtins(interp);
     // T3/T4 (identidad): JCS (RFC 8785), did:key y pruebas W3C Data Integrity.
     synsema_stdlib::canonical::register_canonical_builtins(interp);
+    synsema_stdlib::tools::register_tool_builtins(interp);
     // Linaje (DATOS-17): los resultados estructurados se hashean sobre su JSON canónico.
     interp.lineage_canonical = Some(Rc::new(|v: &synsema_core::types::SynValue| {
         match synsema_stdlib::canonical::canonical_json(v) {
@@ -696,6 +723,8 @@ pub(crate) fn wire_common_with_state(
     synsema_stdlib::privacy::register_privacy_builtins(interp);
     synsema_stdlib::zk::register_zk_builtins(interp);
     synsema_stdlib::archive::register_archive_builtins(interp, caps.clone());
+    // v0.6.46 (C4): Parquet desde el disco, por partes (pide `file.read`).
+    synsema_stdlib::parquet_io::register_parquet_scan(interp, caps.clone());
     synsema_stdlib::raster::register_raster_builtins_with_caps(interp, caps.clone());
     crate::parallel::register_parallel_builtins(interp, caps, secure, mem);
     // render real (sobrescribe el placeholder de core): SSR de templates → raw response.
@@ -751,6 +780,13 @@ pub(crate) fn wire_common_with_state(
                     "synsema: warning: bare `require wallet` permits creating custody from ANY secret; \
                      scope it with `require wallet(\"NAME\")` (the source secret's name, or the new \
                      secret's label when generating)"
+                );
+            }
+            // v0.6.46 (E3): ídem para `declassify` (publicar lo privado de cualquier principal).
+            if ty == CapabilityType::Declassify && scope.is_none() {
+                eprintln!(
+                    "synsema: warning: bare `require declassify` permits publishing data private to ANY principal; \
+                     scope it with `require declassify(\"principal\")` (the principal the call removes)"
                 );
             }
             c.borrow_mut().grant(Capability::new(ty, scope.map(|s| s.to_string())));
@@ -862,6 +898,34 @@ pub(crate) fn wire_common_with_state(
                 .borrow_mut()
                 .require(&Capability::new(CapabilityType::FileRead, Some(path)), "render()")
                 .map_err(|v| v.into_error())
+        }));
+        // v0.6.46 (E8): y se abre sin ventana con ese gate: la MISMA ruta que juzgó (la normalizada
+        // de `raw`), no la que `resolve_template_path` resolvió después (ronda 1, E8-A3: entre el
+        // gate y ese `canonicalize` un link podía cambiar, y la ruta resuelta ya no tiene links que
+        // obliguen a re-juzgar). Con un link en el camino, el mismo gate juzga dónde quedó abierto el
+        // template, y además que siga adentro del directorio de trabajo, el otro chequeo de la carga.
+        let caps_open = caps.clone();
+        interp.set_template_open_hook(Rc::new(move |raw: &str| {
+            use synsema_capabilities::nofollow::{open_checked, OpenFor, Refused};
+            let path = synsema_capabilities::model::normalize_path(raw);
+            let recheck = |real: &str| {
+                synsema_core::capscope::with_physical(&path, real, || {
+                    caps_open
+                        .borrow_mut()
+                        .require(&Capability::new(CapabilityType::FileRead, Some(path.clone())), "render()")
+                        .map_err(|v| v.into_error())
+                })?;
+                let cwd = std::env::current_dir().and_then(|p| p.canonicalize()).map_err(|e| RuntimeError::new(e.to_string()))?;
+                if std::path::Path::new(real).starts_with(&cwd) {
+                    Ok(())
+                } else {
+                    Err(RuntimeError::new(format!("template path escapes the working directory: '{}'", raw)))
+                }
+            };
+            open_checked(&path, OpenFor::READ, &recheck).map_err(|r| match r {
+                Refused::Denied(e) => e,
+                Refused::Io(_) => RuntimeError::new(format!("template not found: {}", raw)),
+            })
         }));
     }
     // run_program(source, opts): Synsema ejecutando Synsema en un proceso hijo bajo
@@ -992,10 +1056,10 @@ fn wire_llm_with(interp: &mut Interpreter, provider: Arc<dyn LLMProvider>) {
     interp.set_llm_usage_callback(Rc::new(crate::llm_providers::llm_tokens_total));
     // Callback de texto: arma `LLMRequest::new(op)` + `data["prompt"]` → `call().content`.
     let p_text = provider.clone();
-    interp.set_llm_callback(Rc::new(move |op: &str, prompt: &str| {
+    interp.set_llm_callback(Rc::new(move |op: &str, prompt: &str, _principals: &[Rc<str>]| {
         let mut req = LLMRequest::new(op);
         req.data.insert("prompt".to_string(), prompt.to_string());
-        p_text.call(&req).content
+        Ok(p_text.call(&req).content)
     }));
     // Callback dedicado de `decide` (DE-039): las opciones viajan estructuradas y el
     // contrato completo (tool/enum forzado → normalización → 1 reintento → fallback
@@ -1020,27 +1084,66 @@ fn wire_llm_with(interp: &mut Interpreter, provider: Arc<dyn LLMProvider>) {
     // `data["prompt"]`/`data["context"]` → `call_step` → mapea `LlmStep`→`StepResult`.
     interp.set_llm_step_callback(Rc::new(
         move |prompt: &str, catalog: &[StepCatalogEntry], context: &str| {
-            let mut req = LLMRequest::new("step").with_tools(
-                catalog
-                    .iter()
-                    .map(|e| ToolSpec {
-                        name: e.name.clone(),
-                        description: e.description.clone(),
-                        params: e.params.clone(),
-                    })
-                    .collect(),
-            );
-            req.data.insert("prompt".to_string(), prompt.to_string());
-            req.data.insert("context".to_string(), context.to_string());
-            let r = provider.call_step(&req);
-            match r.step {
-                LlmStep::Final(t) => StepResult::Final { text: t, tokens: r.tokens_used },
-                LlmStep::ToolCall { name, args } => {
-                    StepResult::Tool { name, args, tokens: r.tokens_used }
-                }
-            }
+            llm_step_with(provider.as_ref(), prompt, catalog, context)
         },
     ));
+}
+
+/// Un paso tool-aware contra `provider`: arma `LLMRequest::new("step").with_tools(catalog)` +
+/// `data["prompt"]`/`data["context"]` → `call_step` → mapea `LlmStep`→`StepResult`.
+fn llm_step_with(provider: &dyn LLMProvider, prompt: &str, catalog: &[StepCatalogEntry], context: &str) -> StepResult {
+    let mut req = LLMRequest::new("step").with_tools(
+        catalog
+            .iter()
+            .map(|e| ToolSpec {
+                name: e.name.clone(),
+                description: e.description.clone(),
+                params: e.params.clone(),
+                types: e.types.iter().map(|t| t.map_or("", |t| t.json_schema()).to_string()).collect(),
+                optional: e.optional.clone(),
+            })
+            .collect(),
+    );
+    req.data.insert("prompt".to_string(), prompt.to_string());
+    req.data.insert("context".to_string(), context.to_string());
+    let r = provider.call_step(&req);
+    match r.step {
+        LlmStep::Final(t) => StepResult::Final { text: t, tokens: r.tokens_used },
+        LlmStep::ToolCall { name, args } => {
+            let args = typed_step_args(catalog, &name, args);
+            StepResult::Tool { name, args, tokens: r.tokens_used }
+        }
+    }
+}
+
+/// v0.6.46 (F1): el proveedor manda los argumentos de una tool-call como texto (`synsema-llm` no
+/// tiene dependencias: un número llega `"3"`, una lista `"[1,2]"`). Un parámetro que el catálogo
+/// declara de un tipo distinto de `text` vuelve a su tipo decodificando ese JSON; si no da el tipo
+/// declarado queda como texto y `call_tool` lo rechaza con el error que lo dice. Los parámetros sin
+/// tipo siguen llegando como texto.
+fn typed_step_args(catalog: &[StepCatalogEntry], tool: &str, args: Vec<(String, String)>) -> Vec<(String, SynValue)> {
+    let entry = catalog.iter().find(|e| e.name == tool);
+    args.into_iter()
+        .filter_map(|(k, s)| {
+            let ty = entry
+                .and_then(|e| e.params.iter().position(|p| *p == k).and_then(|i| e.types.get(i).copied().flatten()));
+            // v0.6.46 (ronda 1 de cf1, N2): muchos modelos mandan `null` para lo que no quieren pasar.
+            // En un parámetro opcional, o tipado y no `text`, es "no lo pasó": corre el default, o
+            // `call_tool` dice que falta (antes llegaba el texto "null").
+            let optional = entry.is_some_and(|e| e.optional.contains(&k));
+            if s == "null" && (optional || ty.is_some_and(|t| t != synsema_core::ast::ParamType::Text)) {
+                return None;
+            }
+            let v = match ty {
+                Some(t) if t != synsema_core::ast::ParamType::Text => serde_json::from_str::<serde_json::Value>(&s)
+                    .ok()
+                    .map(|j| synsema_stdlib::json::json_to_syn(&j))
+                    .filter(|v| t.accepts(v)),
+                _ => None,
+            };
+            Some((k, v.unwrap_or_else(|| synsema_core::types::syn_text(s))))
+        })
+        .collect()
 }
 
 fn finish(mut interp: Interpreter, result: Result<SynValue, Control>) -> RunResult {
@@ -1054,6 +1157,7 @@ fn finish(mut interp: Interpreter, result: Result<SynValue, Control>) -> RunResu
         _ => None,
     };
     LAST_RUN_EXIT.store(exit.unwrap_or(-1), std::sync::atomic::Ordering::SeqCst);
+    RUN_EXIT.with(|c| c.set(exit));
     if let Some(code) = exit {
         return RunResult { success: code == 0, output: std::mem::take(&mut interp.output), errors: Vec::new() };
     }
@@ -1252,6 +1356,14 @@ static LAST_RUN_PRIVATE: std::sync::atomic::AtomicBool = std::sync::atomic::Atom
 /// v0.6.42 — el código que pidió `exit(code)` en la última corrida (-1 = no llamó a `exit`).
 static LAST_RUN_EXIT: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
 
+thread_local! {
+    /// v0.6.46 — el `exit(code)` de la corrida de ESTE hilo del motor (lo fija `finish`). El motor
+    /// decide con éste, no con `LAST_RUN_EXIT`: con dos corridas a la vez en un proceso (un
+    /// embebedor, un binario de tests), la otra lo pisaba en el medio y un agente vivo quedaba
+    /// corriendo para siempre. `LAST_RUN_EXIT` queda para la CLI, que corre una por proceso.
+    static RUN_EXIT: std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) };
+}
+
 /// v0.6.45 (A5) — `serve` anota el código de un `exit(code)` del preámbulo (antes de escuchar),
 /// o que no lo hubo, por el mismo canal que `run`.
 pub(crate) fn note_exit_code(code: Option<i32>) {
@@ -1336,20 +1448,23 @@ pub fn run_program_ceiled_opts(
     let sw = swarm.clone();
     let src = source.to_string();
     let fname = filename.to_string();
-    let mut result = std::thread::Builder::new()
+    let result = std::thread::Builder::new()
         .stack_size(INTERP_STACK_SIZE)
-        .spawn(move || run_inner(&src, &fname, false, Some(sw), live_output, ceiling))
+        .spawn(move || {
+            RUN_EXIT.with(|c| c.set(None));
+            let r = run_inner(&src, &fname, false, Some(sw), live_output, ceiling);
+            (r, RUN_EXIT.with(|c| c.get()))
+        })
         .expect("no se pudo crear el hilo del motor")
         .join()
-        .unwrap_or_else(|p| RunResult {
-            success: false,
-            output: Vec::new(),
-            errors: vec![abort_message(&p)],
+        .unwrap_or_else(|p| {
+            (RunResult { success: false, output: Vec::new(), errors: vec![abort_message(&p)] }, None)
         });
+    let (mut result, run_exit) = result;
 
     // v0.6.42 (auditoría) — `exit(code)` termina el programa: los agentes vivos se detienen (si
     // no, `wait_all` esperaba a uno en bucle para siempre) y el código lo decide `exit`.
-    let exited = last_run_exit_code().is_some();
+    let exited = run_exit.is_some();
     // Los que `exit` detuvo: su error es la cancelación y no se informa. Un agente que ya había
     // fallado antes del `exit` sí (auditoría ronda 2: se descartaban todos).
     let stopped: std::collections::HashSet<String> = if exited {
@@ -1737,9 +1852,9 @@ pub fn run_capturing_llm(source: &str, filename: &str) -> (RunResult, Vec<(Strin
         .spawn(move || {
             run_configured(&src, &fname, move |interp| {
                 let cap = captured.clone();
-                interp.set_llm_callback(Rc::new(move |op: &str, prompt: &str| {
+                interp.set_llm_callback(Rc::new(move |op: &str, prompt: &str, _principals: &[Rc<str>]| {
                     cap.lock().unwrap().push((op.to_string(), prompt.to_string()));
-                    "ok".to_string()
+                    Ok("ok".to_string())
                 }));
             })
         })
@@ -1797,8 +1912,8 @@ pub fn run_with_llm(source: &str, filename: &str, responses: HashMap<String, Str
             run_configured(&src, &fname, move |interp| {
                 let provider = Arc::new(MockProvider::new(responses));
                 // El mock keyea por `op` e ignora el prompt (retrocompat de los tests).
-                interp.set_llm_callback(Rc::new(move |op: &str, _prompt: &str| {
-                    provider.call(&LLMRequest::new(op)).content
+                interp.set_llm_callback(Rc::new(move |op: &str, _prompt: &str, _principals: &[Rc<str>]| {
+                    Ok(provider.call(&LLMRequest::new(op)).content)
                 }));
             })
         })
@@ -1822,25 +1937,7 @@ pub fn run_with_llm_steps(source: &str, filename: &str, steps: Vec<LlmStepRespon
                 let provider = Arc::new(MockProvider::scripted(steps));
                 interp.set_llm_step_callback(Rc::new(
                     move |prompt: &str, catalog: &[StepCatalogEntry], context: &str| {
-                        let mut req = LLMRequest::new("step").with_tools(
-                            catalog
-                                .iter()
-                                .map(|e| ToolSpec {
-                                    name: e.name.clone(),
-                                    description: e.description.clone(),
-                                    params: e.params.clone(),
-                                })
-                                .collect(),
-                        );
-                        req.data.insert("prompt".to_string(), prompt.to_string());
-                        req.data.insert("context".to_string(), context.to_string());
-                        let r = provider.call_step(&req);
-                        match r.step {
-                            LlmStep::Final(t) => StepResult::Final { text: t, tokens: r.tokens_used },
-                            LlmStep::ToolCall { name, args } => {
-                                StepResult::Tool { name, args, tokens: r.tokens_used }
-                            }
-                        }
+                        llm_step_with(provider.as_ref(), prompt, catalog, context)
                     },
                 ));
             })
@@ -2100,10 +2197,13 @@ fn spawn_agent(
     let instance_id = swarm.register_new_agent(&agent_name);
     let sw = swarm.clone();
     let id = instance_id.clone();
+    // v0.6.46 (E6): el agente escribe en el registro sellado de la corrida que lo lanzó.
+    let sealed_log = synsema_core::sealed::current();
     let handle = std::thread::Builder::new()
         .name(id.clone())
         .stack_size(INTERP_STACK_SIZE)
         .spawn(move || {
+            let _sealed = sealed_log.map(synsema_core::sealed::install_thread);
             let (mut interp, caps) = match &builder {
                 // Bajo serve: el MISMO wiring que un tick de cron (state_*, DB, approvals,
                 // cron, bus, memoria, techo del host); los hooks se re-cablean con la
@@ -2294,4 +2394,83 @@ pub fn run_swarm_dump_ceiled(source: &str, filename: &str, ceiling: Option<Vec<C
         .map(|(id, st)| (id, st.name().to_string()))
         .collect();
     SwarmDump { result, blackboard, agents }
+}
+
+#[cfg(all(test, any(target_os = "linux", windows)))]
+mod v0646_e8_tests {
+    use super::*;
+
+    fn link_dir(target: &std::path::Path, link: &std::path::Path) {
+        #[cfg(windows)]
+        assert!(std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(link.to_string_lossy().replace('/', "\\"))
+            .arg(target.to_string_lossy().replace('/', "\\"))
+            .output()
+            .unwrap()
+            .status
+            .success());
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(target, link).unwrap();
+    }
+
+    /// Saca el link (una junction en Windows es un directorio; un symlink en Unix, un archivo).
+    fn unlink(link: &std::path::Path) {
+        if std::fs::remove_dir(link).is_err() {
+            std::fs::remove_file(link).unwrap();
+        }
+    }
+
+    /// v0.6.46 (E8): el template ya gateado, y DESPUÉS su carpeta pasa a ser un link afuera del
+    /// grant (pero adentro del cwd): la apertura lo niega con el mensaje del link. En el orden de la
+    /// ejecución real (ronda 1, E8-A3): gate, cambio, el `canonicalize` de `resolve_template_path` (que
+    /// ya no ve links) y recién ahí la apertura. Un link que queda adentro, sí.
+    #[test]
+    fn e8_template_open_is_judged_where_it_opened() {
+        // Adentro del cwd (el del crate): `render` sólo lee plantillas de ahí.
+        let name = format!(".e8-tpl-test-{}", std::process::id());
+        let d = std::env::current_dir().unwrap().join(&name);
+        let _ = std::fs::remove_dir_all(&d);
+        // Se limpia aunque falle una aserción: la carpeta vive en el crate, no en temp.
+        struct Limpia(std::path::PathBuf);
+        impl Drop for Limpia {
+            fn drop(&mut self) {
+                let sub = self.0.join("proj/sub");
+                if std::fs::remove_dir(&sub).is_err() {
+                    let _ = std::fs::remove_file(&sub);
+                }
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _limpia = Limpia(d.clone());
+        std::fs::create_dir_all(d.join("proj/real")).unwrap();
+        std::fs::create_dir_all(d.join("proj/otra")).unwrap();
+        std::fs::create_dir_all(d.join("afuera")).unwrap();
+        std::fs::write(d.join("proj/real/t.html"), "adentro").unwrap();
+        std::fs::write(d.join("proj/otra/t.html"), "otra").unwrap();
+        std::fs::write(d.join("afuera/t.html"), "SECRETO").unwrap();
+        link_dir(&d.join("proj/real"), &d.join("proj/sub"));
+        let mut interp = Interpreter::new();
+        let caps = Rc::new(RefCell::new(CapabilitySet::new("t")));
+        caps.borrow_mut().grant(Capability::new(CapabilityType::FileRead, Some(format!("{}/proj/**", name))));
+        wire_common(&mut interp, &caps, false, None, "t");
+        let open = interp.template_open_hook().expect("el motor cablea la apertura de templates");
+        let raw = format!("{}/proj/sub/t.html", name);
+        let read = |f: std::fs::File| std::io::read_to_string(f).unwrap();
+        let gate = || interp.gate_template_read(&raw).is_ok();
+        assert!(gate());
+        assert_eq!(read(open(&raw).unwrap()), "adentro");
+        // La carrera: el gate pasa con `sub` → `real`, y antes de abrir `sub` lleva afuera.
+        assert!(gate());
+        unlink(&d.join("proj/sub"));
+        link_dir(&d.join("afuera"), &d.join("proj/sub"));
+        let resolved = d.join("proj/sub/t.html").canonicalize().unwrap();
+        assert!(resolved.ends_with("afuera/t.html") || resolved.ends_with("afuera\\t.html"));
+        let e = open(&raw).unwrap_err();
+        assert!(e.message.contains("a link (symlink or junction) on the way leads outside"), "{}", e.message);
+        // Un link que queda adentro del grant, sí.
+        unlink(&d.join("proj/sub"));
+        link_dir(&d.join("proj/otra"), &d.join("proj/sub"));
+        assert_eq!(read(open(&raw).unwrap()), "otra");
+    }
 }

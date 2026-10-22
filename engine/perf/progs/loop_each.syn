@@ -1,0 +1,4 @@
+let total be 0
+each i in range(0, 200000)
+    set total to total + i % 7
+print(total)

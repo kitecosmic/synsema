@@ -36,3 +36,8 @@ synsema-runtime.workspace = true
 serde_json.workspace = true
 # `synsema update`: verifica el sha256 del release descargado (RustCrypto, puro Rust).
 sha2.workspace = true
+
+[dev-dependencies]
+# v0.6.46 (ronda 2): un server WebSocket local para el test de la tool de confianza (el mismo
+# tungstenite que usa el stdlib, en modo `accept`).
+tungstenite = { workspace = true }

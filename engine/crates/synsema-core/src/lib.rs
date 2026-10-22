@@ -45,6 +45,8 @@ pub mod tabular;
 pub mod temporal;
 pub mod route_meta;
 pub mod secret;
+/// v0.6.46 (E6): el registro de la corrida para el recibo sellado.
+pub mod sealed;
 pub mod templates;
 pub mod term_guard;
 pub mod testgen;

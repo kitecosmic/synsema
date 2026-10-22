@@ -189,7 +189,11 @@ fn every_effectful_family_is_a_label_sink() {
         .union(&set(synsema_core::interpreter::CORE_SINK_BUILTINS))
         .cloned()
         .collect();
-    let aware = set(synsema_core::interpreter::PROTECTED_BUILTIN_NAMES);
+    // v0.6.46 (E5): `llm_step`/`llm_stream` son conscientes con su propio gate (no protegidos).
+    let aware: BTreeSet<String> = set(synsema_core::interpreter::PROTECTED_BUILTIN_NAMES)
+        .union(&set(synsema_core::interpreter::CORE_LLM_LABEL_AWARE))
+        .cloned()
+        .collect();
     let pure = set(synsema_runtime::engine::LABEL_PURE_BUILTINS);
     let deferred = set(synsema_runtime::engine::LABEL_SINKS_SERVE_ONLY);
     let os_reads = set(synsema_runtime::engine::LABEL_OS_READ_BUILTINS);
@@ -223,6 +227,7 @@ fn every_effectful_family_is_a_label_sink() {
     for (family, names) in [
         ("filesystem", pure::FS),
         ("archive", pure::ARCHIVE),
+        ("parquet from disk", pure::PARQUET_FS),
         ("exec", pure::EXEC),
         ("sockets", pure::SOCKETS),
         ("database", pure::DB),

@@ -108,6 +108,18 @@ pub struct RunOptions {
     pub max_steps: Option<u64>,
     /// v0.6.45 (D2) — tope de la memoria lineal del módulo, en MB. Sólo en wasm32.
     pub max_memory_mb: Option<u64>,
+    /// v0.6.46 (E3b) — módulos de confianza del embebedor `(nombre, fuente)`: el programa los
+    /// importa con `use "trusted:nombre"`, y sus tasks exportadas corren con sus `require` ∩
+    /// `trusted_ceiling`, no con lo del programa.
+    pub trusted: Vec<(String, String)>,
+    /// v0.6.46 (E3b) — el techo de los módulos de confianza (la gramática de `ceiling`).
+    pub trusted_ceiling: Option<Vec<Capability>>,
+    /// v0.6.46 (E6) — la pública X25519 del auditor que designa el host: con ella, `Report.receipt`
+    /// trae el recibo sellado de la corrida (lo de una rama privada va cifrado para el auditor, en
+    /// un sobre de tamaño fijo).
+    pub auditor: Option<[u8; 32]>,
+    /// v0.6.46 (E6) — el tamaño del texto plano del sobre (por defecto 64 KiB).
+    pub sealed_bytes: Option<usize>,
 }
 
 impl RunOptions {
@@ -123,6 +135,10 @@ impl RunOptions {
             sources: Vec::new(),
             max_steps: None,
             max_memory_mb: None,
+            trusted: Vec::new(),
+            trusted_ceiling: None,
+            auditor: None,
+            sealed_bytes: None,
         }
     }
 }
@@ -175,6 +191,9 @@ pub struct Report {
     pub private_seen: bool,
     /// v0.6.42 — el código que pidió `exit(code)`, si lo llamó (`ok` = código 0, sin errores).
     pub exit_code: Option<i32>,
+    /// v0.6.46 (E6) — el recibo sellado, si el host puso un auditor (`RunOptions.auditor`). El host lo
+    /// entrega ANTES que la salida.
+    pub receipt: Option<serde_json::Value>,
 }
 
 /// Un `declassify` ejecutado, en forma plana (`Send`, serializable).
@@ -309,7 +328,7 @@ pub fn llm_tokens_total() -> u64 {
 pub fn declared_memory_name(statements: &[Node]) -> Result<Option<String>, String> {
     let mut found: Option<String> = None;
     for stmt in statements {
-        if let NodeKind::RequireStatement { capability, scope } = &stmt.kind {
+        if let NodeKind::RequireStatement { capability, scope, .. } = &stmt.kind {
             if capability != "memory" {
                 continue;
             }
@@ -364,28 +383,29 @@ pub struct HostMemoryCtx {
     pub progress: Arc<Mutex<ProgressManager>>,
 }
 
-/// Abre (carga) la memoria declarada desde el KV del host. `None` si el programa no
-/// declara memoria o el host no ofrece `kv` (entonces la familia falla con el gate).
-fn open_host_memory(name: &str, host: Option<&Rc<dyn HostProvider>>) -> Option<HostMemoryCtx> {
-    let host = host?;
+/// Abre (carga) la memoria declarada desde el KV del host. `Ok(None)` si el host no ofrece `kv`
+/// (entonces la familia falla con el gate). v0.6.46: `Err` si una lectura falló: la memoria no se
+/// abre (cargarla vacía hacía que la próxima escritura pisara la guardada) y el gate lo dice.
+fn open_host_memory(name: &str, host: Option<&Rc<dyn HostProvider>>) -> Result<Option<HostMemoryCtx>, String> {
+    let Some(host) = host else { return Ok(None) };
     if !host.offers("kv") {
-        return None;
+        return Ok(None);
     }
     let ns = memory_namespace(name);
     let mut mem = AgentMemory::new();
     mem.backend = Some("host-kv".to_string());
-    if let Some(Some(json)) = host.kv_get(&ns, "memory") {
-        mem.load_json(&json);
+    if let Some(Some(json)) = host.kv_get(&ns, "memory").transpose().map_err(|e| format!("the host's kv.get failed: {}", e))? {
+        mem.try_load_json(&json).map_err(|e| format!("the stored memory is not readable ({})", e))?;
     }
     let mut prog = ProgressManager::new();
-    if let Some(Some(json)) = host.kv_get(&ns, "progress") {
-        prog.load_json(&json);
+    if let Some(Some(json)) = host.kv_get(&ns, "progress").transpose().map_err(|e| format!("the host's kv.get failed: {}", e))? {
+        prog.try_load_json(&json).map_err(|e| format!("the stored progress is not readable ({})", e))?;
     }
-    Some(HostMemoryCtx {
+    Ok(Some(HostMemoryCtx {
         name: name.to_string(),
         memory: Arc::new(Mutex::new(mem)),
         progress: Arc::new(Mutex::new(prog)),
-    })
+    }))
 }
 
 fn kv_write(ns: &str, key: &str, value: &str) {
@@ -424,6 +444,11 @@ pub fn wire_pure(interp: &mut Interpreter, caps: &Rc<RefCell<CapabilitySet>>, ct
     // el audit nativo ↔ wasm bajo un ceiling y la denegación tiene que aparecer en los dos.
     // En el guest no hay red ni provider: un bloque `judge` degrada siempre a `available: false`.
     caps.borrow_mut().grant_ambient(Capability::new(CapabilityType::Judge, None));
+    // v0.6.46 (E3): `declassify` como capability, con el mismo helper que el nativo (paridad).
+    synsema_stdlib::captoken::install_declassify_hook(interp, caps.clone());
+    // v0.6.46 (E5): datos privados hacia el modelo, con el mismo helper que el nativo. En wasm el
+    // modelo es el del host que embebe (o ninguno): `llm=P@embedder` en el techo.
+    synsema_stdlib::captoken::install_llm_data_hook(interp, caps.clone(), Rc::new(|_| "embedder".to_string()));
 
     register_secure_builtins(interp, caps.clone());
     // Gate de stdout bajo techo (paridad con el nativo): `ceiling` sin `stdout` deniega
@@ -473,6 +498,7 @@ pub fn wire_pure(interp: &mut Interpreter, caps: &Rc<RefCell<CapabilitySet>>, ct
     synsema_stdlib::webauth::register_webauth_builtins(interp, caps.clone());
     synsema_stdlib::webauthn::register_webauthn_builtins(interp);
     synsema_stdlib::canonical::register_canonical_builtins(interp);
+    synsema_stdlib::tools::register_tool_builtins(interp);
     synsema_stdlib::didkey::register_didkey_builtins(interp);
     synsema_stdlib::integrity::register_integrity_builtins(interp, caps.clone());
     synsema_stdlib::receipt::register_receipt_builtins(interp, caps.clone());
@@ -580,6 +606,11 @@ pub fn wire_pure(interp: &mut Interpreter, caps: &Rc<RefCell<CapabilitySet>>, ct
         }
     };
     let suggest = suggested_memory_name(ctx.filename);
+    let opened = declared.as_ref().map(|n| open_host_memory(n, host.as_ref()));
+    let load_err: Option<String> = match &opened {
+        Some(Err(e)) => Some(e.clone()),
+        _ => None,
+    };
     let gate: MemoryGate = match &declared {
         None => Rc::new(move || {
             Err(RuntimeError::new(format!(
@@ -602,6 +633,12 @@ pub fn wire_pure(interp: &mut Interpreter, caps: &Rc<RefCell<CapabilitySet>>, ct
                         name
                     )));
                 }
+                if let Some(e) = &load_err {
+                    return Err(RuntimeError::new(format!(
+                        "memory \"{}\" could not be loaded ({}); nothing was loaded, so nothing is written over it",
+                        name, e
+                    )));
+                }
                 Ok(())
             })
         }
@@ -613,7 +650,7 @@ pub fn wire_pure(interp: &mut Interpreter, caps: &Rc<RefCell<CapabilitySet>>, ct
         gate.clone(),
     );
     if let Some(name) = &declared {
-        if let Some(mctx) = open_host_memory(name, host.as_ref()) {
+        if let Some(Ok(Some(mctx))) = opened {
             let ns = memory_namespace(name);
             let ns_m = ns.clone();
             let on_write_mem: Arc<dyn Fn(&AgentMemory) + Send + Sync> =
@@ -636,13 +673,15 @@ pub fn wire_pure(interp: &mut Interpreter, caps: &Rc<RefCell<CapabilitySet>>, ct
     // host (llm_available() = true; llm_usage() suma los tokens que el host reporte).
     // Sin él: placeholders offline del core, como hasta ahora. `require llm` no cambia.
     if host.as_ref().is_some_and(|h| h.offers("llm")) {
-        interp.set_llm_callback(Rc::new(|op: &str, prompt: &str| {
-            match hostcap::provider().and_then(|p| p.llm(op, prompt)) {
-                Some(r) => {
+        interp.set_llm_callback(Rc::new(|op: &str, prompt: &str, principals: &[Rc<str>]| {
+            let principals: Vec<String> = principals.iter().map(|p| p.to_string()).collect();
+            match hostcap::provider().and_then(|p| p.llm(op, prompt, &principals)) {
+                Some(Ok(r)) => {
                     LLM_TOKENS.with(|t| *t.borrow_mut() += r.tokens);
-                    r.content
+                    Ok(r.content)
                 }
-                None => format!("[llm: the host returned no answer for {}]", op),
+                Some(Err(e)) => Err(e),
+                None => Ok(format!("[llm: the host returned no answer for {}]", op)),
             }
         }));
         interp.set_llm_usage_callback(Rc::new(llm_tokens_total));
@@ -694,6 +733,13 @@ pub fn wire_pure(interp: &mut Interpreter, caps: &Rc<RefCell<CapabilitySet>>, ct
                      secret's label when generating)",
                 );
             }
+            // v0.6.46 (E3): ídem para `declassify` (publicar lo privado de cualquier principal).
+            if ty == CapabilityType::Declassify && scope.is_none() {
+                hostcap::log(
+                    "synsema: warning: bare `require declassify` permits publishing data private to ANY principal; \
+                     scope it with `require declassify(\"principal\")` (the principal the call removes)",
+                );
+            }
             c.borrow_mut().grant(Capability::new(ty, scope.map(|s| s.to_string())));
         }
     }));
@@ -705,6 +751,15 @@ pub fn wire_pure(interp: &mut Interpreter, caps: &Rc<RefCell<CapabilitySet>>, ct
         caps_llm
             .borrow_mut()
             .require(&Capability::new(CapabilityType::Llm, None), "llm operation")
+            .map_err(|v| v.into_error())
+    }));
+    // v0.6.46 (E5): el gate de `judge` también en wasm (antes no había: `judge` pasaba con o sin
+    // la capability, aunque el techo no la diera). Mismo chequeo que el nativo.
+    let caps_judge = caps.clone();
+    interp.set_judge_cap_hook(Rc::new(move || {
+        caps_judge
+            .borrow_mut()
+            .require(&Capability::new(CapabilityType::Judge, None), "judge block")
             .map_err(|v| v.into_error())
     }));
     // `sandbox under <caps>` (T1): techo delegado por bloque — mismo helper que el runtime.
@@ -767,13 +822,20 @@ fn register_state_builtins(interp: &Interpreter, host_kv: bool) {
     const NS: &str = "state";
     let local: synsema_core::types::MapRef = SynMap::new().into_ref();
 
-    fn load(host_kv: bool, local: &synsema_core::types::MapRef, key: &str) -> Option<SynValue> {
+    fn load(host_kv: bool, local: &synsema_core::types::MapRef, key: &str, who: &str) -> Result<Option<SynValue>, Control> {
         if host_kv {
-            let raw = hostcap::provider().and_then(|p| p.kv_get(NS, key)).flatten()?;
-            let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
-            Some(json_to_syn(&v))
+            let raw = match hostcap::provider() {
+                Some(p) => raw_of(&p, key, who)?,
+                None => None,
+            };
+            // v0.6.46 (ronda 2 de cf1, R2-B3): un valor guardado que no es JSON no es "no está": se
+            // pisaba (`state_incr` sobre un texto suelto daba 1).
+            match raw {
+                None => Ok(None),
+                Some(_) => value_of(&raw, key, who).map(Some),
+            }
         } else {
-            local.borrow().get(key).cloned()
+            Ok(local.borrow().get(key).cloned())
         }
     }
     fn store(host_kv: bool, local: &synsema_core::types::MapRef, key: &str, v: &SynValue) {
@@ -803,7 +865,7 @@ fn register_state_builtins(interp: &Interpreter, host_kv: bool) {
         let l = local.clone();
         interp.register_builtin("state_get", -1, Rc::new(move |_i, args, _l| {
             let key = key_arg(args, "state_get")?;
-            Ok(load(host_kv, &l, &key).unwrap_or_else(|| args.get(1).cloned().unwrap_or(SynValue::Nothing)))
+            Ok(load(host_kv, &l, &key, "state_get")?.unwrap_or_else(|| args.get(1).cloned().unwrap_or(SynValue::Nothing)))
         }));
     }
     {
@@ -815,7 +877,7 @@ fn register_state_builtins(interp: &Interpreter, host_kv: bool) {
                 Some(SynValue::Number(n)) => n.clone(),
                 _ => Number::Int(1),
             };
-            let current = match load(host_kv, &l, &key) {
+            let current = match load(host_kv, &l, &key, "state_incr")? {
                 Some(SynValue::Number(n)) => n,
                 _ => Number::Int(0),
             };
@@ -849,8 +911,13 @@ fn register_state_builtins(interp: &Interpreter, host_kv: bool) {
             let mut map = SynMap::new();
             if host_kv {
                 if let Some(p) = hostcap::provider() {
-                    for k in p.kv_list(NS).unwrap_or_default() {
-                        if let Some(v) = load(true, &l, &k) {
+                    let keys = match p.kv_list(NS) {
+                        Some(Err(e)) => return Err(rt_err(&format!("state_all: host kv.list failed: {}", e))),
+                        Some(Ok(keys)) => keys,
+                        None => Vec::new(),
+                    };
+                    for k in keys {
+                        if let Some(v) = load(true, &l, &k, "state_all")? {
                             map.insert(k, v);
                         }
                     }
@@ -878,14 +945,24 @@ fn register_state_builtins(interp: &Interpreter, host_kv: bool) {
             ))),
         }
     }
-    fn raw_of(p: &Rc<dyn HostProvider>, key: &str) -> Option<String> {
-        p.kv_get(NS, key).flatten()
+    /// v0.6.46: una lectura que falla es un error de la operación (antes, `nothing`).
+    fn raw_of(p: &Rc<dyn HostProvider>, key: &str, who: &str) -> Result<Option<String>, Control> {
+        match p.kv_get(NS, key) {
+            Some(Err(e)) => Err(rt_err(&format!("{}: host kv.get failed: {}", who, e))),
+            Some(Ok(v)) => Ok(v),
+            None => Ok(None),
+        }
     }
-    fn value_of(raw: &Option<String>) -> SynValue {
-        raw.as_deref()
-            .and_then(|r| serde_json::from_str::<serde_json::Value>(r).ok())
-            .map(|v| json_to_syn(&v))
-            .unwrap_or(SynValue::Nothing)
+    /// v0.6.46 (ronda 2 de cf1, R2-B3): un texto que no es JSON es error, no `nothing` (que
+    /// `state_update` o un `state_cas(k, nothing, ..)` lo pisaran).
+    fn value_of(raw: &Option<String>, key: &str, who: &str) -> Result<SynValue, Control> {
+        match raw.as_deref() {
+            None => Ok(SynValue::Nothing),
+            Some(r) => match serde_json::from_str::<serde_json::Value>(r) {
+                Ok(v) => Ok(json_to_syn(&v)),
+                Err(e) => Err(rt_err(&format!("{}: the stored value of '{}' is not JSON ({})", who, key, e))),
+            },
+        }
     }
     fn merged(who: &str, key: &str, current: &SynValue, patch: &synsema_core::types::MapRef) -> Result<SynValue, Control> {
         let mut out = SynMap::new();
@@ -928,8 +1005,8 @@ fn register_state_builtins(interp: &Interpreter, host_kv: bool) {
             }
             let p = host_cas(F)?;
             for _ in 0..CAS_ATTEMPTS {
-                let raw = raw_of(&p, &key);
-                let v = merged(F, &key, &value_of(&raw), &patch)?;
+                let raw = raw_of(&p, &key, F)?;
+                let v = merged(F, &key, &value_of(&raw, &key, F)?, &patch)?;
                 match p.kv_cas(NS, &key, raw.as_deref(), &dumps_syn(&v)) {
                     Some(Ok(true)) => return Ok(v),
                     Some(Ok(false)) => continue,
@@ -960,8 +1037,8 @@ fn register_state_builtins(interp: &Interpreter, host_kv: bool) {
             // Igualdad del LENGUAJE (`2.0 == 2`): se compara el valor leído y se escribe con `cas`
             // contra el texto EXACTO que se leyó; si otro escribió en el medio, se vuelve a leer.
             for _ in 0..CAS_ATTEMPTS {
-                let raw = raw_of(&p, &key);
-                if !value_of(&raw).syn_equals(&expected) {
+                let raw = raw_of(&p, &key, F)?;
+                if !value_of(&raw, &key, F)?.syn_equals(&expected) {
                     return Ok(SynValue::Bool(false));
                 }
                 match p.kv_cas(NS, &key, raw.as_deref(), &dumps_syn(&new)) {
@@ -1040,6 +1117,10 @@ pub(crate) fn prepare(program: &Program, opts: &RunOptions) -> (Interpreter, Rc<
     arm_limits(&mut interp, opts);
     let ctx = WireCtx { env: env_store(opts), statements: &program.statements, filename: &opts.filename, no_fs: opts.no_fs };
     wire_pure(&mut interp, &caps, &ctx);
+    // v0.6.46 (E3b): los módulos de confianza del embebedor, con el mismo helper que el nativo.
+    if !opts.trusted.is_empty() {
+        synsema_stdlib::captoken::install_trusted_modules(&mut interp, caps.clone(), &opts.trusted, opts.trusted_ceiling.clone());
+    }
     if opts.labels {
         interp.set_labels(true);
         // v0.6.45 (D1): los MISMOS sumideros que el nativo (una sola lista, `label_lists`). Antes el
@@ -1163,10 +1244,16 @@ pub fn run(source: &str, opts: &RunOptions) -> Report {
                 declassify: Vec::new(),
                 private_seen: false,
                 exit_code: None,
+                receipt: None,
             }
         }
         Ok(p) => p,
     };
+    // v0.6.46 (E6): el registro de la corrida, en este hilo y mientras dure la corrida (desde el
+    // wiring: los grants ambientales también son entradas).
+    let started = synsema_stdlib::receipt::rfc3339_utc(synsema_core::clock::now_secs());
+    let sealed_log = opts.auditor.map(|_| synsema_stdlib::sealed::new_run_log(opts.sealed_bytes.unwrap_or(synsema_stdlib::sealed::DEFAULT_SEALED_BYTES)));
+    let _sealed = sealed_log.clone().map(synsema_core::sealed::install_thread);
     let (mut interp, caps) = prepare(&program, opts);
     if let Err(e) = bind_input(&interp, opts) {
         disarm_limits(); // ronda 2 (M1): esta salida no pasa por `finish`
@@ -1181,6 +1268,7 @@ pub fn run(source: &str, opts: &RunOptions) -> Report {
             declassify: Vec::new(),
             private_seen: false,
             exit_code: None,
+            receipt: None,
         };
     }
     let result = interp.execute(&program);
@@ -1196,6 +1284,9 @@ pub fn run(source: &str, opts: &RunOptions) -> Report {
     let declassify = interp
         .take_declassify_log()
         .into_iter()
+        // v0.6.46 (E6.8): las declasificaciones de una rama privada no salen al host: cuántas hubo
+        // decía qué rama se tomó.
+        .filter(|e| !e.under_private_pc)
         .map(|e| DeclassifyRecord {
             reason: e.reason,
             // T5 (ronda 7): el `from` que sale al host es el conjunto DECLARADO por el programa,
@@ -1211,7 +1302,38 @@ pub fn run(source: &str, opts: &RunOptions) -> Report {
         _ => None,
     };
     let r = finish(interp, result);
+    let receipt = match (&sealed_log, opts.auditor) {
+        (Some(log), Some(auditor)) => {
+            let key = synsema_stdlib::sealed::RunKey::ephemeral();
+            let program_sha = Some(synsema_core::bytesutil::hex_encode(&synsema_stdlib::attest::sha256(source.as_bytes())));
+            let log = log.lock().unwrap_or_else(|p| p.into_inner());
+            match synsema_stdlib::sealed::build_receipt(
+                &log,
+                &synsema_stdlib::sealed::ReceiptContext { auditor, key: &key, program_sha, config_sha: None, started },
+            ) {
+                Ok(v) => Some(v),
+                // Sin recibo no hay salida: es lo que el host pidió al poner un auditor.
+                Err(e) => {
+                    return Report {
+                        ok: false,
+                        output: Vec::new(),
+                        errors: vec![format!("the sealed receipt could not be built: {}", e)],
+                        audit: Vec::new(),
+                        llm_tokens: 0,
+                        steps: 0,
+                        result: None,
+                        declassify: Vec::new(),
+                        private_seen,
+                        exit_code: None,
+                        receipt: None,
+                    }
+                }
+            }
+        }
+        _ => None,
+    };
     Report {
+        receipt,
         ok: exit_code.map_or(r.success, |c| c == 0),
         output: r.output,
         // `exit` no es un error: el programa pidió terminar.

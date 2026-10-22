@@ -1,0 +1,10 @@
+let x be 0
+let m be {"a": 1}
+let i be 0
+while i < 90000
+    set x to m.a
+    set x to m.a
+    set x to m.a
+    set x to m.a
+    set i to i + 1
+print("ok")

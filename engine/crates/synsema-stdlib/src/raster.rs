@@ -687,7 +687,24 @@ pub fn register_raster_builtins_with_caps(
             caps.borrow_mut()
                 .require(&Capability::new(CapabilityType::FileRead, Some(path.clone())), source)
                 .map_err(|v| Control::Error(v.into_error()))?;
-            std::fs::read(&path).map_err(|e| err(format!("{}: cannot read font {}: {}", source, path, e)))
+            // v0.6.46 (E8): sin ventana entre el chequeo y la apertura.
+            let cannot = |e: std::io::Error| err(format!("{}: cannot read font {}: {}", source, path, e));
+            let mut b = Vec::new();
+            use std::io::Read;
+            synsema_capabilities::secure::open_checked(
+                caps,
+                &path,
+                synsema_capabilities::nofollow::OpenFor::READ,
+                &[CapabilityType::FileRead],
+                source,
+            )
+            .map_err(|r| match r {
+                synsema_capabilities::nofollow::Refused::Denied(c) => c,
+                synsema_capabilities::nofollow::Refused::Io(e) => cannot(e),
+            })?
+            .read_to_end(&mut b)
+            .map_err(cannot)?;
+            Ok(b)
         }
     }
     {
@@ -911,6 +928,27 @@ mod tests {
         db.load_font_data(EMBEDDED_FONT.to_vec());
         let ids: Vec<fontdb::ID> = db.faces().map(|f| f.id).collect();
         assert!(crate::font_fallback::restrict(&db, ids[0], ids[1], &chars).is_some());
+    }
+
+    /// v0.6.46 (backlog §10): la copia restringida se guardaba con TODOS los caracteres del SVG en la
+    /// clave: cada texto distinto la rearmaba. Ahora la clave es lo que la copia lleva, así que dos
+    /// textos a los que les falta lo mismo comparten la copia, y uno al que le falta otra cosa no.
+    #[test]
+    fn the_restricted_copy_is_keyed_by_what_it_carries() {
+        let mut db = fontdb::Database::new();
+        db.load_font_data(ascii_font());
+        db.load_font_data(EMBEDDED_FONT.to_vec());
+        let ids: Vec<fontdb::ID> = db.faces().map(|f| f.id).collect();
+        let fonts = ([0x46u8; 32], 0u32, [0x47u8; 32]);
+        let copy = |text: &str| {
+            let chars: std::collections::BTreeSet<char> = text.chars().collect();
+            crate::font_fallback::restricted_copy(&db, ids[0], ids[1], fonts, &chars).expect("hay copia")
+        };
+        let a = copy("Hola → mundo");
+        let b = copy("<text>Chau → otra cosa</text>");
+        assert!(std::sync::Arc::ptr_eq(&a, &b), "les falta lo mismo: la misma copia");
+        let c = copy("Hola → ← mundo");
+        assert!(!std::sync::Arc::ptr_eq(&a, &c), "le falta otra cosa: otra copia");
     }
 
     /// Ronda 4 (M4): una fuente con un cmap armado se rechaza al CARGARLA (usvg la consultaría por

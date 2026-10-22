@@ -1,0 +1,8 @@
+let n be 25000
+let rows be apply(range(0, n), (i) => {"id": i, "name": "n" + text(i), "score": i % 1000})
+let doc be csv_encode(rows)
+let back be csv_parse(doc, {"types": {"id": "int", "score": "int"}})
+let total be 0
+each r in back
+    set total to total + r.id + r.score
+print("check " + text(total + length(back)))

@@ -9,7 +9,7 @@
 //! - **Keystore import → firma:** importar un keystore V3 real → derivar la
 //!   address → firmar gateado por `sign` (la clave importada nunca se materializa).
 //! - **G19 por el runtime:** `text`/`json_encode` de un secret de mnemónico/seed
-//!   → `secret(NAME)` / `[redacted]`, jamás el valor.
+//!   → `secret(NAME)` (text) o error (json_encode, v0.6.46 D8), jamás el valor.
 //! - **G20 en sandbox:** dentro de `sandbox` la creación de custodia se DENIEGA
 //!   (caps vaciadas), los builtins PUROS (solana_pda/spl_*) siguen andando.
 //! - **G21 WebSocket:** puente WS→SSE bajo `serve`; deny sin `net`; server vivo
@@ -140,16 +140,21 @@ let k be hd_derive(seed, "m/44'/60'/0'/0/0")
 -- text() de un secret → su redacción, nunca el valor
 print(contains(text(frase), "abandon"))
 print(text(seed))
--- json_encode de una estructura con secrets → [redacted], no el material
-print(contains(json_encode({{"mnemonic": frase, "seed": seed, "key": k}}), "abandon"))
-print(contains(json_encode({{"key": k}}), "redacted"))
+-- json_encode de una estructura con secrets → error (v0.6.46, D8), sin el material
+let e be ""
+try
+    set e to json_encode({{"mnemonic": frase, "seed": seed, "key": k}})
+recover err
+    set e to err
+print(contains(e, "abandon"))
+print(contains(e, "never written as text"))
 "#,
         STD = STD_MNEMONIC,
     ));
     assert_eq!(o[0], "false", "text(secret) no ecoa el mnemónico");
     assert!(o[1].starts_with("secret("), "text(seed) es la redacción: {}", o[1]);
     assert_eq!(o[2], "false", "json_encode no filtra material");
-    assert_eq!(o[3], "true", "json_encode redacta el secret");
+    assert_eq!(o[3], "true", "json_encode de un secret es error");
 }
 
 // =========================================================

@@ -89,8 +89,8 @@
 //!     `codeintel::declassify_sites` / `synsema code check` para el listado estático de cada
 //!     sitio de `declassify` con su motivo, destino y `constant`, y `Interpreter::declassify_log`
 //!     para lo que la corrida liberó de verdad (motivo, `from`, `to`, ubicación). Los dos se
-//!     cruzan: el estático puede no ver un alias indirecto (`declassify_static_only`) y el de
-//!     runtime sólo ve lo que se ejecutó;
+//!     cruzan: el estático es completo (v0.6.46, E4: `declassify` sólo corre llamado por su
+//!     nombre) y el de runtime dice lo que se ejecutó;
 //!   * **escape explícito**: cuando el lado derecho de un `let`, `set` (a variable, índice
 //!     o campo) o `give` es SINTÁCTICAMENTE `declassify(...)` (resuelto al builtin), el valor
 //!     asignado/devuelto queda con la etiqueta que `declassify` devolvió (su `to`) y NO se le
@@ -191,6 +191,11 @@ pub struct DeclassifyEntry {
     pub from: Label,
     pub to: Label,
     pub loc: SourceLocation,
+    /// v0.6.46 (E6.8): se declasificó dentro de una rama decidida por un valor privado. Lo que sale
+    /// del proceso (la línea `[INF]`, `receipt()`, el informe del wasm) no cuenta estas entradas:
+    /// cuántas hubo decía qué rama se tomó. El registro interno las conserva para el recibo
+    /// sellado.
+    pub under_private_pc: bool,
 }
 
 /// Un valor privado llegó a un sumidero que no acepta (todos) sus principales.

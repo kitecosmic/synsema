@@ -1,0 +1,4 @@
+let n be 100000
+let parts be apply(range(0, n), (i) => text(i) + ",")
+let s be join(parts, "")
+print("check " + text(length(s)))

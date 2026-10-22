@@ -46,6 +46,7 @@ fn via_host(
         headers: headers.unwrap_or(&empty),
         body,
         timeout_secs,
+        forbid_redirects: crate::http_common::request_forbids_redirects(),
     };
     match p.http(&req) {
         None => no_transport(),

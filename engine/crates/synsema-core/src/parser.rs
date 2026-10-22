@@ -1086,16 +1086,57 @@ The inline form belongs where a value is used: let x be when c then a otherwise 
         ))
     }
 
-    /// Un parámetro de `task`: nombre y, tras `=`, un default opcional (Batch 2). El
-    /// default se evalúa en call time (G5). `=` es `Assign` (distinto de `==`/`Equal`).
+    /// Un parámetro de `task`: nombre, `: tipo` opcional (v0.6.46, F1) y, tras `=`, un default
+    /// opcional (Batch 2). El default se evalúa en call time (G5). `=` es `Assign` (distinto de
+    /// `==`/`Equal`).
     fn parse_param(&mut self) -> Result<Param, ParseError> {
         let name = self.expect_name("parameter name")?.as_str().to_string();
+        let ty = if self.match_tok(TokenType::Colon).is_some() {
+            let tok = self.expect(
+                TokenType::Identifier,
+                "Expected a parameter type after ':' (text, number, bool, list or map)",
+            )?;
+            match crate::ast::ParamType::parse(tok.as_str()) {
+                Some(t) => Some(t),
+                None => {
+                    return Err(ParseError::new(
+                        format!(
+                            "unknown type '{}' for parameter '{}': the parameter types are {}",
+                            tok.as_str(),
+                            name,
+                            crate::ast::ParamType::ALL
+                        ),
+                        tok.location.clone(),
+                    ))
+                }
+            }
+        } else {
+            None
+        };
         let default = if self.match_tok(TokenType::Assign).is_some() {
             Some(self.parse_expression()?)
         } else {
             None
         };
-        Ok(Param { name: name.into(), default })
+        if let (Some(t), Some(d)) = (ty, &default) {
+            // Un default literal del otro tipo es un error del autor; `nothing` es el default de un
+            // parámetro opcional y vale para cualquiera.
+            let lit = match &d.kind {
+                NodeKind::NumberLiteral { .. } => Some("number"),
+                NodeKind::TextLiteral { .. } => Some("text"),
+                NodeKind::BoolLiteral { .. } => Some("bool"),
+                NodeKind::ListLiteral { .. } => Some("list"),
+                NodeKind::MapLiteral { .. } => Some("map"),
+                _ => None,
+            };
+            if let Some(l) = lit.filter(|l| *l != t.name()) {
+                return Err(ParseError::new(
+                    format!("the default of '{}: {}' is a {}", name, t.name(), l),
+                    d.location.clone(),
+                ));
+            }
+        }
+        Ok(Param { name: name.into(), default, ty })
     }
 
     fn parse_give(&mut self) -> Result<Node, ParseError> {
@@ -1344,9 +1385,8 @@ The inline form belongs where a value is used: let x be when c then a otherwise 
         let mut capability = cap_tok.as_str().to_string();
         // Capacidad punteada opcional: `file.read` / `file.write` (un solo nivel). El
         // lexer tokeniza `file.read` como Identifier Dot Identifier, así que reconstruimos
-        // el nombre punteado acá. La validación del nombre vive en `capability_type_from_name`
-        // (un nombre punteado desconocido parsea y el grant_hook lo ignora, igual que un
-        // nombre simple desconocido).
+        // el nombre punteado acá. v0.6.46 (D4): un nombre desconocido, simple o punteado, es error
+        // (ver `capscope::unknown_capability_error`, más abajo).
         if self.match_tok(TokenType::Dot).is_some() {
             let sub = self.expect(TokenType::Identifier, "Expected a capability sub-name after '.'")?;
             capability.push('.');
@@ -1362,6 +1402,11 @@ The inline form belongs where a value is used: let x be when c then a otherwise 
             // que es el peor no-op de la familia. Se honra lo que dice el programa.
             scope = Some(Box::new(self.parse_expression()?));
         }
+        // v0.6.46 (D4): un nombre que no existe es error, con el más cercano. Antes parseaba y el
+        // grant_hook lo ignoraba: `require nett("x")` no concedía nada, sin aviso.
+        if let Some(msg) = crate::capscope::unknown_capability_error(&capability) {
+            return Err(ParseError::new(msg, cap_tok.location.clone()));
+        }
         // DB-M1 decisión #1: la declaración ES la identidad — `require memory` sin
         // nombre no significa nada (¿qué .db abriría?). Error en el parse, no al
         // persistir, con el fix exacto en el mensaje (LLM-safe, decisión #8).
@@ -1371,7 +1416,42 @@ The inline form belongs where a value is used: let x be when c then a otherwise 
                 loc,
             ));
         }
-        Ok(Node::new(loc, NodeKind::RequireStatement { capability, scope }))
+        // v0.6.46 (E1): `for net("h"), net("h2")` ata un secret a sus hosts. `for` no es palabra
+        // reservada (como en `analyze … for`). Sólo `secret` lo toma, y con nombre.
+        let mut bound_to = None;
+        if self.current().ty == TokenType::Identifier && self.current_value_eq("for") {
+            if capability != "secret" {
+                return Err(ParseError::new(
+                    format!("`for net(...)` binds a secret to a host; only `require secret(...)` takes it, not `require {}`", capability),
+                    loc,
+                ));
+            }
+            if scope.is_none() {
+                return Err(ParseError::new(
+                    "bind a named secret: require secret(\"NAME\") for net(\"api.example.com\")",
+                    loc,
+                ));
+            }
+            self.advance();
+            let mut hosts = Vec::new();
+            loop {
+                let t = self.expect(TokenType::Identifier, "after `for`, name the host the secret goes to: net(\"api.example.com\")")?;
+                if t.as_str() != "net" {
+                    return Err(ParseError::new(
+                        "after `for`, name the host the secret goes to: net(\"api.example.com\")",
+                        t.location.clone(),
+                    ));
+                }
+                self.expect(TokenType::LParen, "")?;
+                hosts.push(self.parse_expression()?);
+                self.expect(TokenType::RParen, "")?;
+                if self.match_tok(TokenType::Comma).is_none() {
+                    break;
+                }
+            }
+            bound_to = Some(Box::new(hosts));
+        }
+        Ok(Node::new(loc, NodeKind::RequireStatement { capability, scope, bound_to }))
     }
 
     fn parse_sandbox(&mut self) -> Result<Node, ParseError> {
@@ -1642,6 +1722,7 @@ The inline form belongs where a value is used: let x be when c then a otherwise 
         let mut describe = None;
         let mut private = false;
         let mut docs_off = false;
+        let mut discovery_off = false;
         let mut routes = Vec::new();
         let mut tls_cert: Option<Box<Node>> = None;
         let mut tls_key: Option<Box<Node>> = None;
@@ -1774,11 +1855,16 @@ The inline form belongs where a value is used: let x be when c then a otherwise 
                     mloc,
                     NodeKind::MountClause { source: Box::new(source), prefix },
                 ));
+            } else if self.check_word("discovery") {
+                // v0.6.46 (C5): discovery off → ninguna URL generada; las atiende el programa.
+                self.advance();
+                self.expect_word("off", "Expected 'off' after 'discovery' (discovery off)")?;
+                discovery_off = true;
             } else {
                 let tok = self.current();
                 return Err(ParseError::new(
                     format!(
-                        "Inside 'serve', expected 'auth with ...', 'errors with ...', 'route ...', 'mount ...', 'static ...', 'tls ...', 'domain ...', 'bind \"...\"', 'host \"...\"', 'redirect https', 'cors ...', 'timeout ...', 'describe', 'private' or 'docs off', got {}",
+                        "Inside 'serve', expected 'auth with ...', 'errors with ...', 'route ...', 'mount ...', 'static ...', 'tls ...', 'domain ...', 'bind \"...\"', 'host \"...\"', 'redirect https', 'cors ...', 'timeout ...', 'describe', 'private', 'docs off' or 'discovery off', got {}",
                         tok.ty.name()
                     ),
                     tok.location.clone(),
@@ -1829,6 +1915,7 @@ The inline form belongs where a value is used: let x be when c then a otherwise 
                 describe,
                 private,
                 docs_off,
+                discovery_off,
                 routes,
                 tls_cert,
                 tls_key,
@@ -3470,7 +3557,7 @@ mod tests {
     fn require_stmt(src: &str) -> (String, bool) {
         let prog = parse_ok(src);
         match &prog.statements[0].kind {
-            NodeKind::RequireStatement { capability, scope } => (capability.clone(), scope.is_some()),
+            NodeKind::RequireStatement { capability, scope, .. } => (capability.clone(), scope.is_some()),
             other => panic!("esperaba RequireStatement, got {:?}", other),
         }
     }

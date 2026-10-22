@@ -71,7 +71,7 @@ await new Promise((ok) => server.listen(0, "127.0.0.1", ok));
 const port = server.address().port;
 const asyncHost = {
   async http(req) {
-    const res = await fetch(req.url, { method: req.method, headers: Object.fromEntries(req.headers), body: req.body ?? undefined });
+    const res = await fetch(req.url, { method: req.method, headers: Object.fromEntries(req.headers), body: req.body ?? undefined, redirect: req.redirect ?? "follow" });
     return { status: res.status, headers: res.headers, body: await res.text() };
   },
   kv,

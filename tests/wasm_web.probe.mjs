@@ -99,8 +99,10 @@ for (const name of ["wasm_pure", "wasm_agents", "wasm_respond", "wasm_sandbox", 
 //    child_process + curl no; usamos un mini cliente síncrono sobre el bridge async en 7).
 //    Acá el host `http` es SÍNCRONO y responde él mismo (simula un backend).
 {
+  const sentAuth = [];
   const host = {
     http(req) {
+      sentAuth.push((req.headers.find(([k]) => k.toLowerCase() === "authorization") ?? [])[1] ?? null);
       if (req.url === "https://api.example/ping") return { status: 200, headers: [["content-type", "application/json"]], body: JSON.stringify({ pong: true, method: req.method, auth: (req.headers.find(([k]) => k.toLowerCase() === "authorization") ?? [])[1] ?? null }) };
       return { status: 0, error: "host: unknown url " + req.url };
     },
@@ -114,7 +116,9 @@ let bad be fetch("https://api.example/nope")
 print(bad["error"])`;
   const r = syn.run(program, { host, env: { API_KEY: "s3cr3t" } });
   check("host http: fetch pasa por el host", r.ok && r.output[0] === "200" && r.output[1].includes('"pong":true'), r);
-  check("host http: el secret se materializa en el header (bearer)", r.output[1].includes('"auth":"Bearer s3cr3t"'), r.output);
+  check("host http: el secret se materializa en el header (bearer)", sentAuth[0] === "Bearer s3cr3t", sentAuth);
+  // v0.6.46 (E1): el eco de la clave en la respuesta vuelve enmascarado.
+  check("host http: el eco del secret vuelve enmascarado", r.output[1].includes('"auth":"[secret API_KEY]"') && !r.output[1].includes("s3cr3t"), r.output);
   check("host http: error de transporte del host → {error}", r.output[2].startsWith("host: unknown url"), r.output);
   const denied = syn.run('let r be fetch("https://api.example/ping")\nprint(r["status"])', { host });
   check("host http: sin `require net` el gate deniega ANTES de llamar al host", !denied.ok && denied.errors[0].includes("Capability not granted: net"), denied);
@@ -139,6 +143,59 @@ print(llm_usage())`;
   check("host llm: el prompt lleva el subject", calls[0][1].includes("the weather"), calls);
   const offline = syn.run('print(llm_available())\nprint(reason about "x")');
   check("sin host llm: placeholders offline del core", offline.ok && offline.output[0] === "false" && offline.output[1].startsWith("[reasoning about"), offline);
+  // v0.6.46 (E5): un hook que lanza es error de esa llamada (antes: "" con ok: true), con un Error
+  // o con cualquier valor.
+  for (const thrown of [new Error("boom"), "x"]) {
+    const bad = syn.run('require llm\nprint(reason "hola")', { host: { llm() { throw thrown; } } });
+    check(`host llm: un hook que lanza (${typeof thrown}) es error de la llamada`, !bad.ok && bad.output.length === 0 && bad.errors.length > 0, bad);
+  }
+  // Con etiquetas, un dato privado llega al hook sólo con `llm=P@embedder` en el techo; el hook
+  // recibe los principales y la respuesta sale privada.
+  const seenLlm = [];
+  const llmHost = { llm(op, prompt, info) { seenLlm.push([prompt, info && info.principals]); return "respuesta"; } };
+  const e5 = (ceiling) => syn.run('require llm("a")\nlet x be private("dato-secreto", "a")\nlet r be reason x\nprint(label_of(r))', { host: llmHost, labels: true, ceiling });
+  const deny = e5("stdout,llm=a@local");
+  check("E5: sin `llm=a@embedder` el privado no llega al hook", !deny.ok && deny.errors.some((e) => e.includes("label_violation")) && seenLlm.length === 0, { deny, seenLlm });
+  const allow = e5("stdout,llm=a@embedder");
+  check("E5: con el techo llega sin redactar y con los principales", allow.ok && allow.output[0] === "[private(a)]" && seenLlm.length === 1 && seenLlm[0][0].includes("dato-secreto") && JSON.stringify(seenLlm[0][1]) === '["a"]', { allow, seenLlm });
+  const judge = syn.run('let v be judge "hola"\n    q: whether "Is it a greeting?"\nprint(v.q.available)', { ceiling: "stdout" });
+  check("E5: `judge` se gatea en wasm (el techo sin judge lo niega)", !judge.ok && judge.errors.some((e) => e.includes("judge")), judge);
+}
+
+// v0.6.46 (E3b): `trusted` del embebedor. Bajo un techo sin `declassify`, el programa publica sólo
+// por la tool de confianza; directo, no.
+{
+  const trusted = { t: 'export task inicial(c)\n    require declassify("clientes")\n    give declassify(c.nombre, "la inicial del cliente")\n' };
+  const prog = (body) => `use "trusted:t" as t\nlet c be private({"nombre": "Ana"}, "clientes")\n${body}`;
+  const via = syn.run(prog("print(t.inicial(c))"), { labels: true, ceiling: "stdout", trusted });
+  check("E3b: la tool de confianza publica su política", via.ok && via.output[0] === "Ana", via);
+  const direct = syn.run(prog('print(declassify(c.nombre, "m"))'), { labels: true, ceiling: "stdout", trusted });
+  check("E3b: directo, el techo no da declassify", !direct.ok && direct.errors.some((e) => e.includes("declassify is not granted")), direct);
+  const none = syn.run(prog("print(1)"), { labels: true });
+  check("E3b: sin `trusted`, el módulo no existe", !none.ok && none.errors.some((e) => e.includes("no trusted module named 't'")), none);
+}
+
+// v0.6.46 (ronda 1, M1 y B1): `redirect: "error"` en toda request con un secret (también en un
+// header: `fetch` sólo quita `Authorization` al cambiar de host), y sólo en ésa: un RPC no deja la
+// marca puesta para las requests siguientes.
+{
+  const seen = [];
+  const rpcHost = {
+    http(req) {
+      seen.push([req.url.replace(/K3Y-[A-Z]+/, "<k>"), req.redirect ?? null]);
+      return { status: 200, headers: [["content-type", "application/json"]], body: '{"jsonrpc":"2.0","id":1,"result":"0x10"}' };
+    },
+  };
+  const pre = 'require secret("K") for net("127.0.0.1")\nrequire secret("U")\nrequire net("127.0.0.1")\nlet k be secret("K")\n';
+  const env = { K: "K3Y-SECRETO", U: "K3Y-SUELTO" };
+  const hdr = syn.run(pre + 'let r be http_get("http://127.0.0.1:9/h", {"X-Api-Key": k})\nprint(r["status"])', { host: rpcHost, env });
+  check("M1: un secret atado en un header pide redirect: error", hdr.ok && seen.length === 1 && seen[0][1] === "error", { hdr, seen });
+  seen.length = 0;
+  const loose = syn.run(pre + 'let r be http_get("http://127.0.0.1:9/h", {"X-Api-Key": secret("U")})\nprint(r["status"])', { host: rpcHost, env });
+  check("M1: uno no atado en un header también", loose.ok && seen.length === 1 && seen[0][1] === "error", { loose, seen });
+  seen.length = 0;
+  const rpc = syn.run(pre + 'print(evm_rpc(`http://127.0.0.1:9/v2/{k}`, "eth_blockNumber", []))\nlet r be http_get("http://127.0.0.1:9/publico")\nprint(r["status"])', { host: rpcHost, env });
+  check("B1: después de un RPC con un secret, una request sin secrets sigue redirects", rpc.ok && seen.length === 2 && seen[0][1] === "error" && seen[1][1] === null, { rpc, seen });
 }
 
 // 5. Memoria persistente sobre el KV del host (dos corridas, mismo store).
@@ -243,6 +300,13 @@ serve on 8080
   const i1 = syn.handle(iso, { method: "GET", path: "/n" }, { host });
   const i2 = syn.handle(iso, { method: "GET", path: "/n" }, { host });
   check("handle: `set` sobre un global no persiste al request siguiente (snapshot)", i1.body === '{"n": 1, "l": 1, "s": 1}' && i2.body === '{"n": 1, "l": 1, "s": 2}', [i1.body, i2.body, i1.errors, i2.errors]);
+  // v0.6.46 (ronda 2 de cf1, N8): el linaje del top-level no es del primer request; cada request
+  // ve en receipt() sólo lo suyo (antes: 2 en el primero, 1 en los siguientes).
+  const llmHost = { ...host, llm: () => ({ content: "ok", tokens: 1 }) };
+  const lin = 'require serve(9)\nrequire llm\nlet arranque be reason about "arranque"\nserve on 9\n    route "GET /r"\n        let x be reason about "pedido"\n        give {"inputs": length(receipt().credentialSubject.inputs)}';
+  const l1 = syn.handle(lin, { method: "GET", path: "/r" }, { host: llmHost });
+  const l2 = syn.handle(lin, { method: "GET", path: "/r" }, { host: llmHost });
+  check("handle: receipt() del primer request no trae el linaje del top-level", l1.body === '{"inputs": 1}' && l2.body === '{"inputs": 1}', [l1.body, l2.body, l1.errors, l2.errors]);
 }
 
 // 7. Modo asíncrono: Worker + Atomics, con un `http` async (fetch real contra un server local).
@@ -259,7 +323,7 @@ serve on 8080
   const port = server.address().port;
   const host = {
     async http(req) {
-      const res = await fetch(req.url, { method: req.method, headers: Object.fromEntries(req.headers), body: req.body ?? undefined });
+      const res = await fetch(req.url, { method: req.method, headers: Object.fromEntries(req.headers), body: req.body ?? undefined, redirect: req.redirect ?? "follow" });
       return { status: res.status, headers: res.headers, body: await res.text() };
     },
     kv: { get: async () => null, set: async () => {} },
@@ -573,9 +637,9 @@ print("slept")`;
   const big = await pool.runAsync('print(state_get("x"))', {
     host: { kv: { get: async () => 10n, set: async () => {} } },
   }).then((r) => ({ settled: true, r }), (e) => ({ settled: true, e: String(e.message) }));
-  // El hook contesta `{error}` (safeJson); que el motor lo vea como `nothing` es el ítem del backlog
-  // "un kv.get que falla se ve como nothing" (v0.6.46).
-  check("async: un hook que devuelve un BigInt no tira el proceso ni cuelga", big.settled && big.r && big.r.ok, big);
+  // El hook contesta `{error}` (safeJson), y desde v0.6.46 es un error de `state_get` (antes se
+  // leía como `nothing`).
+  check("async: un hook que devuelve un BigInt no tira el proceso ni cuelga", big.settled && big.r && !big.r.ok && big.r.errors.some((e) => e.includes("kv.get failed")), big);
   const again = await pool.runAsync("print(5)");
   check("async: después del hook roto el Worker sigue", again.ok && again.output[0] === "5", again);
   const inf = await pool.runAsync("print(1)", { timeoutMs: Infinity }).then(() => "ok", (e) => String(e.message));
@@ -608,7 +672,7 @@ print("slept")`;
   await swap.close();
   // Ronda 4 (B1): en la API síncrona, un hook que devuelve un BigInt es un error de ese hook, no un trap.
   const bigSync = syn.run('print(state_get("x"))', { host: { kv: { get: () => 10n, set: () => {} } } });
-  check("sync: un hook que devuelve un BigInt no hace trapear el módulo", typeof bigSync === "object" && bigSync.ok, bigSync);
+  check("sync: un hook que devuelve un BigInt no hace trapear el módulo", typeof bigSync === "object" && !bigSync.ok && bigSync.errors.some((e) => e.includes("kv.get failed")), bigSync);
   // Ronda 4 (revisión, A1): con `workers: 2` y un módulo que no se puede instanciar, las llamadas
   // fallan (no se reintenta sin pausa ni quedan colgadas) y no queda ningún arranque en vuelo.
   const broken = new WebAssembly.Module(new Uint8Array([0, 97, 115, 109, 1, 0, 0, 0, 1, 4, 1, 96, 0, 0, 2, 9, 1, 3, 101, 110, 118, 1, 102, 0, 0]));
@@ -618,6 +682,69 @@ print("slept")`;
   check("async: un arranque que siempre falla rechaza las llamadas", outcomes.every((o) => o.status === "rejected"), outcomes.map((o) => o.status));
   check("async: sin arranques en vuelo después del fallo", (bad._spawning ?? 0) === 0 && performance.now() - t0 < 10000, { spawning: bad._spawning, ms: performance.now() - t0 });
   await bad.close();
+  // v0.6.46 (backlog §10): con un Worker sano, dos arranques que fallan (la espera de un segundo) y
+  // después el sano que se cierra: lo encolado no queda colgado — falla con la causa del arranque.
+  const mixed = new Synsema(syn.module, { workers: 3 });
+  await mixed.runAsync("print(0)");
+  mixed.module = broken;
+  const slow = "let s be sum(range(0, 2000000))\nprint(s)";
+  const queued = [mixed.runAsync(slow), mixed.runAsync("print(1)"), mixed.runAsync("print(2)")];
+  await new Promise((r) => setTimeout(r, 300));
+  const waited = (mixed._spawnRetryAt ?? 0) > 0;
+  await mixed._bridges[0].close();
+  const settled = await Promise.race([
+    Promise.allSettled(queued),
+    new Promise((r) => setTimeout(() => r("hang"), 10000)),
+  ]);
+  check("async: dos arranques fallidos y el sano muere: nada queda colgado", waited && settled !== "hang", { waited, settled });
+  check("async: y sin arranques en vuelo", (mixed._spawning ?? 0) === 0, mixed._spawning);
+  await mixed.close();
+  // v0.6.46 (backlog §10): un `kv.get` del host que lanza es un error de `state_get`, no `nothing`.
+  const kvDown = syn.run('print(state_get("k", "default"))', { host: { kv: { get: () => { throw new Error("kv down"); }, set: () => {} } } });
+  check("sync: un kv.get que lanza es un error", !kvDown.ok && kvDown.errors.some((e) => e.includes("kv down")), kvDown);
+  // v0.6.46 (ronda 1 de cf1, M2): el log de audit (reveal/sign/wallet/spend) se lee con kv.get antes
+  // de agregar la línea. Si esa lectura lanza, la operación se niega y el log queda como estaba (antes
+  // se pisaba con una sola línea y `reveal` seguía).
+  {
+    const store = new Map([["audit/reveal.log", "VIEJA-1\nVIEJA-2\n"]]);
+    const kv = {
+      get: (ns, key) => { if (ns === "audit") throw new Error("kv caído"); return store.get(`${ns}/${key}`) ?? null; },
+      set: (ns, key, v) => { store.set(`${ns}/${key}`, v); },
+    };
+    const r = syn.run('require secret("K")\nrequire reveal("K")\nprint(length(reveal(secret("K"))))', { env: { K: "abc" }, host: { kv } });
+    check("sync: el audit no pisa el log si kv.get lanza", !r.ok && r.output.length === 0 && store.get("audit/reveal.log") === "VIEJA-1\nVIEJA-2\n", { r, log: store.get("audit/reveal.log") });
+  }
+  // v0.6.46 (ronda 1 de cf1, B7): un valor que no es texto ni null es un error del host, no "no está".
+  for (const [label, stored] of [["número", 41], ["objeto", { n: 41 }]]) {
+    const store = new Map([["state/c", stored]]);
+    const kv = { get: (ns, k) => store.get(`${ns}/${k}`) ?? null, set: (ns, k, v) => store.set(`${ns}/${k}`, v) };
+    const r = syn.run('print(state_incr("c"))', { host: { kv } });
+    check(`sync: kv.get con un ${label} es un error y no se escribe`, !r.ok && r.errors.some((e) => e.includes("must return a string or null")) && store.get("state/c") === stored, { r, kept: store.get("state/c") });
+  }
+  // v0.6.46 (ronda 1 de cf1): un kv.list que lanza hace fallar state_all (antes daba {}).
+  {
+    const kv = { get: () => '"v"', set: () => {}, list: () => { throw new Error("kv.list caído"); } };
+    const r = syn.run("print(state_all())", { host: { kv } });
+    check("sync: un kv.list que lanza es un error de state_all", !r.ok && r.errors.some((e) => e.includes("kv.list caído")), r);
+  }
+  // v0.6.46 (ronda 2 de cf1, R2-B2): lo que no es una lista de textos es un error (antes, {}).
+  for (const [label, keys] of [["{keys: [{name}]}", { keys: [{ name: "c" }] }], ["array de {name}", [{ name: "c" }]], ["undefined", undefined], ["número", 3]]) {
+    const kv = { get: () => '"v"', set: () => {}, list: () => keys };
+    const r = syn.run("print(state_all())", { host: { kv } });
+    check(`sync: kv.list con ${label} es un error de state_all`, !r.ok && r.errors.some((e) => e.includes("kv.list must return a list of strings")), r);
+  }
+  {
+    const kv = { get: () => '"v"', set: () => {}, list: () => ["c"] };
+    const r = syn.run("print(state_all())", { host: { kv } });
+    check("sync: kv.list con un array de textos sigue andando", r.ok && r.output[0] === '{c: "v"}', r);
+  }
+  // v0.6.46 (ronda 2 de cf1, R2-B3): un valor guardado que no es JSON es un error, no "no está".
+  {
+    const store = new Map([["state/c", "cuarenta y uno"]]);
+    const kv = { get: (ns, k) => store.get(`${ns}/${k}`) ?? null, set: (ns, k, v) => store.set(`${ns}/${k}`, v) };
+    const r = syn.run('print(state_incr("c"))', { host: { kv } });
+    check("sync: state_incr sobre un texto que no es JSON es un error y no se pisa", !r.ok && r.errors.some((e) => e.includes("is not JSON")) && store.get("state/c") === "cuarenta y uno", { r, kept: store.get("state/c") });
+  }
   let startErr = null;
   try {
     new Synsema(broken, { startMs: Infinity });
