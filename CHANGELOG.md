@@ -6,7 +6,7 @@ Each says what changed, why, and what to write instead.
 
 Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the release date.
 
-## Unreleased (v0.6.46)
+## v0.6.46 — 2026-10-22
 
 **Behavior changes (read these first).**
 - **`json_encode`, `jsonl_encode`, `json_for_script` and `csv_encode` of a secret are an error.**
@@ -271,9 +271,8 @@ Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the rele
     of a `parallel_map` has its own stream, also under `--replay`), and with labels the clock is
     fenced (two `now()` in a private branch read the same time). The clock readings take at most a
     quarter of the envelope; past that they are counted (`clock_truncated`) and never push out an
-    entry. `synsema run
-    --replay <opened receipt>` runs the program again with that seed and those clock readings and
-    stops, naming it, at the first input that differs. Keys and tokens (`random_bytes`, `token`,
+    entry. `synsema run --replay <opened receipt>` runs the program again with that seed and those
+    clock readings and stops, naming it, at the first input that differs. Keys and tokens (`random_bytes`, `token`,
     key generation) still come from the OS and are not reproduced.
   - **`run --attest` with an auditor binds the receipt's key:** `report_data` gets `sha256(run_key)`
     at the end, and the JSON line carries `run_key`. Without an auditor `report_data` does not
