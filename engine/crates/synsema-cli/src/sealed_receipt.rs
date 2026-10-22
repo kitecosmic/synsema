@@ -378,7 +378,13 @@ pub fn install_replay(path: &str) -> Result<(), String> {
         return Err(format!("--replay: {} is not an opened receipt (run `synsema receipt open <receipt> --key <private>` first)", path));
     }
     let seed = opened.get("seed").and_then(|v| v.as_str()).ok_or("--replay: the opened receipt has no seed")?;
-    let clock: Vec<f64> = opened.get("clock").and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|x| x.as_f64()).collect()).unwrap_or_default();
+    // Cada lectura del reloj viene como texto (la forma más corta del f64) y `str::parse` la vuelve
+    // bit a bit; un número JSON lo leía `serde_json` a veces con un bit de diferencia.
+    let clock: Vec<f64> = opened
+        .get("clock")
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|x| x.as_str().and_then(|s| s.parse::<f64>().ok())).collect())
+        .unwrap_or_default();
     let inputs: Vec<(String, String)> = opened["entries"]
         .as_array()
         .into_iter()

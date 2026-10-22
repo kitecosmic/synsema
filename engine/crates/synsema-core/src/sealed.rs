@@ -113,8 +113,9 @@ impl RunLog {
     /// privada, y el armado era cuadrático. Pasado el tope se cuenta y no se guarda (`--replay` usa
     /// la hora real para esas).
     pub fn push_clock(&mut self, v: f64) {
-        // Un f64 en el JSON del sobre (ryu): a lo sumo 24 caracteres, más la coma.
-        const COST: usize = 26;
+        // Un f64 en el JSON del sobre, como texto (ryu): a lo sumo 24 caracteres, las comillas y la
+        // coma.
+        const COST: usize = 28;
         if self.clock_used + COST > self.capacity / 4 || self.used + COST + ENVELOPE_RESERVE > self.capacity {
             self.clock_dropped += 1;
             return;

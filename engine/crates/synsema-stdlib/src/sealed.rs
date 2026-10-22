@@ -149,10 +149,16 @@ pub const DOMAIN: &str = "synsema-receipt-v1";
 /// El tope de `SYNSEMA_RECEIPT_SEALED_BYTES`: el sobre viaja entero en el recibo.
 pub const MAX_SEALED_BYTES: usize = 16 * 1024 * 1024;
 
+/// Una lectura del reloj como texto, en la forma más corta que vuelve al mismo f64 (la de `ryu`, la
+/// que escribe `serde_json`). `str::parse` la lee de vuelta exacta.
+fn clock_text(c: f64) -> String {
+    serde_json::Number::from_f64(c).map(|n| n.to_string()).unwrap_or_else(|| "0".to_string())
+}
+
 /// JSON canónico (RFC 8785) de lo que escribe el motor: claves ordenadas, sin espacios. El
 /// `serde_json` del árbol conserva el orden de inserción (`preserve_order`), así que sin esto un
 /// verificador que vuelve a serializar el recibo obtendría otros bytes. Las claves son ASCII y los
-/// números los escribe `serde_json` (enteros, y floats del reloj en forma corta): coinciden con JCS.
+/// números los escribe `serde_json` (enteros): coinciden con JCS. El reloj va como texto.
 pub fn jcs(v: &Value) -> String {
     match v {
         Value::Object(m) => {
@@ -360,7 +366,11 @@ pub fn build_receipt(log: &RunLog, ctx: &ReceiptContext<'_>) -> Result<Value, St
     // era cuadrático.
     let entry_v = |(a, e): &(u64, Value)| json!({"after": a, "entry": e});
     let entry_sizes: Vec<usize> = sealed.iter().map(|x| jcs(&entry_v(x)).len() + 1).collect();
-    let clock_sizes: Vec<usize> = log.clock.iter().map(|c| jcs(&json!(c)).len() + 1).collect();
+    // Ronda final de v0.6.46: cada lectura va como TEXTO (la forma más corta que vuelve al mismo
+    // f64). Como número, `serde_json` la leía de vuelta a veces con un bit de diferencia (sin
+    // `float_roundtrip`) y `--replay` daba otra hora; `str::parse` redondea bien.
+    let clock: Vec<Value> = log.clock.iter().map(|c| Value::String(clock_text(*c))).collect();
+    let clock_sizes: Vec<usize> = clock.iter().map(|c| jcs(c).len() + 1).collect();
     let empty = json!({"entries": [], "seed": seed, "clock": [], "truncated": u64::MAX, "clock_truncated": u64::MAX});
     let budget = size.saturating_sub(LEN_PREFIX);
     let mut total = jcs(&empty).len() + entry_sizes.iter().sum::<usize>() + clock_sizes.iter().sum::<usize>();
@@ -377,7 +387,7 @@ pub fn build_receipt(log: &RunLog, ctx: &ReceiptContext<'_>) -> Result<Value, St
         let mut c = json!({
             "entries": sealed[..n_entries].iter().map(entry_v).collect::<Vec<_>>(),
             "seed": seed,
-            "clock": &log.clock[..n_clock],
+            "clock": &clock[..n_clock],
             "truncated": log.truncated + (sealed.len() - n_entries) as u64,
         });
         let clock_cut = log.clock_dropped + (log.clock.len() - n_clock) as u64;
@@ -656,6 +666,25 @@ pub fn request_finish() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Ronda final de v0.6.46: el CI vio `--replay` devolver `…7256043` donde la corrida leyó
+    /// `…7256045`. Como texto, cada lectura vuelve bit a bit; como número, `serde_json` (sin
+    /// `float_roundtrip`) no siempre.
+    #[test]
+    fn clock_readings_come_back_bit_for_bit() {
+        let mut lossy = 0;
+        let mut x = 1_792_711_237.725_604_5_f64;
+        for i in 0..20_000u32 {
+            let t = clock_text(x);
+            assert_eq!(t.parse::<f64>().unwrap().to_bits(), x.to_bits(), "{}", t);
+            let as_number: Value = serde_json::from_str(&serde_json::Number::from_f64(x).unwrap().to_string()).unwrap();
+            if as_number.as_f64().unwrap().to_bits() != x.to_bits() {
+                lossy += 1;
+            }
+            x += 0.000_123_457 * f64::from(i % 97 + 1);
+        }
+        assert!(lossy > 0, "control: como número JSON alguna lectura vuelve distinta");
+    }
     use synsema_core::bytesutil::hex_decode;
 
     fn h(s: &str) -> Vec<u8> {
@@ -789,7 +818,7 @@ mod tests {
         assert_eq!(entries[0]["sealed"], json!(false));
         assert_eq!(entries[2]["entry"]["line"], json!("sign 1"));
         assert_eq!(entries[2]["sealed"], json!(true));
-        assert_eq!(o["clock"], json!([1_760_000_000.5]));
+        assert_eq!(o["clock"], json!(["1760000000.5"]));
         assert_eq!(o["truncated"], json!(0));
         // La JCS de lo que se re-serializa no depende del orden en que vino.
         let back: Value = serde_json::from_str(&r.to_string()).unwrap();
