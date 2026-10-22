@@ -51,6 +51,7 @@ jobs:
   # del motor). Los símbolos quedan (`STRIP=none`, no cambia el código) para nombrar funciones.
   perf-guard:
     runs-on: ubuntu-24.04
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -67,7 +68,15 @@ jobs:
             engine/target
           key: ${{ runner.os }}-cargo-perf-${{ hashFiles('engine/Cargo.lock') }}
       - name: Install valgrind
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq valgrind
+        # Sin el disparador de man-db: en ubuntu-24.04 regenerar los índices de los manuales deja
+        # `apt-get install` colgado decenas de minutos (pasó en la primera corrida de este job).
+        timeout-minutes: 5
+        run: |
+          echo 'man-db man-db/auto-update boolean false' | sudo debconf-set-selections
+          sudo rm -f /var/lib/man-db/auto-update
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends valgrind
+          valgrind --version
       - name: Build the core `run` (release, as published, with symbols)
         env:
           CARGO_PROFILE_RELEASE_STRIP: none
