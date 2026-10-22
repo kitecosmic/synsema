@@ -135,6 +135,10 @@ Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the rele
   `Option<Result<Option<String>, String>>` and `kv_list` `Option<Result<Vec<String>, String>>`.
 
 **Security.**
+- **Dependencies with advisories updated:** `rustls-webpki` 0.103.16 (RUSTSEC-2026-0382, a
+  certificate chain could be accepted through a distrusted intermediate), and `webpki-roots` and
+  `webpki-root-certs` 1.0.10 (RUSTSEC-2026-0381 and 0383, distrusted emSign intermediates in the
+  bundled roots). `cargo audit` is clean.
 - **`receipt()` no longer publishes what depended on a private value** (with `--labels`). Three
   leaks, all with the program counter public and no `label_violation`: `steps` was the raw count
   (a loop with `when i < n` over a private `n` gave 222 or 378), now `nothing` once a private value

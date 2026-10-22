@@ -931,7 +931,7 @@ mod tests {
         let src = "let s be private({\"amount\": 5, \"note\": \"x\"}, \"app\")
 let out be {\"state\": s, \"fee\": 3, \"pub\": declassify(s[\"amount\"] + 1, \"fee is public\")}
 print(s)";
-        let req = json!({"op":"run","source":src,"labels":true,"result":"out","ceiling":"stdout"});
+        let req = json!({"op":"run","source":src,"labels":true,"result":"out","ceiling":"stdout,declassify=app"});
         let v: Value = serde_json::from_str(&call_json(&req.to_string())).unwrap();
         assert_eq!(v["ok"], json!(true), "{}", v);
         assert_eq!(v["output"][0], json!("private(app)"));
