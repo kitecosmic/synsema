@@ -641,6 +641,7 @@ pub(crate) fn wire_common_with_state(
     synsema_stdlib::webauthn::register_webauthn_builtins(interp);
     // T3/T4 (identidad): JCS (RFC 8785), did:key y pruebas W3C Data Integrity.
     synsema_stdlib::canonical::register_canonical_builtins(interp);
+    synsema_stdlib::tools::register_tool_builtins(interp);
     // Linaje (DATOS-17): los resultados estructurados se hashean sobre su JSON canónico.
     interp.lineage_canonical = Some(Rc::new(|v: &synsema_core::types::SynValue| {
         match synsema_stdlib::canonical::canonical_json(v) {
@@ -722,6 +723,8 @@ pub(crate) fn wire_common_with_state(
     synsema_stdlib::privacy::register_privacy_builtins(interp);
     synsema_stdlib::zk::register_zk_builtins(interp);
     synsema_stdlib::archive::register_archive_builtins(interp, caps.clone());
+    // v0.6.46 (C4): Parquet desde el disco, por partes (pide `file.read`).
+    synsema_stdlib::parquet_io::register_parquet_scan(interp, caps.clone());
     synsema_stdlib::raster::register_raster_builtins_with_caps(interp, caps.clone());
     crate::parallel::register_parallel_builtins(interp, caps, secure, mem);
     // render real (sobrescribe el placeholder de core): SSR de templates → raw response.
@@ -1081,27 +1084,66 @@ fn wire_llm_with(interp: &mut Interpreter, provider: Arc<dyn LLMProvider>) {
     // `data["prompt"]`/`data["context"]` → `call_step` → mapea `LlmStep`→`StepResult`.
     interp.set_llm_step_callback(Rc::new(
         move |prompt: &str, catalog: &[StepCatalogEntry], context: &str| {
-            let mut req = LLMRequest::new("step").with_tools(
-                catalog
-                    .iter()
-                    .map(|e| ToolSpec {
-                        name: e.name.clone(),
-                        description: e.description.clone(),
-                        params: e.params.clone(),
-                    })
-                    .collect(),
-            );
-            req.data.insert("prompt".to_string(), prompt.to_string());
-            req.data.insert("context".to_string(), context.to_string());
-            let r = provider.call_step(&req);
-            match r.step {
-                LlmStep::Final(t) => StepResult::Final { text: t, tokens: r.tokens_used },
-                LlmStep::ToolCall { name, args } => {
-                    StepResult::Tool { name, args, tokens: r.tokens_used }
-                }
-            }
+            llm_step_with(provider.as_ref(), prompt, catalog, context)
         },
     ));
+}
+
+/// Un paso tool-aware contra `provider`: arma `LLMRequest::new("step").with_tools(catalog)` +
+/// `data["prompt"]`/`data["context"]` → `call_step` → mapea `LlmStep`→`StepResult`.
+fn llm_step_with(provider: &dyn LLMProvider, prompt: &str, catalog: &[StepCatalogEntry], context: &str) -> StepResult {
+    let mut req = LLMRequest::new("step").with_tools(
+        catalog
+            .iter()
+            .map(|e| ToolSpec {
+                name: e.name.clone(),
+                description: e.description.clone(),
+                params: e.params.clone(),
+                types: e.types.iter().map(|t| t.map_or("", |t| t.json_schema()).to_string()).collect(),
+                optional: e.optional.clone(),
+            })
+            .collect(),
+    );
+    req.data.insert("prompt".to_string(), prompt.to_string());
+    req.data.insert("context".to_string(), context.to_string());
+    let r = provider.call_step(&req);
+    match r.step {
+        LlmStep::Final(t) => StepResult::Final { text: t, tokens: r.tokens_used },
+        LlmStep::ToolCall { name, args } => {
+            let args = typed_step_args(catalog, &name, args);
+            StepResult::Tool { name, args, tokens: r.tokens_used }
+        }
+    }
+}
+
+/// v0.6.46 (F1): el proveedor manda los argumentos de una tool-call como texto (`synsema-llm` no
+/// tiene dependencias: un número llega `"3"`, una lista `"[1,2]"`). Un parámetro que el catálogo
+/// declara de un tipo distinto de `text` vuelve a su tipo decodificando ese JSON; si no da el tipo
+/// declarado queda como texto y `call_tool` lo rechaza con el error que lo dice. Los parámetros sin
+/// tipo siguen llegando como texto.
+fn typed_step_args(catalog: &[StepCatalogEntry], tool: &str, args: Vec<(String, String)>) -> Vec<(String, SynValue)> {
+    let entry = catalog.iter().find(|e| e.name == tool);
+    args.into_iter()
+        .filter_map(|(k, s)| {
+            let ty = entry
+                .and_then(|e| e.params.iter().position(|p| *p == k).and_then(|i| e.types.get(i).copied().flatten()));
+            // v0.6.46 (ronda 1 de cf1, N2): muchos modelos mandan `null` para lo que no quieren pasar.
+            // En un parámetro opcional, o tipado y no `text`, es "no lo pasó": corre el default, o
+            // `call_tool` dice que falta (antes llegaba el texto "null").
+            let optional = entry.is_some_and(|e| e.optional.contains(&k));
+            if s == "null" && (optional || ty.is_some_and(|t| t != synsema_core::ast::ParamType::Text)) {
+                return None;
+            }
+            let v = match ty {
+                Some(t) if t != synsema_core::ast::ParamType::Text => serde_json::from_str::<serde_json::Value>(&s)
+                    .ok()
+                    .map(|j| synsema_stdlib::json::json_to_syn(&j))
+                    .filter(|v| t.accepts(v)),
+                _ => None,
+            };
+            Some((k, v.unwrap_or_else(|| synsema_core::types::syn_text(s))))
+        })
+        .collect()
 }
 
 fn finish(mut interp: Interpreter, result: Result<SynValue, Control>) -> RunResult {
@@ -1895,25 +1937,7 @@ pub fn run_with_llm_steps(source: &str, filename: &str, steps: Vec<LlmStepRespon
                 let provider = Arc::new(MockProvider::scripted(steps));
                 interp.set_llm_step_callback(Rc::new(
                     move |prompt: &str, catalog: &[StepCatalogEntry], context: &str| {
-                        let mut req = LLMRequest::new("step").with_tools(
-                            catalog
-                                .iter()
-                                .map(|e| ToolSpec {
-                                    name: e.name.clone(),
-                                    description: e.description.clone(),
-                                    params: e.params.clone(),
-                                })
-                                .collect(),
-                        );
-                        req.data.insert("prompt".to_string(), prompt.to_string());
-                        req.data.insert("context".to_string(), context.to_string());
-                        let r = provider.call_step(&req);
-                        match r.step {
-                            LlmStep::Final(t) => StepResult::Final { text: t, tokens: r.tokens_used },
-                            LlmStep::ToolCall { name, args } => {
-                                StepResult::Tool { name, args, tokens: r.tokens_used }
-                            }
-                        }
+                        llm_step_with(provider.as_ref(), prompt, catalog, context)
                     },
                 ));
             })

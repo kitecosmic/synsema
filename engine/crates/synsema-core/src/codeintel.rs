@@ -519,6 +519,72 @@ fn templates_of(body: &[Node]) -> Vec<String> {
     out
 }
 
+/// v0.6.46 (F1): cada parámetro con su tipo, si es obligatorio y su default si es un literal (un
+/// default calculado se evalúa al llamar: sólo se dice que existe).
+fn params_json(parameters: &[crate::ast::Param]) -> Value {
+    Value::Array(
+        parameters
+            .iter()
+            .map(|p| {
+                let mut o = serde_json::Map::new();
+                o.insert("name".into(), json!(&*p.name));
+                o.insert("type".into(), json!(p.ty.map(|t| t.name())));
+                o.insert("required".into(), json!(p.default.is_none()));
+                if let Some(v) = p.default.as_ref().and_then(literal_json) {
+                    o.insert("default".into(), v);
+                }
+                Value::Object(o)
+            })
+            .collect(),
+    )
+}
+
+/// v0.6.46 (F1): la firma como JSON Schema, la forma que piden los proveedores y los SDK de
+/// herramientas (un parámetro sin tipo no dice `type`).
+fn input_schema(parameters: &[crate::ast::Param]) -> Value {
+    let mut props = serde_json::Map::new();
+    for p in parameters {
+        let mut o = serde_json::Map::new();
+        if let Some(t) = p.ty {
+            o.insert("type".into(), json!(t.json_schema()));
+        }
+        // v0.6.46 (ronda 1 de cf1, N4): un default `nothing` no se publica en el esquema (no es del
+        // tipo declarado); el parámetro igual queda fuera de `required`.
+        if let Some(v) = p.default.as_ref().and_then(literal_json).filter(|v| !v.is_null()) {
+            o.insert("default".into(), v);
+        }
+        props.insert(p.name.to_string(), Value::Object(o));
+    }
+    let required: Vec<&str> = parameters.iter().filter(|p| p.default.is_none()).map(|p| &*p.name).collect();
+    json!({"type": "object", "properties": props, "required": required})
+}
+
+/// Un literal como JSON (número, texto, bool, `nothing`, y listas o mapas de literales con claves de
+/// texto); cualquier otra expresión → `None`.
+fn literal_json(n: &Node) -> Option<Value> {
+    Some(match &n.kind {
+        NodeKind::NumberLiteral { value } => serde_json::from_str(&value.to_string()).ok()?,
+        // v0.6.46 (ronda 1 de cf1, N4): `= -3` también es un literal.
+        NodeKind::UnaryOp { operator: crate::ast::UnOp::Neg, operand } => match &operand.kind {
+            NodeKind::NumberLiteral { value } => serde_json::from_str(&format!("-{}", value)).ok()?,
+            _ => return None,
+        },
+        NodeKind::TextLiteral { value } => json!(value),
+        NodeKind::BoolLiteral { value } => json!(value),
+        NodeKind::NothingLiteral => Value::Null,
+        NodeKind::ListLiteral { elements } => Value::Array(elements.iter().map(literal_json).collect::<Option<_>>()?),
+        NodeKind::MapLiteral { pairs } => {
+            let mut o = serde_json::Map::new();
+            for (k, v) in pairs {
+                let NodeKind::TextLiteral { value } = &k.kind else { return None };
+                o.insert(value.clone(), literal_json(v)?);
+            }
+            Value::Object(o)
+        }
+        _ => return None,
+    })
+}
+
 fn text_lit(node: Option<&Node>) -> Option<String> {
     match node.map(|n| &n.kind) {
         Some(NodeKind::TextLiteral { value }) => Some(value.clone()),
@@ -578,6 +644,8 @@ fn sym_of(stmt: &Node, exported: bool, out: &mut Vec<Sym>) {
             end_line: body_end(line, body),
             extra: vec![
                 ("params", json!(parameters.iter().map(|p| p.name.to_string()).collect::<Vec<_>>())),
+                ("parameters", params_json(parameters)),
+                ("input_schema", input_schema(parameters)),
                 ("returns", json!(return_type)),
                 ("exported", json!(exported)),
                 ("calls", json!(direct_calls(body))),
@@ -1308,6 +1376,7 @@ pub fn routes(root: &Root, path: Option<&str>) -> Value {
             "domain": info.domain,
             "private": info.private,
             "docs_off": info.docs_off,
+            "discovery_off": info.discovery_off,
             "has_auth_handler": info.has_auth_handler,
             "hosts": host_routes.iter().map(|(h, _)| h.clone()).collect::<Vec<_>>(),
             "routes": rs,
@@ -1619,6 +1688,19 @@ pub fn declassify_sites(program: &Program) -> Vec<DeclassifySite> {
 }
 
 pub fn check(root: &Root, path: Option<&str>) -> Value {
+    check_with(root, path, &|_, _| Vec::new())
+}
+
+/// Lo que agrega quien llama a `check`: más avisos por archivo, con la forma de los de `synsema
+/// check` (`<ruta>:<línea>: warning: <mensaje>`). El CLI pasa los suyos, que usan la lista de
+/// builtins del runtime (core no la ve).
+pub type ExtraLints<'a> = &'a dyn Fn(&Program, &str) -> Vec<String>;
+
+/// v0.6.46: `check` con los avisos de `synsema check`. Antes `code check` (y la tool del MCP) sólo
+/// avisaba de capabilities faltantes: ni los avisos del chequeo estático (alias que tapa un módulo,
+/// export que no existe, ruta que captura una URL reservada) ni los del CLI (nombre que no existe,
+/// `fetch` posicional, tercer opcional posicional, secret sin atar a un host).
+pub fn check_with(root: &Root, path: Option<&str>, extra: ExtraLints<'_>) -> Value {
     let mut errors: Vec<Value> = Vec::new();
     let mut warnings: Vec<Value> = Vec::new();
     // Sitios de `declassify` de TODOS los archivos (módulos importados incluidos).
@@ -1648,6 +1730,10 @@ pub fn check(root: &Root, path: Option<&str>) -> Value {
                         errors.push(json!({"file": rel, "line": line, "column": column, "message": message}));
                     }
                 }
+                let abs_s = abs.to_string_lossy().into_owned();
+                for w in extra(&prog, &abs_s) {
+                    warnings.push(warning_json(&rel, &abs_s, &w));
+                }
                 for s in declassify_sites(&prog) {
                     declassify.push(json!({
                         "file": rel,
@@ -1669,12 +1755,19 @@ pub fn check(root: &Root, path: Option<&str>) -> Value {
                     }
                     parse_file(root, Path::new(resolved)).map_err(|d| format!("{}:{}:{}: {}", d.file, d.line, d.column, d.message))
                 };
-                if let Err(e) = crate::templates::check_program_static_with(&prog, abs.to_string_lossy().as_ref(), &loader) {
-                    let line = regex::Regex::new(r":(\d+)(?::\d+)?")
-                        .ok()
-                        .and_then(|re| re.captures(&e).and_then(|c| c.get(1)).and_then(|m| m.as_str().parse::<usize>().ok()))
-                        .unwrap_or(0);
-                    errors.push(json!({"file": rel, "line": line, "column": 0, "message": e}));
+                match crate::templates::check_program_static_with_warnings(&prog, abs.to_string_lossy().as_ref(), &loader) {
+                    Ok((_, ws)) => {
+                        for w in ws {
+                            warnings.push(warning_json(&rel, &abs.to_string_lossy(), &w));
+                        }
+                    }
+                    Err(e) => {
+                        let line = regex::Regex::new(r":(\d+)(?::\d+)?")
+                            .ok()
+                            .and_then(|re| re.captures(&e).and_then(|c| c.get(1)).and_then(|m| m.as_str().parse::<usize>().ok()))
+                            .unwrap_or(0);
+                        errors.push(json!({"file": rel, "line": line, "column": 0, "message": e}));
+                    }
                 }
             }
         }
@@ -1713,6 +1806,19 @@ pub fn check(root: &Root, path: Option<&str>) -> Value {
     // v0.6.46 (E4): el listado de `declassify` es completo (sólo declasifica llamado por su nombre),
     // así que ya no lleva `declassify_static_only`.
     json!({"ok": errors.is_empty(), "files": files.len(), "errors": errors, "warnings": warnings, "declassify": declassify})
+}
+
+/// Un aviso `<ruta>:<línea>: warning: <mensaje>` como los de `errors`. La ruta va relativa a la
+/// raíz; uno que no tiene esa forma va entero, en la línea 0.
+fn warning_json(rel: &str, abs: &str, w: &str) -> Value {
+    let parsed = w.strip_prefix(abs).and_then(|r| r.strip_prefix(':')).and_then(|r| {
+        let (line, msg) = r.split_once(": warning: ")?;
+        Some((line.parse::<usize>().ok()?, msg))
+    });
+    match parsed {
+        Some((line, msg)) => json!({"file": rel, "line": line, "column": 0, "message": msg}),
+        None => json!({"file": rel, "line": 0, "column": 0, "message": w}),
+    }
 }
 
 /// `search(pattern, path?, kinds?, regex?, limit?)`: texto en los archivos del proyecto.

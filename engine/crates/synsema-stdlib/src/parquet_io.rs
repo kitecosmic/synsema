@@ -361,8 +361,13 @@ impl<'a> Thrift<'a> {
 /// v0.6.45 (B4) — cuenta sólo los row groups (`rgs`) y las columnas de primer nivel
 /// (`cols`) que se van a leer: pedir una columna de un archivo grande no debe fallar por el tamaño
 /// de las demás.
+///
+/// v0.6.46 (C4) — los encabezados se leen por `fetch` (desde el archivo en disco con
+/// `parquet_scan`, o una vista de los bytes con `parquet_read`), en una ventana chica que crece si el
+/// encabezado no entra: no hace falta el archivo en memoria.
 fn check_expansion_of(
-    data: &[u8],
+    fetch: &Fetch,
+    file_len: u64,
     meta: &parquet::file::metadata::ParquetMetaData,
     max_total: u64,
     fname: &str,
@@ -381,17 +386,14 @@ fn check_expansion_of(
                     continue;
                 }
             }
-            let start = col.dictionary_page_offset().unwrap_or(col.data_page_offset()).max(0) as usize;
-            let len = col.compressed_size().max(0) as usize;
-            let end = start.checked_add(len).filter(|e| *e <= data.len()).ok_or_else(|| {
+            let start = col.dictionary_page_offset().unwrap_or(col.data_page_offset()).max(0) as u64;
+            let len = col.compressed_size().max(0) as u64;
+            let end = start.checked_add(len).filter(|e| *e <= file_len).ok_or_else(|| {
                 err(format!("{}: a column chunk points outside the file (corrupt or truncated)", fname))
             })?;
             let mut pos = start;
             while pos < end {
-                let mut t = Thrift { b: &data[..end], i: pos };
-                let (unc, comp) = t
-                    .skip_struct(0)
-                    .ok_or_else(|| err(format!("{}: unreadable page header (corrupt file)", fname)))?;
+                let ((unc, comp), used) = page_header(fetch, pos, end, fname)?;
                 let (unc, comp) = match (unc, comp) {
                     (Some(u), Some(c)) if u >= 0 && c >= 0 => (u as u64, c as u64),
                     _ => return Err(err(format!("{}: a page header has no sizes (corrupt file)", fname))),
@@ -412,24 +414,66 @@ fn check_expansion_of(
                         max_total
                     )));
                 }
-                pos = t.i.checked_add(comp as usize).ok_or_else(|| err(format!("{}: corrupt page size", fname)))?;
+                pos = pos
+                    .checked_add(used)
+                    .and_then(|p| p.checked_add(comp))
+                    .ok_or_else(|| err(format!("{}: corrupt page size", fname)))?;
             }
         }
     }
     Ok(())
 }
 
-fn parquet_read(args: &[SynValue]) -> Result<SynValue, Control> {
-    const F: &str = "parquet_read";
-    // `parquet_read(bytes, {"max_cells": n, "max_bytes": n})`: los topes contra un archivo
-    // hostil (por defecto 50 millones de celdas y max(1 GiB, 64 × el archivo) descomprimidos).
-    // v0.6.45 (B4): `columns` (sólo esas), `row_groups` (sólo esos, por índice) y `limit` (las
-    // primeras n filas). Un data lake real no entra en memoria: se lee por partes.
+/// El encabezado de la página que empieza en `pos` (sus tamaños descomprimido y comprimido) y
+/// cuántos bytes ocupa. Suele tener menos de 1 KiB (más con estadísticas grandes): se lee una
+/// ventana de 8 KiB que se duplica, hasta el fin del chunk (`end`), si no entra.
+fn page_header(fetch: &Fetch, pos: u64, end: u64, fname: &str) -> Result<((Option<i64>, Option<i64>), u64), Control> {
+    let mut win = HEADER_WINDOW.min(end - pos);
+    loop {
+        let buf = fetch(pos, win as usize)?;
+        let mut t = Thrift { b: &buf, i: 0 };
+        match t.skip_struct(0) {
+            Some(h) => return Ok((h, t.i as u64)),
+            // v0.6.46 (ronda 1 de cf1, N5): con tope. Un encabezado que nunca termina de parsear hacía
+            // leer el chunk entero a memoria; ninguno de verdad se acerca a esto.
+            None if pos + win < end && win < MAX_PAGE_HEADER => win = (win * 2).min(end - pos).min(MAX_PAGE_HEADER),
+            None if win >= MAX_PAGE_HEADER => {
+                return Err(err(format!("{}: a page header larger than {} MiB (corrupt file)", fname, MAX_PAGE_HEADER >> 20)))
+            }
+            None => return Err(err(format!("{}: unreadable page header (corrupt file)", fname))),
+        }
+    }
+}
+
+/// Lee `len` bytes desde `start` de la fuente (el archivo o sus bytes).
+type Fetch<'a> = dyn Fn(u64, usize) -> Result<bytes::Bytes, Control> + 'a;
+
+/// La ventana inicial con la que se lee el encabezado de una página (ver `check_expansion_of`).
+const HEADER_WINDOW: u64 = 8 * 1024;
+
+/// El encabezado de página más grande que se lee (ver `page_header`).
+const MAX_PAGE_HEADER: u64 = 16 * 1024 * 1024;
+
+/// Las opciones de `parquet_read` y `parquet_scan`.
+struct ReadOpts {
+    max_cells: u64,
+    max_bytes: Option<u64>,
+    columns: Option<Vec<String>>,
+    row_groups: Option<Vec<usize>>,
+    limit: Option<u64>,
+}
+
+#[allow(non_snake_case)]
+fn read_opts(opts: Option<&SynValue>, F: &str) -> Result<ReadOpts, Control> {
+    // `{"max_cells": n, "max_bytes": n}`: los topes contra un archivo hostil (por defecto 50
+    // millones de celdas y max(1 GiB, 64 × el archivo) descomprimidos). v0.6.45 (B4): `columns`
+    // (sólo esas), `row_groups` (sólo esos, por índice) y `limit` (las primeras n filas). Un data
+    // lake real no entra en memoria: se lee por partes.
     let (mut max_cells, mut max_bytes_opt) = (DEFAULT_MAX_CELLS, None::<u64>);
     let mut columns: Option<Vec<String>> = None;
     let mut row_groups: Option<Vec<usize>> = None;
     let mut limit: Option<u64> = None;
-    match args.get(1) {
+    match opts {
         None | Some(SynValue::Nothing) => {}
         Some(SynValue::Map(m)) => {
             for (k, v) in m.borrow().iter() {
@@ -462,22 +506,85 @@ fn parquet_read(args: &[SynValue]) -> Result<SynValue, Control> {
         }
         Some(other) => return Err(err(format!("{}: opts must be a map, got {}", F, other.type_name()))),
     }
+    Ok(ReadOpts { max_cells, max_bytes: max_bytes_opt, columns, row_groups, limit })
+}
+
+fn parquet_read(args: &[SynValue]) -> Result<SynValue, Control> {
+    const F: &str = "parquet_read";
+    let o = read_opts(args.get(1), F)?;
     let data = match args.first() {
         Some(SynValue::Bytes(b)) => b.to_vec(),
         Some(other) => {
             return Err(err(format!(
-                "{}: expected the file's bytes (read_file_bytes(path)), got {}",
+                "{}: expected the file's bytes (read_file_bytes(path)), got {} — to read a file from disk without loading it, parquet_scan(path)",
                 F,
                 other.type_name()
             )))
         }
         None => return Err(err("parquet_read(bytes)")),
     };
-    let file_len = data.len() as u64;
     // v0.6.45 (B4): una sola copia de la entrada (antes `data.clone()` hacía dos); `Bytes` se
     // comparte por referencia entre el lector y el chequeo de expansión.
-    let data = bytes::Bytes::from(data);
-    let reader = SerializedFileReader::new(data.clone()).map_err(|e| err(format!("{}: not a Parquet file: {}", F, e)))?;
+    read_bytes(bytes::Bytes::from(data), o, F)
+}
+
+/// Una tabla desde sus bytes en memoria (`parquet_read`, o un archivo del bundle).
+#[allow(non_snake_case)]
+fn read_bytes(data: bytes::Bytes, o: ReadOpts, F: &str) -> Result<SynValue, Control> {
+    let len = data.len() as u64;
+    let view = data.clone();
+    let fetch = move |start: u64, n: usize| -> Result<bytes::Bytes, Control> {
+        let s = start as usize;
+        Ok(view.slice(s..s.saturating_add(n).min(view.len())))
+    };
+    read_table(data, &fetch, len, o, F)
+}
+
+/// v0.6.46 (C4) — `parquet_scan(path, opts?)`: la tabla desde el archivo EN DISCO, sin cargarlo. El
+/// lector pide sólo lo que necesita (el pie con los metadatos, y de las columnas y row groups que se
+/// leen, sus páginas), así un archivo de gigas con una columna pedida lee esa columna. Las mismas
+/// opciones y topes que `parquet_read`. Pide `file.read` sobre la ruta y abre como `read_file`
+/// (chequeo y apertura en un paso); un archivo del bundle se lee de memoria. Es una entrada del
+/// linaje: la ruta y el sha256 de las filas devueltas (como `canonical_json`).
+fn parquet_scan(caps: &Rc<std::cell::RefCell<synsema_capabilities::model::CapabilitySet>>, args: &[SynValue]) -> Result<SynValue, Control> {
+    const F: &str = "parquet_scan";
+    let raw = match args.first() {
+        Some(SynValue::Text(t)) => t.to_string(),
+        Some(other) => {
+            return Err(err(format!(
+                "{}: expected a path, got {} — for bytes already in memory, parquet_read(bytes)",
+                F,
+                other.type_name()
+            )))
+        }
+        None => return Err(err("parquet_scan(path)")),
+    };
+    let o = read_opts(args.get(1), F)?;
+    match synsema_capabilities::secure::open_for_read(caps, &raw, "parquet_scan()")? {
+        synsema_capabilities::secure::OpenedForRead::Bundled(_, b) => read_bytes(bytes::Bytes::from_static(b), o, F),
+        synsema_capabilities::secure::OpenedForRead::Disk(path, file) => {
+            let io = |e: std::io::Error| err(format!("{}: cannot read {}: {}", F, path, e));
+            let len = file.metadata().map_err(io)?.len();
+            let probe = file.try_clone().map_err(io)?;
+            let fetch = move |start: u64, n: usize| -> Result<bytes::Bytes, Control> {
+                use parquet::file::reader::ChunkReader;
+                probe.get_bytes(start, n).map_err(|e| err(format!("{}: {}", F, e)))
+            };
+            read_table(file, &fetch, len, o, F)
+        }
+    }
+}
+
+#[allow(non_snake_case)]
+fn read_table<R: parquet::file::reader::ChunkReader + 'static>(
+    src: R,
+    fetch: &Fetch,
+    file_len: u64,
+    o: ReadOpts,
+    F: &str,
+) -> Result<SynValue, Control> {
+    let ReadOpts { max_cells, max_bytes: max_bytes_opt, columns, row_groups, limit } = o;
+    let reader = SerializedFileReader::new(src).map_err(|e| err(format!("{}: not a Parquet file: {}", F, e)))?;
     let max_bytes = max_bytes_opt.unwrap_or_else(|| (1024 * 1024 * 1024u64).max(file_len.saturating_mul(64)));
     let meta = reader.metadata();
     let all_cols: Vec<String> = meta.file_metadata().schema_descr().root_schema().get_fields().iter().map(|f| f.name().to_string()).collect();
@@ -497,7 +604,7 @@ fn parquet_read(args: &[SynValue]) -> Result<SynValue, Control> {
         }
     }
     let col_set: Option<std::collections::HashSet<String>> = columns.as_ref().map(|c| c.iter().cloned().collect());
-    check_expansion_of(&data, meta, max_bytes, F, row_groups.as_deref(), col_set.as_ref())?;
+    check_expansion_of(fetch, file_len, meta, max_bytes, F, row_groups.as_deref(), col_set.as_ref())?;
     let rows_selected: u64 = match &row_groups {
         Some(rs) => rs.iter().map(|&r| meta.row_group(r).num_rows().max(0) as u64).sum(),
         None => meta.file_metadata().num_rows().max(0) as u64,
@@ -1283,9 +1390,82 @@ pub fn register_parquet_builtins(interp: &Interpreter) {
     interp.register_builtin("parquet_write", -1, Rc::new(|_i, a, _l| parquet_write(a)));
 }
 
+/// v0.6.46 (C4) — `parquet_scan` lee del disco: va con las capabilities, en el perfil nativo (como
+/// los archivos comprimidos), no en el puro que comparte el wasm.
+pub fn register_parquet_scan(interp: &Interpreter, caps: Rc<std::cell::RefCell<synsema_capabilities::model::CapabilitySet>>) {
+    interp.register_builtin("parquet_scan", -1, Rc::new(move |_i, a, _l| parquet_scan(&caps, a)));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// v0.6.46 (C4): un encabezado más grande que la ventana inicial se lee entero (la ventana se
+    /// duplica); uno cortado por el fin del chunk es un error, no un tamaño inventado.
+    #[test]
+    fn a_page_header_larger_than_the_window_is_read_whole() {
+        // Thrift compact: campo 1 i32 (tipo 5) = 0, 2 = 1000 (descomprimido), 3 = 500
+        // (comprimido), un campo 9 binario (tipo 8) de 20 000 bytes que no se mira, y el fin.
+        let zz = |v: i64| -> Vec<u8> {
+            let mut u = ((v << 1) ^ (v >> 63)) as u64;
+            let mut out = Vec::new();
+            loop {
+                let b = (u & 0x7f) as u8;
+                u >>= 7;
+                if u == 0 {
+                    out.push(b);
+                    return out;
+                }
+                out.push(b | 0x80);
+            }
+        };
+        let mut h = vec![0x15];
+        h.extend(zz(0));
+        h.push(0x15);
+        h.extend(zz(1000));
+        h.push(0x15);
+        h.extend(zz(500));
+        h.push(0x68); // delta 6 (campo 9), tipo 8
+        let n = 20_000u64;
+        let mut l = n;
+        loop {
+            let b = (l & 0x7f) as u8;
+            l >>= 7;
+            if l == 0 {
+                h.push(b);
+                break;
+            }
+            h.push(b | 0x80);
+        }
+        h.extend(std::iter::repeat(7u8).take(n as usize));
+        h.push(0);
+        let header_len = h.len() as u64;
+        assert!(header_len > HEADER_WINDOW * 2);
+        h.extend(std::iter::repeat(0u8).take(500));
+        let data = bytes::Bytes::from(h);
+        let fetch = |s: u64, n: usize| -> Result<bytes::Bytes, Control> {
+            let s = s as usize;
+            Ok(data.slice(s..(s + n).min(data.len())))
+        };
+        let (sizes, used) = page_header(&fetch, 0, data.len() as u64, "t").unwrap_or_else(|_| panic!("no leyó"));
+        assert_eq!((sizes, used), ((Some(1000), Some(500)), header_len));
+        // Cortado: el chunk termina antes que el encabezado.
+        assert!(page_header(&fetch, 0, header_len - 1, "t").is_err());
+        // v0.6.46 (ronda 1 de cf1, N5): uno que no termina nunca de parsear no se lee más allá del tope.
+        let junk = bytes::Bytes::from(vec![0x18u8; (MAX_PAGE_HEADER + (1 << 20)) as usize]);
+        let asked = std::cell::Cell::new(0usize);
+        let fetch = |s: u64, n: usize| -> Result<bytes::Bytes, Control> {
+            asked.set(asked.get().max(n));
+            let s = s as usize;
+            Ok(junk.slice(s..(s + n).min(junk.len())))
+        };
+        let e = match page_header(&fetch, 0, junk.len() as u64, "t") {
+            Err(Control::Error(e)) => e.into_message(),
+            _ => panic!("tenía que fallar"),
+        };
+        assert!(e.contains("larger than 16 MiB"), "{}", e);
+        assert_eq!(asked.get() as u64, MAX_PAGE_HEADER);
+    }
 
     /// El esquema Arrow que escribe `parquet_write` se lee de vuelta: cada columna con su tipo, la
     /// zona IANA de un timestamp y la unidad de una duration (pyarrow, pandas y polars lo leen

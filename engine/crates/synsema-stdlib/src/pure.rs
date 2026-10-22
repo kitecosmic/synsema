@@ -45,6 +45,8 @@ pub const FS: &[&str] = &[
 ];
 /// v0.6.20 — archivos comprimidos: crear y extraer viven en el perfil native (archive.rs).
 pub const ARCHIVE: &[&str] = &["zip_create", "zip_extract", "tar_create", "tar_extract"];
+/// v0.6.46 (C4) — Parquet leído del disco por partes. Sin filesystem, `parquet_read(bytes)`.
+pub const PARQUET_FS: &[&str] = &["parquet_scan"];
 pub const EXEC: &[&str] = &["run"];
 pub const SOCKETS: &[&str] = &[
     "mtls_identity",
@@ -93,6 +95,7 @@ pub const PROCESS: &[&str] = &["self_path", "run_program", "shutdown"];
 pub const NATIVE_PURE_TABLE: &[(&str, &[&str], &str)] = &[
     ("filesystem", FS, WHY_NO_FS),
     ("archive", ARCHIVE, WHY_NO_FS),
+    ("parquet from disk", PARQUET_FS, WHY_NO_FS),
     ("exec", EXEC, WHY_NO_EXEC),
     ("hub/proc", HUB, WHY_NO_HUB),
     ("sockets", SOCKETS, WHY_NO_SOCKETS),
@@ -134,6 +137,7 @@ pub fn register_os_stubs(interp: &Interpreter, hint: &'static str) {
 pub fn register_no_fs_stubs(interp: &Interpreter, hint: &'static str) {
     synsema_capabilities::secure::register_pure_fs(interp, hint);
     stub_family(interp, ARCHIVE, WHY_NO_FS, hint);
+    stub_family(interp, PARQUET_FS, WHY_NO_FS, hint);
     stub_family(interp, EXEC, WHY_NO_EXEC, hint);
 }
 

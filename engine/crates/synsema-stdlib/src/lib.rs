@@ -91,6 +91,8 @@ pub mod label_lists;
 pub mod raster;
 // v0.6.20 — parsers de texto de la plataforma. Puros.
 pub mod toml_fmt;
+/// v0.6.46 (F1): `tool_spec`, el catálogo de `llm_step` desde la firma.
+pub mod tools;
 pub mod xml;
 pub mod respond;
 /// Router + contrato de respuesta de `serve`, PUROS (compartidos con el handler-mode wasm).

@@ -65,6 +65,7 @@ fn static_rt(www: &std::path::Path) -> ServeRuntime {
             dir: www.to_string_lossy().into_owned(),
             cache: None,
             fallback: None,
+            deny: Vec::new(),
         }],
         None,
         None,

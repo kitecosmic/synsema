@@ -2611,11 +2611,20 @@ fn proc_spawn(i: &Interpreter, args: &[SynValue], reg: &Registry) -> Result<SynV
             .collect::<Result<Vec<_>, _>>()?,
         Some(_) => return Err(err(format!("{}: args must be a list", F))),
     };
-    // Gate: exec(cmd) — el MISMO de run(); sandbox lo deniega.
+    // Gate: exec(cmd) — el MISMO de run(); sandbox lo deniega. Con `cwd`, el comando relativo se
+    // resuelve contra él (`exec_target`): el gate va después de leer las opciones.
+    let cwd_opt = match opt_map(args.get(2), F)? {
+        Some(m) => match m.get("cwd") {
+            Some(SynValue::Text(d)) => Some(d.to_string()),
+            _ => None,
+        },
+        None => None,
+    };
+    let (scope, cmd) = synsema_capabilities::secure::exec_target(&cmd, cwd_opt.as_deref());
     {
         let caps = reg.borrow().caps.clone();
         caps.borrow_mut()
-            .require(&Capability::new(CapabilityType::Exec, Some(cmd.clone())), "proc_spawn()")
+            .require(&Capability::new(CapabilityType::Exec, Some(scope)), "proc_spawn()")
             .map_err(|v| Control::Error(v.into_error()))?;
     }
     {
@@ -2704,6 +2713,14 @@ fn proc_spawn(i: &Interpreter, args: &[SynValue], reg: &Registry) -> Result<SynV
     }
     // F3: el hijo NO hereda los secretos de Synsema (mismo criterio que run()).
     opts.strip_env = i.sensitive_env().iter().cloned().collect();
+    // v0.6.46 (ronda 1 de cf1, B4): en Windows, `portable-pty` prueba las extensiones de `PATHEXT`
+    // cuando la ruta no existe tal cual: el gate juzgaba `notes.txt` y corría `notes.bat`. Una ruta
+    // (absoluta, o relativa ya resuelta por `exec_target`) tiene que existir exactamente, como en
+    // `run`.
+    #[cfg(windows)]
+    if opts.pty && cmd.contains(['/', '\\']) && !std::path::Path::new(&cmd).is_file() {
+        return Err(err(format!("{}: cannot start \"{}\": no such file (with pty, the exact name is run; no PATHEXT extension is added)", F, cmd)));
+    }
     let live = LiveProc::spawn(&cmd, &arg_list, opts).map_err(|e| err(format!("{}: {}", F, e)))?;
     let mut r = reg.borrow_mut();
     let w = r.waker.clone();
@@ -3092,6 +3109,31 @@ fn watch_open(args: &[SynValue], reg: &Registry) -> Result<SynValue, Control> {
         }
         if let Some(n) = opt_usize(&m, "max_queue", F)? {
             opts.max_queue = n;
+        }
+    }
+    // v0.6.46: mirar un árbol recursivo es leerlo entero, como `grep` y `static`: hace falta
+    // `file.read("<carpeta>/**")` (con el glob por segmentos, `file.read("src")` + `"src/*"` dejaba
+    // ver los eventos de `src/sub/`). Y un `deny` de adentro saca esa parte de la foto.
+    {
+        let caps = reg.borrow().caps.clone();
+        if opts.recursive {
+            let tree = Capability::new(CapabilityType::FileRead, Some(format!("{}/**", path.trim_end_matches('/'))));
+            if std::fs::metadata(&path).map(|m| m.is_dir()).unwrap_or(false) {
+                caps.borrow_mut().require(&tree, "watch()").map_err(|v| Control::Error(v.into_error()))?;
+            } else if !caps.borrow_mut().check_silent(&tree) {
+                // v0.6.46 (ronda 1 de cf1, B5): una raíz que hoy es un archivo puede ser una carpeta
+                // mañana. Sin el árbol concedido, se mira como `recursive: false` (lo que da
+                // `file.read("<ruta>")`, como `list_dir`): antes se recorría entera. Una raíz que no
+                // existe da error más abajo, al abrir (ronda 2, N1).
+                opts.recursive = false;
+            }
+        }
+        let denied = caps.borrow().denied_snapshot();
+        if !denied.is_empty() {
+            opts.skip = Some(Arc::new(move |p: &str| {
+                let c = Capability::new(CapabilityType::FileRead, Some(p.to_string()));
+                denied.iter().any(|d| d.covers_by_name(&c) || d.reaches_physically(&c))
+            }));
         }
     }
     let w = Watch::start(&path, opts).map_err(|e| err(format!("{}: {}", F, e)))?;

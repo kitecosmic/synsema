@@ -220,7 +220,7 @@ impl DatabaseManager {
                 "memory" => Connection::open_in_memory(),
                 _ => Connection::open(&path),
             }
-            .map_err(|e| e.to_string())?;
+            .map_err(sqlite_err)?;
             // Ronda 3 (B3): modo defensivo — sin `writable_schema`, `journal_mode=OFF` ni escrituras
             // a mano en el esquema o en las tablas internas de FTS5, que con un esquema armado le
             // hacían llegar texto no UTF-8 al authorizer. El esquema NO se marca como no confiable
@@ -228,7 +228,7 @@ impl DatabaseManager {
             // una base existente, y no protege nada acá (Synsema no registra funciones SQL propias
             // ni habilita `load_extension`).
             conn.set_db_config(rusqlite::config::DbConfig::SQLITE_DBCONFIG_DEFENSIVE, true)
-                .map_err(|e| e.to_string())?;
+                .map_err(sqlite_err)?;
             // v0.6.45 — `ATTACH DATABASE '<ruta>'` y `VACUUM INTO '<ruta>'` (que por dentro hace un
             // ATTACH) abrían o creaban cualquier archivo sin pasar por `require db(...)`; con una
             // inyección SQL, la ruta la elegía un atacante. Se rechaza el ATTACH a un archivo; el de
@@ -307,7 +307,7 @@ impl DatabaseManager {
                 let pv: Vec<Value> = params.iter().map(syn_to_value).collect();
                 let affected = c
                     .execute(sql, params_from_iter(pv.iter()))
-                    .map_err(|e| e.to_string())?;
+                    .map_err(sqlite_err)?;
                 Ok((affected as i64, c.last_insert_rowid()))
             }
             Backend::Postgres(c) => {
@@ -341,13 +341,13 @@ impl DatabaseManager {
         params_list.iter().try_for_each(|p| reject_sealed_all(p, "sql"))?;
         match self.conn_mut(None)? {
             Backend::Sqlite(c) => {
-                let mut stmt = c.prepare(sql).map_err(|e| e.to_string())?;
+                let mut stmt = c.prepare(sql).map_err(sqlite_err)?;
                 let mut total: i64 = 0;
                 for params in params_list {
                     let pv: Vec<Value> = params.iter().map(syn_to_value).collect();
                     total += stmt
                         .execute(params_from_iter(pv.iter()))
-                        .map_err(|e| e.to_string())? as i64;
+                        .map_err(sqlite_err)? as i64;
                 }
                 Ok(total)
             }
@@ -601,19 +601,34 @@ fn reject_sealed_all(params: &[SynValue], who: &str) -> Result<(), String> {
 
 // -- SQLite: ejecución + conversión SynValue <-> rusqlite Value --
 
+/// v0.6.46: un error de SQLite como texto. El authorizer de `db_open` rechaza el `ATTACH` a un
+/// archivo (y `VACUUM INTO`, que lo usa) y dos pragmas; SQLite sólo dice `not authorized`, así que se
+/// agrega el porqué y qué hacer.
+#[cold]
+#[inline(never)]
+fn sqlite_err(e: rusqlite::Error) -> String {
+    if e.sqlite_error_code() == Some(rusqlite::ErrorCode::AuthorizationForStatementDenied) {
+        return format!(
+            "{}: Synsema refuses ATTACH of a file (VACUUM INTO uses it) and the pragmas data_store_directory and temp_store_directory, so a query cannot open a database the program did not declare; open the other database with db_open(<path>), which needs require db(<path>)",
+            e
+        );
+    }
+    e.to_string()
+}
+
 fn sqlite_query(conn: &Connection, sql: &str, params: &[SynValue]) -> Result<Vec<Row>, String> {
     let pv: Vec<Value> = params.iter().map(syn_to_value).collect();
-    let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
+    let mut stmt = conn.prepare(sql).map_err(sqlite_err)?;
     // Las columnas como claves una vez por consulta: cada fila suma una referencia (F4.4).
     let cols: Vec<Key> = stmt.column_names().iter().map(|s| Key::from(*s)).collect();
     let mut rows = stmt
         .query(params_from_iter(pv.iter()))
-        .map_err(|e| e.to_string())?;
+        .map_err(sqlite_err)?;
     let mut out = Vec::new();
-    while let Some(row) = rows.next().map_err(|e| e.to_string())? {
+    while let Some(row) = rows.next().map_err(sqlite_err)? {
         let mut m = SynMap::with_capacity(cols.len());
         for (i, col) in cols.iter().enumerate() {
-            let v: Value = row.get(i).map_err(|e| e.to_string())?;
+            let v: Value = row.get(i).map_err(sqlite_err)?;
             m.insert(col.clone(), value_to_syn(&v));
         }
         out.push(m);
@@ -2444,6 +2459,20 @@ pub fn register_database_builtins<H: DbHandle>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// v0.6.46 (backlog §10): el `ATTACH` a un archivo (y `VACUUM INTO`) que rechaza el authorizer
+    /// salía como `not authorized`, sin decir por qué ni qué hacer.
+    #[test]
+    fn a_refused_attach_says_why() {
+        let mut m = DatabaseManager::new();
+        m.open(":memory:", "memory").unwrap();
+        for q in ["ATTACH DATABASE 'otra.db' AS o", "VACUUM INTO 'copia.db'"] {
+            let e = m.execute(q, &[]).unwrap_err();
+            assert!(e.contains("refuses ATTACH") && e.contains("db_open"), "{}: {}", q, e);
+        }
+        let e = m.execute("SELECT nada FROM ningun_lado", &[]).unwrap_err();
+        assert!(!e.contains("db_open"), "otro error queda igual: {}", e);
+    }
 
     fn has_returning(sql: &str, d: SqlDialect) -> bool {
         sql_code_words(sql, d).any(|w| w.eq_ignore_ascii_case("RETURNING"))

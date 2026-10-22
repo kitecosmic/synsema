@@ -260,6 +260,18 @@ fn json_to_pairs(v: Option<&Value>) -> Vec<(String, String)> {
     out
 }
 
+/// El tipo JSON de un valor, para un mensaje.
+fn json_kind(v: &Value) -> &'static str {
+    match v {
+        Value::Null => "null",
+        Value::Bool(_) => "a boolean",
+        Value::Number(_) => "a number",
+        Value::String(_) => "a string",
+        Value::Array(_) => "an array",
+        Value::Object(_) => "an object",
+    }
+}
+
 fn str_of(v: &Value) -> String {
     match v {
         Value::String(s) => s.clone(),
@@ -275,11 +287,13 @@ impl HostProvider for WebHost {
         if !self.offers("kv") {
             return None;
         }
-        let prev = host_call_json("kv_get", &json!({"ns": "audit", "key": log}))?
-            .get("value")
-            .and_then(Value::as_str)
-            .map(|s| s.to_string())
-            .unwrap_or_default();
+        // v0.6.46 (ronda 1 de cf1, M2): lo anterior se lee por `kv_get`, que dice si la lectura
+        // falló. Antes un `kv.get` que lanzaba contaba como "no hay log": se pisaba el log entero con
+        // una línea y la operación seguía autorizada. Ahora se niega, como cuando falla el `kv_set`.
+        let prev = match self.kv_get("audit", log)? {
+            Ok(prev) => prev.unwrap_or_default(),
+            Err(e) => return Some(Err(format!("reading the audit log failed: {}", e))),
+        };
         let r = host_call_json("kv_set", &json!({"ns": "audit", "key": log, "value": format!("{}{}", prev, line)}))?;
         Some(match r.get("error").and_then(Value::as_str) {
             Some(e) if !e.is_empty() => Err(e.to_string()),
@@ -346,12 +360,23 @@ impl HostProvider for WebHost {
         }))
     }
 
-    fn kv_get(&self, ns: &str, key: &str) -> Option<Option<String>> {
+    fn kv_get(&self, ns: &str, key: &str) -> Option<Result<Option<String>, String>> {
         if !self.offers("kv") {
             return None;
         }
         let r = host_call_json("kv_get", &json!({"ns": ns, "key": key}))?;
-        Some(r.get("value").and_then(Value::as_str).map(|s| s.to_string()))
+        // v0.6.46: un hook que lanza llega como `{error}` (como en `kv_set`): es un error, no "no está".
+        if let Some(e) = r.get("error").and_then(Value::as_str).filter(|e| !e.is_empty()) {
+            return Some(Err(e.to_string()));
+        }
+        // v0.6.46 (ronda 1 de cf1, B7): un valor que no es texto ni `null` (un número, un objeto ya
+        // parseado) también es un error del host: contarlo como "no está" hacía que `state_incr`
+        // arrancara de 0 y que la memoria cargara vacía y pisara la guardada.
+        Some(match r.get("value") {
+            None | Some(Value::Null) => Ok(None),
+            Some(Value::String(s)) => Ok(Some(s.clone())),
+            Some(other) => Err(format!("kv.get must return a string or null, got {}", json_kind(other))),
+        })
     }
     fn kv_set(&self, ns: &str, key: &str, value: &str) -> Option<Result<(), String>> {
         if !self.offers("kv") {
@@ -388,17 +413,24 @@ impl HostProvider for WebHost {
             },
         })
     }
-    fn kv_list(&self, ns: &str) -> Option<Vec<String>> {
+    fn kv_list(&self, ns: &str) -> Option<Result<Vec<String>, String>> {
         if !self.offers("kv") {
             return None;
         }
         let r = host_call_json("kv_list", &json!({"ns": ns}))?;
-        Some(
-            r.get("keys")
-                .and_then(Value::as_array)
-                .map(|a| a.iter().map(str_of).collect())
-                .unwrap_or_default(),
-        )
+        // v0.6.46 (ronda 1 de cf1): un hook que lanza es un error, no "no hay claves".
+        if let Some(e) = r.get("error").and_then(Value::as_str).filter(|e| !e.is_empty()) {
+            return Some(Err(e.to_string()));
+        }
+        // v0.6.46 (ronda 2 de cf1, R2-B2): como en `kv_get` (B7), lo que no es una lista de textos (la
+        // forma `{keys: [{name}]}` de Cloudflare KV, `undefined`, un número) es un error del host: se
+        // leía como "no hay claves" y `state_all()` daba `{}`.
+        Some(match r.get("keys") {
+            Some(Value::Array(a)) if a.iter().all(Value::is_string) => Ok(a.iter().map(str_of).collect()),
+            Some(Value::Array(_)) => Err("kv.list must return a list of strings, got a list with other values".to_string()),
+            Some(other) => Err(format!("kv.list must return a list of strings, got {}", json_kind(other))),
+            None => Err("kv.list must return a list of strings, got nothing".to_string()),
+        })
     }
     fn llm(&self, op: &str, prompt: &str, principals: &[String]) -> Option<Result<HostLlmResult, String>> {
         if !self.offers("llm") {

@@ -30,4 +30,6 @@ mod type_sizes;
 mod unboxed_lists;
 mod v0620_conformance;
 mod v0642_conformance;
+mod v0646_tanda_c;
+mod v0646_f1;
 mod vm;

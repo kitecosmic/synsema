@@ -75,7 +75,7 @@ impl AddressableCode {
                         result.location = Some(format!("{}:{}", filename, task.location.line));
                         result.source_lines = extract_lines(&lines, task.location.line, 30);
                         let names: Vec<String> = parameters.iter().map(|p| p.name.to_string()).collect();
-                        result.summary = format!("task {}({})", name, names.join(", "));
+                        result.summary = format!("task {}({})", name, typed_params(parameters));
                         result.params = names;
                         result.deps = get_task_dependencies(program, name);
                     }
@@ -85,8 +85,7 @@ impl AddressableCode {
                 if let Some(task) = find_task_by_name(program, identifier) {
                     if let NodeKind::TaskDefinition { name, parameters, .. } = &task.kind {
                         result.found = true;
-                        let names: Vec<String> = parameters.iter().map(|p| p.name.to_string()).collect();
-                        result.summary = format!("task {}({})", name, names.join(", "));
+                        result.summary = format!("task {}({})", name, typed_params(parameters));
                     }
                 }
             }
@@ -138,6 +137,18 @@ impl AddressableCode {
 }
 
 /// Extrae las líneas de un nodo siguiendo la indentación.
+/// v0.6.46 (F1): `id: text, items` — los parámetros con su tipo declarado.
+fn typed_params(parameters: &[crate::ast::Param]) -> String {
+    parameters
+        .iter()
+        .map(|p| match p.ty {
+            Some(t) => format!("{}: {}", p.name, t.name()),
+            None => p.name.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 fn extract_lines(lines: &[String], start_line: usize, max_lines: usize) -> Vec<String> {
     if start_line == 0 || start_line > lines.len() {
         return Vec::new();

@@ -180,6 +180,69 @@ fn docs_off_keeps_openapi() {
     assert!(body.contains("- /openapi.json\n- /sitemap.xml\n"), "sin /docs en la lista: {}", body);
 }
 
+/// v0.6.46 (C5): `discovery off` para un edge que es sólo proxy. Ninguna URL de discovery es
+/// especial (tampoco `/robots.txt`, que `private` sigue generando, ni `/.well-known/synsema-auth`,
+/// que `private` esconde): un `GET /*path` las recibe todas, como a cualquier otra.
+#[test]
+fn discovery_off_hands_every_reserved_url_to_the_program() {
+    let edge = |port: u16, clause: &str| {
+        format!(
+            "require serve({p})\nserve on {p}\n{clause}    route \"GET /*rest\"\n        give \"edge \" + params.rest\n",
+            p = port
+        )
+    };
+    let urls = [
+        "/llms.txt",
+        "/openapi.json",
+        "/sitemap.xml",
+        "/robots.txt",
+        "/docs",
+        "/.well-known/agent-card.json",
+        "/.well-known/agent.json",
+        "/.well-known/synsema-auth",
+    ];
+    let port = free_port();
+    start(edge(port, "    discovery off\n"), port);
+    for u in urls {
+        let (st, _, body) = get(port, u, "");
+        // `give "…"` responde el texto como JSON.
+        assert_eq!((st, body), (200, format!("\"edge {}\"", u.trim_start_matches('/'))), "{}", u);
+    }
+    // Como cualquier otra URL: la ruta gana a un estático del mismo path (sin la cláusula, un
+    // `robots.txt` estático le gana a `/*rest`, por la regla de las URLs reservadas).
+    let dir = std::env::temp_dir().join(format!("syn_c5_static_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("robots.txt"), "static robots").unwrap();
+    let d = dir.to_string_lossy().replace('\\', "/");
+    let with_static = |port: u16, clause: &str| {
+        format!(
+            "require serve({p})\nrequire file.read(\"{d}/**\")\nserve on {p}\n{clause}    static \"/\" from \"{d}\"\n    route \"GET /*rest\"\n        give \"edge \" + params.rest\n",
+            p = port
+        )
+    };
+    let port = free_port();
+    start(with_static(port, "    discovery off\n"), port);
+    assert_eq!(get(port, "/robots.txt", "").2, "\"edge robots.txt\"");
+    let port = free_port();
+    start(with_static(port, ""), port);
+    assert_eq!(get(port, "/robots.txt", "").2, "static robots");
+    // Sin rutas que las atiendan, no existen (404), en vez de una página generada.
+    let port = free_port();
+    start(format!("require serve({p})\nserve on {p}\n    discovery off\n    route \"GET /a\"\n        give 1\n", p = port), port);
+    for u in urls {
+        assert_eq!(get(port, u, "").0, 404, "{}", u);
+    }
+    // El contraste: sin la cláusula, el motor las genera aunque haya `/*rest`; con `private`,
+    // `/robots.txt` sigue siendo del motor.
+    let port = free_port();
+    start(edge(port, ""), port);
+    assert!(get(port, "/llms.txt", "").2.starts_with("# "), "generado sin discovery off");
+    assert!(get(port, "/robots.txt", "").2.starts_with("User-agent"));
+    let port = free_port();
+    start(edge(port, "    private\n"), port);
+    assert_eq!(get(port, "/robots.txt", "").2, "User-agent: *\nDisallow: /\n");
+}
+
 #[test]
 fn declared_route_and_domain_win() {
     let port = free_port();

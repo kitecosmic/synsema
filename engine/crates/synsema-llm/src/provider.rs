@@ -49,11 +49,31 @@ pub struct LLMResponse {
 }
 
 /// Una tool ofrecida al LLM (la arma el programa como dato; ver el loop seguro).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct ToolSpec {
     pub name: String,
     pub description: String,
     pub params: Vec<String>,
+    /// v0.6.46 (F1): el tipo JSON Schema de cada parámetro, en el orden de `params`; vacío = sin
+    /// tipo declarado (se publica `string`, como antes).
+    pub types: Vec<String>,
+    /// v0.6.46 (F1): los parámetros que no van en `required`.
+    pub optional: Vec<String>,
+}
+
+impl ToolSpec {
+    /// El tipo JSON Schema del parámetro `i` (`string` si no declara uno).
+    pub fn schema_type(&self, i: usize) -> &str {
+        match self.types.get(i) {
+            Some(t) if !t.is_empty() => t,
+            _ => "string",
+        }
+    }
+
+    /// Los parámetros obligatorios (todos menos `optional`).
+    pub fn required(&self) -> Vec<String> {
+        self.params.iter().filter(|p| !self.optional.contains(p)).cloned().collect()
+    }
 }
 
 /// El paso que decide el LLM: respuesta final O una tool-call estructurada.

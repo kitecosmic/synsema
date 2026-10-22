@@ -170,6 +170,7 @@ fn acme_http01_end_to_end_against_pebble() {
             dir: www.to_string_lossy().into_owned(),
             cache: None,
             fallback: None,
+            deny: Vec::new(),
         }],
         None,
         None,

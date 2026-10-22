@@ -1412,3 +1412,23 @@ fn e7_every_client_checks_the_address() {
     let (code, out, err) = synsema_env(&dir, &["run", "p.syn"], None, &[("E1C_KEY", E1_VALUE)]);
     assert_eq!((code, out.trim()), (0, "ok"), "{}", err);
 }
+
+/// Ronda 1 de cf1 (B1): lo que la corrida escribe también entra en el recibo sellado (antes sólo en
+/// `receipt()`, que arma el programa).
+#[test]
+fn c3_writes_go_to_the_sealed_receipt() {
+    let dir = project("c3seal");
+    std::fs::write(dir.join("p.syn"), "require file.write(\"./out.txt\")\nwrite_file(\"./out.txt\", \"hola\")\nprint(\"listo\")\n").unwrap();
+    let (sk, pk) = auditor_keys();
+    let (code, out, err) = synsema(&dir, &["run", "--auditor", &pk, "p.syn"], None);
+    assert_eq!(code, 0, "{}", err);
+    assert_eq!(out.trim(), "listo");
+    let opened = open_receipt(&receipt_in(&err), &sk);
+    let entries = opened["entries"].as_array().unwrap();
+    let w = entries.iter().find(|e| e["entry"]["kind"] == "output").unwrap_or_else(|| panic!("sin la escritura: {:?}", entries));
+    assert_eq!(w["entry"]["source"], "write_file");
+    assert_eq!(w["entry"]["what"], "./out.txt");
+    assert_eq!(w["entry"]["bytes"], 4);
+    // sha256("hola")
+    assert_eq!(w["entry"]["sha256"], "b221d9dbb083a7f33428d7c2a3c3198ae925614d70210e28716ccaa7cd4ddb79");
+}

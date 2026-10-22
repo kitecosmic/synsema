@@ -103,11 +103,12 @@ fn stringify_json(v: &Value) -> String {
     }
 }
 
-/// `properties` de un input-schema: cada param → `{"type":"string"}`.
-fn string_properties(params: &[String]) -> Value {
+/// `properties` de un input-schema: cada param → `{"type": <su tipo>}` (`string` si el catálogo no
+/// declara uno; v0.6.46, F1).
+fn tool_properties(t: &ToolSpec) -> Value {
     let mut props = Map::new();
-    for p in params {
-        props.insert(p.clone(), json!({ "type": "string" }));
+    for (i, p) in t.params.iter().enumerate() {
+        props.insert(p.clone(), json!({ "type": t.schema_type(i) }));
     }
     Value::Object(props)
 }
@@ -254,8 +255,8 @@ pub fn build_anthropic_body(
                     "description": t.description,
                     "input_schema": {
                         "type": "object",
-                        "properties": string_properties(&t.params),
-                        "required": t.params,
+                        "properties": tool_properties(t),
+                        "required": t.required(),
                     }
                 })
             })
@@ -744,8 +745,8 @@ pub fn build_openai_body(
                         "description": t.description,
                         "parameters": {
                             "type": "object",
-                            "properties": string_properties(&t.params),
-                            "required": t.params,
+                            "properties": tool_properties(t),
+                            "required": t.required(),
                         }
                     }
                 })
@@ -2446,6 +2447,27 @@ mod tests {
         );
     }
 
+    /// v0.6.46 (F1): el catálogo tipado llega al modelo como JSON Schema: cada tipo declarado, y
+    /// `required` sin los opcionales. Un parámetro sin tipo sigue siendo `string`.
+    #[test]
+    fn a_typed_catalog_publishes_its_schema() {
+        let tools = vec![ToolSpec {
+            name: "add".to_string(),
+            description: "adds".to_string(),
+            params: vec!["a".to_string(), "b".to_string(), "note".to_string()],
+            types: vec!["number".to_string(), "array".to_string(), String::new()],
+            optional: vec!["b".to_string()],
+        }];
+        let a: Value = serde_json::from_str(&build_anthropic_body("m", 64, "q", "", &tools, false)).unwrap();
+        let o: Value = serde_json::from_str(&build_openai_body("m", 64, "q", "", &tools, false)).unwrap();
+        for schema in [&a["tools"][0]["input_schema"], &o["tools"][0]["function"]["parameters"]] {
+            assert_eq!(schema["properties"]["a"]["type"], "number");
+            assert_eq!(schema["properties"]["b"]["type"], "array");
+            assert_eq!(schema["properties"]["note"]["type"], "string");
+            assert_eq!(schema["required"], serde_json::json!(["a", "note"]));
+        }
+    }
+
     // -- Anthropic: build_body --
 
     #[test]
@@ -2454,6 +2476,7 @@ mod tests {
             name: "get_weather".to_string(),
             description: "get the weather".to_string(),
             params: vec!["city".to_string()],
+            ..Default::default()
         }];
         let body =
             build_anthropic_body("claude-opus-4-8", 512, "What's the weather?", "", &tools, false);
@@ -2567,6 +2590,7 @@ mod tests {
             name: "get_weather".to_string(),
             description: "get the weather".to_string(),
             params: vec!["city".to_string()],
+            ..Default::default()
         }];
         let body = build_openai_body("gpt-4o", 256, "What's the weather?", "", &tools, false);
         let v: Value = serde_json::from_str(&body).unwrap();

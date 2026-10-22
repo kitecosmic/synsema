@@ -56,8 +56,11 @@ pub trait HostProvider {
         None
     }
     /// KV durable por namespace (`ns` = nombre declarado en `require memory("x")`, o
-    /// `"state"` para `state_*`). `None` = sin almacenamiento durable.
-    fn kv_get(&self, _ns: &str, _key: &str) -> Option<Option<String>> {
+    /// `"state"` para `state_*`). `None` = sin almacenamiento durable; `Some(Ok(None))` = la clave
+    /// no está; `Some(Err)` = la lectura falló. v0.6.46: antes no había cómo decir que falló, y un
+    /// `kv.get` que lanzaba se leía como "no está" (la memoria cargaba vacía y la próxima escritura
+    /// pisaba la guardada).
+    fn kv_get(&self, _ns: &str, _key: &str) -> Option<Result<Option<String>, String>> {
         None
     }
     fn kv_set(&self, _ns: &str, _key: &str, _value: &str) -> Option<Result<(), String>> {
@@ -66,8 +69,9 @@ pub trait HostProvider {
     fn kv_delete(&self, _ns: &str, _key: &str) -> Option<Result<(), String>> {
         None
     }
-    /// Claves de un namespace (para `state_all`).
-    fn kv_list(&self, _ns: &str) -> Option<Vec<String>> {
+    /// Claves de un namespace (para `state_all`). v0.6.46 (ronda 1 de cf1): `Some(Err)` = la
+    /// lectura falló (antes un `kv.list` que lanzaba daba "no hay claves" y `state_all()` daba `{}`).
+    fn kv_list(&self, _ns: &str) -> Option<Result<Vec<String>, String>> {
         None
     }
     /// v0.6.45 — comparar-y-cambiar atómico: escribe `value` sólo si el valor actual es

@@ -146,6 +146,43 @@ fn receipt_program_sha_equals_code_sha() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// v0.6.46 (backlog §10): `code check` (y la tool `check` del MCP) mostraba sólo las capabilities
+/// faltantes; ahora también los avisos de `synsema check`, con archivo y línea.
+#[test]
+fn check_shows_the_warnings_of_synsema_check() {
+    let dir = std::env::temp_dir().join(format!("synsema-code-cli-lints-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("lint.syn"),
+        "require net(\"api.example.com\")
+require secret(\"K\")
+print(without([1], 1))
+let a be fetch(\"https://api.example.com/x\", \"POST\")
+let b be http_get(\"https://api.example.com/y\", {}, {}, 5)
+let c be http_get(\"https://api.example.com/z?k=\" + secret(\"K\"))
+require serve(8080)
+serve on 8080
+    route \"GET /:page\"
+        give \"x\"
+",
+    )
+    .unwrap();
+    let (code, out, err) = run_code(&dir, &["check", "--json"]);
+    assert_eq!(code, 0, "{} {}", out, err);
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    let ws = v["warnings"].as_array().unwrap();
+    let at = |line: u64, needle: &str| {
+        ws.iter().any(|w| w["file"] == "lint.syn" && w["line"] == line && w["message"].as_str().unwrap_or("").contains(needle))
+    };
+    assert!(at(3, "named 'without'"), "nombre inexistente: {}", out);
+    assert!(at(4, "fetch(url, method"), "fetch posicional: {}", out);
+    assert!(at(5, "pass timeout by name"), "tercer opcional posicional: {}", out);
+    assert!(at(6, "not bound to a host"), "secret sin atar: {}", out);
+    assert!(at(9, "would capture"), "aviso del chequeo estático: {}", out);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn check_exit_code_and_missing_caps_warning() {
     let dir = project("check");

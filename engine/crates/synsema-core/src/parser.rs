@@ -1086,16 +1086,57 @@ The inline form belongs where a value is used: let x be when c then a otherwise 
         ))
     }
 
-    /// Un parámetro de `task`: nombre y, tras `=`, un default opcional (Batch 2). El
-    /// default se evalúa en call time (G5). `=` es `Assign` (distinto de `==`/`Equal`).
+    /// Un parámetro de `task`: nombre, `: tipo` opcional (v0.6.46, F1) y, tras `=`, un default
+    /// opcional (Batch 2). El default se evalúa en call time (G5). `=` es `Assign` (distinto de
+    /// `==`/`Equal`).
     fn parse_param(&mut self) -> Result<Param, ParseError> {
         let name = self.expect_name("parameter name")?.as_str().to_string();
+        let ty = if self.match_tok(TokenType::Colon).is_some() {
+            let tok = self.expect(
+                TokenType::Identifier,
+                "Expected a parameter type after ':' (text, number, bool, list or map)",
+            )?;
+            match crate::ast::ParamType::parse(tok.as_str()) {
+                Some(t) => Some(t),
+                None => {
+                    return Err(ParseError::new(
+                        format!(
+                            "unknown type '{}' for parameter '{}': the parameter types are {}",
+                            tok.as_str(),
+                            name,
+                            crate::ast::ParamType::ALL
+                        ),
+                        tok.location.clone(),
+                    ))
+                }
+            }
+        } else {
+            None
+        };
         let default = if self.match_tok(TokenType::Assign).is_some() {
             Some(self.parse_expression()?)
         } else {
             None
         };
-        Ok(Param { name: name.into(), default })
+        if let (Some(t), Some(d)) = (ty, &default) {
+            // Un default literal del otro tipo es un error del autor; `nothing` es el default de un
+            // parámetro opcional y vale para cualquiera.
+            let lit = match &d.kind {
+                NodeKind::NumberLiteral { .. } => Some("number"),
+                NodeKind::TextLiteral { .. } => Some("text"),
+                NodeKind::BoolLiteral { .. } => Some("bool"),
+                NodeKind::ListLiteral { .. } => Some("list"),
+                NodeKind::MapLiteral { .. } => Some("map"),
+                _ => None,
+            };
+            if let Some(l) = lit.filter(|l| *l != t.name()) {
+                return Err(ParseError::new(
+                    format!("the default of '{}: {}' is a {}", name, t.name(), l),
+                    d.location.clone(),
+                ));
+            }
+        }
+        Ok(Param { name: name.into(), default, ty })
     }
 
     fn parse_give(&mut self) -> Result<Node, ParseError> {
@@ -1681,6 +1722,7 @@ The inline form belongs where a value is used: let x be when c then a otherwise 
         let mut describe = None;
         let mut private = false;
         let mut docs_off = false;
+        let mut discovery_off = false;
         let mut routes = Vec::new();
         let mut tls_cert: Option<Box<Node>> = None;
         let mut tls_key: Option<Box<Node>> = None;
@@ -1813,11 +1855,16 @@ The inline form belongs where a value is used: let x be when c then a otherwise 
                     mloc,
                     NodeKind::MountClause { source: Box::new(source), prefix },
                 ));
+            } else if self.check_word("discovery") {
+                // v0.6.46 (C5): discovery off → ninguna URL generada; las atiende el programa.
+                self.advance();
+                self.expect_word("off", "Expected 'off' after 'discovery' (discovery off)")?;
+                discovery_off = true;
             } else {
                 let tok = self.current();
                 return Err(ParseError::new(
                     format!(
-                        "Inside 'serve', expected 'auth with ...', 'errors with ...', 'route ...', 'mount ...', 'static ...', 'tls ...', 'domain ...', 'bind \"...\"', 'host \"...\"', 'redirect https', 'cors ...', 'timeout ...', 'describe', 'private' or 'docs off', got {}",
+                        "Inside 'serve', expected 'auth with ...', 'errors with ...', 'route ...', 'mount ...', 'static ...', 'tls ...', 'domain ...', 'bind \"...\"', 'host \"...\"', 'redirect https', 'cors ...', 'timeout ...', 'describe', 'private', 'docs off' or 'discovery off', got {}",
                         tok.ty.name()
                     ),
                     tok.location.clone(),
@@ -1868,6 +1915,7 @@ The inline form belongs where a value is used: let x be when c then a otherwise 
                 describe,
                 private,
                 docs_off,
+                discovery_off,
                 routes,
                 tls_cert,
                 tls_key,

@@ -300,6 +300,13 @@ serve on 8080
   const i1 = syn.handle(iso, { method: "GET", path: "/n" }, { host });
   const i2 = syn.handle(iso, { method: "GET", path: "/n" }, { host });
   check("handle: `set` sobre un global no persiste al request siguiente (snapshot)", i1.body === '{"n": 1, "l": 1, "s": 1}' && i2.body === '{"n": 1, "l": 1, "s": 2}', [i1.body, i2.body, i1.errors, i2.errors]);
+  // v0.6.46 (ronda 2 de cf1, N8): el linaje del top-level no es del primer request; cada request
+  // ve en receipt() sólo lo suyo (antes: 2 en el primero, 1 en los siguientes).
+  const llmHost = { ...host, llm: () => ({ content: "ok", tokens: 1 }) };
+  const lin = 'require serve(9)\nrequire llm\nlet arranque be reason about "arranque"\nserve on 9\n    route "GET /r"\n        let x be reason about "pedido"\n        give {"inputs": length(receipt().credentialSubject.inputs)}';
+  const l1 = syn.handle(lin, { method: "GET", path: "/r" }, { host: llmHost });
+  const l2 = syn.handle(lin, { method: "GET", path: "/r" }, { host: llmHost });
+  check("handle: receipt() del primer request no trae el linaje del top-level", l1.body === '{"inputs": 1}' && l2.body === '{"inputs": 1}', [l1.body, l2.body, l1.errors, l2.errors]);
 }
 
 // 7. Modo asíncrono: Worker + Atomics, con un `http` async (fetch real contra un server local).
@@ -630,9 +637,9 @@ print("slept")`;
   const big = await pool.runAsync('print(state_get("x"))', {
     host: { kv: { get: async () => 10n, set: async () => {} } },
   }).then((r) => ({ settled: true, r }), (e) => ({ settled: true, e: String(e.message) }));
-  // El hook contesta `{error}` (safeJson); que el motor lo vea como `nothing` es el ítem del backlog
-  // "un kv.get que falla se ve como nothing" (v0.6.46).
-  check("async: un hook que devuelve un BigInt no tira el proceso ni cuelga", big.settled && big.r && big.r.ok, big);
+  // El hook contesta `{error}` (safeJson), y desde v0.6.46 es un error de `state_get` (antes se
+  // leía como `nothing`).
+  check("async: un hook que devuelve un BigInt no tira el proceso ni cuelga", big.settled && big.r && !big.r.ok && big.r.errors.some((e) => e.includes("kv.get failed")), big);
   const again = await pool.runAsync("print(5)");
   check("async: después del hook roto el Worker sigue", again.ok && again.output[0] === "5", again);
   const inf = await pool.runAsync("print(1)", { timeoutMs: Infinity }).then(() => "ok", (e) => String(e.message));
@@ -665,7 +672,7 @@ print("slept")`;
   await swap.close();
   // Ronda 4 (B1): en la API síncrona, un hook que devuelve un BigInt es un error de ese hook, no un trap.
   const bigSync = syn.run('print(state_get("x"))', { host: { kv: { get: () => 10n, set: () => {} } } });
-  check("sync: un hook que devuelve un BigInt no hace trapear el módulo", typeof bigSync === "object" && bigSync.ok, bigSync);
+  check("sync: un hook que devuelve un BigInt no hace trapear el módulo", typeof bigSync === "object" && !bigSync.ok && bigSync.errors.some((e) => e.includes("kv.get failed")), bigSync);
   // Ronda 4 (revisión, A1): con `workers: 2` y un módulo que no se puede instanciar, las llamadas
   // fallan (no se reintenta sin pausa ni quedan colgadas) y no queda ningún arranque en vuelo.
   const broken = new WebAssembly.Module(new Uint8Array([0, 97, 115, 109, 1, 0, 0, 0, 1, 4, 1, 96, 0, 0, 2, 9, 1, 3, 101, 110, 118, 1, 102, 0, 0]));
@@ -675,6 +682,69 @@ print("slept")`;
   check("async: un arranque que siempre falla rechaza las llamadas", outcomes.every((o) => o.status === "rejected"), outcomes.map((o) => o.status));
   check("async: sin arranques en vuelo después del fallo", (bad._spawning ?? 0) === 0 && performance.now() - t0 < 10000, { spawning: bad._spawning, ms: performance.now() - t0 });
   await bad.close();
+  // v0.6.46 (backlog §10): con un Worker sano, dos arranques que fallan (la espera de un segundo) y
+  // después el sano que se cierra: lo encolado no queda colgado — falla con la causa del arranque.
+  const mixed = new Synsema(syn.module, { workers: 3 });
+  await mixed.runAsync("print(0)");
+  mixed.module = broken;
+  const slow = "let s be sum(range(0, 2000000))\nprint(s)";
+  const queued = [mixed.runAsync(slow), mixed.runAsync("print(1)"), mixed.runAsync("print(2)")];
+  await new Promise((r) => setTimeout(r, 300));
+  const waited = (mixed._spawnRetryAt ?? 0) > 0;
+  await mixed._bridges[0].close();
+  const settled = await Promise.race([
+    Promise.allSettled(queued),
+    new Promise((r) => setTimeout(() => r("hang"), 10000)),
+  ]);
+  check("async: dos arranques fallidos y el sano muere: nada queda colgado", waited && settled !== "hang", { waited, settled });
+  check("async: y sin arranques en vuelo", (mixed._spawning ?? 0) === 0, mixed._spawning);
+  await mixed.close();
+  // v0.6.46 (backlog §10): un `kv.get` del host que lanza es un error de `state_get`, no `nothing`.
+  const kvDown = syn.run('print(state_get("k", "default"))', { host: { kv: { get: () => { throw new Error("kv down"); }, set: () => {} } } });
+  check("sync: un kv.get que lanza es un error", !kvDown.ok && kvDown.errors.some((e) => e.includes("kv down")), kvDown);
+  // v0.6.46 (ronda 1 de cf1, M2): el log de audit (reveal/sign/wallet/spend) se lee con kv.get antes
+  // de agregar la línea. Si esa lectura lanza, la operación se niega y el log queda como estaba (antes
+  // se pisaba con una sola línea y `reveal` seguía).
+  {
+    const store = new Map([["audit/reveal.log", "VIEJA-1\nVIEJA-2\n"]]);
+    const kv = {
+      get: (ns, key) => { if (ns === "audit") throw new Error("kv caído"); return store.get(`${ns}/${key}`) ?? null; },
+      set: (ns, key, v) => { store.set(`${ns}/${key}`, v); },
+    };
+    const r = syn.run('require secret("K")\nrequire reveal("K")\nprint(length(reveal(secret("K"))))', { env: { K: "abc" }, host: { kv } });
+    check("sync: el audit no pisa el log si kv.get lanza", !r.ok && r.output.length === 0 && store.get("audit/reveal.log") === "VIEJA-1\nVIEJA-2\n", { r, log: store.get("audit/reveal.log") });
+  }
+  // v0.6.46 (ronda 1 de cf1, B7): un valor que no es texto ni null es un error del host, no "no está".
+  for (const [label, stored] of [["número", 41], ["objeto", { n: 41 }]]) {
+    const store = new Map([["state/c", stored]]);
+    const kv = { get: (ns, k) => store.get(`${ns}/${k}`) ?? null, set: (ns, k, v) => store.set(`${ns}/${k}`, v) };
+    const r = syn.run('print(state_incr("c"))', { host: { kv } });
+    check(`sync: kv.get con un ${label} es un error y no se escribe`, !r.ok && r.errors.some((e) => e.includes("must return a string or null")) && store.get("state/c") === stored, { r, kept: store.get("state/c") });
+  }
+  // v0.6.46 (ronda 1 de cf1): un kv.list que lanza hace fallar state_all (antes daba {}).
+  {
+    const kv = { get: () => '"v"', set: () => {}, list: () => { throw new Error("kv.list caído"); } };
+    const r = syn.run("print(state_all())", { host: { kv } });
+    check("sync: un kv.list que lanza es un error de state_all", !r.ok && r.errors.some((e) => e.includes("kv.list caído")), r);
+  }
+  // v0.6.46 (ronda 2 de cf1, R2-B2): lo que no es una lista de textos es un error (antes, {}).
+  for (const [label, keys] of [["{keys: [{name}]}", { keys: [{ name: "c" }] }], ["array de {name}", [{ name: "c" }]], ["undefined", undefined], ["número", 3]]) {
+    const kv = { get: () => '"v"', set: () => {}, list: () => keys };
+    const r = syn.run("print(state_all())", { host: { kv } });
+    check(`sync: kv.list con ${label} es un error de state_all`, !r.ok && r.errors.some((e) => e.includes("kv.list must return a list of strings")), r);
+  }
+  {
+    const kv = { get: () => '"v"', set: () => {}, list: () => ["c"] };
+    const r = syn.run("print(state_all())", { host: { kv } });
+    check("sync: kv.list con un array de textos sigue andando", r.ok && r.output[0] === '{c: "v"}', r);
+  }
+  // v0.6.46 (ronda 2 de cf1, R2-B3): un valor guardado que no es JSON es un error, no "no está".
+  {
+    const store = new Map([["state/c", "cuarenta y uno"]]);
+    const kv = { get: (ns, k) => store.get(`${ns}/${k}`) ?? null, set: (ns, k, v) => store.set(`${ns}/${k}`, v) };
+    const r = syn.run('print(state_incr("c"))', { host: { kv } });
+    check("sync: state_incr sobre un texto que no es JSON es un error y no se pisa", !r.ok && r.errors.some((e) => e.includes("is not JSON")) && store.get("state/c") === "cuarenta y uno", { r, kept: store.get("state/c") });
+  }
   let startErr = null;
   try {
     new Synsema(broken, { startMs: Infinity });

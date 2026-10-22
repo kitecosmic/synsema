@@ -1335,6 +1335,16 @@ impl CapabilitySet {
             || self.parent.as_ref().map(|p| p.borrow().escapes_through_link(requested)).unwrap_or(false)
     }
 
+    /// v0.6.46: los `deny` de este set y de sus padres, copiados: para lo que recorre un árbol en
+    /// otro hilo (`watch`), donde el set no viaja. Vacío sin ningún `deny`.
+    pub fn denied_snapshot(&self) -> Vec<Capability> {
+        let mut out: Vec<Capability> = self.denied.iter().cloned().collect();
+        if let Some(p) = &self.parent {
+            out.extend(p.borrow().denied_snapshot());
+        }
+        out
+    }
+
     /// v0.6.45 — ¿un `deny` (propio o de un padre) alcanza esta capability, por nombre o en disco?
     /// Para lo que recorre un árbol bajo un solo `require` (`grep`): cada archivo de adentro tiene
     /// que respetar un `deny` del medio. Sin `deny` no hace nada (no paga ninguna consulta).

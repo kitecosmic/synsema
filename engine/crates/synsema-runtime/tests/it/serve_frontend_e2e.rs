@@ -303,11 +303,13 @@ fn serve_frontend_full_stack() {
     assert!(r.to_lowercase().contains("vary: accept-encoding"));
 }
 
+/// v0.6.46 (ronda 1 de cf1, M3): con el permiso de leerlo; sin él, el arranque no lo abre y lo
+/// chequea `render()` (ver `serve_startup_template_check_needs_file_read`).
 #[test]
 fn serve_validates_render_literal_at_startup() {
     let port = free_port();
     let prog = format!(
-        "require serve({p})\nserve on {p}\n    route \"GET /\"\n        give render(\"tests/fixtures/tpl/no_existe.html\", {{}})\n",
+        "require serve({p})\nrequire file.read(\"tests/fixtures/tpl/*\")\nserve on {p}\n    route \"GET /\"\n        give render(\"tests/fixtures/tpl/no_existe.html\", {{}})\n",
         p = port
     );
     let (tx, rx) = std::sync::mpsc::channel();
@@ -321,4 +323,51 @@ fn serve_validates_render_literal_at_startup() {
     assert!(!success);
     assert!(errors.contains("template validation failed"), "errors: {}", errors);
     assert!(errors.contains("no_existe.html"));
+}
+
+/// v0.6.46 (backlog §10): la validación de los `render("…")` literales al arrancar leía cada template
+/// y sus `include`/`layout` sin `file.read`; ahora pasa por el mismo gate que `render()`. Ronda 1 de
+/// cf1 (M3): lo que el arranque no puede leer no lo lee, pero tampoco frena el server: el `require`
+/// puede estar dentro de la ruta (vale en el request, como en v0.6.45) y `render()` lo chequea ahí.
+#[test]
+fn serve_startup_template_check_needs_file_read() {
+    let start = |pre: &str, tpl: &str, route_pre: &str| {
+        let port = free_port();
+        let prog = format!(
+            "require serve({p})\n{pre}serve on {p}\n    route \"GET /\"\n{route_pre}        give render(\"{tpl}\", {{\"title\": \"Hola\"}})\n",
+            p = port,
+            pre = pre,
+            tpl = tpl,
+            route_pre = route_pre
+        );
+        let (tx, rx) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let r = run_serve_program(&prog, "startup_gate.syn", false);
+            let _ = tx.send((r.success, r.errors.join(" | ")));
+        });
+        (port, rx)
+    };
+    let page = "tests/fixtures/tpl/page_fill.html";
+    let broken = "tests/fixtures/tpl_unread/broken.html";
+    // Sin `file.read`, el arranque no lee el template: uno roto que no puede leer no lo frena (si lo
+    // leyera, fallaría con el error de sintaxis, que dice lo que tiene adentro).
+    let (port, rx) = start("", broken, "");
+    wait_ready(port);
+    assert!(rx.try_recv().is_err(), "arrancó sin leer el template");
+    let r = get(port, "/", "");
+    assert!(r.contains("500"), "render() lo niega en el request: {}", r.replace('\n', " "));
+    // Con permiso, el roto sí se valida al arrancar.
+    let (_, rx) = start("require file.read(\"tests/fixtures/tpl_unread/*\")\n", broken, "");
+    let (ok, errors) = rx.recv_timeout(Duration::from_secs(10)).expect("debió fallar al arrancar");
+    assert!(!ok && errors.contains("template validation failed") && errors.contains("without a matching block"), "{}", errors);
+    // El `require` dentro de la ruta: arranca y sirve (en v0.6.45 también).
+    let (port, _rx) = start("", page, "        require file.read(\"tests/fixtures/tpl/*\")\n");
+    wait_ready(port);
+    let r = get(port, "/", "");
+    assert!(r.contains("200") && r.contains("<h1>Hola</h1>"), "r: {}", r.replace('\n', " "));
+    // Con el permiso en el preámbulo, arranca y sirve.
+    let (port, _rx) = start("require file.read(\"tests/fixtures/tpl/*\")\n", page, "");
+    wait_ready(port);
+    let r = get(port, "/", "");
+    assert!(r.contains("200") && r.contains("<h1>Hola</h1>"), "r: {}", r.replace('\n', " "));
 }

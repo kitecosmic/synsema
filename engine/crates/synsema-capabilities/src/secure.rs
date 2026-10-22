@@ -26,6 +26,29 @@ pub fn set_child_no_window(on: bool) {
     CHILD_NO_WINDOW.store(on, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// v0.6.46: el comando de `run`/`proc_spawn` con `cwd`: `(scope, programa)`. Un comando relativo con
+/// separador (`./tool`) se resuelve contra el `cwd` del hijo, como en un shell (`cd sub && ./tool`), y
+/// eso es lo que se pide: `exec("./sub/tool")`. Antes se pedía `exec("./tool")` tal cual y el archivo
+/// que corría dependía de la plataforma (Unix lo buscaba en el `cwd` nuevo, Windows en el del
+/// programa): el grant no decía qué archivo autorizaba. El programa se pasa absoluto, así no hay
+/// segunda resolución. Sin `cwd`, sin separador (se busca en el `PATH`) o absoluto: tal cual.
+pub fn exec_target(cmd: &str, cwd: Option<&str>) -> (String, String) {
+    let Some(dir) = cwd else { return (cmd.to_string(), cmd.to_string()) };
+    let has_sep = cmd.contains('/') || cmd.contains('\\');
+    if !has_sep || std::path::Path::new(cmd).is_absolute() || cmd.starts_with('/') {
+        return (cmd.to_string(), cmd.to_string());
+    }
+    let joined = crate::model::normalize_path(&format!("{}/{}", dir.trim_end_matches(['/', '\\']), cmd));
+    let rooted = std::path::Path::new(&joined).is_absolute() || joined.starts_with('/');
+    let scope = if rooted || joined.starts_with("../") { joined.clone() } else { format!("./{}", joined) };
+    let program = if rooted {
+        joined
+    } else {
+        std::env::current_dir().map(|h| h.join(&joined).to_string_lossy().into_owned()).unwrap_or(joined)
+    };
+    (scope, program)
+}
+
 /// v0.6.45 (A9) — las variables que un hijo con `env_clean` conserva: en Windows `SystemRoot`, sin
 /// la cual el CRT y WinSock no arrancan (la misma única excepción que `run_program`). Todo lo demás
 /// lo pasa el programa explícito por `env`.
@@ -234,6 +257,25 @@ fn open_read(caps: &Rc<RefCell<CapabilitySet>>, path: &str, source: &str) -> Res
         crate::nofollow::Refused::Io(e) => read_error(path, &e),
         crate::nofollow::Refused::Denied(c) => c,
     })
+}
+
+/// v0.6.46 (C4) — un archivo abierto para leerlo por partes: en disco (con el chequeo y la apertura
+/// en un paso de E8) o embebido en el bundle.
+pub enum OpenedForRead {
+    Disk(String, std::fs::File),
+    Bundled(String, &'static [u8]),
+}
+
+/// v0.6.46 (C4) — lo mismo que hace `read_file_bytes` antes de leer (bundle, `file.read`, apertura
+/// sin carrera), para un builtin de stdlib que lee el archivo por partes (`parquet_scan`).
+pub fn open_for_read(caps: &Rc<RefCell<CapabilitySet>>, raw: &str, source: &str) -> Result<OpenedForRead, Control> {
+    match locate_for_read(caps, raw, source)? {
+        Located::Bundled(p, b) => Ok(OpenedForRead::Bundled(p, b)),
+        Located::Disk(p) => {
+            let f = open_read(caps, &p, source)?;
+            Ok(OpenedForRead::Disk(p, f))
+        }
+    }
 }
 
 /// Lee todo un archivo abierto como texto (UTF-8 estricto, como `read_to_string`).
@@ -1184,8 +1226,9 @@ pub fn register_secure_builtins(interp: &Interpreter, caps: Rc<RefCell<Capabilit
         interp.register_builtin(
             "write_file",
             2,
-            Rc::new(move |_i, args, _loc| {
-                let path = normalize_path(&raw_str(arg(args, 0)?));
+            Rc::new(move |interp, args, _loc| {
+                let raw_path = raw_str(arg(args, 0)?);
+                let path = normalize_path(&raw_path);
                 require(
                     &caps,
                     Capability::new(CapabilityType::FileWrite, Some(path.clone())),
@@ -1194,12 +1237,20 @@ pub fn register_secure_builtins(interp: &Interpreter, caps: Rc<RefCell<Capabilit
                 reject_bundled_write(&path)?;
                 // Escritura atómica (temp+rename); crea dirs padre. Despacha por tipo.
                 let tys = [CapabilityType::FileWrite];
-                let result = match arg(args, 1)? {
-                    SynValue::Bytes(b) => atomic_write(&caps, &path, &b[..], &tys, "write_file()"),
-                    other => atomic_write(&caps, &path, raw_str(other).as_bytes(), &tys, "write_file()"),
+                // v0.6.46 (C3): lo escrito queda en los `outputs` del recibo.
+                let text;
+                let (data, enc): (&[u8], &'static str) = match arg(args, 1)? {
+                    SynValue::Bytes(b) => (&b[..], "bytes"),
+                    other => {
+                        text = raw_str(other);
+                        (text.as_bytes(), "text")
+                    }
                 };
-                match result {
-                    Ok(_) => Ok(syn_bool(true)),
+                match atomic_write(&caps, &path, data, &tys, "write_file()") {
+                    Ok(_) => {
+                        interp.record_output("write_file", &raw_path, data, enc);
+                        Ok(syn_bool(true))
+                    }
                     Err(crate::nofollow::Refused::Denied(c)) => Err(c),
                     Err(crate::nofollow::Refused::Io(e)) => Err(Control::Error(RuntimeError::new(format!(
                         "Cannot write file {}: {}",
@@ -1219,8 +1270,9 @@ pub fn register_secure_builtins(interp: &Interpreter, caps: Rc<RefCell<Capabilit
         interp.register_builtin(
             "edit_file",
             -1,
-            Rc::new(move |_i, args, _loc| {
-                let path = normalize_path(&raw_str(arg(args, 0)?));
+            Rc::new(move |interp, args, _loc| {
+                let raw_path = raw_str(arg(args, 0)?);
+                let path = normalize_path(&raw_path);
                 let old = raw_str(arg(args, 1)?);
                 let new = raw_str(arg(args, 2)?);
                 let replace_all = matches!(args.get(3), Some(SynValue::Bool(true)));
@@ -1281,6 +1333,8 @@ pub fn register_secure_builtins(interp: &Interpreter, caps: Rc<RefCell<Capabilit
                     }
                     crate::nofollow::Refused::Denied(c) => c,
                 })?;
+                // v0.6.46 (C3): el archivo entero como quedó.
+                interp.record_output("edit_file", &raw_path, updated.as_bytes(), "text");
                 let mut m = SynMap::new();
                 m.insert("replaced", syn_int(replaced as i64));
                 Ok(syn_map(m))
@@ -1296,8 +1350,9 @@ pub fn register_secure_builtins(interp: &Interpreter, caps: Rc<RefCell<Capabilit
         interp.register_builtin(
             "append_file",
             2,
-            Rc::new(move |_i, args, _loc| {
-                let path = normalize_path(&raw_str(arg(args, 0)?));
+            Rc::new(move |interp, args, _loc| {
+                let raw_path = raw_str(arg(args, 0)?);
+                let path = normalize_path(&raw_path);
                 require(
                     &caps,
                     Capability::new(CapabilityType::FileWrite, Some(path.clone())),
@@ -1315,13 +1370,19 @@ pub fn register_secure_builtins(interp: &Interpreter, caps: Rc<RefCell<Capabilit
                         }
                         crate::nofollow::Refused::Denied(c) => c,
                     })?;
-                let res = match arg(args, 1)? {
-                    SynValue::Bytes(b) => f.write_all(&b[..]),
-                    other => f.write_all(raw_str(other).as_bytes()),
+                let text;
+                let (data, enc): (&[u8], &'static str) = match arg(args, 1)? {
+                    SynValue::Bytes(b) => (&b[..], "bytes"),
+                    other => {
+                        text = raw_str(other);
+                        (text.as_bytes(), "text")
+                    }
                 };
-                res.map_err(|e| {
+                f.write_all(data).map_err(|e| {
                     Control::Error(RuntimeError::new(format!("Cannot write file {}: {}", path, e)))
                 })?;
+                // v0.6.46 (C3): el pedazo agregado (no el archivo entero: no se relee).
+                interp.record_output("append_file", &raw_path, data, enc);
                 Ok(syn_bool(true))
             }),
         );
@@ -1347,13 +1408,6 @@ pub fn register_secure_builtins(interp: &Interpreter, caps: Rc<RefCell<Capabilit
                         return Err(Control::Error(RuntimeError::new("run: args must be a list")))
                     }
                 };
-                // capability: scope = cmd tal como se pasa (pre-PATH).
-                require(
-                    &caps,
-                    Capability::new(CapabilityType::Exec, Some(cmd.clone())),
-                    "run()",
-                )?;
-
                 // timeout (default 120s).
                 let timeout_secs = match args.get(2) {
                     Some(SynValue::Nothing) | None => 120.0,
@@ -1370,6 +1424,9 @@ pub fn register_secure_builtins(interp: &Interpreter, caps: Rc<RefCell<Capabilit
                     Some(SynValue::Text(s)) => Some(s.to_string()),
                     _ => None,
                 };
+                // capability: scope = cmd tal como se pasa (pre-PATH); con `cwd`, resuelto contra él.
+                let (scope, cmd) = exec_target(&cmd, cwd.as_deref());
+                require(&caps, Capability::new(CapabilityType::Exec, Some(scope)), "run()")?;
                 let stdin_data: Option<Vec<u8>> = match opt("stdin") {
                     Some(SynValue::Bytes(b)) => Some(b[..].to_vec()),
                     Some(SynValue::Text(s)) => Some(s.as_bytes().to_vec()),
@@ -1789,6 +1846,36 @@ mod v0620_tests {
             Err(Control::Error(e)) => Err(e.to_string()),
             Err(_) => Err("control flow escaped the program".to_string()),
         }
+    }
+
+    /// v0.6.46 (backlog §10): con `cwd`, un comando relativo se pedía y se corría tal cual: el grant
+    /// `exec("./tool")` autorizaba el `./tool` de cualquier carpeta, y cuál corría dependía de la
+    /// plataforma. Ahora se resuelve contra el `cwd` y eso es lo que se pide.
+    #[test]
+    fn run_resolves_a_relative_command_against_cwd() {
+        assert_eq!(exec_target("./tool", Some("sub")), ("./sub/tool".to_string(), exec_target("./tool", Some("sub")).1));
+        assert_eq!(exec_target("./tool", None).0, "./tool");
+        assert_eq!(exec_target("git", Some("sub")).0, "git", "sin separador: el PATH");
+        assert_eq!(exec_target("../bin/t", Some("./a/b")).0, "./a/bin/t");
+        assert!(std::path::Path::new(&exec_target("./tool", Some("sub")).1).is_absolute(), "se corre absoluto");
+
+        let d = scratch("exec-cwd");
+        std::fs::create_dir_all(d.join("sub")).unwrap();
+        let name = if cfg!(windows) { "tool.cmd" } else { "tool" };
+        let body = if cfg!(windows) { "@echo off\r\necho from-sub\r\n" } else { "#!/bin/sh\necho from-sub\n" };
+        std::fs::write(d.join("sub").join(name), body).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(d.join("sub").join(name), std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let sub = slash(&d.join("sub"));
+        let src = format!("let r be run(\"./{}\", [], 20, {{\"cwd\": \"{}\"}})\nprint(trim(r.stdout))", name, sub);
+        let denied = run(&[(CapabilityType::Exec, Some(format!("./{}", name)))], &src).unwrap_err();
+        assert!(denied.contains(&format!("{}/{}", sub, name)), "pide el archivo que corre: {}", denied);
+        let out = run(&[(CapabilityType::Exec, Some(format!("{}/{}", sub, name)))], &src).unwrap();
+        assert_eq!(out, vec!["from-sub".to_string()]);
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]

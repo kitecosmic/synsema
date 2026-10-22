@@ -2649,6 +2649,16 @@ fn undefined_call_warnings(program: &synsema_core::ast::Program, path: &str) -> 
     out
 }
 
+/// v0.6.46: los avisos del CLI para `synsema code check` y la tool `check` del MCP, los mismos que
+/// imprime `synsema check`.
+pub(crate) fn cli_lints(program: &synsema_core::ast::Program, path: &str) -> Vec<String> {
+    let mut out = undefined_call_warnings(program, path);
+    out.extend(deprecated_fetch_warnings(program, path));
+    out.extend(positional_beyond_two_warnings(program, path));
+    out.extend(unbound_secret_warnings(program, path));
+    out
+}
+
 fn capability_warnings(path: &str) -> Vec<String> {
     use synsema_core::codeintel::{caps, Root};
     let p = std::path::Path::new(path);
@@ -2740,16 +2750,7 @@ fn cmd_check(args: &[String]) -> ExitCode {
                     for w in &warnings {
                         eprintln!("{}", w);
                     }
-                    for w in undefined_call_warnings(&program, &path) {
-                        eprintln!("{}", w);
-                    }
-                    for w in deprecated_fetch_warnings(&program, &path) {
-                        eprintln!("{}", w);
-                    }
-                    for w in positional_beyond_two_warnings(&program, &path) {
-                        eprintln!("{}", w);
-                    }
-                    for w in unbound_secret_warnings(&program, &path) {
+                    for w in cli_lints(&program, &path) {
                         eprintln!("{}", w);
                     }
                     // T1 (DX, §10.3 del spec de identidad): lo que el programa —o una task de un

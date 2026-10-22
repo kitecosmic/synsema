@@ -36,8 +36,8 @@ impl HostProvider for Host {
             attested: None,
         }))
     }
-    fn kv_get(&self, _ns: &str, _key: &str) -> Option<Option<String>> {
-        Some(None)
+    fn kv_get(&self, _ns: &str, _key: &str) -> Option<Result<Option<String>, String>> {
+        Some(Ok(None))
     }
     fn kv_set(&self, ns: &str, key: &str, value: &str) -> Option<Result<(), String>> {
         self.0.kv.borrow_mut().push(format!("{}/{}={}", ns, key, value));

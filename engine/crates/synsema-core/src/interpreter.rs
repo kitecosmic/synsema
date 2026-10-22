@@ -242,6 +242,30 @@ fn err_validation(msg: impl Into<String>, field: Option<String>) -> Control {
 fn err_at(msg: impl Into<String>, loc: &SourceLocation) -> Control {
     Control::Error(RuntimeError::at(msg, loc.clone()))
 }
+/// v0.6.46 (C6): un argumento con nombre que la task o el builtin no tiene. Dice los que tiene (la
+/// firma es dato: es lo que ve un modelo que arma la llamada) y el más cercano si hay uno. Frío:
+/// está en el camino de llamada y sólo corre al fallar.
+#[cold]
+#[inline(never)]
+fn unknown_parameter<'a>(name: &str, params: impl Iterator<Item = &'a str>, loc: &SourceLocation) -> Control {
+    let params: Vec<&str> = params.collect();
+    let mut msg = format!("unknown parameter '{}'", name);
+    let close = params
+        .iter()
+        .map(|p| (crate::capscope::edit_distance(name, p), *p))
+        .min()
+        .filter(|(d, p)| *d <= 2.max(p.len() / 3));
+    if let Some((_, p)) = close {
+        msg.push_str(&format!(" — did you mean '{}'?", p));
+    }
+    if params.is_empty() {
+        msg.push_str("; it takes no named arguments");
+    } else {
+        msg.push_str(&format!("; the parameters are: {}", params.join(", ")));
+    }
+    err_at(msg, loc)
+}
+
 /// El error de leer una variable que no existe (el mismo texto en el tree-walker y en la VM).
 fn undefined_variable(name: &str, loc: &SourceLocation) -> Control {
     // Batch DX (decisión #6): los bindings que serve inyecta SOLO en el
@@ -1138,12 +1162,19 @@ pub struct StepCatalogEntry {
     pub name: String,
     pub description: String,
     pub params: Vec<String>,
+    /// v0.6.46 (F1): el tipo de cada parámetro (`"nombre: tipo"` en el catálogo), en el orden de
+    /// `params`; `None` = sin tipo (llega como texto, como antes).
+    pub types: Vec<Option<crate::ast::ParamType>>,
+    /// v0.6.46 (F1): los nombres de `optional` (fuera de `required` en el esquema).
+    pub optional: Vec<String>,
 }
 
 /// Resultado que el callback de paso devuelve al builtin `llm_step`.
 pub enum StepResult {
     Final { text: String, tokens: u64 },
-    Tool { name: String, args: Vec<(String, String)>, tokens: u64 },
+    /// v0.6.46 (F1): los argumentos como valores. El motor decodifica los de un parámetro tipado
+    /// del catálogo; los demás llegan como texto, como antes.
+    Tool { name: String, args: Vec<(String, SynValue)>, tokens: u64 },
 }
 
 /// Callback de paso del LLM: `(prompt, catalog, context) -> StepResult`. Lo cablea el
@@ -1694,6 +1725,22 @@ pub struct Interpreter {
     trusted_depth: u32,
     /// v0.6.46 (E8) — ver [`TemplateOpenHook`].
     template_open_hook: Option<TemplateOpenHook>,
+    /// v0.6.46 (C3) — lo que la corrida escribió (archivos), en orden: el reverso de `lineage`. Lo
+    /// anota el builtin que escribe, con los bytes que escribió (`record_output`), no el despacho.
+    outputs: Vec<LineageEntry>,
+    /// v0.6.46 (ronda 1 de cf1, N1): si se descartó alguna entrada de `lineage` / de `outputs` por
+    /// el tope `MAX_LINEAGE`. El recibo lo marca así, no por el largo: con exactamente el tope no se
+    /// perdió nada.
+    lineage_dropped: [bool; 2],
+}
+
+/// v0.6.46 (ronda 1 de cf1, B2): el linaje que juntó un intérprete hijo (un worker de
+/// `parallel_map`), para sumarlo al del padre con [`Interpreter::absorb_lineage`].
+#[derive(Default)]
+pub struct LineageTaken {
+    inputs: Vec<LineageEntry>,
+    outputs: Vec<LineageEntry>,
+    dropped: [bool; 2],
 }
 
 impl Default for Interpreter {
@@ -1839,6 +1886,8 @@ impl Interpreter {
             trusted_base_env: None,
             trusted_depth: 0,
             template_open_hook: None,
+            outputs: Vec::new(),
+            lineage_dropped: [false; 2],
             blackboard: HashMap::new(),
             agent_definitions: HashMap::new(),
             agent_context: Vec::new(),
@@ -2878,6 +2927,72 @@ impl Interpreter {
         &self.lineage
     }
 
+    /// v0.6.46 (C3): lo que el programa escribió hasta ahora, en orden (`receipt()` lo publica como
+    /// `outputs`).
+    pub fn outputs(&self) -> &[LineageEntry] {
+        &self.outputs
+    }
+
+    /// v0.6.46 (C3): un builtin que escribió `data` en `what` (la ruta como la pasó el programa) lo
+    /// anota acá, después de escribir bien: el recibo trae el sha256 de lo que quedó, sin que el
+    /// programa lo meta a mano. `encoding` dice qué bytes se hashearon ("text": utf-8, "bytes").
+    /// Lo llama el builtin y no el despacho: `call_builtin` no paga nada por esto. Una escritura
+    /// bajo un PC privado no se anota (ni llega: escribir es un sumidero público).
+    pub fn record_output(&mut self, source: &str, what: &str, data: &[u8], encoding: &'static str) {
+        if self.labels && self.pc_is_private() {
+            return;
+        }
+        let entry = LineageEntry {
+            source: source.to_string(),
+            what: what.to_string(),
+            sha256: sha256_hex(data),
+            bytes: data.len(),
+            encoding: encoding.to_string(),
+            salt: None,
+            secrets: Vec::new(),
+        };
+        // v0.6.46 (ronda 1 de cf1, B1): con auditor, lo escrito también va al registro sellado de la
+        // corrida, no sólo a `receipt()`.
+        if crate::sealed::active() {
+            seal_output(&entry);
+        }
+        if self.outputs.len() >= MAX_LINEAGE {
+            self.lineage_dropped[1] = true;
+            return;
+        }
+        self.outputs.push(entry);
+    }
+
+    /// v0.6.46 (ronda 1 de cf1, N1): si `lineage()` / `outputs()` perdieron entradas por el tope.
+    pub fn lineage_truncated(&self) -> (bool, bool) {
+        (self.lineage_dropped[0], self.lineage_dropped[1])
+    }
+
+    /// v0.6.46 (ronda 1 de cf1, B2): saca el linaje de este intérprete (un worker que terminó).
+    pub fn take_lineage(&mut self) -> LineageTaken {
+        LineageTaken {
+            inputs: std::mem::take(&mut self.lineage),
+            outputs: std::mem::take(&mut self.outputs),
+            dropped: self.lineage_dropped,
+        }
+    }
+
+    /// v0.6.46 (ronda 1 de cf1, B2): suma lo que leyó y escribió un worker, en el orden en que se
+    /// llama (el de los items). Bajo un PC privado no se suma: igual que una lectura propia, cuántas
+    /// entradas trae `receipt()` diría qué rama se tomó (con auditor, el worker ya lo selló).
+    pub fn absorb_lineage(&mut self, t: LineageTaken) {
+        if self.labels && self.pc_is_private() {
+            return;
+        }
+        for (i, (mine, theirs)) in [(&mut self.lineage, t.inputs), (&mut self.outputs, t.outputs)].into_iter().enumerate() {
+            let room = MAX_LINEAGE.saturating_sub(mine.len());
+            if theirs.len() > room || t.dropped[i] {
+                self.lineage_dropped[i] = true;
+            }
+            mine.extend(theirs.into_iter().take(room));
+        }
+    }
+
     fn record_input(&mut self, source: &str, args: &[SynValue], result: &SynValue) {
         // v0.6.46 (E6.8): una lectura hecha en una rama decidida por un valor privado no entra en
         // el linaje público: cuántas entradas tenía `inputs` en `receipt()` decía qué rama se tomó.
@@ -2887,6 +3002,7 @@ impl Interpreter {
             return;
         }
         if !sealed && self.lineage.len() >= MAX_LINEAGE {
+            self.lineage_dropped[0] = true;
             return;
         }
         // v0.6.46 (ronda 1, E6-A1): bajo un PC privado lo leído llega etiquetado (`private`), y el
@@ -2949,7 +3065,7 @@ impl Interpreter {
             }
         };
         let (what, payload): (String, Vec<u8>) = match source {
-            "read_file" | "read_file_bytes" | "list_dir" | "grep" | "parquet_read" | "file_info" => {
+            "read_file" | "read_file_bytes" | "list_dir" | "grep" | "parquet_read" | "parquet_scan" | "file_info" => {
                 (path_what(args.first()), bytes_of(result))
             }
             "read_line" => ("stdin".to_string(), bytes_of(result)),
@@ -3036,6 +3152,7 @@ impl Interpreter {
     fn record_llm(&mut self, kind: &str, prompt: &str, out: &str, private: bool) {
         use sha2::{Digest, Sha256};
         if self.lineage.len() >= MAX_LINEAGE {
+            self.lineage_dropped[0] = true;
             return;
         }
         let salt = fresh_salt();
@@ -3623,6 +3740,12 @@ impl Interpreter {
         self.request_spend_limits.clear();
         self.stream_emit = None;
         self.recursion_depth = 0;
+        // v0.6.46 (ronda 1 de cf1, M1): el linaje es POR REQUEST. El worker nace vacío (no corre
+        // el top-level), así que todo lo que hay es de requests anteriores, que pueden ser de otros
+        // usuarios: `receipt()` listaba lo que leyeron y escribieron (con su nombre en la ruta).
+        self.lineage.clear();
+        self.outputs.clear();
+        self.lineage_dropped = [false; 2];
         // T5 (ronda 6, B3) — el contador de pasos es POR REQUEST. El serve reusa el intérprete
         // entre requests, así que sin esto el contador acumulaba el trabajo del request
         // ANTERIOR — incluido el privado — y el siguiente lo leía con `touched` ya limpio, o
@@ -5322,7 +5445,9 @@ impl Interpreter {
                         return out;
                     }
                 }
-                check_call_arity(&func, &args, loc)?;
+                if let Err(e) = check_call_arity(&func, &args, loc) {
+                    return Err(arity_error(e, &func, &args, loc));
+                }
                 let out = self.call_value_named(func, &mut args, loc);
                 self.release_args(args);
                 out
@@ -5337,7 +5462,7 @@ impl Interpreter {
                 // nombrados (tienen nombres de param).
                 let lambda_params: Vec<Param> = parameters
                     .iter()
-                    .map(|n| Param { name: n.clone(), default: None })
+                    .map(|n| Param { name: n.clone(), default: None, ty: None })
                     .collect();
                 let task = Rc::new(SynTaskValue {
                     name: "<lambda>".to_string(),
@@ -7827,7 +7952,9 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                 return self.call_label_builtin_by_name(func, &mut args, loc);
             }
         }
-        check_call_arity(&func, &args, loc)?;
+        if let Err(e) = check_call_arity(&func, &args, loc) {
+            return Err(arity_error(e, &func, &args, loc));
+        }
         self.call_value_named(func, &mut args, loc)
     }
 
@@ -7837,7 +7964,9 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
     #[cold]
     #[inline(never)]
     fn call_label_builtin_by_name(&mut self, func: SynValue, args: &mut CallArgs, loc: &SourceLocation) -> Result<SynValue, Control> {
-        check_call_arity(&func, args, loc)?;
+        if let Err(e) = check_call_arity(&func, args, loc) {
+            return Err(arity_error(e, &func, args, loc));
+        }
         self.label_call_armed = true;
         let out = self.call_value_named(func, args, loc);
         self.label_call_armed = false;
@@ -7920,12 +8049,7 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                                             }
                                             slots[idx] = Some(value);
                                         }
-                                        None => {
-                                            return Err(err_at(
-                                                format!("unknown parameter '{}'", n),
-                                                loc,
-                                            ))
-                                        }
+                                        None => return Err(unknown_parameter(&n, names.iter().copied(), loc)),
                                     }
                                 }
                             }
@@ -8014,7 +8138,7 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                                         slots[idx] = Some(value);
                                     }
                                     None => {
-                                        return Err(err_at(format!("unknown parameter '{}'", n), loc))
+                                        return Err(unknown_parameter(&n, task.parameters.iter().map(|p| &*p.name), loc))
                                     }
                                 }
                             }
@@ -8941,7 +9065,23 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                     .collect();
                 Ok(syn_list(items))
             }
-            other => Err(err(format!("enumerate() requires a list, got {}", other.type_name()))),
+            // v0.6.46 (C1): un array por su primer eje, como `length(a)` y `a[i]` (y `apply`, que ya
+            // lo acepta): cada `item` es un número (1-D) o la fila (un array de una dimensión menos).
+            SynValue::Array(a) if a.ndim() == 0 => {
+                Err(err("enumerate() of a 0-d array: it is a scalar and has no rows — use to_list(a) or the value itself"))
+            }
+            SynValue::Array(a) => {
+                let items = (0..a.shape()[0])
+                    .map(|i| {
+                        let mut m = SynMap::new();
+                        m.insert("index", syn_int(i as i64));
+                        m.insert("item", crate::arrays::index_row(&a, i as i64)?);
+                        Ok(syn_map(m))
+                    })
+                    .collect::<Result<Vec<_>, Control>>()?;
+                Ok(syn_list(items))
+            }
+            other => Err(err(format!("enumerate() requires a list or an array, got {}", other.type_name()))),
         }
     }
 
@@ -9717,6 +9857,12 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                 ))
             }
         };
+        // v0.6.46 (F1): la frontera valida los tipos declarados.
+        if let SynValue::Task(t) = &func {
+            if t.parameters.iter().any(|p| p.ty.is_some()) {
+                check_typed_args("call", t, &named, loc)?;
+            }
+        }
         self.call_value_named(func, &mut named, loc)
     }
 
@@ -9740,6 +9886,12 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                 ))
             }
         };
+        // v0.6.46 (F1): la frontera valida los tipos declarados, antes de entrar al scope.
+        if let SynValue::Task(t) = &func {
+            if t.parameters.iter().any(|p| p.ty.is_some()) {
+                check_typed_args("call_tool", t, &named, loc)?;
+            }
+        }
         // Las caps que la tool declaró (vacío si no es una task o no declara ninguna).
         let declared: Vec<(String, Option<String>)> = match &func {
             SynValue::Task(t) => t.required_capabilities.clone(),
@@ -9785,7 +9937,7 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
             args
         };
         let prompt = raw_str(nth(args, 0)?);
-        let catalog = parse_catalog(args.get(1));
+        let catalog = parse_catalog(args.get(1))?;
         let context = match args.get(2) {
             Some(SynValue::Text(s)) => s.to_string(),
             Some(SynValue::Nothing) | None => String::new(),
@@ -9796,7 +9948,11 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                 let r = cb(&prompt, &catalog, &context);
                 let out = match &r {
                     StepResult::Final { text, .. } => text.clone(),
-                    StepResult::Tool { name, args, .. } => format!("{}{:?}", name, args),
+                    StepResult::Tool { name, args, .. } => {
+                        // La misma vista `(clave, texto)` de antes de F1: el registro no cambia.
+                        let view: Vec<(&str, String)> = args.iter().map(|(k, v)| (k.as_str(), raw_str(v))).collect();
+                        format!("{}{:?}", name, view)
+                    }
                 };
                 self.record_llm("llm_step", &format!("{}\n{}", prompt, context), &out, !lab.is_empty());
                 r
@@ -10671,12 +10827,13 @@ fn is_callable(v: &SynValue) -> bool {
 }
 
 /// Parsea el catálogo de tools que el programa pasa a `llm_step`: una lista de maps
-/// `{name, describe|description, params}`. Items mal formados (sin `name` texto) se
-/// saltan (robustez ante data del programa; no se inventa una tool sin nombre).
-fn parse_catalog(arg: Option<&SynValue>) -> Vec<StepCatalogEntry> {
+/// `{name, describe|description, params, optional}`. Items mal formados (sin `name` texto) se
+/// saltan (robustez ante data del programa; no se inventa una tool sin nombre). v0.6.46 (F1): un
+/// parámetro puede ser `"nombre: tipo"`; un tipo desconocido es un error (no un parámetro sin tipo).
+fn parse_catalog(arg: Option<&SynValue>) -> Result<Vec<StepCatalogEntry>, Control> {
     let list = match arg {
         Some(SynValue::List(l)) => l,
-        _ => return Vec::new(),
+        _ => return Ok(Vec::new()),
     };
     let mut out = Vec::new();
     for item in list_values(&list).iter() {
@@ -10693,19 +10850,87 @@ fn parse_catalog(arg: Option<&SynValue>) -> Vec<StepCatalogEntry> {
             Some(SynValue::Text(s)) => s.to_string(),
             _ => String::new(),
         };
-        let params = match m.get("params") {
-            Some(SynValue::List(pl)) => list_values(&pl)
+        let mut params = Vec::new();
+        let mut types = Vec::new();
+        if let Some(SynValue::List(pl)) = m.get("params") {
+            for p in list_values(&pl).iter() {
+                let SynValue::Text(s) = p else { continue };
+                match s.split_once(':') {
+                    Some((n, t)) => match crate::ast::ParamType::parse(t.trim()) {
+                        Some(ty) => {
+                            params.push(n.trim().to_string());
+                            types.push(Some(ty));
+                        }
+                        None => return Err(catalog_type_error(&name, s)),
+                    },
+                    None => {
+                        params.push(s.to_string());
+                        types.push(None);
+                    }
+                }
+            }
+        }
+        let optional = match m.get("optional") {
+            Some(SynValue::List(ol)) => list_values(&ol)
                 .iter()
-                .filter_map(|p| match p {
+                .filter_map(|o| match o {
                     SynValue::Text(s) => Some(s.to_string()),
                     _ => None,
                 })
                 .collect(),
             _ => Vec::new(),
         };
-        out.push(StepCatalogEntry { name, description, params });
+        out.push(StepCatalogEntry { name, description, params, types, optional });
     }
-    out
+    Ok(out)
+}
+
+#[cold]
+#[inline(never)]
+fn catalog_type_error(tool: &str, param: &str) -> Control {
+    err(format!(
+        "llm_step: tool '{}' declares the parameter '{}' with an unknown type: the types are {}",
+        tool,
+        param,
+        crate::ast::ParamType::ALL
+    ))
+}
+
+/// v0.6.46 (F1): `call`/`call_tool` reciben los argumentos como un mapa de datos (de un modelo, de un
+/// JSON): ahí se validan los tipos declarados, estrictos y sin conversiones. Sólo corre si la task
+/// declara alguno; una llamada normal no pasa por acá. Un parámetro tipado sin default que no llegó
+/// es un error (`call` liga a `nothing` lo que falta: el esquema dice que es obligatorio).
+#[cold]
+#[inline(never)]
+fn check_typed_args(op: &str, t: &SynTaskValue, named: &CallArgs, loc: &SourceLocation) -> Result<(), Control> {
+    for p in t.parameters.iter() {
+        let Some(ty) = p.ty else { continue };
+        let Some((_, v)) = named.iter().find(|(k, _)| k.as_deref() == Some(&*p.name)) else {
+            if p.default.is_none() {
+                return Err(err_at(format!("{}({}): missing '{}' ({})", op, t.name, p.name, ty.name()), loc));
+            }
+            continue;
+        };
+        // v0.6.46 (ronda 1 de cf1, N4): `nothing` vale si es el default declarado (`t: text =
+        // nothing`): pasarlo a mano es lo mismo que no pasarlo.
+        if ty.accepts(v)
+            || (matches!(crate::labels::unwrap(v), SynValue::Nothing)
+                && p.default.as_ref().is_some_and(|d| matches!(d.kind, NodeKind::NothingLiteral)))
+        {
+            continue;
+        }
+        let got = crate::labels::unwrap(v).type_name();
+        let hint = if got == "text" {
+            " — a tool call from `llm_step` brings typed arguments only for the parameters the catalog types (`tool_spec(task, describe)` takes them from the signature)"
+        } else {
+            ""
+        };
+        return Err(err_at(
+            format!("{}({}): '{}' must be {}, got {}{}", op, t.name, p.name, ty.name(), got, hint),
+            loc,
+        ));
+    }
+    Ok(())
 }
 
 /// Convierte el `StepResult` del callback al map `{kind, …}` que consume el programa:
@@ -10721,7 +10946,7 @@ fn step_result_to_synvalue(result: StepResult) -> SynValue {
         StepResult::Tool { name, args, tokens } => {
             let mut amap = SynMap::new();
             for (k, v) in args {
-                amap.insert(k, syn_text(v));
+                amap.insert(k, v);
             }
             map.insert("kind", syn_text("tool"));
             map.insert("name", syn_text(name));
@@ -11133,12 +11358,29 @@ fn seal_lineage(e: &LineageEntry, sealed: bool) {
     crate::sealed::note_input(v.to_string(), sealed, &e.source, &e.sha256);
 }
 
+/// v0.6.46 (ronda 1 de cf1, B1): una escritura en el registro de la corrida del recibo sellado. Es
+/// pública (bajo un PC privado escribir se rechaza antes) y no entra en `--replay`, que compara lo
+/// leído.
+#[cold]
+#[inline(never)]
+fn seal_output(e: &LineageEntry) {
+    let v = serde_json::json!({
+        "kind": "output",
+        "source": e.source,
+        "what": e.what,
+        "sha256": e.sha256,
+        "bytes": e.bytes,
+        "encoding": e.encoding,
+    });
+    crate::sealed::push_public(v.to_string());
+}
+
 /// Builtins que TRAEN datos de afuera (archivos, red, bases, nodos de una cadena, sockets,
 /// procesos, la terminal, stdin). Lo que sólo escribe o manda (`write_file`, `ws_send`,
 /// `evm_send`) no es una entrada.
 pub const LINEAGE_SOURCES: &[&str] = &[
     // archivos y stdin
-    "read_file", "read_file_bytes", "read_line", "list_dir", "file_info", "grep", "parquet_read",
+    "read_file", "read_file_bytes", "read_line", "list_dir", "file_info", "grep", "parquet_read", "parquet_scan",
     "term_recv", "watch_recv",
     // HTTP
     "http", "http_get", "http_post", "http_put", "http_delete", "http_bytes", "fetch",
@@ -11307,6 +11549,20 @@ fn check_task_arity(
         }
     }
     Ok(())
+}
+
+/// v0.6.46 (C6): la aridad de una llamada a una task falló; si además vino un nombre que la task no
+/// tiene, ése es el error (`page(limt = 1)` decía que faltaba `limit`). Lo llaman los que llaman a
+/// `check_call_arity`, que tienen `func` y `args` vivos de todos modos: hacerlo adentro alargaba su
+/// vida en el camino feliz y costaba +0,1–0,2 % de instrucciones por llamada en el tree-walker.
+#[cold]
+#[inline(never)]
+fn arity_error(e: Control, func: &SynValue, args: &[(Option<String>, SynValue)], loc: &SourceLocation) -> Control {
+    let SynValue::Task(t) = func else { return e };
+    match args.iter().filter_map(|(n, _)| n.as_deref()).find(|n| !t.parameters.iter().any(|p| *p.name == **n)) {
+        Some(n) => unknown_parameter(n, t.parameters.iter().map(|p| &*p.name), loc),
+        None => e,
+    }
 }
 
 fn check_call_arity(

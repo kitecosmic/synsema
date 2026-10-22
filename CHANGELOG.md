@@ -92,6 +92,47 @@ Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the rele
   with `ok: true`; now that call fails with the hook's message (or `the host's llm hook threw`;
   redacted like any error when the call carried private data). The hook receives a third
   argument, `{principals}` (see New).
+- **A recursive `watch` needs `file.read("<folder>/**")`, like `grep` and `static`.** A program that
+  watched a folder with `file.read("src")` (or `"src/*"`) no longer starts the watch: grant
+  `"src/**"` or pass `{"recursive": false}`. The grant was checked only on the root, so it reported
+  the names of files under `src/sub/`, which the program cannot read. A non-recursive `watch` still
+  needs only the folder (like `list_dir`). A root that is a file when the watch starts, without
+  the tree granted, is watched as `recursive: false`: if a folder replaces it, only its first level
+  is seen (before, the whole tree). A root that does not exist is an error, as before. A `deny`
+  the host sets inside the tree takes that part out of the watch: no entries and no events from
+  there.
+- **`run` and `proc_spawn` with `cwd` resolve a relative command against that folder, and that is
+  what the grant must name.** `run("./tool", [], 60, {"cwd": "sub"})` asks for `exec("./sub/tool")`
+  and runs that file, as `cd sub && ./tool` would. Before, it asked for `exec("./tool")` and which
+  file ran depended on the platform (the one in `sub` on Unix, the one next to the program on
+  Windows), so the grant did not say which file it allowed. A command without a separator (looked
+  up in `PATH`) or an absolute path is unchanged. **Breaking:** a grant written for the old form
+  has to name the path inside `cwd`. With `pty: true` on Windows, a path that does not exist as
+  written is an error: before, the terminal layer tried the `PATHEXT` extensions, so a grant for
+  `notes.txt` could run `notes.bat`, and an absolute path without an extension (`C:/x/node`) ran
+  `node.exe`; now name the file with its extension. A command without a separator (`notes`) is
+  still looked up with `PATHEXT`, and so is a path that disappears between the check and the
+  start.
+- **In `@synsema/wasm`, a host `kv` that fails or answers something else is an error, not "the key
+  is not there".** Before, each of these read as an absent key, and the next write replaced what the
+  host had stored:
+  - a `kv.get` that throws, or that returns something other than a string or `null` (a number, an
+    object already parsed);
+  - a stored value that is not JSON (cut half-way, or written by something else): `state_incr` over
+    it gave 1;
+  - a `kv.list` that throws or that returns something other than a list of strings (the
+    `{keys: [{name}]}` form of Cloudflare KV, a list of `{name}`, `undefined`): `state_all` gave
+    `{}`.
+
+  `state_get`, `state_incr`, `state_all`, `state_merge` and `state_cas` fail and say why. A
+  declared `memory` whose load fails, or whose stored memory or progress is not readable, is not
+  opened: its builtins fail and say why (before, it opened empty and the first `remember` replaced
+  it). The audit log of `reveal`, `sign`, `wallet` and `spend` is not written over either: if
+  reading it fails, the operation is refused (before, the log was replaced by one line and the
+  operation went on). **Breaking** for a host whose `kv.get` returns numbers or objects, or whose
+  `kv.list` returns another shape: return the stored text, and the list of key names. For an
+  embedder written in Rust, `HostProvider::kv_get` now returns
+  `Option<Result<Option<String>, String>>` and `kv_list` `Option<Result<Vec<String>, String>>`.
 
 **Security.**
 - **`receipt()` no longer publishes what depended on a private value** (with `--labels`). Three
@@ -151,6 +192,37 @@ Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the rele
   - On Windows, a name the Win32 layer used to normalize is now opened as written: `a.txt.` and
     `a.txt ` (a trailing dot or space) no longer open `a.txt`, and `…/CON` no longer opens the
     device; they are "not found".
+- **A `static` route honours a `deny` the host sets.** A file under a denied path is a 404, and a
+  `deny` on the served folder itself (or on all of it) stops the server at start with a message.
+  Before, only the `file.read("<dir>/**")` grant was checked. The `deny` is judged again where the
+  file was opened, so a link swapped in between does not serve it. To deny a folder's content, deny
+  `<folder>/**` (as everywhere in the engine, `<folder>` alone names only the folder).
+- **`serve` checks the literal `render("…")` templates at start only with what the run may read.**
+  The check read and parsed each template and its `include`/`layout` files from the working
+  directory without the grant, so the start read files `render()` could not. Now each file passes
+  the same check as `render()` before it is opened. One the start cannot read yet (its
+  `require file.read` is inside the route) is not opened: a `note:` on stderr says so, and
+  `render()` checks it when the route runs, as before. A template inside the bundle of
+  `synsema build` does not need the grant. `synsema check` and `synsema build` still read them, as
+  tools of the project.
+- **`synsema code check` (and the `check` tool of `synsema-code` over MCP) shows the warnings of
+  `synsema check`**, with file and line: a call to a name that does not exist, a positional
+  `fetch(url, method, …)`, a third optional argument by position, a secret in a URL or body that is
+  not bound to a host, and the warnings of the static check (an alias that hides a module, a missing
+  export, a route that captures a reserved URL). Before, it only listed missing capabilities.
+- **SQLite says why it refuses `ATTACH` and `VACUUM INTO` a file.** The message now explains that a
+  query cannot open a database the program did not declare, and to use `db_open` (which needs
+  `require db(...)`). Before, it was SQLite's `not authorized`.
+- **`svg_to_png`/`svg_to_pdf` with `opts.fonts` reuse the restricted fallback copy across texts.**
+  The cache key had every character of the SVG (text and markup), so a server rendering a different
+  text per request rebuilt the copy each time. The key is now what the copy carries: two texts that
+  miss the same glyphs share it.
+- **A `serve` process sweeps the request-body spill folders that dead processes left in the temp
+  folder** (`synsema-spill-*`, after a kill or a crash), once, when it first spills a body. Only
+  real folders (not links), untouched for a day, with only files as old; on Unix, also of the same
+  owner and with mode `0700` (on Windows the temp folder is per user and neither is checked). The temporary
+  files of an atomic write (`<name>.<random>.synsema.tmp`) that a crash leaves next to the file are
+  not swept (it would cost a folder listing per write); they can be deleted.
 
 **New.**
 - **Sealed receipts for an auditor: `--auditor <X25519 public key>`** (or `SYNSEMA_AUDITOR_KEY`)
@@ -297,6 +369,69 @@ Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the rele
 - **`form = {...}` in `http`, `http_bytes`, `http_post`, `http_put` and `fetch`** sends an
   `application/x-www-form-urlencoded` body (the encoder of `oauth_basic`). Fields are text, a
   number, a bool or a bound secret; `body` and `form` together are an error.
+- **`enumerate` takes an array** and walks its first axis, like `length(a)` and `a[i]`: each `item`
+  is a number (1-D) or the row. A 0-d array is an error that says so.
+- **Clearer errors.** `log(x)` says which logarithm to use (`ln`, `log10`, `log2`, `log_base`) and
+  that `log "message"` is the log statement; `in_units` with a number shows how to make the
+  duration (`in_units(duration(seconds = 90), "minutes")`). A named argument that a task or a
+  builtin does not have lists the ones it has and the closest one (`unknown parameter 'limt' —
+  did you mean 'limit'?; the parameters are: limit, offset`); before, a misspelled name on a task
+  said that the right one was missing.
+- **The receipt names what the run wrote.** `credentialSubject.outputs` lists each `write_file`,
+  `append_file`, `edit_file`, `zip_extract` and `tar_extract` with `source`, `what` (the path),
+  `sha256`, `bytes` and `encoding`, in order: a trained model written to disk is in the receipt
+  without hashing it by hand. `what` is the path as the program wrote it (for an extraction, the
+  destination as written plus the entry's name). `append_file` records the appended chunk;
+  `edit_file`, the file as it was left. What the workers of `parallel_map` read and write is
+  included, in the order of the items (their `inputs` were missing too), also when an item fails:
+  what the workers read and wrote until then stays in the receipt. Under `serve`, `inputs` and
+  `outputs` are those of the request (before, `inputs` also listed what earlier requests of the
+  same worker read, which could be another user's). The same in the handler mode of
+  `@synsema/wasm`: what the top-level read is no longer in the first request's receipt. The same cap as `inputs`, 10 000 entries;
+  `inputs_truncated`/`outputs_truncated` now mean that an entry was dropped (they were `true` with
+  exactly 10 000). With `--auditor`, each write also goes to the sealed receipt (`kind: "output"`),
+  in the order it happened: the writes of `parallel_map` workers, in the order they were made, not
+  of the items (as their `capability` entries).
+  A write under a private context is refused (writing is a public sink), so it never reaches
+  `outputs`. The `sha256` has no salt, as for `inputs`: after a `declassify`, the hash of a short
+  value (a PIN) can be guessed by trying. An `append_file` that fails half-way can leave bytes on
+  disk that are not listed.
+- **`parquet_scan(path, opts)`** reads a Parquet file from disk by parts: only the footer, the
+  row groups and the columns that `opts` asks for (`columns`, `row_groups`, `limit`, the same
+  options and the same checks against hostile files as `parquet_read`). It needs `file.read` and
+  is a lineage input with the path. `parquet_read(bytes)` is unchanged.
+- **`discovery off` in a `serve` block**, for an edge that only forwards with `proxy to`: the
+  server generates none of `/llms.txt`, `/openapi.json`, `/sitemap.xml`, `/robots.txt`, `/docs`,
+  the Agent Cards and `/.well-known/synsema-auth`, and they reach the program's routes like any
+  other URL (a `GET /*path` forwards them; without a route they are 404). Before, an edge had to
+  declare each reserved URL as a literal route, and every new one the engine added published the
+  edge's own page in silence. `private` keeps its meaning (it still answers `/robots.txt` and hides
+  `/.well-known/synsema-auth`). `/.well-known/attestation` is identity, not discovery: under
+  `--attested` it is still served and a route still cannot take it. Under `--attested`, a literal
+  route on a reserved URL is still a load error (a `GET /*path` does receive them).
+  `synsema openapi` still describes the routes: it is an offline tool you ask for.
+- **Types on task parameters: `task estado(id: text, items: bool = false)`.** The same five types as
+  `expect body` (`text`, `number`, `bool`, `list`, `map`); an unknown type, or a literal default of
+  another type, is a load error. They are metadata, checked only where arguments arrive as data:
+  `call(task, map)` and `call_tool(task, map)` reject a value of the wrong type or a missing typed
+  parameter without a default (`call_tool(add): 'a' must be number, got text`), strictly, without
+  converting; a normal call does not check them and costs nothing. A secret counts as `text`.
+  - `tool_spec(task, describe)` builds the `llm_step` catalog entry from the signature
+    (`{name, describe, params: ["a: number", …], optional: [...]}`), so the catalog is no longer
+    written by hand. A catalog parameter can be `"name: type"`, and `optional` takes names out of
+    `required`. The hosted providers (Anthropic, OpenAI-compatible) send each declared type in the
+    tool's JSON Schema; the `local` provider lists them in its prompt (`a (number)`,
+    `[optional]`). An argument the model returns for a typed parameter comes back with its type when
+    it decodes to that type (`2` and `"2"` both give the number 2; an argument for a `text`
+    parameter stays text); one that does not decode stays text and `call_tool` rejects it. A `null`
+    for an optional parameter, or for a typed one other than `text`, counts as not passed (the
+    default runs, or `call_tool` says it is missing). The model's JSON `null` and the text `"null"`
+    arrive the same, so `"null"` for an optional `text` parameter also runs the default. From the
+    program, `call_tool(f, {"n": nothing})` is still an error unless the default is `nothing`. Before, every argument arrived as text;
+    parameters without a type still do. A parameter whose default is `nothing` accepts `nothing`
+    in `call` and `call_tool`, and its `input_schema` has no `default`.
+  - `synsema code outline --json` publishes, per task, `parameters` (name, type, required, literal
+    default) and `input_schema` (the signature as JSON Schema); `params` is unchanged.
 
 ## v0.6.45 — 2026-10-20
 

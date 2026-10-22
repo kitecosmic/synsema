@@ -54,6 +54,9 @@ pub const NAME_REFLEXES: &[(&str, &str)] = &[
     ("console", "print(x)"),
     ("json", "json_encode(x) / json_decode(text)"),
     ("math", "the math functions are builtins: sqrt(x), floor(x), pi"),
+    // v0.6.46 (C2): `log(x)` es el logaritmo natural en Python/JS/C; acá `log` es la sentencia
+    // (`log "mensaje"`), y usado como función no existe.
+    ("log", "ln(x) for the natural log, log10(x), log2(x) or log_base(x, b); `log \"message\"` (no parentheses) writes a log line"),
     // pandas
     ("dropna", "drop_missing(rows)"),
     ("fillna", "fill_missing(rows, value)"),

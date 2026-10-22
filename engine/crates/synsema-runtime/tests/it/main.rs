@@ -54,5 +54,7 @@ mod v0645_http_named_args_e2e;
 mod v0645_partial_write_e2e;
 mod v0645_select_reset_e2e;
 mod v0645_state_atomic_e2e;
+mod v0646_tanda_c;
+mod v0646_f1;
 mod webauth_e2e;
 mod webpush_e2e;

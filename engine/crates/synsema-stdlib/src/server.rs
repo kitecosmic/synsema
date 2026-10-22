@@ -33,6 +33,7 @@ use hyper::service::service_fn;
 use hyper::{Request, Response};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 
+use synsema_capabilities::model::{Capability, CapabilityType};
 use synsema_core::interpreter::CancelToken;
 use synsema_core::route_meta::ApiRoute;
 use synsema_core::types::{ServerValue, SynValue};
@@ -295,6 +296,9 @@ pub struct StaticMountSpec {
     /// Archivo relativo al mount servido con 200 cuando el path no existe
     /// (history-fallback de SPA, estilo `try_files ... /index.html`).
     pub fallback: Option<String>,
+    /// v0.6.46: los `deny` de lectura del programa. Un archivo del árbol que alcanzan es un 404,
+    /// como en `grep` (antes sólo se pedía el grant de `<dir>/**` y el `deny` de adentro no valía).
+    pub deny: Vec<Capability>,
 }
 
 /// Traduce la spec de `cache "<...>"` a un valor de header `Cache-Control`.
@@ -336,6 +340,9 @@ struct Mount {
     /// binario lleva ese directorio adentro: el mount se sirve del bundle ANTES del disco
     /// (la misma regla de overlay que `read_file`/`render`). `None` = disco solamente.
     bundled: Option<String>,
+    /// v0.6.46: la carpeta como la escribió el programa (los `deny` se escriben así) y los `deny`.
+    dir: String,
+    deny: Vec<Capability>,
 }
 
 /// Tabla de ruteo de un host: rutas + estáticos + auth propios. El host `default`
@@ -370,7 +377,15 @@ impl HostRouter {
                     let key = synsema_core::bundle::normalize_name(&m.dir)?;
                     b.has_prefix(&key).then_some(key)
                 });
-                Mount { prefix: norm_prefix(&m.prefix), base: real, cache: m.cache, fallback: m.fallback, bundled }
+                Mount {
+                    prefix: norm_prefix(&m.prefix),
+                    base: real,
+                    cache: m.cache,
+                    fallback: m.fallback,
+                    bundled,
+                    dir: m.dir,
+                    deny: m.deny,
+                }
             })
             .collect();
         mounts.sort_by_key(|m| std::cmp::Reverse(m.prefix.len()));
@@ -455,7 +470,11 @@ impl HostRouter {
                             None => continue,
                         },
                     };
-                    let data = match read_within(base, &target) {
+                    let denies = !mount.deny.is_empty();
+                    if denies && static_denied(mount, &target) {
+                        continue;
+                    }
+                    let data = match read_within(base, &target, denies.then_some(mount)) {
                         Some(d) => d,
                         None => continue,
                     };
@@ -603,6 +622,10 @@ pub struct ServeRuntime {
     pub describe_version: Option<String>,
     /// `docs off` apaga la página `/docs` (el `/openapi.json` sigue publicado).
     pub docs_enabled: bool,
+    /// v0.6.46 (C5) — `discovery off` lo apaga: ninguna URL de discovery es especial (ni
+    /// `/robots.txt` ni `/.well-known/synsema-auth`), así un `GET /*path` las recibe como a las
+    /// demás. `/.well-known/attestation` no depende de esto.
+    pub discovery_enabled: bool,
     /// v0.6.20 — ruta de salud que pide el HOST (`SYNSEMA_HEALTH_PATH` o `--health`), no el
     /// programa: `GET <path>` responde `{ok, uptime_s, in_flight, engine}` sin auth ni rate
     /// limit y NO aparece en discovery. Sin la variable no existe: el servidor no inventa rutas.
@@ -713,6 +736,7 @@ impl ServeRuntime {
             trusted_proxies: Vec::new(),
             describe_version: None,
             docs_enabled: true,
+            discovery_enabled: true,
             health_path,
             attestation_json: None,
             card_signer: None,
@@ -1097,6 +1121,9 @@ impl ServeRuntime {
         headers: &[(String, String)],
         host: &HostRouter,
     ) -> Option<RawResponse> {
+        if !self.discovery_enabled {
+            return None;
+        }
         if path == "/llms.txt" && !self.private {
             return Some(RawResponse::text(self.llms_txt(host), "text/plain; charset=utf-8", 200));
         }
@@ -1487,7 +1514,7 @@ impl ServeRuntime {
         // (`GET /:lang` ya no se traga `/openapi.json`); una ruta literal declarada para
         // ellas sigue ganando (params vacíos → no entra acá). Con `private`/`docs off` la
         // superficie no existe y la ruta con parámetros la atiende como siempre.
-        if route_idx.is_some() && !params.is_empty() && RESERVED_PATHS.contains(&path) {
+        if route_idx.is_some() && !params.is_empty() && self.discovery_enabled && RESERVED_PATHS.contains(&path) {
             // Un estático real en ese path exacto sigue ganando (p. ej. un robots.txt propio),
             // exactamente como cuando no hay ruta con parámetros.
             if method == "GET" && !host.static_mounts.is_empty() {
@@ -1859,6 +1886,17 @@ fn norm_prefix(prefix: &str) -> String {
     format!("/{}/", prefix.trim_matches('/'))
 }
 
+/// v0.6.46: ¿un `deny` del programa alcanza este archivo del mount? Se juzga con la ruta como la
+/// escribiría el programa (`<dir>/<resto>`, por nombre) y en disco (un link a un lugar negado).
+#[cold]
+#[inline(never)]
+fn static_denied(mount: &Mount, target: &Path) -> bool {
+    let rest = target.strip_prefix(&mount.base).unwrap_or(target).to_string_lossy().replace('\\', "/");
+    let path = format!("{}/{}", mount.dir.trim_end_matches(['/', '\\']), rest.trim_start_matches('/'));
+    let c = Capability::new(CapabilityType::FileRead, Some(path));
+    mount.deny.iter().any(|d| d.covers_by_name(&c) || d.reaches_physically(&c))
+}
+
 fn within(base: &Path, target: &Path) -> bool {
     target == base || target.starts_with(base)
 }
@@ -1866,9 +1904,19 @@ fn within(base: &Path, target: &Path) -> bool {
 /// v0.6.46 (E8): lee `target` (ya resuelto adentro de `base` por `resolve_in`) sin ventana entre
 /// ese chequeo y la apertura: sin links en el camino se abre exactamente ese archivo, y con un link
 /// (uno que se cambió después de resolver) se juzga dónde quedó abierto.
-fn read_within(base: &Path, target: &Path) -> Option<Vec<u8>> {
+/// v0.6.46 (ronda 1 de cf1, B6): con `deny` en el mount (`denied`), donde quedó abierto también se
+/// juzga contra ellos: un link cambiado entre `static_denied` y la apertura que lleva adentro de la
+/// carpeta negada (sin salir de `base`) no sirve lo negado.
+fn read_within(base: &Path, target: &Path, denied: Option<&Mount>) -> Option<Vec<u8>> {
     use std::io::Read;
-    let inside = |real: &str| if within(base, Path::new(real)) { Ok(()) } else { Err(()) };
+    let inside = |real: &str| {
+        let real = Path::new(real);
+        if within(base, real) && !denied.is_some_and(|m| static_denied(m, real)) {
+            Ok(())
+        } else {
+            Err(())
+        }
+    };
     let mut f = synsema_capabilities::nofollow::open_checked(
         &target.to_string_lossy(),
         synsema_capabilities::nofollow::OpenFor::READ,
@@ -3989,6 +4037,13 @@ fn spill_dir() -> Option<PathBuf> {
                     return None;
                 };
                 *g = Some((d.clone(), id));
+                // v0.6.46: una vez por proceso, las carpetas de volcado que dejó un proceso que murió
+                // sin borrarlas (un kill o un corte): cada proceso arma una con otro nombre, así que
+                // nadie las reusaba y se acumulaban en el temporal.
+                static SWEPT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                if !SWEPT.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    sweep_spill_orphans(&std::env::temp_dir(), &d, id, SPILL_ORPHAN_AGE);
+                }
                 return Some(d);
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
@@ -3996,6 +4051,46 @@ fn spill_dir() -> Option<PathBuf> {
         }
     }
     None
+}
+
+/// Edad desde la que una carpeta de volcado ajena se toma por huérfana: ningún request dura un día.
+const SPILL_ORPHAN_AGE: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
+
+/// v0.6.46: borra las carpetas `synsema-spill-*` de `tmp` que dejaron procesos muertos. Sólo una
+/// carpeta de verdad (no un link) del mismo dueño y con el mismo modo que la nuestra (`dir_identity`;
+/// en Unix, `0700`), sin cambios hace más de `older_than`, y adentro sólo archivos comunes igual de
+/// viejos (un volcado en uso es reciente). Un proceso vivo cuya carpeta se borró arma otra
+/// (`spill_dir` verifica la identidad en cada volcado). Todo es al mejor esfuerzo: un error deja la
+/// carpeta como estaba.
+#[cold]
+#[inline(never)]
+fn sweep_spill_orphans(tmp: &std::path::Path, ours: &std::path::Path, ours_id: (u64, u64, u32), older_than: std::time::Duration) {
+    let old = |m: &std::fs::Metadata| m.modified().ok().and_then(|t| t.elapsed().ok()).is_some_and(|e| e >= older_than);
+    let Ok(rd) = std::fs::read_dir(tmp) else { return };
+    for e in rd.flatten().take(10_000) {
+        let path = e.path();
+        if path == ours || !e.file_name().to_string_lossy().starts_with("synsema-spill-") {
+            continue;
+        }
+        let Some(id) = dir_identity(&path) else { continue };
+        if id.2 != ours_id.2 {
+            continue;
+        }
+        let Ok(m) = std::fs::symlink_metadata(&path) else { continue };
+        if !old(&m) {
+            continue;
+        }
+        let Ok(inner) = std::fs::read_dir(&path) else { continue };
+        let files: Vec<_> = inner.flatten().take(10_000).collect();
+        let all_old_files = files.iter().all(|f| std::fs::symlink_metadata(f.path()).is_ok_and(|m| m.is_file() && old(&m)));
+        if !all_old_files {
+            continue;
+        }
+        for f in &files {
+            let _ = std::fs::remove_file(f.path());
+        }
+        let _ = std::fs::remove_dir(&path);
+    }
 }
 
 /// La identidad de una carpeta de verdad (no un link): en Unix (dispositivo, inodo, dueño), y sólo si
@@ -5071,6 +5166,7 @@ mod tests {
                 dir: dir.to_string_lossy().into_owned(),
                 cache: Some("public, max-age=60".to_string()),
                 fallback: Some("index.html".to_string()),
+                deny: Vec::new(),
             }],
             None,
             None,
@@ -5084,6 +5180,63 @@ mod tests {
         assert_eq!(r.status, 200);
         assert_eq!(r.body, b"SHELL");
         assert!(r.extra.iter().any(|(k, v)| k == "Cache-Control" && v == "public, max-age=60"));
+    }
+
+    #[test]
+    fn static_honours_a_deny_inside_the_tree() {
+        // v0.6.46 (backlog §10): el mount pedía `file.read("<dir>/**")` y nada más; un `deny` del
+        // host dentro del árbol (`<dir>/private/**`) no frenaba el archivo que pedía el cliente.
+        let dir = std::env::temp_dir().join(format!("syn_static_deny_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("private")).unwrap();
+        std::fs::write(dir.join("ok.txt"), b"OK").unwrap();
+        std::fs::write(dir.join("private").join("key.txt"), b"KEY").unwrap();
+        let d = dir.to_string_lossy().replace('\\', "/");
+        let mut rt = static_rt(&d);
+        let deny = Capability::new(CapabilityType::FileRead, Some(format!("{}/private/**", d)));
+        rt.default_host.static_mounts[0].deny = vec![deny];
+        assert_eq!(rt.default_host.serve_static_full("/ok.txt", &[]).expect("ok").body, b"OK");
+        assert!(rt.default_host.serve_static_full("/private/key.txt", &[]).is_none(), "lo negado es un 404");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// v0.6.46 (backlog §10): las carpetas de volcado de procesos muertos se borran; la propia, una
+    /// con un volcado reciente y lo que no es una carpeta de volcado, no.
+    #[test]
+    fn spill_orphans_are_swept() {
+        let tmp = std::env::temp_dir().join(format!("syn_spill_sweep_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let mk = |name: &str, file: Option<&str>| {
+            let d = tmp.join(name);
+            #[allow(unused_mut)] // `mut` sólo en Unix (`mode`)
+            let mut b = std::fs::DirBuilder::new();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt;
+                b.mode(0o700);
+            }
+            b.create(&d).unwrap();
+            if let Some(f) = file {
+                std::fs::write(d.join(f), b"x").unwrap();
+            }
+            d
+        };
+        let ours = mk("synsema-spill-ours", None);
+        let orphan = mk("synsema-spill-dead", Some("body-1"));
+        let other = mk("not-a-spill", Some("keep"));
+        let id = dir_identity(&ours).unwrap();
+        // Con edad cero todo lo ajeno cuenta como viejo.
+        sweep_spill_orphans(&tmp, &ours, id, std::time::Duration::ZERO);
+        assert!(!orphan.exists(), "la huérfana se borra");
+        assert!(ours.exists() && other.join("keep").exists(), "la propia y lo ajeno quedan");
+        // Con la edad de verdad, una recién usada no se toca.
+        let fresh = mk("synsema-spill-live", Some("body-2"));
+        let empty = mk("synsema-spill-just-made", None);
+        sweep_spill_orphans(&tmp, &ours, id, SPILL_ORPHAN_AGE);
+        assert!(fresh.join("body-2").exists(), "un volcado reciente queda");
+        assert!(empty.exists(), "una carpeta recién creada (vacía) queda");
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
@@ -5112,6 +5265,7 @@ mod tests {
                 dir: dir.to_string(),
                 cache: None,
                 fallback: None,
+                deny: Vec::new(),
             }],
             None,
             None,
@@ -5361,14 +5515,52 @@ mod tests {
         std::fs::write(d.join("afuera/a.css"), "SECRETO").unwrap();
         let base = d.join("public").canonicalize().unwrap();
         let target = resolve_in(&base, "css/a.css").unwrap();
-        assert_eq!(read_within(&base, &target).unwrap(), b"adentro");
+        assert_eq!(read_within(&base, &target, None).unwrap(), b"adentro");
         std::fs::remove_dir_all(d.join("public/css")).unwrap();
         link_dir(&d.join("afuera"), &d.join("public/css"));
-        assert!(read_within(&base, &target).is_none(), "sirvió lo de afuera");
+        assert!(read_within(&base, &target, None).is_none(), "sirvió lo de afuera");
         let _ = std::fs::remove_dir(d.join("public/css"));
         let _ = std::fs::remove_file(d.join("public/css"));
         link_dir(&d.join("public/otra"), &d.join("public/css"));
-        assert_eq!(read_within(&base, &target).unwrap(), b"otra");
+        assert_eq!(read_within(&base, &target, None).unwrap(), b"otra");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// v0.6.46 (ronda 1 de cf1, B6): un link cambiado después de `static_denied` hacia la carpeta
+    /// negada, sin salir del mount, no sirve lo negado.
+    #[cfg(any(target_os = "linux", windows))]
+    #[test]
+    fn static_deny_is_judged_where_it_opened() {
+        let d = std::env::temp_dir().join(format!("synsema-b6-static-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("css")).unwrap();
+        std::fs::create_dir_all(d.join("private")).unwrap();
+        std::fs::write(d.join("css/a.css"), "publico").unwrap();
+        std::fs::write(d.join("private/a.css"), "NEGADO").unwrap();
+        let dir = d.to_string_lossy().replace('\\', "/");
+        let mut rt = static_rt(&dir);
+        rt.default_host.static_mounts[0].deny =
+            vec![Capability::new(CapabilityType::FileRead, Some(format!("{}/private/**", dir)))];
+        let m = &rt.default_host.static_mounts[0];
+        let target = resolve_in(&m.base, "css/a.css").unwrap();
+        assert!(!static_denied(m, &target));
+        assert_eq!(read_within(&m.base, &target, Some(m)).unwrap(), b"publico");
+        // Entre el chequeo y la apertura, `css` pasa a ser un link a `private`.
+        std::fs::remove_dir_all(d.join("css")).unwrap();
+        #[cfg(windows)]
+        assert!(std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(d.join("css").to_string_lossy().replace('/', "\\"))
+            .arg(d.join("private").to_string_lossy().replace('/', "\\"))
+            .output()
+            .unwrap()
+            .status
+            .success());
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(d.join("private"), d.join("css")).unwrap();
+        assert!(read_within(&m.base, &target, Some(m)).is_none(), "sirvió lo negado");
+        let _ = std::fs::remove_dir(d.join("css"));
+        let _ = std::fs::remove_file(d.join("css"));
         let _ = std::fs::remove_dir_all(&d);
     }
 }

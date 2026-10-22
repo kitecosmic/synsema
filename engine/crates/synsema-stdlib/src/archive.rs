@@ -238,8 +238,17 @@ fn tar_create(caps: &Rc<RefCell<CapabilitySet>>, args: &[SynValue]) -> Result<Sy
 
 struct Extract {
     dest: PathBuf,
+    /// v0.6.46 (ronda 1 de cf1, N2): `dest` como lo escribió el programa: los `outputs` del recibo
+    /// nombran cada archivo así, igual que `write_file` (antes, la ruta normalizada y absoluta).
+    raw_dest: String,
     max_entries: u64,
     max_bytes: u64,
+}
+
+impl Extract {
+    fn as_written(&self, name: &str) -> String {
+        format!("{}/{}", self.raw_dest.trim_end_matches(['/', '\\']), name)
+    }
 }
 
 fn extract_args(args: &[SynValue], who: &str) -> Result<(Vec<u8>, Extract), Control> {
@@ -251,8 +260,8 @@ fn extract_args(args: &[SynValue], who: &str) -> Result<(Vec<u8>, Extract), Cont
         Some(other) => return Err(err(format!("{}: the archive must be bytes, got {}", who, other.type_name()))),
         None => unreachable!(),
     };
-    let dest = match args.get(1) {
-        Some(SynValue::Text(s)) if !s.trim().is_empty() => normalize_path(s.trim()),
+    let (dest, raw_dest) = match args.get(1) {
+        Some(SynValue::Text(s)) if !s.trim().is_empty() => (normalize_path(s.trim()), s.trim().to_string()),
         _ => return Err(err(format!("{}: dest must be a non-empty directory path", who))),
     };
     let opts = opts_arg(args.get(2), who, &["max_entries", "max_bytes"])?;
@@ -263,6 +272,7 @@ fn extract_args(args: &[SynValue], who: &str) -> Result<(Vec<u8>, Extract), Cont
         data,
         Extract {
             dest: PathBuf::from(dest),
+            raw_dest,
             max_entries: opt_limit(&opts, "max_entries", DEFAULT_MAX_ENTRIES, who)?,
             max_bytes: opt_limit(&opts, "max_bytes", DEFAULT_MAX_BYTES, who)?,
         },
@@ -319,7 +329,16 @@ fn refused(r: Refused<Control>, io: impl FnOnce(std::io::Error) -> String) -> Co
     }
 }
 
+/// Cada archivo que escribe una extracción (la ruta normalizada y los bytes), para los `outputs`
+/// del recibo (v0.6.46, C3).
+type Wrote<'a> = &'a mut dyn FnMut(&str, &[u8]);
+
+#[cfg(test)]
 fn zip_extract(caps: &Rc<RefCell<CapabilitySet>>, args: &[SynValue]) -> Result<SynValue, Control> {
+    zip_extract_to(caps, args, &mut |_, _| {})
+}
+
+fn zip_extract_to(caps: &Rc<RefCell<CapabilitySet>>, args: &[SynValue], wrote: Wrote) -> Result<SynValue, Control> {
     const F: &str = "zip_extract";
     let (data, x) = extract_args(args, F)?;
     let mut archive = zip::ZipArchive::new(Cursor::new(data)).map_err(|e| err(format!("{}: not a zip: {}", F, e)))?;
@@ -355,12 +374,18 @@ fn zip_extract(caps: &Rc<RefCell<CapabilitySet>>, args: &[SynValue]) -> Result<S
             continue;
         }
         write_entry(caps, &target, &buf, F)?;
+        wrote(&x.as_written(&name), &buf);
         written.push(syn_text(name));
     }
     Ok(syn_list(written))
 }
 
+#[cfg(test)]
 fn tar_extract(caps: &Rc<RefCell<CapabilitySet>>, args: &[SynValue]) -> Result<SynValue, Control> {
+    tar_extract_to(caps, args, &mut |_, _| {})
+}
+
+fn tar_extract_to(caps: &Rc<RefCell<CapabilitySet>>, args: &[SynValue], wrote: Wrote) -> Result<SynValue, Control> {
     const F: &str = "tar_extract";
     let (data, x) = extract_args(args, F)?;
     let raw: Vec<u8> = if data.len() >= 2 && data[0] == 0x1f && data[1] == 0x8b {
@@ -416,6 +441,7 @@ fn tar_extract(caps: &Rc<RefCell<CapabilitySet>>, args: &[SynValue]) -> Result<S
             std::fs::create_dir_all(&target).map_err(|e| err(format!("{}: {}: {}", F, target.display(), e)))?;
         } else {
             write_entry(caps, &target, &buf, F)?;
+            wrote(&x.as_written(&name), &buf);
             written.push(syn_text(name));
         }
     }
@@ -429,13 +455,21 @@ pub fn register_archive_builtins(interp: &Interpreter, caps: Rc<RefCell<Capabili
     }
     {
         let caps = caps.clone();
-        interp.register_builtin("zip_extract", -1, Rc::new(move |_i, a, _l| zip_extract(&caps, a)));
+        interp.register_builtin(
+            "zip_extract",
+            -1,
+            Rc::new(move |i, a, _l| zip_extract_to(&caps, a, &mut |p, d| i.record_output("zip_extract", p, d, "bytes"))),
+        );
     }
     {
         let caps = caps.clone();
         interp.register_builtin("tar_create", -1, Rc::new(move |_i, a, _l| tar_create(&caps, a)));
     }
-    interp.register_builtin("tar_extract", -1, Rc::new(move |_i, a, _l| tar_extract(&caps, a)));
+    interp.register_builtin(
+        "tar_extract",
+        -1,
+        Rc::new(move |i, a, _l| tar_extract_to(&caps, a, &mut |p, d| i.record_output("tar_extract", p, d, "bytes"))),
+    );
 }
 
 #[cfg(test)]

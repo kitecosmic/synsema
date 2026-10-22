@@ -227,6 +227,7 @@ fn every_effectful_family_is_a_label_sink() {
     for (family, names) in [
         ("filesystem", pure::FS),
         ("archive", pure::ARCHIVE),
+        ("parquet from disk", pure::PARQUET_FS),
         ("exec", pure::EXEC),
         ("sockets", pure::SOCKETS),
         ("database", pure::DB),

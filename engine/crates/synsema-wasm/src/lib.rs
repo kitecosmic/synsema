@@ -383,28 +383,29 @@ pub struct HostMemoryCtx {
     pub progress: Arc<Mutex<ProgressManager>>,
 }
 
-/// Abre (carga) la memoria declarada desde el KV del host. `None` si el programa no
-/// declara memoria o el host no ofrece `kv` (entonces la familia falla con el gate).
-fn open_host_memory(name: &str, host: Option<&Rc<dyn HostProvider>>) -> Option<HostMemoryCtx> {
-    let host = host?;
+/// Abre (carga) la memoria declarada desde el KV del host. `Ok(None)` si el host no ofrece `kv`
+/// (entonces la familia falla con el gate). v0.6.46: `Err` si una lectura falló: la memoria no se
+/// abre (cargarla vacía hacía que la próxima escritura pisara la guardada) y el gate lo dice.
+fn open_host_memory(name: &str, host: Option<&Rc<dyn HostProvider>>) -> Result<Option<HostMemoryCtx>, String> {
+    let Some(host) = host else { return Ok(None) };
     if !host.offers("kv") {
-        return None;
+        return Ok(None);
     }
     let ns = memory_namespace(name);
     let mut mem = AgentMemory::new();
     mem.backend = Some("host-kv".to_string());
-    if let Some(Some(json)) = host.kv_get(&ns, "memory") {
-        mem.load_json(&json);
+    if let Some(Some(json)) = host.kv_get(&ns, "memory").transpose().map_err(|e| format!("the host's kv.get failed: {}", e))? {
+        mem.try_load_json(&json).map_err(|e| format!("the stored memory is not readable ({})", e))?;
     }
     let mut prog = ProgressManager::new();
-    if let Some(Some(json)) = host.kv_get(&ns, "progress") {
-        prog.load_json(&json);
+    if let Some(Some(json)) = host.kv_get(&ns, "progress").transpose().map_err(|e| format!("the host's kv.get failed: {}", e))? {
+        prog.try_load_json(&json).map_err(|e| format!("the stored progress is not readable ({})", e))?;
     }
-    Some(HostMemoryCtx {
+    Ok(Some(HostMemoryCtx {
         name: name.to_string(),
         memory: Arc::new(Mutex::new(mem)),
         progress: Arc::new(Mutex::new(prog)),
-    })
+    }))
 }
 
 fn kv_write(ns: &str, key: &str, value: &str) {
@@ -497,6 +498,7 @@ pub fn wire_pure(interp: &mut Interpreter, caps: &Rc<RefCell<CapabilitySet>>, ct
     synsema_stdlib::webauth::register_webauth_builtins(interp, caps.clone());
     synsema_stdlib::webauthn::register_webauthn_builtins(interp);
     synsema_stdlib::canonical::register_canonical_builtins(interp);
+    synsema_stdlib::tools::register_tool_builtins(interp);
     synsema_stdlib::didkey::register_didkey_builtins(interp);
     synsema_stdlib::integrity::register_integrity_builtins(interp, caps.clone());
     synsema_stdlib::receipt::register_receipt_builtins(interp, caps.clone());
@@ -604,6 +606,11 @@ pub fn wire_pure(interp: &mut Interpreter, caps: &Rc<RefCell<CapabilitySet>>, ct
         }
     };
     let suggest = suggested_memory_name(ctx.filename);
+    let opened = declared.as_ref().map(|n| open_host_memory(n, host.as_ref()));
+    let load_err: Option<String> = match &opened {
+        Some(Err(e)) => Some(e.clone()),
+        _ => None,
+    };
     let gate: MemoryGate = match &declared {
         None => Rc::new(move || {
             Err(RuntimeError::new(format!(
@@ -626,6 +633,12 @@ pub fn wire_pure(interp: &mut Interpreter, caps: &Rc<RefCell<CapabilitySet>>, ct
                         name
                     )));
                 }
+                if let Some(e) = &load_err {
+                    return Err(RuntimeError::new(format!(
+                        "memory \"{}\" could not be loaded ({}); nothing was loaded, so nothing is written over it",
+                        name, e
+                    )));
+                }
                 Ok(())
             })
         }
@@ -637,7 +650,7 @@ pub fn wire_pure(interp: &mut Interpreter, caps: &Rc<RefCell<CapabilitySet>>, ct
         gate.clone(),
     );
     if let Some(name) = &declared {
-        if let Some(mctx) = open_host_memory(name, host.as_ref()) {
+        if let Some(Ok(Some(mctx))) = opened {
             let ns = memory_namespace(name);
             let ns_m = ns.clone();
             let on_write_mem: Arc<dyn Fn(&AgentMemory) + Send + Sync> =
@@ -809,13 +822,20 @@ fn register_state_builtins(interp: &Interpreter, host_kv: bool) {
     const NS: &str = "state";
     let local: synsema_core::types::MapRef = SynMap::new().into_ref();
 
-    fn load(host_kv: bool, local: &synsema_core::types::MapRef, key: &str) -> Option<SynValue> {
+    fn load(host_kv: bool, local: &synsema_core::types::MapRef, key: &str, who: &str) -> Result<Option<SynValue>, Control> {
         if host_kv {
-            let raw = hostcap::provider().and_then(|p| p.kv_get(NS, key)).flatten()?;
-            let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
-            Some(json_to_syn(&v))
+            let raw = match hostcap::provider() {
+                Some(p) => raw_of(&p, key, who)?,
+                None => None,
+            };
+            // v0.6.46 (ronda 2 de cf1, R2-B3): un valor guardado que no es JSON no es "no está": se
+            // pisaba (`state_incr` sobre un texto suelto daba 1).
+            match raw {
+                None => Ok(None),
+                Some(_) => value_of(&raw, key, who).map(Some),
+            }
         } else {
-            local.borrow().get(key).cloned()
+            Ok(local.borrow().get(key).cloned())
         }
     }
     fn store(host_kv: bool, local: &synsema_core::types::MapRef, key: &str, v: &SynValue) {
@@ -845,7 +865,7 @@ fn register_state_builtins(interp: &Interpreter, host_kv: bool) {
         let l = local.clone();
         interp.register_builtin("state_get", -1, Rc::new(move |_i, args, _l| {
             let key = key_arg(args, "state_get")?;
-            Ok(load(host_kv, &l, &key).unwrap_or_else(|| args.get(1).cloned().unwrap_or(SynValue::Nothing)))
+            Ok(load(host_kv, &l, &key, "state_get")?.unwrap_or_else(|| args.get(1).cloned().unwrap_or(SynValue::Nothing)))
         }));
     }
     {
@@ -857,7 +877,7 @@ fn register_state_builtins(interp: &Interpreter, host_kv: bool) {
                 Some(SynValue::Number(n)) => n.clone(),
                 _ => Number::Int(1),
             };
-            let current = match load(host_kv, &l, &key) {
+            let current = match load(host_kv, &l, &key, "state_incr")? {
                 Some(SynValue::Number(n)) => n,
                 _ => Number::Int(0),
             };
@@ -891,8 +911,13 @@ fn register_state_builtins(interp: &Interpreter, host_kv: bool) {
             let mut map = SynMap::new();
             if host_kv {
                 if let Some(p) = hostcap::provider() {
-                    for k in p.kv_list(NS).unwrap_or_default() {
-                        if let Some(v) = load(true, &l, &k) {
+                    let keys = match p.kv_list(NS) {
+                        Some(Err(e)) => return Err(rt_err(&format!("state_all: host kv.list failed: {}", e))),
+                        Some(Ok(keys)) => keys,
+                        None => Vec::new(),
+                    };
+                    for k in keys {
+                        if let Some(v) = load(true, &l, &k, "state_all")? {
                             map.insert(k, v);
                         }
                     }
@@ -920,14 +945,24 @@ fn register_state_builtins(interp: &Interpreter, host_kv: bool) {
             ))),
         }
     }
-    fn raw_of(p: &Rc<dyn HostProvider>, key: &str) -> Option<String> {
-        p.kv_get(NS, key).flatten()
+    /// v0.6.46: una lectura que falla es un error de la operación (antes, `nothing`).
+    fn raw_of(p: &Rc<dyn HostProvider>, key: &str, who: &str) -> Result<Option<String>, Control> {
+        match p.kv_get(NS, key) {
+            Some(Err(e)) => Err(rt_err(&format!("{}: host kv.get failed: {}", who, e))),
+            Some(Ok(v)) => Ok(v),
+            None => Ok(None),
+        }
     }
-    fn value_of(raw: &Option<String>) -> SynValue {
-        raw.as_deref()
-            .and_then(|r| serde_json::from_str::<serde_json::Value>(r).ok())
-            .map(|v| json_to_syn(&v))
-            .unwrap_or(SynValue::Nothing)
+    /// v0.6.46 (ronda 2 de cf1, R2-B3): un texto que no es JSON es error, no `nothing` (que
+    /// `state_update` o un `state_cas(k, nothing, ..)` lo pisaran).
+    fn value_of(raw: &Option<String>, key: &str, who: &str) -> Result<SynValue, Control> {
+        match raw.as_deref() {
+            None => Ok(SynValue::Nothing),
+            Some(r) => match serde_json::from_str::<serde_json::Value>(r) {
+                Ok(v) => Ok(json_to_syn(&v)),
+                Err(e) => Err(rt_err(&format!("{}: the stored value of '{}' is not JSON ({})", who, key, e))),
+            },
+        }
     }
     fn merged(who: &str, key: &str, current: &SynValue, patch: &synsema_core::types::MapRef) -> Result<SynValue, Control> {
         let mut out = SynMap::new();
@@ -970,8 +1005,8 @@ fn register_state_builtins(interp: &Interpreter, host_kv: bool) {
             }
             let p = host_cas(F)?;
             for _ in 0..CAS_ATTEMPTS {
-                let raw = raw_of(&p, &key);
-                let v = merged(F, &key, &value_of(&raw), &patch)?;
+                let raw = raw_of(&p, &key, F)?;
+                let v = merged(F, &key, &value_of(&raw, &key, F)?, &patch)?;
                 match p.kv_cas(NS, &key, raw.as_deref(), &dumps_syn(&v)) {
                     Some(Ok(true)) => return Ok(v),
                     Some(Ok(false)) => continue,
@@ -1002,8 +1037,8 @@ fn register_state_builtins(interp: &Interpreter, host_kv: bool) {
             // Igualdad del LENGUAJE (`2.0 == 2`): se compara el valor leído y se escribe con `cas`
             // contra el texto EXACTO que se leyó; si otro escribió en el medio, se vuelve a leer.
             for _ in 0..CAS_ATTEMPTS {
-                let raw = raw_of(&p, &key);
-                if !value_of(&raw).syn_equals(&expected) {
+                let raw = raw_of(&p, &key, F)?;
+                if !value_of(&raw, &key, F)?.syn_equals(&expected) {
                     return Ok(SynValue::Bool(false));
                 }
                 match p.kv_cas(NS, &key, raw.as_deref(), &dumps_syn(&new)) {

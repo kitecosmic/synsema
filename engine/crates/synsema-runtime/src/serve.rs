@@ -2317,7 +2317,7 @@ fn resolve_timeout(interp: &mut Interpreter, env: &Rc<RefCell<Environment>>, cla
     }
 }
 
-fn validate_route_templates(routes_n: &[Node]) -> Result<(), Control> {
+fn validate_route_templates(interp: &Interpreter, routes_n: &[Node]) -> Result<(), Control> {
     use synsema_core::ast::NodeKind as NK;
     for r in routes_n {
         let mut err: Option<String> = None;
@@ -2330,13 +2330,24 @@ fn validate_route_templates(routes_n: &[Node]) -> Result<(), Control> {
                     if let Some(first) = arguments.first() {
                         if first.name.is_none() {
                             if let NK::TextLiteral { value } = &first.value.kind {
-                                if let Err(e) =
-                                    synsema_core::templates::validate_template(value)
-                                {
-                                    err = Some(format!(
-                                        "template validation failed for render(\"{}\"): {}",
-                                        value, e
-                                    ));
+                                match synsema_core::templates::validate_template_gated(value, interp) {
+                                    Err(e) => {
+                                        err = Some(format!(
+                                            "template validation failed for render(\"{}\"): {}",
+                                            value, e
+                                        ))
+                                    }
+                                    // v0.6.46 (ronda 1 de cf1, M3): lo que esta corrida todavía no
+                                    // puede leer (un `require` dentro de la ruta) se chequea al
+                                    // renderizar; se avisa una vez, sin leerlo.
+                                    Ok(skipped) => {
+                                        for (tpl, why) in skipped {
+                                            eprintln!(
+                                                "note: render(\"{}\"): \"{}\" is not checked at startup ({}); render() checks it when the route runs",
+                                                value, tpl, why
+                                            );
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -2366,6 +2377,15 @@ fn gate_tls_pem(caps: &Rc<RefCell<CapabilitySet>>, raw: &str) -> Result<String, 
     Ok(path)
 }
 
+/// v0.6.46: el `deny` que alcanza la carpeta entera de un `static` (la carpeta, o `<dir>/**`).
+/// `<dir>/**` se mira sólo por nombre: como ruta tiene un glob, en disco no se resuelve.
+fn static_root_denied<'a>(dir: &str, denied: &'a [Capability]) -> Option<&'a Capability> {
+    let dir = dir.trim_end_matches(['/', '\\']);
+    let root = Capability::new(CapabilityType::FileRead, Some(dir.to_string()));
+    let tree = Capability::new(CapabilityType::FileRead, Some(format!("{}/**", dir)));
+    denied.iter().find(|d| d.covers_by_name(&root) || d.reaches_physically(&root) || d.covers_by_name(&tree))
+}
+
 fn build_host_table(
     interp: &mut Interpreter,
     env: &Rc<RefCell<synsema_core::interpreter::Environment>>,
@@ -2376,6 +2396,7 @@ fn build_host_table(
     block_limit: Option<(i64, f64)>,
     snapshot: &Arc<Vec<(String, GlobalVal)>>,
     caps_snap: &Arc<Vec<Capability>>,
+    denied_snap: &[Capability],
     rules_snap: &Arc<Vec<OwnerRule>>,
     shared_memory: &SharedMemoryStore,
     on_write: &OnWriteFn,
@@ -2390,7 +2411,7 @@ fn build_host_table(
     mem_name: &Option<crate::engine::MemName>,
 ) -> Result<HostTable, Control> {
     // Templates literales de las rutas: validados al construir el serve (fail-fast).
-    validate_route_templates(routes_n)?;
+    validate_route_templates(interp, routes_n)?;
 
     // -- static mounts (dedup por prefijo; cache/fallback validados fail-fast) --
     let mut static_mounts: Vec<StaticMountSpec> = Vec::new();
@@ -2428,6 +2449,14 @@ fn build_host_table(
                         prefix_str, dir, scope
                     ))));
                 }
+                // v0.6.46: un `deny` que alcanza la carpeta entera deja el mount sin nada que servir:
+                // se dice al arrancar. Uno de adentro se mira por request (`server::static_denied`).
+                if let Some(d) = static_root_denied(&dir, denied_snap) {
+                    return Err(Control::Error(RuntimeError::new(format!(
+                        "static \"{}\" from \"{}\": this run denies reading that folder (deny {}, set by the host); serve another folder",
+                        prefix_str, dir, d
+                    ))));
+                }
             }
             // `cache "<spec>"` → valor Cache-Control, validado ACÁ (arranque), nunca
             // en un request.
@@ -2461,6 +2490,7 @@ fn build_host_table(
                 dir,
                 cache: cache_val,
                 fallback: fallback_val,
+                deny: if bundled { Vec::new() } else { denied_snap.to_vec() },
             });
         }
     }
@@ -2738,7 +2768,7 @@ fn build_host_table(
                 for (k, v) in m.borrow().iter() {
                     if k.starts_with("_route_handler_") {
                         if let SynValue::Task(t) = v {
-                            validate_route_templates(&t.body)?;
+                            validate_route_templates(interp, &t.body)?;
                         }
                     }
                 }
@@ -3205,6 +3235,7 @@ fn make_serve_hook(
             describe_n,
             private,
             docs_off,
+            discovery_off,
             routes_n,
             tls_cert_n,
             tls_key_n,
@@ -3228,6 +3259,7 @@ fn make_serve_hook(
                 describe,
                 private,
                 docs_off,
+                discovery_off,
                 routes,
                 tls_cert,
                 tls_key,
@@ -3250,6 +3282,7 @@ fn make_serve_hook(
                 describe.as_deref(),
                 *private,
                 *docs_off,
+                *discovery_off,
                 routes,
                 tls_cert.as_deref(),
                 tls_key.as_deref(),
@@ -3394,6 +3427,8 @@ fn make_serve_hook(
         // su intérprete fresco (los grants no cruzan hilos vía `Rc`).
         let caps_snap: Arc<Vec<Capability>> =
             Arc::new(caps.borrow().granted.iter().cloned().collect());
+        // v0.6.46: los `deny` también, para los mounts de `static` (el archivo lo elige el cliente).
+        let denied_snap: Vec<Capability> = caps.borrow().denied_snapshot();
         // Snapshot de las reglas declaradas en el top-level con `add_rule`. Se clona
         // una vez aquí (el top-level ya corrió completo) y se pre-popula en el
         // agentMemory de cada intérprete de request, para que check_rules/get_rules
@@ -3446,6 +3481,7 @@ fn make_serve_hook(
             block_limit,
             &snapshot,
             &caps_snap,
+            &denied_snap,
             &rules_snap,
             &shared_memory,
             &on_write,
@@ -3557,6 +3593,7 @@ fn make_serve_hook(
                     block_limit,
                     &snapshot,
                     &caps_snap,
+                    &denied_snap,
                     &rules_snap,
                     &shared_memory,
                     &on_write,
@@ -3842,6 +3879,7 @@ fn make_serve_hook(
         runtime.trusted_proxies = trusted;
         runtime.describe_version = describe_version;
         runtime.docs_enabled = !docs_off;
+        runtime.discovery_enabled = !discovery_off;
         // `errors with <task>`: páginas de error propias (401/404/405/500).
         if let Some(h) = error_handler {
             runtime.set_error_handler(h);
@@ -4437,6 +4475,17 @@ pub fn run_serve_program_with_overrides(
 mod tests {
     use super::*;
     use synsema_stdlib::secrets::EnvStore;
+
+    /// v0.6.46 (backlog §10): un `deny` del host en la raíz de un `static` (o en todo su árbol)
+    /// arrancaba igual y servía la carpeta; uno de adentro no frena el arranque.
+    #[test]
+    fn a_deny_on_the_static_root_stops_the_start() {
+        let fr = |p: &str| Capability::new(CapabilityType::FileRead, Some(p.to_string()));
+        assert!(static_root_denied("./www/", &[fr("./www")]).is_some());
+        assert!(static_root_denied("./www", &[fr("./www/**")]).is_some());
+        assert!(static_root_denied("./www", &[fr("./www/private/**")]).is_none());
+        assert!(static_root_denied("./www", &[]).is_none());
+    }
 
     /// R2.5: el código no se copia por worker. Una task (y una lambda guardada en una global)
     /// reconstruida desde la foto usa EL MISMO cuerpo que la del proceso que la definió.

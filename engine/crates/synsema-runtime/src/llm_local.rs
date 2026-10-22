@@ -184,8 +184,25 @@ pub fn build_local_step_prompt(prompt: &str, context: &str, tools: &[ToolSpec]) 
         out.push_str(": ");
         out.push_str(&t.description);
         if !t.params.is_empty() {
+            // v0.6.46 (ronda 1 de cf1, N3): el tipo declarado y si es opcional, como lo ve un
+            // proveedor con JSON Schema (antes sólo los nombres).
+            let params: Vec<String> = t
+                .params
+                .iter()
+                .enumerate()
+                .map(|(i, p)| {
+                    let mut s = p.clone();
+                    if t.types.get(i).is_some_and(|ty| !ty.is_empty()) {
+                        s.push_str(&format!(" ({})", t.schema_type(i)));
+                    }
+                    if t.optional.contains(p) {
+                        s.push_str(" [optional]");
+                    }
+                    s
+                })
+                .collect();
             out.push_str(" (parameters: ");
-            out.push_str(&t.params.join(", "));
+            out.push_str(&params.join(", "));
             out.push(')');
         }
         out.push('\n');
@@ -440,6 +457,7 @@ mod tests {
             name: name.to_string(),
             description: desc.to_string(),
             params: params.iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
         }
     }
 
@@ -457,6 +475,12 @@ mod tests {
         assert!(p.contains("get_weather") && p.contains("get the weather") && p.contains("city"));
         assert!(p.contains("send_mail") && p.contains("to, body"));
         assert!(p.contains("{\"tool\""), "debe exigir el formato JSON: {}", p);
+        // v0.6.46 (ronda 1 de cf1, N3): un catálogo tipado dice el tipo y lo opcional.
+        let mut typed = tool("add", "add two numbers", &["a", "b"]);
+        typed.types = vec!["number".to_string(), "number".to_string()];
+        typed.optional = vec!["b".to_string()];
+        let p = build_local_step_prompt("suma", "", &[typed]);
+        assert!(p.contains("a (number), b (number) [optional]"), "{}", p);
     }
 
     #[test]

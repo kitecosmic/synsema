@@ -419,17 +419,23 @@ impl AgentMemory {
     /// Carga el documento de `to_json` (idéntico a `load` pero desde texto). Sube el
     /// contador de ids para no reusar `mem_N`. Un JSON inválido se ignora (arranca vacío).
     pub fn load_json(&mut self, json: &str) {
-        if let Ok(p) = serde_json::from_str::<Persisted>(json) {
-            for (k, v) in p.entries {
-                if let Some(n) = k.strip_prefix("mem_").and_then(|n| n.parse::<u64>().ok()) {
-                    self.counter = self.counter.max(n);
-                }
-                self.entries.insert(k, v);
+        let _ = self.try_load_json(json);
+    }
+
+    /// v0.6.46 (ronda 2 de cf1, R2-B3): como `load_json`, pero dice si el texto no es una memoria
+    /// guardada (cortada, de otra cosa): quien la abre no la toma por vacía y no la pisa.
+    pub fn try_load_json(&mut self, json: &str) -> Result<(), String> {
+        let p = serde_json::from_str::<Persisted>(json).map_err(|e| e.to_string())?;
+        for (k, v) in p.entries {
+            if let Some(n) = k.strip_prefix("mem_").and_then(|n| n.parse::<u64>().ok()) {
+                self.counter = self.counter.max(n);
             }
-            for (k, v) in p.rules {
-                self.rules.insert(k, v);
-            }
+            self.entries.insert(k, v);
         }
+        for (k, v) in p.rules {
+            self.rules.insert(k, v);
+        }
+        Ok(())
     }
 
     fn persist(&self) {

@@ -1324,7 +1324,7 @@ pub fn module_walk(uses: Vec<String>, file_path: &str, load: SourceLoader<'_>) -
 /// crudos, relativos al working dir — las claves del bundle).
 pub fn template_closure(path: &str) -> Result<Vec<String>, String> {
     let mut seen = Vec::new();
-    validate_template_walk(path, 0, &mut seen)?;
+    validate_template_walk(path, 0, &mut seen, None, &mut Vec::new())?;
     Ok(seen)
 }
 
@@ -1332,11 +1332,36 @@ pub fn template_closure(path: &str) -> Result<Vec<String>, String> {
 /// Lo usa la validación al arranque de `serve` y `synsema check` — un typo en un
 /// `render("literal.html")` debe fallar ANTES del primer request.
 pub fn validate_template(path: &str) -> Result<(), String> {
-    validate_template_walk(path, 0, &mut Vec::new())
+    validate_template_walk(path, 0, &mut Vec::new(), None, &mut Vec::new())
 }
 
-fn validate_template_walk(path: &str, depth: usize, seen: &mut Vec<String>) -> Result<(), String> {
-    fn walk(path: &str, depth: usize, seen: &mut Vec<String>) -> Result<(), String> {
+/// v0.6.46: la validación de `serve` al arrancar, con el permiso de la corrida. Antes leía y
+/// parseaba cada template (y sus `include`/`layout`) del cwd sin `file.read`: el arranque leía lo
+/// que `render()` no habría podido. Ahora cada archivo pasa por el mismo gate que `render()`
+/// antes de abrirse (uno del bundle no lo pide). Ronda 1 de cf1 (M3): un rechazo NO es el error del
+/// arranque: el `require file.read` puede estar dentro de la ruta, y entonces vale recién en el
+/// request (en v0.6.45 eso arrancaba y respondía). Ese template (y lo que incluye) no se lee ni se
+/// valida acá: lo chequea `render()`. Devuelve `(template, por qué)` de cada uno que quedó sin ver.
+pub fn validate_template_gated(path: &str, interp: &Interpreter) -> Result<Vec<(String, String)>, String> {
+    let mut skipped = Vec::new();
+    validate_template_walk(path, 0, &mut Vec::new(), Some(interp), &mut skipped)?;
+    Ok(skipped)
+}
+
+fn validate_template_walk(
+    path: &str,
+    depth: usize,
+    seen: &mut Vec<String>,
+    gate: Option<&Interpreter>,
+    skipped: &mut Vec<(String, String)>,
+) -> Result<(), String> {
+    fn walk(
+        path: &str,
+        depth: usize,
+        seen: &mut Vec<String>,
+        gate: Option<&Interpreter>,
+        skipped: &mut Vec<(String, String)>,
+    ) -> Result<(), String> {
         if depth > 50 {
             return Err(format!("template nesting too deep ({})", path));
         }
@@ -1344,6 +1369,16 @@ fn validate_template_walk(path: &str, depth: usize, seen: &mut Vec<String>) -> R
             return Ok(());
         }
         seen.push(path.to_string());
+        if let Some(interp) = gate {
+            if let Err(c) = gate_nested_template(interp, path) {
+                let why = match c {
+                    Control::Error(e) => e.into_message(),
+                    _ => "template error".to_string(),
+                };
+                skipped.push((path.to_string(), why));
+                return Ok(());
+            }
+        }
         let target = resolve_template_path(path)?;
         let display = target
             .file_name()
@@ -1373,11 +1408,11 @@ fn validate_template_walk(path: &str, depth: usize, seen: &mut Vec<String>) -> R
         let mut children = Vec::new();
         refs(&tree, &mut children);
         for child in children {
-            walk(&child, depth + 1, seen)?;
+            walk(&child, depth + 1, seen, gate, skipped)?;
         }
         Ok(())
     }
-    walk(path, depth, seen)
+    walk(path, depth, seen, gate, skipped)
 }
 
 #[cfg(test)]

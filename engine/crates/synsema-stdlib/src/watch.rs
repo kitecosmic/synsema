@@ -69,6 +69,10 @@ pub struct WatchOpts {
     pub ignore: Vec<String>,
     pub max_entries: usize,
     pub max_queue: usize,
+    /// v0.6.46: lo que el programa no puede leer (un `deny` dentro del árbol). Una entrada que da
+    /// `true` no entra en la foto ni se recorre: sin esto, `deny file.read("src/secret")` no frenaba
+    /// los eventos de adentro. `None` sin ningún `deny` (no paga nada por entrada).
+    pub skip: Option<Arc<dyn Fn(&str) -> bool + Send + Sync>>,
 }
 
 impl Default for WatchOpts {
@@ -79,6 +83,7 @@ impl Default for WatchOpts {
             ignore: DEFAULT_IGNORE.iter().map(|s| s.to_string()).collect(),
             max_entries: DEFAULT_MAX_ENTRIES,
             max_queue: DEFAULT_MAX_QUEUE,
+            skip: None,
         }
     }
 }
@@ -250,6 +255,9 @@ fn snapshot(root: &Path, opts: &WatchOpts, out: &mut Snapshot) -> Result<(), Str
                 continue;
             }
             let p = e.path();
+            if opts.skip.as_ref().is_some_and(|f| f(&display_path(&p))) {
+                continue;
+            }
             // symlink_metadata: no seguir symlinks (un enlace a `/` haría explotar el
             // scan; un enlace a un archivo se ve como el enlace, no como el destino).
             let Ok(m) = std::fs::symlink_metadata(&p) else { continue };

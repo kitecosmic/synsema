@@ -205,6 +205,9 @@ fn generators_in(v: &SynValue, out: &mut Vec<Rc<synsema_core::interpreter::Built
 /// rearmaba su copia de las globales (`from_send`) y corría en el pool de tokio, que no espera a
 /// los `thread_local` de sus hilos.
 #[allow(clippy::too_many_arguments)]
+/// Lo que devuelve cada worker: el resultado, el estado final de sus generadores y su linaje.
+type WorkerOut = (SendValue, Vec<synsema_core::rng::Generator>, synsema_core::interpreter::LineageTaken);
+
 fn run_parallel(
     scope: ScopedFreeze,
     globals: Arc<Vec<(String, GlobalVal)>>,
@@ -220,7 +223,7 @@ fn run_parallel(
     subject: crate::subject::Subject,
     providers: crate::engine::WiredProviders,
     sealed: Option<(synsema_core::sealed::SharedLog, Option<String>)>,
-) -> Result<Vec<(SendValue, Vec<synsema_core::rng::Generator>)>, RuntimeError> {
+) -> Result<Vec<WorkerOut>, (RuntimeError, Vec<synsema_core::interpreter::LineageTaken>)> {
     let n = items.len();
     if n == 0 {
         return Ok(Vec::new());
@@ -229,7 +232,7 @@ fn run_parallel(
     let next = AtomicUsize::new(0);
     let aborted = AtomicBool::new(false);
     let error: Mutex<Option<(usize, RuntimeError)>> = Mutex::new(None);
-    let slots: Vec<Mutex<Option<(SendValue, Vec<synsema_core::rng::Generator>)>>> =
+    let slots: Vec<Mutex<Option<WorkerOut>>> =
         (0..n).map(|_| Mutex::new(None)).collect();
     // Lo que no es `Sync` (el contexto de memoria, el sujeto) se clona por hilo bajo un candado.
     let shared = Mutex::new((mem, subject));
@@ -271,9 +274,12 @@ fn run_parallel(
                     generators_in(&keep, &mut gens);
                     let states = gens.iter().filter_map(synsema_core::rng::snapshot).collect();
                     // El resultado vuelve como copia: nada de lo congelado sale del hilo.
-                    *slots[i].lock().unwrap() = Some((to_send(&v), states));
+                    *slots[i].lock().unwrap() = Some((to_send(&v), states, interp.take_lineage()));
                 }
                 Err(c) => {
+                    // v0.6.46 (ronda 2 de cf1, R2-B1): lo que este item leyó y escribió antes de fallar
+                    // también vuelve: el error no borra del recibo lo que ya quedó en disco.
+                    *slots[i].lock().unwrap() = Some((SendValue::Nothing, Vec::new(), interp.take_lineage()));
                     let re = control_to_error(c);
                     let mut e = error.lock().unwrap();
                     if e.as_ref().is_none_or(|(idx, _)| i < *idx) {
@@ -285,14 +291,15 @@ fn run_parallel(
         }
     });
     if let Err(e) = ran {
-        return Err(RuntimeError::new(format!("parallel_map: no se pudo crear un hilo: {}", e)));
+        return Err((RuntimeError::new(format!("parallel_map: no se pudo crear un hilo: {}", e)), Vec::new()));
     }
     if let Some((_, re)) = error.into_inner().unwrap() {
-        return Err(re);
+        let done = slots.into_iter().filter_map(|m| m.into_inner().unwrap()).map(|(_, _, l)| l).collect();
+        return Err((re, done));
     }
     Ok(slots
         .into_iter()
-        .map(|m| m.into_inner().unwrap().unwrap_or((SendValue::Nothing, Vec::new())))
+        .map(|m| m.into_inner().unwrap().unwrap_or_else(|| (SendValue::Nothing, Vec::new(), Default::default())))
         .collect())
 }
 
@@ -447,20 +454,30 @@ pub(crate) fn register_parallel_builtins(
                 crate::engine::wired_providers(i),
                 synsema_core::sealed::current().map(|log| (log, synsema_capabilities::secure::run_rng_fork())),
             ) {
-                Ok(results) => {
+                Ok(mut results) => {
+                    // v0.6.46 (ronda 1 de cf1, B2): lo que leyó y escribió cada worker entra en el
+                    // linaje del llamador, en el orden de los items (antes `receipt()` no lo veía).
+                    for r in results.iter_mut() {
+                        i.absorb_lineage(std::mem::take(&mut r.2));
+                    }
                     // Lo que cada worker avanzó de SUS generadores vuelve al padre (como con
                     // `apply`): `g` después de `parallel_map(w, [g])`, o los hijos de un
                     // `rng_spawn` usados otra vez, siguen la secuencia en vez de repetirla.
-                    for (item, (_, states)) in list.iter().zip(results.iter()) {
+                    for (item, (_, states, _)) in list.iter().zip(results.iter()) {
                         let mut gens = Vec::new();
                         generators_in(item, &mut gens);
                         for (b, g) in gens.iter().zip(states.iter()) {
                             synsema_core::rng::set_state(b, g.clone());
                         }
                     }
-                    Ok(syn_list(results.iter().map(|(v, _)| from_send(v)).collect()))
+                    Ok(syn_list(results.iter().map(|(v, _, _)| from_send(v)).collect()))
                 }
-                Err(re) => Err(Control::Error(re)),
+                Err((re, done)) => {
+                    for l in done {
+                        i.absorb_lineage(l);
+                    }
+                    Err(Control::Error(re))
+                }
             }
         }),
     );

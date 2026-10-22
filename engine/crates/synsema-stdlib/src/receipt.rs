@@ -190,10 +190,32 @@ pub fn build_receipt(
             syn_map(m)
         })
         .collect();
-    let truncated = inputs.len() >= synsema_core::interpreter::MAX_LINEAGE;
+    // v0.6.46 (ronda 1 de cf1, N1): truncado si se descartó algo, no por el largo.
+    let truncated = interp.lineage_truncated().0;
     subject.insert("inputs", syn_list(inputs));
     if truncated {
         subject.insert("inputs_truncated", SynValue::Bool(true));
+    }
+    // v0.6.46 (C3): y lo que ESCRIBIÓ (archivos), con el sha256 de los bytes escritos: un modelo
+    // entrenado y guardado queda en el recibo sin que el programa meta su hash a mano. Lo anota el
+    // builtin que escribe (`record_output`); `append_file` anota el pedazo agregado.
+    let outputs: Vec<SynValue> = interp
+        .outputs()
+        .iter()
+        .map(|e| {
+            let mut m = SynMap::new();
+            m.insert("source", syn_text(e.source.clone()));
+            m.insert("what", syn_text(e.what.clone()));
+            m.insert("sha256", syn_text(e.sha256.clone()));
+            m.insert("bytes", syn_int(e.bytes as i64));
+            m.insert("encoding", syn_text(e.encoding.clone()));
+            syn_map(m)
+        })
+        .collect();
+    let truncated = interp.lineage_truncated().1;
+    subject.insert("outputs", syn_list(outputs));
+    if truncated {
+        subject.insert("outputs_truncated", SynValue::Bool(true));
     }
     subject.insert(
         "program_sha".to_string(),
