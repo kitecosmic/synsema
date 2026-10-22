@@ -42,6 +42,46 @@ jobs:
       - name: Test
         run: cargo test --locked --manifest-path engine/Cargo.toml --workspace
 
+  # v0.6.46: guardia de rendimiento por instrucciones contra un ancla fija (engine/perf/guard.py).
+  # Falla si un programa del corpus, en cualquiera de los tres caminos del motor (nivel nativo, VM,
+  # tree-walker), pasa +0,2 % sobre `engine/perf/baseline.json`, y dice qué funciones crecieron. El
+  # ancla no es la versión anterior: así una suba chica que se repite release tras release se suma
+  # y se ve. Runner y toolchain fijos: con otra libc u otro compilador los números cambian, y
+  # cambiarlos es volver a medir el ancla (`--bless-from` con el artefacto, en un PR sin cambios
+  # del motor). Los símbolos quedan (`STRIP=none`, no cambia el código) para nombrar funciones.
+  perf-guard:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master 2026-09-12; toolchain pinned below and in rust-toolchain.toml
+        with:
+          toolchain: "1.96.0"
+      - name: Cache cargo
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            engine/target
+          key: ${{ runner.os }}-cargo-perf-${{ hashFiles('engine/Cargo.lock') }}
+      - name: Install valgrind
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq valgrind
+      - name: Build the core `run` (release, as published, with symbols)
+        env:
+          CARGO_PROFILE_RELEASE_STRIP: none
+        run: cargo build --locked --manifest-path engine/Cargo.toml -p synsema-jit --example run --release
+      - name: Instructions against the anchor
+        run: python3 engine/perf/guard.py --bin engine/target/release/examples/run --out perf.json
+      - name: Upload the measurements (for --bless-from)
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: perf-guard
+          path: perf.json
+          if-no-files-found: ignore
+
   # Escritorio: la única plataforma donde el CI corre el
   # motor REAL fuera de Linux. Cubre el riesgo "firma ad-hoc + bytes anexados" en Apple Silicon
   # (ld64 firma ad-hoc todo binario arm64 y el kernel mata los inválidos con "Killed: 9"): un

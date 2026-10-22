@@ -1,0 +1,6 @@
+-- el bench de Joel (medicion-memoria/bench.syn) a 2 M registros
+let n be 60000
+let datos be apply(range(1, n + 1), (i) => {"id": i, "valor": i * i})
+let suma be reduce(datos, (acc, r) => acc + r.valor, 0)
+print("elementos: " + text(length(datos)))
+print("check " + text(suma))

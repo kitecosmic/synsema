@@ -1,0 +1,6 @@
+let total be 0
+let i be 0
+while i < 200000
+    set total to total + i % 7
+    set i to i + 1
+print(total)

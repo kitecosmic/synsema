@@ -1,0 +1,12 @@
+let n be 48
+let a be apply(range(0, n), (i) => apply(range(0, n), (j) => float((i + j) % 7)))
+let b be apply(range(0, n), (i) => apply(range(0, n), (j) => float((i * j) % 5)))
+let total be 0.0
+each i in range(0, n)
+    let ai be a[i]
+    each j in range(0, n)
+        let s be 0.0
+        each k in range(0, n)
+            set s to s + ai[k] * b[k][j]
+        set total to total + s
+print("check " + text(total))

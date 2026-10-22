@@ -1,0 +1,8 @@
+-- 2 M palabras, 5003 distintas: conteo en un mapa de miles de claves
+let n be 100000
+let words be apply(range(0, n), (i) => "w" + text((i * 7919) % 5003))
+let doc be join(words, " ")
+let counts be {}
+each w in split(doc, " ")
+    set counts[w] to get(counts, w, 0) + 1
+print("check " + text(length(keys(counts)) * 1000000 + counts["w17"]))

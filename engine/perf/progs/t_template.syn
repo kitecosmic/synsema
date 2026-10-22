@@ -1,0 +1,5 @@
+let s be 0
+each i in range(60000)
+    let t be `i={i} x={i * 2} ok={true}`
+    set s to s + length(t)
+print(s)

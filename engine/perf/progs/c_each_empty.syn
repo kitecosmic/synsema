@@ -1,0 +1,4 @@
+let x be 0
+each i in range(0, 90000)
+    set x to 1
+print("ok")

@@ -1,0 +1,28 @@
+let n be 50
+task av(v)
+    let out be []
+    each i in range(0, n)
+        let s be 0.0
+        each j in range(0, n)
+            set s to s + v[j] / ((i + j) * (i + j + 1) / 2 + i + 1)
+        set out to append(out, s)
+    give out
+task atv(v)
+    let out be []
+    each i in range(0, n)
+        let s be 0.0
+        each j in range(0, n)
+            set s to s + v[j] / ((j + i) * (j + i + 1) / 2 + j + 1)
+        set out to append(out, s)
+    give out
+let u be apply(range(0, n), (i) => 1.0)
+let v be []
+each t in range(0, 10)
+    set v to atv(av(u))
+    set u to atv(av(v))
+let vbv be 0.0
+let vv be 0.0
+each i in range(0, n)
+    set vbv to vbv + u[i] * v[i]
+    set vv to vv + v[i] * v[i]
+print("check " + text(sqrt(vbv / vv)))

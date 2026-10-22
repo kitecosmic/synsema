@@ -1,0 +1,26 @@
+let g be 1
+each e0 in [1]
+    each e1 in [1]
+        each e2 in [1]
+            each e3 in [1]
+                each e4 in [1]
+                    each e5 in [1]
+                        each e6 in [1]
+                            each e7 in [1]
+                                each e8 in [1]
+                                    each e9 in [1]
+                                        each e10 in [1]
+                                            each e11 in [1]
+                                                each e12 in [1]
+                                                    each e13 in [1]
+                                                        each e14 in [1]
+                                                            each e15 in [1]
+                                                                let x be 0
+                                                                let i be 0
+                                                                while i < 90000
+                                                                    set x to g
+                                                                    set x to g
+                                                                    set x to g
+                                                                    set x to g
+                                                                    set i to i + 1
+print("ok")

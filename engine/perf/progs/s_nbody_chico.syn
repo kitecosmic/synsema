@@ -1,0 +1,54 @@
+-- nbody del benchmarks game, 200k pasos (2 M interacciones de pares); cuerpos como mapas
+let PI be 3.141592653589793
+let SOLAR_MASS be 4.0 * PI * PI
+let DPY be 365.24
+let bodies be [
+    {"x": 0.0, "y": 0.0, "z": 0.0, "vx": 0.0, "vy": 0.0, "vz": 0.0, "m": SOLAR_MASS},
+    {"x": 4.84143144246472090, "y": -1.16032004402742839, "z": -0.103622044471123109, "vx": 0.00166007664274403694 * DPY, "vy": 0.00769901118419740425 * DPY, "vz": -0.0000690460016972063023 * DPY, "m": 0.000954791938424326609 * SOLAR_MASS},
+    {"x": 8.34336671824457987, "y": 4.12479856412430479, "z": -0.403523417114321381, "vx": -0.00276742510726862411 * DPY, "vy": 0.00499852801234917238 * DPY, "vz": 0.0000230417297573763929 * DPY, "m": 0.000285885980666130812 * SOLAR_MASS},
+    {"x": 12.8943695621391310, "y": -15.1111514016986312, "z": -0.223307578892655734, "vx": 0.00296460137564761618 * DPY, "vy": 0.00237847173959480950 * DPY, "vz": -0.0000296589568540237556 * DPY, "m": 0.0000436624404335156298 * SOLAR_MASS},
+    {"x": 15.3796971148509165, "y": -25.9193146099879641, "z": 0.179258772950371181, "vx": 0.00268067772490389322 * DPY, "vy": 0.00162824170038242295 * DPY, "vz": -0.0000951592254519715870 * DPY, "m": 0.0000515138902046611451 * SOLAR_MASS}
+]
+let nb be length(bodies)
+let px be 0.0
+let py be 0.0
+let pz be 0.0
+each b in bodies
+    set px to px + b.vx * b.m
+    set py to py + b.vy * b.m
+    set pz to pz + b.vz * b.m
+set bodies[0].vx to 0.0 - px / SOLAR_MASS
+set bodies[0].vy to 0.0 - py / SOLAR_MASS
+set bodies[0].vz to 0.0 - pz / SOLAR_MASS
+let dt be 0.01
+each step in range(0, 1000)
+    each i in range(0, nb)
+        each j in range(i + 1, nb)
+            let dx be bodies[i].x - bodies[j].x
+            let dy be bodies[i].y - bodies[j].y
+            let dz be bodies[i].z - bodies[j].z
+            let d2 be dx * dx + dy * dy + dz * dz
+            let mag be dt / (d2 * sqrt(d2))
+            let mi be bodies[i].m * mag
+            let mj be bodies[j].m * mag
+            set bodies[i].vx to bodies[i].vx - dx * mj
+            set bodies[i].vy to bodies[i].vy - dy * mj
+            set bodies[i].vz to bodies[i].vz - dz * mj
+            set bodies[j].vx to bodies[j].vx + dx * mi
+            set bodies[j].vy to bodies[j].vy + dy * mi
+            set bodies[j].vz to bodies[j].vz + dz * mi
+    each i in range(0, nb)
+        set bodies[i].x to bodies[i].x + dt * bodies[i].vx
+        set bodies[i].y to bodies[i].y + dt * bodies[i].vy
+        set bodies[i].z to bodies[i].z + dt * bodies[i].vz
+let e be 0.0
+each i in range(0, nb)
+    let b be bodies[i]
+    set e to e + 0.5 * b.m * (b.vx * b.vx + b.vy * b.vy + b.vz * b.vz)
+    each j in range(i + 1, nb)
+        let c be bodies[j]
+        let dx be b.x - c.x
+        let dy be b.y - c.y
+        let dz be b.z - c.z
+        set e to e - b.m * c.m / sqrt(dx * dx + dy * dy + dz * dz)
+print("check " + text(e))
