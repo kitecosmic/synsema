@@ -373,8 +373,9 @@ jobs:
       # outside a closed set of eight. Rust's std links fd_*/path_*/poll_oneoff/sched_yield even
       # though the `stdout` ceiling (no_fs) never reaches them, so the built module is post-processed:
       # tools/wasi-stub replaces every import outside the set by a local stub returning ENOSYS
-      # (fd_prestat_get: EBADF, which ends std's preopen scan cleanly). From here on EVERY probe runs
-      # on the stubbed module — it is what the release publishes and what a kit embeds its app into.
+      # (fd_prestat_get: EBADF, which ends std's preopen scan cleanly; sched_yield: 0, nothing to
+      # yield to in one thread). From here on EVERY probe runs on the stubbed module — it is what
+      # the release publishes and what a kit embeds its app into.
       # The tool runs from the repo root on purpose: the guest's .cargo/config.toml would otherwise
       # cross-compile the tool itself to wasm32-wasip1.
       - name: Stub the WASI imports Vela v0.3.0 refuses (tools/wasi-stub)

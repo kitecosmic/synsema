@@ -8,25 +8,39 @@ Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the rele
 
 ## Unreleased
 
-**Built with Rust 1.99.1 (was 1.96.0).** The releases in between fix two miscompilations (MIR in
-1.96.1, vtables in 1.98.1). Binaries change, so the Vela guest's sha256 differs from v0.6.46 for
-the same source. With rustc 1.99.1, Rust's `std` also links two more WASI imports into the guest
-(`fd_seek`, `sched_yield`). `tools/wasi-stub` replaces them like the others, and the published
-module still declares only six imports, all inside Vela's eight. The new compiler also exposed a
-bug in the guest: comparing the app slot's header against the literal magic left a second copy of
-`SYNSEMA.APPSLOT1` in the module's data, and `tools/embed.syn`, `tools/verify.syn` and the probes,
-which require exactly one slot, refused the module. The guest now recognizes the header by a hash
-of the magic, so no optimizer can bring the literal back.
+**Built with Rust 1.99.1 (was 1.96.0).** The releases in between fix four miscompilations (MIR
+optimization in 1.96.1, an LLVM optimization in 1.97.1, vtables in 1.98.1, FFI `bool` returns on
+x86_64 in 1.99.1). The Vela guest's sha256 changes, as it does every release; the published module
+declares the same six WASI imports as v0.6.46, all inside Vela's eight (rustc 1.99.1 links two
+more, `fd_seek` and `sched_yield`, which `tools/wasi-stub` replaces like the others; `sched_yield`
+now returns success, since a single-threaded guest has nothing to yield to). The new compiler also
+exposed a latent bug in the guest, caught before any release: comparing the app slot's header
+against the literal magic left a second copy of `SYNSEMA.APPSLOT1` in the module's data, and
+`tools/embed.syn`, `tools/verify.syn` and the probes, which require exactly one slot, refused the
+module. The guest now recognizes the header by a hash of the magic, so no optimizer can bring the
+literal back. Guests published up to v0.6.46 are not affected.
 
-The compiler change costs speed outside the native tier. Instructions executed, measured against
-v0.6.46 (PGO, same programs):
-- native tier: −0.05 % to −0.27 % (`c_lit_txt5` +0.6 %);
-- the VM alone (`--jitless`, which is what WebAssembly and `serve --attested` run): +0.2 % to +2.3 %;
-- the tree-walker (what runs under `--labels`): +0.3 % to +2.7 %, and +9.5 % in a deep-recursion
-  benchmark.
+LLVM 23 compiles two of the interpreter's hottest paths with more instructions: the name lookup of
+the tree-walker (iterating the frame's two halves as one chained iterator) and the arithmetic path,
+where the array check (`array_binop`) is no longer inlined. Both are now written so that they do not
+depend on the inliner. The net cost against v0.6.46, in instructions executed on the 31 programs of
+the `perf-guard` corpus (deterministic, without PGO, as `perf-guard` measures, on x86-64):
+- native tier (the default): −1.9 % to +1.2 % (`s_csv` +1.2 %, the other text and data programs
+  at most +0.9 %);
+- the VM alone (`--jitless`, and WebAssembly without labels): −1.8 % to +1.4 % (`s_matrix_list`
+  +1.4 %, `s_csv` and `s_records` +0.9 %);
+- the tree-walker (`--labels`, `serve --attested`, the Vela guest, WebAssembly with
+  `labels: true`): −1.5 % to +1.2 %; 25 of the 31 programs run fewer instructions than in v0.6.46.
 
-Most of the tree-walker cost is in the linear name lookup, which LLVM 23 compiles worse. Times stay
-within noise. The `perf-guard` anchor was re-measured for the new toolchain.
+Release binaries are built with PGO, which shifts where the cost lands. On the same 31 programs:
+native tier −2.2 % to +3.0 % (`s_text_join`), the VM −1.0 % to +3.7 % (`c_depth16`; 30 of the 31
+run more instructions, median +2.3 %), the tree-walker −4.6 % to +1.9 % (`s_nbody_chico`). The new
+name lookup costs the VM 0.5 to 2.6 points (median 1.7), mainly through how LLVM allocates
+registers in the dispatch loop, and the native tier up to 1.8 where it falls back to the VM. The
+previous lookup gives that back but costs the tree-walker up to 13.7 points with PGO (`c_depth16`;
+median 0.8) and 3.7 without, so the new one stays. What was not recovered is tracked to be worked on
+again. The `perf-guard` anchor (`engine/perf/baseline.json`) was re-measured on CI with rustc 1.99.1
+in this same change, so it now measures against the new compiler.
 
 **The skill for coding agents moved to `skills/synsema/` and installs in any agent.** It was in
 `.synsema-skill/`, a hidden folder that only the Claude Code installer knew, and its `SKILL.md`

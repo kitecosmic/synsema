@@ -589,7 +589,14 @@ impl Bindings {
     fn find(&self, name: &str) -> Option<usize> {
         match &self.index {
             Some(ix) => ix.get(name).map(|&k| k as usize),
-            None => self.names.iter().position(|n| n.as_deref() == Some(name)),
+            None => {
+                let (inline, heap) = self.names.as_slices();
+                let is = |n: &Option<Arc<str>>| matches!(n, Some(s) if **s == *name);
+                match inline.iter().position(is) {
+                    Some(k) => Some(k),
+                    None => heap.iter().position(is).map(|k| inline.len() + k),
+                }
+            }
         }
     }
     #[inline]
@@ -7222,8 +7229,11 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
         // array⊕scalar. `*` es ELEMENTWISE (Hadamard), NO producto matricial (eso es
         // matmul/dot). Va DESPUÉS de los concats de Text/List/Bytes y de la rama Complex,
         // y ANTES del camino Number (G2: el tower no se perturba). `array_binop` devuelve
-        // none si ningún operando es array → sigue al camino normal.
-        if matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Pow | BinOp::FloorDiv | BinOp::Mod) {
+        // none si ningún operando es array → sigue al camino normal. El chequeo de array va acá y no
+        // sólo adentro: si LLVM no inlinea `array_binop` (rustc 1.99), cada suma pagaba la llamada.
+        if matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Pow | BinOp::FloorDiv | BinOp::Mod)
+            && (matches!(left, SynValue::Array(_)) || matches!(right, SynValue::Array(_)))
+        {
             if let Some(res) = crate::arrays::array_binop(&left, &right, op.as_str()) {
                 return res;
             }
@@ -13434,5 +13444,31 @@ mod secret_concat_tests {
         assert!(msg(secret_concat(&syn_secret_bytes("B", vec![0xff]), &syn_text("x"), &loc())).contains("secret(B): it holds bytes that are not UTF-8"));
         let sealed = SynValue::Secret(crate::types::Obj::new(SecretInner::new_bytes_sealed("attestation_key", vec![7u8; 32])));
         assert!(msg(secret_concat(&syn_text("x"), &sealed, &loc())).contains("secret(attestation_key): it is sealed"));
+    }
+}
+
+#[cfg(test)]
+mod bindings_find_tests {
+    use super::*;
+
+    /// `find` recorre dos tramos (en línea y heap) sin `Chain`: cada nombre tiene que caer en su
+    /// índice en los dos, antes de que exista el índice por hash (`INDEX_AT`) y después.
+    #[test]
+    fn every_name_is_found_at_its_slot_inline_heap_and_indexed() {
+        let mut b = Bindings::default();
+        for i in 0..INDEX_AT + 4 {
+            b.set(&format!("v{i}"), SynValue::Bool(i % 2 == 0));
+            for j in 0..=i {
+                assert_eq!(b.find(&format!("v{j}")), Some(j), "con {} nombres", i + 1);
+            }
+            assert_eq!(b.find("nadie"), None);
+            // un prefijo o un nombre más largo no es el mismo nombre
+            assert_eq!(b.find("v"), None);
+            assert_eq!(b.find(&format!("v{i}x")), None);
+        }
+        // el hueco que deja `remove` conserva su nombre y su índice
+        assert!(b.remove("v9").is_some());
+        assert_eq!(b.find("v9"), Some(9));
+        assert!(b.get("v9").is_none());
     }
 }

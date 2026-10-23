@@ -67,9 +67,9 @@ itself to wasm):
 ```sh
 cargo run --locked --manifest-path packages/guests/vela/tools/wasi-stub/Cargo.toml -- \
   engine/target/wasm32-wasip1/wasm/synsema_vela_guest.wasm engine/target/wasm32-wasip1/wasm/synsema_vela_guest.stubbed.wasm
-# wasi-stub: replaced (17): fd_close -> ENOSYS(52), … fd_prestat_get -> EBADF(8), … sched_yield -> ENOSYS(52)
+# wasi-stub: replaced (17): fd_close -> ENOSYS(52), … fd_prestat_get -> EBADF(8), … sched_yield -> SUCCESS(0)
 #   kept (6): clock_time_get, environ_get, environ_sizes_get, fd_write, proc_exit, random_get
-#   imports: 23 -> 6; bytes: 11137880 -> 10688788
+#   imports: 23 -> 6; bytes: 11138274 -> 10689144
 ```
 
 Then probe the stubbed module the way the Executor drives it: `node ../../../tests/vela_guest.probe.mjs <the stubbed .wasm>`
@@ -105,7 +105,8 @@ As built with rustc 1.99.1, this crate declares 23. The extra seventeen (`fd_clo
 `stdout,declassify=app` ceiling (`no_fs`), which is a property of the runtime, not of the linker. **`tools/wasi-stub`**
 (a small Rust bin on `walrus`, its own lockfile, outside the engine) replaces each import outside
 the set by a local function of the same type that returns `ENOSYS` (52); `fd_prestat_get` returns
-`EBADF` (8), which is how std's preopen scan ends cleanly at start-up. The tool rewrites and checks
+`EBADF` (8), which is how std's preopen scan ends cleanly at start-up, and `sched_yield` returns
+success (0): a single-threaded guest has no one to yield to, so "done" is the true answer. The tool rewrites and checks
 **imports only** — that no import outside the allowed set is left, and that the output re-parses as
 a valid module. It asserts nothing about the rest: that the exports, the memory and the **app slot**
 come through unchanged is what the probes establish, which is why CI runs all of them on the

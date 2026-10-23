@@ -362,8 +362,9 @@ jobs:
       # The published asset is the STUBBED module: Vela v0.3.0 (pkg/wasm/guest_imports.go) refuses at
       # load any module declaring a WASI import outside its closed set of eight, and Rust's std
       # (rustc 1.99.1) links seventeen more that the `stdout` ceiling never reaches. tools/wasi-stub
-      # replaces them by local stubs returning ENOSYS (fd_prestat_get: EBADF). Every probe below
-      # runs on that module, and it is the one a kit embeds its app into with tools/embed.syn.
+      # replaces them by local stubs returning ENOSYS (fd_prestat_get: EBADF; sched_yield: 0).
+      # Every probe below runs on that module, and it is the one a kit embeds its app into with
+      # tools/embed.syn.
       - name: Build the Vela guest (example app) and stub the imports Vela v0.3.0 refuses
         env:
           SYNSEMA_VERSION: ${{ github.ref_name }}
