@@ -1,7 +1,11 @@
 //! Synsema core.
 //!
-//! Espeja `synsema/core/` de la implementación Python (el oráculo de paridad).
+//! Nació como port de `synsema/core/` de la implementación Python (el oráculo de paridad).
 //! Orden de port: lexer -> tokens -> parser -> ast -> types -> interpreter.
+//! Ese prototipo ya no existe: el Rust es la única implementación. Los `Port de synsema/….py` de
+//! los encabezados de cada módulo nombran archivos que sólo están en la historia de git (se
+//! retiraron en 77c0cda; `git show 77c0cda^:synsema/core/parser.py`). El oráculo de hoy es
+//! `synsema-runtime/tests/it/reference_oracle.rs`: el camino de referencia contra los atajos.
 
 pub mod addressable;
 pub mod arrays;

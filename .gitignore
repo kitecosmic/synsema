@@ -31,8 +31,8 @@ target/
 # Paquetes de la extensión de editor (build artifact de vsce)
 *.vsix
 
-# Privado — herramienta de testing interna (oráculo Python + harness differential).
-# Se usa localmente; no va al repo público. (Los docs de proceso viven fuera del repo.)
+# Privado — corpus local de ~1460 `.syn` (y sus datos) que recorren reference_oracle y el anti-rot
+# de labels_conformance. Se usa localmente; no va al repo público. (Los docs de proceso viven fuera del repo.)
 conformance/
 
 # Probes de verificación local (los corre el agente de testing). NO van al repo público.
@@ -43,15 +43,6 @@ specs/
 
 # Arena de benchmark: comparativas locales (vs Go/Node/etc.), NO va al repo público.
 synsema-arena/
-
-# Árbol Python original (MVP / oráculo de paridad), CONGELADO — producción es Rust
-# (engine/). Se conserva localmente pero ya no va al repo público. Ver synsema/FROZEN.md.
-/synsema/
-
-# Suite pytest del oráculo Python (legado): importa synsema/ y ya no se usa
-# (el conformance es `cargo test`). Se conserva local, fuera del repo público.
-# Los tests del lenguaje en .syn (tests/*.test.syn) SÍ se versionan.
-tests/*.py
 
 # Estado/persistencia y daemons de runtime (fuera del repo, defensivo)
 .synsema/

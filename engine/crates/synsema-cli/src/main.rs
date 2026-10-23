@@ -1,6 +1,6 @@
 //! Synsema CLI. Espeja `synsema/cli.py` y `__main__.py` (capa 11, en progreso).
 //!
-//! Subcomando de conformidad (gate de paridad contra el oráculo Python):
+//! Subcomando de conformidad (nació como gate de paridad contra el oráculo Python, ya retirado):
 //!
 //!     synsema conform <archivo.syn>
 //!
