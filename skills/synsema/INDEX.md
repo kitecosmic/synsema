@@ -79,9 +79,10 @@ host works in — fiat, crypto, commodities, credits (Synsema privileges no curr
   it. Re-install right after `synsema update` (binary and skill version together); each way below
   overwrites in place:
   - **Any agent** (Claude Code, Codex, opencode, Cursor, Gemini CLI, GitHub Copilot, Windsurf, …):
-    `npx skills add kitecosmic/synsema` — it asks which agents; `-g` installs for every project,
-    `-a <agent>` picks the agent (`-a codex`, `-a claude-code`, `-a opencode`, `'*'` for all),
-    `-y` skips the questions. Later: `npx skills update`.
+    `npx skills add kitecosmic/synsema -g -y` — once per machine, for every project and every agent
+    it detects (`-g` = global: without it the skill goes into the current project only, which is
+    also what happens when an agent runs the command without `-g`; `-y` = no questions;
+    `-a <agent>` picks one, e.g. `-a codex`). Later: `npx skills update -g`.
   - **Without Node**:
     `curl -fsSL https://raw.githubusercontent.com/kitecosmic/synsema/main/install-skill.sh | bash`
     writes `~/.claude/skills/synsema` (Claude Code); add `-s -- --agents` for
@@ -93,7 +94,7 @@ host works in — fiat, crypto, commodities, credits (Synsema privileges no curr
     `claude plugin update synsema@synsema` or `codex plugin marketplace upgrade`.
   - **Same version everywhere**: Claude Code reads `~/.claude/skills`, Codex `~/.agents/skills`, and
     opencode reads both (it expects unique names). With a copy in each, update them together:
-    `npx skills update` updates every copy it installed; the curl installer, once per folder.
+    `npx skills update -g` updates every global copy it installed; the curl installer, once per folder.
 - **Docs MCP** (search/get the official docs + run/test Synsema snippets in a sandbox — use it
   when a question goes beyond this skill or to VERIFY code you wrote): `https://synsema.dev/mcp`,
   streamable HTTP, no key.

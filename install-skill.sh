@@ -12,7 +12,7 @@
 #   # or, from a checkout of the repo:
 #   bash install-skill.sh [--agents | --dir <folder>]
 #
-# With Node, `npx skills add kitecosmic/synsema` installs it for any agent (it asks which).
+# With Node, `npx skills add kitecosmic/synsema -g -y` installs it once per machine for every agent it detects.
 # opencode reads both ~/.claude/skills and ~/.agents/skills: with a copy in each, update both.
 # Re-running replaces the installed copy, so it is also how you update it.
 

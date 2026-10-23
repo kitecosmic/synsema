@@ -5,5 +5,5 @@ The skill for coding agents lives in [`skills/synsema/`](skills/synsema/SKILL.md
 Python prototype that no longer exists; the engine is the Rust workspace in `engine/`. Do not learn
 the language from older copies of this file.
 
-Install the skill for any agent: `npx skills add kitecosmic/synsema`, or see the README section
+Install the skill for any agent: `npx skills add kitecosmic/synsema -g -y` (once per machine), or see the README section
 "AI Skill and docs MCP".
