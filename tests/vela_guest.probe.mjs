@@ -15,7 +15,8 @@
 // embebe un programa propio en el slot del módulo (lo mismo que hace tools/embed.syn).
 //
 // El módulo sólo puede declarar los 8 imports que Vela v0.3.0 admite (guest_imports.go). Un
-// módulo sin post-procesar (tools/wasi-stub) declara 21 y esa aserción FALLA: es lo esperado.
+// módulo sin post-procesar (tools/wasi-stub) declara 23 (rustc 1.99.1) y esa aserción FALLA: es
+// lo esperado.
 //
 //   node tests/vela_guest.probe.mjs engine/target/wasm32-wasip1/wasm/synsema_vela_guest.wasm
 import { readFile } from "node:fs/promises";

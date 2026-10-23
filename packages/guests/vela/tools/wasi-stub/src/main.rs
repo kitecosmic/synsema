@@ -3,10 +3,11 @@
 //! Vela `dev` (v0.3.0, `pkg/wasm/guest_imports.go`) rechaza al cargar cualquier módulo que
 //! DECLARE un import de `wasi_snapshot_preview1` fuera de una lista cerrada de ocho:
 //! `args_get`, `args_sizes_get`, `clock_time_get`, `environ_get`, `environ_sizes_get`, `fd_write`,
-//! `proc_exit`, `random_get`. El rechazo es por declarar, no por llamar. Nuestro guest declara 21:
-//! los 15 sobrantes (`fd_close`, `fd_fdstat_get`, `fd_filestat_get`, `fd_prestat_get`,
-//! `fd_prestat_dir_name`, `fd_read`, `fd_readdir`, `path_*` ×7, `poll_oneoff`) los enlaza `std::fs`
-//! desde el motor aunque el techo `stdout` (`no_fs: true`) impida que el programa los alcance.
+//! `proc_exit`, `random_get`. El rechazo es por declarar, no por llamar. Nuestro guest declara 23
+//! con rustc 1.99.1 (21 con 1.96.0): los 17 sobrantes (`fd_close`, `fd_fdstat_get`,
+//! `fd_filestat_get`, `fd_prestat_get`, `fd_prestat_dir_name`, `fd_read`, `fd_readdir`, `fd_seek`,
+//! `path_*` ×7, `poll_oneoff`, `sched_yield`) los enlaza el toolchain desde el motor aunque el techo
+//! `stdout` (`no_fs: true`) impida que el programa los alcance.
 //!
 //! Esta herramienta reemplaza cada import de función de `wasi_snapshot_preview1` que NO esté en la
 //! lista permitida por una función LOCAL del mismo tipo que devuelve `ERRNO_NOSYS` (52) — salvo

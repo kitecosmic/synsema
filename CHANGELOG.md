@@ -8,6 +8,26 @@ Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the rele
 
 ## Unreleased
 
+**Built with Rust 1.99.1 (was 1.96.0).** The releases in between fix two miscompilations (MIR in
+1.96.1, vtables in 1.98.1). Binaries change, so the Vela guest's sha256 differs from v0.6.46 for
+the same source. With rustc 1.99.1, Rust's `std` also links two more WASI imports into the guest
+(`fd_seek`, `sched_yield`). `tools/wasi-stub` replaces them like the others, and the published
+module still declares only six imports, all inside Vela's eight. The new compiler also exposed a
+bug in the guest: comparing the app slot's header against the literal magic left a second copy of
+`SYNSEMA.APPSLOT1` in the module's data, and `tools/embed.syn`, `tools/verify.syn` and the probes,
+which require exactly one slot, refused the module. The guest now recognizes the header by a hash
+of the magic, so no optimizer can bring the literal back.
+
+The compiler change costs speed outside the native tier. Instructions executed, measured against
+v0.6.46 (PGO, same programs):
+- native tier: −0.05 % to −0.27 % (`c_lit_txt5` +0.6 %);
+- the VM alone (`--jitless`, which is what WebAssembly and `serve --attested` run): +0.2 % to +2.3 %;
+- the tree-walker (what runs under `--labels`): +0.3 % to +2.7 %, and +9.5 % in a deep-recursion
+  benchmark.
+
+Most of the tree-walker cost is in the linear name lookup, which LLVM 23 compiles worse. Times stay
+within noise. The `perf-guard` anchor was re-measured for the new toolchain.
+
 **The skill for coding agents moved to `skills/synsema/` and installs in any agent.** It was in
 `.synsema-skill/`, a hidden folder that only the Claude Code installer knew, and its `SKILL.md`
 frontmatter did not parse as YAML for strict readers (a `:` inside the unquoted description), so

@@ -4,14 +4,14 @@
 #
 # Por qué una versión exacta y no `stable`: la reproducibilidad del guest (release.yml,
 # `guest-reproducible`) y la provenance sólo significan algo si dos builds del mismo commit usan
-# el mismo compilador. 1.96.0 es la versión con la que se desarrolla y se valida localmente hoy
-# (2026-09-18); CI la pasa además explícita a dtolnay/rust-toolchain (`toolchain: "1.96.0"`),
-# porque esa action no lee este archivo. Subirla es un cambio deliberado: acá, en los workflows
-# y en el CHANGELOG de la release.
+# el mismo compilador. 1.99.1 es la versión con la que se desarrolla y se valida localmente hoy
+# (2026-10-23; antes 1.96.0, desde 2026-09-18); CI la pasa además explícita a
+# dtolnay/rust-toolchain (`toolchain: "1.99.1"`), porque esa action no lee este archivo. Subirla
+# es un cambio deliberado: acá, en los workflows y en el CHANGELOG de la release.
 #
-# OJO local: rustup trata `1.96.0` y `stable` como toolchains distintos aunque sean la misma
-# versión; la primera vez que corras cargo en el repo se instala `1.96.0-<host>` (una descarga,
+# OJO local: rustup trata `1.99.1` y `stable` como toolchains distintos aunque sean la misma
+# versión; la primera vez que corras cargo en el repo se instala `1.99.1-<host>` (una descarga,
 # ~1 GB con los targets de abajo). Después es transparente.
 [toolchain]
-channel = "1.96.0"
+channel = "1.99.1"
 targets = ["wasm32-wasip1", "wasm32-unknown-unknown"]

@@ -84,6 +84,11 @@ use serde_json::{json, Map, Value};
 /// compilador de por medio — mismo intérprete, y el SHA-256 que Vela verifica cubre a los dos.
 /// Layout: magic (16) · largo del nombre (1) · nombre (63) · largo u32 LE (4) · programa · relleno.
 const SLOT_MAGIC: &[u8; 16] = b"SYNSEMA.APPSLOT1";
+/// La cabecera se reconoce por un hash del magic y no comparando contra `SLOT_MAGIC`: las
+/// herramientas exigen que el magic aparezca UNA vez en el `.wasm`, y desde rustc 1.99 (LLVM 23)
+/// la comparación con el literal deja una segunda copia en los datos del módulo. Un hash no se
+/// puede plegar de vuelta al literal, así que ningún optimizador la reintroduce.
+const SLOT_MAGIC_FNV: u64 = fnv1a64(SLOT_MAGIC);
 const SLOT_SIZE: usize = 524_288;
 const SLOT_HEADER: usize = 16 + 1 + 63 + 4;
 /// `static mut` a propósito: un `static` inmutable es una constante para LLVM, que podría plegar
@@ -97,10 +102,24 @@ fn app_slot() -> &'static [u8] {
     unsafe { core::slice::from_raw_parts(core::ptr::addr_of!(APP_SLOT) as *const u8, SLOT_SIZE) }
 }
 
+const fn fnv1a64(b: &[u8]) -> u64 {
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    let mut i = 0;
+    while i < b.len() {
+        h = (h ^ b[i] as u64).wrapping_mul(0x0100_0000_01b3);
+        i += 1;
+    }
+    h
+}
+
+fn slot_magic_ok(s: &[u8]) -> bool {
+    fnv1a64(&s[..16]) == SLOT_MAGIC_FNV
+}
+
 /// El programa (texto) que hay en el slot; vacío si la cabecera no es la esperada.
 fn app_source() -> &'static str {
     let s = app_slot();
-    if &s[..16] != SLOT_MAGIC {
+    if !slot_magic_ok(s) {
         return "";
     }
     let len = u32::from_le_bytes([s[80], s[81], s[82], s[83]]) as usize;
@@ -114,7 +133,7 @@ fn app_source() -> &'static str {
 fn app_name() -> &'static str {
     let s = app_slot();
     let n = s[16] as usize;
-    if &s[..16] != SLOT_MAGIC || n == 0 || n > 63 {
+    if !slot_magic_ok(s) || n == 0 || n > 63 {
         return "app.syn";
     }
     core::str::from_utf8(&s[17..17 + n]).unwrap_or("app.syn")
@@ -2028,6 +2047,17 @@ mod tests {
 
     fn pad_event_data_ok(ev: &mut Map<String, Value>, bucket: usize) -> bool {
         pad_event_data(ev, bucket).unwrap()
+    }
+
+    #[test]
+    fn slot_header_is_recognized_by_hash() {
+        // El slot que embebió build.rs, y una cabecera con un byte cambiado.
+        assert!(slot_magic_ok(app_slot()));
+        assert!(!app_source().is_empty());
+        let mut bad = *SLOT_MAGIC;
+        bad[15] = b'2';
+        assert!(!slot_magic_ok(&bad));
+        assert!(!slot_magic_ok(&[0x20; 16]));
     }
 
     #[test]
