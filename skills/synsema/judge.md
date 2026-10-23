@@ -223,7 +223,37 @@ behaves like `llm` otherwise: auto-granted in plain `run`/`conform`, **required*
 secure mode, emptied inside `sandbox`, denied under `--deterministic` (it is network I/O), and always
 offline inside a wasm guest (no network there). The key never enters the program and the host is
 fixed by the runtime, so the `.syn` cannot redirect the call. Under `--labels`, `judge` is a declared
-public sink: a `private` state must be `declassify`d before it crosses — see [labels.md](labels.md).
+public sink: a `private` state must be `declassify`d before it crosses — see [labels.md](labels.md) —
+**unless the host allows that principal for the judge's provider** (v0.6.46+):
+
+```sh
+SYNSEMA_JUDGE_PROVIDER=laya SYNSEMA_JUDGE_MODEL=/models/laya \
+  synsema run --labels --cap-set "stdout,judge=customers@local,declassify=customers" app.syn
+```
+
+```synsema
+require judge("customers")                   -- whose data this program may send to the judge
+let ticket be private({"text": "I want my money back"}, "customers")
+let v be judge ticket
+    refund: whether "The customer is asking for money back"
+let route be declassify(v.refund.probability > 0.8, "whether to route to billing is public")
+```
+
+- The ceiling item is `judge=<principal>@<provider host>`: `@local` for `laya` and `mock` (models in
+  the process), `@api.typesafe.ai` for the hosted judge (or the host of `SYNSEMA_JUDGE_BASE_URL`),
+  `@*` for any. `llm=customers@…` does **not** cover the judge, and `judge=customers` without
+  `@provider` allows no private data. A bare `require judge` means public data only.
+- The answers come back **private** (`probability`, `choice`, … carry the label of the state):
+  gate with a `declassify`, which has its own ceiling item.
+- Refused (nothing is sent): `label_violation: judge would send data private to (customers) to the
+  model; the host allows that per principal and provider in its ceiling (\`--cap-set
+  judge=<principal>@<provider host>\`, …) and the program declares \`require judge("<principal>")\``.
+  A `judge` block under a private branch is refused first and writes no audit entry.
+- Each allowed call writes the audit entry `judge("customers@local")`, `source: "llm-data"`.
+- With `SYNSEMA_JUDGE_DECIDE=1`, a `decide` over private data is checked against `judge=` (and the
+  ceiling must still grant `llm`: `--cap-set "stdout,llm,judge=customers@local,…"`).
+- What it does not give is the same as for the LLM ([llm.md](llm.md) § Private data to a model):
+  the provider sees the state, and its answer is private but not trusted.
 
 ## Configuration — the parallel slot
 

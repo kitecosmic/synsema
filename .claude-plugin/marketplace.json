@@ -1,0 +1,16 @@
+{
+  "name": "synsema",
+  "description": "The Synsema language skill for coding agents.",
+  "owner": {
+    "name": "Synsema",
+    "url": "https://synsema.dev"
+  },
+  "plugins": [
+    {
+      "name": "synsema",
+      "source": "./",
+      "description": "The full Synsema language reference as a skill, read on demand.",
+      "category": "development"
+    }
+  ]
+}

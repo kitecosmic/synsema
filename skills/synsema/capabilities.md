@@ -30,6 +30,7 @@ require exec("ffmpeg")
 require env("API_KEY")
 require secret("STRIPE_API_KEY")    -- read as an opaque, redacted secret
 require secret("APP_*")             -- name prefix: APP_DB, APP_KEY, … (only a trailing *)
+require secret("RPC_KEY") for net("rpc.example.com")   -- v0.6.46+: bound — may go in the URL/query/body, only there
 require reveal("STRIPE_API_KEY")    -- enable reveal() for THAT secret only (loud + audited; scoped by name/label)
 require time
 require llm                         -- enable LLM ops (reason/decide/analyze/generate)
@@ -293,6 +294,40 @@ names. Works on `run`/`test`/`conform`/`serve`. It is the same audit the wasm `r
 - Sandbox does NOT inherit parent capabilities
 - `call_tool` runs a task with ONLY its declared capabilities (∩ the program's); a plain call uses the program's ambient capabilities
 - Wildcard: `net("*.example.com")` covers all subdomains
+- **A `net` wildcard reaches only public IP addresses (v0.6.46+, SSRF).** Bare `require net`,
+  `net("*")`, `net("*.x.com")`, a host ceiling `--cap-set net` / `net=*`, a `sandbox under` and a
+  `run_program` ceiling with a wildcard no longer reach loopback (`127/8`, `::1`, `0.0.0.0`), private
+  networks (RFC 1918, CGNAT `100.64/10`, ULA `fc00::/7`), link-local (`169.254/16` incl. the cloud
+  metadata `169.254.169.254`, `fe80::/10`), multicast or the documentation ranges (`192.0.2/24`,
+  `198.51.100/24`, `203.0.113/24`). Before, `net` compared only the name (`127.0.0.1.nip.io` reached
+  localhost). The client resolves once, checks the address it will use and connects to that one; an
+  IPv4 mapped/translated in IPv6 (`::ffff:a.b.c.d`, `64:ff9b::/96`) counts as that IPv4. **To reach a
+  private address, every layer with a wildcard must name it:** the exact host (`net("db")`,
+  `net("localhost")` — reached wherever it resolves), the literal address, or a CIDR
+  (`net("10.0.0.0/8")` covers literal addresses inside it; a *name* resolving inside a CIDR is reached
+  only together with a wildcard grant), or from config: `require net(env("CONTROL_URL"))`. Error (the
+  `http*` builtins return it as a transport failure, `{status: 0, ok: false, error}`; `tcp_connect`,
+  `ws_connect`, the chain RPC builtins and `push_send` raise it): ``http_get: `db` resolved to 10.0.0.5,
+  a private address; a `net` grant with a wildcard reaches only public addresses. Name it: `require
+  net("db:5432")`, its address or its CIDR (the scope can come from the configuration: `require
+  net(env("…_URL"))`)``. Ceiling layers name themselves: `the host ceiling (--sandbox/--cap-set) reaches
+  only public addresses for it. The program cannot fix this; the host must name it: `--cap-set
+  net=127.0.0.1:47100`` / `the enclosing `sandbox under` block reaches only public addresses for it:
+  name it there (`net("…")`)`. Applies to `http`/`fetch`/`http_*`, `ws_connect` (+ reconnects),
+  `tcp_connect`, the blockchain RPC builtins, `push_send`, `proxy to` (502, serve.md). NOT to the DB
+  drivers (`postgres`/`mysql`/`mongo`/`redis` are gated by `db`, not `net`).
+- **A secret bound to hosts (v0.6.46+):** `require secret("K") for net("a.x.com"), net("b.x.com")` (or
+  `*.x.com`, which does NOT cover `x.com`; `for net(env("H"))` works) — see secrets.md. The binding is
+  not a `net` grant. Host ceiling: `--cap-set secret=K@api.x.com` (several: `secret=K@a.x.com|b.x.com`);
+  a program asking for `K` unbound or bound elsewhere gets `secret("K") not permitted: the host binds K
+  to api.x.com; write `require secret("K") for net("api.x.com")``. Load errors: `for net("*")`,
+  `for net("*.com")`, `for net("a*.x.com")`, a name with `@`/`|`.
+- **A `require` with an unknown name is a LOAD error (v0.6.46+)** — it used to parse and grant nothing:
+  ``unknown capability `nett` in `require` — did you mean `require net`?; a name that does not exist
+  grants nothing. Known: net, file, file.read, file.write, exec, env, time, random, stdout, stdin, llm,
+  judge, db, serve, secret, reveal, sign, wallet, spend, memory, sandbox_run, attest, declassify``. Also
+  dotted (`file.raed` → `file.read`) and inside a task/agent; `synsema check` reports it too. The
+  audit forms `file_read`/`file_write` still load.
 - `net` scope is a host, or `host:port` when a port is written (v0.6.29+): `net("api.x.com")` covers every port of that host; `net("localhost:8545")` or `net("http://localhost:8545/")` covers only port 8545, and a call to `http://localhost:8546/` is denied. IPv6 with a port is `net("[::1]:8545")`. A URL is stored without credentials, path or query.
 - **Path scopes are globs by segment (v0.6.45+)**, like gitignore and shell globs:
   - `*` and `?` match **inside one path segment**: `file.read("./data/*")` = the files directly in `./data`; `file.read("*.csv")` = the `.csv` files of the working directory, not every `.csv` on the disk.
@@ -307,7 +342,17 @@ names. Works on `run`/`test`/`conform`/`serve`. It is the same audit the wasm `r
   - A symlink or junction **below** the grant that leads outside is refused: `Capability not granted: file_read("data/ext/s.txt") — by name the path is inside the granted scope, but a link (symlink or junction) on the way leads outside it. … grant the place the link points to, or remove the link`. Same for `use "./ext/o.syn"` through a link.
   - A `deny` of a place also catches a path that reaches it through a link. A broken link is judged where it points (writing through `data/log.txt -> ~/.ssh/authorized_keys` is refused); a path that cannot be resolved is refused.
   - `grep` does not follow links to folders (it skips them) and respects a `deny` inside the tree. `list_dir`/`file_info` mark links with `is_link`.
-  - Not caught yet: a link swapped in between the check and the open, and hard links.
+  - **A link swapped between the check and the open (v0.6.46+, Linux + Windows)** no longer escapes:
+    the file is opened without following links (`openat2` + `RESOLVE_NO_SYMLINKS` / `NtCreateFile` +
+    `OBJ_DONT_REPARSE`); with a link on the way it is opened without data access, re-checked where it
+    really is, then reopened. Covers `read_file`, `read_file_bytes`, `edit_file`, `write_file`,
+    `append_file`, `grep`, `zip_*`/`tar_*` files and entries, `mtls_identity`, `svg_to_*` fonts,
+    `render` (+ `include`/`layout`), `static` files. NOT covered: `list_dir`, `file_exists`,
+    `file_info`, `delete_file`, `delete_dir`, folders `write_file` creates, `tls cert … key …` PEMs;
+    macOS, Linux without `openat2` (< 5.6) or seccomp refusing it (Docker < 20.10), UNC paths; hard
+    links. On Windows `a.txt.` / `a.txt ` (trailing dot/space) no longer open `a.txt` and `…/CON` is
+    not the device (errors; `file_exists("a.txt.")` still says `true`).
+  - Not caught: hard links.
 - Name prefix: `secret("APP_*")` / `env("APP_*")` / `reveal("APP_*")` covers `APP_DB`, `APP_KEY`, … (only a trailing `*`)
 - `db` scope: a **file path** for SQLite; a **canonical URL** for remote engines (Postgres/MySQL/MongoDB/Redis) —
   `scheme://host/db` with **no credentials, port, or query** (so `mysql://user:pw@localhost:3306/appdb?ssl-mode=REQUIRED`

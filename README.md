@@ -180,7 +180,7 @@ when confidence of v.team < 0.8
 ```
 
 `judge` is its own capability (`require judge`, not granted by `llm`), and offline it degrades to
-`available: false` with confidence 0 — never an invented number. See `.synsema-skill/judge.md`.
+`available: false` with confidence 0 — never an invented number. See `skills/synsema/judge.md`.
 
 ### Concurrency
 
@@ -249,7 +249,7 @@ serve on 8080
 - **Rate limiting:** `rate_limit N per second|minute|hour` on the server (default) or per route (override; `none` to disable). Token bucket keyed by the real peer IP (not `X-Forwarded-For`), checked before auth, `429` + `Retry-After` + `RateLimit-*` over the limit, stale buckets purged.
 - **Soft keywords:** `serve`, `on`, `route`, `auth`, `requires`, `expect`, `max_body`, `max_streams`, `stream`, `send` are only special inside their construction — elsewhere they are ordinary names (`let route be "/x"` works).
 
-See [.synsema-skill/serve.md](.synsema-skill/serve.md) for full details.
+See [skills/synsema/serve.md](skills/synsema/serve.md) for full details.
 
 ### Production web stack — no Caddy/nginx needed
 
@@ -551,51 +551,69 @@ code --install-extension synsema.vsix      # or: cursor / windsurf --install-ext
 
 Source and details: [`editors/vscode/`](editors/vscode/README.md).
 
-## AI Skill (for Claude Code, Codex, etc.)
+## AI Skill and docs MCP (for any coding agent)
 
-Synsema includes a structured skill so AI coding assistants can learn the language. The skill is organized as an indexed folder — the AI reads only the sections it needs.
+Synsema ships a skill so coding agents can learn the language: [`skills/synsema/`](skills/synsema/SKILL.md),
+in the open [Agent Skills](https://agentskills.io) format (`SKILL.md` + one file per topic, read on
+demand). The same folder works in Claude Code, Codex, opencode, Cursor, Gemini CLI, GitHub Copilot,
+Windsurf and any other agent that reads skills.
 
-### Install the skill (Claude Code)
+### Install the skill
 
 ```bash
-# From the repo
-cd synsema && bash install-skill.sh
+# Any agent (asks which ones; -g = every project, -a codex / -a claude-code / '*' = pick, -y = no questions)
+npx skills add kitecosmic/synsema
 
-# Or remote
-curl -s https://raw.githubusercontent.com/kitecosmic/synsema/main/install-skill.sh | bash
+# Without Node
+curl -fsSL https://raw.githubusercontent.com/kitecosmic/synsema/main/install-skill.sh | bash                  # ~/.claude/skills  (Claude Code)
+curl -fsSL https://raw.githubusercontent.com/kitecosmic/synsema/main/install-skill.sh | bash -s -- --agents    # ~/.agents/skills  (Codex, opencode, …)
+curl -fsSL https://raw.githubusercontent.com/kitecosmic/synsema/main/install-skill.sh | bash -s -- --dir <dir> # any other skills folder
+
+# As a plugin
+#   Claude Code:  /plugin marketplace add kitecosmic/synsema   then   /plugin install synsema@synsema
+#   Codex:        codex plugin marketplace add kitecosmic/synsema   then   codex plugin add synsema@synsema
 ```
 
-That's it — Claude Code auto-detects the skill via its `SKILL.md` frontmatter. No
-`CLAUDE.md` edit needed: just open a `.syn`/`.fsyn` file or type `/synsema`, and the
-relevant reference sections load on demand.
+Re-run it after each `synsema update` so the skill matches the binary (`npx skills update` if you
+used npx). Claude Code reads `~/.claude/skills`, Codex `~/.agents/skills`, and opencode reads
+both: with a copy in each, update them together (`npx skills update` updates every copy it
+installed). Agents without skill support can read
+[`skills/synsema/INDEX.md`](skills/synsema/INDEX.md) as context: it points to every other file.
+
+### The docs MCP
+
+`https://synsema.dev/mcp` (streamable HTTP, no key): search over the docs, any page, the doctested
+examples and a sandbox that runs and tests Synsema, so the agent checks its code before handing it
+over.
+
+```bash
+claude mcp add --transport http synsema-docs https://synsema.dev/mcp      # Claude Code
+codex mcp add synsema-docs --url https://synsema.dev/mcp                   # Codex
+gemini mcp add --transport http synsema-docs https://synsema.dev/mcp      # Gemini CLI
+```
+
+Cursor (`.cursor/mcp.json`) and most other clients: `{"mcpServers": {"synsema-docs": {"url": "https://synsema.dev/mcp"}}}`.
+opencode (`opencode.json`): `{"mcp": {"synsema-docs": {"type": "remote", "url": "https://synsema.dev/mcp"}}}`.
 
 ### Skill index
 
-The skill lives in `.synsema-skill/` and is organized by topic:
-
 | File | When to read |
 |------|-------------|
-| [INDEX.md](.synsema-skill/INDEX.md) | **Always read first** — points to everything else |
-| [syntax.md](.synsema-skill/syntax.md) | Writing or reading `.syn` code — keywords, operators, statement patterns |
-| [builtins.md](.synsema-skill/builtins.md) | Need to know what functions exist — all built-in tasks with signatures |
-| [types.md](.synsema-skill/types.md) | Working with data — type system, property access, truthiness |
-| [capabilities.md](.synsema-skill/capabilities.md) | Adding security — require, sandbox, intent, per-task scoping |
-| [agents.md](.synsema-skill/agents.md) | Multi-agent work — blackboard, swarm, signals, resource locks |
-| [llm.md](.synsema-skill/llm.md) | Using AI reasoning — reason, decide, analyze, generate, providers |
-| [human.md](.synsema-skill/human.md) | Human interaction — approve, confirm, ask, escalation |
-| [observability.md](.synsema-skill/observability.md) | Debugging — trace, log, measure, error diagnostics, recovery |
-| [memory.md](.synsema-skill/memory.md) | Agent persistence — progress tracking, memory, owner rules |
-| [patterns.md](.synsema-skill/patterns.md) | Common idioms — safe division, pipe chains, intentional ops |
-| [structure.md](.synsema-skill/structure.md) | Understanding the codebase — file map with entry points |
+| [SKILL.md](skills/synsema/SKILL.md) | The entry point: the dev loop, how to stay current, every reference file |
+| [INDEX.md](skills/synsema/INDEX.md) | Which file answers which question |
+| [python-diff.md](skills/synsema/python-diff.md) | Read first when writing `.syn` code: the Python → Synsema table |
+| [syntax.md](skills/synsema/syntax.md) | Writing or reading `.syn` code — keywords, operators, statement patterns |
+| [builtins.md](skills/synsema/builtins.md) | Need to know what functions exist — all built-in tasks with signatures |
+| [types.md](skills/synsema/types.md) | Working with data — type system, property access, truthiness |
+| [capabilities.md](skills/synsema/capabilities.md) | Adding security — require, sandbox, intent, per-task scoping |
+| [serve.md](skills/synsema/serve.md) | The native HTTP server |
+| [agents.md](skills/synsema/agents.md) | Multi-agent work — blackboard, swarm, signals, resource locks |
+| [llm.md](skills/synsema/llm.md) | Using AI reasoning — reason, decide, analyze, generate, providers |
+| [pitfalls.md](skills/synsema/pitfalls.md) | Something failed — errors, their causes and fixes, upgrade notes |
+| [deploy.md](skills/synsema/deploy.md) | Daemon mode, Docker, VPS, Kubernetes, systemd, WebAssembly |
 
-### For other AI tools (Codex, Cursor, Windsurf, etc.)
-
-Point the tool at `.synsema-skill/INDEX.md` in the repo root. Each tool has its own way to add context:
-
-- **Codex**: reference the skill folder in your system instructions
-- **Cursor**: add `.synsema-skill/` to your project rules or docs
-- **Windsurf**: include INDEX.md in your cascade context
-- **Any tool**: paste the contents of INDEX.md as system prompt, the AI will know which sub-file to request
+The rest (labels, attestation, secrets, judge, data and charts, processes, frontend, memory,
+observability, guests, …) is listed in [SKILL.md](skills/synsema/SKILL.md).
 
 ### LLM response validation
 

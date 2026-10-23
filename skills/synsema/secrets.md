@@ -99,6 +99,8 @@ surface**, with no flag to turn that off:
 | LLM context / `generate … given X` | the model never sees the plaintext |
 | blackboard between agents (`share`/`observe`) | redacted on share |
 | `text(secret)` / string coercion | `secret(NAME)` |
+| `json_encode` / `jsonl_encode` / `json_for_script` / `csv_encode` | **error** naming where it is (v0.6.46+; it was `"[redacted]"`) |
+| a list/map holding a secret in a template hole | **error** (v0.6.46+; it was the text `{k: secret(K)}`) |
 | `"x" + secret` (concatenation) | stays a `secret` (taint propagates) |
 | SQL parametrized write | the **plaintext is written to the DB** (the DB is the trust border) |
 
@@ -165,19 +167,27 @@ let b be http_get("https://api.provider.com/v1/items",
   `as_secret(...)`, or the result of `bearer()`) is materialized to its real value
   **only at the socket** — never in your program's value space. Credentials are **not
   Bearer-only**: `{"x-api-key": secret("KEY")}` or any custom header works; `bearer(s)`
-  is just sugar for the `Authorization: Bearer <token>` format. A `secret` in **query
-  params or a body is an error** (v0.6.44+; it used to go out as the text `secret(NAME)`):
-  a credential only travels inside a header. Header/query/`bearer` values are text,
-  number, bool or secret — `nothing`, bytes, lists, maps → error naming the header (was
-  their printed form, e.g. `Bearer None`); a sealed secret or non-UTF-8 bytes secret →
-  error, never `secret(NAME)`. **No outlet yet** for an API that only takes the key in
-  the URL or only in the body (it never worked: it used to send `secret(NAME)`); prefer a
-  header / `basic()` / `bearer()` when the API offers one.
-- **Known limit:** a secret nested in a list/map inside a template hole (`` `Bearer {creds}` ``
-  with `creds = {"k": secret("K")}`) renders the whole container redacted, `Bearer {k: secret(K)}`
-  (like `print`), as plain text — **no error**, a header built from it goes out like that. Never the
-  value, but not the credential. Put the secret itself in the hole (`` `Bearer {creds["k"]}` `` is a
-  secret with the real value) or use `bearer`/`basic`.
+  is just sugar for the `Authorization: Bearer <token>` format. An **unbound** `secret` in the
+  URL, query params, a body or a form is an **error** (v0.6.44+; it used to go out as the text
+  `secret(NAME)`), and since v0.6.46 the error gives the line that fixes it —
+  `require secret("K") for net("<host of that request>")` — see § bound to a host below.
+  Header/query/`bearer` values are text, number, bool or secret — `nothing`, bytes, lists, maps →
+  error naming the header (was their printed form, e.g. `Bearer None`); a sealed secret or
+  non-UTF-8 bytes secret → error, never `secret(NAME)`.
+- **A list/map with a secret inside, in a template hole, is an error** (v0.6.46+): `` `Bearer {creds}` ``
+  with `creds = {"k": secret("K")}` → `a secret inside a map cannot go into a text hole (secret(K)
+  would travel as its placeholder): take it out on its own (`creds.k`) or use bearer(...)/basic(...)`
+  (`inside a list` for a list). Before it gave the plain text `Bearer {k: secret(K)}`. Put the secret
+  itself in the hole (`` `Bearer {creds["k"]}` `` is a secret with the real value) or use
+  `bearer`/`basic`; a secret alone in a hole is unchanged.
+- **`json_encode`/`jsonl_encode`/`json_for_script`/`csv_encode` of a secret are an error** (v0.6.46+),
+  also deep inside: `json_encode: the value["auth"]["key"] is secret(K), and a secret is never written
+  as text — pass the value to the request itself (in a header; in the body or the URL once it is bound:
+  `require secret("K") for net("host")`) and the engine writes it at the socket, or leave it out of what
+  you encode` (`jsonl_encode`: `item 0[...]`; `csv_encode: row 1, column "k": secret(K) is never written
+  as text — leave it out of the rows`). It used to give `"[redacted]"` — a marker the program could
+  send on as the data. **Migrate:** hand the map with the secret to `http_post`/`fetch` directly (bound
+  secret) or drop the field. `give` from a route still answers `"[redacted]"` + a server-log warning.
 - `as_secret(v)` without a label is NAMED `sealed` (`secret(sealed)`, scope of
   `reveal("sealed")`) — a name, not a sealed secret like `attestation_key()`. Pass a label.
 - **As a DB parameter** (`sql`, `mongo_*`, `redis_*`) a secret materializes at the DB edge:
@@ -189,6 +199,44 @@ let b be http_get("https://api.provider.com/v1/items",
   GitHub `sha256=…`, Shopify) and compares in constant time.
 - `==` on a `secret` is already constant-time; prefer `constant_time_eq`/`verify_hmac`
   for credential checks.
+
+## A secret in the URL, the query or the body: bind it to a host (v0.6.46+)
+
+Some APIs take the key only in the URL (RPC providers, bot and map APIs), in the query, or in the body (OAuth `client_secret_post`). Before v0.6.46 that was an error and the only way out was `reveal()`. Now you **bind** the secret to the hosts it may go to, and then it may travel in the URL, the query, a JSON body at any depth, a form, or a header — only to those hosts:
+
+```synsema
+require secret("RPC_KEY") for net("rpc.example.com")
+require secret("APP_SECRET") for net("auth.example.com")
+require net("rpc.example.com")
+require net("auth.example.com")
+
+let k be secret("RPC_KEY")
+let a be http_get(`https://rpc.example.com/v2/{k}`)                  -- in the path, as is
+let b be http_get("https://rpc.example.com/v2", query = {"key": k})  -- in the query, percent-encoded
+let c be http_post("https://rpc.example.com/v2", {"auth": {"key": k}, "op": "status"})  -- JSON body, any depth
+let tok be http_post("https://auth.example.com/oauth/token", form = {
+    "grant_type": "client_credentials",
+    "client_id": "app-1",
+    "client_secret": secret("APP_SECRET")})                          -- a form body
+```
+
+The engine writes the value at the socket; the program never holds it as text. The rules:
+
+- **The binding is not a grant.** `for net("h")` says where the secret may go; the request still needs `require net("h")` (without it: `Capability not granted: net("h")`).
+- **Which hosts.** One or several: `require secret("K") for net("a.example.com"), net("b.example.com")`. A host without a port covers every port; `net("h:8443")` only that port. A subdomain wildcard `*.example.com` covers the subdomains, **not** `example.com` itself — name both if you need both. The host can come from the configuration: `for net(env("RPC_HOST"))` (with `require env("RPC_HOST")`). A name prefix works as in any `secret` scope (`require secret("API_*") for net("h")`). These are load errors: `for net("*")` (`binding a secret to every host is not binding it: name the host it goes to`), `for net("*.com")` (`` `*.com` would cover a whole top-level domain; name the domain``), `for net("a*.example.com")` (`` a `*` may only be the whole first label (`*.example.com`), and nowhere else``), and a secret name with `@` or `|`.
+- **Only to those hosts — also in a header.** `http_get: secret(K) is bound to [api.example.com]; this request goes to 127.0.0.1:47100 — it never goes to another host, not even in a header`. A binding with a wildcard does not reach a private address either (as a wildcard `net` grant): ``http_get: `127.0.0.1.nip.io` resolved to 127.0.0.1, a private address; a secret bound to [*.nip.io] goes there only if the binding names it (the host exactly, its address or its CIDR)`` (in `error of r`).
+- **Only encrypted.** A bound secret goes over `https://` and `wss://`; `http://` and `ws://` only to `127.0.0.1`, `localhost` or `::1`. Otherwise: `http_get: secret(K) only travels over https; this request to example.com is http://`.
+- **The host never comes from a secret.** In a URL that holds a secret, the scheme and the host are written before it. `` `https://{k}.evil/` ``, `` `https://{k}@api.example.com/` `` and `` `https://api.example.com{k}/` `` are errors: `the URL is secret(K) and its host is not written out before the secret; write the scheme and host first (`https://host/…{key}`): the host of a request never comes from a secret`.
+- **In the path it goes as is; in `query` and `form` it is encoded.** `` `https://h/v2/{k}` `` puts the value in the URL without percent-encoding it (`url_encode` refuses a secret: `cannot encode a secret (it would leave as text)`). If the key may contain `+`, `/`, `=`, `&` or spaces, pass it with `query = {"key": k}`, which encodes it.
+- **Adding two bound secrets** keeps only the hosts both allow; with none in common it is an error: `Cannot add secret(A) and secret(C): the first may only go to [a.example.com, b.example.com], the second only to [c.example.com] — no request can carry both`. `bearer`, `basic` and `oauth_basic` keep the binding of the secret they wrap (and a `"pre-" + k` too).
+- **A derived secret is a new, unbound secret.** `hkdf_sha256(k, …)` and `as_secret(v, "S")` give a secret with no binding: it goes only in a header. (The error for them still suggests `require secret("S") for net(...)`, which does not bind a value sealed at runtime — use a header.)
+- **What the server echoes is masked.** In the body, the headers and the error of the response — and in a WebSocket text frame and a JSON-RPC error — each secret that went out becomes `[secret K]`, whether it comes back as is, percent-encoded, JSON-escaped or in base64. It is a defense against an accidental echo, **not** against a hostile server (a server can echo it transformed in a way the mask does not know): the guarantee is the binding. A secret shorter than 4 characters is not masked, and the run warns once: `secret(K) is shorter than 4 characters, so its echo in a response is not masked`.
+- **The record names the secret, never the value.** With `--audit <file>`, each bound secret that went out writes one entry `{"capability": "secret(\"K\")", "granted": true, "source": "bound-send", "reason": "→ api.example.com", …, "file", "line"}`; `lineage()` lists the secrets of each request in `secrets: ["K"]`. Never the URL nor the value.
+- **No redirect carries it.** The native client does not follow redirects: a `301`/`302` comes back as the response, with its `Location` header, and your program decides. (An embedder that implements `http` receives `redirect: "error"` when the request carries a secret: honor it, or the protection is lost on that host.)
+- **`synsema check` warns** an unbound secret that goes in the URL, the query, the body or the form of a request, with the line to write: `app.syn:4: warning: secret("K") goes in the url of http_get() but is not bound to a host, and an unbound secret only goes in a header: write `require secret("K") for net("api.example.com")``.
+- **The other clients.** `evm_rpc` and the other JSON-RPC builtins, `algod`, `btc_rpc` and `ws_connect` take a bound URL (`` ws_connect(`wss://stream.example.com/v1/{k}`) ``). The **params** of a JSON-RPC call still cannot hold a secret: `evm_rpc: params[0] is a secret — a secret never goes into an RPC request`.
+
+**The host can bind too.** `synsema run --cap-set "secret=K@api.example.com,net=api.example.com,stdout" app.syn` (several hosts: `secret=K@a.example.com|b.example.com`), and the same in a delegated ceiling (`run_program`'s `ceiling`). A program that asks for `K` unbound, or bound to another host, gets the line to write: `secret("K") not permitted: the host binds K to api.example.com; write `require secret("K") for net("api.example.com")``. A program may bind tighter than the host (an unbound `secret=K` in the ceiling accepts a program that binds `K`). A child whose ceiling asks for `K` unbound gets nothing above its parent's binding.
 
 ## Sealing a runtime value: `as_secret()`
 

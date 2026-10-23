@@ -100,8 +100,8 @@ and it is a signed `FAILED_LOADING_OR_GETTING_MODULE`: the app simply does not d
 
 As built, this crate declares 21. The extra fifteen (`fd_close`, `fd_fdstat_get`, `fd_filestat_get`,
 `fd_prestat_get`, `fd_prestat_dir_name`, `fd_read`, `fd_readdir`, `path_*`, `poll_oneoff`) come from
-`std::fs` linked by the engine; the program can never reach them — it runs under the `stdout`
-ceiling (`no_fs`), which is a property of the runtime, not of the linker. **`tools/wasi-stub`**
+`std::fs` linked by the engine; the program can never reach them — it runs under the
+`stdout,declassify=app` ceiling (`no_fs`), which is a property of the runtime, not of the linker. **`tools/wasi-stub`**
 (a small Rust bin on `walrus`, its own lockfile, outside the engine) replaces each import outside
 the set by a local function of the same type that returns `ENOSYS` (52); `fd_prestat_get` returns
 `EBADF` (8), which is how std's preopen scan ends cleanly at start-up. The tool rewrites and checks
@@ -109,8 +109,8 @@ the set by a local function of the same type that returns `ENOSYS` (52); `fd_pre
 a valid module. It asserts nothing about the rest: that the exports, the memory and the **app slot**
 come through unchanged is what the probes establish, which is why CI runs all of them on the
 stubbed module and then embeds a program into it with `embed.syn` and probes that too.
-`clock_time_get` and `random_get` stay imported because std uses them at start-up; the `stdout`
-ceiling still denies `now()` and `random()` to the program, which is what matters.
+`clock_time_get` and `random_get` stay imported because std uses them at start-up; the
+`stdout,declassify=app` ceiling still denies `now()` and `random()` to the program, which is what matters.
 
 **From the next release onwards**, the published `synsema-vela-guest.wasm` is the stubbed module —
 assets of v0.6.23 and earlier are not stubbed and declare 21 imports, so a v0.3.0 devnet refuses
@@ -518,8 +518,10 @@ nobody should believe a value is protected when the labels are not on.
 
 ## What the guest cannot do, by construction
 
-The program runs under the ceiling `stdout`: **no `now()`, no `random()`/`token()`, no network, no
-files, no LLM**. Vela signs the state root, so the same inputs must produce the same bytes — the
+The program runs under the ceiling `stdout,declassify=app` (v0.6.46+; before, `stdout`): **no
+`now()`, no `random()`/`token()`, no network, no files, no LLM**, and `declassify` removes only the
+`app` principal — the app publishes its own outcome codes and withdrawal receipts, and a
+`declassify` of any other principal fails the request (`declassify is not granted …` in the log). Vela signs the state root, so the same inputs must produce the same bytes — the
 ceiling makes that a property of the runtime, not of discipline (the Go reference app stamps
 `time.Now()` on every transaction; here that line does not compile into the enclave). Maps keep
 insertion order and JSON is emitted in that order, so the state bytes are the same across runs and

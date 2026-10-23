@@ -9,7 +9,7 @@
 //!   arquitecturas propias. Un trait escrito antes de tener un segundo implementador se
 //!   escribe mal, y el spec ya fija ese criterio para `archdef` (§2.4); vale igual acá.
 //! - **I4 convierte esto en despacho de verdad**, y no sólo entre backends: el binario oficial
-//!   hoy corre el camino escalar porque candle se compila sin AVX2 (`.synsema-skill/llm.md:205`).
+//!   hoy corre el camino escalar porque candle se compila sin AVX2 (`skills/synsema/llm.md`).
 //!   La detección de AVX2/AVX-512/NEON al arrancar vive en este archivo cuando llegue.
 //!
 //! Mientras tanto, la superficie es chica a propósito: las arquitecturas de I1 son adaptadores

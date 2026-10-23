@@ -167,6 +167,13 @@ current documents expire at T)`); if the current documents expire without a rene
 not be renewed (…)`, exit ≠ 0) — never an expired document, never a dropped driver. `run --attest`
 does not renew: it is one run's artefact.
 
+**With `--auditor` (v0.6.46+)** the server's sealed receipts (one per request, see
+[observability.md](observability.md) § Sealed receipts) are signed with **this attested key**:
+header `"run_key": {"alg": "P-256", "public": "<compressed point, 33 bytes, base64url>",
+"identity": "attested"}` — the same key as `public_key_hex` (SPKI there) — and the header's
+`config_sha` is the one `/.well-known/attestation` publishes. The auditor key is NOT in `config`, so
+it does not change `config_sha`.
+
 **`program_sha`** = `sha256(source ‖ 0x00 ‖ sha256(module_1) ‖ … ‖ sha256(module_n))`: each `use`d
 module **once** (by resolved path), depth first in the order the `use` lines appear in the source —
 a `use` inside a task that never runs counts too (up to v0.6.42 a module imported from two places
@@ -273,6 +280,34 @@ the document fails after: the output is already printed, the JSON line is missin
   with different secrets could otherwise give the same `output_sha` with different `steps`, which is
   a channel inside the artefact whose whole job is to be published.
 
+### `run --attest --auditor` binds the receipt's key (v0.6.46+)
+With an auditor the sealed receipt is signed by a key made for the run (`"identity": "ephemeral"`:
+alone, it only detects accidental damage). `run --attest` binds it: the JSON line gains
+`"run_key": "<base64url, the 32-byte Ed25519 public key>"` (= the receipt's
+`header.run_key.public`), the receipt header carries the same `config_sha`, and
+```
+report_data = sha256(program_sha ‖ input_sha ‖ output_sha ‖ config_sha ‖ sha256(run_key))
+```
+(each field the raw 32 bytes; `sha256(run_key)` over the key's 32 bytes). **Without an auditor
+`report_data` does not change** (four fields, no `run_key`). A verifier of `run --attest` documents
+MUST add the fifth field when `run_key` is present, or every audited document fails:
+```synsema
+require file.read("attest.json")
+require time
+
+-- the JSON line that `SYNSEMA_ATTEST=mock synsema run --attest --auditor <public> p.syn` printed last
+let art be json_decode(read_file("attest.json"))
+let a be art["attestation"]
+let seen be attestation_verify(bytes(a["document"], "base64"), {"now": floor(now()), "format": a["format"], "root": bytes(a["root"], "base64")})
+let base be bytes(art["program_sha"], "hex") + bytes(art["input_sha"], "hex") + bytes(art["output_sha"], "hex") + bytes(art["config_sha"], "hex")
+let expected be sha256(base)
+when get(art, "run_key") != nothing
+    set expected to sha256(base + sha256(bytes(art["run_key"], "base64url")))
+print(seen["report_data"] == expected)    -- true
+```
+(`root` only with the `mock` driver.) `--attest --auditor` takes `--receipt <path>`; `--replay` and
+`--explain` combine with neither.
+
 ## Drivers
 
 Chosen by `SYNSEMA_ATTEST` — one driver, or a comma-separated list (`tsm,nitro-tpm`; v0.6.43+) —
@@ -374,9 +409,11 @@ and an `encoding` that says which bytes those were (`"text"`, `"bytes"`, `"jcs"`
 `canonical_json(x)`, or `"json"` = `json_encode(x)` when the value holds an integer beyond 2^53), so
 a verifier can recompute every hash.
 `lineage()` returns that list; `receipt()` carries it as `credentialSubject.inputs` next to
-`program_sha`, `engine`, the capability audit and `declared_result_sha256`. Signed, one document
-then says: *this measured code read these
-inputs and declared this output*. A verifier recomputes the sha256 of the inputs it holds. To fix
+`program_sha`, `engine`, the capability audit and `declared_result_sha256` — and, v0.6.46+,
+`credentialSubject.outputs`: every file the run wrote (`write_file`/`append_file`/`edit_file`/
+`zip_extract`/`tar_extract`, path + sha256; [observability.md](observability.md) § Outputs). Signed,
+one document then says: *this measured code read these inputs, wrote these files and declared this
+output*. A verifier recomputes the sha256 of the inputs it holds. To fix
 the receipt in time, anchor `sha256(canonical_json(signed_receipt))` on a chain (calldata or an event
 of your contract, via `evm_tx` + `evm_send`). What it does not cover: values that are
 not reads (`env`/`secret`, the blackboard) and completeness across units. Full

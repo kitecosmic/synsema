@@ -26,7 +26,8 @@ let raw be `order,day,region,amount
 
 -- 1. Load with TYPES (an empty field is nothing = missing)
 let rows be csv_parse(raw, {"types": {"order": "int", "day": "date", "amount": "float"}})
--- Parquet instead: parquet_read(read_file_bytes("sales.parquet")) comes already typed
+-- Parquet instead: parquet_read(read_file_bytes("sales.parquet")) comes already typed;
+-- parquet_scan("sales.parquet", {"columns": [...]}) reads only those columns from disk (v0.6.46+)
 
 -- 2. Decide what missing means: here, an order without an amount is dropped
 let clean be drop_missing(rows, "amount")
@@ -67,6 +68,58 @@ print(csv_encode(monthly))
 `truncate(d, "month")` · `read_parquet`/`to_parquet` → `parquet_read`/`parquet_write` · `read_json(lines=True)` →
 `jsonl_decode`. More in [python-diff.md](python-diff.md).
 
+## Parquet from disk — `parquet_scan` (v0.6.46+)
+
+`parquet_read(bytes)` needs the whole file in memory first (`read_file_bytes`). `parquet_scan(path,
+opts?)` reads the file **on disk by parts**: the footer (the metadata) and then only the pages of
+the columns and row groups it is asked for. A file of gigabytes with one column asked reads that
+column.
+
+```synsema
+require file.read("./data/**")
+let few be parquet_scan("./data/events.parquet", {"columns": ["id", "kind"], "limit": 1000})
+let first_group be parquet_scan("./data/events.parquet", {"row_groups": [0]})
+```
+
+- **Options** — the same as `parquet_read`, with the same checks: `columns` (a list of names; the
+  rows keep the **file's** column order, whatever order you list them in; `[]` gives one empty map
+  per row), `row_groups` (0-based indexes; `[]` gives `[]`), `limit` (a positive integer: `0`,
+  `-1` or `1.5` is an error), `max_cells` (default 50 000 000 = rows × columns read) and
+  `max_bytes` (default the larger of 1 GiB and 64 × the file size). The caps count only what is
+  read and are checked before allocating; a page that declares more than 256 MiB is refused even
+  with `limit`. No `opts` → the whole file.
+- **Result** — the same typed rows as `parquet_read` (equal values for the same options).
+- **Capability** — `require file.read(<the path>)` (a folder: `file.read("./data/**")`). It is
+  checked and the file opened in one step, as `read_file`. `synsema check` / `synsema code caps`
+  name the missing `require`. A file bundled into a `synsema build` binary (`--include`) is read
+  from the bundle, without the grant.
+- **Lineage** — one input per call: `{source: "parquet_scan", what: <the path as written>, sha256,
+  bytes, encoding: "jcs"}`, where `sha256` is the hex of `sha256(canonical_json(rows))` of the rows
+  returned and `bytes` their length — two calls with different options are two entries.
+  `parquet_read(b)` records only `bytes <n>`; `parquet_scan` records the path.
+- **Labels** — like `read_file`, a call under a branch decided by a private value is a
+  `label_violation` (move it out of the branch).
+- **Not here:** the wasm build (no file system; `parquet_read` is not there either) and
+  `parquet_info`, which still takes bytes (`parquet_info(read_file_bytes(p))`; a path is an error
+  that says so). There is no streaming iterator: the rows asked for come back as one list, so
+  bound a big read with `columns`/`row_groups`/`limit`.
+
+| Error | Fix |
+|---|---|
+| `parquet_scan: expected a path, got bytes — for bytes already in memory, parquet_read(bytes)` | pass the path, or use `parquet_read` |
+| `parquet_scan: the file has no column "zz" (columns: id, name, v)` | a name from the list |
+| `parquet_scan: row group 1 does not exist (the file has 1: 0..1)` | an index below the count (`parquet_info(…).row_groups`) |
+| `parquet_scan: unknown option "bogus" (valid: columns, row_groups, limit, max_cells, max_bytes)` | one of those |
+| `parquet_scan: option "limit" must be a positive integer, got 0` | a whole number ≥ 1 |
+| `parquet_scan: opts must be a map, got text` | a map |
+| `parquet_scan: the file has 30 cells (rows × columns); the limit is 5 — raise it on purpose with {"max_cells": n}` | read less, or raise it for a file you trust |
+| `parquet_scan: the file expands to more than 10 bytes uncompressed (max_bytes) — raise it on purpose with {"max_bytes": n}` | idem |
+| `parquet_scan: a page declares 2047 MiB uncompressed (the limit is 256 MiB per page; …) — the file is malformed or hostile, refusing to allocate it` | the file is broken or hostile; no option raises this |
+| `parquet_scan: not a Parquet file: …` | it is not Parquet |
+| `parquet_scan: the file has two columns named "a" — a row is a map and would lose one; rename it where the file is written` | rewrite the file with distinct names |
+| `File not found: missing.parquet` | the path |
+| ``Capability not granted: file_read("other.parquet") — … add `require file.read("other.parquet")` …`` | that `require` |
+
 ## CSV — `csv_parse` / `csv_encode`
 
 Text ↔ values, mirroring `json_encode`/`json_decode`. RFC 4180: quoted fields with embedded
@@ -92,7 +145,7 @@ write_file("out.csv", csv_encode(rows))
   keys, in order) or list of lists. Opts: `"headers": [..]` (column order/subset),
   `"delimiter"`, `"eol"` (`"\r\n"` default — Excel-friendly; or `"\n"`).
 - Guarantees: minimal quoting; integers without decimals (`42`, not `42.0`); `nothing` →
-  empty field (and back to `nothing` on parse), the empty text → `""` (and back to `""`); dates/datetimes → ISO text; `bytes` → base64; **`secret` → `[redacted]`** (never the plaintext); nested
+  empty field (and back to `nothing` on parse), the empty text → `""` (and back to `""`); dates/datetimes → ISO text; `bytes` → base64; **a `secret` is an error** since v0.6.46 (`csv_encode: row 1, column "a": secret(K) is never written as text — leave it out of the rows`; before, it came out as `[redacted]`); nested
   list/map → clear error suggesting `json_encode` for that field.
 - Errors always carry the line/row: unclosed quote, uneven field count, duplicate
   headers, unknown option (typo guard). All catchable with `try`/`recover`.

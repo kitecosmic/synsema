@@ -69,6 +69,60 @@ const r = await syn.runAsync(code, {
   Worker or a trapped module.
 - In the sync API a trap recreates the instance by itself (the call throws
   `synsema: the module trapped (…); the instance was recreated`; the next call works).
+- With `labels: true`, a run that hits `maxMemoryMb` reports `steps: null` and
+  `private_seen: true` (whether it ran out of memory can depend on a private value): treat it as
+  sensitive, like any run with `private_seen`.
+
+### Ceilings for labelled code (v0.6.46)
+
+- **`declassify` is bounded by `ceiling`.** With `labels: true` and a ceiling, only the principals
+  the ceiling names can be published: `ceiling: "stdout,declassify=customers"` (globs work:
+  `declassify=cust*`; a bare `declassify` allows any; `"sandbox"` never grants it). Otherwise
+  `declassify` fails with `label_violation: declassify is not granted for what this value is private
+  to (customers) …`, which `try`/`recover` cannot catch. Without a ceiling, or without `labels`,
+  nothing changes. **Breaking** for a host that runs labelled code under a ceiling and expects it to
+  publish: add `declassify=<principal>`.
+- **Private data to your `llm` hook:** the program declares `require llm("customers")` and the
+  ceiling says `llm=customers@embedder` (or `llm=customers@*`). Then the prompt carries the data,
+  your hook gets `info.principals` (`["customers"]`), the answer comes back private, and `audit`
+  has `llm("customers@embedder")` (source `llm-data`). Anything less (`llm=customers@local`,
+  `llm=customers`, no ceiling, a bare `require llm`) refuses it before the hook runs. `judge` is the
+  same with `require judge("…")` and `judge=…@embedder`.
+- **`judge` checks its capability:** a `ceiling` without `judge` refuses a `judge` block
+  (`Capability not granted: judge — declared but above the host ceiling …`).
+
+### Trusted tools: `trusted`, `trustedCeiling` (v0.6.46)
+
+```js
+const trusted = { tools: `export task first_name(c)
+    require declassify("customers")
+    give declassify(c.name, "the customer's own name")
+` };
+const code = `use "trusted:tools" as t
+let c be private({"name": "Ana", "card": "4111"}, "customers")
+print(t.first_name(c))`;
+syn.run(code, { labels: true, ceiling: "stdout", trusted, trustedCeiling: "declassify=customers" });  // prints Ana
+```
+
+Code you do not trust can only call the exported tasks of a module you lend; each runs with its own
+`require`, bounded by `trustedCeiling` (give one: without it a trusted task declassifies any
+principal), and nothing from the caller. Its arguments are data (a task or a lambda among them is
+an error). Works in `run`, `test`, `handle` and their `*Async` forms.
+
+### Sealed receipts: `auditor` (v0.6.46)
+
+The engine accepts `auditor` (an X25519 public key in base64url, from `synsema receipt keygen`) and
+`sealed_bytes` (4096–16777216, default 65536) in a `run` request and returns the sealed receipt in
+`receipt`. In v0.6.46 `run()`/`runAsync()` do not pass `auditor` on; use the low-level API:
+
+```js
+import { Synsema, instantiateSync, dispatchHostSync, offersOf } from "@synsema/wasm";
+const syn = await Synsema.loadNode();
+const host = { kv: { get: (ns, k) => null, set: (ns, k, v) => {} } };
+const inst = instantiateSync(syn.module, (kind, payload) => dispatchHostSync(host, kind, payload));
+const r = inst.call({ op: "run", source: code, filename: "app.syn", labels: true, auditor: AUDITOR_PUBLIC_KEY, host: offersOf(host) });
+r.receipt;   // the receipt object: write it as one JSON line for `synsema receipt verify` / `open`
+```
 
 ## Lending capabilities (the host)
 
@@ -80,7 +134,7 @@ makes the builtin fail with a clear error; a `ceiling` denies above what the hos
 const host = {
   http: (req) => ({ status: 200, headers: [["content-type", "application/json"]], body: "{}" }),
   kv: { get: (ns, k) => store.get(ns + "/" + k) ?? null, set: (ns, k, v) => store.set(ns + "/" + k, v) },
-  llm: (op, prompt) => ({ content: "…", tokens: 12 }),
+  llm: (op, prompt, info) => ({ content: "…", tokens: 12 }),   // info.principals (v0.6.46)
   log: (line) => console.log(line),
 };
 
@@ -89,7 +143,9 @@ syn.run(`require llm\nprint(reason about "the weather")`, { host, ceiling: "stdo
 ```
 
 - `kv` backs persistent agent memory (`remember`/`recall`, rules, progress — namespace
-  `memory:<declared name>`) and `state_*` (namespace `state`). `delete` and `list` are optional.
+  `memory:<declared name>`) and `state_*` (namespace `state`). `delete` and `list` are optional
+  (without `list`, `state_all()` is `{}`). `get` returns the stored **text** or `null`/`undefined`;
+  `list` returns the key names as an array of strings.
 - `kv.cas(ns, key, expected, value)` (optional) is compare-and-swap: write `value` only if the
   stored text is exactly `expected` (`null` = the key does not exist) and return `true` or
   `false` — anything else fails the call with `kv.cas must return true or false`. Your store must
@@ -108,9 +164,47 @@ syn.run(`require llm\nprint(reason about "the weather")`, { host, ceiling: "stdo
   without `cas` they fail saying so (`the host's kv does not offer cas (kv.cas) …`) instead of
   risking a lost write. With no host `kv`, the state belongs to the wasm instance and is atomic:
   it lasts across that instance's `handle` requests, and each `run` starts with an empty state.
-- `llm` backs `reason`/`decide`/`analyze`/`generate`; `llm_usage()` sums the tokens you report.
+- `llm(op, prompt, info)` backs `reason`/`decide`/`analyze`/`generate`; `llm_usage()` sums the
+  tokens you report. `info.principals` lists the owners of the private data in the prompt (`[]`
+  with public data).
 - `http` backs `fetch`/`http_*` and the blockchain read-side RPC — after the `net(host)`
   gate, with the same URL canonicalization as the native binary.
+
+### What a hook must answer (v0.6.46 — breaking)
+
+A hook that fails, or answers something unexpected, is an **error of the builtin that asked**, not
+"the key is not there" (before, the next write replaced what your store held):
+
+| Your hook | The program gets |
+|---|---|
+| `kv.get` throws / rejects | `state_get: host kv.get failed: <message>` |
+| `kv.get` returns a number, boolean or object | `… kv.get must return a string or null, got a number` |
+| the stored text is not JSON | `state_incr: the stored value of 'c' is not JSON (…)`; nothing is written |
+| `kv.list` throws, or returns `{keys: [{name}]}` (Cloudflare KV), `[{name}]`, `undefined` | `state_all: host kv.list failed: kv.list must return a list of strings, got an object` |
+| a declared `memory` fails to load or is unreadable | the memory is not opened: `memory "agenda" could not be loaded (…); nothing was loaded, so nothing is written over it` |
+| reading the audit log of `reveal`/`sign`/`wallet`/`spend` fails | the operation is refused; the log stays as it was |
+| `llm` throws | that call fails with the hook's message (`the host's llm hook threw` without one); redacted when the prompt carried private data |
+
+To migrate: give back the exact text the engine handed to `set` (it is JSON; do not parse it), and
+make `list` return key names. Over a store whose `list` answers `{keys: [{name}]}`:
+
+```js
+list: async (ns) => (await store.list({ prefix: `${ns}/` })).keys.map((x) => x.name.slice(ns.length + 1)),
+```
+
+### The `http` hook: redirects and private addresses (v0.6.46)
+
+- A request that carries a secret (URL, query, body, form or any header) arrives with
+  `req.redirect === "error"`. Honor it — with `fetch`, pass `redirect: req.redirect ?? "follow"` —
+  or a 3xx carries the key to a host the program never named.
+- In wasm the engine checks the host **name** against `require net`, never the address. Natively a
+  wildcard `net` grant reaches only public addresses; here that is your hook's job if the programs
+  are not yours: resolve the name, check the address against loopback, the private networks (RFC
+  1918, CGNAT `100.64.0.0/10`, ULA `fc00::/7`), link-local (`169.254.0.0/16`, the cloud metadata
+  endpoint, `fe80::/10`), multicast and the documentation ranges (an IPv4 inside an IPv6 counts as
+  that IPv4), and connect to that same address. The hook does not know whether the program named
+  the host, so name the private destinations your programs need in the hook. A complete Node hook
+  (`node:https` with a checking `lookup`) is in the Synsema docs, *WebAssembly*.
 
 ## Async hosts (browser `fetch`, IndexedDB, LLM SDKs)
 
@@ -138,7 +232,8 @@ res.status; res.content_type; res.headers; res.body;
 ```
 
 Routes, params, query, `auth with`, `errors with`, `content()` negotiation, `redirect`,
-pagination and `state_*` (durable through your `kv`) work as in the native server. Not in
+pagination and `state_*` (durable through your `kv`) work as in the native server. `receipt()`
+in a handler lists only what that request read (v0.6.46: not what the top-level read). Not in
 handler mode: `stream` (SSE), `proxy to`, rate limits, `static` mounts, vhosts, TLS —
 your edge platform does those before calling the handler.
 

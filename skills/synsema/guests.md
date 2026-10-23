@@ -28,6 +28,7 @@ downloads the release asset once and runs it:
 
 ```sh
 synsema test app/app.syn                                                         # the app, natively (same code runs in the enclave)
+synsema test --labels --cap-set stdout,declassify=app app/app.syn                # …with the guest's exact rules (labels on, its ceiling)
 synsema run scripts/embed.syn -- synsema-vela-guest.wasm app/app.syn build/app.wasm   # what scripts/build.sh does
 node scripts/smoke.mjs build/app.wasm                                            # optional; Node 20 or 24+ (NOT 22, see below)
 ```
@@ -55,6 +56,21 @@ covers a `require` (in a private branch, or with a private scope) and the operat
 audit log (`sign` and the signing builtins, `spend`, `reveal`, wallet operations): under a private
 branch they are a `label_violation` — declare capabilities at the top and decide signing with a
 public value ([labels.md](labels.md)). Vela's upload limit is 50 MB.
+
+**Publishing = `declassify` under the guest's ceiling (v0.6.46+).** `app` is the only principal in
+the guest (`ctx["state"]`, `ctx["payload"]` and what derives from them are private to `app`), and
+since v0.6.46 `declassify` is a capability a host ceiling bounds: the guest runs every app under
+`stdout,declassify=app`. Declassifying the app's own data (the outcome code in `error`, an app
+event, a withdrawal receipt) works as before; a value private to any OTHER principal (one the
+program made with `private(x, "other")`) cannot be published — the request fails with
+`{"error": "runtime_error"}` and the log has `ERR runtime_error: Runtime error: label_violation:
+declassify is not granted for what this value is private to (…, other). With a ceiling …`. A private
+value reaching a public field without any `declassify` stays `{"error": "label_violation"}` with
+`ERR label_violation: app_events[0].data is private to app, the sink accepts (public) (declassify it,
+or keep it in state/events)`. Existing apps that only declassify their own data need no change. Test
+with the guest's exact rules natively: `synsema test --labels --cap-set stdout,declassify=app app.syn`
+(the shipped `app.syn` uses `private(...)` in its tests: without `--labels` they fail with
+`private: labels are off; run with --labels or serve --attested`).
 
 Node probe = Node 20 or 24+, **never 22**: Node 22.x segfaults intermittently inside V8 while
 running this module (concurrent tier-up race; 22.23.2 on Linux crashed 1 run in 3, 20 and 24
@@ -104,8 +120,8 @@ process from the same on-chain request run back to back, the second on the state
   hundred per call, `novaw` reserves 100 wei by default: declare constants (the reference app uses
   5/20/35/50) or reserve more.
 
-**Determinism.** The program runs under the `stdout` ceiling: no `now()`, `random()`, `token()`,
-network, files, LLM (the Go reference app stamps `time.Now()`; here that line cannot compile in).
+**Determinism.** The program runs under the ceiling `stdout,declassify=app` (v0.6.46+; before,
+`stdout`): no `now()`, `random()`, `token()`, network, files, LLM (the Go reference app stamps `time.Now()`; here that line cannot compile in).
 Maps keep insertion order, JSON is emitted in that order — the same input gives the same bytes
 across runs and instances (verified: 5 processes, identical hashes). Available: types, JSON,
 `decimal` (exact, 28 digits), `bytes_to_int`/`int_to_bytes` (exact 256-bit), `keccak256`,
@@ -193,12 +209,12 @@ The full table, with the `WRN` each degraded case logs, is in `packages/guests/v
 
 | Path | What | Tests |
 |---|---|---|
-| `app.syn` | private ledger: balances per account/token, transfers, withdrawals with a public **ABI receipt** (`app_events` + `data_hex` + label subtype), deanonymization report, a `trusted` task decoding `(address,address,uint256)` from `payload_hex` | 8; drives the Node probe |
-| `examples/payment_app.syn` | Horizen's Private Transfer app (`vela-nova` `payment_app`) in Synsema, **wire-compatible with the `novaw` wallet** (same payload instructions, event bodies with `balance` in Uint256 hex, `allowedTokens` deploy params, `balances`/`tx_history` reports, keccak invoice receipts). No timestamps (no clock in the enclave) — `tx_history` filters by address | 9 |
-| `examples/trigger_app.syn` | execution pool for the trigger cycle: `execute` locks funds, withdraws to the trigger, emits `execute_requested` with abi `(bytes16,address,uint256,bytes)`; `trusted` decodes `(bytes16,uint256,uint8)`, credits the remainder, clears the lock; no app events on the way back | 6 |
+| `app.syn` | private ledger: balances per account/token, transfers, withdrawals with a public **ABI receipt** (`app_events` + `data_hex` + label subtype), deanonymization report, a `trusted` task decoding `(address,address,uint256)` from `payload_hex` | 10 (`synsema test --labels`); drives the Node probe |
+| `examples/payment_app.syn` | Horizen's Private Transfer app (`vela-nova` `payment_app`) in Synsema, **wire-compatible with the `novaw` wallet** (same payload instructions, event bodies with `balance` in Uint256 hex, `allowedTokens` deploy params, `balances`/`tx_history` reports, keccak invoice receipts). No timestamps (no clock in the enclave) — `tx_history` filters by address | 10 (`--labels`) |
+| `examples/trigger_app.syn` | execution pool for the trigger cycle: `execute` locks funds, withdraws to the trigger, emits `execute_requested` with abi `(bytes16,address,uint256,bytes)`; `trusted` decodes `(bytes16,uint256,uint8)`, credits the remainder, clears the lock; no app events on the way back | 8 (`--labels`) |
 | `examples/trigger/` | `src/PoolTrigger.sol` (extends `AbstractTrigger`), `foundry.toml`, `build.sh` (clones `HorizenOfficial/vela` v0.2.0 — BSL, never vendored — and `forge create`s with the deployer key); only `IERC20` is a stub | — |
 | `examples/erc20/` | `src/TestToken.sol` (minimal ERC-20 **with EIP-2612 `permit`**), `build.sh` (deploy + `addAllowedToken`) | — |
-| `examples/client/vela_client.syn` | the client, below | 7 |
+| `examples/client/vela_client.syn` | the client, below | 15 |
 | `tests/wasmtime-go/` | Go probe on wasmtime-go v1.0.0 | — |
 | `src/lib.rs` | the adapter | 4 (`cargo test --target <host>`) |
 
