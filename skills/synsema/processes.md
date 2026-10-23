@@ -21,6 +21,15 @@ run(cmd, args_list?, timeout?, opts?) -> map
 - `args_list` (list, optional): one argument per element. Absent = no args. Non-list → error.
 - `timeout` (number, optional): seconds. **Default 120.** On expiry: kill the process and **raise**.
 - `opts` (map, optional): `{cwd, env, stdin, max_output}`.
+- **`cwd` + a relative command (v0.6.46+, BREAKING):** a command with a path separator (`./tool`,
+  `bin/tool`) resolves against `cwd`, like `cd sub && ./tool`, and **that** is the scope to grant:
+  `run("./tool.bat", [], 60, {"cwd": "sub"})` (and `proc_spawn("./tool.bat", [], {"cwd": "sub"})`) ask
+  for `exec("./sub/tool.bat")` and run `sub/tool.bat`. Before, they asked for `exec("./tool.bat")` and
+  the file that ran depended on the OS (the one in `sub` on Unix, the one next to the program on
+  Windows). A command without a separator (`git`, `tool.bat`) is still looked up in `PATH` (never in
+  `cwd`); an absolute path is unchanged. Migrate: grant exactly what the error names —
+  `Capability not granted: exec("./sub/tool.bat") … add `require exec("./sub/tool.bat")`` — with the
+  `./` (`exec("sub/tool.bat")` does not match).
 
 Returns `{exit_code, stdout, stderr, stdout_truncated, stderr_truncated}`:
 - `exit_code` number (`-1` if killed by signal). `stdout`/`stderr` text (lossy, up to `max_output`).
@@ -246,6 +255,13 @@ the child inside a real pseudo-terminal (openpty on Linux/macOS, ConPTY on Windo
 pipe doesn't; it changes how the child behaves, not what it may do. `sandbox` denies it
 like any `exec`.
 
+**Windows (v0.6.46+): a pty runs the name as written.** A command with a path that does not exist
+as written is an error — `proc_spawn: cannot start "…\sub/notes": no such file (with pty, the exact
+name is run; no PATHEXT extension is added)`. Before, the terminal layer tried `PATHEXT`, so a grant
+for `notes.txt` could run `notes.bat` and `C:/x/node` ran `node.exe`. Name the file with its
+extension (`./notes.bat`). A command without a separator (`notes`) is still looked up in `PATH` with
+`PATHEXT`.
+
 ```synsema
 require exec("npm")
 let p be proc_spawn("npm", ["install"], {"pty": true, "cols": 120, "rows": 40})
@@ -362,6 +378,15 @@ Changes on disk as a **handle with events**, in the same hub as processes, socke
 bus (so it goes into `select`). Gate: `file_read(path)` — watching a tree is reading it:
 `require file.read("src/**")` (v0.6.45+: `**` covers `src`, everything below it and `src` itself;
 the old `file("src")` + `file("src/*")` pair no longer reaches subfolders).
+
+**A recursive watch (the default) needs `file.read("<dir>/**")` (v0.6.46+, BREAKING)**, like `grep`
+and `static`: with only `file.read("src")` → `Capability not granted: file_read("src/**") … add
+`require file.read("src/**")``; with only `"src/*"` the message names `file_read("src")` (`*` does not
+cover the folder itself). Before, only the root was checked, so the watch reported names under
+`src/sub/` the program could not read. Grant `"src/**"`, or pass `{"recursive": false}` (needs only
+the folder, like `list_dir`; `watch_stats(h).recursive` is then `false`). A root that is a **file**
+when the watch starts is watched as `recursive: false` (if a folder replaces it, only its first level
+is seen). A missing root is still an error: `watch: cannot watch "nope": no such file or directory`.
 
 ```synsema
 require file.read("src/**")

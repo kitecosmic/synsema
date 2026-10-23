@@ -41,9 +41,36 @@ let r be http_delete(url, {"x-api-key": secret("STORE_API_KEY")})  -- any header
 
 **Timeout (optional on every HTTP builtin; a key in `fetch`'s map):** seconds as a
 positive number; absent or invalid → **30** (the historical default). Signatures: `fetch(url,
-{method, headers, body, timeout, tls_pin, attested})` (the form to write), `http(method, url, headers?, query?, body?, timeout?)`,
-`http_get(url, headers?, query?, timeout?)`, `http_post(url, body, headers?, timeout?)`,
-`http_put(url, body, headers?, timeout?)`, `http_delete(url, headers?, timeout?)`, `http_bytes(method, url, headers?, query?, body?, timeout?)`.
+{method, headers, body, form, timeout, tls_pin, attested})` (the form to write), `http(method, url, headers?, query?, body?, timeout?, form?)`,
+`http_get(url, headers?, query?, timeout?)`, `http_post(url, body?, headers?, timeout?, form?)`,
+`http_put(url, body?, headers?, timeout?, form?)`, `http_delete(url, headers?, timeout?)`, `http_bytes(method, url, headers?, query?, body?, timeout?, form?)`.
+An unknown name lists the valid ones: `unknown parameter 'timout' — did you mean 'timeout'?; the
+parameters are: url, headers, query, timeout`.
+
+**`form = {…}` (v0.6.46+)** in `http`, `http_bytes`, `http_post`, `http_put` and `fetch` sends an
+`application/x-www-form-urlencoded` body (the encoder of `oauth_basic`; your own `Content-Type`
+wins): `http_post(url, form = {"grant_type": "client_credentials", "scope": "read write", "n": 1})` →
+`grant_type=client_credentials&scope=read+write&n=1`. Fields: text, number, bool or a **bound** secret
+(`form field "a" must be text, a number or a secret, got list`; `form field "a" is nothing; pass a
+value …, or leave it out`; an unbound secret → the `require secret("K") for net("…")` line). `body`
++ `form` → `pass body or form, not both (form is the body, encoded as a form)`. By name only in
+practice; `http_get`/`http_delete` do not take it (`unknown parameter 'form'`) — use
+`http(method = …, url = u, form = {…})`.
+
+**Redirects are not followed** (any version): a `3xx` comes back as the response with its
+`Location` (`header(r, "location")`); your code decides. An embedder implementing `http` receives
+`redirect: "error"` when the request carries a secret (v0.6.46+) and must honor it.
+
+**A wildcard `net` reaches only public IPs (v0.6.46+, SSRF).** `require net`, `net("*")`,
+`net("*.x.com")` no longer reach loopback/private/link-local (cloud metadata)/documentation ranges.
+The `http*` builtins return it as a transport failure — `{status: 0, ok: false, …, error}` with
+``http_get: `127.0.0.1.nip.io` resolved to 127.0.0.1, a private address; a `net` grant with a
+wildcard reaches only public addresses. Name it: `require net("127.0.0.1.nip.io:47100")`, its address
+or its CIDR (the scope can come from the configuration: `require net(env("…_URL"))`)`` — so check
+`ok of r`. Name the private host (`net("db.internal")`), its address, its CIDR, or
+`net(env("CONTROL_URL"))` — full rules in capabilities.md. Windows note: `localhost` may resolve to
+`::1` first and a `serve` listens on IPv4 `0.0.0.0`; the client connects to the one address it
+checked, so `http://localhost:8080/` can be refused while `http://127.0.0.1:8080/` answers.
 
 **Named arguments (v0.6.45+).** The `http*` builtins take their arguments by name:
 `http_get(url, headers = {…}, query = {…}, timeout = 10)`, `http_post(url, body, headers = {…}, timeout = 30)`,
@@ -71,7 +98,10 @@ takes a map of headers (`request.headers`); `nothing` when absent. `url_encode`/
 > `{"x-api-key": secret("KEY")}` or any custom header; it's materialized only at the
 > socket and redacted in logs/errors. `bearer(s)` is sugar for `Authorization: Bearer
 > <token>`. For a key that arrives at runtime (not from `.env`), seal it with
-> `as_secret(...)`. In query params and the body a `secret` is **redacted** (fail-closed).
+> `as_secret(...)`. An **unbound** `secret` in the URL, query params, the body or a form is an
+> **error** whose message gives the fix; a secret **bound to the host** —
+> `require secret("K") for net("api.x.com")` (v0.6.46+) — may go there (URL path as is, `query` and
+> `form` percent-encoded, JSON body at any depth), only to those hosts, only over https/wss.
 > See **[secrets.md](secrets.md)**. A URL with `user:pass@` sends `Authorization: Basic …`
 > (percent-decoded to raw bytes, like curl; your own `Authorization` header wins) — v0.6.29+. A
 > URL with no host (`http://alice:pw@/rpc`) is the error `the URL has no host`, which never echoes
@@ -133,7 +163,10 @@ ws_close(conn)                      -- clean close frame (idempotent)
 ```
 
 - `ws_connect(url, headers?, opts?)` → handle. `headers` is a text→text map (a `secret`
-  value materializes only at the socket, like HTTP). `opts`: `{"timeout", "max_message_size"
+  value materializes only at the socket, like HTTP). v0.6.46+: a key in the URL is a secret bound to
+  the host (`require secret("K") for net("stream.x.com")` + `` ws_connect(`wss://stream.x.com/v1/{k}`) ``;
+  a text frame echoing it arrives as `[secret K]`), and with a wildcard `net` a private address is an
+  error naming the grant to write (re-checked on each reconnection). `opts`: `{"timeout", "max_message_size"
   (16 MiB default, 64 MiB ceiling), "subprotocols" (list → negotiate Sec-WebSocket-Protocol),
   "max_queue" (inbound cap in MESSAGES, default 1024), "max_queue_bytes" (inbound cap in
   BYTES, default 64 MiB, ceiling 1 GiB — the queue is bounded in BOTH dimensions),
@@ -279,7 +312,10 @@ Universal API routed by the `db_open` target: a **file path** → SQLite (built-
 `bytes` columns round-trip to/from `BLOB`/`BYTEA` byte-exactly (binary-safe).
 
 **SQLite boundaries (v0.6.45+).** `ATTACH DATABASE '<file>'` and `VACUUM INTO '<file>'` are refused
-(`not authorized` / `authorization denied`), with the name written or computed (`ATTACH ? AS x`,
+(`not authorized` / `authorization denied`; v0.6.46+ the message goes on: `Synsema refuses ATTACH of
+a file (VACUUM INTO uses it) and the pragmas data_store_directory and temp_store_directory, so a query
+cannot open a database the program did not declare; open the other database with db_open(<path>),
+which needs require db(<path>)`), with the name written or computed (`ATTACH ? AS x`,
 `'a' || '.db'`): they opened or created any file without `require db(...)`. Open another database
 with `db_open` (gated by `db`). A plain `VACUUM` and `ATTACH ':memory:'` work. The pragmas
 `temp_store_directory`/`data_store_directory` are refused. `db_open` refuses a `file:` URI
@@ -501,7 +537,10 @@ write_file("./out/by_region.svg", chart_svg("bar", ranked, {"x": "region", "y": 
   JSON Lines (`jsonl_encode`/`jsonl_decode`), Parquet (`parquet_read(bytes)`/`parquet_write(rows,
   opts?)`, zstd/snappy/gzip/lz4, native only; v0.6.45+ `parquet_info(bytes)` → columns, row count
   and row groups without reading the data, and `parquet_read(bytes, {"columns": [...],
-  "row_groups": [...], "limit": n})` reads only that part), loose `.csv.gz`/`.json.gz` with
+  "row_groups": [...], "limit": n})` reads only that part; v0.6.46+ `parquet_scan(path, opts?)`
+  reads that part **straight from the disk** — only the footer and the pages of the columns and
+  row groups asked for, never the whole file — with `require file.read(path)`; see
+  [dataviz.md](dataviz.md) § Parquet from disk), loose `.csv.gz`/`.json.gz` with
   `gunzip` (v0.6.45+), scraped pages with `html_select`/`html_text` (v0.6.45+). Bytes/text in and
   out; the disk is `read_file`/`read_file_bytes`/`write_file` with `file.read`/`file.write`.
 - **Tables:** `group_by` → `[{key, items}]`, `summarize` + `sum_of`/`mean_of`/`min_of`/`max_of`/
@@ -518,7 +557,7 @@ write_file("./out/by_region.svg", chart_svg("bar", ranked, {"x": "region", "y": 
   `numpy.random.default_rng(42)`, no capability (train/test splits, simulations).
   `parallel_map(f, rng_spawn(g, n))` gives each worker a copy of its own child (numpy's
   `g.spawn(n)`); one generator in two items is an error.
-- **Lineage:** the engine records every read (`read_file`/`list_dir`/`grep`/`parquet_read`, HTTP host,
+- **Lineage:** the engine records every read (`read_file`/`list_dir`/`grep`/`parquet_read`/`parquet_scan`, HTTP host,
   the hash of each SQL/Mongo/Redis query, chain RPC reads, socket/process messages, model answers,
   stdin, what `run`/`run_program` returned) → `lineage()`, and `receipt()` publishes it as
   `inputs` — sign it to prove which data produced the result. Each entry's `encoding` (`text`,
@@ -755,7 +794,12 @@ let raw2 be psbt_finalize(signed_psbt)            -- → btc_send (the key never
 
 **Read-side / RPC builtins (all `net(host)`-gated; a node is UNTRUSTED input — every
 decode is strict, malformed/oversized/hostile responses → catchable error, never silent
-bad data; errors name the host only, never the full URL — API keys live in the path; the raw
+bad data; errors name the host only, never the full URL — API keys live in the path (v0.6.46+: keep
+the key a secret bound to the provider host, `require secret("RPC_KEY") for net("eth.x.com")`, and
+pass `` `https://eth.x.com/v2/{k}` `` as the url to `evm_rpc`/JSON-RPC builtins, algod calls and
+`btc_rpc`; unbound → error with that line; a secret in `params` is always refused: `evm_rpc:
+params[0] is a secret — a secret never goes into an RPC request`; a JSON-RPC error echoing the key
+comes back as `[secret K]`; a node on a private address under a wildcard `net` must be named); the raw
 answers of `evm_rpc`/`solana_rpc`/`btc_rpc`/`algorand_account`/`algorand_wait` keep integers beyond
 64 bits exact):**
 - EVM JSON-RPC: `evm_rpc(url, method, params?)` (escape hatch: ints→hex-quantity,

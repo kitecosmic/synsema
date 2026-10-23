@@ -578,8 +578,8 @@ tried to read STRIPE_KEY" = `origin == "program" && !granted`; no need to re-par
     it the call fails with a clear error and its Worker is replaced. `0` = no deadline. A host hook
     already running is not cut; its result is discarded.
   - `labels: true` — information-flow labels: a private value (or a branch on one) reaches no sink:
-    not `print`, not the `http` hook (`fetch`/`http_*`), not `kv` (`state_*`, `remember`), not `llm`,
-    not `sleep`. `result: "<global name>"` returns that variable's final value WITH its labels
+    not `print`, not the `http` hook (`fetch`/`http_*`), not `kv` (`state_*`, `remember`), not `llm`
+    (unless the ceiling says `llm=<principal>@embedder`, v0.6.46+), not `sleep`. `result: "<global name>"` returns that variable's final value WITH its labels
     (private parts as `{"$private": [...]}`); `input: {var, value, sources}` binds a global before the
     run, each key of `sources` arriving as `private(value, principals)` (needs `labels: true`).
     `RunResult` then has `declassify` and `private_seen`, and `steps` is `null` after a private value.
@@ -587,6 +587,49 @@ tried to read STRIPE_KEY" = `origin == "program" && !granted`; no need to re-par
   what waits fails with "closed". After a trap the sync API recreates the instance by itself.
 - A host hook that returns something that is not JSON (a `BigInt`, a circular object) or throws
   without a message is an error of that call, not a hung Worker.
+
+**What changed in `@synsema/wasm` v0.6.46** (full tables and code: docs 72-wasm):
+1. **A host `kv` that fails or answers something else is an ERROR of the builtin, not an absent key**
+   (before, the next write replaced what the host had stored): `kv.get` throwing →
+   `state_get: host kv.get failed: <msg>`; `kv.get` returning a number/bool/object →
+   `… kv.get must return a string or null, got a number`; a stored text that is not JSON →
+   `state_incr: the stored value of 'c' is not JSON (…)` (nothing written); `kv.list` throwing or
+   returning `{keys:[{name}]}` (Cloudflare KV), `[{name}]` or `undefined` → `state_all: host kv.list
+   failed: kv.list must return a list of strings, got …`. `state_get`/`state_incr`/`state_all`/
+   `state_merge`/`state_cas` fail and say why; a declared `memory` whose load fails is not opened
+   (`memory "x" could not be loaded (…); nothing was loaded, so nothing is written over it`); a failed
+   read of the audit log refuses `reveal`/`sign`/`wallet`/`spend`. `undefined` from `kv.get` is still
+   an absent key, and a host without `kv.list` still gives `{}`. **Breaking:** return the exact stored
+   text, and a list of key names (map Cloudflare's `{keys:[{name}]}` to `keys.map(k => k.name)`).
+   Rust `HostProvider`: `kv_get` → `Option<Result<Option<String>, String>>`, `kv_list` →
+   `Option<Result<Vec<String>, String>>`, `llm(op, prompt, principals)` →
+   `Option<Result<HostLlmResult, String>>`, and `HostHttpRequest.forbid_redirects`.
+2. **`llm(op, prompt, info)`:** `info.principals` = the owners of the private data in the prompt (`[]`
+   with public data). A hook that throws fails that call with its message (or `the host's llm hook
+   threw`, redacted like any error when the call carried private data) — before, the program got an
+   empty answer with `ok: true`.
+3. **`http` gets `redirect: "error"`** when the request carries a secret (URL, query, body or a
+   header): pass it to `fetch` (the browser option of the same name) or a redirect carries the secret
+   to a host the program never named. **The engine checks the host NAME only:** blocking private
+   addresses for a wildcard grant (loopback, RFC 1918, CGNAT, ULA, link-local and the metadata
+   endpoint `169.254.169.254`, multicast, documentation ranges, IPv4 mapped or translated in IPv6)
+   is the hook's job — resolve the name, check the address, connect to that one. The hook does not
+   know whether the program named the host.
+4. **Ceilings with `labels`:** `declassify=<principal>` (globs) bounds `declassify` — breaking for
+   labelled code under a ceiling that declassifies; `llm=<p>@embedder` / `judge=<p>@embedder` let
+   private data of `<p>` reach the host's hook; `judge` is now gated by its capability (it ran even
+   when the ceiling did not grant it).
+5. **`trusted: {name: source}` + `trustedCeiling`** (`use "trusted:name" as t`), in `run`, `runAsync`,
+   `handle` and `test` — see [modules.md](modules.md) § Trusted modules.
+6. A run with `labels` that hits `maxMemoryMb` reports `steps: null, private_seen: true` (whether it
+   ran out of memory can depend on a private value).
+7. In `handle`, `receipt()`/`lineage()` list only that request's inputs (what the top level read is no
+   longer in the first request's receipt).
+8. **`auditor`** (sealed receipts, [observability.md](observability.md) § Sealed receipts) exists in the
+   engine's `run` request and returns `receipt`, but **the 0.6.46 package's `run()`/`test()`/`handle()`
+   do not pass `auditor`/`sealedBytes` through** — a known gap of that package. Until it is fixed, call
+   the low-level API as docs 72-wasm shows (`instantiateSync(syn.module, …).call({op: "run", …,
+   auditor})`).
 - `state_merge`/`state_cas` with the host's `kv` are atomic only if the `kv` offers
   `cas(ns, key, expected, value)` → `true`/`false` (`expected` `null` = key missing); without it they
   fail saying so. Without a host `kv` the state belongs to the instance and is atomic.

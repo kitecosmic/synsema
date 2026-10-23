@@ -15,6 +15,10 @@ build/
 !engine/crates/**/fixtures/**/*.json
 # El ancla del guardia de rendimiento (engine/perf/guard.py, job perf-guard): sin ella el job falla.
 !engine/perf/baseline.json
+# Los manifiestos del plugin de la skill (Claude Code y Codex) y sus marketplaces.
+!.claude-plugin/*.json
+!.codex-plugin/*.json
+!.agents/plugins/*.json
 
 # Rust
 target/
@@ -53,7 +57,7 @@ tests/*.py
 .synsema/
 
 # Secretos: el .env real NUNCA va al repo (commitear .env.example con las claves
-# sin valores como plantilla). Ver .synsema-skill/secrets.md.
+# sin valores como plantilla). Ver skills/synsema/secrets.md.
 .env
 !.env.example
 

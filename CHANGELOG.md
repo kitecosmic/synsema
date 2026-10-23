@@ -6,6 +6,23 @@ Each says what changed, why, and what to write instead.
 
 Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the release date.
 
+## Unreleased
+
+**The skill for coding agents moved to `skills/synsema/` and installs in any agent.** It was in
+`.synsema-skill/`, a hidden folder that only the Claude Code installer knew, and its `SKILL.md`
+frontmatter did not parse as YAML for strict readers (a `:` inside the unquoted description), so
+`npx skills add` found no skill. Now it is the open Agent Skills layout (`skills/<name>/SKILL.md`,
+description under 1024 characters) and installs with `npx skills add kitecosmic/synsema` (Claude
+Code, Codex, opencode, Cursor, Gemini CLI, GitHub Copilot, Windsurf, …), as a Claude Code plugin
+(`/plugin marketplace add kitecosmic/synsema`, then `/plugin install synsema@synsema`) or a Codex
+plugin (`codex plugin marketplace add kitecosmic/synsema`, then `codex plugin add synsema@synsema`).
+`install-skill.sh` copies the whole folder (no file list to keep in sync), still writes
+`~/.claude/skills/synsema` by default, and takes `--agents` (`~/.agents/skills`, read by Codex and
+opencode), `--dir <folder>` and `--ref <tag>` (a release's skill; tags up to v0.6.46 are read from
+the old folder). `SYNSEMA_SKILL.md` described a Python prototype that no longer exists; it is now a
+pointer to the skill. Links to `.synsema-skill/…` from older docs or projects stop working: use
+`skills/synsema/…`.
+
 ## v0.6.46 — 2026-10-22
 
 **Behavior changes (read these first).**

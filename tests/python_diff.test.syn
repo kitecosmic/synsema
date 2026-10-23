@@ -1,4 +1,4 @@
--- Live probes backing .synsema-skill/python-diff.md (the Python → Synsema table).
+-- Live probes backing skills/synsema/python-diff.md (the Python → Synsema table).
 -- Every SEMANTIC claim in that table has an assertion here; keep the two in sync.
 -- PARSE-error rows (x = 5, # comments, f"...", [x for x in xs], xs[1:3], for/def/
 -- elif/except/import placement) cannot live in a file that must parse — they are

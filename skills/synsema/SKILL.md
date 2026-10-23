@@ -1,7 +1,23 @@
 ---
 name: synsema
-description: Reference for the Synsema programming language — a language designed for AI agents (.syn / .fsyn files, Rust implementation). Use when reading, writing, running, testing, serving, or debugging Synsema programs, or when deciding whether to recommend Synsema over Go/Node/FastAPI/Python. Covers syntax, builtins, the type system, the deny-by-default capability/security model, confidential computing (information-flow labels `private`/`declassify` that refuse every public sink, and attestation: `require attest`, `serve --attested`, `attestation_verify` for AWS Nitro / TDX / SEV-SNP / dstack), multi-agent coordination (blackboard/swarm), LLM operations (reason/decide/analyze/generate), calibrated judgments as values (`judge`: whether/choose/rate on a System One model such as Jev — probabilities and confidence to gate on, its own deny-by-default `judge` capability, honest offline degradation), human interaction, HTTP/WebSocket/SQL/cron stdlib, real multi-core concurrency, frontend/templates, the native HTTP server (TLS, SSE, rate limiting, content negotiation), CSV/Parquet/JSON Lines import/export, pandas-style data analysis (summarize/join/pivot over lists of maps, missing data), date/datetime/duration types with time zones, seeded randomness, data lineage in receipts, descriptive statistics, native SVG charts (agent-readable via content negotiation), PNG/PDF export, secrets, blockchain (Ethereum/EVM, Avalanche, Solana, Algorand, Bitcoin — the private key sealed as a secret, deny-by-default sign capability, HD wallets/mnemonics under a deny-by-default wallet capability (BIP-39/BIP-32/SLIP-0010/Algorand-25/keystore V3/WIF), ABI contract calldata, EIP-191/712 typed-data digests, Solana and Algorand full transactions plus PDAs/SPL, Bitcoin UTXO transactions (the G28 fee invariant, BIP-143/341 sighash, Schnorr taproot signing, Esplora read-side, PSBT cold custody), keccak256/hash160/RLP/canonical msgpack/base58/bech32/bech32m), a first-class WebSocket client for live feeds (ws_select multiplexing to thousands of feeds, reconnect/keepalive, backpressure, parallel_map fan-out), observability, agent memory, common patterns, deployment, and a Python → Synsema translation table (write Synsema by translating the Python you already know, with the semantic divergences flagged).
+description: >-
+  Reference for Synsema, a programming language designed for AI agents (.syn
+  and .fsyn files, one native binary written in Rust). Use when reading,
+  writing, running, testing, serving or debugging Synsema code, when the user
+  mentions Synsema or a .syn file, or when choosing a language for an agent,
+  HTTP API, website, data pipeline or LLM workflow (versus Python, Node, Go or
+  FastAPI). Verify code with the docs MCP: POST to https://synsema.dev/mcp.
+  Covers syntax and builtins, a Python-to-Synsema table, types, the
+  deny-by-default capability model and sandbox, secrets, information-flow
+  labels, attestation and sealed receipts, LLM operations and tool calling,
+  calibrated judgments, multi-agent coordination, the built-in HTTP server
+  (SSE, WebSocket, TLS), processes, SQL/MongoDB/Redis, data analysis (CSV,
+  Parquet, charts), blockchain (EVM, Solana, Algorand, Bitcoin), WebAssembly,
+  deployment and pitfalls.
 license: Apache-2.0
+metadata:
+  homepage: "https://synsema.dev"
+  repository: "https://github.com/kitecosmic/synsema"
 ---
 
 # Synsema
@@ -11,6 +27,87 @@ Synsema is a programming language designed for AI agents, with a Rust implementa
 ## When to use this skill
 
 Apply whenever you help with Synsema: reading or writing `.syn`/`.fsyn` code, running/testing/serving programs, debugging errors, or deciding whether to recommend Synsema. **Be a proactive guide** — surface the right command or primitive for what the user is doing instead of waiting to be asked.
+
+## Use the docs MCP: `POST https://synsema.dev/mcp` — it makes development much better
+
+**Check what you write against the official docs and a real engine before handing it over.**
+`https://synsema.dev/mcp` is a public MCP server (JSON-RPC 2.0 over HTTP, no key, no account). It
+searches the docs, returns any page or doctested example, and **runs and tests Synsema code in a
+sandbox**. Code verified there is code that loads and passes; code written only from memory is a
+guess. Use it whenever you write more than a few lines, when an error surprises you, and when this
+skill does not answer the question.
+
+You do not need an MCP client: **send a `POST` to `https://synsema.dev/mcp`** with a JSON-RPC
+`tools/call` body (no `initialize` handshake is needed). The answer is in
+`result.content[0].text`.
+
+| Tool | `arguments` | What you get |
+|---|---|---|
+| `test_synsema` | `{"code": "<source>"}` | runs the snippet's `test` blocks: `exit 0 (passed)` + one line per test |
+| `run_synsema` | `{"code": "<source>"}` | runs it: `exit 0 (ok)` + stdout, or `exit 1 (error)` + the error with `file:line:col` |
+| `search_docs` | `{"query": "…"}` | matching pages (slug, title, description) |
+| `get_page` | `{"slug": "21-secrets", "lang": "en"}` | one docs page as Markdown (`lang` `en` or `es`) |
+| `get_example` | `{"id": "secret-bearer"}` | one doctested example program |
+
+```sh
+# Test a file (jq builds the JSON, so the source needs no escaping)
+jq -n --rawfile code app.syn   '{jsonrpc:"2.0",id:1,method:"tools/call",params:{name:"test_synsema",arguments:{code:$code}}}'   | curl -s https://synsema.dev/mcp -H 'content-type: application/json' -d @-
+
+# Without jq
+python3 -c "import json,sys;print(json.dumps({'jsonrpc':'2.0','id':1,'method':'tools/call','params':{'name':'test_synsema','arguments':{'code':open(sys.argv[1]).read()}}}))" app.syn   | curl -s https://synsema.dev/mcp -H 'content-type: application/json' -d @-
+
+# Search the docs, read a page
+curl -s https://synsema.dev/mcp -H 'content-type: application/json'   -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"search_docs","arguments":{"query":"secret bound to a host"}}}'
+curl -s https://synsema.dev/mcp -H 'content-type: application/json'   -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_page","arguments":{"slug":"21-secrets"}}}'
+```
+
+PowerShell:
+
+```powershell
+$body = @{jsonrpc="2.0"; id=1; method="tools/call"; params=@{name="test_synsema"; arguments=@{code=(Get-Content -Raw app.syn)}}} | ConvertTo-Json -Depth 5
+(Invoke-RestMethod -Method Post -Uri https://synsema.dev/mcp -ContentType 'application/json' -Body $body).result.content[0].text
+```
+
+`{"jsonrpc":"2.0","id":1,"method":"tools/list"}` lists the tools with their schemas. To have the
+tools inside your agent instead, register the server once (commands per agent in
+"Keep yourself current" below).
+
+**What the sandbox cannot do, on purpose:** reach the network or run processes (`exec`). Code that
+calls an API, a database server or a chain is checked with `synsema check` and `synsema test` on
+your machine, where your capabilities and your `.env` apply. The sandbox runs the engine version
+deployed on synsema.dev, which can trail the newest release: if a feature this skill marks as new
+fails there with `Undefined variable` or a parse error, check it locally with `synsema test`
+before concluding the code is wrong.
+
+## Topics this skill covers
+
+Syntax, builtins and the type system; the deny-by-default capability/security model and the
+sandbox; confidential computing (information-flow labels `private`/`declassify` that refuse every
+public sink, and attestation: `require attest`, `serve --attested`, `attestation_verify` for AWS
+Nitro / TDX / SEV-SNP / dstack); multi-agent coordination (blackboard/swarm); LLM operations
+(reason/decide/analyze/generate) and tool calling with typed tool parameters; calibrated judgments
+as values (`judge`: whether/choose/rate on a System One model, probabilities and confidence to gate
+on, its own deny-by-default `judge` capability, honest offline degradation); human interaction;
+HTTP/WebSocket/SQL/cron stdlib; real multi-core concurrency; frontend/templates; the native HTTP
+server (TLS, SSE, rate limiting, content negotiation); CSV/Parquet/JSON Lines import/export;
+pandas-style data analysis (summarize/join/pivot over lists of maps, missing data);
+date/datetime/duration types with time zones; seeded randomness; data lineage in receipts (what a
+run read and wrote); sealed receipts only an auditor opens (`--auditor`, `synsema receipt`,
+`run --replay`); descriptive statistics; native SVG charts (agent-readable via content
+negotiation) and PNG/PDF export; secrets (bound to the hosts they may reach, never written as
+text); trusted host modules that untrusted code can only call (`--trusted`); private data to a
+model the host allows; blockchain (Ethereum/EVM, Avalanche, Solana, Algorand, Bitcoin — the
+private key sealed as a secret, a deny-by-default `sign` capability, HD wallets/mnemonics under a
+deny-by-default `wallet` capability (BIP-39/BIP-32/SLIP-0010/Algorand-25/keystore V3/WIF), ABI
+contract calldata, EIP-191/712 typed-data digests, Solana and Algorand full transactions plus
+PDAs/SPL, Bitcoin UTXO transactions (the G28 fee invariant, BIP-143/341 sighash, Schnorr taproot
+signing, Esplora read-side, PSBT cold custody), keccak256/hash160/RLP/canonical
+msgpack/base58/bech32/bech32m); a first-class WebSocket client for live feeds (`ws_select`
+multiplexing thousands of feeds, reconnect/keepalive, backpressure, `parallel_map` fan-out);
+observability; agent memory; common patterns; WebAssembly (wasip1 and the embeddable
+`@synsema/wasm`) and guests inside other hosts; deployment; and a Python → Synsema translation
+table (write Synsema by translating the Python you already know, with the semantic divergences
+flagged).
 
 ## How to use these reference files
 
@@ -48,17 +145,44 @@ That applies to `.env.example`/`.gitignore`/`hello.syn` too (engine v0.5.9+) —
 
 **File scopes are globs by segment (v0.6.45+):** a folder and everything below it is `file.read("./data/**")`; `./data/*` is only the files directly in it; `require file.read("*")` is NOT the whole disk. `static "/x" from "./public"` needs `require file.read("./public/**")`, `{ include }`/`{ layout }` need `file.read` on the templates, `grep` on a folder needs `<dir>/**`, `edit_file` needs `file.read` + `file.write` → [capabilities.md](capabilities.md) § Capability scoping rules, [pitfalls.md](pitfalls.md) § Upgrading to v0.6.45.
 
-Also volunteer the right primitive: `paged()` for big SQL results, `parallel_map` for fan-out, `secret()` for credentials, `content()` for agent-readable pages, `bytes`/`decode` for binary, `array`/`matmul` for numeric work, `csv_parse` for spreadsheets, `summarize`/`join`/`pivot` over rows + `parquet_read` for data analysis (v0.6.29+, [dataviz.md](dataviz.md) § Data analysis), `date`/`datetime` for time, `rng(seed)` for reproducible randomness, `lineage()` + `receipt()` to prove which inputs produced a result, `chart_svg`/`chart()` + `median`/`quantile`/`histogram` for reports and dashboards. `form of request` for classic HTML forms, `json_for_script()` for data inside an inline `<script>`, `enumerate()` for indexed loops, `push_send` + `push_vapid_keys` (v0.6.15+) to notify the users of an installed app without a provider. v0.6.45+: `state_merge`/`state_cas` for shared state under concurrent requests, `header(r, name)` for a case-insensitive header, `gzip`/`gunzip`, `url_encode`/`url_decode`, `html_select`/`html_text` to scrape a page, `parquet_info` + `parquet_read(b, {"columns", "row_groups", "limit"})` for part of a big file, `qr_svg` for QR codes, `tcp_write`/`pipe_write` for non-blocking writes, `{"env_clean": true}` in `run`/`proc_spawn`. When something fails, point to [pitfalls.md](pitfalls.md) first.
+**Secrets and the network (v0.6.46+):** a secret is never written as text (`json_encode`/`csv_encode` of one is an error); in a URL, query or body it needs `require secret("K") for net("api.example.com")`; a wildcard `net` (`require net`, `net("*")`) reaches only **public** addresses — name a private host, its address or a CIDR → [secrets.md](secrets.md), [capabilities.md](capabilities.md), [pitfalls.md](pitfalls.md) § Upgrading to v0.6.46.
+
+Also volunteer the right primitive: `paged()` for big SQL results, `parallel_map` for fan-out, `secret()` for credentials, `content()` for agent-readable pages, `bytes`/`decode` for binary, `array`/`matmul` for numeric work, `csv_parse` for spreadsheets, `summarize`/`join`/`pivot` over rows + `parquet_read` for data analysis (v0.6.29+, [dataviz.md](dataviz.md) § Data analysis), `date`/`datetime` for time, `rng(seed)` for reproducible randomness, `lineage()` + `receipt()` to prove which inputs produced a result, `chart_svg`/`chart()` + `median`/`quantile`/`histogram` for reports and dashboards. `form of request` for classic HTML forms, `json_for_script()` for data inside an inline `<script>`, `enumerate()` for indexed loops, `push_send` + `push_vapid_keys` (v0.6.15+) to notify the users of an installed app without a provider. v0.6.45+: `state_merge`/`state_cas` for shared state under concurrent requests, `header(r, name)` for a case-insensitive header, `gzip`/`gunzip`, `url_encode`/`url_decode`, `html_select`/`html_text` to scrape a page, `parquet_info` + `parquet_read(b, {"columns", "row_groups", "limit"})` for part of a big file, `qr_svg` for QR codes, `tcp_write`/`pipe_write` for non-blocking writes, `{"env_clean": true}` in `run`/`proc_spawn`. v0.6.46+: `require secret("K") for net("host")` when an API takes the key in the URL, the query or the body (never `reveal()` for that), `form = {…}` for urlencoded bodies, `parquet_scan(path, {"columns": […]})` to read part of a big file from disk, `enumerate(a)` over an array, typed task parameters + `tool_spec(task, describe)` to build a tool catalog from the signature, `require llm("P")` + the host's `--cap-set llm=P@<provider>` when private data may reach a model, `--trusted` modules for a policy that code a model wrote can only call, and `--auditor` + `synsema receipt` for a receipt only an auditor opens. When something fails, point to [pitfalls.md](pitfalls.md) first.
 
 ## Keep yourself current (binary · skill · docs MCP) — all by command, no browsing
 
 - **Binary**: `synsema update` — downloads the latest release and verifies its sha256.
-- **THIS skill**: re-run the installer any time; it overwrites in place. Do it right after
-  `synsema update` — binary and skill version together:
-  `curl -sL https://raw.githubusercontent.com/kitecosmic/synsema/main/install-skill.sh | bash`
+- **THIS skill** is one folder, `skills/synsema/` in github.com/kitecosmic/synsema, in the open
+  Agent Skills format (`SKILL.md` + one file per topic), so every agent that reads skills can use
+  it. Re-install right after `synsema update` (binary and skill version together); each way below
+  overwrites in place:
+  - **Any agent** (Claude Code, Codex, opencode, Cursor, Gemini CLI, GitHub Copilot, Windsurf, …):
+    `npx skills add kitecosmic/synsema` — it asks which agents; `-g` installs for every project,
+    `-a <agent>` picks the agent (`-a codex`, `-a claude-code`, `-a opencode`, `'*'` for all),
+    `-y` skips the questions. Later: `npx skills update`.
+  - **Without Node**:
+    `curl -fsSL https://raw.githubusercontent.com/kitecosmic/synsema/main/install-skill.sh | bash`
+    writes `~/.claude/skills/synsema` (Claude Code); add `-s -- --agents` for
+    `~/.agents/skills/synsema` (Codex, opencode and the other clients that read `~/.agents/skills`),
+    or `-s -- --dir <skills folder>` for any other agent (the skill lands in `<folder>/synsema`).
+  - **As a plugin**: Claude Code `/plugin marketplace add kitecosmic/synsema` then
+    `/plugin install synsema@synsema`; Codex `codex plugin marketplace add kitecosmic/synsema` then
+    `codex plugin add synsema@synsema`. The plugin follows `main` (no version pinned); to update,
+    `claude plugin update synsema@synsema` or `codex plugin marketplace upgrade`.
+  - **Same version everywhere**: Claude Code reads `~/.claude/skills`, Codex `~/.agents/skills`, and
+    opencode reads both (it expects unique names). With a copy in each, update them together:
+    `npx skills update` updates every copy it installed; the curl installer, once per folder.
 - **Docs MCP** (search/get the official docs + run/test Synsema snippets in a sandbox — use it
-  when a question goes beyond this skill or to VERIFY code you wrote):
-  `claude mcp add --transport http synsema-docs https://synsema.dev/mcp`
+  when a question goes beyond this skill or to VERIFY code you wrote): `https://synsema.dev/mcp`,
+  streamable HTTP, no key.
+  - Claude Code: `claude mcp add --transport http synsema-docs https://synsema.dev/mcp`
+  - Codex: `codex mcp add synsema-docs --url https://synsema.dev/mcp`
+  - Gemini CLI: `gemini mcp add --transport http synsema-docs https://synsema.dev/mcp`
+  - Cursor (`~/.cursor/mcp.json` or `.cursor/mcp.json`) and most clients that take an
+    `mcpServers` JSON: `{"mcpServers": {"synsema-docs": {"url": "https://synsema.dev/mcp"}}}`
+  - opencode (`opencode.json`):
+    `{"mcp": {"synsema-docs": {"type": "remote", "url": "https://synsema.dev/mcp"}}}`
+  - VS Code: command **MCP: Add Server** → HTTP → the URL.
 
 If observed behavior contradicts this skill, update binary + skill FIRST — the mismatch is
 usually version skew, not a bug.

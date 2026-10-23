@@ -90,6 +90,7 @@ Construct `Name.variant(...)`; nullary `Name.pending` is a value. Match by varia
 
 ## Callable
 - `task` — function value, supports closures, default params (`task f(x, y = 10)`) and named args at call (`f(x, timeout = 5)`). Arity is **strict** (v0.6.29+): a missing argument without a default, or one too many, is an error — for lambdas too
+- **Types on task parameters** (v0.6.46+): `task f(id: text, n: number = 3)` with `text`, `number`, `bool`, `list`, `map`. Not a static type system: they are checked only by `call(task, map)` and `call_tool(task, map)` (wrong type or missing typed parameter → error, no conversion) and they describe the tool to a model (`tool_spec`). A normal call is not checked. See [syntax.md](syntax.md) § Statements (tasks) and [llm.md](llm.md) § Typed tool parameters.
 
 ## Custom types
 ```synsema

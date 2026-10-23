@@ -157,6 +157,93 @@ group's shape is validated when the serve is built. Full details in
   file. (A per-task `require` *inside* a task is fine.)
 - **`intent:`** is declared only by the entry file; modules don't override it.
 
+## Trusted modules — `use "trusted:<name>"` (v0.6.46+)
+
+A **trusted module** is a module the **host** loads, written by a person, that code the host does
+not trust (a program written by a model) can only **call**. Each exported task runs with **its own**
+`require`s, not the caller's: so a program under a ceiling without `declassify` cannot publish a
+customer's data, but it can call `t.reply(customer, text)`, whose policy declassifies only that
+customer's own address.
+
+```sh
+synsema run  --labels --cap-set stdout --trusted tools=./tools.syn app.syn
+synsema test --labels --cap-set stdout --trusted tools=./tools.syn app.test.syn
+synsema run  … --trusted tools=./tools.syn --trusted-cap-set "stdout,declassify=customers" app.syn
+```
+
+```synsema
+-- tools.syn — written by a person, loaded by the host
+export task reply(customer, body)
+    require declassify("customers")
+    let dest be declassify(customer.email, "the reply goes to the customer's own address")
+    give {"to": dest, "length": declassify(length(body), "the length of a reply is public")}
+```
+
+```synsema
+-- app.syn — may be written by a model; it cannot declassify by itself under this ceiling
+use "trusted:tools" as t
+let c be private({"email": "ana@example.org", "name": "Ana"}, "customers")
+print(t.reply(c, "your order shipped"))       -- {to: "ana@example.org", length: 18}
+print(declassify(c.email, "direct"))          -- label_violation: declassify is not granted …
+```
+
+**Flags.**
+- `--trusted <name>=<path>` (repeatable; on `synsema run` and `synsema test`): `name` is letters,
+  digits, `_` or `-`; the path is relative to the working directory. Errors: `--trusted takes
+  name=path (a name of letters, digits, '_' or '-'), e.g. --trusted tools=./tools.syn`,
+  `--trusted tools: cannot read ./x.syn: …`, `--trusted tools: the name is given twice`.
+- `--trusted-cap-set "<list>"`: the ceiling of **every** trusted module (same syntax as
+  `--cap-set`). In wasm the options are `trusted: {tools: source}` and `trusted_ceiling`.
+- `synsema serve` refuses `--trusted`: `--trusted runs under \`synsema run\` and \`synsema test\`
+  for now (a trusted tool is not isolated in the workers of \`serve\` yet)`.
+
+**What a trusted task may do.**
+- Its capabilities are its own `require`s **inside each exported task** (a top-level `require` in
+  the module is a load error: `module 'trusted:tt' must not have a top-level 'require': each
+  exported task declares its own`), bounded by `--trusted-cap-set` when the host gives one. Nothing
+  comes from the caller: not its grants, not its `--cap-set`, not a `sandbox` around the call. A
+  task that uses `net` without `require net("…")` fails like any program
+  (`Capability not granted: net("…")`), even if the program has it; with a `--trusted-cap-set` that
+  does not name it, `… declared but above the host ceiling`.
+- **`declassify` in a trusted task follows `--trusted-cap-set`**: with `declassify=customers` it
+  publishes `customers` and nothing else; without a `--trusted-cap-set` it declassifies like a
+  program without a ceiling — **any principal**. So give the trusted modules a ceiling. (Measured
+  on v0.6.46: the task's `require declassify("customers")` documents the policy, but the bound is
+  the trusted ceiling — a task without that `require` still declassifies within it.)
+- A trusted module can `use` another trusted module (`use "trusted:base" as base`); a file module
+  (`use "./x.syn"`) is an error: `a trusted module imports only other trusted modules …`.
+- Its audit entries carry `context: "trusted:tools"` and `file: "trusted:tools"`, and its
+  `declassify` log lines say `at trusted:tools:<line>`.
+
+**What the program can and cannot do with it.**
+- **Arguments are data.** A task, a lambda or a builtin among them — also inside a list or an
+  `ok(…)` — is an error, because it would run with the tool's capabilities:
+  `trusted:tools.apply_it: a trusted tool takes data, not code — an argument holds a task, which
+  would run with the tool's capabilities; pass the values it needs instead`.
+- **It never sees the program's names**: a program that defines `task upper(x)` before or after the
+  `use` does not change what the tool's `upper(...)` runs.
+- **It cannot change the module**: `set t.config to …` changes only the program's own copy of the
+  exports; the tool's tasks and another `use` see the original.
+- **It cannot load one itself**: the name comes only from the host, and the program never sees the
+  path. An unknown name is a load error: `no trusted module named 'tools': the host loads it
+  (\`synsema run --trusted tools=./file.syn\`, or \`trusted: { tools: source }\` in wasm); a
+  program cannot load one itself`. `print(t)` shows `{reply: builtin:trusted:tools.reply, …}`.
+- **Its tasks take positional arguments only**: `t.reply(customer = c)`, `call(t.reply, {...})` and
+  `call_tool(t.reply, {...})` fail with `trusted:tools.reply() does not accept named arguments (got
+  customer = …); pass it by position`, and `tool_spec(t.reply, …)` is refused (`tool_spec needs a
+  task of the program, not the builtin 'trusted:tools.reply'`). To offer a trusted tool to a model,
+  wrap it in a program task: `task reply(customer: map, body: text)` → `give t.reply(customer,
+  body)`, and put the wrapper in the allow-list and the catalog. Note that `call`/`call_tool` with
+  a private value in the argument map give a **private** result, even when the tool declassified
+  what it returns; call the wrapper directly (`reply(c, body)`) to keep the public result.
+
+**What it does not do yet** — each one is an error inside a trusted tool, naming the reason:
+defining or spawning an agent, `parallel_map`, `cron_every`/`cron_after`, a `use` of a file module
+(all of them would run in another interpreter next to the program's names), and `render` (with its
+`include`s and layouts: the template file lives where the program can write it — build the text in
+the tool). With trusted modules the **whole program runs on the tree-walker**, without the bytecode
+VM (measured: a 3 M-iteration loop, 0.07 s → 0.8 s).
+
 ## Example layout (entry → core → data)
 ```
 main.syn       -- entry: front-end + tests     (use "./core.syn" as core)

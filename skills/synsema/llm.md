@@ -20,6 +20,8 @@ let email be generate "response email" given complaint
 
 Auto-granted in plain `run`/`conform` (like `stdout`/`time`), enforced in `serve`/secure mode, and
 stripped inside a `sandbox`. See [capabilities.md](capabilities.md#the-llm-capability).
+With `--labels`, `require llm("<principal>")` (v0.6.46+) is how a program declares that it may send
+that principal's private data to a model the host allows — see § Private data to a model below.
 
 ## Providers
 Choose the provider with `synsema run --provider <name>`, by setting `SYNSEMA_LLM_PROVIDER` (in the
@@ -408,6 +410,167 @@ deterministically with a scripted mock (engine host-config `run_with_llm_steps`)
 **Force a final answer (no tools).** For "tool-greedy" models that keep calling tools, pass an **empty
 catalog** to make the step return a `final`: `llm_step(prompt, [], ctx)`. Useful as the last turn of a
 loop ("you've gathered enough — now answer") or to bound a runaway tool loop.
+
+### Typed tool parameters and `tool_spec` (v0.6.46+)
+
+Before v0.6.46 every argument the model returned arrived as **text** (`"2"`, not `2`), and the
+catalog was written by hand next to the task. Now the task's signature carries the types and the
+catalog comes from it:
+
+```synsema
+require llm
+
+task add(a: number, b: number = 1)
+    give a + b
+
+let tools be {"add": add}
+let catalog be [tool_spec(add, "Add two numbers")]
+-- catalog[0] == {name: "add", describe: "Add two numbers", params: ["a: number", "b: number"], optional: ["b"]}
+let step be llm_step("What is 2 plus 3?", catalog, "")
+when step["kind"] == "tool" and contains(tools, step["name"])
+    print(call_tool(tools[step["name"]], step["args"]))    -- 5, a number
+```
+
+- **Types on parameters** — `task f(id: text, items: bool = false)`, the same five types as
+  `expect body`: `text`, `number`, `bool`, `list`, `map` (syntax and load errors:
+  [syntax.md](syntax.md) § Tasks). They are checked **only** where arguments arrive as data:
+  `call(task, map)` and `call_tool(task, map)`.
+- **`tool_spec(task, describe)`** → `{name, describe, params, optional}` from the signature:
+  `params` is `["a: number", …]` (an untyped parameter is just its name), `optional` lists the
+  parameters with a default. `describe` may be left out (→ `""`). A lambda is an error
+  (`tool_spec needs a named task: a lambda has no name for the model to call`), and so is a builtin
+  (`tool_spec needs a task of the program, not the builtin 'upper'`).
+- **A hand-written catalog** may type its parameters the same way: `"params": ["n: number", "s"]`,
+  and `"optional": ["s"]` takes names out of the schema's `required` (a name in `optional` that is
+  not a parameter is ignored). An unknown type is an error at `llm_step`: `llm_step: tool 'f'
+  declares the parameter 'n: integer' with an unknown type: the types are text, number, bool, list
+  or map`.
+- **What the provider receives.** The hosted providers (Anthropic, OpenAI-compatible) send each
+  declared type in the tool's JSON Schema (`number` → `"number"`, `text` → `"string"`, `bool` →
+  `"boolean"`, `list` → `"array"`, `map` → `"object"`; an untyped parameter goes as `"string"`), and
+  `required` = the parameters not in `optional`.
+- **What comes back in `step["args"]`** (measured on v0.6.46 with an OpenAI-compatible endpoint):
+  an argument for a typed parameter comes back with its type **when it decodes** to that type —
+  `"2"` and `2` both give the number `2`, `"true"` gives `true`, `"[1,2]"` gives `[1, 2]`,
+  `"{\"a\":1}"` gives `{a: 1}`. An argument for a `text` parameter stays text (`5` → `"5"`), and so
+  does an argument for an untyped parameter. One that does not decode (`"two"` for `number`) stays
+  text, and `call_tool` rejects it. A `null` (or the text `"null"`) for an optional parameter, or
+  for a typed parameter other than `text`, is **dropped from `args`**: the default runs, or
+  `call_tool` says it is missing.
+- **The check in `call` / `call_tool`** is strict and never converts:
+  - wrong type → `call_tool(add): 'a' must be number, got text — a tool call from \`llm_step\`
+    brings typed arguments only for the parameters the catalog types (\`tool_spec(task,
+    describe)\` takes them from the signature)`. Fix: type the catalog (use `tool_spec`), or convert
+    in the task.
+  - a typed parameter without a default left out → `call_tool(add): missing 'a' (number)` (an
+    untyped one still arrives as `nothing`).
+  - `nothing` passed for a typed parameter → `… 'a' must be number, got nothing`, unless its default
+    is `nothing` (`extra = nothing` accepts `nothing`).
+  - an unknown key → `unknown parameter 'c' — did you mean 'a'?; the parameters are: a, b`.
+  - A secret counts as `text`.
+- **A normal call does not check the types** and costs nothing: `add("x", "y")` gives `"xy"`. The
+  types are metadata for data that crosses a boundary, not a static type system.
+- `synsema code outline --json` publishes them per task: `parameters` (`name`, `type` or `null`,
+  `required`, and `default` when it is a literal; `null` for a `nothing` default) and
+  `input_schema` (the signature as JSON Schema, without `default` for a `nothing` default or a
+  non-literal one). `params` (the list of names) is unchanged. See [code.md](code.md).
+
+## Private data to a model (v0.6.46+, with `--labels`)
+
+Until v0.6.45 any private value in `reason`, `analyze`, `decide`, `generate`, `judge`, `llm_step` or
+`llm_stream` was a `label_violation`. Now it can reach a model **the host** allows, and the answer
+stays private. Two sides, both required:
+
+1. **The program declares whose data it may send**: `require llm("customers")` (and
+   `require judge("customers")` for the judge). A bare `require llm` still means public data only.
+   `require llm("P")` also covers calls with public data (before v0.6.46 it broke every LLM op).
+2. **The host allows it per principal and per provider** in its ceiling:
+
+| Ceiling item | Allows private data of `customers` to |
+|---|---|
+| `llm=customers@api.anthropic.com` | the provider whose host is `api.anthropic.com` |
+| `llm=customers@127.0.0.1` | an endpoint set with `SYNSEMA_LLM_BASE_URL=http://127.0.0.1:…` (the host, no port) |
+| `llm=customers@local` | a model in the process (`SYNSEMA_LLM_PROVIDER=local`); also what an unconfigured (offline) provider counts as |
+| `llm=customers@*` | any provider — written on purpose |
+| `llm=customers`, `llm=*`, `llm` | **no** private data (an item without `@provider` never does) |
+| `judge=customers@local` | the judge in the process (`laya`, and `mock`) |
+| `judge=customers@api.typesafe.ai` | the hosted judge |
+| `llm=customers@embedder` (wasm) | the embedder's `llm` hook |
+
+The provider host the check compares, by provider (v0.6.46): `anthropic` → `api.anthropic.com`,
+`openai` → `api.openai.com`, `deepseek` → `api.deepseek.com`, `minimax` → `api.minimax.io`,
+`local` → `local`; with `SYNSEMA_LLM_BASE_URL` set, its host. The program never names the provider:
+the host picks it, and the check follows the provider of **each call**. An item with a scope also allows the calls with
+public data, to whichever provider is configured.
+
+```sh
+synsema run --labels --cap-set "stdout,llm=customers@api.anthropic.com,declassify=customers" app.syn
+```
+
+```synsema
+require llm("customers")
+let note be private("Ana Perez, order 3141", "customers")
+let summary be generate "a one-line summary" given note
+print(summary)                                           -- private(customers)
+print(declassify(summary, "the summary goes back to the same customer"))
+```
+
+What happens on each call:
+
+- **Refused** (nothing is sent) when the ceiling has no matching item, the program has no
+  `require llm("customers")`, or there is no ceiling at all:
+
+```
+label_violation: reason would send data private to (customers) to the model; the host allows
+that per principal and provider in its ceiling (`--cap-set llm=<principal>@<provider host>`,
+`@local` for a model in the process, `@embedder` in wasm) and the program declares
+`require llm("<principal>")`. Otherwise declassify(<that value>, "<why the model may see it>") the
+part the model may see
+```
+
+  The judge says the same with `judge=` and `require judge(…)`. Under a **private branch** the call
+  is refused before anything else (`reason called under private control flow …`), and since v0.6.46
+  it writes no "granted llm" audit entry first.
+- **Allowed**: the prompt carries the data itself (the few cases that got through before v0.6.46
+  sent the text `private(customers)`).
+- **The answer carries the label of what went in.** `reason`/`analyze`/`decide`/`generate` give a
+  private text; a `judge` block gives private answers; **`llm_step` gives the whole map private**, so
+  choosing a tool with `step["name"]` needs a `declassify` (with its own ceiling item):
+
+```synsema
+require llm("customers")
+task add(a: number, b: number)
+    give a + b
+let tools be {"add": add}
+let msg be private("Add two and three for Ana", "customers")
+let step be llm_step(msg, [tool_spec(add, "Add two numbers")], "")
+let name be declassify(step["name"], "which tool the model chose is public")
+when name == "add"
+    let v be call_tool(tools[name], step["args"])          -- args are private too
+    print(declassify(v, "the sum is public"))
+```
+
+- **`llm_stream`**: each chunk carries the label, and `on_chunk` runs under the label of the answer
+  (like the body of an `each` over a private list — how many chunks there were is private too). So
+  a public effect in it (`print`, assigning a public variable) is a `label_violation`;
+  collect into a private variable instead (`let parts be private([], "customers")` then
+  `set parts to parts + [t]`).
+- **Audit**: each call writes an entry `llm("customers@api.anthropic.com")` (or
+  `judge("customers@local")`), `source: "llm-data"`, `reason` = the operation; a refused one is
+  written with `granted: false` and `reason: "<op>: not in the host ceiling or not required"`. The
+  principal in it is the program's declared set.
+- **Lineage**: the answer to a private prompt is hashed with the prompt's salt and its length is
+  left out: `what` = `generate prompt sha256-salted:<hex> response sha256-salted`, `bytes: 0`.
+- **`SYNSEMA_JUDGE_DECIDE=1`**: a `decide` the judge answers is checked against `judge=`, not
+  `llm=`, so the program needs `require judge("customers")` too. It is still an LLM operation, so the ceiling must also grant `llm` (any form, e.g.
+  `--cap-set "stdout,llm,judge=customers@local,declassify=customers"`); without it the run stops
+  with an error redacted to `private(customers)` and no further text.
+
+**What this does not give.** The provider **sees the data**: this allows a provider the host trusts;
+it does not protect the data from it. What the model answers is private but **not trusted** (an
+injected prompt can make it say anything): a `declassify`, with its own ceiling, is what stands
+between the answer and a sink. And the size of the prompt is visible on the network, as in any
+`https` request.
 
 ## Not an LLM op: `judge` (v0.6.25+)
 

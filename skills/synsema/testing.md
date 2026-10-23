@@ -67,7 +67,9 @@ ended in `ERROR` fails that test, the next block starts clean. See [agents.md](a
 ## Note
 `synsema check` does not run tests: it parses, resolves imports and templates, and warns (e.g. a
 deprecated builtin name — v0.6.29 renamed several, see [builtins.md](builtins.md) § Renamed in
-v0.6.29). Use `synsema test` to actually execute assertions.
+v0.6.29). Use `synsema test` to actually execute assertions. Over a whole project,
+`synsema code check` (v0.6.46+) prints the same warnings with file and line, plus the missing
+capabilities, and exits 1 only on errors — see [code.md](code.md) § What `check` warns.
 
 A test that compares **printed output** of lists/maps must expect text quoted inside them since
 v0.6.29 (`["1", 1]`, `{a: "b"}`); `assert_eq` on the values themselves is unaffected. Equality

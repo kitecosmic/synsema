@@ -614,7 +614,14 @@ route "GET /"
   blocked).
 - **Errors are caught early.** A template referenced as `render("literal.html")`
   is validated **at startup** (file exists + parses), so a typo/missing file
-  fails when the program runs — not on the first request. A runtime error (e.g. a
+  fails when the program runs — not on the first request (`template validation failed for
+  render("…"): …`). **v0.6.46+: only with what the run may read** — each file (and its
+  `include`/`layout`) passes the same check as `render()` before it is opened. A template whose
+  `require file.read` is inside the route is not opened at start: stderr prints `note:
+  render("templates/page.html"): "templates/page.html" is not checked at startup (Capability not
+  granted: …); render() checks it when the route runs`, and `render()` checks it per request as
+  before. Grant it at the top of the file to have it validated at start. A template in a `synsema
+  build` bundle needs no grant; `synsema check`/`build` still read every template. A runtime error (e.g. a
   missing field) is a `500`: in dev the detail (with `file:line`) is returned so
   you or an agent can fix it; with `--secure` the body is generic and the detail
   only goes to the server log (see "Error responses" below).
@@ -732,9 +739,31 @@ serve on 8080
         version: "1.4.0"                          -- info.version (default "0.0.0")
     -- private                     -- internal server: the 5 documents → 404, robots Disallow: /
     -- docs off                    -- only the /docs page goes away
+    -- discovery off               -- v0.6.46+: none of them; every reserved URL reaches your routes
     route "POST /orders" requires auth
         expect body {book: text, qty: number}
         give {"ok": true}
+```
+
+- **`discovery off`** (v0.6.46+), for an edge that only forwards with `proxy to`: the server generates
+  none of `/llms.txt`, `/openapi.json`, `/sitemap.xml`, `/robots.txt`, `/docs`, the Agent Cards and
+  `/.well-known/synsema-auth`; they reach the program's routes like any URL (a `GET /*path` forwards
+  them to the backend, which answers its own; without a route → 404). Before, an edge had to declare
+  each reserved URL as a literal route, and every new one the engine added published the edge's page in
+  silence. With `discovery off` the engine answers none of them — `private` included (`/robots.txt` is
+  a 404 too). `discovery` + anything but `off` → parse error `Expected 'off' after 'discovery'
+  (discovery off)`. `/.well-known/attestation` is identity, not discovery: under `--attested` it is
+  still served, and a literal route on any reserved URL is still a load error there (`serve
+  --attested: route `GET /llms.txt` collides with a reserved path …`; `GET /*path` receives them).
+  `synsema openapi` still describes the routes (offline tool).
+
+```synsema
+require serve(8080)
+require net("127.0.0.1:9000")
+serve on 8080
+    discovery off
+    route "GET /*path"
+        proxy to "http://127.0.0.1:9000"
 ```
 
 - A declared **literal** route or a static file at any of these paths **overrides** the
@@ -1333,7 +1362,12 @@ serve on 8080
 - **Memory vs disk:** small bodies stay in memory (`body of request`,
   `json of request`). Bodies larger than ~1 MB stream to a temp file;
   `body_file of request` is its path and `read_body()` reads it. The temp file
-  is removed when the request finishes (even if the handler errors).
+  is removed when the request finishes (even if the handler errors). It lives in a
+  `synsema-spill-<random>` folder of the system temp dir; a killed/crashed process leaves its
+  folder behind, and since v0.6.46 a `serve` sweeps those **once, on its first spill**: only real
+  folders (not links), untouched for a day, holding only files as old (Unix: same owner + mode
+  `0700`). Leftover `<name>.<random>.synsema.tmp` files of an interrupted atomic write are not
+  swept — delete them by hand.
 - **Chunked** request bodies (no `Content-Length`) are supported and counted.
 
 This is why raising the limit is safe: the cap is on the in-memory buffer, not
@@ -1636,6 +1670,13 @@ route "GET /api/*path"
         give fail(401, "unauthorized")       -- answered by the edge; nothing is forwarded
     proxy to backend_for(request)            -- a destination without its `net` grant → error, never a connection
 ```
+
+**A wildcard `net` never reaches a private upstream (v0.6.46+).** With `require net("*")` (or bare
+`require net`) the server starts, but `proxy to "http://127.0.0.1:9000"` answers every request
+`502 {"error": "proxy error: upstream not allowed", "status": 502}` — checked on **every
+connection** — and the reason goes to the log: ``[serve] proxy error: proxy to: `127.0.0.1` resolved
+to 127.0.0.1, a private address; a `net` grant with a wildcard reaches only public addresses. Name it:
+`require net("127.0.0.1:9000")`…``. Name the upstream (host, address or CIDR) — capabilities.md.
 
 `proxy to` must be written in the route body (inside a task it is an error). A declared
 `route "OPTIONS …"` wins over the automatic `OPTIONS` answer, so a CORS preflight can be proxied

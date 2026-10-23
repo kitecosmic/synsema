@@ -59,6 +59,149 @@ These five names (the four plus `print`) are **protected**: a program cannot bin
 something callable, because redefining one would silently un-label its own sources and mislead the
 audit listing. Binding one to a plain value is fine — they are soft keywords.
 
+**`declassify` and `private` are called by their name, nowhere else (v0.6.46+, breaking).** Reading
+either one as a value is a **load error** — the program does not start, not even its first line:
+
+```text
+let d be declassify                -- an alias
+let xs be [declassify]             -- a list entry
+let m be {"k": declassify}         -- a map entry
+f(declassify, x)                   -- an argument
+task g()
+    give private                   -- a returned value
+call(declassify, {"value": x})     -- also through call()
+let m be {private: 1}              -- a BARE key evaluates the name, so this is one too
+```
+
+```
+Runtime error: app.syn:1:10: 'declassify' is read as a value here (an alias, a list or map entry,
+an argument): it can only be called by its name, `declassify(…)`, so that every call is in the
+review (`synsema code check`)
+```
+
+Why: before v0.6.46 every one of those forms published for real while `synsema code check --json`
+listed none of them, so the review missed the call. Now every `declassify` is a call the inventory
+sees. Fixes: call it by name (`declassify(x, "why")`; the pipe `x |> declassify("why")` is a call by
+name too and still works); for a map key, quote it (`{"private": 1}` — a bare key is evaluated, and
+v0.6.45 printed `{builtin:private: 1}`). A program that **binds the name to a value** still loads
+(`let private be 5`, a parameter called `private`): the name is then that value. The error fires
+with or without `--labels` (`synsema run`, `synsema test`, `synsema code check`); plain
+`synsema check` (the parse check) does not report it.
+
+## `declassify` is a capability, and the host's ceiling bounds it (v0.6.46+)
+
+`declassify` is the one place private data leaves, so the **host** — not the program — decides
+which principals may be published. Think of it like `unsafe` in your own Rust crate: explicit, with
+its mandatory reason, listed in full by `synsema code check --json`.
+
+| How the program runs (with `--labels`) | What `declassify` may remove |
+|---|---|
+| no ceiling (plain `run`/`test`/`serve`) | any principal — granted by the runtime, as before |
+| `--cap-set …` without a `declassify` item | **nothing** |
+| `--cap-set "stdout,declassify=customers"` | `customers` only |
+| `--cap-set "stdout,declassify=cust*"` | principals matching the glob (as for `secret`) |
+| `--cap-set "stdout,declassify"` or `declassify=*` | any principal |
+| `--sandbox`, `--deterministic` | nothing (they never grant it) |
+| inside a `sandbox` block | nothing |
+| inside `sandbox under {"declassify": "customers"}` | `customers` (globs work), still within the host ceiling |
+| wasm: `ceiling: "stdout,declassify=customers"` | the same as `--cap-set` |
+
+```sh
+synsema run --labels --cap-set "stdout,declassify=customers" app.syn
+```
+
+```synsema
+let c be private(3, "customers")
+sandbox under {"declassify": "customers"}       -- delegate it to this block only
+    print(declassify(c, "the count is public"))
+```
+
+- **What is checked is what the call removes.** `declassify(v, "why")` removes every principal of
+  `v`; the narrowing form `declassify(v, "why", ["bank"])` removes the rest, so with
+  `declassify=app` a value private to `["app", "bank"]` can be narrowed to `["bank"]`. A
+  `declassify` of a value that is not private removes nothing and always passes.
+- **Breaking:** a program that declassifies and runs with `--labels` under `--cap-set`, `--sandbox`
+  or `--deterministic` now stops at the `declassify`. Migrate by adding `declassify=<principal>` to
+  the `--cap-set` (for `--sandbox`/`--deterministic`, switch to an explicit `--cap-set`, e.g.
+  `--cap-set "stdout,time,declassify=app"`).
+- **A refusal is a `label_violation`, and `try`/`recover` cannot catch it** (whether it passes
+  depends on the real label of the value — a catchable refusal would be an oracle). Like every label
+  violation, it ends the run and withholds the buffered output:
+
+```
+Runtime error: app.syn:3:17: label_violation: declassify is not granted for what this value is
+private to (customers,others). With a ceiling the host names what a program may publish
+(`--cap-set declassify=<principal>`), and inside a `sandbox` only a `sandbox under` that delegates
+`declassify` allows it
+```
+
+  The set in parentheses is the program's **declared** set (every principal it marks anywhere),
+  never the value's real label — the real one would tell which value it was. The
+  `[INF] declassify: … (from […] to […])` log line names the declared set too (`[…]` when the
+  program declares no principal).
+- **Without `--labels` nothing is checked**: `private(…)` raises (labels are off) and `declassify`
+  is the identity.
+- **`require declassify("customers")`** is understood (v0.6.45 ignored it) and is what the review
+  and a trusted module declare ([modules.md](modules.md) § Trusted modules). What bounds the
+  publication is the **ceiling**: a `require declassify("P")` does not by itself stop a
+  `declassify` of another principal (measured on v0.6.46: with no ceiling, or with
+  `declassify=customers`, a program that requires `declassify("others")` still publishes
+  `customers`). A **bare** `require declassify` prints a warning at start:
+  `synsema: warning: bare \`require declassify\` permits publishing data private to ANY principal;
+  scope it with \`require declassify("principal")\` (the principal the call removes)`.
+- The Vela guest runs its app under `stdout,declassify=app` (its only principal is `app`).
+
+## What `receipt()` publishes after private data (v0.6.46+)
+
+With `--labels`, `receipt()` no longer carries what depended on a private value (each was a leak
+with the program counter public and no `label_violation`):
+
+- `steps` is `nothing` once a private value was seen (it was the raw count: a loop over a private
+  `n` gave its size). Before the first private value it is the number.
+- `declassified[]` lists `{reason, from, to, line}`, and **`from` is the declared set**, not the
+  value's real label (`["a","b","c"]` even when the value was private to `a` and `c` only). A
+  `declassify` **inside a private branch** is left out of the list, and its `[INF] declassify` log
+  line is not written — how many there were told which branch ran.
+- `inputs`: a read inside a private branch (`read_file`, `env`, …) is refused as a sink
+  (`read_file called under private control flow …`), so it never reaches the list.
+
+## `read_line`, `flush` and the order of the output (v0.6.46+)
+
+- **The prompt of `read_line(prompt)` is a public sink, like `print`.** A private prompt, or a
+  prompt inside a private branch, is a `label_violation` (`read_line prompt under private control
+  flow (pc = [a]) …`; the message says "control flow" for a private prompt too). `read_line()`
+  without a prompt inside a private branch is allowed.
+- **With `--labels`, `flush()` and `read_line` do not write the pending output live.** `print`
+  already kept it until the end; now the prompts come out first and the printed lines at the end
+  (`print("one"); flush(); read_line("> ")` shows `> one`). Without `--labels` nothing changes.
+
+## Private data to a model the host chose (v0.6.46+)
+
+Any private value in `reason`, `analyze`, `decide`, `generate`, `judge`, `llm_step` or
+`llm_stream` was a `label_violation`. Now it may go to a model **the host** allows, per principal
+and per provider, and the answer stays private:
+
+```sh
+synsema run --labels --cap-set "stdout,llm=customers@api.anthropic.com,declassify=customers" app.syn
+```
+
+```synsema
+require llm("customers")                     -- whose data this program may send
+let note be private("Ana Perez, order 3141", "customers")
+let summary be reason about "Summarize the note in one line" with context = note
+print(summary)                               -- private(customers): the answer carries the label
+```
+
+The full rules (`@local`, `@*`, `judge=`, `llm_step`, `llm_stream`, audit, lineage, what it does not
+give) are in [llm.md](llm.md) § Private data to a model.
+
+## Trusted tools: code a person wrote, called by code a model wrote (v0.6.46+)
+
+Under a ceiling without `declassify`, a program written by a model cannot publish anything private.
+The host can still give it **tools** a person wrote, whose own policy declassifies — `synsema run
+--labels --cap-set stdout --trusted tools=./tools.syn app.syn`, then `use "trusted:tools" as t` in
+the program. See [modules.md](modules.md) § Trusted modules.
+
 ## What propagates, and what a sink is
 
 Every operation carries the union of its operands' labels. Branching on a private value puts the
@@ -220,6 +363,20 @@ lists every `declassify` with its file, line, reason, target labels and whether 
 source-level constant. That listing is the review: a program with no `declassify` publishes
 nothing private, and every line of the listing is a decision somebody made and wrote down.
 
+```json
+{"ok": true, "files": 1, "errors": [], "warnings": [],
+ "declassify": [
+   {"file": "app.syn", "line": 2, "column": 20, "reason": "the count is public", "to": null, "constant": false},
+   {"file": "app.syn", "line": 3, "column": 20, "reason": "doubled", "to": [], "constant": false}]}
+```
+
+`to` is `null` for the two-argument form (publish) and the list for the narrowing form. Since
+v0.6.46 the inventory is **complete** — `declassify` can only be called by its name, so there is no
+call it cannot see — and the `declassify_static_only` field is gone (a tool that read it must stop).
+A program that reads `declassify` as a value gives `"ok": false` with the load error in `errors`
+and an empty `declassify` list. When the program declassifies without any `require declassify`,
+`warnings` carries `top-level needs capability \`declassify\` but the program never requires it`.
+
 ## Limits, stated
 
 - **Termination is one bit per *run*, and a server run is one *request*.** A run the checker
@@ -235,8 +392,12 @@ nothing private, and every line of the listing is a decision somebody made and w
   it cannot undo. Do not put public effects in a loop that branches on private data.
 - **Timing and resource use** are not modelled at all.
 - **Audit in private branches.** Since v0.6.45 audit-writing operations refuse to run there and
-  capability checks there are not logged; a sealed run receipt that records them without revealing
-  the branch is planned, not shipped.
+  capability checks there are not logged. Since v0.6.46 a host can designate an auditor
+  (`synsema run --labels --auditor <X25519 public key> --receipt <path>`): then `reveal`, `sign` and
+  the wallet operations do run in a private branch and their audit line goes into a sealed receipt
+  only the auditor opens ([attestation.md](attestation.md)). Without an auditor they are still
+  refused. An LLM or judge operation under a private branch is refused **before** the capability
+  check, so it no longer leaves a "granted llm" entry in `--audit` either.
 - **Crossing into another interpreter** (`parallel_map`, `run_program`, cron, the bus, the swarm)
   is a sink: a labelled argument is refused, before any worker starts. That is a **deliberate
   fail-closed decision, not an impossibility** — the channel between interpreters does carry

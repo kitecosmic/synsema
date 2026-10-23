@@ -28,7 +28,7 @@ the current names; the full old → new list is in [builtins.md](builtins.md) §
 | `x += 1` | `set x to x + 1` | no compound assignment: `+=` → parse error `Synsema has no compound assignment (+=): write set x to x + 1` |
 | `d["k"] = v` (add or overwrite a key) | `set m["k"] to v` | In place on an existing map: `{a: 1}` → `{a: 1, b: 2}` (v0.6.19). `m["k"]` reads it, `contains(m, "k")` tests it |
 | `for k in a_dict:` / `for k, v in d.items():` | `each k in m` / `each e in items(m)` … `e.key` / `e.value` | v0.6.29+: `each` walks a map's **keys** in insertion order (before: `Cannot iterate over map`); also text (characters) and bytes (ints). `{ each }` in a `render()` template does the same |
-| `for i, x in enumerate(xs):` | `each e in enumerate(xs)` … `e.index` / `e.item` | `enumerate(list)` → `[{index, item}, …]` (engine > v0.5.9; before it: `each i in range(length(xs))` … `xs[i]`) |
+| `for i, x in enumerate(xs):` | `each e in enumerate(xs)` … `e.index` / `e.item` | `enumerate(list)` → `[{index, item}, …]` (engine > v0.5.9; before it: `each i in range(length(xs))` … `xs[i]`); v0.6.46+ also over a numeric array (its first axis: `for i, row in enumerate(np_array)`), which `each` does not walk |
 | `while c:` | `while c` | same keyword, no colon; no iteration cap (v0.6.29+ — before, 1,000,000; the wasm build keeps it) |
 | `def f(x): return v` | `task f(x)` … `give v` | load-time errors that name the Synsema word (v0.6.29+): ``return` is not a Synsema statement: `give <value>` returns from a task``; the same kind of hint for `def`/`function`/`fn`/`func`/`for`/`if`/`elif`/`else`/`import`/`from`/`class`/`except`/`catch`/`finally`/`var`/`const`/`pass`/`break`/`continue`/`throw` |
 | `lambda x: x + 1` | `(x) => x + 1` | `lambda y: y` → parse error `a lambda is (y) => y` |
@@ -77,7 +77,7 @@ Also: the LLM words **`reason` / `decide` / `analyze` / `generate`** (like every
 | `xs.index(v)` (raises) | `index_of(xs, v)` → **`nothing`** when absent (not -1, no error); `v in xs` is the operator for membership |
 | `d.get(k, default)` / `d.pop(k)` / `{**a, **b}` | `get(m, k, default)` / `remove(m, k)` (new map) / `merge(a, b)` (new map, right wins) (v0.6.29+). `d.get("a")` → `Map has no key 'get' — … Synsema has no methods: get(m, key, default)` |
 | `d.keys()` / `d.values()` / `d.items()` | `keys(m)` / `values(m)` / `items(m)` → `[{key, value}, …]` (v0.6.29+) |
-| `json.dumps(x)` / `json.loads(s)` | `json_encode(x)` / `json_decode(s)` (pure, no import; big integers exact up to 4300 digits like Python's `int`, `1e400` → error instead of `inf`; a leading UTF-8 BOM is skipped; `NaN`/`Infinity` are an error unless `json_decode(s, allow_nan = true)` — Python's `json.loads` accepts them silently) |
+| `json.dumps(x)` / `json.loads(s)` | `json_encode(x)` / `json_decode(s)` (pure, no import; a `secret` inside is an error since v0.6.46 — it is never written as text; big integers exact up to 4300 digits like Python's `int`, `1e400` → error instead of `inf`; a leading UTF-8 BOM is skipped; `NaN`/`Infinity` are an error unless `json_decode(s, allow_nan = true)` — Python's `json.loads` accepts them silently) |
 | `"%d" % x` / `"{}".format(x)` | `` `{x}` `` / `fmt("{x}", {"x": x})` | `%`-formatting → error `there is no %-formatting: use a template` |
 | `range(n)` | `range(n)` → a real list (also `range(a, b, step)`) |
 | `print(...)` | `print(...)` (written immediately under `run`, v0.6.29+; text inside lists/maps prints quoted: `["1", 1]`) |
@@ -101,6 +101,7 @@ rows. Full pipeline: [dataviz.md](dataviz.md) § Data analysis; contracts: [buil
 |---|---|---|
 | `pd.read_csv(p, dtype={"id": str, "qty": int}, parse_dates=["day"])` | `csv_parse(read_file(p), {"types": {"qty": "int", "day": "date"}})` | untyped columns stay text (never guessed); an empty cell is `nothing` (pandas: NaN) |
 | `pd.read_parquet(p)` / `df.to_parquet(p)` | `parquet_read(read_file_bytes(p))` / `write_file(p, parquet_write(rows))` | flat columns, one type per column; not in the wasm build |
+| `pd.read_parquet(p, columns=["a"])` (only what you need) | `parquet_scan(p, {"columns": ["a"], "limit": n})` (v0.6.46+) | reads the footer and only those pages from disk; needs `require file.read(p)` |
 | `pd.read_json(p, lines=True)` / `df.to_json(orient="records", lines=True)` | `jsonl_decode(read_file(p))` / `jsonl_encode(rows)` | `jsonl_decode(text, default)` is the no-raise form |
 | `df.groupby("r").agg(total=("m", "sum"), n=("m", "size"))` | `summarize(rows, "r", {"total": sum_of("m"), "n": count()})` | groups in first-appearance order (pandas sorts by key); also `mean_of`/`min_of`/`max_of`/`median_of`/`quantile_of(col, q)`/`first_of`/`n_unique_of`, or any `(group) => …` |
 | `for k, g in df.groupby("r"):` | `each g in group_by(rows, "r")` … `g.key` / `g.items` | `group_by` returns `[{key, items}]`, NOT a dict (`keys(group_by(…))` → an error that explains the shape); keys group by `==` (`{"a": 1, "b": 2}` = `{"b": 2, "a": 1}`; `1` = `1.0`, but ≠ `"1"`); a column no row has → error |

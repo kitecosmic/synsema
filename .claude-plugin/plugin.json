@@ -1,0 +1,13 @@
+{
+  "name": "synsema",
+  "displayName": "Synsema",
+  "description": "Synsema, the programming language for AI agents: the full language reference as a skill (syntax, builtins, capabilities, the HTTP server, LLM operations, data, deployment, pitfalls), read on demand.",
+  "author": {
+    "name": "Synsema",
+    "url": "https://synsema.dev"
+  },
+  "homepage": "https://synsema.dev",
+  "repository": "https://github.com/kitecosmic/synsema",
+  "license": "Apache-2.0",
+  "keywords": ["synsema", "programming-language", "agents", "skill"]
+}

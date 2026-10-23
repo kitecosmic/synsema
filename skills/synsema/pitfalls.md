@@ -2,8 +2,9 @@
 
 Read this FIRST if something fails. Each row is a real mistake that costs hours to debug.
 
-> **Just upgraded and something that worked now fails?** Start at *Upgrading to v0.6.45* (file
-> scopes, `static`, templates), then *v0.6.42*, *v0.6.29* and *v0.6.24*, right below.
+> **Just upgraded and something that worked now fails?** Start at *Upgrading to v0.6.46* (secrets
+> in encodings, wildcards and private addresses, `declassify` under a ceiling, `watch`/`cwd`), then
+> *v0.6.45* (file scopes, `static`, templates), *v0.6.42*, *v0.6.29* and *v0.6.24*, right below.
 >
 > **Jump to the `## ` section that matches your failure:** Errors (parse/runtime messages) ·
 > Database SQL · Database MongoDB · Database Redis · HTTP server (serve) · Language features
@@ -11,6 +12,41 @@ Read this FIRST if something fails. Each row is a real mistake that costs hours 
 > Behavioral surprises · Anti-patterns · Secrets & config
 > Coming from Python? The traps that LOOK like Python but aren't are also collected in
 > [python-diff.md](python-diff.md).
+
+## Upgrading to v0.6.46 — what behaves differently
+
+| You see | What changed | What to write |
+|---|---|---|
+| `json_encode: the value["auth"]["key"] is secret(K), and a secret is never written as text …` (also `jsonl_encode`, `json_for_script`, `csv_encode: row 1, column "a": …`) | a secret is no longer written as `"[redacted]"`: the program could send the marker on as if it were the data | pass the secret to the request itself (a header; the URL, query, body or form once it is bound), or leave the field out — see [secrets.md](secrets.md) |
+| `a secret inside a map cannot go into a text hole …` on `` `Bearer {creds}` `` | a list or map with a secret inside, in a template hole, used to become the text `{k: secret(K)}` | take it out on its own (`` `{creds.k}` ``, still a secret) or `bearer(...)`/`basic(...)` |
+| a secret in the URL, the query or the body is an error, and `synsema check` warns `… is not bound to a host …` | an unbound secret only goes in a header | `require secret("K") for net("api.example.com")` — then it goes in the URL/query/body/form, only to that host, over https |
+| `secret("K") not permitted: the host binds K to api.example.com; write …` | the host bound it with `--cap-set secret=K@api.example.com` | write exactly that `require … for net(...)` line |
+| `http_get` to an internal host now gives `status: 0` and ``… resolved to 10.0.0.5, a private address; a `net` grant with a wildcard reaches only public addresses …`` (`tcp_connect`/`ws_connect` raise it) | a wildcard (`require net`, `net("*")`, `net("*.x.com")`, `--cap-set net`, `sandbox under`, a token) reaches only public IP addresses | name the host (`require net("db:5432")`), the address or a CIDR; from configuration, `require net(env("CONTROL_URL"))` |
+| `proxy to` answers `502 proxy error: upstream not allowed` | same rule, checked on every connection (the reason, with the address, is in the server log) | name the upstream in its `require net(...)` |
+| ``unknown capability `nett` in `require` — did you mean `require net`?`` and the program does not start | a `require` with a name that does not exist used to grant nothing, silently | fix the name (`file_read`/`file_write`, the audit form, still load) |
+| ``'declassify' is read as a value here …`` | `declassify`/`private` can only be called by their name (an alias published while `code check` listed nothing) | `declassify(x, "why")` directly; a map key named `private` goes quoted: `{"private": 1}` |
+| with `--labels` under `--cap-set`/`--sandbox`/`--deterministic`: `label_violation: declassify is not granted for what this value is private to (…)` — not catchable | `declassify` is a capability the host ceiling bounds | the host adds `declassify=<principal>` (globs work); in a `sandbox`, `sandbox under {"declassify": "…"}`. `require declassify("P")` in the program declares, it does not bound — the ceiling does |
+| `label_violation: reason would send data private to (P) to the model …` | still the default; v0.6.46 adds a way through | `require llm("P")` + the host's `--cap-set "llm=P@<provider host>"` (`@local`, `@embedder`); for `judge`, `require judge("P")` + `judge=P@…` |
+| after a private `llm_step`, `when step.name == "f"` is a `label_violation` | the answer to a private prompt is private, the whole map | `declassify(step.name, "the tool name is public")` first — under a ceiling that needs `declassify=P` |
+| `label_violation: read_line prompt under private control flow …` | the prompt of `read_line` is a public sink, like `print` | move the prompt out of the private branch, or declassify it |
+| with `--labels` (or an auditor), output printed before `read_line`/`flush()` now appears at the end | they used to write the pending output live, and how many lines came out could depend on a private branch | expected; `eprint` still goes to stderr live |
+| with `--labels`, `receipt().credentialSubject.steps` is `nothing` | the raw count could tell a private value | expected once the run saw a private value |
+| `watch` on a folder fails with `file_read("src/**")` not granted | a recursive watch reports names of the whole tree | grant `file.read("src/**")`, or `watch(…, {"recursive": false})` |
+| `run("./tool", [], 60, {"cwd": "sub"})` now asks for `exec("./sub/tool")` | a relative command resolves against `cwd`, and that is what the grant must name | grant `exec("./sub/tool")`; a command without a separator (from `PATH`) or an absolute path is unchanged |
+| with `pty: true` on Windows, `notes` runs but `./notes` / `C:/x/node` is "not found" | a path is run as written, without trying `PATHEXT` | write the extension: `./notes.bat`, `C:/x/node.exe` |
+| on Windows `read_file("a.txt.")` or `"a.txt "` no longer opens `a.txt`; `…/CON` is not the device | names are opened as written, without the Win32 normalization | remove the trailing dot or space |
+| `serve` prints `note: render("…") is not checked at startup …` | the start checks a template only with what the run may read, and that `require file.read` is inside the route | move the grant to the top level if you want the check at start |
+| `call_tool(add): 'a' must be number, got text …` | typed parameters (`task add(a: number)`) are checked strictly by `call`/`call_tool`, without converting | build the catalog with `tool_spec(add, "…")`, or convert inside the task; a normal call does not check |
+| `unknown parameter 'limt' — did you mean 'limit'?; the parameters are: limit, offset` | a named argument a task or builtin does not have; before, a misspelled name said the right one was missing | use a listed name (found when the call runs, not by `check`) |
+| `log(x)` → `Undefined variable: 'log' — in Synsema: ln(x) …` | `log` is the statement `log "message"` | `ln(x)`, `log10(x)`, `log2(x)`, `log_base(x, b)` |
+| `in_units(90, "minutes")` → `in_units() takes a duration, got number …` | a number is not a duration | `in_units(duration(seconds = 90), "minutes")` |
+| `each x in a` over an array → `Cannot iterate over array` | `each` walks lists | `each e in enumerate(a)` (v0.6.46+, first axis) or `to_list(a)` |
+| `parquet_read(read_file_bytes(big))` to read a few columns | the whole file goes into memory | `parquet_scan(path, {"columns": […]})` reads only those pages |
+| in `@synsema/wasm`: `state_get: host kv.get failed: … must return a string or null, got a number` / `kv.list must return a list of strings, got …` | a host `kv` that fails or answers something else is an error, not an absent key (the next write used to replace what was stored) | return the stored text; `list` → an array of key names (map Cloudflare's `{keys:[{name}]}`) — see [deploy.md](deploy.md) § WebAssembly |
+| a labelled wasm/guest run under a `ceiling` fails at `declassify`; a Vela request returns `runtime_error` with `declassify is not granted …` in the log | the ceiling bounds `declassify`; the Vela guest runs under `stdout,declassify=app` | add `declassify=<principal>` to the ceiling; a Vela app publishes only `app` data |
+| with `--auditor`, `print` output appears only at the end | the receipt comes out before the output | use `eprint` for progress (it goes to stderr live) |
+| with labels and an auditor, `now() - now()` is `0` | the clock is fenced | expected; the readings are in the envelope for `--replay` |
+| `reveal`/`sign` in a private branch still fail with `label_violation` | they run only with an auditor, which seals their audit line | `--auditor <key>` (`synsema receipt keygen`); `spend` stays refused in a private branch |
 
 ## Upgrading to v0.6.45 — what behaves differently
 
@@ -542,7 +578,7 @@ byte-strings (text/bytes/number); structured data goes via `json_encode`/`json_d
 | A deeply nested type / typed-data / txn / derivation path is fine | Nesting over **64 levels** (or a path over 256 chars / 32 segments) errors, atrapable | A DoS guard (like RLP's) — no real payload/path is that deep; hostile input can't crash the process |
 | Derive Solana with a normal BIP-32 path | Wrong key — Solana uses **SLIP-0010**: `hd_derive(seed, "m/44'/501'/0'/0'", "ed25519")` (hardened-only; a non-hardened index errors) | ETH is the default `"secp256k1"`; ed25519 has no non-hardened derivation |
 | Load an Algorand wallet phrase with `mnemonic_to_seed` | Algorand's 25-word phrase is **NOT BIP-39** — use `algorand_mnemonic`/`algorand_mnemonic_to_key` | Different checksum (sha512_256 over the key) and 11-bit packing; the 12/24-word BIP-39 path is for ETH/Solana |
-| `mnemonic_generate`/`hd_derive`/`keystore_import` return usable bytes | They return a `secret` — `text()`/`json_encode` show `secret(NAME)`/`[redacted]` | Use it directly with `hd_derive`/`evm_address`/`secp256k1_sign`; back a phrase up on purpose with `reveal()` (gated + audited) |
+| `mnemonic_generate`/`hd_derive`/`keystore_import` return usable bytes | They return a `secret` — `text()` shows `secret(NAME)`; `json_encode` of it is an error (v0.6.46+; it was `[redacted]`) | Use it directly with `hd_derive`/`evm_address`/`secp256k1_sign`; back a phrase up on purpose with `reveal()` (gated + audited) |
 | `reveal("W")` reveals the seed derived from a `"W"` mnemonic | Derived secrets carry a **derived name**: `mnemonic_to_seed` → `W.seed`, `algorand_mnemonic` → `W.mnemonic`, `hd_derive` → `W/path` | Grant with the prefix `reveal("W*")` (or the exact derived name); the `wallet`/`sign` scope of a derived key follows the same derived name |
 | Custody works with `require sign` (or ambient) | Creating custody needs its OWN capability: `require wallet` (deny-by-default, audited in `wallet.log`, denied in `sandbox`) | `wallet` creates keys, `sign` moves value — an agent can derive addresses without spending |
 | A wrong keystore passphrase returns garbage / partial key | Clear "wrong passphrase" error, **no material** — the MAC is checked before decrypting | Same for a bad mnemonic checksum: the error never echoes the phrase |

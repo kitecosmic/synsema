@@ -149,6 +149,21 @@ name("a", param2 = 20)                -- named arg (any order; like `spawn ... w
 -- Arity is strict (v0.6.29+): name() → "task 'name' is missing argument 'param1' — pass it, or
 -- give the parameter a default"; one argument too many is an error too (a 1-param task `f`
 -- called f(1, 2, 3) → "task 'f' takes 1 argument, got 3"). Lambdas too.
+-- A misspelled named argument lists the real ones (v0.6.46+): f(limt = 1) →
+-- "unknown parameter 'limt' — did you mean 'limit'?; the parameters are: limit, offset".
+
+task estado(id: text, items: bool = false)   -- types on parameters (v0.6.46+)
+    give id
+-- The five types of `expect body`: text, number, bool, list, map. Metadata, checked ONLY where
+-- arguments arrive as data: call(task, map) and call_tool(task, map) reject a wrong type or a
+-- missing typed parameter, strictly, without converting ("call_tool(add): 'a' must be number,
+-- got text"; "call_tool(add): missing 'a' (number)"). A normal call does not check them and costs
+-- nothing (estado(5) runs). A secret counts as text; `nothing` is accepted only when the default
+-- is `nothing`. They feed tool_spec(task, describe) and the JSON Schema the model sees (llm.md §
+-- Typed tool parameters) and `synsema code outline --json` (`parameters`, `input_schema`).
+-- Load errors: task f(a: int) → "unknown type 'int' for parameter 'a': the parameter types are
+-- text, number, bool, list or map"; task f(a: number = "x") → "the default of 'a: number' is a
+-- text". Lambdas take no types: (x: number) => x is a parse error.
 max(1, 2,)                            -- a trailing comma is fine in calls (v0.6.29+), as in lists/maps
 max(
     1,

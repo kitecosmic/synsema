@@ -19,7 +19,7 @@ use synsema_core::parser::parse_source;
 fn skill_dir() -> Option<PathBuf> {
     // `CARGO_MANIFEST_DIR` = engine/crates/synsema-core
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).ancestors().nth(3)?.to_path_buf();
-    let d = root.join(".synsema-skill");
+    let d = root.join("skills").join("synsema");
     d.is_dir().then_some(d)
 }
 
@@ -59,7 +59,7 @@ fn every_tagged_snippet_in_the_skill_loads() {
         return;
     };
     let mut files: Vec<PathBuf> = fs::read_dir(&dir)
-        .expect("leer .synsema-skill")
+        .expect("leer skills/synsema")
         .filter_map(|e| e.ok().map(|e| e.path()))
         .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("md"))
         .collect();
