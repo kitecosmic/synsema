@@ -12,7 +12,7 @@ Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the rele
 `.synsema-skill/`, a hidden folder that only the Claude Code installer knew, and its `SKILL.md`
 frontmatter did not parse as YAML for strict readers (a `:` inside the unquoted description), so
 `npx skills add` found no skill. Now it is the open Agent Skills layout (`skills/<name>/SKILL.md`,
-description under 1024 characters) and installs with `npx skills add kitecosmic/synsema` (Claude
+description under 1024 characters) and installs once per machine with `npx skills add kitecosmic/synsema -g -y` (Claude
 Code, Codex, opencode, Cursor, Gemini CLI, GitHub Copilot, Windsurf, …), as a Claude Code plugin
 (`/plugin marketplace add kitecosmic/synsema`, then `/plugin install synsema@synsema`) or a Codex
 plugin (`codex plugin marketplace add kitecosmic/synsema`, then `codex plugin add synsema@synsema`).

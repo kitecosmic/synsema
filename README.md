@@ -561,8 +561,8 @@ Windsurf and any other agent that reads skills.
 ### Install the skill
 
 ```bash
-# Any agent (asks which ones; -g = every project, -a codex / -a claude-code / '*' = pick, -y = no questions)
-npx skills add kitecosmic/synsema
+# Any agent, once per machine: every project, every agent it detects (-a codex = just one)
+npx skills add kitecosmic/synsema -g -y
 
 # Without Node
 curl -fsSL https://raw.githubusercontent.com/kitecosmic/synsema/main/install-skill.sh | bash                  # ~/.claude/skills  (Claude Code)
@@ -574,10 +574,11 @@ curl -fsSL https://raw.githubusercontent.com/kitecosmic/synsema/main/install-ski
 #   Codex:        codex plugin marketplace add kitecosmic/synsema   then   codex plugin add synsema@synsema
 ```
 
-Re-run it after each `synsema update` so the skill matches the binary (`npx skills update` if you
-used npx). Claude Code reads `~/.claude/skills`, Codex `~/.agents/skills`, and opencode reads
-both: with a copy in each, update them together (`npx skills update` updates every copy it
-installed). Agents without skill support can read
+Install it once per machine, not per project: without `-g` the skill goes into the current folder
+only. Re-run it after each `synsema update` so the skill matches the binary (`npx skills update -g`
+if you used npx). Claude Code reads `~/.claude/skills`, Codex `~/.agents/skills`, and opencode reads
+both: with a copy in each, update them together (`npx skills update -g` updates every global copy
+it installed). Agents without skill support can read
 [`skills/synsema/INDEX.md`](skills/synsema/INDEX.md) as context: it points to every other file.
 
 ### The docs MCP
