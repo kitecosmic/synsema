@@ -935,10 +935,21 @@ enum Failure {
     /// `private`: la corrida de `invariants` tocó datos privados, así que la CANTIDAD de
     /// descripciones no puede salir al log (auditoría ronda 4/V4). Ver `Failure::log`.
     Invariant { descriptions: Vec<String>, private: bool },
-    /// Un valor `private` llegó a un sumidero que no acepta su etiqueta (p. ej. un saldo en
-    /// `app_events`). On-chain `label_violation`; el camino y la etiqueta (nunca el valor) al log.
-    Label { path: String, label: Vec<String>, accepts: &'static str },
+    /// Un corte de etiquetas: un valor `private` llegó a un sumidero que no acepta su etiqueta
+    /// (p. ej. un saldo en `app_events`), o el motor cortó la corrida (`operator_detail` en su
+    /// respuesta; `path` vacío). On-chain `label_violation` y UNA línea fija en el log: desde
+    /// v0.6.47 (T1, B1) ni el camino ni la etiqueta salen, porque cuál de los dos cortes fue, y qué
+    /// campo, lo elige el dato. El camino queda para los tests del adaptador.
+    Label {
+        #[cfg_attr(not(test), allow(dead_code))]
+        path: String,
+        #[cfg_attr(not(test), allow(dead_code))]
+        label: Vec<String>,
+    },
 }
+
+/// v0.6.47 (T1, B1): la línea del log del Executor para cualquier corte de etiquetas.
+const LABEL_CUT_LOG: &str = "label_violation: the flow checker stopped the run; what failed and where stay in the enclave";
 
 impl Failure {
     fn code(&self) -> &str {
@@ -973,15 +984,7 @@ impl Failure {
                     }
                 }
             }
-            Failure::Label { path, label, accepts } => log(
-                "ERR",
-                &format!(
-                    "label_violation: {} is private to {}, the sink accepts {} (declassify it, or keep it in state/events)",
-                    path,
-                    label.join(","),
-                    accepts
-                ),
-            ),
+            Failure::Label { .. } => log("ERR", LABEL_CUT_LOG),
         }
     }
 }
@@ -1107,17 +1110,30 @@ fn run_app_with(app: &App, task: &str, fallback: Option<&str>, ctx: &Value, root
         .unwrap_or_default();
     let ok = resp.get("ok").and_then(Value::as_bool).unwrap_or(false);
     // Todo `print` de la app es log (un `print` de un valor privado ya llega redactado).
-    for line in &output {
-        log("INF", line);
-    }
+    // v0.6.47 (T1): salvo en un corte de etiquetas, del motor o de un sumidero de acá: un corte
+    // del motor deja la salida retenida y un rechazo del sumidero viene después de una corrida
+    // que terminó bien; si la salida saliera en uno y no en el otro, cuál fue lo diría el log.
+    let emit = || {
+        for line in &output {
+            log("INF", line);
+        }
+    };
     if !ok || !errors.is_empty() {
         // El log del Executor está FUERA del enclave. El MOTOR ya redacta el texto de todo error
         // de runtime producido bajo control privado o tras desenvolver un privado: sale
         // `private(<los principales DECLARADOS>)` y **nada más** — desde la ronda 7 tampoco viaja
         // `file:line:col`, porque si el secreto elige cuál de N sitios falla la ubicación vale
-        // log₂(N) bits, y acá cada request es una corrida. Sólo deja en claro sus propios
-        // diagnósticos de etiquetas (el CAMINO del valor, que es lo que hay que ir a arreglar).
-        // Acá se loguea ese texto tal cual, UNA sola vez (en `Failure::log`, L21).
+        // log₂(N) bits, y acá cada request es una corrida. Desde v0.6.47 (T1) sus propios
+        // diagnósticos de etiquetas salen igual: un texto fijo, el mismo para cualquier sitio
+        // (el detalle, `operator_detail`, no se lee acá: no sale del enclave). Acá se loguea el
+        // texto de un error, UNA sola vez (en `Failure::log`, L21).
+        // v0.6.47 (T1, B1): un corte de etiquetas del motor es el mismo `label_violation` que el
+        // rechazo de un sumidero del adaptador (si no, el dato elegía entre dos códigos on-chain).
+        // `operator_detail` se mira sólo para saber que lo hay; no se lee.
+        if resp.get("operator_detail").is_some() {
+            return AppRun { result: Err(Failure::Label { path: String::new(), label: Vec::new() }), steps, private_seen, detail_private: false };
+        }
+        emit();
         let msg = if errors.is_empty() { "the program failed".to_string() } else { errors.join("; ") };
         return AppRun { result: Err(Failure::Runtime(msg)), steps, private_seen, detail_private: false };
     }
@@ -1127,6 +1143,7 @@ fn run_app_with(app: &App, task: &str, fallback: Option<&str>, ctx: &Value, root
     // no necesita este canal: `synsema code check app.syn --json` lista TODOS los sitios con su
     // motivo, su línea y si el argumento es constante, sin correr nada ni mirar una request.
     let Some(result) = resp.get("result").cloned() else {
+        emit();
         return AppRun {
             result: Err(Failure::Runtime("the engine returned no result (an engine without labels/result support)".to_string())),
             steps,
@@ -1134,7 +1151,11 @@ fn run_app_with(app: &App, task: &str, fallback: Option<&str>, ctx: &Value, root
             detail_private: false,
         };
     };
-    match release(result, root) {
+    let released = release(result, root);
+    if !matches!(released, Err(Failure::Label { .. })) {
+        emit();
+    }
+    match released {
         Ok((v, info)) => AppRun { result: Ok(v), steps, private_seen, detail_private: info.detail_private },
         Err(f) => AppRun { result: Err(f), steps, private_seen, detail_private: false },
     }
@@ -1156,16 +1177,6 @@ enum Sink {
     App,
     Log,
     Ignored,
-}
-
-impl Sink {
-    fn accepts(self) -> &'static str {
-        match self {
-            Sink::Public => "(public)",
-            Sink::App | Sink::Log => "app",
-            Sink::Ignored => "anything",
-        }
-    }
 }
 
 /// El sumidero de un camino, por su raíz (y, en `events`, por el campo del evento): `state`,
@@ -1238,7 +1249,7 @@ fn release_at(v: Value, root: Sink, pattern: &mut Vec<String>, shown: &mut Vec<S
             Sink::Ignored => false,
         };
         if violates {
-            return Err(Failure::Label { path: shown_path(shown), label, accepts: sink.accepts() });
+            return Err(Failure::Label { path: shown_path(shown), label });
         }
         if !label.is_empty() {
             if pat.first().copied() == Some("error_detail") {
@@ -1715,6 +1726,9 @@ fn run_invariants(app: &App, ctx: &Value) -> Result<(), Failure> {
     let fail = |descriptions: Vec<String>| Failure::Invariant { descriptions, private };
     match run.result {
         Err(Failure::Runtime(e)) => Err(fail(vec![format!("invariants raised: {}", e)])),
+        // v0.6.47 (T1): un corte del motor adentro de `invariants` (camino vacío) sigue siendo un
+        // invariante que no se cumplió, como antes; el rechazo de un sumidero de su resultado, no.
+        Err(Failure::Label { path, .. }) if path.is_empty() => Err(fail(vec!["invariants were stopped by the flow checker".to_string()])),
         Err(other) => Err(other),
         Ok(Value::Null) => Ok(()),
         Ok(Value::Array(a)) if a.is_empty() => Ok(()),
@@ -2208,7 +2222,7 @@ task deanonymize(ctx)
     }
 
     #[test]
-    fn error_codes_pass_free_text_becomes_app_error_and_raise_is_runtime_error() {
+    fn error_codes_pass_free_text_becomes_app_error_and_raise_is_a_label_cut() {
         let app = App::inline(LEDGER);
         let s0 = deployed(&app, None);
         let coded = process(&app, ALICE, r#"{"type": "code"}"#, &s0);
@@ -2216,8 +2230,11 @@ task deanonymize(ctx)
         assert_eq!(coded["state"], Value::Null);
         let free = process(&app, ALICE, r#"{"type": "free"}"#, &s0);
         assert_eq!(free["error"], json!("app_error"), "{}", free);
+        // v0.6.47 (T1): el motor marca este `raise` como nacido bajo PC privado (su texto ya salía
+        // `private(app)`): es un corte de etiquetas, con el mismo código que un `print` en una rama
+        // privada (si no, el sitio elegía el código on-chain).
         let boom = process(&app, ALICE, r#"{"type": "boom"}"#, &s0);
-        assert_eq!(boom["error"], json!("runtime_error"), "{}", boom);
+        assert_eq!(boom["error"], json!("label_violation"), "{}", boom);
         // Un contrato roto del adaptador (report en un PROCESS no falla; un tipo 2 sin report sí).
         let no_task = process_flow(&App::inline("task deploy(ctx)\n    give {\"state\": {}}\n"), 1, &addr(ALICE), REQUEST_PROCESS, b"{}", b"{}");
         assert_eq!(no_task["error"], json!("runtime_error"));
@@ -2266,9 +2283,9 @@ task deanonymize(ctx)
         let free = process(&app, ALICE, r#"{"type": "free"}"#, &s0);
         let data: Value = serde_json::from_slice(&event_data(&free["events"][0])).unwrap();
         assert_eq!(data["rejected"], json!("app_error"));
-        // Un error de runtime NO se convierte: sigue siendo público.
+        // Un corte (el `raise`, que nace bajo PC privado; v0.6.47 T1) NO se convierte: sigue siendo público.
         let boom = process(&app, ALICE, r#"{"type": "boom"}"#, &s0);
-        assert_eq!(boom["error"], json!("runtime_error"));
+        assert_eq!(boom["error"], json!("label_violation"));
         // Ni un depósito fallido, ni una deanonimización, ni una trusted.
         let bad_deposit = deposit_flow(&App::inline("task deploy(ctx)\n    give {\"state\": {}, \"policy\": {\"reject\": \"private\"}}\ntask deposit(ctx)\n    give {\"error\": \"token_not_allowed\"}\n"), 1, &addr(ALICE), &[0u8; 20], &[5], br#"{"_vela":{"reject":"private"}}"#);
         assert_eq!(bad_deposit["error"], json!("token_not_allowed"));
@@ -2491,6 +2508,7 @@ task process(ctx)
     let kind be declassify(text(p["type"]), "the instruction kind is public")
     match kind
         is "leak"
+            print("procesando")
             give {"state": s, "app_events": [{"subtype": "total", "data": {"total": s["secret_total"]}}]}
         is "declassified"
             give {"state": s, "app_events": [declassify({"subtype": "total", "data": {"total": s["secret_total"]}}, "the total is public by policy")]}
@@ -2500,6 +2518,11 @@ task process(ctx)
             give {"state": s, "withdrawals": [declassify({"to": p["to"], "amount": "1"}, "settlement is public")]}
         is "computed_code"
             give {"error": "unknown_" + text(p["what"])}
+        is "cut"
+            print("procesando")
+            when s["secret_total"] == 42
+                print("x")
+            give {"state": s}
         is "credit"
             let b be s["balances"]
             set b[p["to"]] to "5"
@@ -2543,6 +2566,27 @@ task process(ctx)
         assert_eq!(credit["events"][0]["userId"], json!(BOB));
         let data: Value = serde_json::from_slice(&event_data(&credit["events"][0])).unwrap();
         assert_eq!(data["balance"], json!("5"));
+    }
+
+    /// v0.6.47 (T1, B1): un corte del intérprete (un `print` bajo una rama privada) y el rechazo de
+    /// un sumidero del adaptador (un privado en un app event) salen con el MISMO código on-chain y la
+    /// MISMA línea en el log del Executor, que está fuera del enclave: cuál de los dos fue, y qué
+    /// campo, lo eligió el dato.
+    #[test]
+    fn an_engine_cut_and_a_sink_refusal_look_the_same_outside_the_enclave() {
+        let app = App::inline(LEAKY);
+        let s0 = deployed(&app, None);
+        let _ = taken_log();
+        let leak = process(&app, ALICE, r#"{"type": "leak"}"#, &s0);
+        let leak_log = taken_log();
+        let cut = process(&app, ALICE, r#"{"type": "cut"}"#, &s0);
+        let cut_log = taken_log();
+        assert_eq!(leak["error"], json!("label_violation"), "{}", leak);
+        assert_eq!(cut["error"], json!("label_violation"), "{}", cut);
+        assert_eq!(leak_log, cut_log, "el log distingue los dos cortes");
+        assert!(cut_log.contains(LABEL_CUT_LOG) && !cut_log.contains("app_events") && !cut_log.contains("print"), "{}", cut_log);
+        // Una línea pública antes del corte tampoco sale en ninguno de los dos.
+        assert!(!cut_log.contains("procesando") && !cut_log.contains("withheld"), "{}", cut_log);
     }
 
     /// Auditoría R2/B2: la forma GRANULAR — sin `declassify` del mapa entero y sin declassificar

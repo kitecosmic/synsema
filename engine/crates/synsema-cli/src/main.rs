@@ -115,6 +115,12 @@ impl HostFlags {
         host::set_profile(p);
         if self.labels {
             host::set_labels(true);
+            // v0.6.47 (T1): sin techo, quien corre el binario escribió el programa y es el dueño del
+            // dato: el corte de etiquetas le dice el sitio y el remedio. Con un techo el código no es
+            // de confianza (el de un modelo, típicamente) y su stderr vuelve al modelo: texto fijo, y
+            // el detalle sólo en el recibo sellado. Sin un flag que lo fuerce con techo.
+            let ceiling = self.sandbox || self.cap_set.is_some() || self.deterministic || !self.trusted.is_empty();
+            host::set_labels_detail_to_program(matches!(cmd, "run" | "test") && !ceiling);
         }
         self.apply_trusted(cmd)?;
         Ok(p)

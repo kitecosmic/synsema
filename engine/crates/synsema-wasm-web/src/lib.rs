@@ -657,7 +657,7 @@ fn opts_from(req: &Map<String, Value>) -> Result<RunOptions, String> {
         None | Some(Value::Null) => None,
         Some(v) => Some(synsema_stdlib::sealed::sealed_bytes_from(Some(&v.to_string())).map_err(|e| e.replace("SYNSEMA_RECEIPT_SEALED_BYTES", "sealed_bytes"))?),
     };
-    Ok(RunOptions { filename, env, ceiling, no_fs: true, labels, result, input, sources, max_steps, max_memory_mb, trusted, trusted_ceiling, auditor, sealed_bytes })
+    Ok(RunOptions { filename, env, ceiling, no_fs: true, labels, result, input, sources, max_steps, max_memory_mb, trusted, trusted_ceiling, auditor, sealed_bytes, labels_detail_to_program: false })
 }
 
 fn install_host(req: &Map<String, Value>) {
@@ -744,6 +744,11 @@ fn dispatch(req: &Map<String, Value>) -> Value {
                         out.insert("declassify".into(), Value::Array(r.declassify.iter().map(|d| d.to_json()).collect()));
                         out.insert("private_seen".into(), json!(r.private_seen));
                     }
+                    // v0.6.47 (T1): el diagnóstico de un corte de etiquetas, para el operador. En
+                    // `errors` va el texto fijo; esto es del host y no se le devuelve al programa.
+                    if let Some(d) = &r.operator_detail {
+                        out.insert("operator_detail".into(), json!(d));
+                    }
                     Value::Object(out)
                 }
                 "test" => {
@@ -782,6 +787,10 @@ fn dispatch(req: &Map<String, Value>) -> Value {
                     out.insert("log".into(), json!(r.log));
                     out.insert("errors".into(), json!(r.errors));
                     out.insert("audit".into(), audit_json(&r.audit));
+                    // v0.6.47 (T1): como en `run`, el diagnóstico de un corte de etiquetas va aparte.
+                    if let Some(d) = &r.operator_detail {
+                        out.insert("operator_detail".into(), json!(d));
+                    }
                     Value::Object(out)
                 }
             }
@@ -998,5 +1007,49 @@ print(s)";
         let req = json!({"op":"handle","source":src,"request":{"method":"POST","path":"/hello/ana","headers":[],"body":""}});
         let v: Value = serde_json::from_str(&call_json(&req.to_string())).unwrap();
         assert_eq!(v["status"], 405, "{}", v);
+    }
+
+    /// v0.6.47 (T1): el sitio de un corte de etiquetas va en `operator_detail`, no en lo que ve el
+    /// programa (`errors`, `log`, `output`, el cuerpo de la respuesta).
+    #[test]
+    fn abi_label_cut_detail_goes_to_operator_detail() {
+        let src = "let s be private(1, \"app\")\nwhen s == 1\n    print(\"x\")\n";
+        let req = json!({"op":"run","source":src,"filename":"t.syn","labels":true});
+        let v: Value = serde_json::from_str(&call_json(&req.to_string())).unwrap();
+        assert_eq!(v["ok"], json!(false), "{}", v);
+        let d = v["operator_detail"].as_str().unwrap_or_else(|| panic!("{}", v));
+        assert!(d.contains("t.syn:3:") && d.contains("print called under private control flow"), "{}", d);
+        let mut seen = v.clone();
+        seen.as_object_mut().unwrap().remove("operator_detail");
+        assert!(!seen.to_string().contains("print called"), "{}", seen);
+        assert!(v["errors"][0].as_str().unwrap().contains("label_violation: the flow checker stopped the run (private to app)"), "{}", v);
+
+        let src = "require serve(8080)\nserve on 8080\n    route \"GET /x\"\n        let s be private(1, \"app\")\n        when s == 1\n            print(\"x\")\n        give 1\n";
+        let req = json!({"op":"handle","source":src,"filename":"h.syn","labels":true,"request":{"method":"GET","path":"/x","headers":[],"body":""}});
+        let v: Value = serde_json::from_str(&call_json(&req.to_string())).unwrap();
+        assert_eq!(v["status"], 500, "{}", v);
+        let d = v["operator_detail"].as_str().unwrap_or_else(|| panic!("{}", v));
+        assert!(d.contains("print called under private control flow"), "{}", d);
+        let mut seen = v.clone();
+        seen.as_object_mut().unwrap().remove("operator_detail");
+        assert!(!seen.to_string().contains("print called"), "{}", seen);
+
+        // B1: el mismo handler corta adentro (s == 1) o devuelve un privado (s == 2), que rechaza el
+        // chequeo de la respuesta. El cliente ve lo mismo (cuerpo y log, también con una línea
+        // pública antes); el operador, cuál fue.
+        let src = "require serve(8080)\nserve on 8080\n    route \"GET /x\"\n        print(\"antes\")\n        let s be private(input_s, \"app\")\n        when s == 1\n            print(\"x\")\n        give {\"balance\": s}\n";
+        let mut bodies = Vec::new();
+        for k in [1, 2] {
+            let req = json!({"op":"handle","source":src.replace("input_s", &k.to_string()),"filename":"h.syn","labels":true,"request":{"method":"GET","path":"/x","headers":[],"body":""}});
+            let v: Value = serde_json::from_str(&call_json(&req.to_string())).unwrap();
+            assert_eq!(v["status"], 500, "{}", v);
+            let d = v["operator_detail"].as_str().unwrap_or_else(|| panic!("sin operator_detail: {}", v)).to_string();
+            let mut client = v.clone();
+            client.as_object_mut().unwrap().remove("operator_detail");
+            bodies.push((client, d));
+        }
+        assert_eq!(bodies[0].0, bodies[1].0, "el cliente distingue los dos cortes");
+        assert!(!bodies[0].0.to_string().contains("antes"), "{}", bodies[0].0);
+        assert!(bodies[0].1.contains("print called") && bodies[1].1.contains("response.balance"), "{:?}", bodies);
     }
 }

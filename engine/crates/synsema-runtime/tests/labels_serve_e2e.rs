@@ -63,15 +63,30 @@ serve on {p}
     route "GET /partial"
         let cross be private(1, "bank") + private(2, "airline")
         give {{"x": declassify(cross, "to the bank only", ["bank"])}}
+    route "GET /stream-leak"
+        stream
+            send "antes"
+            send private(5, "bank")
+    route "GET /stream-try"
+        stream
+            try
+                send private(5, "bank")
+            recover e
+                send "atrapado"
 "#,
         p = port
     );
     start_bg(prog, port);
 
-    // Un mapa con un privado adentro: 500 y el camino en el error; el valor jamás sale.
+    // Un mapa con un privado adentro: 500; el valor jamás sale. v0.6.47 (T1, B1): el texto fijo de
+    // todo corte (con el conjunto declarado); qué campo era privado, el operador.
     let leak = http_get(port, "/leak");
     assert!(leak.starts_with("HTTP/1.1 500"), "{}", leak);
-    assert!(leak.contains("label_violation") && leak.contains("response.balance") && leak.contains("bank"), "{}", leak);
+    assert!(
+        leak.contains("label_violation: the flow checker stopped the run (private to airline,bank)") && !leak.contains("response.balance"),
+        "{}",
+        leak
+    );
     assert!(!leak.contains("\"balance\":5") && !leak.contains("\"balance\": 5"), "{}", leak);
 
     // Un `html()` construido con texto privado: el valor del servidor sale envuelto → 500.
@@ -88,10 +103,22 @@ serve on {p}
     // (era un oráculo), así que también necesita `declassify` para salir por el cable.
     let lof = http_get(port, "/label-of");
     assert!(lof.starts_with("HTTP/1.1 500"), "{}", lof);
-    assert!(lof.contains("label_violation") && lof.contains("response.principals"), "{}", lof);
+    assert!(lof.contains("label_violation: the flow checker") && !lof.contains("response.principals"), "{}", lof);
 
     // Declassificado a un subconjunto ({bank}) sigue siendo privado para el cable público.
     let partial = http_get(port, "/partial");
     assert!(partial.starts_with("HTTP/1.1 500"), "{}", partial);
-    assert!(partial.contains("label_violation") && partial.contains("response.x") && !partial.contains("\"x\":3"), "{}", partial);
+    assert!(partial.contains("label_violation: the flow checker") && !partial.contains("response.x") && !partial.contains("\"x\":3"), "{}", partial);
+
+    // v0.6.47 (T1, ronda 2): un privado por un `stream` corta como cualquier sumidero: el texto
+    // fijo, sin el camino, y no se puede atrapar con `try/recover`.
+    for path in ["/stream-leak", "/stream-try"] {
+        let s = http_get(port, path);
+        eprintln!("{path}: {s}");
+        assert!(s.contains("label_violation: the flow checker"), "{}: {}", path, s);
+        let b = s.split_once("
+
+").map(|(_, b)| b).unwrap_or("");
+        assert!(!b.contains("stream.") && !b.contains("atrapado") && !b.contains("data: 5"), "{}: {}", path, s);
+    }
 }

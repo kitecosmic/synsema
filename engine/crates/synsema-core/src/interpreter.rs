@@ -69,6 +69,7 @@ impl fmt::Debug for RuntimeError {
             .field("redact_label", &self.redact_label)
             .field("from_labels", &self.from_labels)
             .field("denied_by_token", &self.denied_by_token)
+            .field("operator_detail", &self.operator_detail)
             .finish()
     }
 }
@@ -118,6 +119,13 @@ pub struct RuntimeErrorData {
     /// v0.6.42 — `proxy to <destino>` ejecutado dentro de una ruta: corta el handler (no se
     /// atrapa, como `exit`) y el runtime de `serve` reenvía la request a ese destino.
     pub proxy: Option<ProxyTo>,
+    /// v0.6.47 (T1) — el diagnóstico completo de un corte de etiquetas (el mensaje con el sitio y
+    /// el remedio, con su ubicación), apartado para el OPERADOR. `Some` quiere decir que `message`
+    /// ya es el texto fijo que ve el programa y `location` ya no está: ver
+    /// `Interpreter::withhold_labels_detail`. El host lo lleva por su propio canal (stderr del CLI
+    /// sin techo, el campo `operator_detail` del wasm, el log de `serve`, el recibo sellado) y
+    /// nunca a `errors` ni al log del programa.
+    pub operator_detail: Option<String>,
 }
 
 /// v0.6.42 — el destino de un `proxy to` evaluado por request.
@@ -135,10 +143,10 @@ impl RuntimeError {
         self.0.message
     }
     pub fn new(message: impl Into<String>) -> Self {
-        RuntimeError(Box::new(RuntimeErrorData { message: message.into(), location: None, is_validation: false, field: None, is_assertion: false, from_private_pc: false, redact_label: String::new(), from_labels: false, denied_by_token: false, exit_code: None, proxy: None }))
+        RuntimeError(Box::new(RuntimeErrorData { message: message.into(), location: None, is_validation: false, field: None, is_assertion: false, from_private_pc: false, redact_label: String::new(), from_labels: false, denied_by_token: false, exit_code: None, proxy: None, operator_detail: None }))
     }
     pub fn at(message: impl Into<String>, location: SourceLocation) -> Self {
-        RuntimeError(Box::new(RuntimeErrorData { message: message.into(), location: Some(location), is_validation: false, field: None, is_assertion: false, from_private_pc: false, redact_label: String::new(), from_labels: false, denied_by_token: false, exit_code: None, proxy: None }))
+        RuntimeError(Box::new(RuntimeErrorData { message: message.into(), location: Some(location), is_validation: false, field: None, is_assertion: false, from_private_pc: false, redact_label: String::new(), from_labels: false, denied_by_token: false, exit_code: None, proxy: None, operator_detail: None }))
     }
     /// El texto de este error **hacia un cliente REMOTO** (el cuerpo de una respuesta HTTP, el
     /// evento final de un stream): igual que `Display`, pero la ubicación viaja con el NOMBRE del
@@ -165,15 +173,22 @@ impl RuntimeError {
     /// Error de validación de cliente (input que no cumple `expect`): se mapea a HTTP 400
     /// con el nombre del campo ofensor, en vez de a un 500 genérico.
     pub fn validation(message: impl Into<String>, field: Option<String>) -> Self {
-        RuntimeError(Box::new(RuntimeErrorData { message: message.into(), location: None, is_validation: true, field, is_assertion: false, from_private_pc: false, redact_label: String::new(), from_labels: false, denied_by_token: false, exit_code: None, proxy: None }))
+        RuntimeError(Box::new(RuntimeErrorData { message: message.into(), location: None, is_validation: true, field, is_assertion: false, from_private_pc: false, redact_label: String::new(), from_labels: false, denied_by_token: false, exit_code: None, proxy: None, operator_detail: None }))
     }
     /// Falla de aserción (`assert*`): marca `is_assertion` para el reporte de tests.
     pub fn assertion(message: impl Into<String>) -> Self {
-        RuntimeError(Box::new(RuntimeErrorData { message: message.into(), location: None, is_validation: false, field: None, is_assertion: true, from_private_pc: false, redact_label: String::new(), from_labels: false, denied_by_token: false, exit_code: None, proxy: None }))
+        RuntimeError(Box::new(RuntimeErrorData { message: message.into(), location: None, is_validation: false, field: None, is_assertion: true, from_private_pc: false, redact_label: String::new(), from_labels: false, denied_by_token: false, exit_code: None, proxy: None, operator_detail: None }))
     }
     /// Diagnóstico del sistema de etiquetas (`from_labels`), con ubicación.
     pub fn labels(message: impl Into<String>, location: SourceLocation) -> Self {
-        RuntimeError(Box::new(RuntimeErrorData { message: message.into(), location: Some(location), is_validation: false, field: None, is_assertion: false, from_private_pc: false, redact_label: String::new(), from_labels: true, denied_by_token: false, exit_code: None, proxy: None }))
+        RuntimeError(Box::new(RuntimeErrorData { message: message.into(), location: Some(location), is_validation: false, field: None, is_assertion: false, from_private_pc: false, redact_label: String::new(), from_labels: true, denied_by_token: false, exit_code: None, proxy: None, operator_detail: None }))
+    }
+    /// v0.6.47 (T1, B1): el chequeo de un `stream` (un sumidero del host) es un corte de etiquetas
+    /// como cualquier otro: no se atrapa, no lleva ubicación y sale con el texto fijo por el embudo.
+    pub fn stream_label_cut(message: impl Into<String>) -> Self {
+        let mut e = RuntimeError::new(message);
+        e.from_labels = true;
+        e
     }
     /// v0.6.42 — el fin pedido por `exit(code)` (ver `exit_code`).
     pub fn exit(code: i32) -> Self {
@@ -313,7 +328,7 @@ fn err_labels(msg: impl Into<String>, loc: &SourceLocation) -> Control {
 /// Nombre de archivo de una ruta (sin directorios), para los diagnósticos que salen al cliente.
 /// v0.6.42 — escribe líneas en stderr, sin buffer (un lock, un flush). Con la terminal en raw
 /// mode (`term_open`) un `\n` solo no vuelve al margen: `\r\n`, como `drain_output`.
-fn write_stderr_lines(lines: &[String]) {
+pub fn write_stderr_lines(lines: &[String]) {
     use std::io::Write;
     let raw = crate::term_guard::is_raw();
     let err = std::io::stderr();
@@ -1330,6 +1345,36 @@ pub type SpawnHook = Rc<
 pub struct SpawnSubject {
     pub identity: Option<String>,
     pub spend_limits: Vec<(String, String)>,
+    /// v0.6.47 (T1, A1): el corte de la corrida que lanza al agente; el agente lo comparte.
+    pub run_cut: Option<std::sync::Arc<RunCut>>,
+    /// v0.6.47 (T1, N3): los principales declarados del que lo lanza, para que el texto fijo de un
+    /// corte del agente sea el mismo que el de la corrida.
+    pub principals: Vec<String>,
+}
+
+/// La única línea de salida de una corrida cortada por el chequeo de flujo (ver
+/// `redact_output_for_host`); el motor la usa también cuando el corte es de un agente.
+pub const LABELS_WITHHELD_OUTPUT: &str = "private(labels): the run was stopped by the flow checker; its output is withheld because the NUMBER of lines before the stop depends on private data";
+
+/// v0.6.47 (T1, A1) — **el corte de etiquetas de una corrida, compartido con sus agentes.** Un
+/// agente corre en su propio hilo; si un corte suyo quedara contenido (DE-011), su estado
+/// `error`/`done` sería un bit por agente que el principal lee con `agents()` y sigue corriendo
+/// (diez agentes, uno por dígito, deletreaban una tarjeta en una corrida). El agente que se corta
+/// anota acá `(texto, detalle)` antes de que su estado cambie, y desde ese momento todo sumidero de
+/// la corrida y el embudo del host dan ese corte: la corrida entera termina como un corte, como en
+/// wasm (donde `spawn` corre en línea) y como en el runner de tests.
+#[derive(Debug, Default)]
+pub struct RunCut(std::sync::OnceLock<(String, String)>);
+
+impl RunCut {
+    /// Anota el corte; el primero gana.
+    pub fn set(&self, message: String, detail: String) {
+        let _ = self.0.set((message, detail));
+    }
+    /// `(texto hacia el programa, detalle para el operador)`, si hubo corte.
+    pub fn get(&self) -> Option<&(String, String)> {
+        self.0.get()
+    }
 }
 
 /// Hooks que el host (motor) cablea para conectar `share`/`observe`/`signal`/
@@ -1739,6 +1784,17 @@ pub struct Interpreter {
     /// el tope `MAX_LINEAGE`. El recibo lo marca así, no por el largo: con exactamente el tope no se
     /// perdió nada.
     lineage_dropped: [bool; 2],
+    /// v0.6.47 (T1) — el diagnóstico de un corte de etiquetas sale entero HACIA EL PROGRAMA (el
+    /// texto de hoy, con sitio, remedio y ubicación). Apagado por defecto: el programa recibe un
+    /// texto fijo y el detalle va al operador. Lo enciende sólo el CLI sin techo, donde quien corre
+    /// el binario escribió el programa y es el dueño del dato. Al final del struct a propósito.
+    labels_detail_to_program: bool,
+    /// v0.6.47 (T1, A1): el corte compartido con los agentes de la corrida (ver `RunCut`).
+    run_cut: std::sync::Arc<RunCut>,
+    /// v0.6.47 (T1): adónde va el stderr retenido al terminar sin corte (`None` = al stderr del
+    /// proceso). Con agentes y etiquetas, al swarm: sale al cierre de la corrida, no cuando
+    /// termina cada intérprete (cuándo terminó cada uno lo elegía el dato).
+    pub err_hook: Option<std::sync::Arc<dyn Fn(&str) + Send + Sync>>,
 }
 
 /// v0.6.46 (ronda 1 de cf1, B2): el linaje que juntó un intérprete hijo (un worker de
@@ -1895,6 +1951,9 @@ impl Interpreter {
             template_open_hook: None,
             outputs: Vec::new(),
             lineage_dropped: [false; 2],
+            labels_detail_to_program: false,
+            run_cut: std::sync::Arc::new(RunCut::default()),
+            err_hook: None,
             blackboard: HashMap::new(),
             agent_definitions: HashMap::new(),
             agent_context: Vec::new(),
@@ -2037,6 +2096,12 @@ impl Interpreter {
         self.label_stop.replace(false)
     }
 
+    /// v0.6.47 (T1): el host anota un corte que el chequeo vio fuera del bloque (el valor que un
+    /// handler de `serve` devuelve y la respuesta rechaza), para tratarlo como cualquier corte.
+    pub fn mark_label_stop(&self) {
+        self.label_stop.set(true);
+    }
+
     /// Los principales declarados, como lista — para un host que arma su propio informe (el ABI
     /// wasm). Constante para la corrida, a diferencia de la etiqueta de un valor.
     pub fn declared_principals_list(&self) -> Vec<String> {
@@ -2130,7 +2195,10 @@ impl Interpreter {
     fn safe_label(&self, _l: &Label) -> String {
         let text = self.redaction_names();
         if text.is_empty() {
-            "…".to_string()
+            // v0.6.47 (T1): un intérprete que no cargó el programa (el worker de `serve`, un agente)
+            // usa el conjunto del proceso, como el `Display` de un valor privado: si no, su corte decía
+            // `…` y el rechazo de la respuesta `app`, dos textos para el mismo corte.
+            labels::principals_out()
         } else {
             text
         }
@@ -2145,6 +2213,9 @@ impl Interpreter {
     /// Comprobación de sumidero (B7) sobre valores ya evaluados: PC vacío y ningún valor con
     /// etiquetas a ninguna profundidad. `what` nombra al sumidero en el camino del error.
     fn sink_check(&self, what: &str, values: &[&SynValue], loc: &SourceLocation) -> Result<(), Control> {
+        if let Some(c) = self.cut_by_agent() {
+            return Err(c);
+        }
         if !self.pc_is_empty() {
             return Err(err_labels(
                 format!(
@@ -2177,6 +2248,12 @@ impl Interpreter {
     /// `redact_for_host`.
     fn host_message(&self, c: &Control) -> String {
         match c {
+            // v0.6.47 (T1): el reporte de tests no pasa por `redact_for_host`; el texto fijo, igual.
+            Control::Error(e) if e.is_fatal_for_labels() && e.operator_detail.is_none() && self.labels && !self.labels_detail_to_program => {
+                let mut e = e.clone();
+                self.withhold_labels_detail(&mut e);
+                e.message.clone()
+            }
             Control::Error(e) => self.redacted_message(e).unwrap_or_else(|| e.to_string()),
             other => control_message(other),
         }
@@ -2236,17 +2313,16 @@ impl Interpreter {
             self.err_output.clear();
         } else if !self.err_output.is_empty() {
             let lines = std::mem::take(&mut self.err_output);
-            write_stderr_lines(&lines);
+            match &self.err_hook {
+                Some(hook) => lines.iter().for_each(|l| hook(l)),
+                None => write_stderr_lines(&lines),
+            }
         }
-        if self.output.is_empty() {
-            return;
-        }
+        // v0.6.47 (T1): con corte, la línea fija SIEMPRE, también sin salida previa: si no, «hubo
+        // líneas antes del corte» quedaba a la vista y el sitio del corte lo elige el privado.
         if fatal {
             self.output.clear();
-            self.output.push(
-                "private(labels): the run was stopped by the flow checker; its output is withheld because the NUMBER of lines before the stop depends on private data"
-                    .to_string(),
-            );
+            self.output.push(LABELS_WITHHELD_OUTPUT.to_string());
         }
     }
 
@@ -2257,6 +2333,12 @@ impl Interpreter {
         if !self.labels {
             return r;
         }
+        // v0.6.47 (T1, A1): si un agente de la corrida se cortó, la corrida termina con ese corte.
+        let r = match (r, self.cut_by_agent()) {
+            (Err(Control::Error(e)), _) if e.is_fatal_for_labels() => Err(Control::Error(e)),
+            (_, Some(c)) => Err(c),
+            (r, None) => r,
+        };
         // T5 (ronda 6, B2): la salida acumulada tampoco sale si el chequeo de flujo cortó la
         // corrida — acá, en el mismo embudo que el mensaje, para que no dependa de que cada
         // host se acuerde. Idempotente: los hosts lo vuelven a llamar como segunda red.
@@ -2271,10 +2353,85 @@ impl Interpreter {
                 if !e.redact_label.is_empty() && !e.from_labels {
                     e.message = format!("private({})", e.redact_label);
                 }
+                self.withhold_labels_detail(&mut e);
                 Err(Control::Error(e))
             }
             other => other,
         }
+    }
+
+    /// v0.6.47 (T1) — **un corte de etiquetas le llega al programa con un texto fijo.** El mensaje
+    /// de un `label_violation` nombra el sitio (la variable, el builtin, la ruta del argumento) y la
+    /// ubicación, y cuál de N sitios falla lo elige el dato privado: eran log₂(N) bits por corrida,
+    /// y en un loop de agente el error vuelve al modelo (el exploit leía una tarjeta entera, un
+    /// dígito por corrida). Hacia el programa sale el mismo texto para cualquier sitio y tipo, con el
+    /// conjunto DECLARADO (constante para el programa); el diagnóstico entero queda en
+    /// `operator_detail` y, con auditor, en el sobre del recibo. Un error que el programa hizo bajo
+    /// una rama privada (`from_private_pc`) sale con el MISMO texto.
+    ///
+    /// Idempotente (`operator_detail` ya puesto): los hosts pasan por más de un embudo. Con
+    /// `labels_detail_to_program` (el CLI sin techo) no hace nada: el texto de hoy, que trae el
+    /// remedio exacto, es para quien escribió el programa.
+    #[cold]
+    #[inline(never)]
+    fn withhold_labels_detail(&self, e: &mut RuntimeError) {
+        if !self.labels || self.labels_detail_to_program || !e.is_fatal_for_labels() || e.is_halt() || e.operator_detail.is_some() {
+            return;
+        }
+        let detail = e.to_string();
+        // El detalle depende del dato privado, así que va al sobre (sólo lo abre el auditor).
+        crate::sealed::push_sealed(serde_json::json!({"kind": "label_violation", "detail": detail}).to_string());
+        // Un solo texto para los dos tipos de corte: si un `label_violation` y un error bajo la rama
+        // privada dijeran cosas distintas, cuál de los dos fue también lo elegiría el dato.
+        e.message = labels::cut_text(&self.safe_label(&labels::empty()));
+        e.location = None;
+        e.operator_detail = Some(detail);
+    }
+
+    /// v0.6.47 (T1) — el diagnóstico entero de un corte de etiquetas sale hacia el programa (ver
+    /// `withhold_labels_detail`). Sólo para un host donde quien lo corre escribió el programa: el CLI
+    /// sin techo.
+    pub fn labels_detail_to_program(&self) -> bool {
+        self.labels_detail_to_program
+    }
+
+    /// v0.6.47 (T1, A1): el corte que comparte esta corrida con sus agentes (ver `RunCut`).
+    pub fn run_cut(&self) -> std::sync::Arc<RunCut> {
+        self.run_cut.clone()
+    }
+
+    /// v0.6.47 (T1, A1): el agente adopta el corte de la corrida que lo lanzó.
+    pub fn set_run_cut(&mut self, cut: std::sync::Arc<RunCut>) {
+        self.run_cut = cut;
+    }
+
+    /// v0.6.47 (T1, A1): `Some` si un agente de la corrida se cortó por etiquetas. El error ya sale
+    /// retenido (texto del agente, detalle en `operator_detail`): el agente lo selló al cortarse.
+    #[inline]
+    fn cut_by_agent(&self) -> Option<Control> {
+        if !self.labels {
+            return None;
+        }
+        self.run_cut.get().map(|(m, d)| Self::agent_cut_error(m, d))
+    }
+
+    /// v0.6.47 (T1, A1): quien observa el estado de un agente cortado (`agents()`) adopta su corte.
+    pub fn adopt_run_cut(&self, message: &str, detail: &str) -> Control {
+        self.run_cut.set(message.to_string(), detail.to_string());
+        Self::agent_cut_error(message, detail)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn agent_cut_error(message: &str, detail: &str) -> Control {
+        let mut e = RuntimeError::new(message.to_string());
+        e.from_labels = true;
+        e.operator_detail = Some(detail.to_string());
+        Control::Error(e)
+    }
+
+    pub fn set_labels_detail_to_program(&mut self, on: bool) {
+        self.labels_detail_to_program = on;
     }
 
     /// No-sensitive-upgrade ESTRICTO (B1/M4): asignar bajo PC privado a algo cuya etiqueta
@@ -2641,6 +2798,9 @@ impl Interpreter {
     /// escribir. Lo que sigue funcionando igual es imprimir un valor privado con el PC público:
     /// sale `private(A,B)` por Display, como siempre.
     fn stdout_flow_check(&self, what: &str, loc: &SourceLocation) -> Result<(), Control> {
+        if let Some(c) = self.cut_by_agent() {
+            return Err(c);
+        }
         if !self.labels || self.pc_is_empty() {
             return Ok(());
         }
@@ -4725,7 +4885,16 @@ impl Interpreter {
         crate::resolve::check::register(program);
         let r = self.execute_inner(program);
         // T5 (M1): un error no atrapado sale redactado si la corrida tocó privados.
-        self.redact_for_host(r)
+        let r = self.redact_for_host(r);
+        // v0.6.47 (T1): el corte del programa también es el de la corrida, y el cierre con agentes
+        // (`close_swarm_run`) retiene igual su eco y su stderr. Sólo acá, en la corrida entera: un
+        // `call_task`/`run_block` (cron, handlers de serve) no corta a los que vienen después.
+        if let Err(Control::Error(e)) = &r {
+            if self.labels && e.is_fatal_for_labels() {
+                self.run_cut.set(e.to_string(), e.operator_detail.clone().unwrap_or_else(|| e.to_string()));
+            }
+        }
+        r
     }
 
     fn execute_inner(&mut self, program: &Program) -> Result<SynValue, Control> {
@@ -4831,6 +5000,11 @@ impl Interpreter {
         let mut outcomes = Vec::new();
         for stmt in &program.statements {
             if let NodeKind::TestBlock { name, body } = &stmt.kind {
+                // v0.6.47 (T1, A1): un agente del setup o del bloque anterior (ya esperado por
+                // `after_each`) se cortó: la corrida entera termina, como con un corte del bloque.
+                if let Some(c) = self.cut_by_agent() {
+                    return vec![self.labels_stopped_outcome(&c)];
+                }
                 let test_env = Environment::child(&g, &format!("test:{}", name));
                 // Cada bloque `test` es su propia unidad — la tinta de continuación de uno
                 // No puede llegarle al siguiente (ni al setup).
@@ -4846,24 +5020,8 @@ impl Interpreter {
                     // violación como bit. La corrida entera se corta acá, con UN outcome —el
                     // límite que declara la spec es un bit por corrida, no uno por bloque.
                     Err(Control::Error(e)) if self.labels && e.is_fatal_for_labels() => {
-                        let msg = self.host_message(&Control::Error(e));
-                        outcomes.clear();
-                        outcomes.push(TestOutcome {
-                            // Ronda 7: el nombre del bloque lo pone el ATACANTE, así que nombrar
-                            // en cuál murió es tantos bits como bloques haya — el mismo mensaje
-                            // que dice "un veredicto por bloque sería un bit por bloque" los
-                            // entregaba en su propio título.
-                            name: "labels: the run was stopped".to_string(),
-                            passed: false,
-                            assertion: false,
-                            message: Some(format!(
-                                "{} — a label violation stops the whole run: a per-block verdict would \
-                                 be one bit of private data per block. Fix it and run the suite again",
-                                msg
-                            )),
-                        });
                         self.restore_taint(saved_taint);
-                        return outcomes;
+                        return vec![self.labels_stopped_outcome(&Control::Error(e))];
                     }
                     Err(Control::Error(e)) => TestOutcome {
                         name: name.clone(),
@@ -4891,7 +5049,32 @@ impl Interpreter {
                 outcomes.push(outcome);
             }
         }
+        if let Some(c) = self.cut_by_agent() {
+            return vec![self.labels_stopped_outcome(&c)];
+        }
         outcomes
+    }
+
+    /// El único outcome de una corrida de tests cortada por etiquetas.
+    fn labels_stopped_outcome(&self, c: &Control) -> TestOutcome {
+        // v0.6.47 (T1): el corte de la suite es el de la corrida: el cierre retiene el eco y el
+        // stderr de los agentes (`run_tests_inner`).
+        if let Control::Error(e) = c {
+            self.run_cut.set(self.host_message(c), e.operator_detail.clone().unwrap_or_else(|| e.to_string()));
+        }
+        TestOutcome {
+            // Ronda 7: el nombre del bloque lo pone el ATACANTE, así que nombrar en cuál murió es
+            // tantos bits como bloques haya — el mismo mensaje que dice "un veredicto por bloque
+            // sería un bit por bloque" los entregaba en su propio título.
+            name: "labels: the run was stopped".to_string(),
+            passed: false,
+            assertion: false,
+            message: Some(format!(
+                "{} — a label violation stops the whole run: a per-block verdict would \
+                 be one bit of private data per block. Fix it and run the suite again",
+                self.host_message(c)
+            )),
+        }
     }
 
     fn exec_block(
@@ -6616,6 +6799,8 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                 let subject = SpawnSubject {
                     identity: self.request_identity.clone(),
                     spend_limits: self.request_spend_limits.clone(),
+                    run_cut: Some(self.run_cut.clone()),
+                    principals: self.declared_principals_list(),
                 };
                 let id = spawn(agent_name, def.0, spawn_args, global_vals, subject)?;
                 Ok(syn_text(id))
@@ -9644,7 +9829,12 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                 // este chequeo cubre un prompt privado y uno dentro de una rama privada. Leer sin
                 // prompt en una rama privada sigue permitido.
                 self.stdout_flow_check("read_line prompt", loc)?;
-                if !self.live_output && crate::sealed::active() {
+                if self.labels {
+                    // v0.6.47 (T1): con etiquetas el prompt se junta como `print`: si saliera en
+                    // vivo, cuántos prompts se vieron antes de un corte lo elegiría el dato. Va por
+                    // `emit_line` (el eco de un agente lleva su prefijo y también se retiene).
+                    self.emit_line(raw_str(p).to_string());
+                } else if !self.live_output && crate::sealed::active() {
                     // v0.6.46 (E6): con auditor nada sale antes del recibo; el prompt se junta como
                     // cualquier salida.
                     self.output.push(raw_str(p).to_string());

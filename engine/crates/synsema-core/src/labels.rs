@@ -357,6 +357,16 @@ fn redaction_text() -> String {
     REDACTION_FALLBACK.read().map(|g| g.clone()).unwrap_or_default()
 }
 
+/// v0.6.47 (T1) — **el texto fijo de un corte de etiquetas**, el mismo para cualquier sitio y tipo de
+/// corte (el del intérprete, el de la respuesta, el de un `stream`, el de un agente): cuál de N sitios
+/// cortó lo elige el dato privado. `principals` es el conjunto DECLARADO (`principals_out()`).
+pub fn cut_text(principals: &str) -> String {
+    format!(
+        "label_violation: the flow checker stopped the run (private to {}); what failed, where and how to fix it go to the operator, not to the program",
+        principals
+    )
+}
+
 /// Los principales DECLARADOS, para un mensaje que sale del proceso. `…` si no hay ninguno.
 /// **Éste es el embudo**: todo texto hacia afuera que quiera nombrar principales pasa por acá o
 /// por `redacted_display()`, nunca por `label_display_raw`.

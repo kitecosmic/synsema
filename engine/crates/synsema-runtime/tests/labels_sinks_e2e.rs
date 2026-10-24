@@ -16,9 +16,9 @@ fn free_port() -> u16 {
     TcpListener::bind(("127.0.0.1", 0)).unwrap().local_addr().unwrap().port()
 }
 
-fn start_bg(prog: String, port: u16) {
+fn start_bg(prog: String, port: u16, ov: ServeOverrides) {
     thread::spawn(move || {
-        let _ = run_serve_program_with_overrides(&prog, "labels_sinks.syn", false, ServeOverrides::default());
+        let _ = run_serve_program_with_overrides(&prog, "labels_sinks.syn", false, ov);
     });
     for _ in 0..100 {
         if TcpStream::connect(("127.0.0.1", port)).is_ok() {
@@ -28,6 +28,28 @@ fn start_bg(prog: String, port: u16) {
         thread::sleep(Duration::from_millis(50));
     }
     panic!("server no quedó listo en 127.0.0.1:{}", port);
+}
+
+/// v0.6.47 (T1): el motivo de un corte es del operador; con `--auditor` va al sobre del recibo de
+/// esa request. Devuelve el `detail` de la entrada sellada `label_violation` del último recibo.
+fn cut_detail(receipts: &std::path::Path, sk: &[u8]) -> String {
+    let text = std::fs::read_to_string(receipts).unwrap_or_default();
+    let last = text.lines().last().unwrap_or_else(|| panic!("no hay recibos en {}", receipts.display()));
+    let r: serde_json::Value = serde_json::from_str(last).unwrap();
+    let opened = synsema_stdlib::sealed::open_receipt(&r, sk).expect("el auditor abre el recibo");
+    opened["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["sealed"] == true && e["entry"]["kind"] == "label_violation")
+        .filter_map(|e| e["entry"]["detail"].as_str())
+        .last()
+        .unwrap_or_else(|| panic!("sin entrada label_violation: {}", opened))
+        .to_string()
+}
+
+fn body(resp: &str) -> &str {
+    resp.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or("")
 }
 
 fn http_get(port: u16, path: &str) -> String {
@@ -87,11 +109,30 @@ fn effectful_builtins_refuse_private_values_and_private_control_flow() {
     std::fs::create_dir_all(&dir).unwrap();
     let out = dir.join("out.txt").to_string_lossy().replace('\\', "/");
     let port = free_port();
+    let (sk, pk) = synsema_stdlib::sealed::generate_keypair();
+    let sk = synsema_core::bytesutil::b64url_decode(&sk).unwrap();
+    let receipts = dir.join("receipts.jsonl");
+    let ov = ServeOverrides {
+        port: Some(port),
+        auditor: Some(synsema_stdlib::sealed::parse_auditor_key(&pk).unwrap()),
+        receipt: Some(receipts.to_string_lossy().into_owned()),
+        ..Default::default()
+    };
     let prog = format!(
         r#"require serve({p})
 require net("127.0.0.1")
 require file.write("{dir}/*")
+agent Corta
+    when private(true, "bank")
+        print("x")
 serve on {p}
+    route "GET /resp-leak"
+        give {{"balance": private(5, "bank")}}
+    route "GET /spawn"
+        spawn Corta
+        give {{"ok": true}}
+    route "GET /agents"
+        give {{"n": length(agents())}}
     route "GET /file-leak"
         write_file("{out}", "balance=" + text(private(5, "bank")))
         give {{"ok": true}}
@@ -113,24 +154,46 @@ serve on {p}
         dir = dir.to_string_lossy().replace('\\', "/"),
         out = out
     );
-    start_bg(prog, port);
+    start_bg(prog, port, ov);
 
+    // v0.6.47 (T1): el cliente recibe el texto fijo, el mismo cuerpo para todo corte; qué sumidero
+    // cortó va al sobre del recibo (con `--auditor`), no al cliente ni al log del server.
     let leak = http_get(port, "/file-leak");
     assert!(leak.starts_with("HTTP/1.1 500"), "{}", leak);
-    assert!(leak.contains("label_violation") && leak.contains("write_file"), "{}", leak);
+    assert!(leak.contains("label_violation: the flow checker stopped the run") && !leak.contains("write_file"), "{}", leak);
     assert!(!std::path::Path::new(&out).exists(), "the file must not be written");
+    assert!(cut_detail(&receipts, &sk).contains("write_file"), "el motivo, para el auditor");
+    let fixed = body(&leak).to_string();
 
     let leak = http_get(port, "/http-leak");
     assert!(leak.starts_with("HTTP/1.1 500"), "{}", leak);
-    assert!(leak.contains("label_violation") && leak.contains("http_post"), "{}", leak);
+    assert_eq!(body(&leak), fixed, "{}", leak);
+    assert!(cut_detail(&receipts, &sk).contains("http_post"));
     thread::sleep(Duration::from_millis(200));
     assert!(seen.lock().unwrap().is_empty(), "the sink must not have received anything: {:?}", seen.lock().unwrap());
 
     let leak = http_get(port, "/pc-leak");
     assert!(leak.starts_with("HTTP/1.1 500"), "{}", leak);
-    assert!(leak.contains("label_violation") && leak.contains("control flow"), "{}", leak);
+    assert_eq!(body(&leak), fixed, "{}", leak);
+    assert!(cut_detail(&receipts, &sk).contains("control flow"));
     thread::sleep(Duration::from_millis(200));
     assert!(seen.lock().unwrap().is_empty(), "no call under private control flow: {:?}", seen.lock().unwrap());
+
+    // B1: el rechazo de la respuesta (después del handler) da el mismo cuerpo que un corte adentro.
+    let leak = http_get(port, "/resp-leak");
+    assert!(leak.starts_with("HTTP/1.1 500"), "{}", leak);
+    assert_eq!(body(&leak), fixed, "{}", leak);
+    assert!(cut_detail(&receipts, &sk).contains("response.balance"));
+
+    // A1 bajo serve: el agente cortado es de su request; otro request no lo ve (v0.6.47: cada
+    // request ve sólo sus agentes), así que ni lee su estado ni queda en 500.
+    let r = http_get(port, "/agents");
+    assert!(r.starts_with("HTTP/1.1 200"), "{}", r);
+    let r = http_get(port, "/spawn");
+    assert!(r.starts_with("HTTP/1.1 200"), "{}", r);
+    thread::sleep(Duration::from_millis(500));
+    let r = http_get(port, "/agents");
+    assert!(r.starts_with("HTTP/1.1 200") && body(&r).replace(' ', "").contains("\"n\":0"), "{}", r);
 
     let ok = http_get(port, "/declassified");
     assert!(ok.starts_with("HTTP/1.1 200"), "{}", ok);

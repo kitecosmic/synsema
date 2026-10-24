@@ -64,6 +64,47 @@ fn violation(r: &synsema_wasm::Report) -> bool {
     r.errors.iter().any(|e| e.contains("label_violation"))
 }
 
+/// v0.6.47 (T1): el dato privado elige cuál de N sitios corta la corrida (`fetch`, `state_set`, un
+/// `http_post` con el dato, `print`, una asignación). Lo que ve el programa (`ok`, `output`, `errors`,
+/// `exit_code`) es idéntico byte a byte; cuál fue queda en `operator_detail`.
+#[test]
+fn t1_the_site_a_private_input_chooses_is_the_same_text_for_the_program() {
+    let sites = [
+        "fetch(\"https://x.test/si\", {\"method\": \"GET\"})",
+        "state_set(\"k\", 1)",
+        "http_post(\"https://x.test/\", {\"d\": d})",
+        "print(\"x\")",
+        "set a to 1",
+    ];
+    let mut body = String::from("require net(\"x.test\")\nlet d be input.d\nlet a be 0\n");
+    for (i, site) in sites.iter().enumerate() {
+        body.push_str(&format!("when d == {}\n    {}\n", i, site));
+    }
+    let mut seen = Vec::new();
+    let mut details = Vec::new();
+    for k in 0..sites.len() {
+        let spy = Rc::new(Spy::default());
+        hostcap::install(Some(Rc::new(Host(spy.clone()))));
+        let mut opts = RunOptions::new("t1.syn");
+        opts.labels = true;
+        opts.input = Some(("input".to_string(), serde_json::json!({"d": k})));
+        opts.sources = vec![("d".to_string(), vec!["cliente".to_string()])];
+        let r = run(&body, &opts);
+        hostcap::install(None);
+        assert!(!r.ok, "sitio {}: tenía que cortar", k);
+        assert!(spy.http.borrow().is_empty() && spy.kv.borrow().is_empty(), "sitio {}: salió algo al host", k);
+        seen.push(format!("{:?} {:?} {:?} {:?}", r.ok, r.output, r.errors, r.exit_code));
+        details.push(r.operator_detail.clone().unwrap_or_else(|| panic!("sitio {}: sin operator_detail: {:?}", k, r.errors)));
+    }
+    for (k, s) in seen.iter().enumerate() {
+        assert_eq!(s, &seen[0], "el sitio {} se distingue del 0 hacia el programa", k);
+    }
+    assert!(seen[0].contains("the flow checker stopped the run (private to cliente)"), "{}", seen[0]);
+    for (k, d) in details.iter().enumerate() {
+        assert!(d.contains(&format!("t1.syn:{}:", 5 + 2 * k)), "sitio {}: el detalle lleva su línea: {}", k, d);
+    }
+}
+
 #[test]
 fn a_private_value_never_reaches_the_host_network_hook() {
     let (r, spy) = run_with_secret("http_post(\"https://x.test/\", {\"t\": input.tarjeta})\n");
@@ -152,8 +193,10 @@ fn e3_wasm_ceiling_bounds_declassify() {
     };
     let r = run_with("print(declassify(x, \"m\"))\n", Some("stdout,declassify=a"));
     assert!(r.ok, "{:?}", r.errors);
+    // v0.6.47 (T1): el programa ve el texto fijo; el motivo va en `operator_detail`.
     let r = run_with("print(declassify(y, \"m\"))\n", Some("stdout,declassify=a"));
-    assert!(!r.ok && r.errors.iter().any(|e| e.contains("declassify is not granted")), "{:?}", r.errors);
+    assert!(!r.ok && r.errors.iter().all(|e| !e.contains("declassify is not granted")), "{:?}", r.errors);
+    assert!(r.operator_detail.as_deref().is_some_and(|d| d.contains("declassify is not granted")), "{:?}", r.operator_detail);
     // Sin techo, de ambiente como en el nativo.
     let r = run_with("print(declassify(y, \"m\"))\n", None);
     assert!(r.ok, "{:?}", r.errors);
@@ -177,7 +220,8 @@ fn e3b_wasm_trusted_tool_publishes_its_policy_only() {
     let r = run_with("print(t.inicial(c))\n");
     assert!(r.ok && r.output.iter().any(|l| l == "Ana"), "{:?} {:?}", r.output, r.errors);
     let r = run_with("print(declassify(c.nombre, \"m\"))\n");
-    assert!(!r.ok && r.errors.iter().any(|e| e.contains("declassify is not granted")), "{:?}", r.errors);
+    assert!(!r.ok && r.errors.iter().all(|e| !e.contains("declassify is not granted")), "{:?}", r.errors);
+    assert!(r.operator_detail.as_deref().is_some_and(|d| d.contains("declassify is not granted")), "{:?}", r.operator_detail);
 }
 
 /// v0.6.46 (E5): un host que presta `llm` y anota (prompt, principales). `falla`: el hook "lanza".
@@ -229,8 +273,8 @@ fn e5_wasm_private_to_the_embedder_needs_the_ceiling() {
     }
     let (r, _) = run_with("stdout,llm=a@embedder", true);
     // El mensaje sale redactado (la llamada tocó datos privados); lo que cambia es que ya no es
-    // una respuesta vacía con `ok`.
-    assert!(!r.ok && r.output.is_empty() && !r.errors.is_empty(), "{:?} {:?}", r.output, r.errors);
+    // una respuesta vacía con `ok`. v0.6.47 (T1): la salida de un corte es siempre la línea fija.
+    assert!(!r.ok && r.output.len() == 1 && r.output[0].contains("its output is withheld") && !r.errors.is_empty(), "{:?} {:?}", r.output, r.errors);
 }
 
 /// v0.6.46 (E5): `judge` se gatea en wasm como en el nativo (antes no había gate: el bloque pasaba
@@ -281,4 +325,115 @@ fn e6_wasm_report_carries_the_receipt() {
         opened
     );
     assert!(receipt["public"].as_array().unwrap().iter().all(|e| e.get("line") != Some(&serde_json::json!(4))));
+}
+
+/// v0.6.47 (T1): un corte antes de toda salida y uno después dan la misma salida (la línea fija).
+#[test]
+fn t1_a_cut_before_any_output_looks_like_a_cut_after_it() {
+    let out = |k: u32| {
+        let (r, _) = run_with_secret(&format!(
+            "let s be private({k}, \"app\")\nwhen s == 1\n    print(\"x\")\nprint(\"antes\")\nwhen s == 2\n    print(\"y\")\n"
+        ));
+        (r.ok, r.output, r.errors)
+    };
+    let (a, b) = (out(1), out(2));
+    assert_eq!(a, b);
+    assert!(!a.0 && a.1.len() == 1 && a.1[0].contains("its output is withheld"), "{:?}", a);
+}
+
+/// v0.6.47 (T1, ronda 6, M2): en el handler, como en serve, un corte es siempre el 500 fijo, aunque
+/// nazca en un `expect` o en una denegación del token bajo una rama privada (era 400 con el `field`
+/// o 403: el status decía qué sitio cortó). El detalle va al operador.
+#[test]
+fn m2_a_cut_in_the_handler_is_always_the_fixed_500() {
+    let src = r#"require serve(8080)
+require time
+require random
+let root be "root-key-m2"
+task check_agent(token, request)
+    give captoken_verify(token, root, {"aud": "m2"})
+serve on 8080
+    auth with check_agent
+    route "GET /token"
+        give {"t": captoken_mint({"net": "api.example.com"}, root, {"aud": "m2", "ttl": 600, "id": "m2", "deterministic": true})}
+    route "GET /corta"
+        let s be private(int(query["s"]), "app")
+        when s == 1
+            let z be 1 / 0
+        give 1
+    route "POST /valida"
+        let s be private(int(query["s"]), "app")
+        when s == 1
+            expect body {item: text}
+        give 1
+    route "GET /niega" requires auth
+        let s be private(int(query["s"]), "app")
+        when s == 1
+            let r be now()
+        give 1
+"#;
+    let mut opts = RunOptions::new("m2.syn");
+    opts.labels = true;
+    let call = |method: &str, path: &str, headers: Vec<(String, String)>, body: &str| {
+        let req = synsema_wasm::HttpRequestIn {
+            method: method.to_string(),
+            path: path.to_string(),
+            headers,
+            body: body.as_bytes().to_vec(),
+            client_ip: "127.0.0.1".to_string(),
+        };
+        synsema_wasm::handle(src, &opts, &req)
+    };
+    let json = vec![("content-type".to_string(), "application/json".to_string())];
+    let corte = call("GET", "/corta?s=1", Vec::new(), "");
+    assert_eq!(corte.response.status, 500, "{:?}", String::from_utf8_lossy(&corte.response.body));
+    let v = call("POST", "/valida?s=1", json.clone(), "{}");
+    assert_eq!(v.response.status, 500, "{}", String::from_utf8_lossy(&v.response.body));
+    assert_eq!(v.response.body, corte.response.body);
+    assert!(v.operator_detail.is_some());
+    assert_eq!(call("POST", "/valida?s=2", json, "{}").response.status, 200);
+
+    let tok = call("GET", "/token", Vec::new(), "");
+    let t: serde_json::Value = serde_json::from_slice(&tok.response.body).unwrap();
+    let auth = vec![("authorization".to_string(), format!("Bearer {}", t["t"].as_str().unwrap()))];
+    let n = call("GET", "/niega?s=1", auth.clone(), "");
+    assert_eq!(n.response.status, 500, "{}", String::from_utf8_lossy(&n.response.body));
+    assert_eq!(n.response.body, corte.response.body);
+    assert!(n.operator_detail.is_some());
+    assert_eq!(call("GET", "/niega?s=2", auth, "").response.status, 200);
+}
+
+/// v0.6.47 (T1, ronda 7, B1): en el handler, la página de `errors with` que se corta o devuelve algo
+/// que la respuesta rechaza es un corte, como en serve: el log es la línea fija y el detalle va al
+/// operador.
+#[test]
+fn b1_an_error_page_cut_leaves_the_fixed_log() {
+    let src = r#"require serve(8080)
+task pag(status, message, request)
+    print("pagina")
+    let k be private(1, "app")
+    when status == 404
+        give {"k": k}
+    when k == 1
+        let z be 1 / 0
+    give nothing
+serve on 8080
+    errors with pag
+    route "GET /x"
+        give 1
+"#;
+    let mut opts = RunOptions::new("b1.syn");
+    opts.labels = true;
+    for (method, path) in [("GET", "/nada"), ("POST", "/x")] {
+        let req = synsema_wasm::HttpRequestIn {
+            method: method.to_string(),
+            path: path.to_string(),
+            headers: Vec::new(),
+            body: Vec::new(),
+            client_ip: "127.0.0.1".to_string(),
+        };
+        let r = synsema_wasm::handle(src, &opts, &req);
+        assert_eq!(r.log, vec![synsema_core::interpreter::LABELS_WITHHELD_OUTPUT.to_string()], "{} {}", method, path);
+        assert!(r.operator_detail.is_some(), "{} {}", method, path);
+    }
 }

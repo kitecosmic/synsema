@@ -91,7 +91,11 @@ serve on {p}
 
     route "GET /spawn"
         spawn Runner
-        give {{"spawned": true}}
+        let n be 0
+        while n < 40 and agents()[0]["state"] != "error" and agents()[0]["state"] != "done"
+            sleep(0.1)
+            set n to n + 1
+        give {{"agent_ran": state_get("agent_ran"), "agents": agents()}}
 
     route "GET /state"
         give {{"preamble": state_get("preamble"), "agent_ran": state_get("agent_ran"), "agents": agents()}}
@@ -132,20 +136,11 @@ serve on {p}
         assert!(low.contains("exec") && (low.contains("ceiling") || low.contains("not permitted") || low.contains("denied") || low.contains("capability")), "{}", r);
     }
 
-    // (3) El agente spawneado desde el handler tampoco: termina en error, visible en agents().
-    let s = get(port, "/spawn");
-    assert_eq!(status(&s), 200, "{}", s);
-    let mut seen_error = false;
-    for _ in 0..40 {
-        thread::sleep(Duration::from_millis(100));
-        let st = get(port, "/state");
-        if st.contains("\"state\":\"error\"") || st.contains("\"state\": \"error\"") {
-            assert!(st.contains("\"agent_ran\":null") || st.contains("\"agent_ran\": null"), "el agente NO ejecutó: {}", st);
-            let low = st.to_lowercase();
-            assert!(low.contains("exec"), "el error nombra la capability: {}", st);
-            seen_error = true;
-            break;
-        }
-    }
-    assert!(seen_error, "el agente debía fallar por el techo del host");
+    // (3) El agente spawneado desde el handler tampoco: termina en error, visible en el `agents()` del
+    //     mismo request (v0.6.47: cada request ve sólo sus agentes).
+    let st = get(port, "/spawn");
+    assert_eq!(status(&st), 200, "{}", st);
+    assert!(st.contains("\"state\":\"error\"") || st.contains("\"state\": \"error\""), "el agente debía fallar por el techo del host: {}", st);
+    assert!(st.contains("\"agent_ran\":null") || st.contains("\"agent_ran\": null"), "el agente NO ejecutó: {}", st);
+    assert!(st.to_lowercase().contains("exec"), "el error nombra la capability: {}", st);
 }

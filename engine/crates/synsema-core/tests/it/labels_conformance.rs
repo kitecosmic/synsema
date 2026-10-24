@@ -12,11 +12,25 @@ use synsema_core::parser::parse_source;
 use synsema_core::types::{syn_int, syn_list, syn_map, syn_text, SynValue};
 
 /// Corre `source` con etiquetas encendidas (o no) y devuelve el intérprete (para mirar
-/// `output`, el entorno global, `steps()`, `declassify_log()`).
+/// `output`, el entorno global, `steps()`, `declassify_log()`). Como el CLI sin techo: el
+/// diagnóstico de un corte de etiquetas sale entero (v0.6.47 T1), que es lo que miran estos tests.
+/// El texto que ve un programa de otro (con techo, wasm, serve) lo prueba `run_for_program`.
 fn run(source: &str, labels_on: bool) -> (Interpreter, Result<SynValue, Control>) {
     let program = parse_source(source, "<labels>").unwrap_or_else(|e| panic!("parse: {}\n{}", e, source));
     let mut interp = Interpreter::new();
     interp.set_labels(labels_on);
+    interp.set_labels_detail_to_program(true);
+    let r = interp.execute(&program);
+    (interp, r)
+}
+
+/// v0.6.47 (T1): como `run`, pero como cualquier host que no es el dueño del código (el default):
+/// un corte de etiquetas le llega al programa con el texto fijo y el detalle queda en
+/// `operator_detail`.
+fn run_for_program(source: &str) -> (Interpreter, Result<SynValue, Control>) {
+    let program = parse_source(source, "<labels>").unwrap_or_else(|e| panic!("parse: {}\n{}", e, source));
+    let mut interp = Interpreter::new();
+    interp.set_labels(true);
     let r = interp.execute(&program);
     (interp, r)
 }
@@ -580,7 +594,8 @@ fn audit_r4_v4_stdout_is_a_public_sink_under_a_private_branch() {
         assert!(msg.contains("label_violation") && msg.contains(what), "{}: {}", what, msg);
         assert!(msg.contains("pc = [a]"), "el mensaje nombra el principal: {}", msg);
         // Falla ANTES de escribir: la linea no llego a la salida, ni siquiera redactada.
-        assert!(i.output.is_empty(), "{}: {:?}", what, i.output);
+        // v0.6.47 (T1): la salida de un corte es sólo la línea fija.
+        assert_eq!(i.output, vec![synsema_core::interpreter::LABELS_WITHHELD_OUTPUT.to_string()], "{}", what);
     }
     // El canal completo: un `print` por vuelta sobre una coleccion privada deletrea su largo.
     let loop_src = "let xs be private([1, 2, 3], \"app\")\neach x in xs\n    print(x)\n";
@@ -641,6 +656,7 @@ fn private_over_a_secret_is_refused_and_principals_are_validated() {
     let program = parse_source("let y be private(k, \"a\")\n", "<labels>").unwrap();
     let mut interp = Interpreter::new();
     interp.set_labels(true);
+    interp.set_labels_detail_to_program(true); // el diagnóstico, como el CLI sin techo (v0.6.47 T1)
     interp.set_global("k", synsema_core::types::syn_secret("K", "plain"));
     match interp.execute(&program) {
         Err(Control::Error(e)) => assert!(e.message.contains("a secret is already opaque"), "{}", e),
@@ -659,6 +675,7 @@ fn private_plus_secret_in_an_operation_is_refused() {
     let program = parse_source("let y be private(\"x\", \"a\") + k\n", "<labels>").unwrap();
     let mut interp = Interpreter::new();
     interp.set_labels(true);
+    interp.set_labels_detail_to_program(true); // el diagnóstico, como el CLI sin techo (v0.6.47 T1)
     interp.set_global("k", synsema_core::types::syn_secret("K", "plain"));
     match interp.execute(&program) {
         Err(Control::Error(e)) => assert!(e.message.contains("a secret is already opaque"), "{}", e),
@@ -1013,6 +1030,7 @@ fn audit_b7_sinks_are_checked_before_running() {
         let program = parse_source(src, "<labels>").unwrap();
         let mut interp = Interpreter::new();
         interp.set_labels(true);
+        interp.set_labels_detail_to_program(true); // el diagnóstico, como el CLI sin techo (v0.6.47 T1)
         let s = seen.clone();
         interp.register_builtin(
             "emit",
@@ -1163,6 +1181,7 @@ fn audit_m2_secret_under_pc_is_refused() {
     let program = parse_source("let f be private(true, \"a\")\nlet s be k2\nwhen f\n    set s to k1\n", "<labels>").unwrap();
     let mut interp = Interpreter::new();
     interp.set_labels(true);
+    interp.set_labels_detail_to_program(true); // el diagnóstico, como el CLI sin techo (v0.6.47 T1)
     interp.set_global("k1", synsema_core::types::syn_secret("K1", "yes"));
     interp.set_global("k2", synsema_core::types::syn_secret("K2", "no"));
     match interp.execute(&program) {
@@ -1392,7 +1411,8 @@ try\n    when secret\n        raise \"stop here\"\n    set after to \"reached\"\
     assert_eq!(msg, "private(app)", "{}", msg);
     // El `recover` no llegó a correr (si no, sería observable que corrió).
     let (i, _) = run(src, true);
-    assert!(i.output.is_empty(), "{:?}", i.output);
+    // v0.6.47 (T1): la salida de un corte es sólo la línea fija.
+    assert_eq!(i.output, vec![synsema_core::interpreter::LABELS_WITHHELD_OUTPUT.to_string()]);
 }
 
 #[test]
@@ -1701,6 +1721,7 @@ test \"lee el contador\"\n    assert_eq(counter, 181)\n";
     let program = parse_source(src, "<labels>").unwrap();
     let mut interp = Interpreter::new();
     interp.set_labels(true);
+    interp.set_labels_detail_to_program(true); // el diagnóstico, como el CLI sin techo (v0.6.47 T1)
     let outcomes = interp.run_test_blocks(&program);
     // El setup muere con la violación: el contador nunca llega a tener el secreto.
     assert_eq!(outcomes.len(), 1);
@@ -1891,9 +1912,12 @@ raise \"balance is \" + text(v)
     // Exactamente lo que hace el host: marcar la fuente desde Rust e inyectarla.
     interp.set_global("ctx", mark(syn_map(m), labels::label_from(&["app"])));
     match interp.execute(&program) {
+        // v0.6.47 (T1): hacia el programa, el texto fijo (sin ubicación); el operador recibe el
+        // error redactado con su ubicación. En los dos, el principal por nombre.
         Err(Control::Error(e)) => {
-            assert_eq!(e.message, "private(app)", "se perdió el nombre del principal");
-            assert!(e.location.is_some(), "se conserva file:line");
+            assert!(e.message.contains("(private to app)"), "se perdió el nombre del principal: {}", e.message);
+            assert!(e.location.is_none(), "sin ubicación hacia el programa");
+            assert_eq!(e.operator_detail.as_deref(), Some("<labels>:2:1: private(app)"), "el detalle conserva file:line");
         }
         _ => panic!("se esperaba el error redactado"),
     }
@@ -1909,8 +1933,9 @@ when ctx[\"balance\"] > 1
     let mut m2 = SynMap::new();
     m2.insert("balance", syn_int(500));
     i2.set_global("ctx", mark(syn_map(m2), labels::label_from(&["app"])));
+    // v0.6.47 (T1): el diagnóstico es del operador.
     let msg = match i2.execute(&program2) {
-        Err(Control::Error(e)) => e.into_message(),
+        Err(Control::Error(e)) => e.operator_detail.clone().unwrap_or_default(),
         _ => panic!("se esperaba label_violation"),
     };
     assert!(msg.contains("pc = [app]") && !msg.contains("#0"), "{}", msg);
@@ -2367,4 +2392,69 @@ fn audit_r8_the_eight_higher_order_builtins_by_name() {
     let i = run_ok("let SECRET be private(165, \"app\")\nlet r be count_where([1, 2, 3], (v) => v < 2)\n");
     assert_eq!(label_of(&i, "r"), "");
     assert_eq!(plain_of(&i, "r"), "1");
+}
+
+/// v0.6.47 (T1) — el dato privado elige cuál de N sitios corta la corrida (asignar a una variable
+/// pública, imprimir, escribir una posición de un contenedor, llamar a un sumidero, un error de
+/// runtime y un `raise` bajo la rama privada). Hacia el programa, los N errores son el MISMO texto
+/// byte a byte y sin ubicación; el sitio, el remedio y la línea quedan en `operator_detail`, y ahí
+/// sí son distintos. Era el exploit de `12_trifecta_v0646`: una corrida por dígito de una tarjeta.
+#[test]
+fn t1_the_site_a_private_value_chooses_does_not_reach_the_program() {
+    let sites = [
+        "set a to 1",
+        "print(\"x\")",
+        "set m[\"k\"] to 1",
+        "exit(3)",
+        "let z be 1 / (s - s)",
+        "raise \"boom\"",
+    ];
+    let mut body = String::from("let s be private(K, \"app\")\nlet a be 0\nlet m be {\"k\": 0}\n");
+    for (i, site) in sites.iter().enumerate() {
+        body.push_str(&format!("when s == {}\n    {}\n", i, site));
+    }
+    let mut for_program = Vec::new();
+    let mut details = Vec::new();
+    for k in 0..sites.len() {
+        let src = body.replace("private(K,", &format!("private({},", k));
+        let (_i, r) = run_for_program(&src);
+        let e = match r {
+            Err(Control::Error(e)) => e,
+            _ => panic!("el sitio {} tenía que cortar la corrida:\n{}", k, src),
+        };
+        assert!(e.is_fatal_for_labels(), "sitio {}: {:?}", k, e);
+        assert!(e.location.is_none(), "sitio {}: sin ubicación hacia el programa", k);
+        for_program.push((e.to_string(), e.to_string_for_client()));
+        details.push(e.operator_detail.clone().unwrap_or_else(|| panic!("sitio {}: sin detalle para el operador", k)));
+    }
+    // Igual también entre TIPOS de corte: un `label_violation` (sitios 0 a 3) y un error bajo la
+    // rama privada (4 y 5).
+    for (k, t) in for_program.iter().enumerate() {
+        assert_eq!(t, &for_program[0], "el sitio {} se distingue del 0 hacia el programa", k);
+    }
+    assert_eq!(
+        for_program[0].0,
+        "label_violation: the flow checker stopped the run (private to app); what failed, where and how to fix it go to the operator, not to the program",
+        "el texto fijo, con el conjunto declarado"
+    );
+    // El operador sí ve cuál: cada detalle es distinto y lleva la línea del sitio.
+    for (k, d) in details.iter().enumerate() {
+        assert!(d.contains(&format!("<labels>:{}:", 5 + 2 * k)), "sitio {}: el detalle lleva su línea: {}", k, d);
+        for (j, o) in details.iter().enumerate() {
+            assert!(k == j || d != o, "los detalles {} y {} son iguales: {}", k, j, d);
+        }
+    }
+
+    assert!(details[0].contains("cannot assign to 'a'"), "el detalle es el diagnóstico de hoy: {}", details[0]);
+
+    // Como el CLI sin techo (`run`): el texto de hoy, con el sitio y la ubicación.
+    let (_i, r) = run(&body.replace("private(K,", "private(0,"), true);
+    match r {
+        Err(Control::Error(e)) => {
+            assert!(e.operator_detail.is_none());
+            assert!(e.to_string().starts_with("<labels>:5:"), "{}", e);
+            assert!(e.message.contains("cannot assign to 'a'"), "{}", e);
+        }
+        _ => panic!("tenía que cortar"),
+    }
 }

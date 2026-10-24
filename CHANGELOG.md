@@ -42,6 +42,29 @@ median 0.8) and 3.7 without, so the new one stays. What was not recovered is tra
 again. The `perf-guard` anchor (`engine/perf/baseline.json`) was re-measured on CI with rustc 1.99.1
 in this same change, so it now measures against the new compiler.
 
+**Breaking, with labels: a flow-checker cut no longer tells the program or the log where it
+happened.** Before, the text of a `label_violation` named the site and the label, and how much
+output, log or shared state survived depended on where the cut fell, which a private value could
+choose. Now:
+- under a ceiling (`--cap-set`, `--sandbox`, `--deterministic`, `--trusted`), under `serve`, and in
+  the embeddable WebAssembly module, the program sees one fixed text, `private(labels): the run was
+  stopped by the flow checker`, with no location, and output before the cut is replaced by that one
+  line. `run` and `test` without a ceiling (native or the wasip1 binary) keep the detail, as the
+  owner's own run. The detail goes to the operator: the host's `log` hook, stderr without a
+  ceiling, the sealed receipt with `--auditor`, and `operator_detail` in WebAssembly (`run` and
+  `handle`), never `errors`;
+- a cut in an agent cuts its whole run: from then on every sink of the run fails, and `agents()`
+  reports it to whoever launched it;
+- `serve --labels`: each request, cron tick and socket handler is its own run. Its stdout and stderr
+  are held and written when it ends, or replaced by the fixed line if it was cut (a notice at
+  startup says so; run without `--labels` for a live log). Agents' output is not written.
+  `agents()` and `agent_stop` see only the agents of the same run. A cut is always a 500 with the
+  fixed text (a refused response counts as a cut);
+- `serve --labels` and the blackboard and signal queue: a run (the request, or the preamble, with
+  all its agents) is committed once, when all of it has ended without a cut, and undone entirely if
+  any part is cut, including what its agents wrote after the request answered. What other runs read
+  while it was open, and signals already consumed, stay (as with any effect before a cut).
+
 **The skill for coding agents moved to `skills/synsema/` and installs in any agent.** It was in
 `.synsema-skill/`, a hidden folder that only the Claude Code installer knew, and its `SKILL.md`
 frontmatter did not parse as YAML for strict readers (a `:` inside the unquoted description), so

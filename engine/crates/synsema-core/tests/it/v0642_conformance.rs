@@ -30,7 +30,10 @@ fn eprint_is_a_public_sink_under_labels() {
     // Bajo una rama privada la llamada misma es la fuga (cuántas líneas salen).
     let (_i, r) = run_labels("let s be private(true, \"a\")\nwhen s\n    eprint(\"x\")\n");
     let Err(Control::Error(e)) = r else { panic!("se esperaba label_violation") };
-    assert!(e.to_string().contains("eprint under private control flow"), "{}", e);
+    // v0.6.47 (T1): el diagnóstico va al operador; el programa ve el texto fijo.
+    let detail = e.operator_detail.clone().unwrap_or_default();
+    assert!(detail.contains("eprint under private control flow"), "{}", detail);
+    assert!(e.to_string().starts_with("label_violation: the flow checker stopped the run"), "{}", e);
     // Un valor privado con el PC público sale redactado, como en `print`.
     let (i, r) = run_labels("let s be private(\"clave\", \"a\")\neprint(s)\nprint(\"ok\")\n");
     assert!(r.is_ok(), "{:?}", r.err().map(|c| matches!(c, Control::Error(_))));
@@ -104,7 +107,8 @@ fn and_or_right_side_runs_under_the_left_label() {
         let (i, r) = run_labels(src);
         let Err(Control::Error(e)) = r else { panic!("se esperaba label_violation en:\n{}", src) };
         assert!(e.exit_code.is_none() && e.to_string().contains("label_violation"), "{}\n{}", src, e);
-        assert!(i.output.is_empty(), "{}: salió {:?}", src, i.output);
+        // v0.6.47 (T1): la salida de un corte es sólo la línea fija.
+        assert_eq!(i.output, vec![synsema_core::interpreter::LABELS_WITHHELD_OUTPUT.to_string()], "{}", src);
     }
     // Con el izquierdo público nada cambia, y el lado derecho no corre si no hace falta.
     let (i, r) = run_labels("let p be true\np and print(\"x\")\nlet q be false\nq and print(\"no\")\n");

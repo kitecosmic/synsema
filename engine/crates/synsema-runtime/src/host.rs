@@ -36,6 +36,9 @@ static PROGRAM_ARGS: OnceLock<Vec<String>> = OnceLock::new();
 /// Etiquetas de flujo de información (`private`/`declassify`) encendidas para
 /// TODOS los intérpretes del proceso (`run --labels`, `test --labels`, `serve --attested`).
 static LABELS: OnceLock<bool> = OnceLock::new();
+/// v0.6.47 (T1): el diagnóstico de un corte de etiquetas sale entero hacia el programa. Sólo lo
+/// enciende `run`/`test` sin techo (ver `Interpreter::set_labels_detail_to_program`).
+static LABELS_DETAIL: OnceLock<bool> = OnceLock::new();
 
 /// v0.6.46 (E3b): los módulos de confianza que cargó quien invoca el binario (`--trusted
 /// nombre=ruta`, ya leídos: el programa no ve la ruta) y su techo (`--trusted-cap-set`).
@@ -84,4 +87,15 @@ pub fn set_labels(on: bool) -> bool {
 /// runtime y el coste es cero (ver `synsema_core::labels`).
 pub fn labels() -> bool {
     LABELS.get().copied().unwrap_or(false)
+}
+
+/// v0.6.47 (T1): fija, una vez, si el diagnóstico de etiquetas sale entero hacia el programa.
+pub fn set_labels_detail_to_program(on: bool) -> bool {
+    LABELS_DETAIL.set(on).is_ok()
+}
+
+/// v0.6.47 (T1): ¿el diagnóstico de etiquetas sale entero hacia el programa? Apagado por defecto: el
+/// programa recibe un texto fijo y el detalle va al operador.
+pub fn labels_detail_to_program() -> bool {
+    LABELS_DETAIL.get().copied().unwrap_or(false)
 }

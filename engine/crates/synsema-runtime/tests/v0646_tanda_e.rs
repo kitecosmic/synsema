@@ -9,11 +9,19 @@
 //!
 //! Cada test corre el mismo programa con dos secretos y exige la misma salida pública
 //! (no-interferencia).
+//!
+//! v0.6.47 (T1): este binario corre entero en modo dueño (`set_labels_detail_to_program(true)`, un
+//! `OnceLock` del proceso), porque sus tests miran el diagnóstico. Con techo eso no lo produce el
+//! CLI: el camino de producción (texto fijo hacia el programa y motivo en el recibo) lo prueba
+//! `synsema-cli/tests/it/v0646_tanda_e_cli.rs` (`cut_for_operator`). Un test que espere el texto
+//! fijo va en otro binario.
 
 use synsema_runtime::engine::run_source;
 
 fn run_labelled(src: &str) -> Vec<String> {
     assert!(synsema_runtime::host::set_labels(true) || synsema_runtime::host::labels());
+    // v0.6.47 (T1): estos tests miran el diagnóstico, que sin esto va al operador.
+    let _ = synsema_runtime::host::set_labels_detail_to_program(true);
     let r = run_source(src, "<v0646-receipt>");
     assert!(r.success, "{:?}", r.errors);
     r.output
@@ -447,6 +455,8 @@ fn e1_errors_never_print_the_url() {
 
 fn run_labelled_err(src: &str) -> String {
     assert!(synsema_runtime::host::set_labels(true) || synsema_runtime::host::labels());
+    // v0.6.47 (T1): estos tests miran el diagnóstico, que sin esto va al operador.
+    let _ = synsema_runtime::host::set_labels_detail_to_program(true);
     let r = run_source(src, "<v0646-e4>");
     assert!(!r.success, "debía fallar: {:?}\n{}", r.output, src);
     r.errors.join(" ")
@@ -502,6 +512,8 @@ fn e4_nested_alias_in_arguments_is_the_one_refused() {
 
 fn run_ceiled(src: &str, cap_set: &str) -> synsema_core::interpreter::RunResult {
     assert!(synsema_runtime::host::set_labels(true) || synsema_runtime::host::labels());
+    // v0.6.47 (T1): estos tests miran el diagnóstico, que sin esto va al operador.
+    let _ = synsema_runtime::host::set_labels_detail_to_program(true);
     let ceiling = synsema_capabilities::model::build_ceiling(false, Some(cap_set)).unwrap();
     synsema_runtime::engine::run_source_ceiled(src, "<v0646-e3>", ceiling)
 }

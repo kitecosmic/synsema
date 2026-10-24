@@ -457,10 +457,10 @@ pub(crate) fn run_mode_cron_executor(
         // mismos Arc — el cache por-hilo se renueva solo al cambiar el snapshot).
         let swarm = swarm_cell
             .get_or_init(|| {
-                Arc::new(match synsema_stdlib::ws::bus_of_interp(interp) {
+                Arc::new(labels_swarm(match synsema_stdlib::ws::bus_of_interp(interp) {
                     Some(b) => Swarm::with_bus(b),
                     None => Swarm::new(),
-                })
+                }))
             })
             .clone();
         let env = CronExecEnv {
@@ -1526,6 +1526,90 @@ pub fn set_serve_log_sink(sink: Option<ServeLogSink>) {
     *SERVE_LOG_SINK.lock().unwrap() = sink;
 }
 
+/// v0.6.47 (T1): bajo `serve` con etiquetas no hay modo dueño (quien llama a un server es otro; el
+/// detalle de un corte ya va sólo al recibo). Lo que imprime un request o un tick del cron se retiene
+/// y se escribe al terminar, sólo si no lo cortaron las etiquetas: si saliera en vivo, cuántas líneas
+/// salieron antes del corte lo elegiría el dato, y bajo `--attested` el log está fuera del enclave.
+/// La salida de los agentes no se escribe (ver `Swarm::dropping_output`).
+const SERVE_LABELS_LOG_NOTICE: &str = "labels: request and cron output is logged when each one ends, and not at all if a label cut stopped it; agent output is not logged (which agent stopped would be the private data)";
+
+/// Tope de lo retenido por request (líneas): lo que pasa del tope se descarta y se cuenta.
+const SERVE_LABELS_LOG_CAP: usize = 10_000;
+
+fn labels_swarm(s: Swarm) -> Swarm {
+    if crate::host::labels() {
+        s.dropping_output().journaling_runs()
+    } else {
+        s
+    }
+}
+
+/// Lo retenido de un request: `(es_stderr, línea)` y cuántas quedaron afuera del tope.
+#[derive(Default)]
+struct HeldServeLog {
+    lines: Vec<(bool, String)>,
+    dropped: usize,
+}
+
+impl HeldServeLog {
+    fn push(&mut self, err: bool, line: &str) {
+        if self.lines.len() < SERVE_LABELS_LOG_CAP {
+            self.lines.push((err, line.to_string()));
+        } else {
+            self.dropped += 1;
+        }
+    }
+}
+
+/// Engancha la salida del intérprete a un buffer por request (con etiquetas).
+fn hold_serve_log(interp: &mut Interpreter) -> Arc<Mutex<HeldServeLog>> {
+    let held: Arc<Mutex<HeldServeLog>> = Arc::default();
+    let (out, err) = (held.clone(), held.clone());
+    interp.log_hook = Some(Arc::new(move |line: &str| out.lock().unwrap().push(false, line)));
+    interp.err_hook = Some(Arc::new(move |line: &str| err.lock().unwrap().push(true, line)));
+    held
+}
+
+/// Suelta lo retenido: entero si no hubo corte; si lo hubo, la línea fija y nada más.
+fn release_serve_log(interp: &mut Interpreter, held: Arc<Mutex<HeldServeLog>>, stopped: bool) {
+    interp.log_hook = Some(serve_log_sink());
+    interp.err_hook = None;
+    let held = std::mem::take(&mut *held.lock().unwrap());
+    let sink = serve_log_sink();
+    if stopped {
+        sink(synsema_core::interpreter::LABELS_WITHHELD_OUTPUT);
+        return;
+    }
+    for (err, line) in &held.lines {
+        if *err {
+            synsema_core::interpreter::write_stderr_lines(std::slice::from_ref(line));
+        } else {
+            sink(line);
+        }
+    }
+    if held.dropped > 0 {
+        sink(&format!("labels: {} line(s) over the cap of {} were not logged", held.dropped, SERVE_LABELS_LOG_CAP));
+    }
+}
+
+/// v0.6.47 (T1): una línea de stderr del server sobre una entrada (la task de `auth with` o de
+/// `errors with` que falló) va con el resto del log de esa entrada: con etiquetas se retiene y, si la
+/// entrada se cortó, no sale.
+fn entry_eprintln(interp: &Interpreter, line: &str) {
+    match &interp.err_hook {
+        Some(hook) => hook(line),
+        None => eprintln!("{}", line),
+    }
+}
+
+/// v0.6.47 (T1): el valor que devuelve un handler y la respuesta va a rechazar (un privado sin
+/// `declassify`) es un corte como cualquier otro: lo retenido del request no se escribe.
+fn mark_if_response_refused(interp: &Interpreter, v: &SynValue) {
+    if interp.labels_enabled() && synsema_core::labels::check_flow(v, &[], "response").is_err() {
+        interp.mark_label_stop();
+    }
+}
+
 /// Resuelve el sink de log de serve: el instalado o, por defecto, stdout `[serve] …`.
 fn serve_log_sink() -> ServeLogSink {
     SERVE_LOG_SINK
@@ -1735,6 +1819,22 @@ thread_local! {
 /// intérprete y las capabilities al snapshot del preámbulo → el próximo request
 /// arranca aislado (un `require`/print/share dentro de un handler no se filtra).
 #[allow(clippy::too_many_arguments)]
+/// v0.6.47 (T1): el dueño de la corrida de una entrada de serve. Si el hilo se desenrolla antes de
+/// cerrarla, la cierra con corte (`specs/t1-diario-modelo.md`).
+struct RunOwner<'a> {
+    swarm: &'a Arc<Swarm>,
+    scope: Option<Arc<synsema_core::interpreter::RunCut>>,
+}
+
+impl Drop for RunOwner<'_> {
+    fn drop(&mut self) {
+        if let Some(s) = self.scope.take() {
+            self.swarm.close_run(&s, true);
+            synsema_agents::blackboard::set_thread_scope(None);
+        }
+    }
+}
+
 fn with_serve_interp<R>(
     swarm: &Arc<Swarm>,
     snapshot: &Arc<Vec<(String, GlobalVal)>>,
@@ -1827,8 +1927,29 @@ fn with_serve_interp<R>(
     }
     // T5 (ronda 7): el diario del almacén compartido cubre exactamente este request.
     arm_state_journal();
+    // v0.6.47 (T1): cada entrada (request, tick del cron, handler de socket) es su propia corrida,
+    // con su propio corte y sus propios agentes: el intérprete del worker no arrastra los de la
+    // anterior.
+    base.interp.set_run_cut(Arc::new(synsema_core::interpreter::RunCut::default()));
+    let held = if crate::host::labels() { Some(hold_serve_log(&mut base.interp)) } else { None };
+    // v0.6.47 (T1): lo que esta entrada escribe en el blackboard va al diario de su corrida, como
+    // `state_*` (abajo): se deshace si la cortan.
+    let scope = swarm.journals_runs().then(|| base.interp.run_cut());
+    synsema_agents::blackboard::set_thread_scope(scope.clone());
+    // Si `f` entra en pánico (un bug del motor), la corrida se cierra igual, con corte: si no, quedaba
+    // abierta para siempre, con lo que escribió a la vista y sin confirmar ni deshacer.
+    let mut owner = RunOwner { swarm, scope };
     let out = f(&mut base.interp, &base.caps);
-    finish_state_journal(shared_state, base.interp.take_label_stop());
+    let stopped = base.interp.take_label_stop();
+    finish_state_journal(shared_state, stopped);
+    if let Some(s) = owner.scope.take() {
+        // El request y sus agentes son una sola corrida (el `RunCut` de arriba, que heredan).
+        swarm.close_run(&s, stopped || s.get().is_some());
+        synsema_agents::blackboard::set_thread_scope(None);
+    }
+    if let Some(h) = held {
+        release_serve_log(&mut base.interp, h, stopped);
+    }
 
     // Limpieza por-request: estado transitorio del intérprete + capabilities al
     // snapshot del preámbulo (aislamiento entre requests reusando el mismo intérprete).
@@ -2126,15 +2247,21 @@ fn run_route(
         interp.set_cancel_token(ctx.cancel.clone());
         match interp.run_request_block(body, request_bindings(ctx)) {
             Ok(_) => GiveOutcome::Give(None),
-            Err(Control::Give(v)) => GiveOutcome::Give(Some(v)),
+            Err(Control::Give(v)) => {
+                mark_if_response_refused(interp, &v);
+                GiveOutcome::Give(Some(v))
+            }
             Err(Control::Error(e)) if e.proxy.is_some() => proxy_outcome(interp, caps, e.proxy.clone().unwrap()),
             // Falla de validación (`expect`) → 400 + `field`; cualquier otro error → 500.
-            Err(Control::Error(e)) if e.is_validation => {
+            // v0.6.47 (T1): un corte de etiquetas es siempre el 500 fijo, aunque haya nacido en un
+            // `expect` o en una denegación del token bajo una rama privada (si no, el status y el
+            // `field` dirían qué sitio cortó).
+            Err(Control::Error(e)) if e.is_validation && !e.is_fatal_for_labels() => {
                 GiveOutcome::Validation { message: e.message.clone(), field: e.field.clone() }
             }
             // T1: denegada por el token del CALLER → 403 genérico, no 500 (la culpa no es del
             // server). Se decide por el flag, jamás por el texto.
-            Err(Control::Error(e)) if e.denied_by_token => GiveOutcome::Forbidden(e.to_string_for_client()),
+            Err(Control::Error(e)) if e.denied_by_token && !e.is_fatal_for_labels() => GiveOutcome::Forbidden(e.to_string_for_client()),
             Err(Control::Error(e)) => GiveOutcome::Error(e.to_string_for_client()),
             Err(Control::Stop(_)) => {
                 GiveOutcome::Error("'give'/'stop' used outside of a task or loop".to_string())
@@ -2199,7 +2326,7 @@ fn run_stream(
             // Un stream es un sumidero PÚBLICO como la respuesta: un valor
             // `private` no sale sin `declassify` (el error nombra el camino, nunca el valor).
             if let Err(e) = synsema_core::labels::check_flow(&val, &[], "stream") {
-                return Err(Control::Error(RuntimeError::new(e.to_string())));
+                return Err(Control::Error(RuntimeError::stream_label_cut(e.to_string())));
             }
             match (*ec.borrow_mut())(&val, event) {
                 Ok(()) => Ok(()),
@@ -2553,7 +2680,7 @@ fn build_host_table(
                     match interp.call_task(task, args) {
                         Ok(v) => Some(v),
                         Err(Control::Error(e)) => {
-                            eprintln!("[serve] auth task failed, so the request has no user: {}", e.message);
+                            entry_eprintln(interp, &format!("[serve] auth task failed, so the request has no user: {}", e.message));
                             None
                         }
                         Err(_) => None,
@@ -3024,14 +3151,20 @@ fn run_mounted_route(
         interp.set_cancel_token(ctx.cancel.clone());
         match interp.run_request_block_in(&task.body, request_bindings(ctx), &parent) {
             Ok(_) => GiveOutcome::Give(None),
-            Err(Control::Give(v)) => GiveOutcome::Give(Some(v)),
+            Err(Control::Give(v)) => {
+                mark_if_response_refused(interp, &v);
+                GiveOutcome::Give(Some(v))
+            }
             Err(Control::Error(e)) if e.proxy.is_some() => proxy_outcome(interp, caps, e.proxy.clone().unwrap()),
-            Err(Control::Error(e)) if e.is_validation => {
+            // v0.6.47 (T1): un corte de etiquetas es siempre el 500 fijo, aunque haya nacido en un
+            // `expect` o en una denegación del token bajo una rama privada (si no, el status y el
+            // `field` dirían qué sitio cortó).
+            Err(Control::Error(e)) if e.is_validation && !e.is_fatal_for_labels() => {
                 GiveOutcome::Validation { message: e.message.clone(), field: e.field.clone() }
             }
             // T1: denegada por el token del CALLER → 403 genérico, no 500 (la culpa no es del
             // server). Se decide por el flag, jamás por el texto.
-            Err(Control::Error(e)) if e.denied_by_token => GiveOutcome::Forbidden(e.to_string_for_client()),
+            Err(Control::Error(e)) if e.denied_by_token && !e.is_fatal_for_labels() => GiveOutcome::Forbidden(e.to_string_for_client()),
             Err(Control::Error(e)) => GiveOutcome::Error(e.to_string_for_client()),
             Err(Control::Stop(_)) => {
                 GiveOutcome::Error("'give'/'stop' used outside of a task or loop".to_string())
@@ -3101,7 +3234,7 @@ fn run_mounted_stream(
             // Un stream es un sumidero PÚBLICO como la respuesta: un valor
             // `private` no sale sin `declassify` (el error nombra el camino, nunca el valor).
             if let Err(e) = synsema_core::labels::check_flow(&val, &[], "stream") {
-                return Err(Control::Error(RuntimeError::new(e.to_string())));
+                return Err(Control::Error(RuntimeError::stream_label_cut(e.to_string())));
             }
             match (*ec.borrow_mut())(&val, event) {
                 Ok(()) => Ok(()),
@@ -3545,12 +3678,17 @@ fn make_serve_hook(
                                 vec![syn_int(status), syn_text(message), build_request_syn(ctx)];
                             match interp.call_task(task, args) {
                                 Ok(SynValue::Nothing) => None,
-                                Ok(v) => Some(v),
+                                // v0.6.47 (T1): si la página no puede salir por etiquetas, es un corte
+                                // como el de una ruta (el log de esta entrada queda en la línea fija).
+                                Ok(v) => {
+                                    mark_if_response_refused(interp, &v);
+                                    Some(v)
+                                }
                                 Err(e) => {
                                     // La task de errores falló: se loggea y el default
                                     // JSON responde — un bug acá jamás tumba el error path.
                                     if let Control::Error(re) = e {
-                                        eprintln!("[serve] errors task failed: {}", re.message);
+                                        entry_eprintln(interp, &format!("[serve] errors task failed: {}", re.message));
                                     }
                                     None
                                 }
@@ -4285,7 +4423,10 @@ fn serve_inner(source: &str, filename: &str, secure: bool, overrides: ServeOverr
     register_serve_memory_builtins(&interp, shared_memory.clone(), persist_memory.clone(), top_gate.clone());
     register_serve_progress_builtins(&interp, shared_progress.clone(), persist_progress.clone(), top_gate);
 
-    let swarm = Arc::new(Swarm::new());
+    let swarm = Arc::new(labels_swarm(Swarm::new()));
+    if crate::host::labels() {
+        (serve_log_sink())(SERVE_LABELS_LOG_NOTICE);
+    }
     // Techo del host (--sandbox/--cap-set) aún no se extiende a `serve` (extensión posterior).
     wire_swarm_hooks(&mut interp, swarm.clone(), "main", serve_ceiling(), top_mem_ctx, None, &caps);
     // db compartida: el top-level abre/crea tablas; los handlers (en sus hilos) la
@@ -4349,6 +4490,12 @@ fn serve_inner(source: &str, filename: &str, secure: bool, overrides: ServeOverr
         };
     }
 
+    // v0.6.47 (T1, ronda 7): el preámbulo es una corrida más (la del swarm, que heredan los agentes que
+    // lanzó) y terminó: su dueño la cierra. Si le quedan agentes vivos, la corrida sigue abierta hasta
+    // que terminen (ronda 8, N1; caso 14 de `specs/t1-diario-modelo.md`): recién ahí se confirma, y si
+    // uno se corta ya sirviendo, se deshace todo lo del preámbulo. Un worker que no termina nunca deja
+    // la corrida abierta para siempre (cadena acotada: una versión por corrida con algo vivo).
+    swarm.close_run(&swarm.run_cut, swarm.run_cut.get().is_some());
     let handles: Vec<JoinHandle<()>> = std::mem::take(&mut *servers.lock().unwrap());
     if handles.is_empty() {
         // Sin rutas pero CON jobs de cron → proceso vivo con los jobs ejecutando
@@ -4475,6 +4622,23 @@ pub fn run_serve_program_with_overrides(
 mod tests {
     use super::*;
     use synsema_stdlib::secrets::EnvStore;
+
+    /// v0.6.47 (T1): una entrada de serve que entra en pánico cierra su corrida con corte (lo que
+    /// escribió se deshace y la corrida no queda abierta para siempre).
+    #[test]
+    fn a_panicking_entry_closes_its_run_with_a_cut() {
+        let swarm = Arc::new(Swarm::new().journaling_runs());
+        let run = Arc::new(synsema_core::interpreter::RunCut::default());
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            synsema_agents::blackboard::set_thread_scope(Some(run.clone()));
+            let _owner = RunOwner { swarm: &swarm, scope: Some(run.clone()) };
+            swarm.blackboard.write("k", synsema_core::types::SendValue::Text("x".into()), "");
+            panic!("bug del motor");
+        }));
+        assert!(r.is_err());
+        assert_eq!(swarm.blackboard.read("k", ""), None);
+        assert!(synsema_agents::blackboard::thread_scope().is_none());
+    }
 
     /// v0.6.46 (backlog §10): un `deny` del host en la raíz de un `static` (o en todo su árbol)
     /// arrancaba igual y servía la carpeta; uno de adentro no frena el arranque.

@@ -120,6 +120,10 @@ pub struct RunOptions {
     pub auditor: Option<[u8; 32]>,
     /// v0.6.46 (E6) — el tamaño del texto plano del sobre (por defecto 64 KiB).
     pub sealed_bytes: Option<usize>,
+    /// v0.6.47 (T1) — el diagnóstico entero de un corte de etiquetas va al programa (en `errors` y
+    /// en el reporte de tests), como `synsema run` sin techo. Lo prende sólo quien escribió el
+    /// programa (el bin wasip1 sin techo); un embebedor lo deja apagado y lee `operator_detail`.
+    pub labels_detail_to_program: bool,
 }
 
 impl RunOptions {
@@ -139,6 +143,7 @@ impl RunOptions {
             trusted_ceiling: None,
             auditor: None,
             sealed_bytes: None,
+            labels_detail_to_program: false,
         }
     }
 }
@@ -194,6 +199,11 @@ pub struct Report {
     /// v0.6.46 (E6) — el recibo sellado, si el host puso un auditor (`RunOptions.auditor`). El host lo
     /// entrega ANTES que la salida.
     pub receipt: Option<serde_json::Value>,
+    /// v0.6.47 (T1) — el diagnóstico entero de un corte de etiquetas (sitio, remedio, ubicación), para
+    /// el OPERADOR. En `errors` el programa ve un texto fijo; esto no va nunca ahí ni al log del
+    /// programa. Depende del dato privado: el host no se lo devuelve a un modelo, y bajo el guest no
+    /// sale del enclave.
+    pub operator_detail: Option<String>,
 }
 
 /// Un `declassify` ejecutado, en forma plana (`Send`, serializable).
@@ -1123,6 +1133,7 @@ pub(crate) fn prepare(program: &Program, opts: &RunOptions) -> (Interpreter, Rc<
     }
     if opts.labels {
         interp.set_labels(true);
+        interp.set_labels_detail_to_program(opts.labels_detail_to_program);
         // v0.6.45 (D1): los MISMOS sumideros que el nativo (una sola lista, `label_lists`). Antes el
         // wasm encendía las etiquetas sin registrar ninguno: `print` redactaba, pero `fetch`/`http_*`
         // hacia el hook del host, `state_set` al KV y `remember` salían con el dato en claro (en
@@ -1245,6 +1256,7 @@ pub fn run(source: &str, opts: &RunOptions) -> Report {
                 private_seen: false,
                 exit_code: None,
                 receipt: None,
+                operator_detail: None,
             }
         }
         Ok(p) => p,
@@ -1269,6 +1281,7 @@ pub fn run(source: &str, opts: &RunOptions) -> Report {
             private_seen: false,
             exit_code: None,
             receipt: None,
+            operator_detail: None,
         };
     }
     let result = interp.execute(&program);
@@ -1301,6 +1314,10 @@ pub fn run(source: &str, opts: &RunOptions) -> Report {
         Err(Control::Error(e)) => e.exit_code,
         _ => None,
     };
+    let operator_detail = match &result {
+        Err(Control::Error(e)) => e.operator_detail.clone(),
+        _ => None,
+    };
     let r = finish(interp, result);
     let receipt = match (&sealed_log, opts.auditor) {
         (Some(log), Some(auditor)) => {
@@ -1326,6 +1343,7 @@ pub fn run(source: &str, opts: &RunOptions) -> Report {
                         private_seen,
                         exit_code: None,
                         receipt: None,
+                        operator_detail: None,
                     }
                 }
             }
@@ -1345,6 +1363,7 @@ pub fn run(source: &str, opts: &RunOptions) -> Report {
         result: value,
         declassify,
         private_seen,
+        operator_detail,
     }
 }
 
