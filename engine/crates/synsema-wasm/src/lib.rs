@@ -30,7 +30,7 @@ pub mod handler;
 use synsema_core::synlist::{list_values};
 use synsema_core::types::SynMap;
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
@@ -41,7 +41,7 @@ use synsema_agents::builtins::{
 use synsema_agents::memory::AgentMemory;
 use synsema_agents::progress::ProgressManager;
 use synsema_capabilities::model::{
-    capability_type_from_name, validate_memory_name, Capability, CapabilitySet, CapabilityType,
+    capability_type_from_name, validate_memory_name, CapSet, Capability, CapabilitySet, CapabilityType,
 };
 use synsema_capabilities::secure::register_secure_builtins;
 use synsema_core::ast::{Node, NodeKind, Program};
@@ -778,7 +778,7 @@ pub fn wire_pure(interp: &mut Interpreter, caps: &Rc<RefCell<CapabilitySet>>, ct
     // Aislamiento de `sandbox`: guarda y VACÍA el CapabilitySet al entrar; restaura
     // al salir (stack para anidados) — idéntico al runtime.
     #[allow(clippy::type_complexity)]
-    let saved: Rc<RefCell<Vec<(HashSet<Capability>, HashSet<Capability>, Option<Rc<RefCell<CapabilitySet>>>)>>> =
+    let saved: Rc<RefCell<Vec<(CapSet, CapSet, Option<Rc<RefCell<CapabilitySet>>>)>>> =
         Rc::new(RefCell::new(Vec::new()));
     let caps_sb = caps.clone();
     interp.set_sandbox_hook(Rc::new(move |entering| {
@@ -798,13 +798,13 @@ pub fn wire_pure(interp: &mut Interpreter, caps: &Rc<RefCell<CapabilitySet>>, ct
     // Aislamiento por-tool (least-privilege): la tool corre con sus caps declaradas
     // ∩ las del agente, sin heredar el padre — idéntico al runtime.
     #[allow(clippy::type_complexity)]
-    let saved_tool: Rc<RefCell<Vec<(HashSet<Capability>, HashSet<Capability>, Option<Rc<RefCell<CapabilitySet>>>)>>> =
+    let saved_tool: Rc<RefCell<Vec<(CapSet, CapSet, Option<Rc<RefCell<CapabilitySet>>>)>>> =
         Rc::new(RefCell::new(Vec::new()));
     let caps_tool = caps.clone();
     interp.set_tool_scope_hook(Rc::new(move |entering, declared: &[(String, Option<String>)]| {
         let mut cs = caps_tool.borrow_mut();
         if entering {
-            let mut allowed: HashSet<Capability> = HashSet::new();
+            let mut allowed: CapSet = CapSet::new();
             for (name, scope) in declared {
                 if let Some(ty) = capability_type_from_name(name) {
                     let cap = Capability::new(ty, scope.clone());

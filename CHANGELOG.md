@@ -65,6 +65,23 @@ choose. Now:
   any part is cut, including what its agents wrote after the request answered. What other runs read
   while it was open, and signals already consumed, stay (as with any effect before a cut).
 
+**The audit names the same grant every run: the narrowest one.** When two grants covered a use
+(`require llm` and `require llm("clientes")`, or `net("*.x.com")` and `net("api.x.com")`), the
+audit's `Granted by …` named one at random, because grants were kept in a hash set whose seed
+changes per run. A program with private data could not choose it, but the audit of the same run
+differed from one execution to the next. Grants and denies are now kept in a fixed order, the grant
+that covers least first, read the way each type matches: a scope before none, no wildcard (`*`,
+`?`) before a wildcard, more literal characters before fewer. A CIDR counts as a range by its
+prefix (`net("10.1.2.3")` before `net("10.1.0.0/16")` before `net("10.0.0.0/8")`, and a port
+narrows it as it narrows a host: `net("10.0.0.0/8:9")` before `net("10.0.0.0/8")`); `[` is a literal
+character, not a wildcard; a secret bound to hosts (`secret("k") for net("*.x.com")`) comes before
+the unbound one; and in `llm`/`judge`, where the scope names whose private data may be sent, the
+unscoped grant covers only public data, so a public call names `llm` and a call with data of `P`
+names `llm("P…")`. The order is read from the text of the declaration, so a relative path against
+an absolute one compares by length. Ties break by type and scope. The same order picks the `deny`
+that the audit and the error name, the `deny` of a private-address `net` check and of a `static`
+root, and the order of the hosts of a bound secret.
+
 **The skill for coding agents moved to `skills/synsema/` and installs in any agent.** It was in
 `.synsema-skill/`, a hidden folder that only the Claude Code installer knew, and its `SKILL.md`
 frontmatter did not parse as YAML for strict readers (a `:` inside the unquoted description), so

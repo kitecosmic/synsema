@@ -28,7 +28,7 @@ use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use indexmap::IndexMap;
-use synsema_capabilities::model::{Capability, CapabilitySet, CapabilityType};
+use synsema_capabilities::model::{CapSet, Capability, CapabilitySet, CapabilityType};
 use synsema_core::ast::{Node, NodeKind};
 use synsema_core::interpreter::{Control, Environment, Interpreter, RuntimeError};
 use synsema_core::parser::parse_source;
@@ -95,7 +95,7 @@ struct App {
     captured: Rc<RefCell<Option<Captured>>>,
     /// Caps concedidas al terminar el top-level: cada request arranca de acá (como el
     /// snapshot de caps por worker del serve nativo).
-    granted: HashSet<Capability>,
+    granted: CapSet,
     /// Globales al terminar el top-level (copia PROFUNDA de listas/mapas): cada request
     /// corre sobre este snapshot — un `set` sobre un global dentro de un handler NO
     /// persiste al request siguiente, exactamente como en el serve nativo (serve.md:

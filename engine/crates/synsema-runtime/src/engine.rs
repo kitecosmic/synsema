@@ -11,7 +11,7 @@
 
 use synsema_core::types::SynMap;
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
@@ -32,7 +32,7 @@ use synsema_agents::memory::AgentMemory;
 use synsema_agents::progress::ProgressManager;
 use synsema_agents::swarm::{AgentState, Swarm};
 use synsema_capabilities::model::{
-    capability_type_from_name, Capability, CapabilitySet, CapabilityType,
+    capability_type_from_name, CapSet, Capability, CapabilitySet, CapabilityType,
 };
 use synsema_capabilities::secure::register_secure_builtins;
 use synsema_core::ast::Node;
@@ -820,7 +820,7 @@ pub(crate) fn wire_common_with_state(
     // al salir, restaura. Stack para sandboxes anidados. Cubre TODOS los builtins gateados
     // de una sola vez (leen el mismo CapabilitySet vía el `caps` Rc compartido).
     #[allow(clippy::type_complexity)]
-    let saved: Rc<RefCell<Vec<(HashSet<Capability>, HashSet<Capability>, Option<Rc<RefCell<CapabilitySet>>>)>>> =
+    let saved: Rc<RefCell<Vec<(CapSet, CapSet, Option<Rc<RefCell<CapabilitySet>>>)>>> =
         Rc::new(RefCell::new(Vec::new()));
     let caps_sb = caps.clone();
     interp.set_sandbox_hook(Rc::new(move |entering| {
@@ -842,7 +842,7 @@ pub(crate) fn wire_common_with_state(
     // sandbox-hook (stack para tools anidadas). Hace ENFORCED el `require` por-tool: una
     // tool no puede usar una capability que no declaró, aunque el agente la tenga.
     #[allow(clippy::type_complexity)]
-    let saved_tool: Rc<RefCell<Vec<(HashSet<Capability>, HashSet<Capability>, Option<Rc<RefCell<CapabilitySet>>>)>>> =
+    let saved_tool: Rc<RefCell<Vec<(CapSet, CapSet, Option<Rc<RefCell<CapabilitySet>>>)>>> =
         Rc::new(RefCell::new(Vec::new()));
     let caps_tool = caps.clone();
     interp.set_tool_scope_hook(Rc::new(move |entering, declared: &[(String, Option<String>)]| {
@@ -850,7 +850,7 @@ pub(crate) fn wire_common_with_state(
         if entering {
             // Las declaradas que el set ACTUAL (efectivo, incl. padre) ya satisface → la
             // tool no puede exceder al agente. `check` audita y camina la cadena de padres.
-            let mut allowed: HashSet<Capability> = HashSet::new();
+            let mut allowed: CapSet = CapSet::new();
             for (name, scope) in declared {
                 if let Some(ty) = capability_type_from_name(name) {
                     let cap = Capability::new(ty, scope.clone());
