@@ -79,7 +79,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master 2026-09-12; toolchain pinned below and in rust-toolchain.toml
         with:
-          toolchain: "1.96.0"
+          toolchain: "1.99.1"
           targets: ${{ matrix.target }}
 
       # Linux: se compila contra glibc 2.17 con zig como toolchain C/C++ (cargo-zigbuild), así el
@@ -114,7 +114,7 @@ jobs:
           TARGET: ${{ matrix.target }}
         run: |
           set -euo pipefail
-          rustup component add llvm-tools --toolchain 1.96.0
+          rustup component add llvm-tools --toolchain 1.99.1
           if [ "$TARGET" = "x86_64-apple-darwin" ]; then
             sudo softwareupdate --install-rosetta --agree-to-license
           fi
@@ -142,6 +142,11 @@ jobs:
           RUSTFLAGS: -Cprofile-generate=${{ runner.temp }}/pgo-raw
         run: |
           set -euo pipefail
+          # macOS: el C de las dependencias sin instrumentar (Apple clang escribe otro formato de
+          # perfil que el runtime de rustc 1.99.1; ver engine/pgo/zig, que hace lo mismo en Linux).
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            export "CFLAGS_${TARGET//-/_}=-fno-profile-generate" "CXXFLAGS_${TARGET//-/_}=-fno-profile-generate"
+          fi
           # El mismo comando y el mismo directorio que el build final de abajo, con otro RUSTFLAGS.
           if [ "$RUNNER_OS" = "Linux" ]; then
             cargo zigbuild --release --locked --manifest-path engine/Cargo.toml -p synsema-cli --features llm-local,judge-laya --target "$TARGET.2.17"
@@ -160,8 +165,8 @@ jobs:
           PGO_DIR: ${{ runner.temp }}
         run: |
           set -euo pipefail
-          host=$(rustc +1.96.0 -vV | sed -n 's/^host: //p')
-          profdata="$(rustc +1.96.0 --print sysroot)/lib/rustlib/$host/bin/llvm-profdata"
+          host=$(rustc +1.99.1 -vV | sed -n 's/^host: //p')
+          profdata="$(rustc +1.99.1 --print sysroot)/lib/rustlib/$host/bin/llvm-profdata"
           "$profdata" merge -o "$PGO_DIR/pgo.profdata" "$PGO_DIR/pgo-raw"
           ls -la "$PGO_DIR/pgo.profdata"
 
@@ -202,6 +207,10 @@ jobs:
           RUSTFLAGS: -Cprofile-use=${{ runner.temp }}/pgo.profdata -Cllvm-args=-pgo-warn-missing-function
         run: |
           set -euo pipefail
+          # macOS: el C sin el perfil de rustc (lo mismo que el paso instrumentado).
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            export "CFLAGS_${TARGET//-/_}=-fno-profile-use" "CXXFLAGS_${TARGET//-/_}=-fno-profile-use"
+          fi
           cargo build --release --locked --manifest-path engine/Cargo.toml -p synsema-cli --features llm-local,judge-laya --target "$TARGET" 2>&1 | tee "$RUNNER_TEMP/pgo-final-build.log"
 
       # Un perfil que no calza con el build final NO rompe nada: el binario sale igual, sin la ganancia,
@@ -344,7 +353,7 @@ jobs:
             packages/guests/vela/tests/wasmtime-go-v47/go.sum
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master 2026-09-12; toolchain pinned below and in rust-toolchain.toml
         with:
-          toolchain: "1.96.0"
+          toolchain: "1.99.1"
           targets: wasm32-wasip1,wasm32-unknown-unknown
       - name: Build wasm artifacts
         env:
@@ -360,10 +369,11 @@ jobs:
       # Guest de Vela con la app de ejemplo embebida (packages/guests/vela): para desplegar algo en
       # el starter kit de Vela antes de escribir una línea; el propio se construye con SYNSEMA_VELA_APP.
       # The published asset is the STUBBED module: Vela v0.3.0 (pkg/wasm/guest_imports.go) refuses at
-      # load any module declaring a WASI import outside its closed set of eight, and Rust's std links
-      # fifteen more through std::fs that the `stdout` ceiling never reaches. tools/wasi-stub replaces
-      # them by local stubs returning ENOSYS (fd_prestat_get: EBADF). Every probe below runs on that
-      # module, and it is the one a kit embeds its app into with tools/embed.syn.
+      # load any module declaring a WASI import outside its closed set of eight, and Rust's std
+      # (rustc 1.99.1) links seventeen more that the `stdout` ceiling never reaches. tools/wasi-stub
+      # replaces them by local stubs returning ENOSYS (fd_prestat_get: EBADF; sched_yield: 0).
+      # Every probe below runs on that module, and it is the one a kit embeds its app into with
+      # tools/embed.syn.
       - name: Build the Vela guest (example app) and stub the imports Vela v0.3.0 refuses
         env:
           SYNSEMA_VERSION: ${{ github.ref_name }}
@@ -548,7 +558,7 @@ jobs:
 
   # Reproducibility of the published Vela guest, MEASURED rather than promised. The same commit is
   # built and stubbed on two runners (ubuntu-latest and ubuntu-22.04) with the pinned toolchain:
-  # `--locked` on both lockfiles and rustc 1.96.0 exactly — rust-toolchain.toml at the repo root
+  # `--locked` on both lockfiles and rustc 1.99.1 exactly — rust-toolchain.toml at the repo root
   # pins it for rustup, and the same version is passed to dtolnay/rust-toolchain, which does not
   # read that file. The compare job then puts THREE hashes side by side: the two rebuilds and the
   # asset that was actually published — re-downloaded from the Release on a tag run, so the
@@ -571,7 +581,7 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master 2026-09-12; toolchain pinned below and in rust-toolchain.toml
         with:
-          toolchain: "1.96.0"
+          toolchain: "1.99.1"
           targets: wasm32-wasip1
       - name: Build and stub the Vela guest
         env:

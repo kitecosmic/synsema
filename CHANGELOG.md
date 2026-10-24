@@ -6,7 +6,94 @@ Each says what changed, why, and what to write instead.
 
 Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the release date.
 
-## Unreleased
+## v0.6.47 — 2026-10-24
+
+**Built with Rust 1.99.1 (was 1.96.0).** The releases in between fix four miscompilations (MIR
+optimization in 1.96.1, an LLVM optimization in 1.97.1, vtables in 1.98.1, FFI `bool` returns on
+x86_64 in 1.99.1). The Vela guest's sha256 changes, as it does every release; the published module
+declares the same six WASI imports as v0.6.46, all inside Vela's eight (rustc 1.99.1 links two
+more, `fd_seek` and `sched_yield`, which `tools/wasi-stub` replaces like the others; `sched_yield`
+now returns success, since a single-threaded guest has nothing to yield to). The new compiler also
+exposed a latent bug in the guest, caught before any release: comparing the app slot's header
+against the literal magic left a second copy of `SYNSEMA.APPSLOT1` in the module's data, and
+`tools/embed.syn`, `tools/verify.syn` and the probes, which require exactly one slot, refused the
+module. The guest now recognizes the header by a hash of the magic, so no optimizer can bring the
+literal back. Guests published up to v0.6.46 are not affected.
+
+LLVM 23 compiles two of the interpreter's hottest paths with more instructions: the name lookup of
+the tree-walker (iterating the frame's two halves as one chained iterator) and the arithmetic path,
+where the array check (`array_binop`) is no longer inlined. Both are now written so that they do not
+depend on the inliner. The net cost against v0.6.46, in instructions executed on the 31 programs of
+the `perf-guard` corpus (deterministic, without PGO, as `perf-guard` measures, on x86-64):
+- native tier (the default): −1.9 % to +1.2 % (`s_csv` +1.2 %, the other text and data programs
+  at most +0.9 %);
+- the VM alone (`--jitless`, and WebAssembly without labels): −1.8 % to +1.4 % (`s_matrix_list`
+  +1.4 %, `s_csv` and `s_records` +0.9 %);
+- the tree-walker (`--labels`, `serve --attested`, the Vela guest, WebAssembly with
+  `labels: true`): −1.5 % to +1.2 %; 25 of the 31 programs run fewer instructions than in v0.6.46.
+
+Release binaries are built with PGO, which shifts where the cost lands. On the same 31 programs:
+native tier −2.2 % to +3.0 % (`s_text_join`), the VM −1.0 % to +3.7 % (`c_depth16`; 30 of the 31
+run more instructions, median +2.3 %), the tree-walker −4.6 % to +1.9 % (`s_nbody_chico`). The new
+name lookup costs the VM 0.5 to 2.6 points (median 1.7), mainly through how LLVM allocates
+registers in the dispatch loop, and the native tier up to 1.8 where it falls back to the VM. The
+previous lookup gives that back but costs the tree-walker up to 13.7 points with PGO (`c_depth16`;
+median 0.8) and 3.7 without, so the new one stays. What was not recovered is tracked to be worked on
+again. The `perf-guard` anchor (`engine/perf/baseline.json`) was re-measured on CI with rustc 1.99.1
+in this same change, so it now measures against the new compiler.
+
+**Known, not fixed in this release: RUSTSEC-2026-0387** (`crypto-bigint` 0.5.5, published
+2026-10-23). Some operations meant to run in constant time may branch on secret values, depending on
+the compiler and the CPU. It reaches Synsema through the elliptic-curve crates (`k256`, `p256`, `p384`,
+`p521` 0.13), which handle secret keys in ES256 and VAPID signing, Web Push ECDH, P-521 ECDH and
+`k256` transaction signing. Every release up to v0.6.46 ships the same version. The 0.5 series gets no
+fix, so the fix is moving to the 0.14 curve crates. That is the first item of the next release; this
+one ignores the advisory in `.cargo/audit.toml` with that reason.
+
+**Breaking, with labels: a flow-checker cut no longer tells the program or the log where it
+happened.** Before, the text of a `label_violation` named the site and the label, and how much
+output, log or shared state survived depended on where the cut fell, which a private value could
+choose. Now:
+- under a ceiling (`--cap-set`, `--sandbox`, `--deterministic`, `--trusted`), under `serve`, and in
+  the embeddable WebAssembly module, the program sees one fixed text, `private(labels): the run was
+  stopped by the flow checker`, with no location, and output before the cut is replaced by that one
+  line. `run` and `test` without a ceiling (native or the wasip1 binary) keep the detail, as the
+  owner's own run. The detail goes to the operator: stderr without a ceiling, the sealed receipt
+  with `--auditor`, and `operator_detail` in WebAssembly (`run` and `handle`), never `errors` nor
+  the program's log;
+- a cut in an agent cuts its whole run: from then on every sink of the run fails;
+- `serve --labels`: each request, cron tick and socket handler is its own run. Its stdout and stderr
+  are held and written when it ends, or replaced by the fixed line if it was cut (a notice at
+  startup says so; run without `--labels` for a live log). Agents' output is not written.
+  `agents()` and `agent_stop` see only the agents of the same run. A cut is always a 500 with the
+  fixed text (a refused response counts as a cut);
+- `serve --labels` and the blackboard and signal queue: a run (the request, or the preamble, with
+  all its agents) is committed once, when all of it has ended without a cut, and undone entirely if
+  any part is cut, including what its agents wrote after the request answered. What other runs read
+  while it was open, and signals already consumed, stay (as with any effect before a cut);
+- the Vela guest: any cut by the flow checker answers `{"error": "label_violation"}` on chain, the
+  same code as a private value reaching a public field. That includes a `declassify` the host did not
+  grant and a runtime error on private data, which used to be `runtime_error`. The Executor's log gets
+  one fixed line, `ERR label_violation: the flow checker stopped the run; what failed and where stay
+  in the enclave`, instead of the path and the label. An error that touches no private data is still
+  `runtime_error`, with its text in the log.
+
+**The audit names the same grant every run: the narrowest one.** When two grants covered a use
+(`require llm` and `require llm("clientes")`, or `net("*.x.com")` and `net("api.x.com")`), the
+audit's `Granted by …` named one at random, because grants were kept in a hash set whose seed
+changes per run. A program with private data could not choose it, but the audit of the same run
+differed from one execution to the next. Grants and denies are now kept in a fixed order, the grant
+that covers least first, read the way each type matches: a scope before none, no wildcard (`*`,
+`?`) before a wildcard, more literal characters before fewer. A CIDR counts as a range by its
+prefix (`net("10.1.2.3")` before `net("10.1.0.0/16")` before `net("10.0.0.0/8")`, and a port
+narrows it as it narrows a host: `net("10.0.0.0/8:9")` before `net("10.0.0.0/8")`); `[` is a literal
+character, not a wildcard; a secret bound to hosts (`secret("k") for net("*.x.com")`) comes before
+the unbound one; and in `llm`/`judge`, where the scope names whose private data may be sent, the
+unscoped grant covers only public data, so a public call names `llm` and a call with data of `P`
+names `llm("P…")`. The order is read from the text of the declaration, so a relative path against
+an absolute one compares by length. Ties break by type and scope. The same order picks the `deny`
+that the audit and the error name, the `deny` of a private-address `net` check and of a `static`
+root, and the order of the hosts of a bound secret.
 
 **The skill for coding agents moved to `skills/synsema/` and installs in any agent.** It was in
 `.synsema-skill/`, a hidden folder that only the Claude Code installer knew, and its `SKILL.md`

@@ -75,6 +75,12 @@ impl<T: Default, const N: usize> InlineVec<T, N> {
     pub(crate) fn iter(&self) -> impl Iterator<Item = &T> {
         self.inline[..self.len.min(N)].iter().chain(self.heap.iter())
     }
+
+    /// Los dos tramos por separado, para recorrerlos sin `Chain` en caminos calientes.
+    #[inline]
+    pub(crate) fn as_slices(&self) -> (&[T], &[T]) {
+        (&self.inline[..self.len.min(N)], &self.heap)
+    }
 }
 
 impl<T: Default, const N: usize> std::ops::Index<usize> for InlineVec<T, N> {

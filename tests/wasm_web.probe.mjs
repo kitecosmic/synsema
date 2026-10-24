@@ -170,7 +170,7 @@ print(llm_usage())`;
   const via = syn.run(prog("print(t.inicial(c))"), { labels: true, ceiling: "stdout", trusted });
   check("E3b: la tool de confianza publica su política", via.ok && via.output[0] === "Ana", via);
   const direct = syn.run(prog('print(declassify(c.nombre, "m"))'), { labels: true, ceiling: "stdout", trusted });
-  check("E3b: directo, el techo no da declassify", !direct.ok && direct.errors.some((e) => e.includes("declassify is not granted")), direct);
+  check("E3b: directo, el techo no da declassify (v0.6.47: el programa ve el texto fijo; el motivo, el operador)", !direct.ok && direct.errors.some((e) => e.includes("label_violation: the flow checker stopped the run")) && !direct.errors.some((e) => e.includes("declassify is not granted")) && (direct.operator_detail ?? "").includes("declassify is not granted"), direct);
   const none = syn.run(prog("print(1)"), { labels: true });
   check("E3b: sin `trusted`, el módulo no existe", !none.ok && none.errors.some((e) => e.includes("no trusted module named 't'")), none);
 }

@@ -30,7 +30,7 @@ pub mod handler;
 use synsema_core::synlist::{list_values};
 use synsema_core::types::SynMap;
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
@@ -41,7 +41,7 @@ use synsema_agents::builtins::{
 use synsema_agents::memory::AgentMemory;
 use synsema_agents::progress::ProgressManager;
 use synsema_capabilities::model::{
-    capability_type_from_name, validate_memory_name, Capability, CapabilitySet, CapabilityType,
+    capability_type_from_name, validate_memory_name, CapSet, Capability, CapabilitySet, CapabilityType,
 };
 use synsema_capabilities::secure::register_secure_builtins;
 use synsema_core::ast::{Node, NodeKind, Program};
@@ -120,6 +120,10 @@ pub struct RunOptions {
     pub auditor: Option<[u8; 32]>,
     /// v0.6.46 (E6) — el tamaño del texto plano del sobre (por defecto 64 KiB).
     pub sealed_bytes: Option<usize>,
+    /// v0.6.47 (T1) — el diagnóstico entero de un corte de etiquetas va al programa (en `errors` y
+    /// en el reporte de tests), como `synsema run` sin techo. Lo prende sólo quien escribió el
+    /// programa (el bin wasip1 sin techo); un embebedor lo deja apagado y lee `operator_detail`.
+    pub labels_detail_to_program: bool,
 }
 
 impl RunOptions {
@@ -139,6 +143,7 @@ impl RunOptions {
             trusted_ceiling: None,
             auditor: None,
             sealed_bytes: None,
+            labels_detail_to_program: false,
         }
     }
 }
@@ -194,6 +199,11 @@ pub struct Report {
     /// v0.6.46 (E6) — el recibo sellado, si el host puso un auditor (`RunOptions.auditor`). El host lo
     /// entrega ANTES que la salida.
     pub receipt: Option<serde_json::Value>,
+    /// v0.6.47 (T1) — el diagnóstico entero de un corte de etiquetas (sitio, remedio, ubicación), para
+    /// el OPERADOR. En `errors` el programa ve un texto fijo; esto no va nunca ahí ni al log del
+    /// programa. Depende del dato privado: el host no se lo devuelve a un modelo, y bajo el guest no
+    /// sale del enclave.
+    pub operator_detail: Option<String>,
 }
 
 /// Un `declassify` ejecutado, en forma plana (`Send`, serializable).
@@ -768,7 +778,7 @@ pub fn wire_pure(interp: &mut Interpreter, caps: &Rc<RefCell<CapabilitySet>>, ct
     // Aislamiento de `sandbox`: guarda y VACÍA el CapabilitySet al entrar; restaura
     // al salir (stack para anidados) — idéntico al runtime.
     #[allow(clippy::type_complexity)]
-    let saved: Rc<RefCell<Vec<(HashSet<Capability>, HashSet<Capability>, Option<Rc<RefCell<CapabilitySet>>>)>>> =
+    let saved: Rc<RefCell<Vec<(CapSet, CapSet, Option<Rc<RefCell<CapabilitySet>>>)>>> =
         Rc::new(RefCell::new(Vec::new()));
     let caps_sb = caps.clone();
     interp.set_sandbox_hook(Rc::new(move |entering| {
@@ -788,13 +798,13 @@ pub fn wire_pure(interp: &mut Interpreter, caps: &Rc<RefCell<CapabilitySet>>, ct
     // Aislamiento por-tool (least-privilege): la tool corre con sus caps declaradas
     // ∩ las del agente, sin heredar el padre — idéntico al runtime.
     #[allow(clippy::type_complexity)]
-    let saved_tool: Rc<RefCell<Vec<(HashSet<Capability>, HashSet<Capability>, Option<Rc<RefCell<CapabilitySet>>>)>>> =
+    let saved_tool: Rc<RefCell<Vec<(CapSet, CapSet, Option<Rc<RefCell<CapabilitySet>>>)>>> =
         Rc::new(RefCell::new(Vec::new()));
     let caps_tool = caps.clone();
     interp.set_tool_scope_hook(Rc::new(move |entering, declared: &[(String, Option<String>)]| {
         let mut cs = caps_tool.borrow_mut();
         if entering {
-            let mut allowed: HashSet<Capability> = HashSet::new();
+            let mut allowed: CapSet = CapSet::new();
             for (name, scope) in declared {
                 if let Some(ty) = capability_type_from_name(name) {
                     let cap = Capability::new(ty, scope.clone());
@@ -1123,6 +1133,7 @@ pub(crate) fn prepare(program: &Program, opts: &RunOptions) -> (Interpreter, Rc<
     }
     if opts.labels {
         interp.set_labels(true);
+        interp.set_labels_detail_to_program(opts.labels_detail_to_program);
         // v0.6.45 (D1): los MISMOS sumideros que el nativo (una sola lista, `label_lists`). Antes el
         // wasm encendía las etiquetas sin registrar ninguno: `print` redactaba, pero `fetch`/`http_*`
         // hacia el hook del host, `state_set` al KV y `remember` salían con el dato en claro (en
@@ -1245,6 +1256,7 @@ pub fn run(source: &str, opts: &RunOptions) -> Report {
                 private_seen: false,
                 exit_code: None,
                 receipt: None,
+                operator_detail: None,
             }
         }
         Ok(p) => p,
@@ -1269,6 +1281,7 @@ pub fn run(source: &str, opts: &RunOptions) -> Report {
             private_seen: false,
             exit_code: None,
             receipt: None,
+            operator_detail: None,
         };
     }
     let result = interp.execute(&program);
@@ -1301,6 +1314,10 @@ pub fn run(source: &str, opts: &RunOptions) -> Report {
         Err(Control::Error(e)) => e.exit_code,
         _ => None,
     };
+    let operator_detail = match &result {
+        Err(Control::Error(e)) => e.operator_detail.clone(),
+        _ => None,
+    };
     let r = finish(interp, result);
     let receipt = match (&sealed_log, opts.auditor) {
         (Some(log), Some(auditor)) => {
@@ -1326,6 +1343,7 @@ pub fn run(source: &str, opts: &RunOptions) -> Report {
                         private_seen,
                         exit_code: None,
                         receipt: None,
+                        operator_detail: None,
                     }
                 }
             }
@@ -1345,6 +1363,7 @@ pub fn run(source: &str, opts: &RunOptions) -> Report {
         result: value,
         declassify,
         private_seen,
+        operator_detail,
     }
 }
 

@@ -6,8 +6,8 @@
 // errores como datos y logs por stdout.
 //
 // Lo que la cadena ve. `error` es siempre un código
-// (`insufficient_balance`, `app_error`, `runtime_error`, `invariant_violation`) y el texto va al
-// log; el fuel es UN valor idéntico en toda respuesta; con la política `{"reject": "private",
+// (`insufficient_balance`, `app_error`, `runtime_error`, `invariant_violation`, `label_violation`) y
+// el texto va al log (desde v0.6.47, T1, un corte de etiquetas deja una línea fija: ni qué ni dónde); el fuel es UN valor idéntico en toda respuesta; con la política `{"reject": "private",
 // "events_pad": 256, "events_min": 2}` un rechazo de la app es un éxito con el motivo cifrado al
 // sender, cada `data` mide un múltiplo de 256 y hay al menos 2 eventos; la política viaja bajo
 // `_vela` en el estado y la app no la ve; `invariants(ctx)` corre tras cada transición. Para los
@@ -15,7 +15,8 @@
 // embebe un programa propio en el slot del módulo (lo mismo que hace tools/embed.syn).
 //
 // El módulo sólo puede declarar los 8 imports que Vela v0.3.0 admite (guest_imports.go). Un
-// módulo sin post-procesar (tools/wasi-stub) declara 21 y esa aserción FALLA: es lo esperado.
+// módulo sin post-procesar (tools/wasi-stub) declara 23 (rustc 1.99.1) y esa aserción FALLA: es
+// lo esperado.
 //
 //   node tests/vela_guest.probe.mjs engine/target/wasm32-wasip1/wasm/synsema_vela_guest.wasm
 import { readFile } from "node:fs/promises";
@@ -214,7 +215,9 @@ const badAddr = note("app", g.process(1, ALICE, 1, JSON.stringify({ type: "trans
 check(badAddr.json.error === "runtime_error", `an adapter/engine error is the code runtime_error, not a trap: ${badAddr.json.error}`);
 check(!badAddr.text.includes("not hex"), "the engine's message is not in the response");
 const crash = note("app", g.process(1, ALICE, 1, JSON.stringify({ type: "transfer", to: BOB, amount: "abc" }), state2));
-check(crash.json.error === "runtime_error", `a runtime error inside the program (decimal(\"abc\")) is runtime_error: ${crash.json.error}`);
+// v0.6.47 (T1): el payload es {app}, así que el error sale de un dato privado y es un corte de
+// etiquetas: decir que falló ya cuenta algo del payload.
+check(crash.json.error === "label_violation", `a runtime error on private data (decimal(\"abc\")) is label_violation: ${crash.json.error}`);
 
 console.log("== process_request DEANONYMIZATION (2): the report is mandatory");
 const de = note("app", g.process(1, ALICE, 2, "{}", state2));
@@ -295,9 +298,9 @@ check(rejData.rejected === "insufficient_balance" && typeof rejData.detail === "
 check(rej.json.events.every(isPadded), "the rejection and its filler are padded to 256");
 check(!rej.text.includes("insufficient"), "the code is only inside the encrypted event, not in the clear response");
 check(rej.json.fuel === dep.json.fuel, "a rejected request reports the same fuel");
-// A runtime error is NOT converted: it stays a public runtime_error even under reject: private.
+// A label cut is NOT converted: an error on private data stays label_violation even under reject: private.
 const prt = note("app", g.process(1, ALICE, 1, JSON.stringify({ type: "transfer", to: BOB, amount: "abc" }), pstate1));
-check(prt.json.error === "runtime_error", `a runtime error stays public under reject: private: ${prt.json.error}`);
+check(prt.json.error === "label_violation", `a label cut stays label_violation under reject: private: ${prt.json.error}`);
 
 console.log("== policy: successful transfer/withdraw/deanonymize under padding");
 const ptr = note("app", g.process(1, ALICE, 1, JSON.stringify({ type: "transfer", to: BOB, amount: "250000000000000000" }), pstate1));
@@ -395,7 +398,7 @@ const tstate0 = b64(tdep.json.state);
 const tfree = note("tamper", t.process(2, ALICE, 1, JSON.stringify({ type: "free" }), tstate0));
 check(tfree.json.error === "app_error" && !tfree.text.includes("seller"), `free-text error → app_error, text kept off-chain: ${tfree.text}`);
 const tboom = note("tamper", t.process(2, ALICE, 1, JSON.stringify({ type: "boom" }), tstate0));
-check(tboom.json.error === "runtime_error" && !tboom.text.includes("range"), `raise → runtime_error: ${tboom.text}`);
+check(tboom.json.error === "label_violation" && !tboom.text.includes("range"), `raise on private data → label_violation: ${tboom.text}`);
 const tmint = note("tamper", t.process(2, ALICE, 1, JSON.stringify({ type: "mint" }), tstate0));
 check(tmint.json.error === "invariant_violation" && tmint.json.state === null, `breaking the conservation → invariant_violation, state not applied: ${tmint.text}`);
 const tdepo = note("tamper", t.deposit(2, ALICE, ETH, 5n, tstate0));
@@ -406,15 +409,17 @@ check(!tlogs.includes("the seller holds 5"), "…and the seller's balance is now
 // El motor redacta el mensaje. Desde la ronda 7 tampoco viaja `file:line:col` hacia el host, y
 // desde la ronda 7 el principal que sale es el conjunto DECLARADO del programa (constante), no el
 // del valor concreto — ése variaba con cuál se había seleccionado y publicaba el dato.
-check(/ERR runtime_error: .*private\([^)]*\)/.test(tlogs) && !tlogs.includes("index 7 out of range") && !/ERR runtime_error: [^\n]*:\d+:\d+:/.test(tlogs),
-      "the raise text NEVER leaves the enclave, and since round 7 neither does file:line (which of N sites failed is log2(N) bits)");
+// v0.6.47 (T1): un corte de etiquetas deja una sola línea fija, igual para cualquier causa.
+const CUT = "ERR label_violation: the flow checker stopped the run; what failed and where stay in the enclave";
+check(tlogs.includes(CUT) && !tlogs.includes("index 7 out of range") && !/ERR [a-z_]+: [^\n]*:\d+:\d+:/.test(tlogs),
+      "the raise text NEVER leaves the enclave, nor file:line (which of N sites failed is log2(N) bits): the fixed cut line");
 check(/ERR invariant_violation: \(private\)/.test(tlogs) && !tlogs.includes("conservation broken"), "an invariant description computed from the private state is redacted in the log");
 check(/INF fuel: reported 0x7$/m.test(tlogs), "fuel log for a task that declares none: the same single line");
 
 console.log("== information-flow labels: state/payload are {app}; app_events/withdrawals/error are public sinks");
 const tleak = note("tamper", t.process(2, ALICE, 1, JSON.stringify({ type: "leak" }), tstate0));
 check(tleak.json.error === "label_violation" && tleak.json.state === null, `a state value in a public app event → label_violation, nothing applied: ${tleak.text}`);
-check(/ERR label_violation: app_events\[0\]\.data\.total is private to app, the sink accepts \(public\)/.test(t.logs()), "the path (never the value) is in the log");
+check(t.logs().includes(CUT) && !t.logs().includes("app_events[0]"), "a sink rejection logs the same fixed line: neither the value nor the path");
 const tdecl = note("tamper", t.process(2, ALICE, 1, JSON.stringify({ type: "declassified" }), tstate0));
 check(tdecl.json.error === undefined && JSON.parse(b64(tdecl.json.appEvents[0].data)).total === 0, `the same value declassified with a reason leaves: ${tdecl.text.slice(0, 80)}`);
 check(!/^INF declassify:/m.test(t.logs()), "the executed declassify is NOT logged (audit R3/B2): the trace carried the source line, which names the instruction that ran; the audit surface is the static `synsema code check --json`");
@@ -425,7 +430,7 @@ check(tcode.json.error === "label_violation", `an error code computed from the p
 const ttier = note("tamper", t.process(2, ALICE, 1, JSON.stringify({ type: "tier" }), tstate0));
 check(ttier.json.error === "label_violation" && ttier.json.state === null, `a literal chosen by a private branch is private (gold/silver): label_violation (${ttier.text.slice(0, 60)})`);
 const tierLog = (t.logs().match(new RegExp("ERR label_violation: [^\n]*", "g")) || []).join(" | ");
-check(/ERR label_violation: app_events\[0\]/.test(tierLog) && !tierLog.includes("gold"), `…with the path in the log, never the value: ${tierLog.slice(0, 200)}`);
+check(tierLog.length > 0 && tierLog.split(" | ").every(l => l === CUT) && !tierLog.includes("gold"), `…with only the fixed line in the log: ${tierLog.slice(0, 200)}`);
 // M12: a payload whose keys look like the engine's markers stays DATA, never a marker.
 const techo = note("tamper", t.process(2, ALICE, 1, JSON.stringify({ type: "echo", note: { $bytes: "aGk=", $private: ["bank"], value: 1 } }), tstate0));
 check(techo.json.error === undefined, `a payload with $bytes/$private keys is plain data: ${techo.text.slice(0, 80)}`);

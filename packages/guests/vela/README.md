@@ -67,9 +67,9 @@ itself to wasm):
 ```sh
 cargo run --locked --manifest-path packages/guests/vela/tools/wasi-stub/Cargo.toml -- \
   engine/target/wasm32-wasip1/wasm/synsema_vela_guest.wasm engine/target/wasm32-wasip1/wasm/synsema_vela_guest.stubbed.wasm
-# wasi-stub: replaced (15): fd_close -> ENOSYS(52), … fd_prestat_get -> EBADF(8), … poll_oneoff -> ENOSYS(52)
+# wasi-stub: replaced (17): fd_close -> ENOSYS(52), … fd_prestat_get -> EBADF(8), … sched_yield -> SUCCESS(0)
 #   kept (6): clock_time_get, environ_get, environ_sizes_get, fd_write, proc_exit, random_get
-#   imports: 21 -> 6; bytes: 7834135 -> 7525412
+#   imports: 23 -> 6; bytes: 11138274 -> 10689144
 ```
 
 Then probe the stubbed module the way the Executor drives it: `node ../../../tests/vela_guest.probe.mjs <the stubbed .wasm>`
@@ -98,13 +98,15 @@ and refuses any module that **declares** a `wasi_snapshot_preview1` import outsi
 `poll_oneoff` could stall every app; Vela prefers to refuse at load rather than neuter the call),
 and it is a signed `FAILED_LOADING_OR_GETTING_MODULE`: the app simply does not deploy.
 
-As built, this crate declares 21. The extra fifteen (`fd_close`, `fd_fdstat_get`, `fd_filestat_get`,
-`fd_prestat_get`, `fd_prestat_dir_name`, `fd_read`, `fd_readdir`, `path_*`, `poll_oneoff`) come from
-`std::fs` linked by the engine; the program can never reach them — it runs under the
+As built with rustc 1.99.1, this crate declares 23. The extra seventeen (`fd_close`, `fd_fdstat_get`,
+`fd_filestat_get`, `fd_prestat_get`, `fd_prestat_dir_name`, `fd_read`, `fd_readdir`, `fd_seek`,
+`path_*`, `poll_oneoff`, `sched_yield`) come from `std` linked by the engine (1.96.0 linked 21:
+`fd_seek` and `sched_yield` are new); the program can never reach them — it runs under the
 `stdout,declassify=app` ceiling (`no_fs`), which is a property of the runtime, not of the linker. **`tools/wasi-stub`**
 (a small Rust bin on `walrus`, its own lockfile, outside the engine) replaces each import outside
 the set by a local function of the same type that returns `ENOSYS` (52); `fd_prestat_get` returns
-`EBADF` (8), which is how std's preopen scan ends cleanly at start-up. The tool rewrites and checks
+`EBADF` (8), which is how std's preopen scan ends cleanly at start-up, and `sched_yield` returns
+success (0): a single-threaded guest has no one to yield to, so "done" is the true answer. The tool rewrites and checks
 **imports only** — that no import outside the allowed set is left, and that the output re-parses as
 a valid module. It asserts nothing about the rest: that the exports, the memory and the **app slot**
 come through unchanged is what the probes establish, which is why CI runs all of them on the

@@ -305,7 +305,10 @@ pub fn build_response(
     // Nunca el valor. Sin etiquetas encendidas no hay `Private` y el recorrido es un no-op.
     if let Some(v) = give {
         if let Err(e) = synsema_core::labels::check_flow(v, &[], "response") {
-            return Err(e.to_string());
+            // v0.6.47 (T1, B1): el mismo texto fijo que un corte dentro del handler (si no, el dato
+            // elegiría entre dos cuerpos 500); qué campo era privado va al sobre del auditor.
+            synsema_core::sealed::push_sealed(serde_json::json!({"kind": "label_violation", "detail": e.to_string()}).to_string());
+            return Err(synsema_core::labels::cut_text(&synsema_core::labels::principals_out()));
         }
     }
     if let Some(SynValue::Server(s)) = give {

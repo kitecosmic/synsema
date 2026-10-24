@@ -56,6 +56,12 @@ pub struct AgentInfo {
     /// Token de cancelación cooperativa del agente (`agent_stop`): el intérprete del
     /// agente lo adopta al arrancar; `agent_stop(id)` lo cancela desde cualquier hilo.
     pub cancel: CancelToken,
+    /// v0.6.47 (T1, A1): `(texto, detalle)` si el agente terminó cortado por etiquetas. Quien lo
+    /// observa (`agents()`) adopta el corte: su estado es un dato que eligió el privado.
+    pub labels_cut: Option<(String, String)>,
+    /// v0.6.47 (T1): la corrida que lo lanzó (su `RunCut`): un request, un tick del cron, el
+    /// preámbulo o el `run` entero. `agents()` y `agent_stop` sólo ven los de la propia corrida.
+    pub scope: Option<std::sync::Arc<synsema_core::interpreter::RunCut>>,
 }
 
 #[derive(Clone, Debug)]
@@ -68,7 +74,7 @@ pub struct Signal {
 
 struct SwarmState {
     agents: IndexMap<String, AgentInfo>,
-    pending: HashMap<String, VecDeque<Signal>>,
+    pending: HashMap<String, VecDeque<(Signal, Option<std::sync::Arc<synsema_core::interpreter::RunCut>>)>>,
     history: Vec<Signal>,
 }
 
@@ -80,6 +86,19 @@ pub struct Swarm {
     state: Mutex<SwarmState>,
     cvar: Condvar,
     threads: Mutex<Vec<JoinHandle<()>>>,
+    /// v0.6.47 (T1, A1): el corte de la corrida que usa este swarm (`run`, `test`); el principal y
+    /// los agentes que lanza lo comparten. Bajo `serve` cada request lleva el suyo.
+    pub run_cut: std::sync::Arc<synsema_core::interpreter::RunCut>,
+    /// v0.6.47 (T1, A1): con etiquetas, el eco de los agentes (`[id] línea`) se retiene hasta el fin
+    /// de la corrida, como la salida del principal (`None` = en vivo).
+    held_echo: Option<Mutex<Vec<String>>>,
+    /// v0.6.47 (T1): lo mismo para el stderr del principal y de los agentes.
+    held_err: Option<Mutex<Vec<String>>>,
+    /// v0.6.47 (T1): bajo `serve` con etiquetas el eco y el stderr de los agentes no se escriben
+    /// (viven más que el request: no hay un fin de corrida donde soltarlos sin delatar cuál cortó).
+    drop_output: bool,
+    /// v0.6.47 (T1): lleva el diario por corrida del blackboard (serve con etiquetas).
+    journal_runs: bool,
 }
 
 impl Default for Swarm {
@@ -106,7 +125,80 @@ impl Swarm {
             }),
             cvar: Condvar::new(),
             threads: Mutex::new(Vec::new()),
+            run_cut: std::sync::Arc::new(synsema_core::interpreter::RunCut::default()),
+            held_echo: None,
+            held_err: None,
+            drop_output: false,
+            journal_runs: false,
         }
+    }
+
+    /// v0.6.47 (T1, A1): un swarm que retiene el eco de sus agentes (`run`/`test` con etiquetas).
+    pub fn holding_echo() -> Self {
+        let mut s = Self::new();
+        s.held_echo = Some(Mutex::new(Vec::new()));
+        s.held_err = Some(Mutex::new(Vec::new()));
+        s
+    }
+
+    /// v0.6.47 (T1): un swarm cuyos agentes no escriben eco ni stderr (`serve` con etiquetas).
+    pub fn dropping_output(mut self) -> Self {
+        self.drop_output = true;
+        self
+    }
+
+    /// v0.6.47 (T1): con etiquetas bajo `serve`, cada corrida (una entrada de `with_serve_interp`, con
+    /// sus agentes) se confirma o se deshace en el blackboard y la cola de señales. Bajo `run` no
+    /// hace falta: la corrida es el programa entero, no se cierra hasta el final, y desde un corte
+    /// todo sumidero de la corrida corta (nadie más lee el blackboard).
+    pub fn journaling_runs(mut self) -> Self {
+        self.journal_runs = true;
+        self
+    }
+
+    pub fn journals_runs(&self) -> bool {
+        self.journal_runs
+    }
+
+    /// ¿Descarta este swarm el eco y el stderr de sus agentes?
+    pub fn drops_output(&self) -> bool {
+        self.drop_output
+    }
+
+    /// ¿Retiene este swarm el eco y el stderr?
+    pub fn holds_output(&self) -> bool {
+        self.held_err.is_some()
+    }
+
+    /// Retiene una línea de stderr (no hace nada si el swarm no retiene).
+    pub fn hold_err(&self, line: String) {
+        if let Some(m) = &self.held_err {
+            m.lock().unwrap().push(line);
+        }
+    }
+
+    /// El stderr retenido (se vacía al leerlo).
+    pub fn take_err(&self) -> Vec<String> {
+        self.held_err.as_ref().map(|m| std::mem::take(&mut *m.lock().unwrap())).unwrap_or_default()
+    }
+
+    /// Retiene una línea de eco; `false` si el eco va en vivo.
+    pub fn hold_echo(&self, line: String) -> bool {
+        if self.drop_output {
+            return true;
+        }
+        match &self.held_echo {
+            Some(m) => {
+                m.lock().unwrap().push(line);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// El eco retenido (se vacía al leerlo).
+    pub fn take_echo(&self) -> Vec<String> {
+        self.held_echo.as_ref().map(|m| std::mem::take(&mut *m.lock().unwrap())).unwrap_or_default()
     }
 
     /// Registra un nuevo agente y devuelve su instance_id = "{name}_{N}" (N = nº de
@@ -123,6 +215,8 @@ impl Swarm {
                 started_at: now_secs(),
                 finished_at: 0.0,
                 cancel: CancelToken::new(),
+                labels_cut: None,
+                scope: None,
             },
         );
         id
@@ -162,6 +256,51 @@ impl Swarm {
         ids.iter().filter(|id| self.stop_agent(id, reason)).count()
     }
 
+    /// v0.6.47 (T1): anota la corrida dueña del agente (ver `AgentInfo::scope`).
+    pub fn set_agent_scope(&self, id: &str, scope: std::sync::Arc<synsema_core::interpreter::RunCut>) {
+        if let Some(a) = self.state.lock().unwrap().agents.get_mut(id) {
+            a.scope = Some(scope);
+        }
+    }
+
+    /// v0.6.47 (T1): el dueño de la corrida `scope` (la entrada de `serve`) la cierra. Con corte, lo
+    /// que dejó en el estado compartido del swarm y nadie tomó todavía se deshace: el blackboard (con
+    /// su diario) y las señales que siguen en cola. Lo ya entregado (una señal que alguien consumió,
+    /// un evento del bus) es el prefijo de efectos, como un `http_post` antes del corte.
+    pub fn close_run(&self, scope: &std::sync::Arc<synsema_core::interpreter::RunCut>, cut: bool) {
+        if self.blackboard.close_run(scope, cut) {
+            self.drop_signals_of(scope);
+        }
+    }
+
+    /// v0.6.47 (T1): se lanzó un agente de la corrida `scope` (ver `Blackboard::agent_started`).
+    pub fn agent_started(&self, scope: &std::sync::Arc<synsema_core::interpreter::RunCut>) {
+        self.blackboard.agent_started(scope);
+    }
+
+    /// v0.6.47 (T1): un agente de la corrida `scope` terminó (ver `Blackboard::agent_done`).
+    pub fn agent_done(&self, scope: &std::sync::Arc<synsema_core::interpreter::RunCut>, cut: bool) {
+        if self.blackboard.agent_done(scope, cut) {
+            self.drop_signals_of(scope);
+        }
+    }
+
+    fn drop_signals_of(&self, scope: &std::sync::Arc<synsema_core::interpreter::RunCut>) {
+        let mut g = self.state.lock().unwrap();
+        for q in g.pending.values_mut() {
+            q.retain(|(_, s)| !s.as_ref().is_some_and(|s| std::sync::Arc::ptr_eq(s, scope)));
+        }
+    }
+
+    /// ¿El agente es de la corrida `scope`? (`false` si no existe o si no tiene dueño anotado.)
+    pub fn in_scope(&self, id: &str, scope: &std::sync::Arc<synsema_core::interpreter::RunCut>) -> bool {
+        match self.state.lock().unwrap().agents.get(id) {
+            // Falla cerrado: un agente sin corrida no es de nadie.
+            Some(a) => a.scope.as_ref().is_some_and(|s| std::sync::Arc::ptr_eq(s, scope)),
+            None => false,
+        }
+    }
+
     /// Snapshot de todos los agentes (para `agents()`).
     pub fn agents_info(&self) -> Vec<(String, AgentInfo)> {
         self.state.lock().unwrap().agents.iter().map(|(id, a)| (id.clone(), a.clone())).collect()
@@ -188,6 +327,21 @@ impl Swarm {
         self.cvar.notify_all();
     }
 
+    /// v0.6.47 (T1, A1): el agente terminó cortado por etiquetas. Estado `Error` con el texto que ve
+    /// el programa, y SIN la señal `__agent_error`: quien espera señales no distingue este fin del
+    /// de un agente que terminó bien.
+    pub fn set_labels_cut(&self, id: &str, message: String, detail: String) {
+        {
+            let mut g = self.state.lock().unwrap();
+            if let Some(a) = g.agents.get_mut(id) {
+                a.state = AgentState::Error;
+                a.error = Some(message.clone());
+                a.labels_cut = Some((message, detail));
+            }
+        }
+        self.cvar.notify_all();
+    }
+
     pub fn set_finished(&self, id: &str) {
         let mut g = self.state.lock().unwrap();
         if let Some(a) = g.agents.get_mut(id) {
@@ -199,12 +353,12 @@ impl Swarm {
     pub fn signal(&self, name: &str, sender: &str, data: Option<SendValue>) {
         {
             let mut g = self.state.lock().unwrap();
-            g.pending.entry(name.to_string()).or_default().push_back(Signal {
-                name: name.to_string(),
-                sender: sender.to_string(),
-                data,
-                timestamp: now_secs(),
-            });
+            // v0.6.47 (T1): con la corrida del hilo, para sacarla de la cola si esa corrida se corta.
+            let scope = crate::blackboard::thread_scope();
+            g.pending.entry(name.to_string()).or_default().push_back((
+                Signal { name: name.to_string(), sender: sender.to_string(), data, timestamp: now_secs() },
+                scope,
+            ));
         }
         self.cvar.notify_all();
     }
@@ -229,7 +383,7 @@ impl Swarm {
         let mut g = self.state.lock().unwrap();
         loop {
             if let Some(q) = g.pending.get_mut(name) {
-                if let Some(sig) = q.pop_front() {
+                if let Some((sig, _)) = q.pop_front() {
                     g.history.push(sig.clone());
                     return Some(sig);
                 }

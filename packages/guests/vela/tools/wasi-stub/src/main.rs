@@ -3,18 +3,22 @@
 //! Vela `dev` (v0.3.0, `pkg/wasm/guest_imports.go`) rechaza al cargar cualquier módulo que
 //! DECLARE un import de `wasi_snapshot_preview1` fuera de una lista cerrada de ocho:
 //! `args_get`, `args_sizes_get`, `clock_time_get`, `environ_get`, `environ_sizes_get`, `fd_write`,
-//! `proc_exit`, `random_get`. El rechazo es por declarar, no por llamar. Nuestro guest declara 21:
-//! los 15 sobrantes (`fd_close`, `fd_fdstat_get`, `fd_filestat_get`, `fd_prestat_get`,
-//! `fd_prestat_dir_name`, `fd_read`, `fd_readdir`, `path_*` ×7, `poll_oneoff`) los enlaza `std::fs`
-//! desde el motor aunque el techo `stdout` (`no_fs: true`) impida que el programa los alcance.
+//! `proc_exit`, `random_get`. El rechazo es por declarar, no por llamar. Nuestro guest declara 23
+//! con rustc 1.99.1 (21 con 1.96.0): los 17 sobrantes (`fd_close`, `fd_fdstat_get`,
+//! `fd_filestat_get`, `fd_prestat_get`, `fd_prestat_dir_name`, `fd_read`, `fd_readdir`, `fd_seek`,
+//! `path_*` ×7, `poll_oneoff`, `sched_yield`) los enlaza el toolchain desde el motor aunque el techo
+//! `stdout` (`no_fs: true`) impida que el programa los alcance.
 //!
 //! Esta herramienta reemplaza cada import de función de `wasi_snapshot_preview1` que NO esté en la
 //! lista permitida por una función LOCAL del mismo tipo que devuelve `ERRNO_NOSYS` (52) — salvo
 //! `fd_prestat_get`, que devuelve `ERRNO_BADF` (8): es lo que hace parar limpio el escaneo de
-//! preopens de std al arrancar (un `NOSYS` ahí abortaría). El resto del módulo no se toca: mismas
-//! funciones, mismos data segments (el app slot de `tools/embed.syn` sigue siendo un tramo
-//! contiguo), misma memoria exportada. Falla si tras el proceso queda un import fuera de la lista
-//! o si el módulo importa algo de otro módulo que no sea WASI.
+//! preopens de std al arrancar (un `NOSYS` ahí abortaría); y `sched_yield`, que devuelve éxito
+//! (0): en un guest de un solo hilo no hay a quién ceder, así que "hecho" es la respuesta
+//! verdadera (y el `debug_assert_eq!(ret, 0)` de `std::thread::yield_now` no salta en debug).
+//! El resto del módulo no se toca: mismas funciones, mismos data segments (el app slot de
+//! `tools/embed.syn` sigue siendo un tramo contiguo), misma memoria exportada. Falla si tras el
+//! proceso queda un import fuera de la lista o si el módulo importa algo de otro módulo que no sea
+//! WASI.
 //!
 //!   wasi-stub <in.wasm> <out.wasm> [--allow a,b,c] [--errno-nosys 52]
 //!
@@ -47,6 +51,8 @@ pub const ERRNO_NOSYS: i32 = 52;
 /// `__WASI_ERRNO_BADF`: "bad file descriptor". `fd_prestat_get(fd)` devolviéndolo es cómo std
 /// (wasi-libc `__wasilibc_populate_preopens`) descubre que no hay más preopens y termina.
 pub const ERRNO_BADF: i32 = 8;
+/// `__WASI_ERRNO_SUCCESS`: lo que devuelve `sched_yield` (no hay otro hilo al que ceder).
+pub const ERRNO_SUCCESS: i32 = 0;
 
 /// Qué hizo el proceso, para el resumen y para los tests.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -91,7 +97,11 @@ pub fn stub(module: &mut Module, allow: &BTreeSet<String>, errno_nosys: i32) -> 
 
     let mut replaced = Vec::with_capacity(to_replace.len());
     for (fid, name) in to_replace {
-        let errno = if name == "fd_prestat_get" { ERRNO_BADF } else { errno_nosys };
+        let errno = match name.as_str() {
+            "fd_prestat_get" => ERRNO_BADF,
+            "sched_yield" => ERRNO_SUCCESS,
+            _ => errno_nosys,
+        };
         // Un stub devuelve el errno en cada resultado i32 de la firma; una firma sin resultado
         // (como `proc_exit`) queda como cuerpo vacío. Cualquier otra cosa no es una función de
         // WASI preview1 y es mejor fallar que inventar un valor.
@@ -217,7 +227,14 @@ fn run(opts: &Options) -> Result<(), String> {
         let list: Vec<String> = report
             .replaced
             .iter()
-            .map(|(n, e)| format!("{} -> {}({})", n, if *e == ERRNO_BADF { "EBADF" } else { "ENOSYS" }, e))
+            .map(|(n, e)| {
+                let what = match *e {
+                    ERRNO_BADF => "EBADF",
+                    ERRNO_SUCCESS => "SUCCESS",
+                    _ => "ENOSYS",
+                };
+                format!("{} -> {}({})", n, what, e)
+            })
             .collect();
         println!("  replaced ({}): {}", report.replaced.len(), list.join(", "));
     }
@@ -334,12 +351,23 @@ mod tests {
     }
 
     #[test]
+    fn sched_yield_returns_success_not_enosys() {
+        let wasm = module_with(&[(WASI_MODULE, "sched_yield"), (WASI_MODULE, "fd_write")]);
+        let mut m = module_config().parse(&wasm).unwrap();
+        let report = stub(&mut m, &allow_default(), ERRNO_NOSYS).unwrap();
+        // El valor del contrato (0), no la constante: cambiar `ERRNO_SUCCESS` tiene que romperlo.
+        assert_eq!(report.replaced, vec![("sched_yield".to_string(), 0)]);
+        assert_eq!(first_const_of(&m, "sched_yield"), Some(0));
+        validate(&m.emit_wasm());
+    }
+
+    #[test]
     fn fd_prestat_get_returns_ebadf_not_enosys() {
         let wasm = module_with(&[(WASI_MODULE, "fd_prestat_get"), (WASI_MODULE, "fd_write")]);
         let mut m = module_config().parse(&wasm).unwrap();
         let report = stub(&mut m, &allow_default(), ERRNO_NOSYS).unwrap();
-        assert_eq!(report.replaced, vec![("fd_prestat_get".to_string(), ERRNO_BADF)]);
-        assert_eq!(first_const_of(&m, "fd_prestat_get"), Some(ERRNO_BADF));
+        assert_eq!(report.replaced, vec![("fd_prestat_get".to_string(), 8)]);
+        assert_eq!(first_const_of(&m, "fd_prestat_get"), Some(8));
         validate(&m.emit_wasm());
     }
 

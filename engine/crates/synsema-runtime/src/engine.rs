@@ -11,7 +11,7 @@
 
 use synsema_core::types::SynMap;
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
@@ -32,7 +32,7 @@ use synsema_agents::memory::AgentMemory;
 use synsema_agents::progress::ProgressManager;
 use synsema_agents::swarm::{AgentState, Swarm};
 use synsema_capabilities::model::{
-    capability_type_from_name, Capability, CapabilitySet, CapabilityType,
+    capability_type_from_name, CapSet, Capability, CapabilitySet, CapabilityType,
 };
 use synsema_capabilities::secure::register_secure_builtins;
 use synsema_core::ast::Node;
@@ -537,6 +537,7 @@ pub(crate) fn wire_common_with_state(
     // etiquetas sería un agujero, no un knob.
     if crate::host::labels() {
         interp.set_labels(true);
+        interp.set_labels_detail_to_program(crate::host::labels_detail_to_program());
         // Todo builtin con EFECTO es un sumidero público. Un valor privado en
         // cualquiera de sus argumentos, o la llamada bajo una rama que dependió de datos privados,
         // Es `label_violation` ANTES de ejecutar el efecto (el archivo no se escribe, el socket no
@@ -819,7 +820,7 @@ pub(crate) fn wire_common_with_state(
     // al salir, restaura. Stack para sandboxes anidados. Cubre TODOS los builtins gateados
     // de una sola vez (leen el mismo CapabilitySet vía el `caps` Rc compartido).
     #[allow(clippy::type_complexity)]
-    let saved: Rc<RefCell<Vec<(HashSet<Capability>, HashSet<Capability>, Option<Rc<RefCell<CapabilitySet>>>)>>> =
+    let saved: Rc<RefCell<Vec<(CapSet, CapSet, Option<Rc<RefCell<CapabilitySet>>>)>>> =
         Rc::new(RefCell::new(Vec::new()));
     let caps_sb = caps.clone();
     interp.set_sandbox_hook(Rc::new(move |entering| {
@@ -841,7 +842,7 @@ pub(crate) fn wire_common_with_state(
     // sandbox-hook (stack para tools anidadas). Hace ENFORCED el `require` por-tool: una
     // tool no puede usar una capability que no declaró, aunque el agente la tenga.
     #[allow(clippy::type_complexity)]
-    let saved_tool: Rc<RefCell<Vec<(HashSet<Capability>, HashSet<Capability>, Option<Rc<RefCell<CapabilitySet>>>)>>> =
+    let saved_tool: Rc<RefCell<Vec<(CapSet, CapSet, Option<Rc<RefCell<CapabilitySet>>>)>>> =
         Rc::new(RefCell::new(Vec::new()));
     let caps_tool = caps.clone();
     interp.set_tool_scope_hook(Rc::new(move |entering, declared: &[(String, Option<String>)]| {
@@ -849,7 +850,7 @@ pub(crate) fn wire_common_with_state(
         if entering {
             // Las declaradas que el set ACTUAL (efectivo, incl. padre) ya satisface → la
             // tool no puede exceder al agente. `check` audita y camina la cadena de padres.
-            let mut allowed: HashSet<Capability> = HashSet::new();
+            let mut allowed: CapSet = CapSet::new();
             for (name, scope) in declared {
                 if let Some(ty) = capability_type_from_name(name) {
                     let cap = Capability::new(ty, scope.clone());
@@ -1413,6 +1414,11 @@ pub fn run_source_ceiled(source: &str, filename: &str, ceiling: Option<Vec<Capab
 /// Recolecta los agentes que terminaron en ERROR como líneas legibles
 /// `Agent error [<id>]: <msg>` (para reflejarlos en el exit code + stderr de `run`).
 fn collect_agent_errors(swarm: &Swarm) -> Vec<String> {
+    // v0.6.47 (T1, A1): con un corte de etiquetas de un agente no se lista ninguno: el id del que
+    // se cortó es el dato (lo cierra `close_swarm_run`).
+    if swarm.run_cut.get().is_some() {
+        return Vec::new();
+    }
     swarm
         .agent_states()
         .into_iter()
@@ -1422,6 +1428,38 @@ fn collect_agent_errors(swarm: &Swarm) -> Vec<String> {
             format!("Agent error [{}]: {}", id, msg)
         })
         .collect()
+}
+
+/// v0.6.47 (T1, A1): el swarm de una corrida de `run`/`test`. Con etiquetas retiene el eco de los
+/// agentes hasta el fin (`close_swarm_run`).
+fn run_swarm() -> Swarm {
+    if crate::host::labels() {
+        Swarm::holding_echo()
+    } else {
+        Swarm::new()
+    }
+}
+
+/// v0.6.47 (T1, A1): el cierre de una corrida con agentes, después de `wait_all`. Si un agente se
+/// cortó por etiquetas, la corrida entera termina con ese corte: la salida retenida (la del
+/// principal y el eco de los agentes) no se entrega, no se lista qué agente falló y el código de
+/// salida es el de un corte. Si no, el eco retenido sale antes que la salida del principal.
+fn close_swarm_run(swarm: &Swarm, result: &mut RunResult) {
+    let echo = swarm.take_echo();
+    let err = swarm.take_err();
+    if let Some((message, _)) = swarm.run_cut.get() {
+        result.success = false;
+        result.output = vec![synsema_core::interpreter::LABELS_WITHHELD_OUTPUT.to_string()];
+        result.errors = vec![format!("Runtime error: {}", message)];
+        LAST_RUN_EXIT.store(-1, std::sync::atomic::Ordering::SeqCst);
+        return;
+    }
+    if !echo.is_empty() {
+        result.output.splice(0..0, echo);
+    }
+    if !err.is_empty() {
+        synsema_core::interpreter::write_stderr_lines(&err);
+    }
 }
 
 pub fn run_program(source: &str, filename: &str) -> RunResult {
@@ -1444,7 +1482,7 @@ pub fn run_program_ceiled_opts(
     ceiling: Option<Vec<Capability>>,
     live_output: bool,
 ) -> RunResult {
-    let swarm = Arc::new(Swarm::new());
+    let swarm = Arc::new(run_swarm());
     let sw = swarm.clone();
     let src = source.to_string();
     let fname = filename.to_string();
@@ -1482,6 +1520,7 @@ pub fn run_program_ceiled_opts(
         result.success = false;
         result.errors.extend(agent_errors);
     }
+    close_swarm_run(&swarm, &mut result);
     result
 }
 
@@ -1531,7 +1570,7 @@ fn run_tests_inner(source: &str, filename: &str, ceiling: Option<Vec<Capability>
     // `agents()`/`agent_stop` existen, el bus es el del swarm. Al terminar cada bloque
     // `test` se joinean sus agentes y un agente en ERROR hace fallar ESE test — un
     // programa con agentes se prueba con `synsema test`, sin scripts externos.
-    let swarm = Arc::new(Swarm::new());
+    let swarm = Arc::new(run_swarm());
     let ceiling_arc: Option<Arc<Vec<Capability>>> = ceiling.as_ref().map(|c| Arc::new(c.clone()));
     wire_swarm_hooks(&mut interp, swarm.clone(), "main", ceiling_arc, mem_ctx.clone(), None, &caps);
     let mut reported: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -1553,7 +1592,16 @@ fn run_tests_inner(source: &str, filename: &str, ceiling: Option<Vec<Capability>
     let outcomes = interp.run_test_blocks_with(&program, &mut after_each);
     let passed = outcomes.iter().filter(|o| o.passed).count();
     let failed = outcomes.len() - passed;
-    TestReport { outcomes, passed, failed, output: std::mem::take(&mut interp.output) }
+    // v0.6.47 (T1, A1): el eco retenido de los agentes, salvo que la corrida se haya cortado.
+    let mut output = swarm.take_echo();
+    let err = swarm.take_err();
+    if swarm.run_cut.get().is_some() {
+        output.clear();
+    } else if !err.is_empty() {
+        synsema_core::interpreter::write_stderr_lines(&err);
+    }
+    output.append(&mut interp.output);
+    TestReport { outcomes, passed, failed, output }
 }
 
 /// Corre los bloques `test` de un archivo en un hilo con stack grande (como `spawn_run`).
@@ -1753,7 +1801,7 @@ pub fn run_with_diagnostics(source: &str, filename: &str) -> DiagRun {
 /// Como `run_with_diagnostics` pero con un techo de capabilities del host
 /// (`--sandbox`/`--cap-set`): el main y sus agentes jamás exceden `ceiling`.
 pub fn run_with_diagnostics_ceiled(source: &str, filename: &str, ceiling: Option<Vec<Capability>>) -> DiagRun {
-    let swarm = Arc::new(Swarm::new());
+    let swarm = Arc::new(run_swarm());
     let sw = swarm.clone();
     let src = source.to_string();
     let fname = filename.to_string();
@@ -1773,6 +1821,11 @@ pub fn run_with_diagnostics_ceiled(source: &str, filename: &str, ceiling: Option
         run.result.success = false;
         run.result.errors.extend(agent_errors);
     }
+    if swarm.run_cut.get().is_some() {
+        // El diagnóstico rico es el del main; con el corte de un agente, el del corte (el texto).
+        run.diagnostics.clear();
+    }
+    close_swarm_run(&swarm, &mut run.result);
     run
 }
 
@@ -1999,21 +2052,43 @@ pub(crate) fn wire_swarm_hooks(
     caps: &Rc<RefCell<CapabilitySet>>,
 ) {
     let name = agent_name.to_string();
+    // v0.6.47 (T1, A1): el principal comparte el corte de la corrida del swarm; cada agente adopta
+    // el del que lo lanzó (`spawn_agent`).
+    if agent_name == "main" {
+        interp.set_run_cut(swarm.run_cut.clone());
+    }
+    // v0.6.47 (T1): con etiquetas, el stderr del principal y de cada agente se junta en el swarm y
+    // sale al cierre de la corrida (`close_swarm_run`), sólo si no hubo corte.
+    if swarm.holds_output() {
+        let sw = swarm.clone();
+        interp.err_hook = Some(Arc::new(move |line: &str| sw.hold_err(line.to_string())));
+    }
     // Bus de eventos del proceso: `bus_*`/`select` del hub de I/O publican y suscriben
     // contra el MISMO bus que agentes, cron y handlers (vive en el swarm).
     synsema_stdlib::ws::attach_bus(interp, swarm.bus.clone());
     // Observabilidad de agentes desde el lenguaje: `agents()` (snapshot de estados) y
     // `agent_stop(id)` (cancelación cooperativa). Sin capability: introspección del
-    // propio proceso.
+    // propio proceso, acotada a la corrida (v0.6.47).
     {
         let sw = swarm.clone();
         interp.register_builtin(
             "agents",
             0,
-            Rc::new(move |_i, _args, _loc| {
+            Rc::new(move |i, _args, _loc| {
                 use synsema_core::types::{syn_map, syn_number, syn_text};
-                let items: Vec<SynValue> = sw
-                    .agents_info()
+                // v0.6.47 (T1): cada corrida ve sólo sus agentes (los que lanzó ella o sus agentes):
+                // bajo `serve`, un request no ve ni frena los de otro request u otro usuario.
+                let mine = i.run_cut();
+                let mut info = sw.agents_info();
+                info.retain(|(_, a)| a.scope.as_ref().is_some_and(|s| Arc::ptr_eq(s, &mine)));
+                // v0.6.47 (T1, A1): el estado de un agente cortado por etiquetas lo eligió el dato
+                // privado. Quien lo mira adopta el corte.
+                if i.labels_enabled() {
+                    if let Some((m, d)) = info.iter().find_map(|(_, a)| a.labels_cut.as_ref()) {
+                        return Err(i.adopt_run_cut(m, d));
+                    }
+                }
+                let items: Vec<SynValue> = info
                     .into_iter()
                     .map(|(id, a)| {
                         let mut m = SynMap::new();
@@ -2038,7 +2113,7 @@ pub(crate) fn wire_swarm_hooks(
         interp.register_builtin(
             "agent_stop",
             -1,
-            Rc::new(move |_i, args, _loc| {
+            Rc::new(move |i, args, _loc| {
                 let id = match args.first() {
                     Some(SynValue::Text(s)) => s.to_string(),
                     Some(other) => {
@@ -2053,7 +2128,9 @@ pub(crate) fn wire_swarm_hooks(
                     Some(SynValue::Text(s)) => s.to_string(),
                     _ => "stopped by agent_stop".to_string(),
                 };
-                Ok(synsema_core::types::syn_bool(sw.stop_agent(&id, &reason)))
+                // v0.6.47 (T1): sólo un agente de la propia corrida; uno ajeno es como uno que no
+                // existe (`false`).
+                Ok(synsema_core::types::syn_bool(sw.in_scope(&id, &i.run_cut()) && sw.stop_agent(&id, &reason)))
             }),
         );
     }
@@ -2121,7 +2198,8 @@ pub(crate) fn wire_swarm_hooks(
             };
             // v0.6.45 (A1): el agente usa los mismos providers que el que lo spawnea.
             let wired = providers.borrow().clone();
-            Ok(spawn_agent(sw.clone(), agent.to_string(), body, send_args, global_snap, ceiling.clone(), mem.clone(), builder.clone(), subject, wired))
+            let cut = SpawnCut { run_cut: spawn_subject.run_cut, principals: spawn_subject.principals };
+            Ok(spawn_agent(sw.clone(), agent.to_string(), body, send_args, global_snap, ceiling.clone(), mem.clone(), builder.clone(), subject, wired, cut))
         })
     };
 
@@ -2157,11 +2235,17 @@ fn setup_swarm_interpreter(
         }
     }
     // Propaga el techo (y el ctx de memoria) a los sub-agentes que este agente spawnee.
+    let echo = swarm.clone();
     wire_swarm_hooks(&mut interp, swarm, agent_name, ceiling, mem, None, &caps);
     let name = agent_name.to_string();
     // El hook del agente es un destino (lleva su prefijo), no un observador como el de `run --labels`.
     interp.log_hook_observes_only = false;
     interp.log_hook = Some(Arc::new(move |line: &str| {
+        // v0.6.47 (T1, A1): con etiquetas (`run`/`test`), el eco se retiene como la salida del
+        // principal; si un agente vivo se delatara en vivo, cuál falta sería el dato.
+        if echo.hold_echo(format!("[{}] {}", name, line)) {
+            return;
+        }
         // `conform` exige stdout = SOLO el JSON final: bajo ese modo el eco vivo
         // ([main]/[agente]) va a stderr (sigue siendo visible, no rompe el parse).
         if AGENT_ECHO_TO_STDERR.load(std::sync::atomic::Ordering::Relaxed) {
@@ -2193,8 +2277,21 @@ fn spawn_agent(
     builder: Option<InterpBuilder>,
     subject: crate::subject::Subject,
     providers: WiredProviders,
+    cut: SpawnCut,
 ) -> String {
     let instance_id = swarm.register_new_agent(&agent_name);
+    if let Some(c) = &cut.run_cut {
+        swarm.set_agent_scope(&instance_id, c.clone());
+    }
+    // v0.6.47 (T1): bajo `serve` con etiquetas el agente cuenta como vivo en su corrida desde acá (en
+    // el hilo que lanza, antes de crear el suyo): la corrida no se confirma mientras viva.
+    let journal = if swarm.journals_runs() { cut.run_cut.clone() } else { None };
+    if let Some(s) = &journal {
+        swarm.agent_started(s);
+    }
+    // El `-1`: se arma acá y se mueve al hilo, así resta también si el hilo no se llega a crear (el
+    // closure se suelta) o entra en pánico; si no, la corrida no se confirmaría nunca.
+    let mut live = journal.clone().map(|scope| AgentLive { sw: swarm.clone(), scope, cut: false });
     let sw = swarm.clone();
     let id = instance_id.clone();
     // v0.6.46 (E6): el agente escribe en el registro sellado de la corrida que lo lanzó.
@@ -2211,6 +2308,12 @@ fn spawn_agent(
                 Some(b) => {
                     let (mut interp, caps) = b();
                     wire_swarm_hooks(&mut interp, sw.clone(), &id, ceiling.clone(), mem.clone(), Some(b.clone()), &caps);
+                    // v0.6.47 (T1): con etiquetas, la salida de un agente de serve no se escribe
+                    // (ver `Swarm::dropping_output`).
+                    if sw.drops_output() {
+                        interp.log_hook = Some(Arc::new(|_: &str| {}));
+                        interp.err_hook = Some(Arc::new(|_: &str| {}));
+                    }
                     (interp, caps)
                 }
                 // Bajo serve el builder ya cablea los providers; sin builder (`run`), los del
@@ -2232,6 +2335,14 @@ fn spawn_agent(
             // del agente es su NOMBRE declarado (no el instance_id — `from = "writer"`
             // debe cruzar a ese namespace sin adivinar sufijos de instancia).
             interp.set_agent_context(&agent_name);
+            // v0.6.47 (T1, A1/N3): el corte de la corrida que lo lanzó, y sus principales declarados
+            // (el texto fijo de un corte del agente es el mismo que el de la corrida).
+            if let Some(c) = cut.run_cut {
+                interp.set_run_cut(c);
+            }
+            for p in &cut.principals {
+                interp.register_label_principal(p);
+            }
             // Restaurar tareas y valores del top-level para que el agente
             // los pueda llamar directamente sin necesitar HTTP.
             let registry = rebuild_globals(&mut interp, &globals, None);
@@ -2242,12 +2353,38 @@ fn spawn_agent(
                 interp.set_global(k, from_send(v));
             }
             sw.set_state(&id, AgentState::Working);
-            match interp.run_block(&body) {
+            // v0.6.47 (T1): lo que el agente escribe en el blackboard va al diario de su corrida, que se
+            // confirma entera cuando termina entera (`specs/t1-diario-modelo.md`).
+            synsema_agents::blackboard::set_thread_scope(journal.clone());
+            let result = interp.run_block(&body);
+            // v0.6.47 (T1, A1; ronda 10, B1): un corte de etiquetas no queda contenido. Se anota en el
+            // corte de la corrida ANTES de avisar al diario: desde ahí todo sumidero de la corrida
+            // corta, así ninguna otra parte escribe entre el deshacer y el corte.
+            let labels_cut = match &result {
+                Err(Control::Error(e)) if !interp.is_cancelled() && interp.labels_enabled() && e.is_fatal_for_labels() => {
+                    let message = if interp.labels_detail_to_program() { format!("agent {}: {}", id, e) } else { e.message.clone() };
+                    let detail = e.operator_detail.clone().unwrap_or_else(|| format!("agent {}: {}", id, e));
+                    interp.run_cut().set(message.clone(), detail.clone());
+                    Some((message, detail))
+                }
+                _ => None,
+            };
+            if let Some(g) = live.as_mut() {
+                g.cut = matches!(&result, Err(Control::Error(e)) if e.is_fatal_for_labels());
+            }
+            drop(live);
+            synsema_agents::blackboard::set_thread_scope(None);
+            match result {
                 Ok(_) => sw.set_state(&id, AgentState::Done),
                 // Cancelado cooperativamente (agent_stop/shutdown): estado STOPPED, no
                 // ERROR — parar un agente no es una falla del agente.
                 Err(Control::Error(_)) if interp.is_cancelled() => {
                     sw.set_state(&id, AgentState::Stopped);
+                }
+                // El corte ya se anotó arriba; cambia el estado, sin la señal `__agent_error`.
+                Err(Control::Error(_)) if labels_cut.is_some() => {
+                    let (message, detail) = labels_cut.expect("corte de etiquetas");
+                    sw.set_labels_cut(&id, message, detail);
                 }
                 Err(Control::Error(e)) => {
                     sw.set_error(&id, e.to_string());
@@ -2263,6 +2400,26 @@ fn spawn_agent(
         .expect("no se pudo crear el hilo del agente");
     swarm.add_thread(handle);
     instance_id
+}
+
+/// v0.6.47 (T1): el agente vivo en su corrida; al soltarse avisa que terminó (con corte si lo cortaron
+/// o si su corrida ya estaba cortada).
+struct AgentLive {
+    sw: Arc<Swarm>,
+    scope: Arc<synsema_core::interpreter::RunCut>,
+    cut: bool,
+}
+
+impl Drop for AgentLive {
+    fn drop(&mut self) {
+        self.sw.agent_done(&self.scope, self.cut || self.scope.get().is_some() || std::thread::panicking());
+    }
+}
+
+/// v0.6.47 (T1, A1/N3): lo que el agente hereda de la corrida que lo lanza para los cortes de etiquetas.
+struct SpawnCut {
+    run_cut: Option<Arc<synsema_core::interpreter::RunCut>>,
+    principals: Vec<String>,
 }
 
 fn agent_state_str(s: AgentState) -> &'static str {
@@ -2333,7 +2490,7 @@ impl Default for Engine {
 
 impl Engine {
     pub fn new() -> Self {
-        Self { swarm: Arc::new(Swarm::new()) }
+        Self { swarm: Arc::new(run_swarm()) }
     }
 
     /// Corre el programa (con swarm cableado) en un hilo con stack grande. Los hilos
@@ -2378,8 +2535,14 @@ pub fn run_swarm_dump(source: &str, filename: &str) -> SwarmDump {
 /// Como `run_swarm_dump` pero con el techo del host (`conform --swarm --sandbox/--cap-set`).
 pub fn run_swarm_dump_ceiled(source: &str, filename: &str, ceiling: Option<Vec<Capability>>) -> SwarmDump {
     let engine = Engine::new();
-    let result = engine.run_ceiled(source, filename, ceiling);
+    let mut result = engine.run_ceiled(source, filename, ceiling);
     engine.swarm.wait_all();
+    // v0.6.47 (T1, A1): el volcado pasa por el mismo cierre que `run`. Con un corte no se vuelcan
+    // los estados ni el blackboard: qué agente cortó (y qué escribió antes) es el dato.
+    close_swarm_run(&engine.swarm, &mut result);
+    if engine.swarm.run_cut.get().is_some() {
+        return SwarmDump { result, blackboard: Vec::new(), agents: Vec::new() };
+    }
     let blackboard: Vec<(String, String)> = engine
         .swarm
         .blackboard

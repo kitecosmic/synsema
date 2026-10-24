@@ -161,6 +161,10 @@ export interface RunResult {
   declassify?: unknown[];
   /** Con `labels`: si algún valor privado pasó por la corrida (entonces `steps` no se publica). */
   private_seen?: boolean;
+  /** v0.6.47 — con `labels`, si un corte de etiquetas paró la corrida: qué falló, dónde y cómo arreglarlo. Es
+   * del operador: el programa (y el cliente) ven en `errors` un texto fijo, porque cuál sitio cortó lo eligió el
+   * dato privado. No se lo devuelvas al modelo ni al cliente. */
+  operator_detail?: string;
 }
 
 export interface TestResult {
@@ -197,6 +201,10 @@ export interface HandleResult {
   /** Errores de preparación del programa (parse/top-level); el status es 500. */
   errors: string[];
   audit: AuditEntry[];
+  /** v0.6.47 — con `labels`, si un corte de etiquetas paró la corrida: qué falló, dónde y cómo arreglarlo. Es
+   * del operador: el programa (y el cliente) ven en `errors` un texto fijo, porque cuál sitio cortó lo eligió el
+   * dato privado. No se lo devuelvas al modelo ni al cliente. */
+  operator_detail?: string;
 }
 
 export type ModuleSource = WebAssembly.Module | Uint8Array | ArrayBuffer | URL | string | Response;

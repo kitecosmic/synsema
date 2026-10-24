@@ -30,7 +30,7 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master 2026-09-12; toolchain pinned below and in rust-toolchain.toml
         with:
-          toolchain: "1.96.0"
+          toolchain: "1.99.1"
       - name: Cache cargo
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
@@ -58,7 +58,7 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master 2026-09-12; toolchain pinned below and in rust-toolchain.toml
         with:
-          toolchain: "1.96.0"
+          toolchain: "1.99.1"
       - name: Cache cargo
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
@@ -105,7 +105,7 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master 2026-09-12; toolchain pinned below and in rust-toolchain.toml
         with:
-          toolchain: "1.96.0"
+          toolchain: "1.99.1"
       - name: Cache cargo
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
@@ -166,7 +166,7 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master 2026-09-12; toolchain pinned below and in rust-toolchain.toml
         with:
-          toolchain: "1.96.0"
+          toolchain: "1.99.1"
           targets: wasm32-wasip1
       - name: Cache cargo
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
@@ -275,7 +275,7 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master 2026-09-12; toolchain pinned below and in rust-toolchain.toml
         with:
-          toolchain: "1.96.0"
+          toolchain: "1.99.1"
           targets: wasm32-unknown-unknown
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
@@ -326,7 +326,7 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master 2026-09-12; toolchain pinned below and in rust-toolchain.toml
         with:
-          toolchain: "1.96.0"
+          toolchain: "1.99.1"
           targets: wasm32-wasip1
       # Node 20 o >= 24 para la sonda WASI: Node 22.x (V8 12.4) segfaultea de forma intermitente al
       # correr este módulo (carrera del tier-up concurrente Liftoff->TurboFan; reproducido con 22.23.2
@@ -370,11 +370,12 @@ jobs:
         # cdylib nativo en packages/guests/vela/target y la sonda no encuentra el .wasm).
         run: cargo build --locked --manifest-path packages/guests/vela/Cargo.toml --profile wasm --target wasm32-wasip1 --target-dir engine/target
       # Vela v0.3.0 (pkg/wasm/guest_imports.go) refuses at load any module that DECLARES a WASI import
-      # outside a closed set of eight. Rust's std links fd_*/path_*/poll_oneoff through std::fs even
+      # outside a closed set of eight. Rust's std links fd_*/path_*/poll_oneoff/sched_yield even
       # though the `stdout` ceiling (no_fs) never reaches them, so the built module is post-processed:
       # tools/wasi-stub replaces every import outside the set by a local stub returning ENOSYS
-      # (fd_prestat_get: EBADF, which ends std's preopen scan cleanly). From here on EVERY probe runs
-      # on the stubbed module — it is what the release publishes and what a kit embeds its app into.
+      # (fd_prestat_get: EBADF, which ends std's preopen scan cleanly; sched_yield: 0, nothing to
+      # yield to in one thread). From here on EVERY probe runs on the stubbed module — it is what
+      # the release publishes and what a kit embeds its app into.
       # The tool runs from the repo root on purpose: the guest's .cargo/config.toml would otherwise
       # cross-compile the tool itself to wasm32-wasip1.
       - name: Stub the WASI imports Vela v0.3.0 refuses (tools/wasi-stub)
@@ -422,7 +423,7 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master 2026-09-12; toolchain pinned below and in rust-toolchain.toml
         with:
-          toolchain: "1.96.0"
+          toolchain: "1.99.1"
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: "22"
@@ -465,7 +466,7 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master 2026-09-12; toolchain pinned below and in rust-toolchain.toml
         with:
-          toolchain: "1.96.0"
+          toolchain: "1.99.1"
       - name: Install cargo-audit
         run: cargo install cargo-audit --version 0.22.2 --locked
       - name: Audit
@@ -504,7 +505,7 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master 2026-09-12; toolchain pinned below and in rust-toolchain.toml
         with:
-          toolchain: "1.96.0"
+          toolchain: "1.99.1"
       - name: Cache cargo
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:

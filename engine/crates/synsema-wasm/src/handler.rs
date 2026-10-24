@@ -28,7 +28,7 @@ use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use indexmap::IndexMap;
-use synsema_capabilities::model::{Capability, CapabilitySet, CapabilityType};
+use synsema_capabilities::model::{CapSet, Capability, CapabilitySet, CapabilityType};
 use synsema_core::ast::{Node, NodeKind};
 use synsema_core::interpreter::{Control, Environment, Interpreter, RuntimeError};
 use synsema_core::parser::parse_source;
@@ -67,6 +67,9 @@ pub struct HandleReport {
     /// entonces un 500 genérico y acá está el porqué.
     pub errors: Vec<String>,
     pub audit: Vec<AuditEntry>,
+    /// v0.6.47 (T1): si un corte de etiquetas mató la request, su diagnóstico entero, para el
+    /// operador. La respuesta lleva el texto fijo (ver `synsema_wasm::Report::operator_detail`).
+    pub operator_detail: Option<String>,
 }
 
 struct RouteEntry {
@@ -92,7 +95,7 @@ struct App {
     captured: Rc<RefCell<Option<Captured>>>,
     /// Caps concedidas al terminar el top-level: cada request arranca de acá (como el
     /// snapshot de caps por worker del serve nativo).
-    granted: HashSet<Capability>,
+    granted: CapSet,
     /// Globales al terminar el top-level (copia PROFUNDA de listas/mapas): cada request
     /// corre sobre este snapshot — un `set` sobre un global dentro de un handler NO
     /// persiste al request siguiente, exactamente como en el serve nativo (serve.md:
@@ -101,6 +104,9 @@ struct App {
     globals: Vec<(String, SynValue)>,
     /// Agentes definidos en el top-level (`reset_for_request` los borra; vuelven de acá).
     agents: HashMap<String, (std::sync::Arc<[Node]>, Rc<RefCell<Environment>>)>,
+    /// v0.6.47 (T1): el diagnóstico de un corte de etiquetas de la request en curso, para el
+    /// operador (`HandleReport::operator_detail`). El cliente recibe el texto fijo.
+    operator_detail: Option<String>,
 }
 
 /// Copia profunda de los contenedores mutables (List/Map); el resto (números, texto,
@@ -326,8 +332,21 @@ fn prepare_app(source: &str, opts: &RunOptions) -> Result<(), Vec<String>> {
     // v0.6.46 (ronda 2 de cf1, N8): lo que leyó y escribió el top-level no es del primer request
     // (los siguientes ya arrancan vacíos por `reset_for_request`). Como el worker de `serve`.
     let _ = interp.take_lineage();
-    APP.with(|a| *a.borrow_mut() = Some(App { key, interp, caps, captured, granted, globals, agents }));
+    APP.with(|a| *a.borrow_mut() = Some(App { key, interp, caps, captured, granted, globals, agents, operator_detail: None }));
     Ok(())
+}
+
+thread_local! {
+    /// v0.6.47 (T1, ronda 7): el corte de la página de `errors with` de este request (su task se
+    /// cortó, o devolvió algo que la respuesta rechaza). Como en serve, deja el log en la línea fija;
+    /// el detalle va al operador. `handle` lo junta con `operator_detail`.
+    static ERROR_PAGE_CUT: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+fn error_page_cut(detail: String) {
+    ERROR_PAGE_CUT.with(|c| {
+        c.borrow_mut().get_or_insert(detail);
+    });
 }
 
 /// `errors with`: la task da forma al BODY del error; el STATUS se conserva (salvo
@@ -342,11 +361,21 @@ fn custom_error(
 ) -> Option<(u16, ResponseBody, Vec<(String, String)>)> {
     let genv = interp.global_env.clone();
     let task = interp.eval(handler, &genv).ok()?;
-    let v = interp
-        .call_task(task, vec![syn_int(i64::from(status)), syn_text(message), build_request_syn(ctx)])
-        .ok()?;
+    let v = match interp.call_task(task, vec![syn_int(i64::from(status)), syn_text(message), build_request_syn(ctx)]) {
+        Ok(v) => v,
+        Err(Control::Error(e)) if interp.labels_enabled() && e.is_fatal_for_labels() => {
+            error_page_cut(e.operator_detail.clone().unwrap_or_else(|| e.to_string()));
+            return None;
+        }
+        Err(_) => return None,
+    };
     if matches!(v, SynValue::Nothing) {
         return None;
+    }
+    if interp.labels_enabled() {
+        if let Err(e) = synsema_core::labels::check_flow(&v, &[], "response") {
+            error_page_cut(e.to_string());
+        }
     }
     let mut hdrs: Vec<(String, String)> = Vec::new();
     let v = match v {
@@ -552,18 +581,33 @@ fn dispatch(app: &mut App, req: &HttpRequestIn) -> (HttpResponseOut, Vec<String>
         let delegations: Vec<_> = ctx.user.as_ref().and_then(delegation_of).into_iter().collect();
         app.caps.borrow_mut().set_delegations(delegations);
     }
+    // v0.6.47 (T1): cada request es su propia corrida, con su propio corte (el intérprete se reusa).
+    app.interp.set_run_cut(std::sync::Arc::new(synsema_core::interpreter::RunCut::default()));
     let outcome = match app.interp.run_request_block(&route.body, request_bindings(&ctx)) {
         Ok(_) => GiveOutcome::Give(None),
-        Err(Control::Give(v)) => GiveOutcome::Give(Some(v)),
-        Err(Control::Error(e)) if e.is_validation => {
+        Err(Control::Give(v)) => {
+            // v0.6.47 (T1): como serve, la respuesta que las etiquetas van a rechazar es un corte: el
+            // log es la línea fija y el detalle va al operador.
+            if app.interp.labels_enabled() {
+                if let Err(e) = synsema_core::labels::check_flow(&v, &[], "response") {
+                    app.operator_detail = Some(e.to_string());
+                }
+            }
+            GiveOutcome::Give(Some(v))
+        }
+        // v0.6.47 (T1): un corte de etiquetas es siempre el 500 fijo (ver `run_route` en serve).
+        Err(Control::Error(e)) if e.is_validation && !e.is_fatal_for_labels() => {
             GiveOutcome::Validation { message: e.message.clone(), field: e.field.clone() }
         }
-        Err(Control::Error(e)) if e.denied_by_token => GiveOutcome::Forbidden(e.to_string()),
+        Err(Control::Error(e)) if e.denied_by_token && !e.is_fatal_for_labels() => GiveOutcome::Forbidden(e.to_string()),
         // v0.6.42 — `proxy to` necesita el transporte del server nativo.
         Err(Control::Error(e)) if e.proxy.is_some() => {
             GiveOutcome::Error("proxy to is not available in an embedded handler (it needs the native serve)".to_string())
         }
-        Err(Control::Error(e)) => GiveOutcome::Error(e.to_string()),
+        Err(Control::Error(e)) => {
+            app.operator_detail = e.operator_detail.clone();
+            GiveOutcome::Error(e.to_string())
+        }
         Err(Control::Stop(_)) => GiveOutcome::Error("'give'/'stop' used outside of a task or loop".to_string()),
     };
     let mut custom_headers: Vec<(String, String)> = Vec::new();
@@ -601,6 +645,8 @@ fn dispatch(app: &mut App, req: &HttpRequestIn) -> (HttpResponseOut, Vec<String>
             } else {
                 match build_response(v.as_ref(), &ctx.query) {
                     Ok(sb) => sb,
+                    // v0.6.47 (T1, B1): el cliente ve el texto fijo; qué campo era privado ya quedó
+                    // para el operador al recibir el `give`.
                     Err(e) => shape_500(&mut app.interp, &e, &ctx, &mut custom_headers),
                 }
             }
@@ -644,19 +690,29 @@ fn dispatch(app: &mut App, req: &HttpRequestIn) -> (HttpResponseOut, Vec<String>
 pub fn handle(source: &str, opts: &RunOptions, req: &HttpRequestIn) -> HandleReport {
     if let Err(errors) = prepare_app(source, opts) {
         let (st, body) = json_err(500, "the program could not be prepared (see errors)");
-        return HandleReport { response: finalize(st, body, Vec::new()), log: Vec::new(), errors, audit: Vec::new() };
+        return HandleReport { response: finalize(st, body, Vec::new()), log: Vec::new(), errors, audit: Vec::new(), operator_detail: None };
     }
     APP.with(|a| {
         let mut guard = a.borrow_mut();
         let app = guard.as_mut().expect("prepared");
         // v0.6.45 (D2): los límites valen en CADA request (el reset del anterior apagó la bandera).
         crate::arm_limits(&mut app.interp, opts);
-        let (response, log) = dispatch(app, req);
+        app.operator_detail = None;
+        ERROR_PAGE_CUT.with(|c| c.borrow_mut().take());
+        let (response, mut log) = dispatch(app, req);
+        let page_cut = ERROR_PAGE_CUT.with(|c| c.borrow_mut().take());
+        let operator_detail = app.operator_detail.take().or(page_cut);
+        // v0.6.47 (T1): un corte de etiquetas (del motor o de la respuesta) deja el log en la línea
+        // fija. El rechazo de la respuesta viene después de un bloque que terminó bien: si su log
+        // saliera entero y el del corte no, cuál de los dos fue lo diría el log.
+        if operator_detail.is_some() {
+            log = vec![synsema_core::interpreter::LABELS_WITHHELD_OUTPUT.to_string()];
+        }
         crate::disarm_limits();
         let audit = export_audit(&app.caps);
         // Aislamiento entre requests (como `with_serve_interp`): el próximo request
         // arranca del estado post-top-level, no del que dejó este handler.
         restore_after_request(app);
-        HandleReport { response, log, errors: Vec::new(), audit }
+        HandleReport { response, log, errors: Vec::new(), audit, operator_detail }
     })
 }

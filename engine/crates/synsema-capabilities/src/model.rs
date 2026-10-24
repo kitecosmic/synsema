@@ -4,12 +4,13 @@
 //! seguridad: cero acceso por defecto, grants explícitos y con scope, auditados.
 
 use std::cell::RefCell;
-use std::collections::HashSet;
+use std::cmp::Ordering;
+use std::collections::BTreeSet;
 use std::fmt;
 use std::rc::Rc;
 
-/// Categorías de capability.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+/// Categorías de capability. El orden de declaración es el desempate fijo de `Capability::cmp`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum CapabilityType {
     Net,
     FileRead,
@@ -273,6 +274,107 @@ pub struct Capability {
     pub scope: Option<String>,
 }
 
+/// v0.6.47 (T2): los grants y denies de un set, en su orden canónico (`Capability::cmp`). Con un
+/// `HashSet`, cuando dos grants cubrían lo mismo el audit nombraba uno al azar (la semilla del hash
+/// cambia por corrida): esa diferencia la elegía la corrida, no el programa.
+pub type CapSet = BTreeSet<Capability>;
+
+impl Capability {
+    /// La familia del tipo: los tipos que pueden cubrirse entre sí (sólo `file` cubre a `file.read`
+    /// y `file.write`; ver `covers_by_name`).
+    fn family(ty: CapabilityType) -> CapabilityType {
+        match ty {
+            CapabilityType::FileRead | CapabilityType::FileWrite => CapabilityType::File,
+            t => t,
+        }
+    }
+
+    /// Los tipos donde un grant con scope cubre un pedido sin scope: en `llm`/`judge` el scope nombra
+    /// los datos privados que se pueden mandar, y el pedido sin scope (datos públicos) lo cubre
+    /// cualquiera (`llm_scope_covers`). En el resto, sin scope sólo lo cubre un grant sin scope.
+    fn scoped_covers_unscoped(ty: CapabilityType) -> bool {
+        matches!(ty, CapabilityType::Llm | CapabilityType::Judge)
+    }
+
+    /// El grant de `set` que cubre `requested`, el primero en el orden canónico (el más específico).
+    /// Sólo prueba `covers` con la familia del pedido. Uno sin scope (fuera de `llm`/`judge`) sólo lo
+    /// cubre un grant sin scope, y esos son los menos específicos (rango 0): van al final del set,
+    /// ordenados por tipo; se los recorre desde atrás (sin comparar; buscar con `range` compara contra
+    /// cada clave del nodo y cada comparación recorre los scopes) y el primero en el orden canónico es
+    /// el último encontrado. En `llm`/`judge` el sin scope es el más angosto y va primero.
+    fn first_covering<'a>(set: &'a CapSet, requested: &Capability) -> Option<&'a Capability> {
+        let fam = Self::family(requested.ty);
+        if requested.scope.is_none() && !Self::scoped_covers_unscoped(fam) {
+            return set
+                .iter()
+                .rev()
+                .take_while(|c| c.scope.is_none())
+                .filter(|c| Self::family(c.ty) == fam && c.covers(requested))
+                .last();
+        }
+        set.iter().filter(|c| Self::family(c.ty) == fam).find(|c| c.covers(requested))
+    }
+
+    /// Cuán poco cubre el grant, de mayor a menor: `(rango, sin comodín, literales)`, con la
+    /// misma lectura que `covers` en cada tipo (el modelo y sus casos: `specs/t2-especificidad-modelo.md`).
+    /// - rango: 2 = `llm`/`judge` sin scope (sólo lo público, lo más angosto); 1 = con scope; 0 = sin
+    ///   scope en el resto (el comodín).
+    /// - comodín: `*` o `?` (`[` es literal en `fnmatch` y `path_glob`). En `net` un CIDR es un rango
+    ///   y cuenta los bits del prefijo (más el puerto, como en un host); en `secret`/`llm`/`judge`
+    ///   el comodín se mira en el nombre: un `*` en la atadura (`@*.x.com`) no la vuelve más amplia
+    ///   que no atar, y la atadura suma literales.
+    ///
+    /// Sólo depende del tipo y del texto del scope (no del cwd ni del entorno): el orden del `BTreeSet`
+    /// no puede cambiar con el elemento adentro. Por eso una ruta relativa contra una absoluta se
+    /// compara por el largo del texto (declarado).
+    fn specificity(&self) -> (u8, bool, usize) {
+        let wild = |c: char| matches!(c, '*' | '?');
+        let literals = |s: &str| s.chars().filter(|c| !wild(*c)).count();
+        let Some(s) = &self.scope else {
+            return (if Self::scoped_covers_unscoped(self.ty) { 2 } else { 0 }, true, 0);
+        };
+        match self.ty {
+            CapabilityType::Net => {
+                let (host, port) = split_net_scope(s);
+                let cidr = host.split_once('/').and_then(|(ip, bits)| {
+                    ip.trim_start_matches('[').trim_end_matches(']').parse::<std::net::IpAddr>().ok()?;
+                    bits.parse::<usize>().ok()
+                });
+                match cidr {
+                    // El puerto suma como en un host (`:9`): un CIDR con puerto es más angosto.
+                    Some(bits) => (1, false, bits + port.map_or(0, |p| p.len() + 1)),
+                    None => (1, !host.contains(wild), literals(s)),
+                }
+            }
+            CapabilityType::Secret | CapabilityType::Llm | CapabilityType::Judge => {
+                let (name, _) = split_secret_scope(s);
+                (1, !name.contains(wild), literals(s))
+            }
+            _ => (1, !s.contains(wild), literals(s)),
+        }
+    }
+}
+
+/// v0.6.47 (T2): el orden canónico. Primero el más específico, el que cubre menos (también entre
+/// tipos: `file` cubre a `file.read`; ver `specificity`); después el tipo y el scope como desempate
+/// fijo. Quedarse con el primero que cubre da el grant más específico sin probar `covers` de más
+/// (puede ir a disco).
+impl Ord for Capability {
+    fn cmp(&self, other: &Self) -> Ordering {
+        other
+            .specificity()
+            .cmp(&self.specificity())
+            .then_with(|| self.ty.cmp(&other.ty))
+            .then_with(|| self.scope.cmp(&other.scope))
+    }
+}
+
+impl PartialOrd for Capability {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
 impl Capability {
     pub fn new(ty: CapabilityType, scope: Option<String>) -> Self {
         // `net` es un permiso por HOST, o por `host:puerto` si el puerto se escribió:
@@ -395,7 +497,7 @@ impl Capability {
                 normalize_path(s)
             }
         };
-        if matches!(self.ty, CapabilityType::Llm | CapabilityType::Judge) {
+        if Self::scoped_covers_unscoped(self.ty) {
             return llm_scope_covers(self.scope.as_deref(), other.scope.as_deref());
         }
         match &self.scope {
@@ -921,8 +1023,8 @@ pub mod audit_sink {
 /// v0.6.46 (E3b): lo que el scope de un módulo de confianza deja de lado y devuelve al salir.
 pub struct TrustedSaved {
     name: String,
-    granted: HashSet<Capability>,
-    denied: HashSet<Capability>,
+    granted: CapSet,
+    denied: CapSet,
     parent: Option<Rc<RefCell<CapabilitySet>>>,
     ceiling: Option<Rc<Vec<Capability>>>,
     delegated: Vec<Rc<Delegation>>,
@@ -933,8 +1035,8 @@ pub struct TrustedSaved {
 /// (global, sandbox, agente) tiene el suyo.
 pub struct CapabilitySet {
     pub name: String,
-    pub granted: HashSet<Capability>,
-    pub denied: HashSet<Capability>,
+    pub granted: CapSet,
+    pub denied: CapSet,
     pub audit_log: Vec<CapabilityAuditEntry>,
     pub parent: Option<Rc<RefCell<CapabilitySet>>>,
     /// Techo de capabilities impuesto por el HOST (`--sandbox`/`--cap-set`): un grant sólo
@@ -960,8 +1062,8 @@ impl CapabilitySet {
     pub fn new(name: &str) -> Self {
         Self {
             name: name.to_string(),
-            granted: HashSet::new(),
-            denied: HashSet::new(),
+            granted: CapSet::new(),
+            denied: CapSet::new(),
             audit_log: Vec::new(),
             rejected_by_ceiling: Vec::new(),
             parent: None,
@@ -1259,8 +1361,7 @@ impl CapabilitySet {
         }
 
         // 2) Grants.
-        let granted_by: Option<Capability> =
-            self.granted.iter().find(|c| c.covers(requested)).cloned();
+        let granted_by: Option<Capability> = Capability::first_covering(&self.granted, requested).cloned();
         if let Some(c) = granted_by {
             if audit {
                 self.push_audit(CapabilityAuditEntry {
@@ -1485,8 +1586,8 @@ impl CapabilitySet {
     pub fn create_child(parent: &Rc<RefCell<CapabilitySet>>, name: &str) -> CapabilitySet {
         CapabilitySet {
             name: name.to_string(),
-            granted: HashSet::new(),
-            denied: HashSet::new(),
+            granted: CapSet::new(),
+            denied: CapSet::new(),
             audit_log: Vec::new(),
             rejected_by_ceiling: Vec::new(),
             parent: Some(parent.clone()),
@@ -2530,5 +2631,195 @@ mod e7_private_dest {
         assert!(m.contains("`db` resolved to 10.0.0.5, a private address") && m.contains("require net(\"db:5432\")"), "{}", m);
         let m = private_dest_message("http_get()", "x:80", ip("::ffff:127.0.0.1"), &DenyCause::AboveCeiling);
         assert!(m.contains("127.0.0.1") && m.contains("--cap-set net=x:80"), "{}", m);
+    }
+
+}
+
+#[cfg(test)]
+mod t2_tests {
+    use super::*;
+
+    fn cap(ty: CapabilityType, scope: Option<&str>) -> Capability {
+        Capability::new(ty, scope.map(|x| x.to_string()))
+    }
+
+    // v0.6.47 (T2): el audit nombra el grant (o el deny) más específico, el mismo en cada corrida y
+    // en cualquier orden de declaración. Con `HashSet` la semilla del hash elegía cuál.
+    fn reason_for(grants: &[Capability], denies: &[Capability], requested: &Capability) -> String {
+        let mut set = CapabilitySet::new("t");
+        for g in grants {
+            set.grant(g.clone());
+        }
+        for d in denies {
+            set.deny(d.clone());
+        }
+        let _ = set.check_cause(requested, "t");
+        set.audit_log.last().unwrap().reason.clone()
+    }
+
+    fn every_order(caps: &[Capability]) -> Vec<Vec<Capability>> {
+        let mut out = Vec::new();
+        for first in 0..caps.len() {
+            for rev in [false, true] {
+                let mut v: Vec<Capability> = caps[first..].iter().chain(caps[..first].iter()).cloned().collect();
+                if rev {
+                    v.reverse();
+                }
+                out.push(v);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn t2_the_most_specific_grant_is_named_in_any_order() {
+        let net = |s: &str| cap(CapabilityType::Net, Some(s));
+        let grants = [net("*.com"), net("api.example.com"), net("*.example.com"), cap(CapabilityType::Net, None)];
+        let want = format!("Granted by {}", net("api.example.com"));
+        for order in every_order(&grants) {
+            // Cada set nuevo trae otra semilla: con `HashSet` alguna vuelta nombraba otro.
+            for _ in 0..8 {
+                assert_eq!(reason_for(&order, &[], &net("api.example.com")), want, "{:?}", order);
+            }
+        }
+        // Un glob que cubre con el mismo literal que el exacto (`*` vacío): gana el exacto.
+        let grants = [net("a*.io"), net("a.io")];
+        for order in every_order(&grants) {
+            assert_eq!(reason_for(&order, &[], &net("a.io")), format!("Granted by {}", net("a.io")));
+        }
+        // Sin el exacto, el glob con más literal.
+        let grants = [net("*.com"), net("*.example.com"), cap(CapabilityType::Net, None)];
+        for order in every_order(&grants) {
+            assert_eq!(reason_for(&order, &[], &net("api.example.com")), format!("Granted by {}", net("*.example.com")));
+        }
+    }
+
+    #[test]
+    fn t2_specificity_crosses_types_and_ties_break_by_a_fixed_order() {
+        // `file` cubre a `file.read`: gana el scope más específico, sea del tipo que sea.
+        let read = cap(CapabilityType::FileRead, Some("/t2-no-existe/x.txt"));
+        let grants = [cap(CapabilityType::File, Some("/t2-no-existe/**")), cap(CapabilityType::FileRead, Some("/t2-no-existe/x.txt"))];
+        for order in every_order(&grants) {
+            assert_eq!(reason_for(&order, &[], &read), format!("Granted by {}", grants[1]));
+        }
+        let grants = [cap(CapabilityType::FileRead, Some("/t2-no-existe/**")), cap(CapabilityType::File, Some("/t2-no-existe/x.txt"))];
+        for order in every_order(&grants) {
+            assert_eq!(reason_for(&order, &[], &read), format!("Granted by {}", grants[1]));
+        }
+        // Mismo scope en los dos tipos: el tipo más angosto (`file.read`, antes en la declaración).
+        let grants = [cap(CapabilityType::File, Some("/t2-no-existe/x.txt")), cap(CapabilityType::FileRead, Some("/t2-no-existe/x.txt"))];
+        for order in every_order(&grants) {
+            assert_eq!(reason_for(&order, &[], &read), format!("Granted by {}", grants[1]));
+        }
+        // Empate de especificidad (dos globs con el mismo literal): el orden fijo del scope.
+        let net = |s: &str| cap(CapabilityType::Net, Some(s));
+        let grants = [net("a*.x.com"), net("*b.x.com")];
+        let want = reason_for(&grants, &[], &net("ab.x.com"));
+        assert_eq!(want, format!("Granted by {}", net("*b.x.com")));
+        for order in every_order(&grants) {
+            for _ in 0..8 {
+                assert_eq!(reason_for(&order, &[], &net("ab.x.com")), want);
+            }
+        }
+    }
+
+    #[test]
+    fn t2_the_lookup_stays_in_the_family_and_finds_the_unscoped_grants() {
+        // El pedido sin scope recorre desde atrás el tramo sin scope: tiene que quedarse con el primero
+        // del orden canónico (`file.read` antes que `file`) y no tomar uno de otra familia.
+        let grants = [
+            cap(CapabilityType::Net, Some("a.x.com")),
+            cap(CapabilityType::Net, None),
+            cap(CapabilityType::Time, None),
+            cap(CapabilityType::FileRead, Some("/t2-no-existe/a")),
+            cap(CapabilityType::FileRead, None),
+            cap(CapabilityType::File, None),
+            cap(CapabilityType::Secret, Some("K")),
+        ];
+        for order in every_order(&grants) {
+            let reason = |r: Capability| reason_for(&order, &[], &r);
+            assert_eq!(reason(cap(CapabilityType::Time, None)), format!("Granted by {}", cap(CapabilityType::Time, None)));
+            assert_eq!(reason(cap(CapabilityType::FileRead, None)), format!("Granted by {}", cap(CapabilityType::FileRead, None)));
+            assert_eq!(reason(cap(CapabilityType::FileWrite, None)), format!("Granted by {}", cap(CapabilityType::File, None)));
+            assert_eq!(reason(cap(CapabilityType::Net, None)), format!("Granted by {}", cap(CapabilityType::Net, None)));
+            assert_eq!(reason(cap(CapabilityType::Net, Some("b.x.com"))), format!("Granted by {}", cap(CapabilityType::Net, None)));
+            assert_eq!(reason(cap(CapabilityType::FileWrite, Some("/t2-no-existe/b"))), format!("Granted by {}", cap(CapabilityType::File, None)));
+            assert_eq!(reason(cap(CapabilityType::Random, None)), "No matching grant found");
+        }
+    }
+
+    #[test]
+    fn t2_in_llm_and_judge_the_unscoped_grant_is_the_narrowest() {
+        // Filas 8-11 del modelo. En `llm`/`judge` el grant sin scope cubre sólo lo público: es el más
+        // angosto, y la llamada pública lo nombra. Con sólo `llm("P")` la llamada pública pasa igual
+        // (el atajo de los sin scope no vale acá) y lo nombra a él.
+        for ty in [CapabilityType::Llm, CapabilityType::Judge] {
+            let c = |s: Option<&str>| cap(ty, s);
+            for order in every_order(&[c(None), c(Some("P")), cap(CapabilityType::Time, None)]) {
+                assert_eq!(reason_for(&order, &[], &c(None)), format!("Granted by {}", c(None)));
+            }
+            assert_eq!(reason_for(&[c(Some("P"))], &[], &c(None)), format!("Granted by {}", c(Some("P"))));
+            let grants = [c(None), c(Some("*")), c(Some("P")), c(Some("P@embedder"))];
+            for order in every_order(&grants) {
+                assert_eq!(reason_for(&order, &[], &c(Some("P@embedder"))), format!("Granted by {}", c(Some("P@embedder"))));
+                assert_eq!(reason_for(&order, &[], &c(Some("P@otro"))), format!("Granted by {}", c(Some("P"))));
+            }
+        }
+    }
+
+    #[test]
+    fn t2_specificity_reads_the_scope_like_covers_does() {
+        // Filas 2-7 del modelo (`specs/t2-especificidad-modelo.md`): los pares de B1 de la auditoría.
+        let case = |grants: &[Capability], req: Capability, want: &Capability| {
+            for order in every_order(grants) {
+                assert_eq!(reason_for(&order, &[], &req), format!("Granted by {}", want), "{:?} → {}", order, req);
+            }
+        };
+        let net = |s: &str| cap(CapabilityType::Net, Some(s));
+        // Un CIDR es un rango: la IP exacta antes que cualquier CIDR, y el prefijo más largo antes.
+        case(&[net("10.0.0.0/8"), net("10.1.0.0/16"), net("10.1.2.3")], net("10.1.2.3:9"), &net("10.1.2.3"));
+        case(&[net("10.0.0.0/8"), net("10.1.0.0/16")], net("10.1.2.3"), &net("10.1.0.0/16"));
+        case(&[net("0.0.0.0/0"), net("10.0.0.0/8")], net("10.1.2.3"), &net("10.0.0.0/8"));
+        // Los corchetes de una IPv6 con puerto no son comodín: con puerto antes que sin.
+        case(&[net("::1"), net("[::1]:9")], net("[::1]:9"), &net("[::1]:9"));
+        // Un CIDR con puerto es más angosto que el mismo sin puerto (ronda 2, B1).
+        case(&[net("10.0.0.0/8"), net("10.0.0.0/8:9")], net("10.1.2.3:9"), &net("10.0.0.0/8:9"));
+        case(&[net("fd00::/8"), net("[fd00::/8]:443")], net("[fd00::1]:443"), &net("[fd00::/8]:443"));
+        // En `file`, `[` es literal: el nombre exacto antes que el glob con el mismo literal.
+        let read = |s: &str| cap(CapabilityType::FileRead, Some(s));
+        case(&[read("/t2-no-existe/*[x].txt"), read("/t2-no-existe/[x].txt")], read("/t2-no-existe/[x].txt"), &read("/t2-no-existe/[x].txt"));
+        // La atadura de un secret lo achica, aunque sea `*.x.com`.
+        let secret = |s: &str| cap(CapabilityType::Secret, Some(s));
+        case(&[secret("k"), secret("k@*.x.com")], secret("k@*.x.com"), &secret("k@*.x.com"));
+        let three = [secret("k"), secret("k@*.x.com"), secret("k@api.x.com")];
+        // `check` de un pedido atado a un host:
+        case(&three, secret("k@api.x.com"), &secret("k@api.x.com"));
+        // lo que pide `secret("k")` con esos grants: la unión de las ataduras (`secret_binding`), que
+        // `k@api.x.com` no cubre (ronda 2, N1).
+        case(&three, secret("k@api.x.com|*.x.com"), &secret("k@*.x.com"));
+    }
+
+    #[test]
+    fn t2_the_most_specific_deny_is_named_and_the_secret_hosts_keep_a_fixed_order() {
+        let net = |s: &str| cap(CapabilityType::Net, Some(s));
+        let denies = [net("*.com"), net("api.example.com"), net("*.example.com")];
+        for order in every_order(&denies) {
+            for _ in 0..8 {
+                assert_eq!(reason_for(&[], &order, &net("api.example.com")), format!("Explicitly denied by {}", net("api.example.com")));
+            }
+        }
+        let secret = |s: &str| cap(CapabilityType::Secret, Some(s));
+        let grants = [secret("K@zeta.com"), secret("K@alfa.com"), secret("K@mid.com")];
+        let mut seen = std::collections::HashSet::new();
+        for order in every_order(&grants) {
+            for _ in 0..8 {
+                let mut set = CapabilitySet::new("t");
+                for g in &order {
+                    set.grant(g.clone());
+                }
+                seen.insert(set.secret_binding("K").unwrap());
+            }
+        }
+        assert_eq!(seen.len(), 1, "{:?}", seen);
     }
 }
