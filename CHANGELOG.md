@@ -6,7 +6,7 @@ Each says what changed, why, and what to write instead.
 
 Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the release date.
 
-## Unreleased
+## v0.6.47 — 2026-10-24
 
 **Built with Rust 1.99.1 (was 1.96.0).** The releases in between fix four miscompilations (MIR
 optimization in 1.96.1, an LLVM optimization in 1.97.1, vtables in 1.98.1, FFI `bool` returns on
@@ -58,11 +58,10 @@ choose. Now:
   the embeddable WebAssembly module, the program sees one fixed text, `private(labels): the run was
   stopped by the flow checker`, with no location, and output before the cut is replaced by that one
   line. `run` and `test` without a ceiling (native or the wasip1 binary) keep the detail, as the
-  owner's own run. The detail goes to the operator: the host's `log` hook, stderr without a
-  ceiling, the sealed receipt with `--auditor`, and `operator_detail` in WebAssembly (`run` and
-  `handle`), never `errors`;
-- a cut in an agent cuts its whole run: from then on every sink of the run fails, and `agents()`
-  reports it to whoever launched it;
+  owner's own run. The detail goes to the operator: stderr without a ceiling, the sealed receipt
+  with `--auditor`, and `operator_detail` in WebAssembly (`run` and `handle`), never `errors` nor
+  the program's log;
+- a cut in an agent cuts its whole run: from then on every sink of the run fails;
 - `serve --labels`: each request, cron tick and socket handler is its own run. Its stdout and stderr
   are held and written when it ends, or replaced by the fixed line if it was cut (a notice at
   startup says so; run without `--labels` for a live log). Agents' output is not written.
@@ -71,7 +70,13 @@ choose. Now:
 - `serve --labels` and the blackboard and signal queue: a run (the request, or the preamble, with
   all its agents) is committed once, when all of it has ended without a cut, and undone entirely if
   any part is cut, including what its agents wrote after the request answered. What other runs read
-  while it was open, and signals already consumed, stay (as with any effect before a cut).
+  while it was open, and signals already consumed, stay (as with any effect before a cut);
+- the Vela guest: any cut by the flow checker answers `{"error": "label_violation"}` on chain, the
+  same code as a private value reaching a public field. That includes a `declassify` the host did not
+  grant and a runtime error on private data, which used to be `runtime_error`. The Executor's log gets
+  one fixed line, `ERR label_violation: the flow checker stopped the run; what failed and where stay
+  in the enclave`, instead of the path and the label. An error that touches no private data is still
+  `runtime_error`, with its text in the log.
 
 **The audit names the same grant every run: the narrowest one.** When two grants covered a use
 (`require llm` and `require llm("clientes")`, or `net("*.x.com")` and `net("api.x.com")`), the
