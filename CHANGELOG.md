@@ -42,6 +42,14 @@ median 0.8) and 3.7 without, so the new one stays. What was not recovered is tra
 again. The `perf-guard` anchor (`engine/perf/baseline.json`) was re-measured on CI with rustc 1.99.1
 in this same change, so it now measures against the new compiler.
 
+**Known, not fixed in this release: RUSTSEC-2026-0387** (`crypto-bigint` 0.5.5, published
+2026-10-23). Some operations meant to run in constant time may branch on secret values, depending on
+the compiler and the CPU. It reaches Synsema through the elliptic-curve crates (`k256`, `p256`, `p384`,
+`p521` 0.13), which handle secret keys in ES256 and VAPID signing, Web Push ECDH, P-521 ECDH and
+`k256` transaction signing. Every release up to v0.6.46 ships the same version. The 0.5 series gets no
+fix, so the fix is moving to the 0.14 curve crates. That is the first item of the next release; this
+one ignores the advisory in `.cargo/audit.toml` with that reason.
+
 **Breaking, with labels: a flow-checker cut no longer tells the program or the log where it
 happened.** Before, the text of a `label_violation` named the site and the label, and how much
 output, log or shared state survived depended on where the cut fell, which a private value could
