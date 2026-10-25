@@ -36,11 +36,11 @@ node scripts/smoke.mjs build/app.wasm                                           
 Only when changing the ADAPTER itself (packages/guests/vela):
 ```sh
 rustup target add wasm32-wasip1 && cd packages/guests/vela
-cargo build --profile wasm                             # → ../../../engine/target/wasm32-wasip1/wasm/synsema_vela_guest.wasm (≈ 7.8 MB; 2–5 min, LTO); SYNSEMA_VELA_APP=… fills the slot at build time
+cargo build --profile wasm                             # → ../../../engine/target/wasm32-wasip1/wasm/synsema_vela_guest.wasm (≈ 11.1 MB, ≈ 10.7 MB once stubbed; 2–5 min, LTO); SYNSEMA_VELA_APP=… fills the slot at build time
 # THEN stub the WASI imports Vela refuses: the STUBBED file IS the module — what the probes load,
 # what the release publishes, what `embed.syn` fills. Run it from the REPO ROOT (inside the crate,
 # .cargo/config.toml would cross-compile the tool itself to wasm), hence the subshell:
-(cd ../../.. && W=engine/target/wasm32-wasip1/wasm/synsema_vela_guest; cargo run --locked --manifest-path packages/guests/vela/tools/wasi-stub/Cargo.toml -- $W.wasm $W.stubbed.wasm)   # imports: 21 -> 6
+(cd ../../.. && W=engine/target/wasm32-wasip1/wasm/synsema_vela_guest; cargo run --locked --manifest-path packages/guests/vela/tools/wasi-stub/Cargo.toml -- $W.wasm $W.stubbed.wasm)   # imports: 23 -> 6
 node ../../../tests/vela_guest.probe.mjs <the STUBBED .wasm>   # WASI ≈ the Executor: imports, exports, every entry point, formats, determinism, memory
 cd tests/wasmtime-go && go run . <the STUBBED .wasm>   # wasmtime-go v1.0.0 = the Executor's exact runtime (needs Go + a C compiler)
 cargo test --target <host triple>                      # unit tests — the crate's DEFAULT target is wasm, a bare `cargo test` builds a .wasm it cannot run
@@ -62,12 +62,24 @@ the guest (`ctx["state"]`, `ctx["payload"]` and what derives from them are priva
 since v0.6.46 `declassify` is a capability a host ceiling bounds: the guest runs every app under
 `stdout,declassify=app`. Declassifying the app's own data (the outcome code in `error`, an app
 event, a withdrawal receipt) works as before; a value private to any OTHER principal (one the
-program made with `private(x, "other")`) cannot be published — the request fails with
-`{"error": "runtime_error"}` and the log has `ERR runtime_error: Runtime error: label_violation:
-declassify is not granted for what this value is private to (…, other). With a ceiling …`. A private
-value reaching a public field without any `declassify` stays `{"error": "label_violation"}` with
-`ERR label_violation: app_events[0].data is private to app, the sink accepts (public) (declassify it,
-or keep it in state/events)`. Existing apps that only declassify their own data need no change. Test
+program made with `private(x, "other")`) cannot be published. Existing apps that only declassify
+their own data need no change.
+
+**What a failure looks like on chain and in the log (v0.6.47+).** The Executor's log is written
+outside the enclave, so it never says where a label cut fell (a private value can choose which of N
+sites fails):
+
+| What happened | On chain | The Executor's log |
+|---|---|---|
+| any cut by the flow checker: a private value in a public field (`app_events`, `withdrawals`, `error`), a `declassify` the ceiling does not grant, a runtime error on private data (`decimal("abc")` on the payload), `print` under a private branch | `{"error": "label_violation"}`, nothing applied | one fixed line: `ERR label_violation: the flow checker stopped the run; what failed and where stay in the enclave` |
+| a runtime error that touches no private data (e.g. a malformed address the adapter rejects) | `{"error": "runtime_error"}` | `ERR runtime_error: <the message>` |
+
+Before v0.6.47 the log named the path (`app_events[0].data is private to app …`) and a refused
+`declassify` or an error on the payload answered `runtime_error`. To see what failed, run the
+app's tests natively **without** the ceiling, `synsema test --labels app/app.syn`: that run is
+yours, so the error names the site and the fix (with `--cap-set` it shows the fixed text, as in the
+enclave). Without the ceiling every `declassify` is granted, so check a refused `declassify` with
+the ceiling and the rest without it ([labels.md](labels.md) § What a cut shows, and to whom). Test
 with the guest's exact rules natively: `synsema test --labels --cap-set stdout,declassify=app app.syn`
 (the shipped `app.syn` uses `private(...)` in its tests: without `--labels` they fail with
 `private: labels are off; run with --labels or serve --attested`).

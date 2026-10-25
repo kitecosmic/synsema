@@ -289,6 +289,27 @@ One line per capability check: `{ts, context, capability, granted, source, reaso
 names. Works on `run`/`test`/`conform`/`serve`. It is the same audit the wasm `run()` returns as
 `r.audit` (plus `ts`/`context`/`file`/`line`); `run_program` returns its child's audit as `r["audit"]`.
 
+**Which grant `Granted by …` names (v0.6.47+): always the narrowest that covers the use.** Before,
+with two grants covering the same use it named one at random (a new seed per run). Now grants are
+kept in a fixed order, the one that covers least first, read the way each type matches:
+
+- a scope before none; no wildcard (`*`, `?`) before a wildcard; more literal characters before fewer
+  (`[` is a literal character, not a wildcard);
+- `net`: an exact host or IP before a CIDR, a longer prefix before a shorter one
+  (`net("10.1.2.3")` → `net("10.1.0.0/16")` → `net("10.0.0.0/8")`), and a port narrows it
+  (`net("10.0.0.0/8:9")` before `net("10.0.0.0/8")`);
+- `secret`: one bound to hosts (`secret("k") for net("*.x.com")`) before the unbound one;
+- `llm`/`judge`: the scope names whose private data may be sent, so the **unscoped** grant covers only
+  public data and is the narrowest — a public call names `llm`, a call with data of `P` names
+  `llm("P…")`;
+- ties break by type and then scope. The order is read from the text, so a relative path against an
+  absolute one compares by length.
+
+Measured on v0.6.47 with `require net("*.example.com")`, `require net("api.example.com")` and
+`require net`, a call to `api.example.com` logs `"reason":"Granted by net(\"api.example.com\")"` on
+every run; with `require llm` and `require llm("clientes")`, a public `generate` logs
+`"reason":"Granted by llm"`. The same order picks the `deny` that the audit and the error name.
+
 ## Capability scoping rules
 - `deny` overrides `grant`
 - Sandbox does NOT inherit parent capabilities

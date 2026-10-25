@@ -626,8 +626,8 @@ tried to read STRIPE_KEY" = `origin == "program" && !granted`; no need to re-par
 7. In `handle`, `receipt()`/`lineage()` list only that request's inputs (what the top level read is no
    longer in the first request's receipt).
 8. **`auditor`** (sealed receipts, [observability.md](observability.md) § Sealed receipts) exists in the
-   engine's `run` request and returns `receipt`, but **the 0.6.46 package's `run()`/`test()`/`handle()`
-   do not pass `auditor`/`sealedBytes` through** — a known gap of that package. Until it is fixed, call
+   engine's `run` request and returns `receipt`, but **the 0.6.46 and 0.6.47 packages' `run()`/`test()`/`handle()`
+   do not pass `auditor`/`sealedBytes` through** — a known gap of the package. Until it is fixed, call
    the low-level API as docs 72-wasm shows (`instantiateSync(syn.module, …).call({op: "run", …,
    auditor})`).
 - `state_merge`/`state_cas` with the host's `kv` are atomic only if the `kv` offers
