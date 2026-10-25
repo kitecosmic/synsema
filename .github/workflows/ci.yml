@@ -350,7 +350,7 @@ jobs:
             ~/.cargo/git
             engine/target
             packages/guests/vela/tools/wasi-stub/target
-          key: ${{ runner.os }}-cargo-vela-guest-${{ hashFiles('engine/Cargo.lock', 'packages/guests/vela/Cargo.lock', 'packages/guests/vela/tools/wasi-stub/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-vela-guest-${{ hashFiles('engine/Cargo.lock', 'Cargo.lock', 'packages/guests/vela/tools/wasi-stub/Cargo.lock') }}
       - name: Build native synsema (to test the example app)
         run: cargo build --locked --manifest-path engine/Cargo.toml -p synsema-cli
       - name: Test the example apps and the client natively (ledger, novaw-compatible payment app, execution pool, client)
@@ -364,11 +364,6 @@ jobs:
       # día del release.
       - name: The PGO training corpus still runs
         run: bash engine/pgo/train.sh "$GITHUB_WORKSPACE/engine/target/debug/synsema"
-      - name: Build the Vela guest (wasm32-wasip1, profile wasm)
-        # Target y target-dir explícitos: el .cargo/config.toml del crate sólo aplica cuando cargo corre
-        # DENTRO de packages/guests/vela; desde la raíz del repo hay que decirlos (si no, compila un
-        # cdylib nativo en packages/guests/vela/target y la sonda no encuentra el .wasm).
-        run: cargo build --locked --manifest-path packages/guests/vela/Cargo.toml --profile wasm --target wasm32-wasip1 --target-dir engine/target
       # Vela v0.3.0 (pkg/wasm/guest_imports.go) refuses at load any module that DECLARES a WASI import
       # outside a closed set of eight. Rust's std links fd_*/path_*/poll_oneoff/sched_yield even
       # though the `stdout` ceiling (no_fs) never reaches them, so the built module is post-processed:
@@ -378,10 +373,12 @@ jobs:
       # the release publishes and what a kit embeds its app into.
       # The tool runs from the repo root on purpose: the guest's .cargo/config.toml would otherwise
       # cross-compile the tool itself to wasm32-wasip1.
-      - name: Stub the WASI imports Vela v0.3.0 refuses (tools/wasi-stub)
+      # The build and the stub are tools/build.sh, the same script release.yml publishes with: the
+      # source paths remapped (v0.6.48, VG1), so the module does not depend on the checkout's folder.
+      - name: Build the Vela guest (wasm32-wasip1, profile wasm) and stub the WASI imports Vela v0.3.0 refuses
         run: |
           cargo test --locked --manifest-path packages/guests/vela/tools/wasi-stub/Cargo.toml
-          cargo run --locked --manifest-path packages/guests/vela/tools/wasi-stub/Cargo.toml -- engine/target/wasm32-wasip1/wasm/synsema_vela_guest.wasm engine/target/wasm32-wasip1/wasm/synsema_vela_guest.stubbed.wasm
+          bash packages/guests/vela/tools/build.sh engine/target/wasm32-wasip1/wasm/synsema_vela_guest.stubbed.wasm
       - name: Probe under Node WASI (imports, exports, every entry point, formats, determinism)
         run: node tests/vela_guest.probe.mjs engine/target/wasm32-wasip1/wasm/synsema_vela_guest.stubbed.wasm
       - name: Probe under wasmtime-go v1.0.0 (the v0.2.0 Executor's runtime; v0.3.0's import check; compile + instantiate timings)
@@ -473,10 +470,11 @@ jobs:
         run: cargo audit --file engine/Cargo.lock
       # v0.6.45: el guest de Vela tiene su propio lock (y compila con `--locked` en su job): una
       # vulnerabilidad ahí no la veía nadie (quedó rkyv 0.7.46 cuando el motor ya lo había sacado).
+      # Desde v0.6.48 (VG1) ese lock es el de la raíz del repo (ver ./Cargo.toml).
       - name: Audit (Vela guest lock)
         # Corre aunque falle el del motor: cada lock dice lo suyo.
         if: always()
-        run: cargo audit --file packages/guests/vela/Cargo.lock
+        run: cargo audit --file Cargo.lock
 
   # Every Synsema program in the repository still LOADS. This is the gate that was missing when a
   # language rule stopped a program from loading and nobody noticed for a whole round: the engine's

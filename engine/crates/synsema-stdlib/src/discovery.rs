@@ -618,9 +618,9 @@ impl CardSigner {
 
     /// Desde el escalar P-256 (32 bytes) de la identidad atestada.
     pub fn p256_from_scalar(scalar: &[u8]) -> Result<CardSigner, String> {
-        use p256::elliptic_curve::sec1::ToEncodedPoint;
+        use p256::elliptic_curve::sec1::ToSec1Point;
         let key = p256::SecretKey::from_slice(scalar).map_err(|_| "not a valid P-256 scalar".to_string())?;
-        let pk = key.public_key().to_encoded_point(true).as_bytes().to_vec();
+        let pk = key.public_key().to_sec1_point(true).as_bytes().to_vec();
         let did = crate::didkey::encode(crate::didkey::KeyAlg::P256, &pk)?;
         Ok(CardSigner::P256 { key, did })
     }

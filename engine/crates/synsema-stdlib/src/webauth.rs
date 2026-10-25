@@ -1150,8 +1150,8 @@ fn inline_public_keys(m: &MapObj, who: &str) -> Result<Vec<KeyEntry>, Control> {
             crate::didkey::KeyAlg::Ed25519 => Ok(vec![KeyEntry { kid, alg: Some("EdDSA".to_string()), key: Jwk::Ed25519 { x: key } }]),
             crate::didkey::KeyAlg::P256 => {
                 let pk = p256::PublicKey::from_sec1_bytes(&key).map_err(|_| err(format!("{}: the did:key P-256 point is malformed", who)))?;
-                use p256::elliptic_curve::sec1::ToEncodedPoint;
-                let pt = pk.to_encoded_point(false);
+                use p256::elliptic_curve::sec1::ToSec1Point;
+                let pt = pk.to_sec1_point(false);
                 match (pt.x(), pt.y()) {
                     (Some(x), Some(y)) => Ok(vec![KeyEntry { kid, alg: Some("ES256".to_string()), key: Jwk::P256 { x: x.to_vec(), y: y.to_vec() } }]),
                     _ => Err(err(format!("{}: the did:key P-256 point is malformed", who))),
@@ -1183,7 +1183,7 @@ fn inline_public_keys(m: &MapObj, who: &str) -> Result<Vec<KeyEntry>, Control> {
                     KeyEntry { kid: None, alg: Some("RS256".to_string()), key: Jwk::Rsa { n: pk.n().to_bytes_be(), e: pk.e().to_bytes_be() } }
                 }
                 AsymPublic::P256(vk) => {
-                    let pt = vk.to_encoded_point(false);
+                    let pt = vk.to_sec1_point(false);
                     let (x, y) = (pt.x().map(|x| x.to_vec()), pt.y().map(|y| y.to_vec()));
                     match (x, y) {
                         (Some(x), Some(y)) => KeyEntry { kid: None, alg: Some("ES256".to_string()), key: Jwk::P256 { x, y } },
@@ -1812,7 +1812,7 @@ mod v0620_tests {
     fn js(args: &[SynValue]) -> Result<SynValue, Control> {
         b_jwt_sign(args, &caps_with_time(), &tloc())
     }
-    use p256::elliptic_curve::sec1::ToEncodedPoint;
+    use p256::elliptic_curve::sec1::ToSec1Point;
     use synsema_core::bytesutil::b64_encode;
 
     fn pem(label: &str, der: &[u8]) -> String {
@@ -1860,7 +1860,7 @@ mod v0620_tests {
         let mut scalar = vec![0u8; 32];
         scalar[31] = 7;
         let sk = p256::SecretKey::from_slice(&scalar).unwrap();
-        let pt = sk.public_key().to_encoded_point(false);
+        let pt = sk.public_key().to_sec1_point(false);
         // SEC1: SEQUENCE { INTEGER 1, OCTET STRING(32) }
         let mut sec1 = vec![0x30, 0x25, 0x02, 0x01, 0x01, 0x04, 0x20];
         sec1.extend_from_slice(&scalar);
@@ -1946,6 +1946,22 @@ mod v0620_tests {
         assert!(e.contains("needs an RSA private key"), "{}", e);
     }
 
+    /// RFC 6979, apéndice A.2.5 (P-256, SHA-256): la firma determinista es la del RFC, byte a byte.
+    /// v0.6.48: fija que pasar de RustCrypto 0.13 a 0.14 (RUSTSEC-2026-0387) no cambió ni un byte de
+    /// ES256 ni de VAPID; el test de arriba sólo veía que dos firmas seguidas fueran iguales.
+    #[test]
+    fn es256_sign_matches_rfc6979_a25_vectors() {
+        let x = synsema_core::bytesutil::hex_decode("C9AFA9D845BA75166B5C215767B1D6934E50C3DB36E89B127B8A622B120F6721").unwrap();
+        let sk = p256::SecretKey::from_slice(&x).unwrap();
+        let cases = [
+            ("sample", "EFD48B2AACB6A8FD1140DD9CD45E81D69D2C877B56AAF991C34D0EA84EAF3716F7CB1C942D657C41D436C7A1B6E29F65F3E900DBB9AFF4064DC4AB2F843ACDA8"),
+            ("test", "F1ABB023518351CD71D881567B1EA663ED3EFCF6C5132B354F28D3B0B7D38367019F4113742A2B14BD25926B49C649155F267E60D3814B4C0CC84250E46F0083"),
+        ];
+        for (msg, rs) in cases {
+            assert_eq!(es256_sign(&sk, msg.as_bytes()), synsema_core::bytesutil::hex_decode(rs).unwrap(), "RFC 6979 A.2.5, mensaje {:?}", msg);
+        }
+    }
+
     #[test]
     fn jwt_sign_es256_and_raw_ecdsa_round_trip() {
         let (sec1, pkcs8, spki) = p256_pems();
@@ -2017,7 +2033,7 @@ mod v0620_tests {
             Ok(AsymPublic::P256(vk)) => vk,
             _ => panic!("esperaba P-256"),
         };
-        let pt = vk.to_encoded_point(false);
+        let pt = vk.to_sec1_point(false);
         format!(
             r#"{{"kty":"EC","crv":"P-256","kid":"{}","x":"{}","y":"{}"}}"#,
             kid,
@@ -2078,7 +2094,7 @@ mod v0620_tests {
         // JWKS con dos claves: `kid` elige. k1 es OTRA clave P-256 (escalar 9).
         let mut scalar9 = vec![0u8; 32];
         scalar9[31] = 9;
-        let other = p256::SecretKey::from_slice(&scalar9).unwrap().public_key().to_encoded_point(false);
+        let other = p256::SecretKey::from_slice(&scalar9).unwrap().public_key().to_sec1_point(false);
         let k1 = format!(r#"{{"kty":"EC","crv":"P-256","kid":"k1","x":"{}","y":"{}"}}"#, b64url_encode(other.x().unwrap()), b64url_encode(other.y().unwrap()));
         let k2 = p256_jwk(&spki, "k2");
         let jwks_text = jwks_doc(&[k1.clone(), k2.clone()]);
@@ -2353,7 +2369,7 @@ mod v0620_tests {
                 s
             })
             .unwrap();
-            crate::didkey::encode(crate::didkey::KeyAlg::P256, sk.public_key().to_encoded_point(true).as_bytes()).unwrap()
+            crate::didkey::encode(crate::didkey::KeyAlg::P256, sk.public_key().to_sec1_point(true).as_bytes()).unwrap()
         };
         assert!(is_nothing(&ok(jv(&[syn_text(tok.as_str()), map(&[("did", syn_text(p256_did.as_str()))]), now_ok()]))));
         // Firma alterada → nothing.

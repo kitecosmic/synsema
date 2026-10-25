@@ -245,7 +245,7 @@ impl RunKey {
     pub fn public_bytes(&self) -> Vec<u8> {
         match &self.sk {
             RunSigner::Ed25519(k) => k.verifying_key().to_bytes().to_vec(),
-            RunSigner::P256(k) => k.verifying_key().to_encoded_point(true).as_bytes().to_vec(),
+            RunSigner::P256(k) => k.verifying_key().to_sec1_point(true).as_bytes().to_vec(),
         }
     }
 

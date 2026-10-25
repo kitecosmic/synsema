@@ -1107,7 +1107,7 @@ mod tests {
             assert_eq!(t2, 0x04);
             assert_eq!(scalar.len(), 48);
             let sk = p384::ecdsa::SigningKey::from_slice(scalar).unwrap();
-            assert_eq!(sk.verifying_key().to_encoded_point(false).as_bytes(), self.key.public_key_raw(), "la clave de ring y la de RustCrypto coinciden");
+            assert_eq!(sk.verifying_key().to_sec1_point(false).as_bytes(), self.key.public_key_raw(), "la clave de ring y la de RustCrypto coinciden");
             sk
         }
     }
@@ -1892,8 +1892,8 @@ mod tee_platform_tests {
         let ark = rsa_cert(1, &format!("ARK-{}", product), &format!("ARK-{}", product), rsa_spki(ark_k), vec![ca_ext()], ark_k, 48);
         let asvk = rsa_cert(2, &format!("ARK-{}", product), &format!("SEV-VLEK-{}", product), rsa_spki(asvk_k), vec![ca_ext()], ark_k, asvk_salt);
         let ask = rsa_cert(3, &format!("ARK-{}", product), &format!("SEV-{}", product), rsa_spki(ask_k), vec![ca_ext()], ark_k, 48);
-        let vlek_key = p384::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
-        let point = vlek_key.verifying_key().to_encoded_point(false).as_bytes().to_vec();
+        let vlek_key = <p384::ecdsa::SigningKey as p384::elliptic_curve::Generate>::generate();
+        let point = vlek_key.verifying_key().to_sec1_point(false).as_bytes().to_vec();
         let mut tcb_exts = vec![
             ext(&amd_oid(&[0x02]), &der::tlv(0x16, product.as_bytes())),
             ext(&amd_oid(&[0x03, 0x01]), &int_der(tcb.1)),
@@ -1908,8 +1908,8 @@ mod tee_platform_tests {
         for (k, b) in hwid.iter_mut().enumerate() {
             *b = 0x40 + k as u8;
         }
-        let vcek_key = p384::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
-        let vcek_point = vcek_key.verifying_key().to_encoded_point(false).as_bytes().to_vec();
+        let vcek_key = <p384::ecdsa::SigningKey as p384::elliptic_curve::Generate>::generate();
+        let vcek_point = vcek_key.verifying_key().to_sec1_point(false).as_bytes().to_vec();
         let mut vcek_exts = tcb_exts.clone();
         vcek_exts.push(ext(&amd_oid(&[0x04]), &der::octets(&hwid)));
         let vcek = rsa_cert(4, &format!("SEV-{}", product), "SEV-VCEK", der::ec_spki(der::OID_SECP384R1, &vcek_point), vcek_exts, ask_k, 48);

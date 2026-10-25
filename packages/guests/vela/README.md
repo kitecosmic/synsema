@@ -48,29 +48,41 @@ Only if you change the adapter itself:
 
 ```sh
 rustup target add wasm32-wasip1
-cd packages/guests/vela
-cargo build --profile wasm                       # default target: wasm32-wasip1 (.cargo/config.toml)
-# → ../../../engine/target/wasm32-wasip1/wasm/synsema_vela_guest.wasm  (≈ 7.8 MB, 512 KB of it the slot)
-
-SYNSEMA_VELA_APP=/path/to/my_app.syn cargo build --profile wasm   # fill the slot at build time instead of app.syn
-
-# From any other directory (a CI job at the repo root) the crate's .cargo/config.toml does not
-# apply — say the target and the shared target dir explicitly, or you get a native cdylib:
-cargo build --locked --manifest-path packages/guests/vela/Cargo.toml --profile wasm --target wasm32-wasip1 --target-dir engine/target
-```
-
-Then **stub the WASI imports Vela v0.3.0 refuses** (see the subsection below) — the stubbed file is
-the module: the one the probes load, the release publishes and `embed.syn` fills. From the repo
-root (inside `packages/guests/vela` the crate's `.cargo/config.toml` would cross-compile the tool
-itself to wasm):
-
-```sh
-cargo run --locked --manifest-path packages/guests/vela/tools/wasi-stub/Cargo.toml -- \
-  engine/target/wasm32-wasip1/wasm/synsema_vela_guest.wasm engine/target/wasm32-wasip1/wasm/synsema_vela_guest.stubbed.wasm
+bash packages/guests/vela/tools/build.sh my_guest.wasm     # from the repo root
+# → my_guest.wasm, the stubbed module (the one to probe, embed into and deploy), and the
+#   unstubbed build in engine/target/wasm32-wasip1/wasm/synsema_vela_guest.wasm
 # wasi-stub: replaced (17): fd_close -> ENOSYS(52), … fd_prestat_get -> EBADF(8), … sched_yield -> SUCCESS(0)
 #   kept (6): clock_time_get, environ_get, environ_sizes_get, fd_write, proc_exit, random_get
-#   imports: 23 -> 6; bytes: 11138274 -> 10689144
+#   imports: 23 -> 6; bytes: 11136876 -> 10682554
+
+SYNSEMA_VELA_APP=/path/to/my_app.syn bash packages/guests/vela/tools/build.sh my_guest.wasm   # fill the slot at build time instead of app.syn
+# (a relative SYNSEMA_VELA_APP is read from packages/guests/vela; only the file name goes into the module)
 ```
+
+`tools/build.sh` is what CI and the release run, so the same commit gives the published module
+**byte for byte, from any folder** (since v0.6.48), **on Linux** — on Windows, build in WSL. Native
+Windows cannot reach the published hash and the script refuses to run there (Git Bash, MSYS,
+Cygwin): the source paths left in the module use `\` (`/cargo\registry\…`, measured), the remap only
+rewrites their start, and Rust has no option to normalize the separators; cargo's per-crate hash
+of the engine's relative paths carries the same `\`. Two things make it hold on Linux, and a
+hand-written `cargo build` misses both:
+- the source paths Rust leaves in the module (panic locations) are remapped:
+  `--remap-path-prefix=<repo>=/synsema` and `--remap-path-prefix=<CARGO_HOME>=/cargo`, passed with
+  `--config` so they add to the 64 MB stack flag of `.cargo/config.toml` (a `RUSTFLAGS` would replace
+  it, so the script refuses to run with one set);
+- the guest's workspace is the `Cargo.toml` at the repo root, and its lockfile is `./Cargo.lock`.
+  Cargo derives each path crate's `-C metadata` from its path relative to the workspace root only
+  when the crate sits under that root; with the root in `packages/guests/vela`, the engine's crates
+  were outside it, their metadata hashed the absolute folder, and so did the module's code.
+
+To reach a release's hash, build its tag with `SYNSEMA_VERSION` set to that tag (e.g. `v0.6.48`;
+the engine reads it at compile time) and with rustc 1.99.1 (`rust-toolchain.toml`). The stub step is
+`tools/wasi-stub` (see the subsection below); it runs from the repo root on purpose, since inside
+`packages/guests/vela` the crate's `.cargo/config.toml` would cross-compile the tool itself to wasm.
+
+To iterate on the adapter, `cd packages/guests/vela && cargo build --profile wasm` also works (the
+crate's `.cargo/config.toml` sets the target and the shared target dir), but that module is not the
+published one: it carries this machine's paths and is not stubbed.
 
 Then probe the stubbed module the way the Executor drives it: `node ../../../tests/vela_guest.probe.mjs <the stubbed .wasm>`
 (Node's WASI ≈ wasmtime-go's `DefineWasi()`; the probe checks imports, exports, every entry point,
@@ -168,7 +180,7 @@ keys, no attestation, reset from time to time; `https://devnet.synsema.app/` sho
 | Path | What | Tests |
 |---|---|---|
 | `app.syn` | A private ledger: balances per account and token, transfers, withdrawals with a public **ABI receipt** (`app_events` + `data_hex` + a label subtype), a deanonymization report, and a `trusted` task that decodes `(address,address,uint256)` from `payload_hex`. The Node probe drives this one, with and without an output policy. | `synsema test app.syn` (10) |
-| `examples/payment_app.syn` | Horizen's own Private Transfer app (`vela-nova` `payment_app`) rewritten in Synsema, **wire-compatible with the `novaw` wallet**: the same payload instructions, event bodies (`balance` in Uint256 hex), deploy params (`allowedTokens`) and reports (`balances`, `tx_history`), keccak invoice receipts — so `novaw deployapp / registeruser / deposit / privatetransfer / withdraw / getprivatebalance / requestreport` drive it unchanged. No timestamps (there is no clock in the enclave; the Go reference calls `time.Now()`): `tx_history` filters by address. `SYNSEMA_VELA_APP=examples/payment_app.syn cargo build --profile wasm`, then the starter kit's hello-world with this `.wasm`. | 10 |
+| `examples/payment_app.syn` | Horizen's own Private Transfer app (`vela-nova` `payment_app`) rewritten in Synsema, **wire-compatible with the `novaw` wallet**: the same payload instructions, event bodies (`balance` in Uint256 hex), deploy params (`allowedTokens`) and reports (`balances`, `tx_history`), keccak invoice receipts — so `novaw deployapp / registeruser / deposit / privatetransfer / withdraw / getprivatebalance / requestreport` drive it unchanged. No timestamps (there is no clock in the enclave; the Go reference calls `time.Now()`): `tx_history` filters by address. `SYNSEMA_VELA_APP=examples/payment_app.syn bash packages/guests/vela/tools/build.sh payment.wasm` (from the repo root), then the starter kit's hello-world with `payment.wasm`. | 10 |
 | `examples/trigger_app.syn` | An execution pool for the trigger cycle (starter kit doc 4): `execute` locks funds, withdraws to the trigger contract and emits `execute_requested` with abi.encode`(bytes16,address,uint256,bytes)`; `trusted` decodes `(bytes16,uint256,uint8)` from `payload_hex`, credits the remainder and clears the lock, emitting no app event so the loop ends. Deploy it with `{"triggerContract": "0x…"}` **and** the same address in `submitDeployRequestWithTrigger`. | 8 |
 | `examples/trigger/` | `src/PoolTrigger.sol` (extends Vela's `AbstractTrigger`: runs the call from the pool, builds the TRUSTPROCESS payload), `foundry.toml`, `build.sh` — clones `HorizenOfficial/vela` v0.2.0 (BSL, never vendored) and `forge create`s with the deployer key. Only `IERC20` is a stub. | — |
 | `examples/erc20/` | `src/TestToken.sol`, a minimal ERC-20 **with EIP-2612 `permit`**, and `build.sh` (deploy + `TokenAllowlist.addAllowedToken`). | — |

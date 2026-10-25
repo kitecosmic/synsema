@@ -39,7 +39,7 @@ use std::rc::Rc;
 use bech32::{segwit, Hrp};
 use k256::ecdsa::signature::hazmat::PrehashVerifier;
 use k256::ecdsa::{Signature as EcSignature, SigningKey as EcSigningKey, VerifyingKey};
-use k256::elliptic_curve::sec1::ToEncodedPoint;
+use k256::elliptic_curve::sec1::ToSec1Point;
 use k256::elliptic_curve::PrimeField;
 use k256::schnorr;
 use k256::{ProjectivePoint, Scalar};
@@ -370,7 +370,7 @@ fn tap_tweak_scalar(xonly: &[u8; 32], merkle: Option<&[u8]>, fname: &str) -> Res
         h.update(m);
     }
     let t = h.finalize();
-    Option::<Scalar>::from(Scalar::from_repr(t)).ok_or_else(|| {
+    Option::<Scalar>::from(Scalar::from_repr(<[u8; 32]>::from(t).into())).ok_or_else(|| {
         err(format!(
             "{}: the taproot tweak for this key is invalid (an astronomically unlikely key); use a different key",
             fname
@@ -385,7 +385,7 @@ fn tap_output_key(
     merkle: Option<&[u8]>,
     fname: &str,
 ) -> Result<([u8; 32], bool), Control> {
-    let vk = schnorr::VerifyingKey::from_bytes(xonly).map_err(|_| {
+    let vk = schnorr::VerifyingKey::from_slice(xonly).map_err(|_| {
         err(format!(
             "{}: the 32-byte x-only public key is not a valid secp256k1 x coordinate",
             fname
@@ -393,7 +393,7 @@ fn tap_output_key(
     })?;
     let t = tap_tweak_scalar(xonly, merkle, fname)?;
     let q = (ProjectivePoint::from(*vk.as_affine()) + ProjectivePoint::GENERATOR * t).to_affine();
-    let enc = q.to_encoded_point(true);
+    let enc = q.to_sec1_point(true);
     let bytes = enc.as_bytes();
     if bytes.len() != 33 {
         // Punto en el infinito: t == -int(P)·… — imposible salvo clave hostil.
@@ -411,7 +411,7 @@ fn tap_output_key(
 /// más el tweak) — el `tweakedPrivkey` de los vectores oficiales, sin la
 /// re-normalización de salida (esa la hace BIP-340 al firmar).
 fn tap_tweaked_scalar(key: &[u8], merkle: Option<&[u8]>, fname: &str) -> Result<Scalar, Control> {
-    let sk = schnorr::SigningKey::from_bytes(key).map_err(|_| {
+    let sk = schnorr::SigningKey::from_slice(key).map_err(|_| {
         err(format!(
             "{}: the private key must be 32 bytes of valid secp256k1 scalar (the key value is never shown)",
             fname
@@ -491,7 +491,7 @@ fn schnorr_sign(
     let sk = if taproot {
         tap_tweaked_signing_key(&key, None, F)
     } else {
-        schnorr::SigningKey::from_bytes(&key).map_err(|_| {
+        schnorr::SigningKey::from_slice(&key).map_err(|_| {
             err(format!(
                 "{}: the private key must be 32 bytes of valid secp256k1 scalar (the key value is never shown)",
                 F
@@ -510,7 +510,7 @@ fn schnorr_verify(args: &[SynValue]) -> Result<SynValue, Control> {
     let digest = arg_bytes_len(arg(args, 0, F)?, F, "the digest", 32)?;
     let sig = arg_bytes_len(arg(args, 1, F)?, F, "the signature", 64)?;
     let pubkey = arg_bytes_len(arg(args, 2, F)?, F, "the x-only public key", 32)?;
-    let vk = match schnorr::VerifyingKey::from_bytes(pubkey) {
+    let vk = match schnorr::VerifyingKey::from_slice(pubkey) {
         Ok(vk) => vk,
         Err(_) => return Ok(syn_bool(false)), // x fuera de la curva: no verifica
     };
@@ -524,7 +524,7 @@ fn schnorr_verify(args: &[SynValue]) -> Result<SynValue, Control> {
 fn schnorr_pubkey(args: &[SynValue]) -> Result<SynValue, Control> {
     const F: &str = "schnorr_pubkey";
     let (_name, mut key) = key_material(arg(args, 0, F)?, F)?;
-    let sk = schnorr::SigningKey::from_bytes(&key);
+    let sk = schnorr::SigningKey::from_slice(&key);
     key.zeroize();
     let sk = sk.map_err(|_| {
         err(format!(
@@ -553,7 +553,7 @@ fn compressed_pubkey(v: &SynValue, fname: &str) -> Result<Vec<u8>, Control> {
                     fname
                 ))
             })?;
-            Ok(signing.verifying_key().to_encoded_point(true).as_bytes().to_vec())
+            Ok(signing.verifying_key().to_sec1_point(true).as_bytes().to_vec())
         }
         SynValue::Bytes(b) => match b.len() {
             33 => {
@@ -585,7 +585,7 @@ fn xonly_pubkey(v: &SynValue, fname: &str) -> Result<[u8; 32], Control> {
         SynValue::Bytes(b) if b.len() == 32 => b[..].try_into().expect("32 bytes"),
         SynValue::Secret(_) => {
             let (_name, mut key) = key_material(v, fname)?;
-            let sk = schnorr::SigningKey::from_bytes(&key);
+            let sk = schnorr::SigningKey::from_slice(&key);
             key.zeroize();
             let sk = sk.map_err(|_| {
                 err(format!(
@@ -1765,7 +1765,7 @@ fn btc_tx_raw(args: &[SynValue]) -> Result<SynValue, Control> {
                 }
                 let out_key: [u8; 32] =
                     input.program[..].try_into().expect("program p2tr de 32");
-                let vk = schnorr::VerifyingKey::from_bytes(&out_key)
+                let vk = schnorr::VerifyingKey::from_slice(&out_key)
                     .map_err(|_| err(format!("{}: input {} has an invalid taproot key", F, i)))?;
                 let sig = schnorr::Signature::try_from(sig_raw)
                     .map_err(|_| err(format!("{}: {} is not a valid Schnorr signature", F, what)))?;
@@ -2619,7 +2619,7 @@ mod tests {
     fn schnorr_aux_is_pinned_to_bip340_vector_zero() {
         // El determinismo documentado: aux = 32 bytes cero ⇒ el vector 0 de
         // BIP-340 byte a byte. Si el aux cambia, esto rompe.
-        let sk = schnorr::SigningKey::from_bytes(&hx(
+        let sk = schnorr::SigningKey::from_slice(&hx(
             "0000000000000000000000000000000000000000000000000000000000000003",
         ))
         .unwrap();
@@ -2839,7 +2839,7 @@ mod tests {
     /// Firma ECDSA como lo haría `secp256k1_sign` (RFC 6979, r‖s‖recid).
     fn ecdsa_sign65(key_hex: &str, digest: &[u8]) -> Vec<u8> {
         let sk = EcSigningKey::from_slice(&hx(key_hex)).unwrap();
-        let (sig, recid) = sk.sign_prehash_recoverable(digest).unwrap();
+        let (sig, recid) = sk.sign_prehash_recoverable(digest);
         let mut out = sig.to_bytes().to_vec();
         out.push(recid.to_byte());
         out
@@ -3213,7 +3213,7 @@ mod tests {
         // Firma taproot SIN tweak sobre un input p2tr → error con la pista.
         let tx_t = ok(btc_tx(&[vec_t_params()]));
         let d = get_list(&tx_t, "digests");
-        let untweaked = schnorr::SigningKey::from_bytes(&hx(KEY_86_0))
+        let untweaked = schnorr::SigningKey::from_slice(&hx(KEY_86_0))
             .unwrap()
             .sign_raw(&as_bytes(&d[0]), &SCHNORR_AUX)
             .unwrap();

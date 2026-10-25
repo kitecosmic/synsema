@@ -202,9 +202,7 @@ fn secp256k1_sign(
         err("secp256k1_sign: the private key must be 32 bytes of valid secp256k1 scalar; check the key's length/format (the key value is never shown)")
     })?;
     // RFC 6979 (determinista, G5) + low-s normalizado + recovery id (G6).
-    let (sig, recid): (EcSignature, RecoveryId) = signing
-        .sign_prehash_recoverable(&digest)
-        .map_err(|_| err("secp256k1_sign: failed to sign the digest"))?;
+    let (sig, recid): (EcSignature, RecoveryId) = signing.sign_prehash_recoverable(&digest);
     let mut out = Vec::with_capacity(65);
     out.extend_from_slice(&sig.to_bytes()); // r(32) || s(32)
     out.push(recid.to_byte()); // v = recovery id (0/1); el caller ajusta a EIP-155
@@ -269,7 +267,7 @@ pub(crate) fn recover_pubkey(digest: &[u8], sig65: &[u8], fname: &str) -> Result
     let recid = recovery_id(sig65[64], fname)?;
     let vk = VerifyingKey::recover_from_prehash(digest, &sig, recid)
         .map_err(|_| err(format!("{}: could not recover a public key from this (digest, signature)", fname)))?;
-    Ok(vk.to_encoded_point(false).as_bytes().to_vec())
+    Ok(vk.to_sec1_point(false).as_bytes().to_vec())
 }
 
 /// Dirección EVM (20 bytes) de una clave pública sin comprimir.
@@ -327,7 +325,7 @@ fn secp256k1_pubkey(args: &[SynValue]) -> Result<SynValue, Control> {
             )))
         }
     };
-    Ok(syn_bytes(signing.verifying_key().to_encoded_point(compressed).as_bytes().to_vec()))
+    Ok(syn_bytes(signing.verifying_key().to_sec1_point(compressed).as_bytes().to_vec()))
 }
 
 // =========================================================
@@ -519,7 +517,7 @@ fn uncompressed_pubkey(v: &SynValue, fname: &str) -> Result<Vec<u8>, Control> {
             let signing = signing.map_err(|_| {
                 err(format!("{}: the private key must be 32 bytes of valid secp256k1 scalar (the key value is never shown)", fname))
             })?;
-            Ok(signing.verifying_key().to_encoded_point(false).as_bytes().to_vec())
+            Ok(signing.verifying_key().to_sec1_point(false).as_bytes().to_vec())
         }
         SynValue::Bytes(b) => {
             if !matches!(b.len(), 33 | 65) {
@@ -531,7 +529,7 @@ fn uncompressed_pubkey(v: &SynValue, fname: &str) -> Result<Vec<u8>, Control> {
             }
             let vk = VerifyingKey::from_sec1_bytes(b)
                 .map_err(|_| err(format!("{}: the public key is not a valid secp256k1 point", fname)))?;
-            Ok(vk.to_encoded_point(false).as_bytes().to_vec())
+            Ok(vk.to_sec1_point(false).as_bytes().to_vec())
         }
         other => Err(err(format!(
             "{}: expected a secp256k1 public key (bytes) or a key secret, got {}",

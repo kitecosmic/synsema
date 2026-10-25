@@ -4,19 +4,11 @@
 # símbolo como un archivo de entrada (`ld.lld: error: cannot open __llvm_profile_runtime`). Acá
 # `-u <símbolo>` se reescribe como `-Wl,-u,<símbolo>`, que es lo mismo; todo lo demás pasa intacto al
 # zig real: `$REAL_ZIG` si está, si no el de `pip install ziglang` (el que usa cargo-zigbuild en CI).
-#
-# También descarta `-fprofile-generate*` y `-fprofile-use*`: cc-rs copia el `-Cprofile-generate` /
-# `-Cprofile-use` de RUSTFLAGS a todo compilador clang (zig cc lo es) al compilar las dependencias en
-# C. El LLVM de zig escribe otro formato de perfil que el runtime de rustc: con rustc 1.99.1 (LLVM 23)
-# el instrumentado crasheaba al salir, al escribir el perfil (rust-lang/rust#163640, cc-rs#1986). El
-# código C queda sin PGO; el intérprete, que es Rust, lo tiene igual.
 args=()
 while [ $# -gt 0 ]; do
     if [ "$1" = "-u" ] && [ $# -ge 2 ]; then
         args+=("-Wl,-u,$2")
         shift 2
-    elif [[ "$1" == -fprofile-generate* || "$1" == -fprofile-use* ]]; then
-        shift
     else
         args+=("$1")
         shift

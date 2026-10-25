@@ -217,7 +217,12 @@ svg2pdf = { version = "0.13", default-features = false, features = ["text"] }
 #   bech32        : bech32/bech32m BIP-173/350 (Avalanche X/P; direcciones segwit).
 # `schnorr` (Batch 16): firma BIP-340 de taproot — el MISMO crate ya presente, cero
 # dep nueva para firmar Bitcoin (el módulo schnorr viene dentro de k256).
-k256 = { version = "0.13", default-features = false, features = ["ecdsa", "std", "schnorr"] }
+# v0.6.48 (RUSTSEC-2026-0387): k256/p256/p384/p521 pasan juntas a 0.14 (elliptic-curve 0.14, ecdsa
+# 0.17, crypto-bigint >= 0.7.6; la 0.13 traía crypto-bigint 0.5.5, con ramas que dependen del
+# secreto). `alloc` en vez de `std`: en 0.14 `std` prende `getrandom` 0.4, que no compila a
+# wasm32-unknown-unknown sin un backend y que el guest de Vela no tiene. Las claves al azar salen de
+# `os_random` (webpush.rs, crypto.rs), no del `Generate` de RustCrypto.
+k256 = { version = "0.14", default-features = false, features = ["ecdsa", "alloc", "schnorr"] }
 ed25519-dalek = { version = "2", default-features = false, features = ["std", "zeroize", "fast"] }
 sha3 = { version = "0.10", default-features = false, features = ["std"] }
 bs58 = "0.5"
@@ -258,9 +263,9 @@ argon2 = { version = "0.5", default-features = false, features = ["alloc", "pass
 # `*-sys`/C → preservan el binario único estático.
 rsa = { version = "0.9", default-features = false, features = ["sha2"] }
 # `ecdh` (tanda PWA): el acuerdo de claves de Web Push (RFC 8291) usa ECDH sobre la
-# MISMA P-256 — feature del crate ya presente (trae `hkdf` 0.12, RustCrypto; el HKDF de
+# MISMA P-256 — feature del crate ya presente (trae `hkdf`, RustCrypto; el HKDF de
 # webpush.rs es propio sobre hmac/sha2 y está fijado con el vector de RFC 5869).
-p256 = { version = "0.13", default-features = false, features = ["ecdsa", "ecdh", "std"] }
+p256 = { version = "0.14", default-features = false, features = ["ecdsa", "ecdh", "alloc"] }
 # Tanda PWA (webpush.rs): AES-128-GCM del cifrado de Web Push (RFC 8188 aes128gcm).
 # RustCrypto puro-Rust, misma familia que `aes`/`ctr` ya presentes (comparte `aes` 0.8 y
 # `ctr` 0.9; suma sólo el modo GCM: `aead`, `ghash`, `polyval`, `universal-hash`,
@@ -270,22 +275,22 @@ p256 = { version = "0.13", default-features = false, features = ["ecdsa", "ecdh"
 aes-gcm = { version = "0.10", default-features = false, features = ["aes", "alloc"] }
 # v0.6.20 — criptografía genérica (stdlib/crypto.rs): ECDH P-521 + HKDF-SHA256 + AES-GCM con
 # nombres WebCrypto (lo pide un TEE; le sirve a cualquiera que cifre extremo a extremo).
-# p521 PINNEADA a 0.13 para compartir elliptic-curve 0.13 con p256/k256 (la 0.14 duplicaría
-# toda la pila RustCrypto: elliptic-curve/digest/sha2/hkdf por partida doble).
-# `default-features = false`: sólo `ecdh` + `std` (sin ecdsa/pem/getrandom; la clave sale de
-# OsRng como en webpush). hkdf ya era transitiva de elliptic-curve; directa no agrega crate.
+# p521 en la MISMA versión que p256/k256/p384 (las cuatro comparten elliptic-curve; desde v0.6.48,
+# la 0.14). `default-features = false`: sólo `ecdh` + `alloc` (sin ecdsa/pem/getrandom; la clave
+# sale de OsRng como en webpush). El `hkdf` 0.12 directo es el del HKDF de crypto.rs (sobre sha2
+# 0.10); elliptic-curve 0.14 trae su propio hkdf 0.13 para `ecdh`.
 # AES-256-GCM es el MISMO aes-gcm de arriba (Aes256Gcm). Cero `*-sys`.
-p521 = { version = "0.13", default-features = false, features = ["ecdh", "std"] }
+p521 = { version = "0.14", default-features = false, features = ["ecdh", "alloc"] }
 # Attestation de plataforma (TEEs): verificar documentos y firmar la identidad del proceso.
 #   p384        : ES384 (ECDSA sobre NIST P-384). Nitro firma el documento COSE_Sign1 con ES384 y
 #                 toda su PKI (raiz, intermedios, hoja) es P-384 + SHA-384. Misma familia RustCrypto,
-#                 PINNEADA a 0.13 para compartir elliptic-curve 0.13 con p256/p521/k256. `ecdsa` da
+#                 en la MISMA versión que p256/p521/k256 (comparten elliptic-curve). `ecdsa` da
 #                 verificar (y firmar, para el driver `mock`); sin `pem`/`getrandom`.
 #   x509-parser : parsear la cadena de certificados DER del documento (SPKI, validez, TBS,
 #                 firma, issuer/subject). YA estaba en el arbol (transitivo de rcgen 0.14 via
 #                 instant-acme); directo no agrega crate. `default-features = false` deja fuera su
 #                 `verify` (ring): la firma la verificamos nosotros con p384/p256.
-p384 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
+p384 = { version = "0.14", default-features = false, features = ["ecdsa", "alloc"] }
 x509-parser = { version = "0.18", default-features = false }
 hkdf = "0.12"
 # Los argumentos de una llamada sin pedir memoria para los primeros 4 (core, F1.7 de

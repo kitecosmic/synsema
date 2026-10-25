@@ -253,14 +253,18 @@ pub(crate) fn verify_with(key: &Jwk, alg: &str, signing_input: &[u8], sig: &[u8]
             vk.verify(signing_input, &signature).is_ok()
         }
         (Jwk::P256 { x, y }, "ES256") => {
+            use p256::ecdsa::signature::Verifier;
             use p256::ecdsa::{Signature, VerifyingKey};
-            use p256::EncodedPoint;
+            use p256::{FieldBytes, Sec1Point};
             // JWS ES256 es la firma CRUDA r‖s de 64 bytes (no DER).
             if sig.len() != 64 {
                 return false;
             }
-            let point = EncodedPoint::from_affine_coordinates(x.as_slice().into(), y.as_slice().into(), false);
-            let Ok(vk) = VerifyingKey::from_encoded_point(&point) else {
+            let (Ok(x), Ok(y)) = (FieldBytes::try_from(x.as_slice()), FieldBytes::try_from(y.as_slice())) else {
+                return false;
+            };
+            let point = Sec1Point::from_affine_coordinates(&x, &y, false);
+            let Ok(vk) = VerifyingKey::from_sec1_point(&point) else {
                 return false;
             };
             let Ok(signature) = Signature::from_slice(sig) else {
@@ -638,7 +642,7 @@ mod tests {
         }
 
         fn jwks(&self, kid: &str) -> String {
-            let point = self.signing.verifying_key().to_encoded_point(false);
+            let point = self.signing.verifying_key().to_sec1_point(false);
             format!(
                 r#"{{"keys":[{{"kty":"EC","crv":"P-256","kid":"{}","alg":"ES256","use":"sig","x":"{}","y":"{}"}}]}}"#,
                 kid,

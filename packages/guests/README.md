@@ -41,3 +41,21 @@ a serverless runtime, a plugin system — gets a **thin adapter here**, never a 
    the example artifact so people can try the guest before building their own.
 7. Document the `.syn` contract in the guest's README: task names, the context each one receives,
    the map it must return, and how errors travel.
+8. Make the published module **reproducible from any folder**: a host that pins the module by hash
+   (Vela verifies it on-chain) is only as trustworthy as anyone's ability to rebuild that hash. A
+   copy of `vela/` gets this for free if three things are kept:
+   - **Add the guest to `members` in the repo root's `Cargo.toml`, and never give it its own
+     `[workspace]`.** Cargo hashes each path crate's `-C metadata` with its path relative to the
+     workspace root only when the crate sits under that root. With the root inside the guest's
+     folder, the engine's crates would be hashed by their absolute folder, and the module's code
+     would change with it. The guests share the root lockfile (`./Cargo.lock`).
+   - **Build through a script like `vela/tools/build.sh`**, and use the same one in `ci.yml`, in
+     `release.yml` and in the README. It remaps the source paths Rust leaves in the module
+     (`--remap-path-prefix=<repo>=/synsema`, `<CARGO_HOME>=/cargo`). The remaps go through
+     `--config`, not `RUSTFLAGS`, which would replace the 64 MB stack flag of `.cargo/config.toml`.
+   - **Give the guest a `guest-reproducible` job in `release.yml`** with two legs, one of them in
+     another folder and with another `CARGO_HOME`. Compare both with the published asset, and read
+     the result: the job warns, it does not fail the release.
+
+   It holds on Linux (WSL included), not on native Windows. There the paths inside the module use
+   `\`, and Rust cannot normalize them, so a Windows build never matches the published hash.
