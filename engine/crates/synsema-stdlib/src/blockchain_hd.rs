@@ -32,7 +32,7 @@ use aes::Aes128;
 use bip39::{Language, Mnemonic};
 use ctr::cipher::{KeyIvInit, StreamCipher};
 use hmac::{Hmac, Mac};
-use k256::elliptic_curve::sec1::ToEncodedPoint;
+use k256::elliptic_curve::sec1::ToSec1Point;
 use k256::elliptic_curve::PrimeField;
 use k256::{ProjectivePoint, Scalar};
 use sha2::{Digest, Sha256, Sha512, Sha512_256};
@@ -362,7 +362,7 @@ fn derive_secp256k1(seed: &[u8], path: &[u32], fname: &str) -> Result<Vec<u8>, C
     };
     let mut i = hmac512(b"Bitcoin seed", seed);
     let (kb, cb) = i.split_at(32);
-    let key_ct = Option::<Scalar>::from(Scalar::from_repr(*k256::FieldBytes::from_slice(kb)));
+    let key_ct = Option::<Scalar>::from(Scalar::from_repr(k256::FieldBytes::try_from(kb).expect("32 bytes")));
     let mut chain: [u8; 32] = cb.try_into().expect("32 bytes");
     i.zeroize();
     let mut key: Scalar = match key_ct {
@@ -376,13 +376,13 @@ fn derive_secp256k1(seed: &[u8], path: &[u32], fname: &str) -> Result<Vec<u8>, C
             data.extend_from_slice(&key.to_bytes());
         } else {
             let point = (ProjectivePoint::GENERATOR * key).to_affine();
-            data.extend_from_slice(point.to_encoded_point(true).as_bytes());
+            data.extend_from_slice(point.to_sec1_point(true).as_bytes());
         }
         data.extend_from_slice(&idx.to_be_bytes());
         let mut i = hmac512(&chain, &data);
         data.zeroize();
         let (ilb, irb) = i.split_at(32);
-        let il = Option::<Scalar>::from(Scalar::from_repr(*k256::FieldBytes::from_slice(ilb)));
+        let il = Option::<Scalar>::from(Scalar::from_repr(k256::FieldBytes::try_from(ilb).expect("32 bytes")));
         chain = irb.try_into().expect("32 bytes");
         i.zeroize();
         let il = match il {
@@ -937,7 +937,7 @@ fn keystore_export(
                 F
             ))
         })?;
-        let uncompressed = signing.verifying_key().to_encoded_point(false);
+        let uncompressed = signing.verifying_key().to_sec1_point(false);
         let addr20 = &Keccak256::digest(&uncompressed.as_bytes()[1..])[12..];
 
         let mut salt = [0u8; 32];

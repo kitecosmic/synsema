@@ -1,0 +1,32 @@
+# El workspace de los guests (packages/guests/<host>; hoy, sólo vela), y nada más. Un guest nuevo se
+# agrega a `members` y no lleva `[workspace]` propio (packages/guests/README.md, paso 8). El motor
+# tiene su workspace (engine/Cargo.toml) y no se toca desde acá: `exclude` lo deja afuera, igual que a
+# wasi-stub, que tiene el propio.
+#
+# Por qué la raíz del repo (v0.6.48, VG1): cargo calcula el `-C metadata` de un crate `path` con su
+# ruta RELATIVA a la raíz del workspace, pero sólo si el crate está debajo de esa raíz; si no, con la
+# ruta absoluta. Con la raíz en packages/guests/vela, los crates del motor (../../../engine) quedaban
+# afuera, su metadata dependía de la carpeta del build, y con ella el código del wasm: dos copias del
+# mismo commit en carpetas distintas daban hashes distintos aunque `--remap-path-prefix` sacara las
+# rutas del módulo. Con la raíz acá, engine/ queda debajo y el hash no depende de dónde esté el repo.
+# El lock de los guests vive por lo mismo en ./Cargo.lock (antes, packages/guests/vela/Cargo.lock).
+# Se reproduce en Linux (y en la WSL), no en Windows nativo: ver packages/guests/vela/tools/build.sh.
+#
+# Compilar el módulo publicado: `bash packages/guests/vela/tools/build.sh <salida.wasm>`.
+[workspace]
+resolver = "2"
+members = ["packages/guests/vela"]
+exclude = ["engine", "packages/guests/vela/tools/wasi-stub"]
+
+[profile.release]
+opt-level = 3
+lto = true
+
+# Mismo perfil que los artefactos wasm del motor: tamaño por sobre velocidad pico, un solo CGU
+# para que LTO recorte, `panic = "abort"` (un panic es un trap igual) y símbolos fuera.
+[profile.wasm]
+inherits = "release"
+opt-level = "s"
+codegen-units = 1
+panic = "abort"
+strip = true

@@ -22,7 +22,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use hkdf::Hkdf;
-use p256::elliptic_curve::sec1::ToEncodedPoint;
+use p256::elliptic_curve::sec1::ToSec1Point;
 use sha2::Sha256;
 use zeroize::Zeroize;
 
@@ -127,12 +127,12 @@ fn public_of(curve: Curve, private: &[u8], who: &str) -> Result<Vec<u8>, Control
         Curve::P256 => {
             let sk = p256::SecretKey::from_slice(private)
                 .map_err(|_| err(format!("{}: the private key is not a valid P-256 scalar (32 bytes)", who)))?;
-            sk.public_key().to_encoded_point(false).as_bytes().to_vec()
+            sk.public_key().to_sec1_point(false).as_bytes().to_vec()
         }
         Curve::P521 => {
             let sk = p521::SecretKey::from_slice(private)
                 .map_err(|_| err(format!("{}: the private key is not a valid P-521 scalar (66 bytes)", who)))?;
-            sk.public_key().to_encoded_point(false).as_bytes().to_vec()
+            sk.public_key().to_sec1_point(false).as_bytes().to_vec()
         }
         Curve::X25519 => {
             let k = x25519_key(private, who, "the private key")?;
@@ -395,7 +395,7 @@ mod tests {
         // ECDH con la clave PROPIA: es el uso legítimo y tiene que seguir andando.
         let peer = {
             let sk = p256::SecretKey::from_slice(&[9u8; 32]).unwrap();
-            sk.public_key().to_encoded_point(false).as_bytes().to_vec()
+            sk.public_key().to_sec1_point(false).as_bytes().to_vec()
         };
         let own = p256::SecretKey::from_slice(&scalar).unwrap();
         let out = match b_ecdh_shared_secret(&[sealed.clone(), syn_bytes(peer.clone()), syn_text("P-256")]) {

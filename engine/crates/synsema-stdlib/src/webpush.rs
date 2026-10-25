@@ -35,7 +35,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use hmac::{Hmac, Mac};
-use p256::elliptic_curve::sec1::ToEncodedPoint;
+use p256::elliptic_curve::sec1::ToSec1Point;
 use sha2::Sha256;
 use synsema_capabilities::model::{Capability, CapabilitySet, CapabilityType};
 use synsema_core::bytesutil::{b64url_decode, b64url_encode, hex_decode};
@@ -137,7 +137,7 @@ fn derive(
 }
 
 fn uncompressed(pk: &p256::PublicKey) -> Vec<u8> {
-    pk.to_encoded_point(false).as_bytes().to_vec()
+    pk.to_sec1_point(false).as_bytes().to_vec()
 }
 
 /// Cifra `plaintext` para el navegador (`ua_public` = `keys.p256dh`, `auth_secret` =
@@ -416,10 +416,10 @@ fn payload_bytes(v: Option<&SynValue>) -> Result<Option<Vec<u8>>, Control> {
     }
 }
 
-fn os_random(n: usize) -> Result<Vec<u8>, Control> {
+fn os_random(n: usize, who: &str) -> Result<Vec<u8>, Control> {
     let mut out = vec![0u8; n];
     rand::RngCore::try_fill_bytes(&mut rand::rngs::OsRng, &mut out)
-        .map_err(|_| err("push_send: the OS random source is unavailable"))?;
+        .map_err(|_| err(format!("{}: the OS random source is unavailable", who)))?;
     Ok(out)
 }
 
@@ -522,8 +522,8 @@ pub fn build_push_request(args: &[SynValue], now: i64) -> Result<PushRequest, Co
     let body = match payload_bytes(args.get(1))? {
         None => None,
         Some(plain) => {
-            let as_secret = p256::SecretKey::random(&mut rand::rngs::OsRng);
-            let salt_v = os_random(16)?;
+            let as_secret = fresh_secret("push_send")?;
+            let salt_v = os_random(16, "push_send")?;
             let mut salt = [0u8; 16];
             salt.copy_from_slice(&salt_v);
             let (body, _) = encrypt_with(&plain, &p256dh, &auth, &as_secret, &salt)
@@ -596,9 +596,29 @@ fn push_send(caps: &Rc<RefCell<CapabilitySet>>, args: &[SynValue]) -> Result<Syn
 }
 
 /// Un par P-256 nuevo (OsRng). Sirve para VAPID y, en tests, para simular la
-/// suscripción del navegador (`keys.p256dh` = `public_b64`).
+/// suscripción del navegador (`keys.p256dh` = `public_b64`). Sin entropía entra en pánico, como el
+/// `SecretKey::random` que reemplaza; el builtin usa `fresh_secret`, que devuelve el error.
 pub fn keygen() -> p256::SecretKey {
-    p256::SecretKey::random(&mut rand::rngs::OsRng)
+    match fresh_secret("keygen") {
+        Ok(sk) => sk,
+        Err(_) => panic!("keygen: the OS random source is unavailable"),
+    }
+}
+
+/// Una privada P-256 nueva: 32 bytes de `os_random` que `from_slice` acepta (rechaza 0 y ≥ n, y se
+/// reintenta: la probabilidad de un rechazo es ~2^-32). v0.6.48: `SecretKey::random` de RustCrypto
+/// 0.14 pide un generador de `rand_core` 0.10, que no es el `OsRng` de `rand` 0.8; así la clave sale
+/// de la misma fuente que la sal, y una falla de entropía es un error y no un pánico.
+fn fresh_secret(who: &str) -> Result<p256::SecretKey, Control> {
+    for _ in 0..16 {
+        let mut bytes = os_random(32, who)?;
+        let sk = p256::SecretKey::from_slice(&bytes);
+        bytes.zeroize();
+        if let Ok(sk) = sk {
+            return Ok(sk);
+        }
+    }
+    Err(err(format!("{}: could not draw a valid P-256 private key", who)))
 }
 
 /// La pública en el formato de Web Push: base64url del punto sin comprimir (65 bytes).
@@ -621,7 +641,7 @@ fn push_vapid_keys(caps: &Rc<RefCell<CapabilitySet>>, args: &[SynValue]) -> Resu
     caps.borrow_mut()
         .require(&Capability::new(CapabilityType::Random, None), "push_vapid_keys()")
         .map_err(|v| Control::Error(v.into_error()))?;
-    let sk = keygen();
+    let sk = fresh_secret("push_vapid_keys")?;
     let public = public_b64(&sk);
     let private = private_b64(&sk);
     let mut m = SynMap::new();
@@ -753,12 +773,12 @@ mod tests {
 
     #[test]
     fn encrypt_decrypt_round_trip_with_fresh_keys() {
-        let ua = p256::SecretKey::random(&mut rand::rngs::OsRng);
+        let ua = keygen();
         let ua_pub = uncompressed(&ua.public_key());
-        let auth = ok(os_random(16));
-        let as_secret = p256::SecretKey::random(&mut rand::rngs::OsRng);
+        let auth = ok(os_random(16, "test"));
+        let as_secret = keygen();
         let mut salt = [0u8; 16];
-        salt.copy_from_slice(&ok(os_random(16)));
+        salt.copy_from_slice(&ok(os_random(16, "test")));
         let msg = b"{\"title\":\"hola\",\"body\":\"desde synsema\"}";
         let (body, _) = encrypt_with(msg, &ua_pub, &auth, &as_secret, &salt).unwrap();
         assert_eq!(decrypt_with(&body, &ua, &auth).unwrap(), msg);
@@ -768,16 +788,16 @@ mod tests {
         bad[last] ^= 1;
         assert!(decrypt_with(&bad, &ua, &auth).is_err());
         // Clave equivocada → falla.
-        let other = p256::SecretKey::random(&mut rand::rngs::OsRng);
+        let other = keygen();
         assert!(decrypt_with(&body, &other, &auth).is_err());
     }
 
     #[test]
     fn payload_size_limit_is_the_documented_one() {
-        let ua = p256::SecretKey::random(&mut rand::rngs::OsRng);
+        let ua = keygen();
         let ua_pub = uncompressed(&ua.public_key());
         let auth = [7u8; 16];
-        let as_secret = p256::SecretKey::random(&mut rand::rngs::OsRng);
+        let as_secret = keygen();
         let salt = [1u8; 16];
         let ok = vec![b'x'; MAX_PLAINTEXT];
         let (body, _) = encrypt_with(&ok, &ua_pub, &auth, &as_secret, &salt).unwrap();
@@ -791,7 +811,7 @@ mod tests {
     #[test]
     fn vapid_header_verifies_with_the_public_key() {
         use p256::ecdsa::signature::Verifier;
-        let sk = p256::SecretKey::random(&mut rand::rngs::OsRng);
+        let sk = keygen();
         let h = vapid_authorization("https://web.push.apple.com/QAbc/def?x=1", "mailto:ops@example.com", 1_900_000_000, &sk).unwrap();
         let rest = h.strip_prefix("vapid t=").unwrap();
         let (jwt, k) = rest.split_once(", k=").unwrap();
@@ -822,8 +842,8 @@ mod tests {
     #[test]
     fn build_push_request_shape_and_errors() {
         use synsema_core::types::syn_list;
-        let ua = p256::SecretKey::random(&mut rand::rngs::OsRng);
-        let vapid = p256::SecretKey::random(&mut rand::rngs::OsRng);
+        let ua = keygen();
+        let vapid = keygen();
         let sub = || {
             let mut keys = SynMap::new();
             keys.insert("p256dh", syn_text(b64url_encode(&uncompressed(&ua.public_key()))));
@@ -870,7 +890,7 @@ mod tests {
         assert!(req.headers.iter().all(|(k, _)| k != "Content-Encoding"));
 
         // Errores claros: pública cruzada, urgency inválida, opción desconocida, sin vapid.
-        let other = p256::SecretKey::random(&mut rand::rngs::OsRng);
+        let other = keygen();
         let mut bad_vapid = SynMap::new();
         bad_vapid.insert("public", syn_text(b64url_encode(&uncompressed(&other.public_key()))));
         bad_vapid.insert("private", syn_secret("k", b64url_encode(&vapid.to_bytes())));
@@ -894,7 +914,7 @@ mod tests {
 
     #[test]
     fn private_key_formats() {
-        let sk = p256::SecretKey::random(&mut rand::rngs::OsRng);
+        let sk = keygen();
         let raw = sk.to_bytes();
         let b64s = b64url_encode(&raw);
         let hexs = synsema_core::bytesutil::hex_encode(&raw);

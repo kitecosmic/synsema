@@ -85,10 +85,13 @@ have their `.sha256` files and nothing else, and `gh attestation verify` on thos
 attestations found". The release workflow (`.github/workflows/release.yml`) publishes each asset
 with a `.sha256` file and a **SLSA build provenance attestation** signed by GitHub's Sigstore
 instance, stating that this workflow built this exact file from this commit. The
-`guest-reproducible` job rebuilds the guest on two runners with the pinned toolchain and reports
-whether the hashes match — and compares both with the hash of the asset the `wasm` job actually
-published; if the three differ, the release says so (a warning with all three hashes) and does
-not claim reproducibility. When an audit closes, the tag, commit and hashes above are filled in
+`guest-reproducible` job rebuilds the guest on two runners with the pinned toolchain — since v0.6.48
+one of them from another folder and with another `CARGO_HOME`, so a dependency on the build path
+shows up — and reports whether the hashes match. It compares both with the hash of the asset the
+`wasm` job actually published; if the three differ, the release says so (a warning with all three
+hashes) and does not claim reproducibility. From v0.6.48 a rebuild of the tag gives the published
+hash from any folder on Linux (or WSL) with `packages/guests/vela/tools/build.sh`. Native Windows
+does not: the source paths inside the module use `\` there, and the script refuses to run. When an audit closes, the tag, commit and hashes above are filled in
 from those artifacts; `tools/verify.syn --audited <sha256>` then compares the release asset's
 hash with the value you copy from this table (it takes the hash from you; it does not know this
 file).

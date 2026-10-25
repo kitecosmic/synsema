@@ -1137,7 +1137,7 @@ pub mod mock {
     }
 
     fn sec1_point(k: &p384::ecdsa::SigningKey) -> Vec<u8> {
-        k.verifying_key().to_encoded_point(false).as_bytes().to_vec()
+        k.verifying_key().to_sec1_point(false).as_bytes().to_vec()
     }
 
     fn name(cn: &str) -> Vec<u8> {
@@ -1513,7 +1513,7 @@ pub fn build_attested_identity(source: &str, filename: &str, config: AttestConfi
 /// [`build_attested_identity`] con los drivers dados (los tests inyectan drivers falsos).
 /// `config.drivers` se reemplaza por sus nombres, así entra en `config_sha`.
 pub fn build_attested_identity_with(source: &str, filename: &str, mut config: AttestConfig, drivers: &[DriverFn<'_>]) -> Result<AttestedIdentity, String> {
-    use p256::elliptic_curve::sec1::ToEncodedPoint;
+    use p256::elliptic_curve::sec1::ToSec1Point;
     if drivers.is_empty() {
         return Err("serve --attested: no attestation driver".to_string());
     }
@@ -1532,7 +1532,7 @@ pub fn build_attested_identity_with(source: &str, filename: &str, mut config: At
     }
     let private_scalar = scalar.ok_or_else(|| "serve --attested: could not draw a valid P-256 scalar".to_string())?;
     let sk = p256::SecretKey::from_slice(&private_scalar).map_err(|_| "serve --attested: invalid scalar".to_string())?;
-    let point = sk.public_key().to_encoded_point(false).as_bytes().to_vec();
+    let point = sk.public_key().to_sec1_point(false).as_bytes().to_vec();
     let spki_der = der::ec_spki(der::OID_PRIME256V1, &point);
     let pkcs8_der = der::ec_pkcs8(der::OID_PRIME256V1, &private_scalar, &point);
     let config_sha = config.sha();

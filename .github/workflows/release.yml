@@ -142,11 +142,6 @@ jobs:
           RUSTFLAGS: -Cprofile-generate=${{ runner.temp }}/pgo-raw
         run: |
           set -euo pipefail
-          # macOS: el C de las dependencias sin instrumentar (Apple clang escribe otro formato de
-          # perfil que el runtime de rustc 1.99.1; ver engine/pgo/zig, que hace lo mismo en Linux).
-          if [ "$RUNNER_OS" = "macOS" ]; then
-            export "CFLAGS_${TARGET//-/_}=-fno-profile-generate" "CXXFLAGS_${TARGET//-/_}=-fno-profile-generate"
-          fi
           # El mismo comando y el mismo directorio que el build final de abajo, con otro RUSTFLAGS.
           if [ "$RUNNER_OS" = "Linux" ]; then
             cargo zigbuild --release --locked --manifest-path engine/Cargo.toml -p synsema-cli --features llm-local,judge-laya --target "$TARGET.2.17"
@@ -207,10 +202,6 @@ jobs:
           RUSTFLAGS: -Cprofile-use=${{ runner.temp }}/pgo.profdata -Cllvm-args=-pgo-warn-missing-function
         run: |
           set -euo pipefail
-          # macOS: el C sin el perfil de rustc (lo mismo que el paso instrumentado).
-          if [ "$RUNNER_OS" = "macOS" ]; then
-            export "CFLAGS_${TARGET//-/_}=-fno-profile-use" "CXXFLAGS_${TARGET//-/_}=-fno-profile-use"
-          fi
           cargo build --release --locked --manifest-path engine/Cargo.toml -p synsema-cli --features llm-local,judge-laya --target "$TARGET" 2>&1 | tee "$RUNNER_TEMP/pgo-final-build.log"
 
       # Un perfil que no calza con el build final NO rompe nada: el binario sale igual, sin la ganancia,
@@ -379,8 +370,8 @@ jobs:
           SYNSEMA_VERSION: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          cargo build --locked --manifest-path packages/guests/vela/Cargo.toml --profile wasm --target wasm32-wasip1 --target-dir engine/target
-          cargo run --locked --manifest-path packages/guests/vela/tools/wasi-stub/Cargo.toml -- engine/target/wasm32-wasip1/wasm/synsema_vela_guest.wasm synsema-vela-guest.wasm
+          # The same script as ci.yml and `guest-reproducible`: source paths remapped (v0.6.48, VG1).
+          bash packages/guests/vela/tools/build.sh synsema-vela-guest.wasm
           shasum -a 256 synsema-vela-guest.wasm > synsema-vela-guest.wasm.sha256
       # The hash of the guest this run produced, handed to `guest-reproducible-compare` as a small
       # artifact of its own (it needs the hash, not the 7 MB module).
@@ -565,13 +556,21 @@ jobs:
   # comparison is against what a user gets, not against a number this same workflow reported.
   # A difference is a warning with all three SHAs and does NOT fail the release: a verifier relies
   # on the provenance attestation, and this job only says whether "rebuild it yourself" holds too.
+  # Since v0.6.48 (VG1) the ubuntu-22.04 leg also builds from ANOTHER folder with ANOTHER CARGO_HOME
+  # (a copy of the checkout under /tmp): before, both legs ran in /home/runner/work/synsema/synsema
+  # with /home/runner/.cargo, so the job checked the compiler and never the path, and the module did
+  # depend on the path (Horizen only reached the published hash by copying the runner's folders).
   guest-reproducible:
     name: guest-reproducible (${{ matrix.os }})
     needs: prepare
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, ubuntu-22.04]
+        include:
+          - os: ubuntu-latest
+            relocate: false
+          - os: ubuntu-22.04
+            relocate: true
     runs-on: ${{ matrix.os }}
     permissions:
       contents: read
@@ -589,11 +588,21 @@ jobs:
         run: |
           set -euo pipefail
           rustc -Vv | tee rustc.txt
-          cargo build --locked --manifest-path packages/guests/vela/Cargo.toml --profile wasm --target wasm32-wasip1 --target-dir engine/target
-          cargo run --locked --manifest-path packages/guests/vela/tools/wasi-stub/Cargo.toml -- engine/target/wasm32-wasip1/wasm/synsema_vela_guest.wasm synsema-vela-guest.wasm
-          sha256sum synsema-vela-guest.wasm | awk '{print $1}' > guest.sha256
-          sha256sum engine/target/wasm32-wasip1/wasm/synsema_vela_guest.wasm | awk '{print $1}' > guest-unstubbed.sha256
-          echo "${{ matrix.os }}: stubbed $(cat guest.sha256), unstubbed $(cat guest-unstubbed.sha256)"
+          out="$GITHUB_WORKSPACE"
+          if [ "${{ matrix.relocate }}" = "true" ]; then
+            # Another folder, another name and another CARGO_HOME (the registry is downloaded again
+            # there); the toolchain is the same rustup one.
+            mkdir -p /tmp/elsewhere
+            cp -a "$GITHUB_WORKSPACE" /tmp/elsewhere/repo-copy
+            cd /tmp/elsewhere/repo-copy
+            export CARGO_HOME=/tmp/cargo-elsewhere
+            mkdir -p "$CARGO_HOME"
+          fi
+          echo "building in $(pwd) with CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" | tee -a "$out/rustc.txt"
+          bash packages/guests/vela/tools/build.sh synsema-vela-guest.wasm
+          sha256sum synsema-vela-guest.wasm | awk '{print $1}' > "$out/guest.sha256"
+          sha256sum engine/target/wasm32-wasip1/wasm/synsema_vela_guest.wasm | awk '{print $1}' > "$out/guest-unstubbed.sha256"
+          echo "${{ matrix.os }}: stubbed $(cat "$out/guest.sha256"), unstubbed $(cat "$out/guest-unstubbed.sha256")"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: guest-sha-${{ matrix.os }}
@@ -646,7 +655,7 @@ jobs:
           summary="published=$published"
           for d in shas/*/; do
             leg=$(basename "$d" | sed 's/^guest-sha-//')
-            echo "== $leg"; echo "stubbed:   $(cat "$d/guest.sha256")"; echo "unstubbed: $(cat "$d/guest-unstubbed.sha256")"; grep -E '^(release|host|commit-hash)' "$d/rustc.txt" || true
+            echo "== $leg"; echo "stubbed:   $(cat "$d/guest.sha256")"; echo "unstubbed: $(cat "$d/guest-unstubbed.sha256")"; grep -E '^(release|host|commit-hash|building)' "$d/rustc.txt" || true
             summary="$summary $leg=$(cat "$d/guest.sha256")"
           done
           distinct=$( { echo "$published"; cat shas/*/guest.sha256; } | sort -u | wc -l)

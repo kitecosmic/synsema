@@ -273,7 +273,7 @@ fn well_known_attestation_binds_the_tls_key_to_the_program() {
 
 #[test]
 fn attestation_key_is_the_announced_p256_key_and_a_secret() {
-    use p256::elliptic_curve::sec1::ToEncodedPoint;
+    use p256::elliptic_curve::sec1::ToSec1Point;
     let _port = attested_server();
     let id = synsema_stdlib::attest::attested_identity().expect("identidad instalada");
     // El escalar que `attestation_key()` devuelve es el de la clave anunciada: ECDH desde
@@ -286,7 +286,7 @@ fn attestation_key_is_the_announced_p256_key_and_a_secret() {
         assert_eq!(tag, 0x03);
         p256::PublicKey::from_sec1_bytes(&bits[1..]).unwrap()
     };
-    assert_eq!(server_sk.public_key().to_encoded_point(false), server_pub_from_spki.to_encoded_point(false));
+    assert_eq!(server_sk.public_key().to_sec1_point(false), server_pub_from_spki.to_sec1_point(false));
     let client_sk = p256::SecretKey::from_slice(&[7u8; 32]).unwrap();
     let a = p256::ecdh::diffie_hellman(server_sk.to_nonzero_scalar(), client_sk.public_key().as_affine());
     let b = p256::ecdh::diffie_hellman(client_sk.to_nonzero_scalar(), server_pub_from_spki.as_affine());

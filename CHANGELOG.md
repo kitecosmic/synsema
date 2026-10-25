@@ -6,6 +6,46 @@ Each says what changed, why, and what to write instead.
 
 Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the release date.
 
+## Unreleased
+
+**Security: RUSTSEC-2026-0387 fixed.** v0.6.47 shipped `crypto-bigint` 0.5.5, where some operations
+meant to run in constant time may branch on secret values. The elliptic-curve crates now come from
+the 0.14 generation (`k256`, `p256`, `p384`, `p521` 0.14, `ecdsa` 0.17, `elliptic-curve` 0.14), which
+uses `crypto-bigint` 0.7.8. That covers every operation with an EC secret key: ES256 and VAPID
+signing, Web Push ECDH, P-256 and P-521 ECDH (`ecdh_*`), secp256k1 and Schnorr (taproot) signing.
+The advisory is no longer ignored in `.cargo/audit.toml`, and `cargo audit` passes on the engine and
+the Vela guest.
+
+Nothing changes for a program: signatures are byte for byte the same (RFC 6979 is deterministic; a
+new test pins ES256 to the RFC's own vectors, and secp256k1 was already pinned to eth-account's), and
+keys, points and DER/PEM encodings are read and written as before. One behavior does change: when
+the host gives no entropy, `push_send` and `push_vapid_keys` now return an error instead of
+panicking. The embeddable WebAssembly module grows by about 10 KB gzipped; the Vela guest is about
+6 KB smaller and declares the same six WASI imports.
+
+**The Vela guest now rebuilds byte for byte from any folder.** Before, the module depended on where
+it was built: Rust leaves source paths in it (panic locations), and cargo hashed the absolute folder
+of the engine's crates into their `-C metadata`, which changes the generated code. So a rebuild only
+matched the published hash in GitHub Actions' own folders (`/home/runner/work/synsema/synsema`,
+`/home/runner/.cargo`). Now:
+- the source paths are remapped to `/synsema` and `/cargo`;
+- the guest's workspace is a new `Cargo.toml` at the repo root, so the engine sits under it. Its
+  lockfile moves from `packages/guests/vela/Cargo.lock` to `./Cargo.lock`.
+
+The build is one script, `packages/guests/vela/tools/build.sh`, used by CI, by the release and in
+the guest's README. The release's `guest-reproducible` check now builds one of its two copies from
+another folder with another `CARGO_HOME`, so a path dependency fails the comparison. The guest's
+sha256 changes once more than usual in this release (RustCrypto plus the paths), and from here on a
+rebuild of the tag gives the published hash from any folder on Linux (or WSL). Native Windows does
+not reach it: the source paths inside the module use `\` there, which Rust cannot normalize, so
+`build.sh` refuses to run under Git Bash, MSYS or Cygwin instead of producing a hash that never
+matches.
+
+The release build uses `cc` 1.10 (was 1.2.65). `cc` 1.8.0 fixed how it forwarded rustc's
+`-Cprofile-generate`/`-Cprofile-use` to clang-based C compilers (zig cc, Apple clang; cc-rs#1986),
+which made the instrumented PGO binary crash on exit with rustc 1.99.1, so the workarounds v0.6.47
+added (in `engine/pgo/zig`, and in `release.yml` for macOS) are gone.
+
 ## v0.6.47 — 2026-10-24
 
 **Built with Rust 1.99.1 (was 1.96.0).** The releases in between fix four miscompilations (MIR

@@ -486,14 +486,12 @@ impl PubKey {
             PubKey::P256 { x, y } => {
                 use p256::ecdsa::signature::Verifier;
                 use p256::ecdsa::{Signature, VerifyingKey};
-                use p256::elliptic_curve::generic_array::GenericArray;
-                use p256::EncodedPoint;
-                let pt = EncodedPoint::from_affine_coordinates(
-                    GenericArray::from_slice(x),
-                    GenericArray::from_slice(y),
-                    false,
-                );
-                let Ok(vk) = VerifyingKey::from_encoded_point(&pt) else { return false };
+                use p256::{FieldBytes, Sec1Point};
+                let (Ok(x), Ok(y)) = (FieldBytes::try_from(x.as_slice()), FieldBytes::try_from(y.as_slice())) else {
+                    return false;
+                };
+                let pt = Sec1Point::from_affine_coordinates(&x, &y, false);
+                let Ok(vk) = VerifyingKey::from_sec1_point(&pt) else { return false };
                 let Ok(s) = Signature::from_der(sig) else { return false };
                 vk.verify(msg, &s).is_ok()
             }
@@ -844,11 +842,11 @@ mod tests {
 
     impl P256Auth {
         fn new() -> Self {
-            let secret = p256::SecretKey::random(&mut rand::rngs::OsRng);
+            let secret = <p256::SecretKey as p256::elliptic_curve::Generate>::generate();
             P256Auth { sk: p256::ecdsa::SigningKey::from(secret) }
         }
         fn cose(&self) -> Cbor {
-            let pt = self.sk.verifying_key().to_encoded_point(false);
+            let pt = self.sk.verifying_key().to_sec1_point(false);
             Cbor::Map(vec![
                 (Cbor::Int(1), Cbor::Int(2)),
                 (Cbor::Int(3), Cbor::Int(-7)),

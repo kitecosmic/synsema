@@ -31,16 +31,4 @@ ignore = [
     "RUSTSEC-2026-0367",
     "RUSTSEC-2026-0368",
     "RUSTSEC-2026-0369",
-
-    # crypto-bigint 0.5.5 (RUSTSEC-2026-0387, 2026-10-23): ramas que dependen del secreto en
-    # resta, conteo de ceros, división y multiplicación de Montgomery, según compilador y CPU.
-    # Agregado 2026-10-24 (v0.6.47). Entra por elliptic-curve 0.13 (k256/p256/p384/p521 0.13), y SÍ
-    # hay operaciones con clave secreta: firma ES256 y VAPID (p256), ECDH de webpush (p256) y de
-    # P-521, firma de blockchain (k256). No es una aceptación de que no afecte: la serie 0.5 no
-    # tiene parche (sólo >= 0.7.6), y el arreglo es migrar a la pila RustCrypto 0.14 (k256/p256/
-    # p384/p521 0.14, ecdsa 0.17, elliptic-curve 0.14), unos 20 archivos de cripto con sus
-    # vectores. Eso no entra apurado en un corte: es el primer ítem de v0.6.48
-    # (specs/v0.6.48-migas.md). Todo binario publicado hasta v0.6.46 ya trae esta versión.
-    # Quitar con esa migración; no dejar pasar otra versión con este ignore.
-    "RUSTSEC-2026-0387",
 ]

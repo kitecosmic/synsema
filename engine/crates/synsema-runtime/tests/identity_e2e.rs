@@ -15,7 +15,7 @@ use std::net::{TcpListener, TcpStream};
 use std::thread;
 use std::time::Duration;
 
-use p256::elliptic_curve::sec1::ToEncodedPoint;
+use p256::elliptic_curve::sec1::ToSec1Point;
 use sha2::{Digest, Sha256};
 use synsema_core::bytesutil::{b64url_encode, hex_encode};
 use synsema_runtime::engine::run_program;
@@ -79,7 +79,7 @@ fn p256_fixture() -> P256Fixture {
     let mut scalar = [0u8; 32];
     scalar[31] = 7;
     let sk = p256::SecretKey::from_slice(&scalar).unwrap();
-    let pt = sk.public_key().to_encoded_point(false);
+    let pt = sk.public_key().to_sec1_point(false);
     let mut sec1 = vec![0x30, 0x25, 0x02, 0x01, 0x01, 0x04, 0x20];
     sec1.extend_from_slice(&scalar);
     let alg: Vec<u8> = vec![
@@ -92,7 +92,7 @@ fn p256_fixture() -> P256Fixture {
     spki.push(66);
     spki.push(0x00);
     spki.extend_from_slice(pt.as_bytes());
-    let did = did_encode(KeyAlg::P256, sk.public_key().to_encoded_point(true).as_bytes()).unwrap();
+    let did = did_encode(KeyAlg::P256, sk.public_key().to_sec1_point(true).as_bytes()).unwrap();
     P256Fixture { sec1_pem: pem("EC PRIVATE KEY", &sec1), spki_pem: pem("PUBLIC KEY", &spki), did }
 }
 
@@ -123,7 +123,7 @@ print("p256 " + did_key_encode(bytes("{p256_hex}", "hex"), "p256"))
         p256_hex = {
             let mut scalar = [0u8; 32];
             scalar[31] = 7;
-            hex_encode(p256::SecretKey::from_slice(&scalar).unwrap().public_key().to_encoded_point(true).as_bytes())
+            hex_encode(p256::SecretKey::from_slice(&scalar).unwrap().public_key().to_sec1_point(true).as_bytes())
         }
     );
     let r = run_program(&prog, "identity_pure.syn");
@@ -419,7 +419,7 @@ fn client_data(ty: &str, chal: &[u8]) -> Vec<u8> {
 }
 
 fn cose_p256(sk: &p256::ecdsa::SigningKey) -> Vec<u8> {
-    let pt = sk.verifying_key().to_encoded_point(false);
+    let pt = sk.verifying_key().to_sec1_point(false);
     let mut out = Vec::new();
     cbor_head(5, 5, &mut out);
     cbor_int(1, &mut out);

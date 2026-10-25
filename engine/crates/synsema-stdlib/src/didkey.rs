@@ -23,7 +23,7 @@
 //! `did:key:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK`).
 
 use synsema_core::types::SynMap;
-use p256::elliptic_curve::sec1::ToEncodedPoint;
+use p256::elliptic_curve::sec1::ToSec1Point;
 
 use synsema_core::bytesutil::{base58_decode, base58_encode, hex_decode};
 use synsema_core::interpreter::{Control, Interpreter, RuntimeError};
@@ -102,12 +102,12 @@ fn normalize_key(alg: KeyAlg, key: &[u8]) -> Result<Vec<u8>, String> {
         KeyAlg::P256 => {
             let pk = p256::PublicKey::from_sec1_bytes(key)
                 .map_err(|_| "not a valid P-256 point (SEC1: 33 bytes compressed or 65 uncompressed)".to_string())?;
-            Ok(pk.to_encoded_point(true).as_bytes().to_vec())
+            Ok(pk.to_sec1_point(true).as_bytes().to_vec())
         }
         KeyAlg::Secp256k1 => {
             let pk = k256::PublicKey::from_sec1_bytes(key)
                 .map_err(|_| "not a valid secp256k1 point (SEC1: 33 bytes compressed or 65 uncompressed)".to_string())?;
-            Ok(pk.to_encoded_point(true).as_bytes().to_vec())
+            Ok(pk.to_sec1_point(true).as_bytes().to_vec())
         }
     }
 }
@@ -320,8 +320,8 @@ mod tests {
 
     #[test]
     fn p256_is_compressed_and_wrong_prefixes_are_errors() {
-        let sk = p256::SecretKey::random(&mut rand::rngs::OsRng);
-        let uncompressed = sk.public_key().to_encoded_point(false).as_bytes().to_vec();
+        let sk = <p256::SecretKey as p256::elliptic_curve::Generate>::generate();
+        let uncompressed = sk.public_key().to_sec1_point(false).as_bytes().to_vec();
         let did = encode(KeyAlg::P256, &uncompressed).unwrap();
         let (alg, key, _) = decode(&did).unwrap();
         assert_eq!(alg, KeyAlg::P256);

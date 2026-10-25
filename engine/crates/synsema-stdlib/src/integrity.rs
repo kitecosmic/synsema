@@ -110,8 +110,8 @@ impl Signer {
         match self {
             Signer::Ed25519(sk) => didkey::encode(KeyAlg::Ed25519, &sk.verifying_key().to_bytes()),
             Signer::P256(sk) => {
-                use p256::elliptic_curve::sec1::ToEncodedPoint;
-                didkey::encode(KeyAlg::P256, sk.public_key().to_encoded_point(true).as_bytes())
+                use p256::elliptic_curve::sec1::ToSec1Point;
+                didkey::encode(KeyAlg::P256, sk.public_key().to_sec1_point(true).as_bytes())
             }
         }
     }
@@ -335,7 +335,7 @@ impl Verifier {
 pub(crate) fn did_key_of_public_key(v: &SynValue, who: &str) -> Result<String, Control> {
     let did = match verifier_from(v, who)? {
         Verifier::Ed25519(pk) => didkey::encode(KeyAlg::Ed25519, &pk),
-        Verifier::P256(vk) => didkey::encode(KeyAlg::P256, vk.to_encoded_point(true).as_bytes()),
+        Verifier::P256(vk) => didkey::encode(KeyAlg::P256, vk.to_sec1_point(true).as_bytes()),
     };
     did.map_err(|e| err(format!("{}: {}", who, e)))
 }
@@ -648,10 +648,10 @@ mod tests {
 
     #[test]
     fn ecdsa_jcs_2019_with_a_p256_secret_and_a_did_key() {
-        let sk = p256::SecretKey::random(&mut rand::rngs::OsRng);
+        let sk = <p256::SecretKey as p256::elliptic_curve::Generate>::generate();
         let scalar: [u8; 32] = sk.to_bytes().into();
-        use p256::elliptic_curve::sec1::ToEncodedPoint;
-        let pk = sk.public_key().to_encoded_point(true).as_bytes().to_vec();
+        use p256::elliptic_curve::sec1::ToSec1Point;
+        let pk = sk.public_key().to_sec1_point(true).as_bytes().to_vec();
         let did = didkey::encode(KeyAlg::P256, &pk).unwrap();
         let opts = entries(&map(vec![
             ("verification_method", text(&did)),

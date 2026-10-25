@@ -218,3 +218,9 @@ libc = "0.2"
 [dev-dependencies]
 # Cert self-signed para los tests de integración TLS (backend ring, sin C/cmake).
 rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
+# v0.6.48 (RustCrypto 0.14): las claves al azar de los tests salen de `Generate::generate()`, que pide
+# la feature `getrandom` (getrandom 0.4). Sólo en dev-dependencies: el binario y los builds wasm no la
+# compilan (resolver 2), y en el código del motor la clave sale de `os_random`.
+k256 = { workspace = true, features = ["getrandom"] }
+p256 = { workspace = true, features = ["getrandom"] }
+p384 = { workspace = true, features = ["getrandom"] }
