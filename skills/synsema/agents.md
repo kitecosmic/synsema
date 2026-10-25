@@ -73,6 +73,14 @@ for state that must survive restarts, agents share the program's **declared memo
 its own `source` namespace, and `recall()` inside an agent defaults to its OWN entries —
 cross with `recall(from = "other")` / `from = "*"`. See [memory.md](memory.md).)
 
+**With labels under `serve` (v0.6.47+) a run's writes land all at once or not at all.** Under
+`serve --labels` each request, cron tick and socket handler is a run (with every agent it spawned):
+its `share`s and signals are committed when the whole run ends without a label cut, and undone if
+any part of it is cut, including what its agents wrote after the request answered. Measured: a
+route that `share`s `"b"` and then hits a cut answers 500, and a later request's `observe "b"` gets
+`nothing`. Without labels nothing changes. See [labels.md](labels.md) § What a cut shows, and to
+whom.
+
 ## Signals (consumable queue)
 ```synsema
 signal "done"                    -- emit a signal

@@ -126,7 +126,9 @@ sandbox under {"declassify": "customers"}       -- delegate it to this block onl
   `--cap-set "stdout,time,declassify=app"`).
 - **A refusal is a `label_violation`, and `try`/`recover` cannot catch it** (whether it passes
   depends on the real label of the value — a catchable refusal would be an oracle). Like every label
-  violation, it ends the run and withholds the buffered output:
+  violation, it ends the run and withholds the buffered output. **Under a ceiling the error does not
+  say which `declassify` it was** (see [What a cut shows, and to whom](#what-a-cut-shows-and-to-whom-v0647));
+  without a ceiling, as the owner's own run, it does:
 
 ```
 Runtime error: app.syn:3:17: label_violation: declassify is not granted for what this value is
@@ -150,6 +152,52 @@ private to (customers,others). With a ceiling the host names what a program may 
   `synsema: warning: bare \`require declassify\` permits publishing data private to ANY principal;
   scope it with \`require declassify("principal")\` (the principal the call removes)`.
 - The Vela guest runs its app under `stdout,declassify=app` (its only principal is `app`).
+
+## What a cut shows, and to whom (v0.6.47+)
+
+A cut by the flow checker (any `label_violation`) used to tell the program and the log **where** it
+fell, and that was itself a channel: a private value can choose which of N sites fails. Now who runs
+the program decides what it sees:
+
+| How it runs (with labels) | What the program and its output show | Where the detail goes |
+|---|---|---|
+| `run`/`test` **without** a ceiling (native or the wasip1 binary) | the full error, with file, line and what failed (the owner's own run) | the same, on stderr |
+| `run --cap-set …`, `--sandbox`, `--deterministic`, `--trusted` | a fixed error with **no location** | only the sealed receipt with `--auditor` |
+| `serve --labels` / `serve --attested` | a 500 with the fixed text (below) | the server's stderr line has the same fixed text; the detail only in the sealed receipt with `--auditor` |
+| embeddable WebAssembly (`run`/`handle` with `labels: true`) | `errors` has the fixed text | `operator_detail` in the result (the `log` hook does not get it) |
+| the Vela guest | `{"error": "label_violation"}` | the Executor's log gets one fixed line ([guests.md](guests.md)) |
+
+In every case the output printed before the cut is replaced by one line:
+
+```
+private(labels): the run was stopped by the flow checker; its output is withheld because the NUMBER of lines before the stop depends on private data
+```
+
+and the fixed error, under a ceiling, under `serve` and in WebAssembly, is the same for every site:
+
+```
+Runtime error: label_violation: the flow checker stopped the run (private to customers); what failed, where and how to fix it go to the operator, not to the program
+```
+
+(`customers` is the program's **declared** set of principals, a constant of the program — never the
+label of the value that failed.) Measured on v0.6.47: the same program, `run --labels` prints
+`cut.syn:4:10: label_violation: print called under private control flow (pc = [customers]) …`, and
+`run --labels --cap-set stdout` prints the fixed line above. **To debug a cut, run it yourself
+without a ceiling**, or read `operator_detail` in WebAssembly; the program cannot see the detail.
+
+- **A cut in an agent cuts the run it belongs to**: under `run`, the whole program (it ends with
+  the same fixed error; without a ceiling the detail starts with `agent Leaky_0: …`); under
+  `serve --labels`, the request or tick that spawned it. From then on every sink of that run fails.
+- **`serve --labels`: each request, cron tick and socket handler is its own run.** Its stdout and
+  stderr are held and written when it ends, or replaced by the fixed line if it was cut; agent
+  output is not written. The server says so at startup:
+  `[serve] labels: request and cron output is logged when each one ends, and not at all if a label cut stopped it; agent output is not logged (which agent stopped would be the private data)`.
+  For a live log while developing, run without `--labels`. `agents()` and `agent_stop` see only the
+  agents of the same run.
+- **`serve --labels` and the blackboard and signals**: a run (the request, or the preamble, with all
+  its agents) is **committed once**, when all of it has ended without a cut, and **undone entirely**
+  if any part is cut, including what its agents wrote after the request answered. What other runs
+  read while it was open, and signals already consumed, stay (as with any effect before a cut).
 
 ## What `receipt()` publishes after private data (v0.6.46+)
 

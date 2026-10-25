@@ -2,7 +2,8 @@
 
 Read this FIRST if something fails. Each row is a real mistake that costs hours to debug.
 
-> **Just upgraded and something that worked now fails?** Start at *Upgrading to v0.6.46* (secrets
+> **Just upgraded and something that worked now fails?** Start at *Upgrading to v0.6.47* (label cuts
+> with no location, runs committed or undone under `serve --labels`, the audit's grant), then *v0.6.46* (secrets
 > in encodings, wildcards and private addresses, `declassify` under a ceiling, `watch`/`cwd`), then
 > *v0.6.45* (file scopes, `static`, templates), *v0.6.42*, *v0.6.29* and *v0.6.24*, right below.
 >
@@ -12,6 +13,16 @@ Read this FIRST if something fails. Each row is a real mistake that costs hours 
 > Behavioral surprises · Anti-patterns · Secrets & config
 > Coming from Python? The traps that LOOK like Python but aren't are also collected in
 > [python-diff.md](python-diff.md).
+
+## Upgrading to v0.6.47 — what behaves differently
+
+| You see | What changed | What to write |
+|---|---|---|
+| `Runtime error: label_violation: the flow checker stopped the run (private to …); what failed, where and how to fix it go to the operator, not to the program` (with `--labels` under `--cap-set`/`--sandbox`/`--deterministic`/`--trusted`, under `serve --labels`/`--attested`, in WebAssembly) | a label cut no longer tells the program where it fell: which of N sites failed was a channel for the private value | nothing in the program; to see the site and the fix, run it yourself **without** a ceiling (`synsema run --labels app.syn`), read `operator_detail` in WebAssembly, or open the receipt with `--auditor` — [labels.md](labels.md) § What a cut shows, and to whom |
+| under `serve --labels`, request output appears when the request ends, not live; agent output does not appear | each request/tick/socket handler is a run whose output is held and written at its end, or replaced by one fixed line if it was cut | for a live log while developing, run without `--labels` |
+| under `serve --labels`, a `share` from a request that failed with a label cut is gone | the run's blackboard writes and signals are committed only when it ends without a cut | do not rely on writes made before a cut ([agents.md](agents.md) § Blackboard) |
+| Vela: `{"error": "label_violation"}` where it was `runtime_error`, and the log line `ERR label_violation: the flow checker stopped the run; what failed and where stay in the enclave` | any flow-checker cut (a refused `declassify`, an error on private data) is `label_violation`, with no path in the log | debug with `synsema test --labels app/app.syn` (no ceiling) — [guests.md](guests.md) |
+| the audit's `Granted by …` names a different grant than before (always the same one now) | it names the narrowest grant that covers the use, not a random one | nothing; see [capabilities.md](capabilities.md) § Audit |
 
 ## Upgrading to v0.6.46 — what behaves differently
 
