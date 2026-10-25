@@ -447,10 +447,13 @@ v0.6.24, `release.yml@refs/tags/v0.6.24` at commit `8284861`. This is the check 
 
 **3. Reproducibility — can someone else get the same bytes?** For the **Vela guest** the release
 rebuilds `synsema-vela-guest.wasm` on two different Ubuntu versions with the pinned toolchain and
-compares both against the asset it published. On v0.6.24 all three agreed:
-`87bad7b8d20c1d249fbfd06a9cf48c73e51af533bfd87754351922ee587d0325`. It matters there because the
-chain verifies a `wasmSha256`, so "rebuild it yourself and compare" is a real check a counterparty
-can run.
+compares both against the asset it published; since v0.6.48 one of the two builds from another
+folder with another `CARGO_HOME`. On v0.6.48 all three agreed: `f1284076b8098915e31002baecbd2348b9987c586a1446ceaf498307a429315d`. It matters there because
+the chain verifies a `wasmSha256`, so "rebuild it yourself and compare" is a real check a
+counterparty can run: from a checkout of the tag, on Linux or WSL, `bash
+packages/guests/vela/tools/build.sh out.wasm` from the repo root gives the published hash in any
+folder (before v0.6.48 it held only in the runner's own path). Native Windows does not reproduce it
+(the paths inside the module keep `\`) and the script refuses to run there.
 
 **What is not promised, stated plainly.** That comparison **warns, it does not fail** the release:
 reproducibility is *reported*, not guaranteed. And the four native binaries have **no reproducibility

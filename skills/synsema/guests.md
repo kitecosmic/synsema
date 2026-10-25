@@ -35,16 +35,27 @@ node scripts/smoke.mjs build/app.wasm                                           
 
 Only when changing the ADAPTER itself (packages/guests/vela):
 ```sh
-rustup target add wasm32-wasip1 && cd packages/guests/vela
-cargo build --profile wasm                             # → ../../../engine/target/wasm32-wasip1/wasm/synsema_vela_guest.wasm (≈ 11.1 MB, ≈ 10.7 MB once stubbed; 2–5 min, LTO); SYNSEMA_VELA_APP=… fills the slot at build time
-# THEN stub the WASI imports Vela refuses: the STUBBED file IS the module — what the probes load,
-# what the release publishes, what `embed.syn` fills. Run it from the REPO ROOT (inside the crate,
-# .cargo/config.toml would cross-compile the tool itself to wasm), hence the subshell:
-(cd ../../.. && W=engine/target/wasm32-wasip1/wasm/synsema_vela_guest; cargo run --locked --manifest-path packages/guests/vela/tools/wasi-stub/Cargo.toml -- $W.wasm $W.stubbed.wasm)   # imports: 23 -> 6
+rustup target add wasm32-wasip1
+# FROM THE REPO ROOT, on Linux or WSL (v0.6.48+). Builds AND stubs the WASI imports Vela refuses; the
+# STUBBED file IS the module — what the probes load, what the release publishes, what `embed.syn` fills.
+bash packages/guests/vela/tools/build.sh my_guest.wasm   # ≈ 10.7 MB stubbed (unstubbed ≈ 11.1 MB in engine/target/wasm32-wasip1/wasm/); 2–5 min, LTO; imports: 23 -> 6
+SYNSEMA_VELA_APP=/abs/path/app.syn bash packages/guests/vela/tools/build.sh my_guest.wasm   # fill the slot at build time (a relative path is read from packages/guests/vela)
+cd packages/guests/vela
 node ../../../tests/vela_guest.probe.mjs <the STUBBED .wasm>   # WASI ≈ the Executor: imports, exports, every entry point, formats, determinism, memory
 cd tests/wasmtime-go && go run . <the STUBBED .wasm>   # wasmtime-go v1.0.0 = the Executor's exact runtime (needs Go + a C compiler)
 cargo test --target <host triple>                      # unit tests — the crate's DEFAULT target is wasm, a bare `cargo test` builds a .wasm it cannot run
 ```
+
+**Rebuilding the published hash (v0.6.48+).** `tools/build.sh` is the one recipe CI, the release
+and the README use: it remaps the source paths Rust leaves in the module
+(`--remap-path-prefix=<repo>=/synsema`, `<CARGO_HOME>=/cargo`, through `--config`, because
+`RUSTFLAGS` would replace the guest's 64 MB stack flag), and the guest's workspace is the repo root's
+`Cargo.toml` (lockfile `./Cargo.lock`). So a checkout of the tag rebuilds the release's
+`synsema-vela-guest.wasm` byte for byte **from any folder and any `CARGO_HOME`, on Linux or WSL**.
+Native Windows cannot: the paths inside the module keep `\`, and the script refuses to run there
+(Git Bash, MSYS, Cygwin), as it does with `RUSTFLAGS` set. A hand-written `cargo build` inside
+`packages/guests/vela` does not reproduce the hash. The release's `guest-reproducible` job checks
+this on two runners, one from another folder and another `CARGO_HOME`; it warns, it does not fail.
 
 The guest always targets `wasm32-wasip1` (`.cargo/config.toml`): Vela's linker defines WASI only,
 and `print` becomes the Executor's log (`INF …`) — which under Nitro is written **outside** the
