@@ -6,7 +6,7 @@ Each says what changed, why, and what to write instead.
 
 Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the release date.
 
-## Unreleased
+## v0.6.48 — 2026-10-25
 
 **Security: RUSTSEC-2026-0387 fixed.** v0.6.47 shipped `crypto-bigint` 0.5.5, where some operations
 meant to run in constant time may branch on secret values. The elliptic-curve crates now come from
