@@ -300,8 +300,9 @@ kept in a fixed order, the one that covers least first, read the way each type m
   (`net("10.0.0.0/8:9")` before `net("10.0.0.0/8")`);
 - `secret`: one bound to hosts (`secret("k") for net("*.x.com")`) before the unbound one;
 - `llm`/`judge`: the scope names whose private data may be sent, so the **unscoped** grant covers only
-  public data and is the narrowest — a public call names `llm`, a call with data of `P` names
-  `llm("P…")`;
+  public data and is the narrowest. The entry of the operation itself (`source: "llm operation"`)
+  names `llm` for every call; a call with private data of `P` leaves, besides, an entry with
+  `source: "llm-data"` whose `capability` is the grant that let the data out (`llm("P@<provider>")`);
 - ties break by type and then scope. The order is read from the text, so a relative path against an
   absolute one compares by length.
 
