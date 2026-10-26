@@ -9,7 +9,7 @@ ABI (ver engine/crates/synsema-wasm-web/src/lib.rs):
   imports  synsema_host.host_call / host_random_fill / host_now_ms
 
 El host es un dict con lo que tu app le PRESTA al programa (todo opcional):
-  {"http": fn(req) -> dict, "kv": obj con get/set/delete/list, "llm": fn(op, prompt),
+  {"http": fn(req) -> dict, "kv": obj con get/set/delete/list, "llm": fn(op, prompt, principals),
    "log": fn(line), "sleep": fn(secs) | True}
 Python es síncrono, así que no hace falta ningún bridge: urllib/requests resuelven ahí.
 """
@@ -84,7 +84,9 @@ def dispatch_host(host, kind, payload):
     if kind == "llm":
         if not callable(host.get("llm")):
             return None
-        r = host["llm"](payload["op"], payload["prompt"])
+        # `principals`: los dueños de lo privado que lleva el prompt (vacío con datos públicos); la app
+        # decide con eso a qué proveedor puede ir.
+        r = host["llm"](payload["op"], payload["prompt"], payload.get("principals") or [])
         return {"content": r, "tokens": 0} if isinstance(r, str) else {"content": str(r.get("content", "")), "tokens": int(r.get("tokens", 0))}
     if kind == "log":
         if not callable(host.get("log")):
@@ -162,8 +164,10 @@ class Synsema:
         finally:
             self._host = None
 
-    def _req(self, op, source, filename="<embedded>", env=None, ceiling=None, host=None):
+    def _req(self, op, source, filename="<embedded>", env=None, ceiling=None, host=None, labels=False):
         r = {"op": op, "source": source, "filename": filename}
+        if labels:
+            r["labels"] = True
         if env:
             r["env"] = env
         if ceiling:

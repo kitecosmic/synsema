@@ -335,6 +335,8 @@ g.close();
 // =========================================================
 console.log("== embedded probe program: free text → app_error, raise → runtime_error, invariants");
 const TAMPER = `-- probe-only program: the cases the example app no longer has
+-- v0.6.49 (A1): under the guest's ceiling an app publishes only what it declares.
+require declassify("app")
 task deploy(ctx)
     let r be {"state": {"total": 0, "nonce": 0}}
     when ctx["params"] != nothing and contains(ctx["params"], "policy")

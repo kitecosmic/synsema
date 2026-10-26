@@ -286,6 +286,9 @@ pub struct ReceiptContext<'a> {
     pub key: &'a RunKey,
     pub program_sha: Option<String>,
     pub config_sha: Option<String>,
+    /// v0.6.49 (ronda 1, M3): el sha256 de cada módulo `--trusted` (`{nombre: sha}`), o `None` si
+    /// la corrida no tuvo. `--replay` lo compara como a `program_sha`.
+    pub trusted: Option<serde_json::Value>,
     pub started: String,
 }
 
@@ -333,6 +336,16 @@ fn parse_entries(list: &[(u64, String)]) -> Vec<(u64, Value)> {
         .collect()
 }
 
+/// v0.6.49 (ronda 1, M3): el `trusted` del encabezado: el sha256 de cada módulo de confianza
+/// (`{nombre: sha}`), o `None` si la corrida no tuvo.
+pub fn trusted_shas(modules: &[(String, String)]) -> Option<Value> {
+    if modules.is_empty() {
+        return None;
+    }
+    let map: Map<String, Value> = modules.iter().map(|(name, src)| (name.clone(), Value::String(hex_encode(&Sha256::digest(src.as_bytes()))))).collect();
+    Some(Value::Object(map))
+}
+
 /// Arma el recibo sellado de la corrida que registró `log`.
 pub fn build_receipt(log: &RunLog, ctx: &ReceiptContext<'_>) -> Result<Value, String> {
     let public_seq = parse_entries(&log.public);
@@ -351,6 +364,7 @@ pub fn build_receipt(log: &RunLog, ctx: &ReceiptContext<'_>) -> Result<Value, St
         "engine": crate::attest::engine_version(),
         "program_sha": ctx.program_sha,
         "config_sha": ctx.config_sha,
+        "trusted": ctx.trusted,
         "started": ctx.started,
         "run_key": {"alg": ctx.key.alg(), "public": b64url_encode(&ctx.key.public_bytes()), "identity": ctx.key.identity},
         "auditor": b64url_encode(&ctx.auditor),
@@ -512,7 +526,10 @@ pub fn open_receipt(receipt: &Value, auditor_sk: &[u8]) -> Result<Value, String>
 /// Adónde van los recibos de `serve`: una línea JSON por request.
 enum ReceiptDest {
     Stderr,
-    File(std::fs::File),
+    /// v0.6.49 (B11): la RUTA, que se abre para agregar en cada recibo. Con el archivo abierto una
+    /// vez, borrarlo dejaba a `serve` escribiendo en un archivo sin nombre: los recibos se perdían
+    /// en silencio. Abrir por request cuesta poco al lado de sellar el recibo.
+    File(String),
     #[cfg(unix)]
     Fd(i32),
 }
@@ -569,17 +586,18 @@ pub fn install_serve_receipts(
                 return Err("--receipt fd:N is only available on Unix; use --receipt <path>".to_string());
             }
         }
-        Some(path) => ReceiptDest::File(
-            std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(path)
-                .map_err(|e| format!("--receipt: cannot open {}: {}", path, e))?,
-        ),
+        Some(path) => {
+            open_append(path).map_err(|e| format!("--receipt: cannot open {}: {}", path, e))?;
+            ReceiptDest::File(path.to_string())
+        }
     };
     SERVE_RECEIPTS
         .set(ServeReceipts { auditor, size, key, program_sha, config_sha, dest: std::sync::Mutex::new(dest) })
         .map_err(|_| "the serve receipts are already installed in this process".to_string())
+}
+
+fn open_append(path: &str) -> std::io::Result<std::fs::File> {
+    std::fs::OpenOptions::new().create(true).append(true).open(path)
 }
 
 /// ¿Corre `serve` con auditor?
@@ -637,6 +655,7 @@ pub fn request_finish() -> Result<(), String> {
                 key: &r.key,
                 program_sha: r.program_sha.clone(),
                 config_sha: r.config_sha.clone(),
+                trusted: None,
                 started: req.started.clone(),
             },
         )?
@@ -650,7 +669,7 @@ pub fn request_finish() -> Result<(), String> {
             let mut e = std::io::stderr().lock();
             e.write_all(line.as_bytes()).and_then(|_| e.flush())
         }
-        ReceiptDest::File(f) => f.write_all(line.as_bytes()).and_then(|_| f.flush()),
+        ReceiptDest::File(path) => open_append(path).and_then(|mut f| f.write_all(line.as_bytes()).and_then(|_| f.flush())),
         #[cfg(unix)]
         ReceiptDest::Fd(n) => {
             use std::os::unix::io::FromRawFd;
@@ -756,7 +775,7 @@ mod tests {
         let l = log.lock().unwrap();
         build_receipt(
             &l,
-            &ReceiptContext { auditor, key, program_sha: Some("ab".repeat(32)), config_sha: None, started: "2026-10-21T00:00:00Z".into() },
+            &ReceiptContext { auditor, key, program_sha: Some("ab".repeat(32)), config_sha: None, trusted: None, started: "2026-10-21T00:00:00Z".into() },
         )
         .unwrap()
     }
@@ -796,7 +815,7 @@ mod tests {
         }
         let t0 = std::time::Instant::now();
         let l = log.lock().unwrap();
-        let ctx = ReceiptContext { auditor: pk, key: &key, program_sha: None, config_sha: None, started: "2026-10-21T00:00:00Z".into() };
+        let ctx = ReceiptContext { auditor: pk, key: &key, program_sha: None, config_sha: None, trusted: None, started: "2026-10-21T00:00:00Z".into() };
         let r = build_receipt(&l, &ctx).unwrap();
         assert!(t0.elapsed() < std::time::Duration::from_secs(20), "{:?}", t0.elapsed());
         let o = open_receipt(&r, &sk).unwrap();
@@ -852,7 +871,7 @@ mod tests {
         let mut l = RunLog::new(16 * 1024);
         l.seed = Some("00".repeat(32));
         l.push_sealed(json!({"kind": "op", "line": "x"}).to_string());
-        let ctx = ReceiptContext { auditor: pk, key: &key, program_sha: None, config_sha: None, started: "s".into() };
+        let ctx = ReceiptContext { auditor: pk, key: &key, program_sha: None, config_sha: None, trusted: None, started: "s".into() };
         let good = build_receipt(&l, &ctx).unwrap();
         let mut forged = good.clone();
         forged["root"] = json!(hex_encode(&[7u8; 32]));

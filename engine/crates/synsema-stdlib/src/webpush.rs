@@ -406,6 +406,14 @@ fn payload_bytes(v: Option<&SynValue>) -> Result<Option<Vec<u8>>, Control> {
         Some(SynValue::Text(s)) => Ok(Some(s.as_bytes().to_vec())),
         Some(SynValue::Bytes(b)) => Ok(Some(b.to_vec())),
         Some(v @ SynValue::Map(_)) | Some(v @ SynValue::List(_)) => {
+            // v0.6.49 (A4): un secreto adentro es error, como en `json_encode` (antes salía el
+            // marcador `[redacted]` como dato, con un aviso `[serve]`). El payload va al navegador,
+            // que es otro dueño: no hay host al que atarlo, así que el remedio es sacarlo.
+            crate::json::reject_code_with(v, "push_send", "the payload", &|_| {
+                "a push payload goes to the browser, another owner, so a secret cannot travel in it; \
+                 leave it out of the payload"
+                    .to_string()
+            })?;
             Ok(Some(crate::json::dumps_syn(v).into_bytes()))
         }
         Some(SynValue::Secret(_)) => Err(err("push_send: the payload cannot be a secret (it would leave the process)")),
@@ -910,6 +918,29 @@ mod tests {
         // Un secret como payload jamás sale del proceso.
         let e = errmsg(build_push_request(&[sub(), syn_secret("s", "x"), opts(vec![])], 0));
         assert!(e.contains("cannot be a secret"), "{}", e);
+        // v0.6.49 (A4): ni dentro de un mapa o una lista, a cualquier nivel: error que nombra dónde
+        // está (antes salía `[redacted]` como dato). Tampoco código.
+        let mut m = SynMap::new();
+        m.insert("k", syn_secret("K", "sk-push-LEAK"));
+        let e = errmsg(build_push_request(&[sub(), syn_map(m), opts(vec![])], 0));
+        assert!(e.contains("push_send: the payload[\"k\"] is secret(K)") && e.contains("leave it out of the payload"), "{}", e);
+        assert!(!e.contains("sk-push-LEAK") && !e.contains("require secret"), "{}", e);
+        let mut inner = SynMap::new();
+        inner.insert("a", syn_list(vec![syn_secret("K", "x")]));
+        let e = errmsg(build_push_request(&[sub(), syn_list(vec![syn_int(1), syn_map(inner)]), opts(vec![])], 0));
+        assert!(e.contains("the payload[1][\"a\"][0] is secret(K)"), "{}", e);
+        let mut code = SynMap::new();
+        code.insert(
+            "f",
+            SynValue::Builtin(std::rc::Rc::new(synsema_core::interpreter::BuiltinTask::new(
+                "upper",
+                1,
+                None,
+                std::rc::Rc::new(|_i, _a, _l| Ok(SynValue::Nothing)),
+            ))),
+        );
+        let e = errmsg(build_push_request(&[sub(), syn_map(code), opts(vec![])], 0));
+        assert!(e.contains("not data"), "{}", e);
     }
 
     #[test]

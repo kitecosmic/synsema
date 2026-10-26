@@ -21,6 +21,10 @@
 -- account for every wei after each transition.
 intent: "vela guest: execution pool — lock, run a call from the pool, credit the remainder"
 
+-- The adapter runs the app under the ceiling `stdout,declassify=app`; since v0.6.49 a program under a
+-- ceiling publishes only what it declares, so the outcome codes and receipts it publishes need this:
+require declassify("app")
+
 let ETH be "0x0000000000000000000000000000000000000000"
 -- One fuel for every entry point: a per-branch value would name the instruction on-chain.
 let FUEL be "50"

@@ -112,15 +112,16 @@ an error). Works in `run`, `test`, `handle` and their `*Async` forms.
 ### Sealed receipts: `auditor` (v0.6.46)
 
 The engine accepts `auditor` (an X25519 public key in base64url, from `synsema receipt keygen`) and
-`sealed_bytes` (4096–16777216, default 65536) in a `run` request and returns the sealed receipt in
-`receipt`. In v0.6.46 `run()`/`runAsync()` do not pass `auditor` on; use the low-level API:
+`sealedBytes` (4096–16777216, default 65536) in `run()`/`runAsync()` and returns the sealed receipt
+in `receipt`. `test` and `handle` build no receipt: an `auditor` or `sealedBytes` there is an
+error (`auditor: only run seals a receipt`). Before v0.6.49 `run()`/`runAsync()` did not
+pass `auditor` on.
 
 ```js
-import { Synsema, instantiateSync, dispatchHostSync, offersOf } from "@synsema/wasm";
+import { Synsema } from "@synsema/wasm";
 const syn = await Synsema.loadNode();
-const host = { kv: { get: (ns, k) => null, set: (ns, k, v) => {} } };
-const inst = instantiateSync(syn.module, (kind, payload) => dispatchHostSync(host, kind, payload));
-const r = inst.call({ op: "run", source: code, filename: "app.syn", labels: true, auditor: AUDITOR_PUBLIC_KEY, host: offersOf(host) });
+await syn.ready();
+const r = syn.run(code, { filename: "app.syn", labels: true, auditor: AUDITOR_PUBLIC_KEY });
 r.receipt;   // the receipt object: write it as one JSON line for `synsema receipt verify` / `open`
 ```
 

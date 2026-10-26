@@ -495,6 +495,23 @@ fn build_http_request(method: &str, path: &str, host: &str, headers: Option<&[(S
 /// HTTP/1.1 es idéntica, solo el transporte cambia). Base compartida por `fetch_raw`
 /// (lee hasta EOF) y `http_request_stream` (lee incrementalmente). El read/write
 /// timeout del socket aplica POR operación, no a la duración total.
+/// v0.6.49 (§C): `localhost` resuelve primero a `::1` en Windows, y un `serve` en `0.0.0.0` sólo
+/// escucha IPv4: el rechazo lo dice, en vez de un "connection refused" que parece un servidor caído.
+#[cold]
+#[inline(never)]
+fn connect_error(e: std::io::Error, host: &str, sa: std::net::SocketAddr) -> String {
+    let refused = e.kind() == std::io::ErrorKind::ConnectionRefused;
+    if refused && sa.ip().is_loopback() && sa.is_ipv6() && host.parse::<std::net::IpAddr>().is_err() {
+        return format!(
+            "{} — {} resolved to ::1 (IPv6) and nothing listens there; a `serve` on 0.0.0.0 listens on IPv4 only: use http://127.0.0.1:{}",
+            e,
+            host,
+            sa.port()
+        );
+    }
+    e.to_string()
+}
+
 fn connect_and_send(
     method: &str,
     url: &str,
@@ -539,7 +556,7 @@ fn connect_and_send(
     // v0.6.46 (E7): la IP que se usa, chequeada antes de conectar (no hay segunda resolución).
     crate::http_common::dest_check(&host, port, sa.ip())?;
     let timeout = Duration::from_secs(timeout_secs);
-    let tcp = TcpStream::connect_timeout(&sa, timeout).map_err(|e| e.to_string())?;
+    let tcp = TcpStream::connect_timeout(&sa, timeout).map_err(|e| connect_error(e, &host, sa))?;
     let _ = tcp.set_read_timeout(Some(timeout));
     let _ = tcp.set_write_timeout(Some(timeout));
 
@@ -1317,7 +1334,9 @@ mod tests {
         use crate::http_common::{header_pairs_to, map_pairs_to, Outgoing};
         use synsema_core::types::{syn_secret, syn_text, SynValue};
         let mut m = synsema_core::types::SynMap::new();
-        m.insert("Authorization", syn_secret("STRIPE_KEY", "Bearer sk_live_LEAKCANARY"));
+        // Como lo devuelve `secret("STRIPE_KEY")` (v0.6.49: sólo uno así se puede atar).
+        let read = |v: &str| SynValue::Secret(synsema_core::types::Obj::new(synsema_core::secret::SecretInner::new("STRIPE_KEY", v).from_config(true)));
+        m.insert("Authorization", read("Bearer sk_live_LEAKCANARY"));
         m.insert("X-Trace", syn_text("plain"));
         let map = SynValue::Map(m.into_ref());
 
@@ -1337,6 +1356,15 @@ mod tests {
         };
         assert!(e.contains("query parameter \"Authorization\" is secret(STRIPE_KEY)") && !e.contains("LEAKCANARY"), "{}", e);
         assert!(e.contains("require secret(\"STRIPE_KEY\") for net(\"api.stripe.com\")"), "{}", e);
+        // v0.6.49 (§C): uno derivado o sellado por el programa no se puede atar: el error no lo sugiere.
+        let mut derived = synsema_core::types::SynMap::new();
+        derived.insert("k", syn_secret("H", "derivado"));
+        let mut out = Outgoing::for_url("https://api.stripe.com/v1", "http_get");
+        let e = match map_pairs_to(Some(&SynValue::Map(derived.into_ref())), &mut out) {
+            Err(synsema_core::interpreter::Control::Error(e)) => e.into_message(),
+            _ => panic!("expected an error"),
+        };
+        assert!(e.contains("made by the program") && !e.contains("for net(\"api.stripe.com\")") && !e.contains("derivado"), "{}", e);
     }
 
     /// El certificado de cliente es la identidad del workload: sólo se presenta a
@@ -1368,7 +1396,7 @@ mod tests {
 
 #[cfg(test)]
 mod content_length_tests {
-    use super::build_http_request;
+    use super::{build_http_request, connect_error};
 
     /// RFC 9110 §8.6: un POST/PUT/PATCH sin cuerpo declara `Content-Length: 0`; un GET/DELETE
     /// sin cuerpo no lleva ninguno; con cuerpo, el largo real.
@@ -1387,5 +1415,18 @@ mod content_length_tests {
         assert!(!del.contains("Content-Length"), "{}", del);
         let with = String::from_utf8(build_http_request("POST", "/x", "h", None, Some(b"abc"))).unwrap();
         assert!(with.contains("Content-Length: 3\r\n") && with.ends_with("\r\n\r\nabc"), "{}", with);
+    }
+
+    #[test]
+    fn a_refused_localhost_on_ipv6_names_the_ipv4_address() {
+        let refused = || std::io::Error::from(std::io::ErrorKind::ConnectionRefused);
+        let v6: std::net::SocketAddr = "[::1]:8080".parse().unwrap();
+        let e = connect_error(refused(), "localhost", v6);
+        assert!(e.contains("localhost resolved to ::1") && e.contains("http://127.0.0.1:8080"), "{}", e);
+        // Una IP literal ya es lo que el programa pidió; IPv4 y otros errores quedan como estaban.
+        assert!(!connect_error(refused(), "::1", v6).contains("127.0.0.1"));
+        assert!(!connect_error(refused(), "localhost", "127.0.0.1:8080".parse().unwrap()).contains("resolved"));
+        let timed_out = std::io::Error::from(std::io::ErrorKind::TimedOut);
+        assert!(!connect_error(timed_out, "localhost", v6).contains("resolved"));
     }
 }

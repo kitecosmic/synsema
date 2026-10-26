@@ -250,6 +250,9 @@ fn lock_unpoisoned<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 // F-C — techo de cantidad de firmas (lo llama blockchain::gate_and_audit)
 // =========================================================
 
+/// v0.6.49 (A3): el texto de una firma con techo de cantidad en una rama privada.
+pub const SIGN_CEILING_IN_PRIVATE_BRANCH: &str = "label_violation: a signature that counts against SYNSEMA_SIGN_CEILING cannot run in a branch decided by a private value — whether the next signature still fits would tell how many were made in the branch; sign outside the branch, or decide with a public value";
+
 /// Chequea el techo de firmas para `name` y, si hay cupo, lo RESERVA bajo el mismo
 /// lock (sin TOCTOU entre handlers concurrentes de `serve`). Sin config para esa
 /// clave → no-op byte-idéntico al comportamiento previo.
@@ -272,10 +275,10 @@ pub fn sign_ceiling_reserve(
     // de cantidad: el contador es del proceso, y que la próxima firma pública alcance o no diría
     // cuántas se hicieron en la rama (el mismo oráculo que `spend`).
     if synsema_core::labels::pc_private_now() {
-        return Err(Control::Error(RuntimeError::new(format!(
-            "label_violation: sign(\"{}\") counts against SYNSEMA_SIGN_CEILING, and here it runs in a branch decided by a private value — whether the next signature still fits would tell how many were made in the branch; decide with a public value, or declassify(<the condition>, \"<why it may be published>\") it first",
-            name
-        ))));
+        // v0.6.49 (A3): un corte de etiquetas con su texto (antes salía `private(app)`, redactado) y
+        // fijo: sin el nombre de la clave, que puede ser el sitio que eligió el dato (T1).
+        let _ = name;
+        return Err(Control::Error(RuntimeError::label_cut(SIGN_CEILING_IN_PRIVATE_BRANCH)));
     }
     let mut counts = lock_unpoisoned(sign_counts());
     let used = counts.get(name).copied().unwrap_or(0);

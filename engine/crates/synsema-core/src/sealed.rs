@@ -340,6 +340,14 @@ pub fn replay_progress() -> Option<(usize, usize)> {
     out
 }
 
+/// v0.6.49 (A7): `(lecturas del reloj que hizo la corrida, lecturas grabadas)` de un `--replay`. Las
+/// que pasan de las grabadas salieron del reloj real.
+pub fn replay_clock_progress() -> Option<(usize, usize)> {
+    let mut out = None;
+    with_log(|l| out = l.replay_clock.as_ref().map(|(rec, used)| (*used, rec.len())));
+    out
+}
+
 /// Un momento público (un sumidero que corre, una lectura de afuera con el PC público): el reloj
 /// cercado avanza hasta acá.
 #[cold]
@@ -381,6 +389,22 @@ mod tests {
         assert_eq!(l.clock.len() as u64 + l.clock_dropped, 100_000);
         l.push_sealed("x".repeat(30_000));
         assert_eq!((l.sealed.len(), l.truncated), (1, 0));
+    }
+
+    /// v0.6.49 (A2, fila 3; ronda 1, B2): con lecturas falsas, sin depender del reloj real. El reloj
+    /// cercado da la primera lectura hasta el próximo momento público, y después la de ese momento.
+    #[test]
+    fn the_fenced_clock_moves_only_at_a_public_moment() {
+        let a: SharedLog = Arc::new(Mutex::new(RunLog::new(1 << 16)));
+        let _g = install_thread(a.clone());
+        assert_eq!(read_clock(100.0, true), Some(100.0));
+        assert_eq!(read_clock(105.0, true), Some(100.0));
+        // `read_file` con el PC público (o un sumidero que corre): el momento queda en 110.
+        tick_clock(110.0);
+        assert_eq!(read_clock(120.0, true), Some(110.0));
+        // Sin etiquetas, el reloj es el real.
+        assert_eq!(read_clock(130.0, false), Some(130.0));
+        assert_eq!(a.lock().unwrap().clock, vec![100.0, 100.0, 110.0, 130.0]);
     }
 
     #[test]

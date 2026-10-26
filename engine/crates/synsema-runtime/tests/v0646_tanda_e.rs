@@ -522,7 +522,8 @@ const E3_NOT_GRANTED: &str = "declassify is not granted";
 
 #[test]
 fn e3_ceiling_bounds_declassify() {
-    let both = "let x be private(1, \"a\")\nlet y be private(2, \"b\")\n";
+    // v0.6.49 (A1): bajo un techo se publica lo que el programa declara Y el techo permite.
+    let both = "require declassify(\"a\")\nlet x be private(1, \"a\")\nlet y be private(2, \"b\")\n";
     // El techo nombra `a`: publicar lo de `a` sí, lo de `b` no.
     let r = run_ceiled(&format!("{both}print(declassify(x, \"m\"))\n"), "stdout,declassify=a");
     assert!(r.success, "{:?}", r.errors);
@@ -531,7 +532,7 @@ fn e3_ceiling_bounds_declassify() {
     assert!(!r.success && r.errors.join(" ").contains(E3_NOT_GRANTED), "{:?}", r.errors);
     // Lo que se angosta sin quitar `b` no pide nada de `b` (sólo lo que la llamada quita).
     let r = run_ceiled(
-        "let z be private(3, [\"a\", \"b\"])\nlet w be declassify(z, \"m\", \"b\")\nprint(\"ok\")\n",
+        "require declassify(\"a\")\nlet z be private(3, [\"a\", \"b\"])\nlet w be declassify(z, \"m\", \"b\")\nprint(\"ok\")\n",
         "stdout,declassify=a",
     );
     assert!(r.success, "{:?}", r.errors);
@@ -541,7 +542,7 @@ fn e3_ceiling_bounds_declassify() {
     let r = run_ceiled("print(declassify(7, \"m\"))\n", "stdout");
     assert!(r.success, "{:?}", r.errors);
     // Un glob en el techo, como el de `secret`.
-    let r = run_ceiled("let c be private(4, \"clientes-ar\")\nprint(declassify(c, \"m\"))\n", "stdout,declassify=clientes*");
+    let r = run_ceiled("require declassify(\"clientes-ar\")\nlet c be private(4, \"clientes-ar\")\nprint(declassify(c, \"m\"))\n", "stdout,declassify=clientes*");
     assert!(r.success, "{:?}", r.errors);
     // Sin techo: de ambiente (D3), como antes.
     assert_eq!(run_labelled(&format!("{both}print(declassify(y, \"m\"))\n")), ["2"]);

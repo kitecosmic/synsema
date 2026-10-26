@@ -97,6 +97,9 @@ pub fn check_warnings(program: &Program, file_path: &str, warnings: &mut Vec<Str
             file_path, line, old, new
         ));
     }
+    for line in generate_joined_lines(program) {
+        warnings.push(generate_joined_warning(file_path, line));
+    }
     let mut seen = HashSet::new();
     for st in &program.statements {
         crate::ast_api::walk(st, &mut |n| {
@@ -305,15 +308,46 @@ pub fn warned_at_load() -> Vec<String> {
     guard.as_ref().map(|s| s.iter().cloned().collect()).unwrap_or_default()
 }
 
+/// v0.6.49 (A9): las líneas donde un `generate` sin `given` es el lado izquierdo de un `+`.
+/// `generate "x" + c` se lee `(generate "x") + c`: el modelo no ve `c`, que se pega a la respuesta.
+/// Es seguro (nada privado llega al modelo sin `given`), pero engaña. `reason` y `analyze` toman la
+/// expresión entera.
+pub fn generate_joined_lines(program: &Program) -> Vec<usize> {
+    let mut out = Vec::new();
+    for st in &program.statements {
+        crate::ast_api::walk(st, &mut |n| {
+            if let NodeKind::BinaryOp { left, operator, .. } = &n.kind {
+                if operator == "+" && matches!(&left.kind, NodeKind::GenerateExpression { given: None, .. }) {
+                    out.push(n.location.line);
+                }
+            }
+        });
+    }
+    out
+}
+
+fn generate_joined_warning(file_path: &str, line: usize) -> String {
+    format!(
+        "warning: {}:{}: `generate \"…\" + …` joins the model's answer with what follows the `+`; the model does not see it. To give it to the model: generate \"…\" given <expression>",
+        file_path, line
+    )
+}
+
 /// Aviso en tiempo de carga: una vez por nombre y por proceso (un `serve` con N workers
 /// no lo repite N veces).
 pub fn warn_once_at_load(program: &Program, file_path: &str) {
     let used = used_in(program);
-    if used.is_empty() {
+    let joined = generate_joined_lines(program);
+    if used.is_empty() && joined.is_empty() {
         return;
     }
     let mut guard = SEEN.lock().unwrap_or_else(|e| e.into_inner());
     let seen = guard.get_or_insert_with(HashSet::new);
+    for line in joined {
+        if seen.insert(format!("generate+{}:{}", file_path, line)) {
+            eprintln!("{}", generate_joined_warning(file_path, line));
+        }
+    }
     for (old, new, line) in used {
         if seen.insert(old.clone()) {
             eprintln!(
@@ -321,5 +355,27 @@ pub fn warn_once_at_load(program: &Program, file_path: &str) {
                 file_path, line, old, new
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn lines(src: &str) -> Vec<usize> {
+        generate_joined_lines(&crate::parser::parse_source(src, "g.syn").unwrap())
+    }
+
+    /// v0.6.49 (A9): `generate "x" + c` avisa (el modelo no ve `c`); con `given`, o con el `generate`
+    /// a la derecha, no.
+    #[test]
+    fn a9_generate_joined_with_plus_warns_once_per_site() {
+        assert_eq!(lines("let c be \"hola\"\nlet r be generate \"un saludo\" + c\n"), [2]);
+        assert!(lines("let c be 1\nlet r be generate \"un saludo\" given c\n").is_empty());
+        assert!(lines("let c be \"a\"\nlet r be c + (generate \"x\")\n").is_empty());
+        assert!(lines("let r be generate \"x\" given 1 + 2\n").is_empty());
+        let mut w = Vec::new();
+        check_warnings(&crate::parser::parse_source("let c be 1\nlet r be generate \"x\" + c\n", "g.syn").unwrap(), "g.syn", &mut w);
+        assert!(w.iter().any(|m| m.starts_with("warning: g.syn:2: `generate \"…\" + …`") && m.contains("generate \"…\" given <expression>")), "{:?}", w);
     }
 }

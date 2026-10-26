@@ -107,6 +107,15 @@ fn decide_is_served_by_the_judge_when_the_knob_is_on() {
     let r = run_source_ceiled(&src, "<test>", Some(vec![cap(CapabilityType::Llm), cap(CapabilityType::Stdout)]));
     assert!(!r.success, "{:?}", r.output);
     assert!(r.errors.iter().any(|e| e.contains("SYNSEMA_JUDGE_DECIDE") && e.contains("require judge")), "{:?}", r.errors);
+    // v0.6.49 (§C): con `judge` y sin `llm`, el error tiene la línea y dice por qué pide `llm`.
+    let src = "require judge\nlet d be decide between [\"alpha\", \"beta\"] given \"x\"\nprint(d)\n";
+    let r = run_source_ceiled(src, "<test>", Some(vec![cap(CapabilityType::Judge), cap(CapabilityType::Stdout)]));
+    assert!(!r.success, "{:?}", r.output);
+    assert!(
+        r.errors.iter().any(|e| e.contains("<test>:2:") && e.contains("falls back to the model") && e.contains("needs `llm`")),
+        "{:?}",
+        r.errors
+    );
     std::env::remove_var("SYNSEMA_JUDGE_DECIDE");
 }
 

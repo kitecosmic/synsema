@@ -125,6 +125,7 @@ pub fn bundled_audit(caps: &Rc<RefCell<CapabilitySet>>, ty: CapabilityType, path
         source: source.to_string(),
         reason: BUNDLED_ASSET.to_string(),
         origin: "runtime",
+        context: None,
     });
 }
 
@@ -199,6 +200,14 @@ pub(crate) fn read_error(path: &str, e: &std::io::Error) -> Control {
     let why = if std::fs::metadata(path).map(|m| m.is_dir()).unwrap_or(false) {
         "it is a directory (use list_dir)".to_string()
     } else if e.kind() == ErrorKind::NotFound {
+        // v0.6.49 (§C): en Windows un nombre que termina en punto o espacio no existe como tal (la
+        // API de Win32 lo recorta y `symlink_metadata` veía el otro archivo): decía "broken link".
+        if cfg!(windows) && path.trim_end_matches(['/', '\\']).ends_with(['.', ' ']) && !path.ends_with("..") {
+            return Control::Error(RuntimeError::new(format!(
+                "File not found: {} (on Windows a file name cannot end in a dot or a space)",
+                path
+            )));
+        }
         if std::fs::symlink_metadata(path).is_ok() {
             "it is a broken link (it points to something that does not exist)".to_string()
         } else {
@@ -1305,6 +1314,9 @@ pub fn register_secure_builtins(interp: &Interpreter, caps: Rc<RefCell<Capabilit
                     crate::nofollow::Refused::Denied(c) => c,
                 })?;
                 let content = read_text(f).map_err(|e| read_error(&path, &e))?;
+                // v0.6.49 (B11): lo leído entra en `inputs`, como un `read_file` (antes sólo
+                // quedaba el archivo como quedó, en `outputs`).
+                interp.record_read("edit_file", &args[..1], &syn_text(&content))?;
                 let count = content.matches(&old).count();
                 if count == 0 {
                     return Err(Control::Error(RuntimeError::new("edit_file: pattern not found")));

@@ -883,6 +883,9 @@ pub struct CapabilityAuditEntry {
     /// `serve` concedido por `--port`…). Deja separar "este tenant quiso leer STRIPE_KEY"
     /// del ruido de los grants ambientales rechazados por el techo.
     pub origin: &'static str,
+    /// v0.6.49 (B2): el módulo de confianza en cuyo scope se hizo (`trusted:<módulo>`), o `None`.
+    /// Lo pone `push_audit`; el JSONL del nativo ya lo decía en `context`, y wasm no lo veía.
+    pub context: Option<String>,
 }
 
 /// Una entrada del audit en forma de strings (la frontera con el embebedor wasm, el
@@ -895,6 +898,8 @@ pub struct AuditEntry {
     pub source: String,
     pub reason: String,
     pub origin: String,
+    /// `trusted:<módulo>` si la entrada nació dentro de una tool de confianza.
+    pub context: Option<String>,
 }
 
 impl From<&CapabilityAuditEntry> for AuditEntry {
@@ -905,6 +910,7 @@ impl From<&CapabilityAuditEntry> for AuditEntry {
             source: e.source.clone(),
             reason: e.reason.clone(),
             origin: e.origin.to_string(),
+            context: e.context.clone(),
         }
     }
 }
@@ -1072,6 +1078,24 @@ impl CapabilitySet {
         }
     }
 
+    /// El motivo de un rechazo del techo. v0.6.49 (B3): `llm("P")`/`judge("P")` contra un techo que
+    /// tiene `llm`/`judge` SIN principal decía sólo "above host ceiling", y el programa veía andar sus
+    /// llamadas públicas (ésas las cubre el `llm` de ambiente): el motivo dice qué ítem falta.
+    fn ceiling_reason(&self, cap: &Capability) -> String {
+        if let (CapabilityType::Llm | CapabilityType::Judge, Some(scope), Some(c)) = (&cap.ty, &cap.scope, &self.ceiling) {
+            if c.iter().any(|a| a.ty == cap.ty && a.scope.is_none()) {
+                let principal = scope.rsplit_once('@').map_or(scope.as_str(), |(p, _)| p);
+                return format!(
+                    "{}: the ceiling's `{ty}` allows public data only; data private to {p} goes to the model with `{ty}={p}@<provider host>`",
+                    ABOVE_CEILING,
+                    ty = cap.ty.name_lower(),
+                    p = principal
+                );
+            }
+        }
+        ABOVE_CEILING.to_string()
+    }
+
     /// ¿La capability cae DENTRO del techo del host? Reusa el mismo `covers()` que gate los
     /// `require` (misma canonización de rutas/URLs, mismo cierre de bypass `..`/glob), así no
     /// hay una segunda lógica de scopes que pueda divergir. Sin techo (`None`) → siempre true.
@@ -1121,26 +1145,24 @@ impl CapabilitySet {
         self.grant_from(capability, "runtime");
     }
 
-    /// v0.6.46 (E3): `declassify` de ambiente (D3: el `unsafe` de Rust). Sin techo, sin scope;
-    /// con techo, cada ítem `declassify=…` que el techo nombra (y nada si no nombra ninguno). Va
-    /// directo a `granted`, sin entrada de audit: la tenía todo programa, declasificara o no, y
+    /// v0.6.46 (E3): `declassify` de ambiente (D3: el `unsafe` de Rust), sólo SIN techo y sin scope.
+    /// Va directo a `granted`, sin entrada de audit: la tenía todo programa, declasificara o no, y
     /// el audit de cada corrida habría cambiado. Así `sandbox` la vacía como a todo grant, y
     /// serve la recupera en cada request desde el snapshot del preámbulo.
+    ///
+    /// v0.6.49 (A1): con techo no hay nada de ambiente. La concede el `require declassify("P")` del
+    /// programa (o de la task de confianza), que pasa por el techo como cualquier `require`, igual
+    /// que `net`: se publica lo que el programa declara Y el techo permite. Antes se concedía cada
+    /// ítem `declassify=…` del techo, declarara el programa o no.
     pub fn grant_ambient_declassify(&mut self) {
-        match &self.ceiling {
-            None => {
-                self.granted.insert(Capability::new(CapabilityType::Declassify, None));
-            }
-            Some(c) => {
-                let items: Vec<Capability> = c.iter().filter(|c| c.ty == CapabilityType::Declassify).cloned().collect();
-                self.granted.extend(items);
-            }
+        if self.ceiling.is_none() {
+            self.granted.insert(Capability::new(CapabilityType::Declassify, None));
         }
     }
 
     /// v0.6.46 (E3b): entra al scope de un módulo de confianza. Deja de lado TODO lo del llamador
-    /// (grants, denials, padre, techo, techos delegados) y concede lo de ambiente (`stdout`, `time`,
-    /// `declassify` según el techo de confianza) más lo que la task declaró, filtrado por ese techo
+    /// (grants, denials, padre, techo, techos delegados) y concede lo de ambiente (`stdout`, `time`;
+    /// `declassify` sólo sin techo de confianza, v0.6.49 A1) más lo que la task declaró, filtrado por ese techo
     /// (sin techo de confianza, lo declarado entero). El audit de adentro sale con el nombre
     /// `trusted:<módulo>`. `leave_trusted_scope` lo devuelve todo.
     pub fn enter_trusted_scope(
@@ -1194,7 +1216,10 @@ impl CapabilitySet {
 
     /// Pushea una entrada al `audit_log` del set y la entrega al sink del proceso (si
     /// hay). ÚNICO camino de escritura del audit: todo chequeo/grant pasa por acá.
-    pub fn push_audit(&mut self, entry: CapabilityAuditEntry) {
+    pub fn push_audit(&mut self, mut entry: CapabilityAuditEntry) {
+        if self.name.starts_with("trusted:") {
+            entry.context = Some(self.name.clone());
+        }
         // v0.6.45 (ronda 4, M5): con etiquetas, una entrada generada en una rama decidida por un valor
         // privado no se registra: cuántas hubo decía qué rama se tomó y cuántas vueltas dio un bucle
         // privado (5 entradas con n=1, 54 con n=50). Lo que audita en serio (`sign`/`spend`/
@@ -1223,12 +1248,14 @@ impl CapabilitySet {
             if origin == "program" {
                 self.rejected_by_ceiling.push(capability.clone());
             }
+            let reason = self.ceiling_reason(&capability);
             self.push_audit(CapabilityAuditEntry {
                 capability,
                 granted: false,
                 source: "ceiling".to_string(),
-                reason: ABOVE_CEILING.to_string(),
+                reason,
                 origin,
+                context: None,
             });
             return;
         }
@@ -1246,6 +1273,7 @@ impl CapabilitySet {
                 source: d.source.audit_source().to_string(),
                 reason,
                 origin,
+                context: None,
             });
             return;
         }
@@ -1258,6 +1286,7 @@ impl CapabilitySet {
                 source: "ambient".to_string(),
                 reason: AMBIENT_GRANT.to_string(),
                 origin,
+                context: None,
             });
         }
         self.granted.insert(capability);
@@ -1313,6 +1342,7 @@ impl CapabilitySet {
                     source: source.to_string(),
                     reason: format!("Explicitly denied by {}", d),
                     origin: "program",
+                    context: None,
                 });
             }
             return Err(DenyCause::ExplicitlyDenied(d));
@@ -1332,8 +1362,9 @@ impl CapabilitySet {
                     capability: requested.clone(),
                     granted: false,
                     source: source.to_string(),
-                    reason: ABOVE_CEILING.to_string(),
+                    reason: self.ceiling_reason(requested),
                     origin: "program",
+                    context: None,
                 });
             }
             return Err(DenyCause::AboveCeiling);
@@ -1353,6 +1384,7 @@ impl CapabilitySet {
                             source: source.to_string(),
                             reason: d.reason_for(requested),
                             origin: "program",
+                            context: None,
                         });
                     }
                     return Err(DenyCause::Delegated((*d).clone()));
@@ -1370,6 +1402,7 @@ impl CapabilitySet {
                     source: source.to_string(),
                     reason: format!("Granted by {}", c),
                     origin: "program",
+                    context: None,
                 });
             }
             return Ok(());
@@ -1398,6 +1431,7 @@ impl CapabilitySet {
                 source: source.to_string(),
                 reason: reason.to_string(),
                 origin: "program",
+                context: None,
             });
         }
         Err(DenyCause::NoGrant)
@@ -1427,6 +1461,33 @@ impl CapabilitySet {
             next = p.borrow().parent.clone();
         }
         layers
+    }
+
+    /// v0.6.49 (A5): el primer grant de `net` con un CIDR (`net("10.0.0.0/8")`), propio o de un padre,
+    /// cuando lo pedido es un NOMBRE. Un CIDR cubre las direcciones escritas como tales y nunca un
+    /// nombre, resuelva a donde resuelva (el permiso no depende del DNS, como en E7): el mensaje lo
+    /// dice y nombra el `require` del nombre, que es lo que lo arregla.
+    fn cidr_grant_for_name(&self, requested: &Capability) -> Option<Capability> {
+        if requested.ty != CapabilityType::Net {
+            return None;
+        }
+        let (host, _) = split_net_scope(requested.scope.as_deref()?);
+        if host.is_empty() || host.parse::<std::net::IpAddr>().is_ok() {
+            return None;
+        }
+        let is_cidr = |c: &&Capability| {
+            c.ty == CapabilityType::Net
+                && c.scope.as_deref().is_some_and(|g| {
+                    let (gh, _) = split_net_scope(g);
+                    cidr_contains(gh, std::net::IpAddr::from([0u8, 0, 0, 0])).is_some()
+                        || cidr_contains(gh, std::net::IpAddr::from([0u16; 8])).is_some()
+                })
+        };
+        self.granted
+            .iter()
+            .find(is_cidr)
+            .cloned()
+            .or_else(|| self.parent.as_ref().and_then(|p| p.borrow().cidr_grant_for_name(requested)))
     }
 
     /// v0.6.45 — ¿un grant la cubre por NOMBRE pero no en disco? Es un link debajo del scope que
@@ -1546,17 +1607,39 @@ impl CapabilitySet {
         }
     }
 
+    /// v0.6.49 (§C): dentro de una tool de confianza el `require` que falta va en la task del
+    /// módulo, no en el preámbulo del programa (que no le da nada a la tool).
+    fn where_to_require(&self, message: String) -> String {
+        let Some(module) = self.name.strip_prefix("trusted:") else { return message };
+        let there = format!(
+            "to the task of the trusted module `{}` that needs it (a trusted task has only what it declares, within the host's --trusted-cap-set)",
+            module
+        );
+        message
+            .replace("to the program's preamble (or to the importing file, when this code runs in a module)", &there)
+            .replace("to the program's preamble", &there)
+    }
+
     /// Chequea y devuelve error si no está otorgada.
     pub fn require(&mut self, requested: &Capability, source: &str) -> Result<(), CapabilityViolation> {
         if let Err(cause) = self.check_cause(requested, source) {
+            let cidr = if cause == DenyCause::NoGrant { self.cidr_grant_for_name(requested) } else { None };
             let message = if cause == DenyCause::NoGrant && self.escapes_through_link(requested) {
                 format!(
                     "Capability not granted: {} — by name the path is inside the granted scope, but a link (symlink or junction) on the way leads outside it. Synsema checks where a path really leads: grant the place the link points to, or remove the link",
                     requested
                 )
+            } else if let Some(c) = cidr {
+                format!(
+                    "Capability not granted: {} — {} covers the addresses inside it when the URL writes the address, never a name, whatever the name resolves to: the permission does not depend on DNS. Name the host: add `{}` to the program's preamble",
+                    requested,
+                    c,
+                    Self::require_line(requested)
+                )
             } else {
                 Self::denial_message(requested, &cause)
             };
+            let message = self.where_to_require(message);
             return Err(CapabilityViolation {
                 message,
                 requested: Some(requested.clone()),
@@ -1695,6 +1778,103 @@ pub fn validate_memory_name(name: &str) -> Result<(), String> {
 mod tests {
     // Discovery-era audit fixes: la causa llega al mensaje (programa vs host) y el audit
     // distingue el origen (program vs runtime) — sin re-parsear el fuente.
+    /// v0.6.49 (A1): bajo un techo, `declassify` no se concede de ambiente: la concede el `require`
+    /// del programa, filtrado por el techo como cualquier otro (filas 2–7 del modelo).
+    #[test]
+    fn a1_declassify_under_a_ceiling_needs_the_programs_require() {
+        let d = |p: Option<&str>| Capability::new(CapabilityType::Declassify, p.map(|s| s.to_string()));
+        let with_ceiling = |items: Vec<Capability>| {
+            let mut cs = CapabilitySet::new("t");
+            cs.ceiling = Some(Rc::new(items));
+            cs.grant_ambient_declassify();
+            cs
+        };
+        // Sin techo: de ambiente, sin scope (fila 1).
+        let mut open = CapabilitySet::new("t");
+        open.grant_ambient_declassify();
+        assert!(open.check_silent(&d(Some("customers"))));
+        // Techo `declassify=customers` sin `require`: nada (fila 2; antes se concedía).
+        let mut cs = with_ceiling(vec![d(Some("customers"))]);
+        assert!(!cs.check_silent(&d(Some("customers"))));
+        // Con el `require` que el techo permite, sí (fila 3); con otro principal, no (fila 4).
+        cs.grant(d(Some("customers")));
+        assert!(cs.check_silent(&d(Some("customers"))));
+        let mut cs = with_ceiling(vec![d(Some("customers"))]);
+        cs.grant(d(Some("billing")));
+        assert!(!cs.check_silent(&d(Some("billing"))) && !cs.check_silent(&d(Some("customers"))));
+        assert!(cs.audit_log.iter().any(|e| !e.granted && e.capability == d(Some("billing")) && e.source == "ceiling"));
+        // Un `require declassify` sin scope es más ancho que el techo y se rechaza entero (fila 5).
+        let mut cs = with_ceiling(vec![d(Some("customers"))]);
+        cs.grant(d(None));
+        assert!(!cs.check_silent(&d(Some("customers"))));
+        // Techo sin scope + `require` con scope (fila 6); techo sin `declassify` (fila 7).
+        let mut cs = with_ceiling(vec![d(None)]);
+        cs.grant(d(Some("customers")));
+        assert!(cs.check_silent(&d(Some("customers"))) && !cs.check_silent(&d(Some("billing"))));
+        let mut cs = with_ceiling(vec![Capability::new(CapabilityType::Stdout, None)]);
+        cs.grant(d(Some("customers")));
+        assert!(!cs.check_silent(&d(Some("customers"))));
+    }
+
+    /// v0.6.49 (A5): un CIDR no cubre un nombre, y el error lo explica sólo cuando aplica.
+    #[test]
+    fn a5_cidr_does_not_cover_a_name_and_the_error_says_so() {
+        let net = |s: &str| Capability::new(CapabilityType::Net, Some(s.to_string()));
+        let mut cs = CapabilitySet::new("t");
+        cs.grant(net("10.0.0.0/8"));
+        assert!(cs.require(&net("10.1.2.3:1"), "t").is_ok());
+        let e = cs.require(&net("10.1.2.3.nip.io:1"), "t").unwrap_err().to_string();
+        assert!(e.contains("net(\"10.0.0.0/8\") covers the addresses inside it") && e.contains("does not depend on DNS"), "{}", e);
+        assert!(e.contains("`require net(\"10.1.2.3.nip.io:1\")`"), "{}", e);
+        // Una dirección fuera del rango no es un nombre: el mensaje de siempre (fila 4).
+        let e = cs.require(&net("[::1]:1"), "t").unwrap_err().to_string();
+        assert!(!e.contains("DNS") && e.contains("this is a permission, not a bug"), "{}", e);
+        // Sin CIDR, el mensaje de siempre (fila 3).
+        let mut cs = CapabilitySet::new("t");
+        cs.grant(net("api.x.com"));
+        let e = cs.require(&net("db.internal"), "t").unwrap_err().to_string();
+        assert!(!e.contains("DNS") && e.contains("this is a permission, not a bug"), "{}", e);
+        // También un CIDR IPv6 y uno heredado del padre.
+        let parent = Rc::new(RefCell::new(CapabilitySet::new("p")));
+        parent.borrow_mut().grant(net("fd00::/8"));
+        let mut child = CapabilitySet::create_child(&parent, "c");
+        let e = child.require(&net("db.internal"), "t").unwrap_err().to_string();
+        assert!(e.contains("net(\"fd00::/8\")") && e.contains("does not depend on DNS"), "{}", e);
+    }
+
+    /// v0.6.49 (B2): lo que se audita dentro de una tool de confianza lleva `trusted:<módulo>`;
+    /// antes y después, nada.
+    #[test]
+    fn b2_audit_inside_a_trusted_scope_names_the_module() {
+        let stdout = Capability::new(CapabilityType::Stdout, None);
+        let mut cs = CapabilitySet::new("program");
+        cs.grant(stdout.clone());
+        let saved = cs.enter_trusted_scope("tools", None, &[Capability::new(CapabilityType::Time, None)]);
+        let _ = cs.require(&stdout, "print()");
+        cs.leave_trusted_scope(saved);
+        let _ = cs.require(&stdout, "print()");
+        let ctx: Vec<Option<&str>> = cs.audit_log.iter().map(|e| e.context.as_deref()).collect();
+        assert_eq!(ctx, [Some("trusted:tools"), None]);
+        let exported = export_audit(&Rc::new(RefCell::new(cs)));
+        assert_eq!(exported.iter().map(|a| a.context.as_deref()).collect::<Vec<_>>(), [Some("trusted:tools"), None]);
+    }
+
+    /// v0.6.49 (B3): `llm("P")` contra un techo con `llm` sin principal: el motivo dice qué ítem falta.
+    #[test]
+    fn b3_scoped_llm_above_an_unscoped_ceiling_says_which_item() {
+        let llm = |s: Option<&str>| Capability::new(CapabilityType::Llm, s.map(str::to_string));
+        let mut cs = CapabilitySet::new("t");
+        cs.ceiling = Some(Rc::new(vec![Capability::new(CapabilityType::Stdout, None), llm(None)]));
+        cs.grant(llm(Some("a")));
+        let r = &cs.audit_log.last().unwrap().reason;
+        assert!(r.starts_with(ABOVE_CEILING) && r.contains("`llm=a@<provider host>`"), "{}", r);
+        // Sin `llm` en el techo, el motivo de siempre.
+        let mut cs = CapabilitySet::new("t");
+        cs.ceiling = Some(Rc::new(vec![Capability::new(CapabilityType::Stdout, None)]));
+        cs.grant(llm(Some("a")));
+        assert_eq!(cs.audit_log.last().unwrap().reason, ABOVE_CEILING);
+    }
+
     #[test]
     fn deny_cause_and_origin() {
         let mut caps = CapabilitySet::new("t");

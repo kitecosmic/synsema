@@ -599,7 +599,13 @@ fn read_table<R: parquet::file::reader::ChunkReader + 'static>(
     if let Some(rs) = &row_groups {
         for &r in rs {
             if r >= n_rgs {
-                return Err(err(format!("{}: row group {} does not exist (the file has {}: 0..{})", F, r, n_rgs, n_rgs)));
+                // v0.6.49 (§C): sin la notación de rangos de Rust (`0..1`).
+                let has = match n_rgs {
+                    0 => "the file has no row groups".to_string(),
+                    1 => "the file has 1 row group, number 0".to_string(),
+                    n => format!("the file has {} row groups, numbered 0 to {}", n, n - 1),
+                };
+                return Err(err(format!("{}: row group {} does not exist — {}", F, r, has)));
             }
         }
     }
@@ -1564,6 +1570,6 @@ mod tests {
             _ => panic!("esperaba un error"),
         };
         assert!(msg(parquet_read(&[file.clone(), opts(&[("columns", syn_list(vec![syn_text("zz")]))])])).contains("no column \"zz\""));
-        assert!(msg(parquet_read(&[file, opts(&[("row_groups", syn_list(vec![syn_int(3)]))])])).contains("row group 3 does not exist"));
+        assert!(msg(parquet_read(&[file, opts(&[("row_groups", syn_list(vec![syn_int(3)]))])])).contains("row group 3 does not exist — the file has 3 row groups, numbered 0 to 2"));
     }
 }

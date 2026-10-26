@@ -191,7 +191,11 @@ fn e3_wasm_ceiling_bounds_declassify() {
         opts.ceiling = ceiling.map(|c| synsema_wasm::parse_ceiling(c).unwrap().unwrap());
         run(&format!("let x be private(1, \"a\")\nlet y be private(2, \"b\")\n{}", body), &opts)
     };
+    // v0.6.49 (A1): bajo el techo, sólo con el `require` del programa.
     let r = run_with("print(declassify(x, \"m\"))\n", Some("stdout,declassify=a"));
+    assert!(!r.ok, "{:?}", r.output);
+    assert!(r.operator_detail.as_deref().is_some_and(|d| d.contains("declassify is not granted")), "{:?}", r.operator_detail);
+    let r = run_with("require declassify(\"a\")\nprint(declassify(x, \"m\"))\n", Some("stdout,declassify=a"));
     assert!(r.ok, "{:?}", r.errors);
     // v0.6.47 (T1): el programa ve el texto fijo; el motivo va en `operator_detail`.
     let r = run_with("print(declassify(y, \"m\"))\n", Some("stdout,declassify=a"));

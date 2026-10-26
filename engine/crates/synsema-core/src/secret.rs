@@ -55,24 +55,28 @@ pub struct SecretInner {
     /// `bearer`/`basic`. El audit los nombra a todos y el eco de una respuesta se enmascara con
     /// cada uno. Vacío = es él mismo.
     parts: Vec<(String, String)>,
+    /// v0.6.49 (§C): salió de `secret("NAME")` (o se armó sólo con secrets así). Sólo uno así se
+    /// puede atar a un host (`require secret("NAME") for net(…)`); uno derivado o sellado por el
+    /// programa (`hkdf_sha256`, `as_secret`) va sólo en un header, y el error no sugiere la atadura.
+    from_config: bool,
 }
 
 impl SecretInner {
     /// Construye un secret de TEXTO a partir de su nombre de origen y su plaintext.
     pub fn new(name: impl Into<String>, plaintext: impl Into<String>) -> Self {
-        Self { value: SecretPayload::Text(plaintext.into()), name: name.into(), sealed: false, bound: None, public_prefix: None, parts: Vec::new() }
+        Self { value: SecretPayload::Text(plaintext.into()), name: name.into(), sealed: false, bound: None, public_prefix: None, parts: Vec::new(), from_config: false }
     }
 
     /// Construye un secret de BYTES (blob binario sellado con `as_secret`).
     pub fn new_bytes(name: impl Into<String>, bytes: Vec<u8>) -> Self {
-        Self { value: SecretPayload::Bytes(bytes), name: name.into(), sealed: false, bound: None, public_prefix: None, parts: Vec::new() }
+        Self { value: SecretPayload::Bytes(bytes), name: name.into(), sealed: false, bound: None, public_prefix: None, parts: Vec::new(), from_config: false }
     }
 
     /// Construye un secret de BYTES **sellado**: `reveal()` lo rechaza siempre y los bordes
     /// genéricos también (`expose_bytes_checked`, `expose`); sólo los usos legítimos del material
     /// —firma/MAC y ECDH con la clave propia— lo leen por `expose_bytes`. Ver `sealed`.
     pub fn new_bytes_sealed(name: impl Into<String>, bytes: Vec<u8>) -> Self {
-        Self { value: SecretPayload::Bytes(bytes), name: name.into(), sealed: true, bound: None, public_prefix: None, parts: Vec::new() }
+        Self { value: SecretPayload::Bytes(bytes), name: name.into(), sealed: true, bound: None, public_prefix: None, parts: Vec::new(), from_config: false }
     }
 
     /// `true` si el secret está sellado (no revelable).
@@ -91,6 +95,17 @@ impl SecretInner {
         self.public_prefix = public_prefix;
         self.parts = parts;
         self
+    }
+
+    /// Marca un secret leído con `secret("NAME")` (ver `from_config`).
+    pub fn from_config(mut self, yes: bool) -> Self {
+        self.from_config = yes;
+        self
+    }
+
+    /// ¿Se puede atar a un host? (Ver `from_config`.)
+    pub fn is_from_config(&self) -> bool {
+        self.from_config
     }
 
     /// Los hosts a los que puede ir (`None` = no atado).

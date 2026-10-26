@@ -574,7 +574,8 @@ pub(crate) fn wire_common_with_state(
         caps.borrow_mut().grant_ambient(Capability::new(CapabilityType::Judge, None));
     }
     // v0.6.46 (E3): `declassify` es una capability (D3, el `unsafe` de Rust): de ambiente sin
-    // techo, también bajo secure/serve; con techo, sólo lo que el techo nombra.
+    // techo, también bajo secure/serve; con techo (v0.6.49, A1), nada de ambiente: la concede el
+    // `require declassify("P")` del programa, dentro del techo.
     synsema_stdlib::captoken::install_declassify_hook(interp, caps.clone());
     // v0.6.46 (E5): datos privados hacia el modelo, sólo con `llm=P@<host>` en el techo. El host
     // sale del provider cableado en ESTE intérprete al momento de la llamada (se cablea después,

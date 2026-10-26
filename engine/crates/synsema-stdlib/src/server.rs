@@ -2644,9 +2644,9 @@ static LIVE_SERVERS: AtomicUsize = AtomicUsize::new(0);
 // programa mismo (una ventana que se cierra, un job que terminó). Mismo camino: no más
 // requests, drenar hasta la gracia, cancelar cron/agentes, exit 0.
 
-/// `synsema serve` corre en este proceso (top-level, workers, cron, agentes). Lo que
-/// `shutdown()` necesita para distinguir "sólo bajo serve" de "todavía no hay nada corriendo".
-static UNDER_SERVE: AtomicBool = AtomicBool::new(false);
+// `synsema serve` corre en este proceso: el flag vive en `json.rs` (v0.6.49, B4), que compila
+// también en wasm, para que el aviso de redacción diga `[serve]` sólo bajo serve.
+use crate::json::UNDER_SERVE;
 /// v0.6.45 (A5) — el bloque `serve` ya abrió su puerto (se marca en el hilo del programa, justo
 /// después del `bind`; `LIVE_SERVERS` sube recién dentro del hilo del server y dejaría una carrera).
 static SERVE_BOUND: AtomicBool = AtomicBool::new(false);

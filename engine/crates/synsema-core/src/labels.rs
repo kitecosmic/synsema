@@ -18,9 +18,10 @@
 //! Invariantes de la variante (los garantiza `mark`):
 //!   * nunca `Private` de `Private` (marcar uno existente = unión de etiquetas);
 //!   * nunca `Private` con etiqueta vacía (= el valor pelado);
-//!   * nunca `Private` de un `Secret` (un secret ya es opaco; el intérprete lo rechaza
-//!     con "a secret is already opaque; use private on the value you compute"; `mark`
-//!     devuelve el secret intacto).
+//!   * nunca `Private` de un `Secret` (un secret ya es opaco: `private(secreto, p)` es error, y
+//!     un secreto creado, elegido o combinado con algo privado también, con los textos
+//!     `SECRET_UNDER_PRIVATE_PC`/`SECRET_FROM_PRIVATE_VALUE` del intérprete; `mark` devuelve el
+//!     secret intacto).
 //!
 //! Qué cubre la propagación del intérprete (sólo con etiquetas encendidas):
 //!   * **flujos explícitos**: operadores binarios y unarios (con la etiqueta PROFUNDA de los

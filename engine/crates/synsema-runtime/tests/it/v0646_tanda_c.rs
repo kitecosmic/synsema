@@ -40,9 +40,10 @@ fn c3_the_receipt_names_what_the_run_wrote() {
          print(\"0x\" + o[2].sha256 == hex(sha256(read_file(\"{d}/model.json\"))))\n\
          print(length(receipt().credentialSubject.inputs))\n"
     );
+    // Dos entradas: lo que leyó `edit_file` (v0.6.49, B11) y el `read_file` del final.
     assert_eq!(
         out(&src),
-        vec!["3 write_file append_file edit_file", "true true true text", "true 4", "true", "1"]
+        vec!["3 write_file append_file edit_file", "true true true text", "true 4", "true", "2"]
     );
     // Bytes: `encoding` lo dice; una escritura negada no queda.
     let src = format!(

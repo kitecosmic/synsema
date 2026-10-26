@@ -464,7 +464,13 @@ fn typed_field(s: &str, quoted: bool, ty: &str, col: &str, line: usize) -> Resul
                     line, col, digits.len(), crate::number::MAX_DEC_TEXT_DIGITS
                 )));
             }
-            syn_number(Number::from_bigint(t.parse::<BigInt>().map_err(|_| bad())?))
+            // Primero `i64`, que es casi toda columna: así el entero chico no pasa por `BigInt`
+            // y no depende de que LTO inlinee `from_biguint` (en v0.6.49 dejó de hacerlo: +29
+            // instrucciones por entero en `s_csv`). Da lo mismo que `from_bigint`.
+            match t.parse::<i64>() {
+                Ok(i) => syn_number(Number::Int(i)),
+                Err(_) => syn_number(Number::from_bigint(t.parse::<BigInt>().map_err(|_| bad())?)),
+            }
         }
         "float" => {
             let x = t.parse::<f64>().map_err(|_| bad())?;
@@ -937,6 +943,30 @@ mod tests {
         let out = encode(syn_list(vec![syn_map(m)]));
         assert!(out.contains("Zm9v"), "{}", out);
         assert!(out.contains("42"), "{}", out);
+    }
+
+    /// Una columna `int`: el camino de `i64` y el de `BigInt` dan lo mismo en los bordes.
+    #[test]
+    fn typed_int_small_and_big() {
+        let int = |s: &str| match ok(typed_field(s, false, "int", "c", 1)) {
+            SynValue::Number(Number::Int(i)) => format!("int {}", i),
+            SynValue::Number(Number::Big(b)) => format!("big {}", b),
+            other => panic!("{} dio {}", s, other.type_name()),
+        };
+        assert_eq!(int("5"), "int 5");
+        assert_eq!(int("+5"), "int 5");
+        assert_eq!(int("-5"), "int -5");
+        assert_eq!(int("-0"), "int 0");
+        assert_eq!(int(" 42 "), "int 42");
+        assert_eq!(int("007"), "int 7");
+        assert_eq!(int("9223372036854775807"), "int 9223372036854775807");
+        assert_eq!(int("-9223372036854775808"), "int -9223372036854775808");
+        assert_eq!(int("9223372036854775808"), "big 9223372036854775808");
+        assert_eq!(int("-9223372036854775809"), "big -9223372036854775809");
+        assert_eq!(int("+99999999999999999999"), "big 99999999999999999999");
+        for bad in ["+", "-", "1.5", "1e3", "0x10", "1 2"] {
+            assert!(typed_field(bad, false, "int", "c", 1).is_err(), "{}", bad);
+        }
     }
 }
 

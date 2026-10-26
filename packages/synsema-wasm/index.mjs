@@ -386,6 +386,10 @@ function requestOf(op, source, opts = {}) {
   // v0.6.46 (E3b): módulos de confianza del embebedor y su techo.
   if (opts.trusted) r.trusted = opts.trusted;
   if (opts.trustedCeiling) r.trusted_ceiling = opts.trustedCeiling;
+  // v0.6.49 (B1): el recibo sellado. Antes no se reenviaban y `run()` volvía sin `receipt`;
+  // `!= null` por lo mismo que los límites: un valor inválido llega al motor, que lo rechaza.
+  if (opts.auditor != null) r.auditor = opts.auditor;
+  if (opts.sealedBytes != null) r.sealed_bytes = opts.sealedBytes;
   return r;
 }
 

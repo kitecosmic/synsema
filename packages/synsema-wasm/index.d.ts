@@ -133,6 +133,14 @@ export interface RunOptions {
   trusted?: Record<string, string>;
   /** El techo de los módulos de confianza, con la gramática de `ceiling` (`"stdout,declassify=clientes"`). */
   trustedCeiling?: string;
+  /**
+   * v0.6.46 — la pública X25519 (base64url, de `synsema receipt keygen`) del auditor que designa el
+   * host: `run`/`runAsync` devuelven el recibo sellado de la corrida en `RunResult.receipt` (lo de
+   * una rama privada va cifrado para el auditor). Sólo `run`; `test` y `handle` no arman recibo, y un `auditor` (o `sealedBytes`) ahí es un error.
+   */
+  auditor?: string;
+  /** Con `auditor`: los bytes del bloque sellado (4096–16777216, default 65536). */
+  sealedBytes?: number;
 }
 
 export interface AuditEntry {
@@ -142,6 +150,8 @@ export interface AuditEntry {
   reason: string;
   /** "program" (the program asked or called) or "runtime" (an ambient host grant, e.g. time/llm under a ceiling). */
   origin: "program" | "runtime";
+  /** v0.6.49 — dentro de una tool de confianza, `"trusted:<módulo>"` (como el `context` del audit nativo). */
+  context?: string;
 }
 
 export interface RunResult {
@@ -165,6 +175,12 @@ export interface RunResult {
    * del operador: el programa (y el cliente) ven en `errors` un texto fijo, porque cuál sitio cortó lo eligió el
    * dato privado. No se lo devuelvas al modelo ni al cliente. */
   operator_detail?: string;
+  /**
+   * Con `auditor`: el recibo sellado (un objeto). Escribilo como UNA línea JSON para
+   * `synsema receipt verify` / `synsema receipt open`. Sin recibo no hay salida: si no se pudo
+   * armar, `ok` es false y `errors` lo dice.
+   */
+  receipt?: Record<string, unknown>;
 }
 
 export interface TestResult {
@@ -212,6 +228,8 @@ export type ModuleSource = WebAssembly.Module | Uint8Array | ArrayBuffer | URL |
 export declare function readModule(src: ModuleSource): Promise<WebAssembly.Module>;
 export declare function offersOf(host?: Host): Record<string, boolean>;
 export declare function sleepSync(secs: number): void;
+/** Despacha una llamada del módulo (`kind`, `payload`) a los hooks síncronos de `host`; es lo que usan `run`/`test`/`handle`. */
+export declare function dispatchHostSync(host: Host | undefined, kind: string, payload: any): any;
 export declare function instantiate(
   module: WebAssembly.Module,
   hostCall: (kind: string, payload: any) => any,
@@ -234,6 +252,8 @@ export declare function instantiateSync(
 
 export declare class Synsema {
   constructor(module: WebAssembly.Module, opts?: LoadOptions);
+  /** El módulo compilado (para `instantiate`/`instantiateSync` con un despacho propio). */
+  readonly module: WebAssembly.Module;
   static load(src: ModuleSource, opts?: LoadOptions): Promise<Synsema>;
   /**
    * Node: carga el `synsema.wasm` que trae el paquete (sin resolver rutas; anda en Next, rutas

@@ -15,6 +15,8 @@ fn err(msg: impl Into<String>) -> Control {
 fn b_tool_spec(args: &[SynValue]) -> Result<SynValue, Control> {
     let t = match args.first() {
         Some(SynValue::Task(t)) if t.name != "<lambda>" => t,
+        // v0.6.49 (B9): una task de un módulo de confianza: su firma.
+        Some(SynValue::Builtin(b)) if b.trusted.is_some() => &b.trusted.as_ref().unwrap().task,
         Some(SynValue::Task(_)) => {
             return Err(err("tool_spec needs a named task: a lambda has no name for the model to call"))
         }

@@ -207,6 +207,17 @@ impl Outgoing {
                 } else {
                     "body"
                 };
+                // v0.6.49 (§C): uno derivado o sellado por el programa no se puede atar: sugerir la
+                // atadura mandaba a escribir algo que no lo arregla.
+                if !s.is_from_config() {
+                    return Err(perr(format!(
+                        "{}: {} is secret({}), made by the program (derived or sealed with as_secret), and such a secret only goes in a header: only a secret read with `secret(\"NAME\")` can be bound to a host (`require secret(\"NAME\") for net(\"host\")`). If the API needs it in the {}, keep the final value in the config and read it with `secret(\"NAME\")`",
+                        self.who,
+                        what,
+                        s.name(),
+                        place
+                    )));
+                }
                 return Err(perr(format!(
                     "{}: {} is secret({}), and an unbound secret only goes in a header. If the API takes it in the {}, bind it to the host it goes to: `require secret(\"{}\") for net(\"{}\")`",
                     self.who,
@@ -268,6 +279,7 @@ impl Outgoing {
                 source: "bound-send".to_string(),
                 reason: format!("→ {}", self.dest),
                 origin: "program",
+                context: None,
             });
         }
     }

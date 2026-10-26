@@ -39,13 +39,15 @@ pub fn from_flags(cmd: &str, flag: Option<String>, dest: Option<String>) -> Resu
         eprintln!("synsema {}: {}", cmd, msg);
         ExitCode::from(2)
     };
+    // v0.6.49 (§C): el error nombra de dónde vino la clave (antes, `--auditor: …` también para el knob).
+    let origin = if flag.is_some() { "--auditor" } else { "SYNSEMA_AUDITOR_KEY" };
     let Some(raw) = flag.or_else(|| knob("SYNSEMA_AUDITOR_KEY")) else {
         if dest.is_some() {
             return Err(fail("--receipt needs an auditor: pass --auditor <X25519 public key> or set SYNSEMA_AUDITOR_KEY".to_string()));
         }
         return Ok(None);
     };
-    let key = sealed::parse_auditor_key(&raw).map_err(|e| fail(format!("--auditor: {}", e)))?;
+    let key = sealed::parse_auditor_key(&raw).map_err(|e| fail(format!("{}: {}", origin, e)))?;
     let size = sealed::sealed_bytes_from(knob("SYNSEMA_RECEIPT_SEALED_BYTES").as_deref()).map_err(fail)?;
     if let Some(d) = &dest {
         check_dest(d).map_err(fail)?;
@@ -75,13 +77,15 @@ pub fn serve_from_flags(flag: Option<String>, dest: &Option<String>) -> Result<O
         eprintln!("synsema serve: {}", msg);
         ExitCode::from(2)
     };
+    // v0.6.49 (§C): el error nombra de dónde vino la clave (antes, `--auditor: …` también para el knob).
+    let origin = if flag.is_some() { "--auditor" } else { "SYNSEMA_AUDITOR_KEY" };
     let Some(raw) = flag.or_else(|| knob("SYNSEMA_AUDITOR_KEY")) else {
         if dest.is_some() {
             return Err(fail("--receipt needs an auditor: pass --auditor <X25519 public key> or set SYNSEMA_AUDITOR_KEY".to_string()));
         }
         return Ok(None);
     };
-    let key = sealed::parse_auditor_key(&raw).map_err(|e| fail(format!("--auditor: {}", e)))?;
+    let key = sealed::parse_auditor_key(&raw).map_err(|e| fail(format!("{}: {}", origin, e)))?;
     let size = sealed::sealed_bytes_from(knob("SYNSEMA_RECEIPT_SEALED_BYTES").as_deref()).map_err(fail)?;
     if let Some(d) = dest {
         check_dest(d).map_err(fail)?;
@@ -118,6 +122,13 @@ fn rfc3339_now() -> String {
     synsema_stdlib::receipt::rfc3339_utc(synsema_core::clock::now_secs())
 }
 
+/// v0.6.49 (ronda 1, M3): el sha256 de cada módulo `--trusted` de la corrida (`{nombre: sha}`), o
+/// `None` si no hay. Va al encabezado del recibo, y `--replay` lo compara: una tool de confianza
+/// cambiada cambia lo que el programa hace sin cambiar su `program_sha`.
+fn trusted_shas() -> Option<serde_json::Value> {
+    sealed::trusted_shas(&synsema_runtime::host::trusted()?.modules)
+}
+
 impl Auditor {
     /// Instala el registro de la corrida (uno por proceso: el CLI corre un programa).
     pub fn install(&self) {
@@ -140,7 +151,7 @@ impl Auditor {
         log.close();
         sealed::build_receipt(
             &log,
-            &sealed::ReceiptContext { auditor: self.key, key: &self.run_key, program_sha, config_sha, started: self.started.clone() },
+            &sealed::ReceiptContext { auditor: self.key, key: &self.run_key, program_sha, config_sha, trusted: trusted_shas(), started: self.started.clone() },
         )
     }
 
@@ -290,7 +301,14 @@ pub fn cmd_receipt(args: &[String]) -> ExitCode {
                 }
             }
             if receipts.is_empty() {
-                eprintln!("synsema receipt: {} has no sealed receipt", path);
+                // v0.6.49 (§C): un recibo cortado no es "no hay recibo".
+                match broken.first() {
+                    Some(n) => eprintln!(
+                        "synsema receipt: line {} of {} names a sealed receipt but is not one: it is cut or changed",
+                        n, path
+                    ),
+                    None => eprintln!("synsema receipt: {} has no sealed receipt", path),
+                }
                 return ExitCode::from(1);
             }
             // v0.6.46 (ronda 1, E6-M3): con varios recibos, `verify` revisa TODOS (antes sólo el
@@ -365,19 +383,70 @@ pub fn cmd_receipt(args: &[String]) -> ExitCode {
     }
 }
 
+/// v0.6.49 (A7): lo que el veredicto de un `--replay` necesita saber del recibo.
+struct ReplayInfo {
+    /// El programa no es el del recibo y se corrió igual (`--replay-any-program`).
+    other_program: bool,
+    /// El recibo cortó lecturas del reloj: las de más salen del reloj real, y eso no es una diferencia.
+    clock_truncated: bool,
+}
+
+static REPLAY_INFO: std::sync::OnceLock<ReplayInfo> = std::sync::OnceLock::new();
+
 /// `run --replay <recibo abierto>` (la salida de `synsema receipt open`): fija la semilla de
 /// `random()`/`random_int()` y las lecturas de `now()` de la corrida grabada, y compara cada entrada
 /// que lee el programa con la `sha256` grabada; en la primera que difiere, la corrida corta y dice
 /// cuál. Las entradas se vuelven a leer de verdad (el recibo guarda hashes, no datos): lo que el
 /// replay prueba es que leyó lo mismo e hizo lo mismo. No regenera claves ni tokens (salen de la
 /// entropía del SO, a propósito).
-pub fn install_replay(path: &str) -> Result<(), String> {
+///
+/// v0.6.49 (A7): antes de correr compara el `program_sha` del recibo con el de `source` (el mismo
+/// cálculo que el recibo). Si no coincide, o el recibo no lo tiene, es error salvo `any_program`, y
+/// entonces el veredicto dice que no es una verificación.
+pub fn install_replay(path: &str, source: &str, filename: &str, any_program: bool) -> Result<(), String> {
     let text = std::fs::read_to_string(path).map_err(|e| format!("--replay: cannot read {}: {}", path, e))?;
     let opened: serde_json::Value = serde_json::from_str(&text).map_err(|e| format!("--replay: {} is not JSON: {}", path, e))?;
     if opened.get("entries").is_none() || opened.get("header").is_none() {
         return Err(format!("--replay: {} is not an opened receipt (run `synsema receipt open <receipt> --key <private>` first)", path));
     }
     let seed = opened.get("seed").and_then(|v| v.as_str()).ok_or("--replay: the opened receipt has no seed")?;
+    let recorded_sha = opened.pointer("/header/program_sha").and_then(|v| v.as_str());
+    let here = synsema_stdlib::attest::program_sha_of(source, filename).map(|s| synsema_core::bytesutil::hex_encode(&s));
+    let other_program = match (recorded_sha, here.as_deref()) {
+        (Some(r), Some(h)) if r == h => false,
+        (Some(r), Some(h)) if !any_program => {
+            return Err(format!(
+                "--replay: the receipt is of another program (program_sha {} in the receipt, {} here); to run this program against it anyway, add --replay-any-program (the result is not a verification)",
+                r, h
+            ))
+        }
+        (None, _) if !any_program => {
+            return Err("--replay: the receipt has no program_sha, so it does not say which program it recorded; to run this program against it anyway, add --replay-any-program (the result is not a verification)".to_string())
+        }
+        (Some(_), None) if !any_program => {
+            return Err(format!(
+                "--replay: the program_sha of {} cannot be computed (a `use` that does not resolve?), so it cannot be compared with the receipt's; fix that, or add --replay-any-program (the result is not a verification)",
+                filename
+            ))
+        }
+        _ => true,
+    };
+    // Ronda 1 (M3): los módulos `--trusted` son parte de lo que corrió; si difieren de los grabados,
+    // es otro programa aunque el `program_sha` coincida.
+    let recorded_trusted = opened.pointer("/header/trusted").filter(|v| !v.is_null());
+    let here_trusted = trusted_shas();
+    let other_program = other_program
+        || if recorded_trusted == here_trusted.as_ref() {
+            false
+        } else if any_program {
+            true
+        } else {
+            return Err(format!(
+                "--replay: the receipt's trusted modules ({}) are not the ones given here ({}); to run against it anyway, add --replay-any-program (the result is not a verification)",
+                recorded_trusted.map_or("none".to_string(), |v| v.to_string()),
+                here_trusted.map_or("none".to_string(), |v| v.to_string())
+            ));
+        };
     // Cada lectura del reloj viene como texto (la forma más corta del f64) y `str::parse` la vuelve
     // bit a bit; un número JSON lo leía `serde_json` a veces con un bit de diferencia.
     let clock: Vec<f64> = opened
@@ -394,10 +463,24 @@ pub fn install_replay(path: &str) -> Result<(), String> {
             (e.get("kind")?.as_str()? == "input").then(|| Some((e.get("source")?.as_str()?.to_string(), e.get("sha256")?.as_str()?.to_string())))?
         })
         .collect();
+    // El aviso nombra lo que se cortó: antes decía "truncated 0 sealed entries" cuando sólo se había
+    // cortado el reloj.
     let truncated = opened.get("truncated").and_then(|v| v.as_u64()).unwrap_or(0);
-    if truncated > 0 || opened.get("clock_truncated").is_some() {
+    let clock_cut = opened.get("clock_truncated").and_then(|v| v.as_u64()).unwrap_or(0);
+    if truncated > 0 {
         eprintln!("synsema run --replay: warning: the recorded run truncated {} sealed entries; the comparison covers what the envelope kept", truncated);
     }
+    if clock_cut > 0 {
+        eprintln!(
+            "synsema run --replay: warning: the recorded run kept {} clock readings and truncated {}; readings past those come from the real clock",
+            clock.len(),
+            clock_cut
+        );
+    }
+    if other_program {
+        eprintln!("synsema run --replay: warning: this is not the program of the receipt (--replay-any-program); the result is not a verification");
+    }
+    let _ = REPLAY_INFO.set(ReplayInfo { other_program, clock_truncated: clock_cut > 0 });
     let size = opened.pointer("/header/sealed_bytes").and_then(|v| v.as_u64()).unwrap_or(sealed::DEFAULT_SEALED_BYTES as u64) as usize;
     let mut log = synsema_core::sealed::RunLog::new(size);
     log.seed = Some(seed.to_string());
@@ -408,13 +491,41 @@ pub fn install_replay(path: &str) -> Result<(), String> {
 }
 
 /// El veredicto de un `--replay` al terminar: `Ok(resumen)` si leyó exactamente lo grabado.
-pub fn replay_verdict() -> Result<String, String> {
+///
+/// v0.6.49 (A7): no dice "match" si la corrida terminó con error (`run_failed`: no se comparó hasta
+/// el final), ni "same clock readings" si leyó el reloj otra cantidad de veces que la grabada (salvo
+/// que el recibo las haya cortado), y con `--replay-any-program` dice que no es una verificación.
+///
+/// Ronda 1 (B3): `exit_code` es el de un `exit(n)` del programa. Es un fin pedido, no un error: se
+/// compara hasta el final como una corrida terminada, y el veredicto dice `ended with exit(n)`.
+pub fn replay_verdict(run_failed: bool, exit_code: Option<i32>) -> Result<String, String> {
     if let Some(e) = synsema_core::sealed::replay_error() {
         return Err(e);
     }
+    let info = REPLAY_INFO.get();
+    let ended = exit_code.map(|c| format!(", ended with exit({})", c)).unwrap_or_default();
+    let other = format!("{}{}", ended, if info.is_some_and(|i| i.other_program) { " (another program: not a verification)" } else { "" });
     let (used, recorded) = synsema_core::sealed::replay_progress().unwrap_or((0, 0));
-    if used < recorded {
-        return Err(format!("replay: the run read {} of the {} inputs of the recorded run", used, recorded));
+    if run_failed && exit_code.is_none() {
+        return Err(format!(
+            "replay: the run stopped with an error, so it was not compared to the end; the {} inputs it read match the first {} of the recorded run's {}{}",
+            used, used, recorded, other
+        ));
     }
-    Ok(format!("replay: the {} inputs match the recorded run (same seed, same clock readings)", recorded))
+    if used < recorded {
+        return Err(format!("replay: the run read {} of the {} inputs of the recorded run{}", used, recorded, other));
+    }
+    let (clock_used, clock_recorded) = synsema_core::sealed::replay_clock_progress().unwrap_or((0, 0));
+    let clock = if info.is_some_and(|i| i.clock_truncated) && clock_used >= clock_recorded {
+        format!(
+            "the {} recorded clock readings and {} from the real clock past the receipt's truncation",
+            clock_recorded,
+            clock_used - clock_recorded
+        )
+    } else if clock_used != clock_recorded {
+        return Err(format!("replay: the run read the clock {} times, the recorded run {}{}", clock_used, clock_recorded, other));
+    } else {
+        format!("the same {} clock reading{}", clock_recorded, if clock_recorded == 1 { "" } else { "s" })
+    };
+    Ok(format!("replay: the {} inputs match the recorded run (same seed, {}){}", recorded, clock, other))
 }
