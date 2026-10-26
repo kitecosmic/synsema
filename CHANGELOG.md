@@ -44,11 +44,11 @@ Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the rele
 - **`run --replay` refuses a receipt of another program.** It compares the receipt's `program_sha`
   with the program's (the same hash as `synsema code sha`) before running, and stops with exit 2 if
   they differ or the receipt has none; the receipt's header now also records the sha256 of each
-  `--trusted` module (`trusted`), and a replay with other trusted modules stops the same way: `--replay: the receipt is of another program (program_sha …
-  in the receipt, … here); to run this program against it anyway, add --replay-any-program (the
-  result is not a verification)`. With `--replay-any-program` it runs, and the verdict ends with
-  `(another program: not a verification)`. Before, a different program replayed in silence and
-  could end in "match".
+  `--trusted` module (`trusted`), and a replay with other trusted modules stops the same way:
+  `--replay: the receipt is of another program (program_sha … in the receipt, … here); to run this
+  program against it anyway, add --replay-any-program (the result is not a verification)`. With
+  `--replay-any-program` it runs, and the verdict ends with `(another program: not a
+  verification)`. Before, a different program replayed in silence and could end in "match".
 - **The `reason` of an `llm-data` audit entry names the permission**: `Granted by
   llm("customers@api.anthropic.com")`, like any other permission used (before it was the operation,
   `generate`). Receipts and audits written before this version say `generate`; a tool that reads
@@ -131,12 +131,12 @@ corrected in place):
   to 2` (it used Rust's range notation, `0..3`).
 - `decide` served by the judge (`SYNSEMA_JUDGE_DECIDE`) under a ceiling with `judge` and without
   `llm` gives the line and says why it needs `llm` (it falls back to the model when the judge does
-  not choose), with private data too (whatever the `given` is: the check runs before `given` is
-  evaluated; a `decide` whose statement already touched the private value before it, as in
-  `[c + "!", decide … given c]`, still gets the redacted text, so give it its own line), and names both forms (`require llm`, or `require llm("<principal>")` with
-  `llm=<principal>@<provider host>` for private data); before, `Runtime error: private(…)` with
-  neither. Inside a private branch the first error is still `decide called under private control
-  flow`.
+  not choose), and names both forms: `require llm`, or with private data `require
+  llm("<principal>")` and a ceiling of `llm=<principal>@<provider host>`. Before, `Runtime error:
+  private(…)` with neither. With private data too, whatever the `given` is: the check runs before
+  `given` is evaluated. A `decide` whose statement already touched the private value before it, as
+  in `[c + "!", decide … given c]`, still gets the redacted text, so give it its own line. Inside a
+  private branch the first error is still `decide called under private control flow`.
 - A `require` missing inside a trusted task says to add it to that task (within the host's
   `--trusted-cap-set`), not to the program's preamble.
 - The `[INF] declassify` log says `from principals the program does not declare` instead of
@@ -153,6 +153,18 @@ corrected in place):
   bool was accepted but not named).
 - A refused connection to `localhost` that resolved to `::1` (Windows) says so and gives the
   `127.0.0.1` URL: a `serve` on `0.0.0.0` listens on IPv4 only.
+
+**Security: `zstd` 0.14.3, `zstd-safe` 8.2.0, `zstd-sys` 2.1.2.** RustSec published on 2026-10-16
+advisories against the versions v0.6.48 shipped (RUSTSEC-2026-0391, -0398, -0403, -0410, and the
+`unsound` warnings between -0395 and -0406): data from an abandoned stream leaking into the next
+one on a reused context, uninitialized memory and out-of-bounds reads in the safe wrapper, and the
+wasm allocator shim. `zstd` is only reached by `parquet_read`/`parquet_scan`/`parquet_write` with
+zstd-compressed files; the update is a patch release of each crate, with no API change.
+
+**`csv_parse` with an `int` column parses the number as an `i64` first** and goes through `BigInt`
+only when it does not fit; the result is the same. In this release LTO stopped inlining the
+conversion from `BigInt` (+29 instructions per integer, +0.7 % in the `s_csv` row of `perf-guard`);
+with the `i64` path the small integer no longer depends on that decision.
 
 ## v0.6.48 — 2026-10-25
 
