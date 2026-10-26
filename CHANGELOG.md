@@ -166,6 +166,15 @@ only when it does not fit; the result is the same. In this release LTO stopped i
 conversion from `BigInt` (+29 instructions per integer, +0.7 % in the `s_csv` row of `perf-guard`);
 with the `i64` path the small integer no longer depends on that decision.
 
+**The `perf-guard` anchor was re-measured on CI** (`engine/perf/baseline.json`, from this release's
+PR). Three rows move on purpose and are recorded:
+- `s_csv` drops 12 % (jit), 11.7 % (vm) and 7.9 % (ref), from the `i64` path above;
+- `a_args0` and `a_name64` (jit) rise 0.6 %: about 100 000 instructions once at process start, all
+  in glibc's `malloc_consolidate`/`unlink_chunk` (`BuiltinTask` carries one more field); nothing on
+  the program's own path;
+- `s_sort` (vm) rises 0.34 %: the same calls to `memcmp` as before, each costing more because the
+  binary's constant data moved; no function of `sort` or of loading changed.
+
 ## v0.6.48 — 2026-10-25
 
 **Security: RUSTSEC-2026-0387 fixed.** v0.6.47 shipped `crypto-bigint` 0.5.5, where some operations
