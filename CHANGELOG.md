@@ -6,7 +6,7 @@ Each says what changed, why, and what to write instead.
 
 Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the release date.
 
-## Unreleased
+## v0.6.49 — 2026-10-26
 
 **Behavior changes (read these first).**
 - **Under a ceiling, a program publishes only what it declares: `require declassify("P")` bounds
