@@ -1316,7 +1316,8 @@ pub fn install_ceiling_hook(interp: &mut Interpreter, caps: Rc<RefCell<Capabilit
 }
 
 /// v0.6.46 (E3): `declassify` como capability, igual en el nativo y en wasm. Concede la de
-/// ambiente (sin techo, sin scope; con techo, lo que el techo nombra) y cablea el gate: cada
+/// ambiente sólo sin techo (sin scope; v0.6.49, A1: con techo no hay nada de ambiente, la concede
+/// el `require declassify("P")` del programa dentro del techo) y cablea el gate: cada
 /// principal que la llamada quita tiene que estar cubierto por `declassify(P)`. La entrada de
 /// audit nombra el conjunto DECLARADO (el real variaría con el valor elegido); bajo una rama
 /// privada `push_audit` la descarta, como a toda entrada.
@@ -1333,6 +1334,7 @@ pub fn install_declassify_hook(interp: &mut Interpreter, caps: Rc<RefCell<Capabi
             source: "declassify()".to_string(),
             reason: if ok { "Granted (declared set)".to_string() } else { "declassify is not granted".to_string() },
             origin: "program",
+            context: None,
         });
         ok
     }));
@@ -1357,12 +1359,19 @@ pub fn install_llm_data_hook(
             let c = Capability::new(ty, Some(format!("{}@{}", p, host)));
             cs.ceiling_names(&c) && cs.check_silent(&c)
         });
+        // v0.6.49 (A9): concedida, el `reason` nombra el permiso, como cualquier permiso usado
+        // (`Granted by llm("clientes@embedder")`); antes decía sólo la operación (`generate`). Es el
+        // conjunto DECLARADO, como `capability`: cuáles principales trae el valor depende del dato, así
+        // que hay una sola entrada por llamada.
+        let capability = Capability::new(ty, Some(format!("{}@{}", declared, host)));
+        let reason = if ok { format!("Granted by {}", capability) } else { format!("{}: not in the host ceiling or not required", op) };
         cs.push_audit(synsema_capabilities::model::CapabilityAuditEntry {
-            capability: Capability::new(ty, Some(format!("{}@{}", declared, host))),
+            capability,
             granted: ok,
             source: "llm-data".to_string(),
-            reason: if ok { op.to_string() } else { format!("{}: not in the host ceiling or not required", op) },
+            reason,
             origin: "program",
+            context: None,
         });
         ok
     }));

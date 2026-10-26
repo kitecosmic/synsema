@@ -1326,7 +1326,7 @@ pub fn run(source: &str, opts: &RunOptions) -> Report {
             let log = log.lock().unwrap_or_else(|p| p.into_inner());
             match synsema_stdlib::sealed::build_receipt(
                 &log,
-                &synsema_stdlib::sealed::ReceiptContext { auditor, key: &key, program_sha, config_sha: None, started },
+                &synsema_stdlib::sealed::ReceiptContext { auditor, key: &key, program_sha, config_sha: None, trusted: synsema_stdlib::sealed::trusted_shas(&opts.trusted), started },
             ) {
                 Ok(v) => Some(v),
                 // Sin recibo no hay salida: es lo que el host pidió al poner un auditor.

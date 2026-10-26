@@ -19,6 +19,7 @@ import { execFileSync } from "node:child_process";
 import { createServer } from "node:http";
 import { resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
+import { generateKeyPairSync, createHash } from "node:crypto";
 import { Synsema } from "../packages/synsema-wasm/index.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -173,6 +174,43 @@ print(llm_usage())`;
   check("E3b: directo, el techo no da declassify (v0.6.47: el programa ve el texto fijo; el motivo, el operador)", !direct.ok && direct.errors.some((e) => e.includes("label_violation: the flow checker stopped the run")) && !direct.errors.some((e) => e.includes("declassify is not granted")) && (direct.operator_detail ?? "").includes("declassify is not granted"), direct);
   const none = syn.run(prog("print(1)"), { labels: true });
   check("E3b: sin `trusted`, el módulo no existe", !none.ok && none.errors.some((e) => e.includes("no trusted module named 't'")), none);
+  // v0.6.49 (B2): lo que se audita dentro de la tool lleva `context: "trusted:t"`, como en el nativo.
+  const inTool = via.audit.filter((a) => a.context === "trusted:t");
+  check("B2: el audit de la tool de confianza nombra el módulo", inTool.some((a) => a.capability === 'declassify("clientes")') && via.audit.some((a) => a.context === undefined), via.audit);
+  // Ronda 1 (M3): el encabezado del recibo graba el sha256 de cada módulo de confianza.
+  const auditor = generateKeyPairSync("x25519").publicKey.export({ format: "jwk" }).x;
+  const sealedVia = syn.run(prog("print(t.inicial(c))"), { labels: true, ceiling: "stdout", trusted, auditor });
+  const want = createHash("sha256").update(trusted.t).digest("hex");
+  check("M3: el recibo nombra el sha de cada módulo de confianza", sealedVia.ok && sealedVia.receipt?.header?.trusted?.t === want, sealedVia.receipt?.header);
+}
+
+// v0.6.49 (B1): `run()`/`runAsync()` pasan `auditor` y `sealedBytes` y devuelven `receipt`.
+{
+  const { publicKey } = generateKeyPairSync("x25519");
+  const auditor = publicKey.export({ format: "jwk" }).x;
+  const r = syn.run('require time\nprint("hola")', { labels: true, auditor });
+  check("B1: run() con auditor devuelve el recibo", r.ok && r.receipt && typeof r.receipt === "object" && r.output[0] === "hola", r);
+  const a = await syn.runAsync('print("hola")', { labels: true, auditor, sealedBytes: 4096 });
+  check("B1: runAsync() también, y sealedBytes llega al motor", a.ok && a.receipt && typeof a.receipt === "object", a);
+  const bad = syn.run('print("hola")', { labels: true, auditor, sealedBytes: 10 });
+  check("B1: un sealedBytes fuera de rango es un error del motor, no se descarta", !bad.ok && bad.errors.some((e) => e.includes("sealed_bytes")), bad);
+  const none = syn.run('print("hola")', { labels: true });
+  check("B1: sin auditor no hay recibo", none.ok && none.receipt === undefined, none);
+  // Ronda 1 (M4): `test()`/`handle()` no sellan, y un `auditor` ahí es un error, no se ignora.
+  const t = syn.test('test "a"\n    assert_eq(1 + 1, 2)\n', { labels: true, auditor });
+  check("M4: test() con auditor es un error", !t.ok && (t.errors ?? []).some((e) => e.includes("only run seals a receipt")), t);
+  const h = syn.handle('require serve(8080)\nserve on 8080\n    route "GET /x"\n        give "x"\n', { method: "GET", path: "/x" }, { labels: true, auditor });
+  check("M4: handle() con auditor es un error", !h.ok && (h.errors ?? []).some((e) => e.includes("only run seals a receipt")), h);
+  const tb = syn.test('test "a"\n    assert_eq(1 + 1, 2)\n', { sealedBytes: 4096 });
+  check("M4: test() con sealedBytes también", !tb.ok && (tb.errors ?? []).some((e) => e.includes("only run seals a receipt")), tb);
+}
+
+// v0.6.49 (B3): `require llm("a")` bajo un techo `stdout,llm` queda negado (el `llm` sin principal es
+// sólo para datos públicos) y el motivo dice qué ítem falta; la llamada pública anda.
+{
+  const r = syn.run('require llm("a")\nprint(reason about "hola")', { labels: true, ceiling: "stdout,llm", host: { llm: () => "ok" } });
+  const denied = r.audit.find((a) => a.capability === 'llm("a")' && !a.granted);
+  check("B3: el motivo nombra el ítem que falta", r.ok && r.output[0] === "ok" && denied && denied.reason.includes("`llm=a@<provider host>`"), r);
 }
 
 // v0.6.46 (ronda 1, M1 y B1): `redirect: "error"` en toda request con un secret (también en un

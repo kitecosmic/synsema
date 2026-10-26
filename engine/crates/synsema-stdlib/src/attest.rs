@@ -157,14 +157,21 @@ pub fn current_program_sha() -> Option<[u8; 32]> {
     }
     *PROGRAM_SHA.get_or_init(|| {
         let (source, filename) = NOTED_PROGRAM.get()?;
-        let program = synsema_core::parser::parse_source(source, filename).ok()?;
-        let loaded = |resolved: &str, raw: &str| match synsema_core::loaded_modules::get(resolved) {
-            Some(entry) => Ok(entry),
-            None => read_module(resolved, raw),
-        };
-        let modules = synsema_core::templates::module_walk(synsema_core::loaded_modules::use_paths(&program), filename, &loaded).ok()?;
-        Some(fold_program_sha(source, &modules).0)
+        program_sha_of(source, filename)
     })
+}
+
+/// El `program_sha` de un fuente con el mismo cálculo que el recibo ([`current_program_sha`]), sin
+/// el chequeo estático de [`program_sha`]. v0.6.49 (A7): `run --replay` lo compara con el del recibo
+/// antes de correr.
+pub fn program_sha_of(source: &str, filename: &str) -> Option<[u8; 32]> {
+    let program = synsema_core::parser::parse_source(source, filename).ok()?;
+    let loaded = |resolved: &str, raw: &str| match synsema_core::loaded_modules::get(resolved) {
+        Some(entry) => Ok(entry),
+        None => read_module(resolved, raw),
+    };
+    let modules = synsema_core::templates::module_walk(synsema_core::loaded_modules::use_paths(&program), filename, &loaded).ok()?;
+    Some(fold_program_sha(source, &modules).0)
 }
 
 /// Un módulo del bundle (`synsema build`) o del disco, como `load_module_inner`: su fuente y sus `use`.

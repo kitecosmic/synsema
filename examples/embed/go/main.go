@@ -32,8 +32,9 @@ import (
 type Host struct {
 	HTTP func(req map[string]any) map[string]any
 	KV   map[string]string // ns + "\x00" + key -> value
-	LLM  func(op, prompt string) (string, int)
-	Log  func(line string)
+	// principals: los dueños de lo privado del prompt (vacío con datos públicos).
+	LLM func(op, prompt string, principals []string) (string, int)
+	Log func(line string)
 }
 
 func (h *Host) offers() map[string]bool {
@@ -99,7 +100,15 @@ func (h *Host) dispatch(kind string, payload map[string]any) (any, bool) {
 		if h.LLM == nil {
 			return nil, false
 		}
-		content, tokens := h.LLM(str("op"), str("prompt"))
+		principals := []string{}
+		if ps, ok := payload["principals"].([]any); ok {
+			for _, p := range ps {
+				if s, ok := p.(string); ok {
+					principals = append(principals, s)
+				}
+			}
+		}
+		content, tokens := h.LLM(str("op"), str("prompt"), principals)
 		return map[string]any{"content": content, "tokens": tokens}, true
 	case "log":
 		if h.Log == nil {
@@ -237,6 +246,9 @@ func (s *Synsema) Handle(source string, method, path string, host *Host) map[str
 	return r
 }
 
+// seenPrincipals: lo que el host recibió en cada llamada a `LLM` (los dueños de lo privado del prompt).
+var seenPrincipals []string
+
 func main() {
 	wasm := "../../../engine/target/wasm32-unknown-unknown/wasm/synsema_wasm_web.wasm"
 	if len(os.Args) > 1 {
@@ -280,7 +292,10 @@ func main() {
 
 	host := &Host{
 		KV:  map[string]string{},
-		LLM: func(op, prompt string) (string, int) { return "[" + op + "] " + prompt, 9 },
+		LLM: func(op, prompt string, principals []string) (string, int) {
+			seenPrincipals = append(seenPrincipals, strings.Join(principals, ","))
+			return "[" + op + "] " + prompt, 9
+		},
 		Log: func(line string) { fmt.Println("   [host]", line) },
 		HTTP: func(req map[string]any) map[string]any {
 			method, _ := req["method"].(string)
@@ -323,6 +338,9 @@ func main() {
 	// 3. LLM del host + llm_usage.
 	r = syn.Run("require llm\nprint(reason about \"el clima\")\nprint(llm_usage())", host, nil)
 	check("llm: reason va al host y llm_usage cuenta", r["ok"] == true && strings.HasPrefix(outputs(r)[0], "[reason]") && outputs(r)[1] == "9", r)
+	check("llm: un prompt público llega sin principals", seenPrincipals[len(seenPrincipals)-1] == "", seenPrincipals)
+	r = syn.Run("require llm(\"clientes\")\nlet c be private(\"ana@cliente.com\", \"clientes\")\nprint(label_of(reason c))", host, map[string]any{"labels": true, "ceiling": "stdout,llm=clientes@embedder"})
+	check("llm: el host ve de quién es lo privado del prompt", r["ok"] == true && seenPrincipals[len(seenPrincipals)-1] == "clientes", r)
 
 	// 4. Red gateada: sin `require net` no se llama a net/http.
 	r = syn.Run("let r be fetch(\"https://example.com\")", host, nil)

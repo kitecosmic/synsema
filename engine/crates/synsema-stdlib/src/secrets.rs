@@ -302,7 +302,7 @@ pub(crate) fn edge_text(v: &SynValue, who: &str, what: &str) -> Result<String, C
             who, what
         )))),
         other => Err(Control::Error(RuntimeError::new(format!(
-            "{}: {} must be text, a number or a secret, got {}",
+            "{}: {} must be text, a number, a bool or a secret, got {}",
             who,
             what,
             other.type_name()
@@ -340,8 +340,9 @@ fn derived_secret(
         }
     }
     let parts: Vec<(String, String)> = sources.iter().flat_map(|s| s.atoms()).collect();
+    let from_config = sources.iter().all(|s| s.is_from_config());
     Ok(SynValue::Secret(synsema_core::types::Obj::new(
-        synsema_core::secret::SecretInner::new(name, plaintext).with_binding(bound.map(Into::into), None, parts),
+        synsema_core::secret::SecretInner::new(name, plaintext).with_binding(bound.map(Into::into), None, parts).from_config(from_config),
     )))
 }
 
@@ -690,7 +691,7 @@ fn iso_now() -> String {
 /// alcanza o no (un oráculo de la rama).
 pub fn audited_op_preflight(op: &str) -> Result<(), Control> {
     if synsema_core::labels::pc_private_now() && (op == "spend" || !synsema_core::sealed::active()) {
-        return Err(Control::Error(RuntimeError::new(synsema_core::labels::audited_in_private_branch(op))));
+        return Err(Control::Error(RuntimeError::label_cut(synsema_core::labels::audited_in_private_branch(op))));
     }
     Ok(())
 }
@@ -916,11 +917,11 @@ pub fn register_secret_builtins(
                 }
                 match resolve(&env, &name, args.get(1)) {
                     Some(v) => Ok(match binding {
-                        None => syn_secret(name, v),
+                        None => SynValue::Secret(synsema_core::types::Obj::new(synsema_core::secret::SecretInner::new(name, v).from_config(true))),
                         Some(h) => {
                             let hosts: Vec<String> = h.split('|').map(str::to_string).collect();
                             SynValue::Secret(synsema_core::types::Obj::new(
-                                synsema_core::secret::SecretInner::new(name, v).with_binding(Some(hosts.into()), None, Vec::new()),
+                                synsema_core::secret::SecretInner::new(name, v).with_binding(Some(hosts.into()), None, Vec::new()).from_config(true),
                             ))
                         }
                     }),
@@ -1260,7 +1261,7 @@ mod tests {
         assert_eq!(edge_text(&synsema_core::types::syn_int(42), "t", "x").ok().unwrap(), "42");
         assert_eq!(edge_text(&syn_secret("K", "s3cret".to_string()), "t", "x").ok().unwrap(), "s3cret");
         assert!(msg(edge_text(&SynValue::Nothing, "fetch", "header \"X\"")).contains("fetch: header \"X\" is nothing"));
-        assert!(msg(edge_text(&syn_bytes(vec![1u8]), "t", "x")).contains("must be text, a number or a secret, got bytes"));
+        assert!(msg(edge_text(&syn_bytes(vec![1u8]), "t", "x")).contains("must be text, a number, a bool or a secret, got bytes"));
         assert!(msg(edge_text(&syn_secret_bytes("B", vec![0xff, 0xfe]), "t", "x")).contains("secret(B), which holds bytes that are not UTF-8"));
         assert_eq!(edge_text(&syn_secret_bytes("U", b"utf8 ok".to_vec()), "t", "x").ok().unwrap(), "utf8 ok");
         let sealed = SynValue::Secret(synsema_core::types::Obj::new(synsema_core::secret::SecretInner::new_bytes_sealed("attestation_key", vec![7u8; 32])));

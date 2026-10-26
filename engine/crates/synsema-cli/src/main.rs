@@ -40,7 +40,7 @@ mod update;
 mod code;
 mod sealed_receipt;
 
-const USAGE: &str = "uso: synsema <conform [--swarm] [--flat] | serve [--secure] [--watch] [--port N] [--domain d1,d2] [--tls-auto <email> | --tls-cert <p> --tls-key <p>] [--bind addr] [--trust-proxy ip,cidr] [--health <path>] [--attested] [--auditor <X25519 public key> [--receipt <ruta|fd:N>]] | run [--flat] [--explain] [--format human|json] [--provider <name>] [--attest] [--auditor <X25519 public key> [--receipt <ruta|fd:N>] | --replay <recibo abierto>] <archivo.syn | -> [-- args...] | receipt <open <recibo> --key <privada> | verify <recibo> | keygen> | test [-v] <archivo|dir> | build <main.syn> -o <salida> [--include <p>]... [--engine-binary <ruta>] [--serve [--bind addr] ...] [--no-console] [--icon <svg|png|ico>] [--bundle [--name <n>] [--id <id>]] | check | code <outline|symbol|refs|routes|caps|check|search|deps> [--json] | code --mcp | openapi [--out f] [--base-url URL] | tokens | ast | repl | daemon | init [dir] [--synfide | --pwa | --desktop] | llm status [--json] | version | update> [--sandbox | --cap-set <list> | --deterministic] [--labels] [--jitless] [--profile native|pure] [--audit json|<ruta>|fd:N|unix:<ruta>] [--env-file <path> | --no-env-file] <archivo.syn>";
+const USAGE: &str = "uso: synsema <conform [--swarm] [--flat] | serve [--secure] [--watch] [--port N] [--domain d1,d2] [--tls-auto <email> | --tls-cert <p> --tls-key <p>] [--bind addr] [--trust-proxy ip,cidr] [--health <path>] [--attested] [--auditor <X25519 public key> [--receipt <ruta|fd:N>]] | run [--flat] [--explain] [--format human|json] [--provider <name>] [--attest] [--auditor <X25519 public key> [--receipt <ruta|fd:N>] | --replay <recibo abierto> [--replay-any-program]] <archivo.syn | -> [-- args...] | receipt <open <recibo> --key <privada> | verify <recibo> | keygen> | test [-v] [--auditor <X25519 public key> [--receipt <ruta|fd:N>]] <archivo|dir> | build <main.syn> -o <salida> [--include <p>]... [--engine-binary <ruta>] [--serve [--bind addr] ...] [--no-console] [--icon <svg|png|ico>] [--bundle [--name <n>] [--id <id>]] | check | code <outline|symbol|refs|routes|caps|check|search|deps> [--json] | code --mcp | openapi [--out f] [--base-url URL] | tokens | ast | repl | daemon | init [dir] [--synfide | --pwa | --desktop] | llm status [--json] | version | update> [--sandbox | --cap-set <list> | --deterministic] [--trusted <nombre=ruta>]... [--trusted-cap-set <list>] [--labels] [--jitless] [--profile native|pure] [--audit json|<ruta>|fd:N|unix:<ruta>] [--env-file <path> | --no-env-file] <archivo.syn>";
 
 // `build_ceiling` (--sandbox/--cap-set → techo) vive en synsema-capabilities: lo comparten
 // este binario y `synsema-wasm` (mismas flags, misma semántica en los dos front-ends).
@@ -631,13 +631,18 @@ fn main() -> ExitCode {
         Some("llm") => cmd_llm(&args),
         Some("judge") => cmd_judge(&args),
         Some("update") => update::cmd_update(),
+        // v0.6.49 (B5): `--help` era "subcomando desconocido"; ahora da el uso, a stdout y con 0.
+        Some("help") | Some("--help") | Some("-h") => {
+            println!("{}", USAGE);
+            ExitCode::SUCCESS
+        }
         Some("version") | Some("--version") | Some("-V") => {
             println!("Synsema {}", update::current_version());
             update::notify_if_outdated();
             ExitCode::SUCCESS
         }
         Some(other) => {
-            eprintln!("subcomando desconocido: '{}'. Disponibles: init, conform, serve, run, test, build, check, code, openapi, tokens, ast, repl, daemon, llm, version, update", other);
+            eprintln!("subcomando desconocido: '{}'. Disponibles: init, conform, serve, run, test, build, check, code, openapi, tokens, ast, repl, daemon, llm, version, update, help", other);
             ExitCode::from(2)
         }
         None => {
@@ -1603,11 +1608,14 @@ fn cmd_run(args: &[String]) -> ExitCode {
     let mut auditor_flag: Option<String> = None;
     let mut receipt_flag: Option<String> = None;
     let mut replay_flag: Option<String> = None;
+    // v0.6.49 (A7): `--replay` exige el programa del recibo; esto deja correr otro (no verifica).
+    let mut replay_any_program = false;
     let rest = &host.rest;
     let mut i = 0;
     while i < rest.len() {
         match rest[i].as_str() {
             "--flat" => flat = true,
+            "--replay-any-program" => replay_any_program = true,
             flag @ ("--auditor" | "--receipt" | "--replay") => match rest.get(i + 1) {
                 Some(v) if !v.starts_with("--") => {
                     match flag {
@@ -1686,7 +1694,7 @@ fn cmd_run(args: &[String]) -> ExitCode {
     let path = match path {
         Some(p) => p,
         None => {
-            eprintln!("uso: synsema run [--flat] [--explain] [--format human|json] [--provider <name>] [--attest] [--auditor <X25519 public key> [--receipt <ruta|fd:N>]] [--sandbox | --cap-set <list> | --deterministic] [--profile native|pure] [--audit json|<ruta>|fd:N] <archivo.syn | -> [-- args...]");
+            eprintln!("uso: synsema run [--flat] [--explain] [--format human|json] [--provider <name>] [--attest] [--auditor <X25519 public key> [--receipt <ruta|fd:N>] | --replay <recibo abierto> [--replay-any-program]] [--sandbox | --cap-set <list> | --deterministic] [--trusted <nombre=ruta>]... [--trusted-cap-set <list>] [--labels] [--profile native|pure] [--audit json|<ruta>|fd:N] <archivo.syn | -> [-- args...]");
             return ExitCode::from(2);
         }
     };
@@ -1712,6 +1720,10 @@ fn cmd_run(args: &[String]) -> ExitCode {
     };
     if auditor.is_some() && explain {
         eprintln!("synsema run: --auditor and --explain are mutually exclusive (the receipt goes before the output, and --explain prints a diagnostic)");
+        return ExitCode::from(2);
+    }
+    if replay_any_program && replay_flag.is_none() {
+        eprintln!("synsema run: --replay-any-program goes with --replay <opened receipt>");
         return ExitCode::from(2);
     }
     if replay_flag.is_some() && (auditor.is_some() || explain || report_mode || attest) {
@@ -1781,7 +1793,7 @@ fn cmd_run(args: &[String]) -> ExitCode {
         a.install();
     }
     if let Some(path) = &replay_flag {
-        if let Err(e) = sealed_receipt::install_replay(path) {
+        if let Err(e) = sealed_receipt::install_replay(path, &source, &filename, replay_any_program) {
             eprintln!("synsema run: {}", e);
             return ExitCode::from(2);
         }
@@ -1980,14 +1992,16 @@ fn cmd_run(args: &[String]) -> ExitCode {
     }
     let mut code = run_exit_code(&result);
     if replay_flag.is_some() {
-        match sealed_receipt::replay_verdict() {
+        match sealed_receipt::replay_verdict(!result.success, synsema_runtime::engine::last_run_exit_code()) {
             Ok(m) => eprintln!("{}", m),
             Err(m) => {
                 // Si el corte ya salió como el error de la corrida, no se repite.
                 if !result.errors.iter().any(|e| e.contains(&m)) {
                     eprintln!("{}", m);
                 }
-                code = code.max(1);
+                // Ronda 2 (B4): una diferencia sale con 1 aunque la corrida terminara con
+                // `exit(n)`; con `n` no se distinguía de un replay que coincide.
+                code = 1;
             }
         }
     }
@@ -2123,19 +2137,39 @@ fn cmd_test(args: &[String]) -> ExitCode {
     // Varios archivos o directorios, como `cargo test`/`pytest`/`go test` (antes quedaba el
     // último en silencio: `synsema test a.syn b.syn` corría sólo b.syn).
     let mut paths: Vec<String> = Vec::new();
-    for a in &host.rest {
+    // v0.6.49 (B11): el recibo sellado, como en `run` (un archivo: un recibo sella una corrida).
+    let mut auditor_flag: Option<String> = None;
+    let mut receipt_flag: Option<String> = None;
+    let mut i = 0;
+    while i < host.rest.len() {
+        let a = &host.rest[i];
         match a.as_str() {
             "--flat" => flat = true,
             "-v" | "--verbose" => verbose = true,
+            flag @ ("--auditor" | "--receipt") => match host.rest.get(i + 1) {
+                Some(v) if !v.starts_with("--") => {
+                    if flag == "--auditor" {
+                        auditor_flag = Some(v.clone());
+                    } else {
+                        receipt_flag = Some(v.clone());
+                    }
+                    i += 1;
+                }
+                _ => {
+                    eprintln!("synsema test: {} needs a value", flag);
+                    return ExitCode::from(2);
+                }
+            },
             p if !p.starts_with('-') => paths.push(p.to_string()),
             other => {
                 eprintln!("synsema test: unknown flag '{}'", other);
                 return ExitCode::from(2);
             }
         }
+        i += 1;
     }
     if paths.is_empty() {
-        eprintln!("uso: synsema test [-v] [--flat] [--sandbox | --cap-set <list>] [--profile native|pure] [--audit json|<ruta>|fd:N] <archivo.syn | dir>...");
+        eprintln!("uso: synsema test [-v] [--flat] [--auditor <X25519 public key> [--receipt <ruta|fd:N>]] [--sandbox | --cap-set <list>] [--trusted <nombre=ruta>]... [--trusted-cap-set <list>] [--profile native|pure] [--audit json|<ruta>|fd:N] <archivo.syn | dir>...");
         return ExitCode::from(2);
     }
     // Techo de capabilities del host (--sandbox/--cap-set): opt-in, defense-in-depth.
@@ -2169,6 +2203,17 @@ fn cmd_test(args: &[String]) -> ExitCode {
             }
         }
     }
+    let auditor = match sealed_receipt::from_flags("test", auditor_flag, receipt_flag) {
+        Ok(a) => a,
+        Err(code) => return code,
+    };
+    if auditor.is_some() && files.len() != 1 {
+        eprintln!("synsema test: --auditor seals one run; pass one test file ({} found)", files.len());
+        return ExitCode::from(2);
+    }
+    if let Some(a) = &auditor {
+        a.install();
+    }
     let multi = files.len() > 1;
     let mut total_passed = 0usize;
     let mut total_failed = 0usize;
@@ -2188,6 +2233,12 @@ fn cmd_test(args: &[String]) -> ExitCode {
             println!("{}:", file);
         }
         let report = run_tests_ceiled(&source, file, ceiling.clone());
+        // Con auditor, el recibo sale antes que el informe (como la salida de `run`).
+        if let Some(a) = &auditor {
+            if let Err(code) = emit_receipt(a, None) {
+                return code;
+            }
+        }
         print_test_report(&report, verbose);
         total_passed += report.passed;
         total_failed += report.failed;
@@ -2726,6 +2777,15 @@ fn cmd_check(args: &[String]) -> ExitCode {
     use synsema_core::parser::CompileError;
     match synsema_core::parser::parse_source(&source, &path) {
         Ok(program) => {
+            // v0.6.49 (B7): un builtin protegido (`declassify`, `private`…) leído como valor o
+            // redefinido es un error de carga en `run` y en `code check`; `check` daba OK.
+            if let Err(synsema_core::interpreter::Control::Error(re)) = synsema_core::interpreter::check_protected_names(&program) {
+                match &re.location {
+                    Some(l) => eprintln!("Error: {}:{}:{}: {}", l.file, l.line, l.column, re.message),
+                    None => eprintln!("Error: {}", re.message),
+                }
+                return ExitCode::from(1);
+            }
             // Chequeo estático profundo: módulos `use` (recursivo, mismas reglas que
             // el runtime) + templates `render("literal")` (existen y parsean). Un
             // import roto o un template con typo falla en `check`, no en producción.

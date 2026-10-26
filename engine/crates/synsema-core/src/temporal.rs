@@ -975,12 +975,25 @@ pub fn in_units(args: &[SynValue]) -> Result<SynValue, Control> {
             Temporal::Duration(d) => (*d, u.to_string()),
             other => return Err(err(format!("in_units() takes a duration, got {}", other.type_name()))),
         },
-        // v0.6.46 (C2): un número no dice en qué unidad está; la pista arma la duración.
-        (Some(n @ SynValue::Number(_)), _) => {
+        // v0.6.46 (C2): un número no dice en qué unidad está; la pista arma la duración. v0.6.49
+        // (§C): con la unidad que se pidió (antes, siempre "minutes").
+        (Some(n @ SynValue::Number(_)), u) => {
+            let unit = match u {
+                Some(SynValue::Text(u)) => u.to_string(),
+                _ => "minutes".to_string(),
+            };
             return Err(err(format!(
-                "in_units() takes a duration, got {} — make one first: in_units(duration(seconds = {}), \"minutes\")",
+                "in_units() takes a duration, got {} — make one first: in_units(duration(seconds = {}), \"{}\")",
                 n.type_name(),
-                n
+                n,
+                unit
+            )));
+        }
+        // v0.6.49 (§C): el primer argumento no es una duración (antes decía que la unidad era mala).
+        (Some(other), Some(SynValue::Text(_))) => {
+            return Err(err(format!(
+                "in_units() takes a duration, got {} — make one with duration(…) or the difference of two times (t2 - t1)",
+                other.type_name()
             )))
         }
         _ => return Err(err("in_units(duration, unit): unit is \"weeks\", \"days\", \"hours\", \"minutes\", \"seconds\" or \"milliseconds\"")),
@@ -993,7 +1006,12 @@ pub fn in_units(args: &[SynValue]) -> Result<SynValue, Control> {
         "minutes" => 60.0,
         "seconds" => 1.0,
         "milliseconds" => 1e-3,
-        other => return Err(err(format!("in_units: unknown unit {:?}", other))),
+        other => {
+            return Err(err(format!(
+                "in_units: unknown unit {:?} — the unit is \"weeks\", \"days\", \"hours\", \"minutes\", \"seconds\" or \"milliseconds\"",
+                other
+            )))
+        }
     };
     Ok(syn_float(secs / per))
 }

@@ -70,9 +70,9 @@
 //! La política la devuelve `deploy` (o `load_module`) en `"policy"` y viaja dentro del estado
 //! firmado bajo la clave `"_vela"`, que la app nunca ve.
 //!
-//! El programa corre bajo el techo `stdout` del ABI genérico: sin `time`, sin `random`, sin red —
-//! Determinista por construcción, que es lo que el state root firmado exige. `print` va al stdout
-//! De WASI con prefijo `INF`, que es el canal de logs de Vela.
+//! El programa corre bajo el techo `stdout,declassify=app` ([`CEILING`]): sin `time`, sin `random`,
+//! sin red — determinista por construcción, que es lo que el state root firmado exige. `print` va
+//! al stdout de WASI con prefijo `INF`, que es el canal de logs de Vela.
 
 use std::cell::{Cell, OnceCell};
 
@@ -145,6 +145,8 @@ fn app_name() -> &'static str {
 /// v0.6.46 (E3): `declassify` es una capability que el techo acota. El único principal de Vela es
 /// `app` (`PRINCIPAL_APP`) y la app publica sus resultados (el código de error, el recibo de un
 /// retiro) con su propio `declassify`: el techo lo nombra. Otro principal no se puede publicar.
+/// v0.6.49 (A1): bajo un techo se publica lo que el programa declara Y el techo permite, así que la
+/// app tiene que decir `require declassify("app")` (las tres del repo lo dicen).
 const CEILING: &str = "stdout,declassify=app";
 
 const REQUEST_PROCESS: i32 = 1;
@@ -2171,6 +2173,7 @@ mod tests {
 
     /// Un libro mínimo: `deploy` acepta `params.policy`; `process` tiene una rama por caso.
     const LEDGER: &str = r#"
+require declassify("app")
 let FUEL be "5"
 
 task deploy(ctx)
@@ -2242,6 +2245,21 @@ task deanonymize(ctx)
         for r in [&coded, &free, &boom] {
             assert!(!r.to_string().contains("Insufficient") && !r.to_string().contains("out of range"), "{}", r);
         }
+    }
+
+    /// v0.6.49 (A1): el techo nombra `declassify=app`, pero una app que no lo declara no publica:
+    /// el primer `declassify` corta (antes lo concedía el techo solo).
+    #[test]
+    fn an_app_without_require_declassify_cannot_publish() {
+        let bare = LEDGER.replacen("require declassify(\"app\")\n", "", 1);
+        assert_ne!(bare, LEDGER);
+        let app = App::inline(&bare);
+        let s0 = deployed(&app, None);
+        let coded = process(&app, ALICE, r#"{"type": "code"}"#, &s0);
+        assert_eq!(coded["error"], json!("label_violation"), "{}", coded);
+        assert_eq!(coded["state"], Value::Null);
+        let with = App::inline(LEDGER);
+        assert_eq!(process(&with, ALICE, r#"{"type": "code"}"#, &deployed(&with, None))["error"], json!("insufficient_balance"));
     }
 
     #[test]
@@ -2499,6 +2517,7 @@ task invariants(ctx)
     /// Un libro que, a propósito, deja escapar valores privados por sumideros públicos en unas
     /// ramas y los declassifica en otras.
     const LEAKY: &str = r#"
+require declassify("app")
 task deploy(ctx)
     give {"state": {"balances": {}, "secret_total": 42}}
 
@@ -2592,6 +2611,7 @@ task process(ctx)
     /// Auditoría R2/B2: la forma GRANULAR — sin `declassify` del mapa entero y sin declassificar
     /// El despacho (`match payload["type"]` a secas, con el payload privado).
     const GRANULAR: &str = r#"
+require declassify("app")
 let FUEL be "0x32"
 
 task deploy(ctx)

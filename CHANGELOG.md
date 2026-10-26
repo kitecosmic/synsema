@@ -6,6 +6,154 @@ Each says what changed, why, and what to write instead.
 
 Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the release date.
 
+## Unreleased
+
+**Behavior changes (read these first).**
+- **Under a ceiling, a program publishes only what it declares: `require declassify("P")` bounds
+  `declassify`, like `require net` bounds the network** (with `--labels`). Since v0.6.46 the ceiling
+  alone decided: `--cap-set stdout,declassify=customers` let `declassify` remove `customers` from a
+  program that never declared it. Now, under a ceiling (`--cap-set`, `ceiling` in wasm) nothing is
+  granted from the environment: the program's `require declassify("customers")` grants it, and it
+  goes through the ceiling like any other `require` (`--sandbox` and `--deterministic` have no
+  `declassify` to allow: under them nothing is published, as before). A
+  `require declassify("billing")` under `declassify=customers` is refused (the audit says so), and a
+  bare `require declassify` under a scoped ceiling is wider than the ceiling and refused whole, as
+  `require net` is under `net=api.x.com`. Without a ceiling nothing changes (`declassify` is still
+  granted, like `unsafe` in your own crate), and without `--labels` it is not checked. A trusted
+  task is "a program" here: under `--trusted-cap-set` it publishes what its own `require
+  declassify(...)` declares (what the v0.6.46 entry already said; it is now true), and so is an
+  agent, which declares its own capabilities: the program's `require` does not reach it.
+  **Breaking:** a program that runs under a ceiling with `--labels` and declassifies needs `require
+  declassify("<principal>")` in its preamble, in the trusted task, or in the agent that
+  declassifies. The refusal says where the line goes: in a trusted module, the exported task that
+  runs it and `--trusted-cap-set` (also when an agent calls it; while the module loads nothing
+  is declared, not even by a task its top level calls, so it says to move it into an exported task
+  that the program calls); in an agent, that agent's body (an
+  agent spawned by another declares its own too); otherwise the program's preamble or the body of
+  the agent that runs the code (a `parallel_map` inside an agent inherits the agent's
+  capabilities, so the agent's line covers it).
+- **The Vela guest's bundled app, and the two example apps, now declare `require
+  declassify("app")`**, for the change above (the guest runs its app under `stdout,declassify=app`).
+  An app written for the v0.6.48 guest that declassifies without declaring it gets a
+  `label_violation` from this guest on: add the line. The guest's sha256 changes with its app.
+- **A secret inside the payload of `push_send` is an error**, as in `json_encode` (A4). Before, the
+  payload carried the marker `[redacted]` as if it were data, with a `[serve]` warning. The error
+  names where the secret is (`push_send: the payload["k"] is secret(K)…`); the payload goes to the
+  browser, another owner, so there is no host to bind it to: leave it out. A task or a builtin
+  inside the payload is an error too.
+- **`run --replay` refuses a receipt of another program.** It compares the receipt's `program_sha`
+  with the program's (the same hash as `synsema code sha`) before running, and stops with exit 2 if
+  they differ or the receipt has none; the receipt's header now also records the sha256 of each
+  `--trusted` module (`trusted`), and a replay with other trusted modules stops the same way: `--replay: the receipt is of another program (program_sha …
+  in the receipt, … here); to run this program against it anyway, add --replay-any-program (the
+  result is not a verification)`. With `--replay-any-program` it runs, and the verdict ends with
+  `(another program: not a verification)`. Before, a different program replayed in silence and
+  could end in "match".
+- **The `reason` of an `llm-data` audit entry names the permission**: `Granted by
+  llm("customers@api.anthropic.com")`, like any other permission used (before it was the operation,
+  `generate`). Receipts and audits written before this version say `generate`; a tool that reads
+  them has to accept both. There is one entry per call, with the principals the program declares
+  (never the real ones of the value, which would depend on the data).
+- **Replacing a task of a trusted module from outside is an error** (`set t.reply to f`: `cannot
+  replace the trusted task 'reply' from outside the module`), and so is adding a name it does not
+  export (`set t.NEW to 1`). Before, the first changed only the program's copy and the second added
+  a key; a module loaded from a file already refused both. Setting an exported variable still
+  changes the program's copy only.
+
+**Corrections to the v0.6.46 entry** (the engine already did this; the entry said otherwise, and is
+corrected in place):
+- the clock is fenced in the whole program, not only in a private branch (A2);
+- `mnemonic_generate`, `hd_derive` and any operation that creates or returns a new secret do not run
+  in a private branch (A3); `reveal` and `sign` do;
+- a CIDR grant covers the addresses written inside it, never a name, whatever it resolves to (A5);
+- `discovery off` turns `/robots.txt` off too, with `private` or without it (A6).
+
+**Fixes.**
+- **`@synsema/wasm`: `run()` and `runAsync()` pass `auditor` and `sealedBytes`**, and return
+  `receipt`. Before, only the raw ABI did, so the sealed receipt the v0.6.46 entry announced for
+  wasm never came back through the package. `test()` and `handle()` build no receipt: an `auditor`
+  or a `sealedBytes` there is an error (`auditor: only run seals a receipt`), where the engine used
+  to ignore it. `index.d.ts` declares them,
+  with `dispatchHostSync` and `module`.
+- **wasm: the audit entries of a trusted tool carry `context: "trusted:<module>"`**, as in the native
+  runtime.
+- **A `require llm("P")` (or `judge("P")`) refused by a ceiling with a bare `llm` says why**: the
+  ceiling's `llm` allows public data only, and data private to `P` goes to the model with
+  `llm=P@<provider host>` (before, only "above host ceiling"). The rule does not change: a bare `llm`
+  in the ceiling never covered private data.
+- **The redaction warning names `serve` only under `serve`.** Outside it (`evm_rpc` under `synsema
+  run`, …) it says `synsema: warning: secret(K) was redacted in a value serialized to JSON`.
+- **`synsema --help` (and `help`, `-h`) prints the usage**, which now lists `--trusted`,
+  `--trusted-cap-set` and `--replay-any-program`.
+- **`synsema code check`**: a deprecation warning has its line and the file as given (it had line 0
+  and the absolute path in the message); a missing-capability warning points at the call that
+  needs it, not at the start of the task; the `check` tool of the MCP server describes what it
+  returns today. For a `declassify` without `require`, it suggests `require declassify("<principal>")`
+  (a bare one allows any principal).
+- **`synsema check` sees `declassify`/`private` read as a value** (an alias, a list entry, an
+  argument), like `run` and `code check`: exit 1 with the file, line and column.
+- **The tasks of a trusted module can be described with `tool_spec` and dispatched with
+  `call_tool`**, with named arguments (`call_tool(t.reply, {"customer": c, "text": "hi"})`), and
+  called with named arguments (`t.reply(c, text = "hi")`). They run in the module's scope as when
+  called by position; typed parameters are checked; a task or a lambda among the arguments is still
+  an error. Before, they could only be called by position.
+- **`read_line` with a private prompt outside a private branch** says the prompt is private and goes
+  to stdout (before, it said "under private control flow").
+- **Sealed receipts:** what `edit_file` reads is a lineage input, like `read_file`; `synsema test`
+  takes `--auditor` (and `--receipt`) for one test file, as `run` does; `serve` opens the
+  `--receipt` file for each receipt, so one deleted or moved while it runs is created again (before,
+  on Windows, the following receipts were lost in silence).
+- **`--replay` says what it compared.** After a run that stopped with an error it no longer says
+  "match" (it says how far it got); a run that ends with `exit(n)` is compared to the end, and the
+  verdict says `ended with exit(n)` (a match exits with `n`; any difference exits with 1, with or
+  without `exit(n)`, so a matching `exit(1)` and a difference share the code and the verdict's
+  text tells them apart); it counts the clock readings (`the same 2 clock readings`) and
+  a run that read the clock more or fewer times than the recorded one is a difference (exit 1),
+  unless the receipt cut its clock readings, which the verdict then names; the warning names what
+  was cut (`kept N clock readings and truncated M`), never "truncated 0 sealed entries".
+- **`sign` with `SYNSEMA_SIGN_CEILING` in a private branch says the rule** (it said `Runtime error:
+  private(app)`), and so does creating a secret there or from a private value: `a secret cannot be
+  created or chosen under private control flow — … create or pick the secret before the when (or
+  the loop) that depends on the private value`, and `a secret cannot be made from, combined with or
+  chosen by a private value — …` (it said `a secret is already opaque; use private on the value you
+  compute`). The texts are fixed: they name no site, key or value.
+- **A CIDR grant and a name**: the error explains that the grant covers addresses, never a name,
+  and gives the line to write (`require net("db.internal:5432")`).
+- **A warning at load for `generate "x" + c`**: it reads `(generate "x") + c`, so the model does not
+  see `c`; the warning (once per site, also in `check` and `code check`) suggests `generate "x"
+  given c`.
+
+**Messages.**
+- `in_units(5, "hours")` suggests a duration in the unit asked for (it always said `"minutes"`);
+  `in_units("5", "hours")` says the first argument is not a duration (it said the unit was wrong);
+  an unknown unit lists the valid ones.
+- `parquet_read`/`parquet_scan`: `row group 3 does not exist — the file has 3 row groups, numbered 0
+  to 2` (it used Rust's range notation, `0..3`).
+- `decide` served by the judge (`SYNSEMA_JUDGE_DECIDE`) under a ceiling with `judge` and without
+  `llm` gives the line and says why it needs `llm` (it falls back to the model when the judge does
+  not choose), with private data too (whatever the `given` is: the check runs before `given` is
+  evaluated; a `decide` whose statement already touched the private value before it, as in
+  `[c + "!", decide … given c]`, still gets the redacted text, so give it its own line), and names both forms (`require llm`, or `require llm("<principal>")` with
+  `llm=<principal>@<provider host>` for private data); before, `Runtime error: private(…)` with
+  neither. Inside a private branch the first error is still `decide called under private control
+  flow`.
+- A `require` missing inside a trusted task says to add it to that task (within the host's
+  `--trusted-cap-set`), not to the program's preamble.
+- The `[INF] declassify` log says `from principals the program does not declare` instead of
+  `from […]`.
+- A bad `SYNSEMA_AUDITOR_KEY` is named as the variable (it said `--auditor: …`), in `run`, `test`
+  and `serve`; a cut receipt alone in its file says it is cut (it said the file had none).
+- On Windows, `read_file("a.txt.")` says the file is not found and why (a name cannot end in a dot
+  or a space there); it said "a broken link".
+- A secret the program made (`as_secret`, `hkdf_sha256`, …) in a URL, a query or a body says such a
+  secret only goes in a header, and to keep the final value in the configuration; it suggested a
+  binding, which only a secret read with `secret("NAME")` (or built only from such secrets, like
+  `bearer(secret("K"))`) can have.
+- A form field or a header of the wrong type says `must be text, a number, a bool or a secret` (a
+  bool was accepted but not named).
+- A refused connection to `localhost` that resolved to `::1` (Windows) says so and gives the
+  `127.0.0.1` URL: a `serve` on `0.0.0.0` listens on IPv4 only.
+
 ## v0.6.48 — 2026-10-25
 
 **Security: RUSTSEC-2026-0387 fixed.** v0.6.47 shipped `crypto-bigint` 0.5.5, where some operations
@@ -199,7 +347,8 @@ pointer to the skill. Links to `.synsema-skill/…` from older docs or projects 
   window for a DNS answer that changes in between); an IPv4 mapped or translated in IPv6 counts as
   that IPv4. To reach a private address, every layer has to name it: the exact host
   (`require net("db")`, `net("localhost")`), the address, or a CIDR that contains it
-  (`require net("10.0.0.0/8")`, which also covers a literal address inside it by name). A
+  (`require net("10.0.0.0/8")`, which covers the addresses inside it written as such in the URL,
+  never a name, whatever the name resolves to; this line was ambiguous until v0.6.49). A
   `deny` of a CIDR set by an embedder (`CapabilitySet::deny`) now also stops a name that resolves
   inside. The error names the line
   to write: ``http_get(): `db` resolved to 10.0.0.5, a private address; a `net` grant with a
@@ -408,12 +557,19 @@ pointer to the skill. Links to `.synsema-skill/…` from older docs or projects 
     `serve` writes one per request that runs program code, to stderr or appended to `--receipt`,
     before the response; if it cannot be written the client gets a 500 instead. A `stream` or
     `socket` route is a load error with an auditor (its body leaves while it runs).
-  - `reveal`, `sign` and the wallet operations run in a private branch; their audit line goes into
-    the envelope. **`spend` does not** (it spends a shared budget, and whether the next spend fits
-    would tell what the branch did), nor a signature that counts against `SYNSEMA_SIGN_CEILING`.
+  - `reveal` and `sign` run in a private branch; their audit line goes into the envelope. **`spend`
+    does not** (it spends a shared budget, and whether the next spend fits would tell what the
+    branch did), nor a signature that counts against `SYNSEMA_SIGN_CEILING`, nor an operation that
+    creates or returns a new secret (`mnemonic_generate`, `hd_derive`): a secret carries no label,
+    so the branch would be lost in it. (Corrected in v0.6.49: this line said "the wallet operations"
+    run there.)
   - The run's `random()` and `random_int()` come from a seed recorded in the envelope (each item
     of a `parallel_map` has its own stream, also under `--replay`), and with labels the clock is
-    fenced (two `now()` in a private branch read the same time). The clock readings take at most a
+    fenced in the whole program: `now()` returns the reading of the last public moment (the first
+    reading, then each sink or outside read that runs with the program counter public; `print` and
+    `eprint` do not count), so two `now()` in a row read the same time, and so does a `now()` after
+    a loop over a private value. (Corrected in v0.6.49: this line said only "in a private
+    branch".) The clock readings take at most a
     quarter of the envelope; past that they are counted (`clock_truncated`) and never push out an
     entry. Each reading is stored as text (`"1792711237.7256045"`), so it comes back bit for bit.
     `synsema run --replay <opened receipt>` runs the program again with that seed and those clock
@@ -553,8 +709,9 @@ pointer to the skill. Links to `.synsema-skill/…` from older docs or projects 
   the Agent Cards and `/.well-known/synsema-auth`, and they reach the program's routes like any
   other URL (a `GET /*path` forwards them; without a route they are 404). Before, an edge had to
   declare each reserved URL as a literal route, and every new one the engine added published the
-  edge's own page in silence. `private` keeps its meaning (it still answers `/robots.txt` and hides
-  `/.well-known/synsema-auth`). `/.well-known/attestation` is identity, not discovery: under
+  edge's own page in silence. That includes `/robots.txt` with `private` too, and `private` still
+  hides `/.well-known/synsema-auth`. (Corrected in v0.6.49: this line said `private` still answered
+  `/robots.txt`.) `/.well-known/attestation` is identity, not discovery: under
   `--attested` it is still served and a route still cannot take it. Under `--attested`, a literal
   route on a reserved URL is still a load error (a `GET /*path` does receive them).
   `synsema openapi` still describes the routes: it is an offline tool you ask for.

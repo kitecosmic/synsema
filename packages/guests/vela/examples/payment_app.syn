@@ -18,6 +18,10 @@
 -- each transition. Payloads, events and reports are untouched.
 intent: "vela guest: private balances per account and token, novaw-compatible"
 
+-- The adapter runs the app under the ceiling `stdout,declassify=app`; since v0.6.49 a program under a
+-- ceiling publishes only what it declares, so the outcome codes and receipts it publishes need this:
+require declassify("app")
+
 let ETH be "0x0000000000000000000000000000000000000000"
 let MAX_TRANSACTIONS be 50
 let MAX_INVOICE_ID be 100

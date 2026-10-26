@@ -186,6 +186,13 @@ impl RuntimeError {
     /// v0.6.47 (T1, B1): el chequeo de un `stream` (un sumidero del host) es un corte de etiquetas
     /// como cualquier otro: no se atrapa, no lleva ubicación y sale con el texto fijo por el embudo.
     pub fn stream_label_cut(message: impl Into<String>) -> Self {
+        Self::label_cut(message)
+    }
+    /// v0.6.49 (A3): un corte de etiquetas que decide un builtin del stdlib (una operación auditada
+    /// o una firma con techo en una rama privada). Sin la marca salía redactado (`private(app)`,
+    /// sin texto): se construía bajo el PC privado con `RuntimeError::new`. Sin ubicación, como el de
+    /// un `stream`: cuál sitio cortó lo elige el dato.
+    pub fn label_cut(message: impl Into<String>) -> Self {
         let mut e = RuntimeError::new(message);
         e.from_labels = true;
         e
@@ -449,6 +456,18 @@ pub struct BuiltinTask {
     /// por nombre en tablas en cada llamada (specs/compute-rendimiento.md §3.4). Lo arma
     /// `BuiltinTask::new`, el único constructor.
     pub meta: BuiltinMeta,
+    /// v0.6.49 (B9): si es el envoltorio de una task de un módulo de confianza, la task y su scope.
+    /// Con eso `tool_spec` lee la firma y una llamada con argumentos nombrados (`call_tool`) entra
+    /// al scope igual que una posicional. Antes las tasks de confianza eran sólo posicionales.
+    pub trusted: Option<Rc<TrustedTool>>,
+}
+
+/// Ver `BuiltinTask::trusted`.
+pub struct TrustedTool {
+    pub module: String,
+    pub label: String,
+    pub task: Rc<SynTaskValue>,
+    pub hook: TrustedScopeHook,
 }
 
 /// Ver `BuiltinTask::meta`. Las tablas (`BUILTIN_ARITY`, `BUILTIN_KWARGS`, `LINEAGE_SOURCES`)
@@ -486,7 +505,7 @@ impl BuiltinTask {
             lineage_source: LINEAGE_SOURCES.contains(&name.as_str()),
             constructor: name.starts_with(|c: char| c.is_ascii_uppercase()),
         };
-        BuiltinTask { name, func, param_count, param_names, meta }
+        BuiltinTask { name, func, param_count, param_names, meta, trusted: None }
     }
 }
 
@@ -859,6 +878,65 @@ fn module_rebind(
     }
 }
 
+thread_local! {
+    /// v0.6.49 (B8): las vistas de los módulos de confianza (la copia de sus exportaciones que
+    /// recibe cada `use "trusted:…"`), por dirección; el `Weak` reserva la dirección, como en
+    /// `ModuleRegistry`. Un mapa de datos, pero con los nombres de un módulo.
+    ///
+    /// Ronda 1 (B1): la regla vale en el hilo donde se cargó el módulo. La vista que cruza a un
+    /// worker (`parallel_map`, `spawn`) es otro mapa en otro hilo y no está registrada: ahí
+    /// `set t.NEW to 5` agrega el nombre a esa copia. No hay nada que proteger: en el worker las
+    /// tasks de confianza llegan como texto (no se pueden llamar), y la copia muere con el worker.
+    static TRUSTED_VIEWS: RefCell<(HashMap<usize, synsema_heap::WeakTail<MapObj>>, usize)> = RefCell::new((HashMap::new(), 0));
+}
+
+/// ¿Alguna vista registrada en el proceso? `set` sobre un mapa es camino caliente: sin módulos de
+/// confianza no se toca el thread-local.
+static ANY_TRUSTED_VIEW: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn register_trusted_view(map: &crate::types::MapRef) {
+    ANY_TRUSTED_VIEW.store(true, std::sync::atomic::Ordering::Relaxed);
+    TRUSTED_VIEWS.with(|r| {
+        let (views, prune_at) = &mut *r.borrow_mut();
+        if views.len() >= (*prune_at).max(64) {
+            views.retain(|_, m| m.strong_count() > 0);
+            *prune_at = views.len() * 2;
+        }
+        views.insert(crate::types::MapRef::as_ptr(map).cast::<()>() as usize, crate::types::MapRef::downgrade(map));
+    });
+}
+
+#[inline]
+fn is_trusted_view(map: &crate::types::MapRef) -> bool {
+    ANY_TRUSTED_VIEW.load(std::sync::atomic::Ordering::Relaxed) && is_trusted_view_slow(map)
+}
+
+#[cold]
+#[inline(never)]
+fn is_trusted_view_slow(map: &crate::types::MapRef) -> bool {
+    TRUSTED_VIEWS.with(|r| {
+        let r = r.borrow();
+        !r.0.is_empty() && r.0.get(&(crate::types::MapRef::as_ptr(map).cast::<()>() as usize)).is_some_and(|m| m.upgrade().is_some())
+    })
+}
+
+/// `set t.X to v` sobre la vista de un módulo de confianza: las reglas de un módulo de archivo
+/// (sus nombres son sus exportaciones, sus tasks no se reemplazan desde afuera); lo demás cambia
+/// sólo esta copia, que la tool no ve. Antes `set t.NEW` agregaba un nombre y `set t.task` tapaba
+/// la task.
+fn trusted_view_set(m: &crate::types::MapRef, name: &str, loc: &SourceLocation) -> Result<(), Control> {
+    match m.borrow().get(name) {
+        None => Err(err_at(
+            format!("trusted module has no export '{}' — its names are the ones it exports, and the program cannot add one", name),
+            loc,
+        )),
+        Some(SynValue::Task(_)) | Some(SynValue::Builtin(_)) => {
+            Err(err_at(format!("cannot replace the trusted task '{}' from outside the module", name), loc))
+        }
+        Some(_) => Ok(()),
+    }
+}
+
 /// La hoja de `set <camino>.campo to v` (sin etiquetas: ya se resolvieron), con el contenedor ya
 /// evaluado: lo mismo para el tree-walker y para la VM (F4.6a). Devuelve el valor escrito.
 pub(crate) fn set_leaf_prop(obj: &SynValue, property_name: &str, value: SynValue, loc: &SourceLocation) -> Result<SynValue, Control> {
@@ -869,6 +947,9 @@ pub(crate) fn set_leaf_prop(obj: &SynValue, property_name: &str, value: SynValue
             // desde afuera.
             if let Some(menv) = module_env_of_map(m) {
                 return module_rebind(m, &menv, property_name, value, loc);
+            }
+            if is_trusted_view(m) {
+                trusted_view_set(m, property_name, loc)?;
             }
             m.borrow_mut().set(property_name, value.clone());
             Ok(value)
@@ -909,6 +990,9 @@ pub(crate) fn set_leaf_index(
             // `set lib["X"] to v`: las mismas reglas que `set lib.X to v`.
             if let Some(menv) = module_env_of_map(m) {
                 return module_rebind(m, &menv, &idx.to_string(), value, loc);
+            }
+            if is_trusted_view(m) {
+                trusted_view_set(m, &idx.to_string(), loc)?;
             }
             m.borrow_mut().set_value_key(idx, value.clone());
             Ok(value)
@@ -2701,16 +2785,26 @@ impl Interpreter {
     fn pc_mark(&self, v: SynValue, loc: &SourceLocation) -> Result<SynValue, Control> {
         if self.labels && !self.pc_is_empty() {
             if v.is_secret() {
-                return Err(err_labels(
-                    "a secret is already opaque; use private on the value you compute",
-                    loc,
-                ));
+                return Err(err_labels(SECRET_UNDER_PRIVATE_PC, loc));
             }
             if !labels::is_container(&v) {
                 return Ok(labels::mark(v, self.pc_label()));
             }
         }
         Ok(v)
+    }
+
+    /// v0.6.49 (A3): el texto de un secreto que sale de una operación con algo privado. Un secreto no
+    /// lleva etiqueta, así que no puede nacer, elegirse ni combinarse con lo privado (sigue prohibido;
+    /// sólo cambia el mensaje). Hay dos causas y un texto fijo para cada una: no nombra el sitio, el
+    /// builtin ni el secreto, que podrían depender del dato (T1).
+    #[cold]
+    fn secret_under_labels_text(&self) -> &'static str {
+        if self.pc_is_empty() {
+            SECRET_FROM_PRIVATE_VALUE
+        } else {
+            SECRET_UNDER_PRIVATE_PC
+        }
     }
 
     /// v0.6.42 (auditoría, ronda 2) — el lado derecho de `and`/`or` corre SÓLO si el izquierdo lo
@@ -2732,6 +2826,15 @@ impl Interpreter {
 
     /// Empuja `l` al stack de PC (acumulada con la de abajo). Sólo se llama con etiquetas
     /// encendidas y `l` no vacía. Siempre se aparea con `pc_pop`, también en error.
+    /// ¿El PC era privado ANTES de la llamada al builtin en curso? (el despacho genérico empuja un
+    /// nivel con la etiqueta de los argumentos; el de abajo es el de la rama.)
+    #[cold]
+    fn outer_pc_private(&self) -> bool {
+        !self.control_taint.is_empty()
+            || !self.loop_taint.is_empty()
+            || (self.pc.len() >= 2 && !self.pc[self.pc.len() - 2].is_empty())
+    }
+
     fn pc_push(&mut self, l: &Label) {
         let joined = match self.pc.last() {
             Some(top) => labels::union(top, l),
@@ -2770,10 +2873,7 @@ impl Interpreter {
             return Ok(r);
         }
         if r.is_secret() {
-            return Err(err_labels(
-                "a secret is already opaque; use private on the value you compute",
-                loc,
-            ));
+            return Err(err_labels(self.secret_under_labels_text(), loc));
         }
         self.note_seen(&l);
         Ok(labels::mark(r, l))
@@ -2984,6 +3084,12 @@ impl Interpreter {
         if self.label_aware.contains(bt.name.as_str()) {
             return self.call_builtin_at(&f, args, loc);
         }
+        // v0.6.49 (B9): `call_tool` sobre una task de confianza es la llamada directa con nombres:
+        // los argumentos entran con su etiqueta y la política de la tool decide qué publica. Sólo
+        // con la tool a la vista: una elegida por un valor privado sigue por el despacho genérico.
+        if bt.name == "call_tool" && matches!(args.first(), Some(SynValue::Builtin(t)) if t.trusted.is_some()) {
+            return self.call_builtin_at(&f, args, loc);
+        }
         let mut arg_label = labels::empty();
         for a in args {
             arg_label = labels::union(&arg_label, &labels::label_deep(a));
@@ -3035,7 +3141,7 @@ impl Interpreter {
             return Ok(r);
         }
         if r.is_secret() {
-            return Err(err_labels("a secret is already opaque; use private on the value you compute", loc));
+            return Err(err_labels(self.secret_under_labels_text(), loc));
         }
         self.note_seen(&l);
         // `mark_owned`: un builtin puede devolver un contenedor que COMPARTE `Rc` con un
@@ -3105,6 +3211,19 @@ impl Interpreter {
     /// programa lo meta a mano. `encoding` dice qué bytes se hashearon ("text": utf-8, "bytes").
     /// Lo llama el builtin y no el despacho: `call_builtin` no paga nada por esto. Una escritura
     /// bajo un PC privado no se anota (ni llega: escribir es un sumidero público).
+    /// v0.6.49 (B11): una lectura que hace un builtin que NO es fuente del linaje por lo que
+    /// devuelve (`edit_file` lee el archivo y devuelve `{replaced}`): se anota `content` como si lo
+    /// hubiera devuelto `source(args…)`, y `--replay` lo compara igual. `Err` = el replay difiere.
+    pub fn record_read(&mut self, source: &str, args: &[SynValue], content: &SynValue) -> Result<(), Control> {
+        self.record_input(source, args, content);
+        if crate::sealed::active() {
+            if let Some(m) = crate::sealed::replay_error() {
+                return Err(Control::Error(RuntimeError::new(m)));
+            }
+        }
+        Ok(())
+    }
+
     pub fn record_output(&mut self, source: &str, what: &str, data: &[u8], encoding: &'static str) {
         if self.labels && self.pc_is_private() {
             return;
@@ -3232,7 +3351,7 @@ impl Interpreter {
             }
         };
         let (what, payload): (String, Vec<u8>) = match source {
-            "read_file" | "read_file_bytes" | "list_dir" | "grep" | "parquet_read" | "parquet_scan" | "file_info" => {
+            "read_file" | "read_file_bytes" | "list_dir" | "grep" | "parquet_read" | "parquet_scan" | "file_info" | "edit_file" => {
                 (path_what(args.first()), bytes_of(result))
             }
             "read_line" => ("stdin".to_string(), bytes_of(result)),
@@ -3999,7 +4118,9 @@ impl Interpreter {
         // sin test propio (hoy el `set` ya copia el mapa antes de escribirlo, porque el caché es
         // otro dueño); no sacarla creyendo que sobra.
         if let Some(SynValue::Map(cached)) = self.module_cache.get(&key) {
-            return Ok(SynValue::Map(cached.borrow().to_ref()));
+            let copy = cached.borrow().to_ref();
+            register_trusted_view(&copy);
+            return Ok(SynValue::Map(copy));
         }
         let (Some(source), Some(hook)) = (self.trusted_sources.get(name).cloned(), self.trusted_scope_hook.clone()) else {
             return Err(err(format!(
@@ -4065,6 +4186,7 @@ impl Interpreter {
         // (`set m.X to v` religa su variable); la de uno de confianza es un mapa de datos.
         let map = exports.into_ref();
         let copy = map.borrow().to_ref();
+        register_trusted_view(&copy);
         self.module_cache.insert(key, SynValue::Map(map));
         Ok(SynValue::Map(copy))
     }
@@ -5931,6 +6053,36 @@ impl Interpreter {
         let loc = &node.location;
         let NodeKind::DecideExpression { options, given, .. } = &node.kind else { unreachable!("exec_decide_expression: otro nodo") };
         {
+        // v0.6.26 — `SYNSEMA_JUDGE_DECIDE`: el juez contesta con una de TUS opciones,
+        // calibrado y sin normalización ni reintento. Si no aplica o no está disponible,
+        // sigue el camino LLM de siempre.
+        // v0.6.46 (E5): ese camino se chequea contra el techo del JUEZ (`judge=P@…`).
+        let via_judge = self.decide_via_judge && self.judge_callback.is_some();
+        if via_judge {
+            // v0.6.49 (§C): `llm` se pide antes de preguntarle al juez (si el juez no elige,
+            // contesta el modelo, y que eso dependa de la respuesta haría depender el permiso del
+            // dato). El error salía sin ubicación ni por qué. Ronda 2 (M1): al entrar, antes de
+            // evaluar `options` y `given`. Si el nodo ya tocó lo privado (`given c.name`), un
+            // error común sale redactado (`private(customers)`), y el texto de este no depende
+            // del dato. Ronda 2 (B1): con el PC privado va primero el del sumidero, el de fondo,
+            // como en el camino LLM común.
+            if self.labels && !self.pc_is_empty() {
+                self.sink_check("decide", &[], loc)?;
+            }
+            if let Err(Control::Error(e)) = self.check_llm_cap() {
+                // Ronda 1 (N6): un solo remedio; el de la denegación común sólo nombraba el
+                // preámbulo. Ronda 2 (B2): con las dos formas, porque acá no se sabe todavía si
+                // el dato es privado.
+                let head = e.message.split(" — ").next().unwrap_or(&e.message);
+                return Err(err_at(
+                    format!(
+                        "{} — a `decide` served by the judge (SYNSEMA_JUDGE_DECIDE) falls back to the model when the judge does not choose, so it needs `llm` as well as `judge`: add `require llm` to the program's preamble (with private data, `require llm(\"<principal>\")`), and the host's ceiling has to allow it too (`llm`, or `llm=<principal>@<provider host>` for private data), or unset the knob",
+                        head
+                    ),
+                    loc,
+                ));
+            }
+        }
         let opts = match options {
             Some(o) => self.exec(o, env)?,
             None => SynValue::Nothing,
@@ -5939,15 +6091,8 @@ impl Interpreter {
             Some(g) => self.exec(g, env)?,
             None => SynValue::Nothing,
         };
-        // v0.6.26 — `SYNSEMA_JUDGE_DECIDE`: el juez contesta con una de TUS opciones,
-        // calibrado y sin normalización ni reintento. Si no aplica o no está disponible,
-        // sigue el camino LLM de siempre.
-        // v0.6.46 (E5): ese camino se chequea contra el techo del JUEZ (`judge=P@…`).
-        let mut llm_checked = false;
-        if self.decide_via_judge && self.judge_callback.is_some() {
+        if via_judge {
             let lab = self.llm_data_gate("decide", true, &[&opts, &giv], loc)?;
-            self.check_llm_cap()?;
-            llm_checked = true;
             let (o, g) = if lab.is_empty() { (opts.clone(), giv.clone()) } else { (labels::strip_deep(&opts), labels::strip_deep(&giv)) };
             if let Some((chosen, prompt)) = self.decide_with_judge(&o, &g, loc)? {
                 let c = chosen.to_string();
@@ -5956,7 +6101,7 @@ impl Interpreter {
             }
         }
         let lab = self.llm_data_gate("decide", false, &[&opts, &giv], loc)?;
-        if !llm_checked {
+        if !via_judge {
             self.check_llm_cap()?;
         }
         let (opts, giv) = if lab.is_empty() { (opts, giv) } else { (labels::strip_deep(&opts), labels::strip_deep(&giv)) };
@@ -8200,6 +8345,12 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
         result
     }
 
+    #[cold]
+    #[inline(never)]
+    fn call_trusted_named(&mut self, tool: Rc<TrustedTool>, args: &mut CallArgs, loc: &SourceLocation) -> Result<SynValue, Control> {
+        call_trusted(self, &tool, args, loc)
+    }
+
     fn call_value_named_inner(
         &mut self,
         func: SynValue,
@@ -8256,6 +8407,12 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                         self.dispatch_builtin(&bt, &pos, loc)
                     }
                     None => {
+                        // v0.6.49 (B9): una task de confianza con argumentos nombrados.
+                        if let Some(tool) = &bt.trusted {
+                            if args.iter().any(|(n, _)| n.is_some()) {
+                                return self.call_trusted_named(tool.clone(), args, loc);
+                            }
+                        }
                         let mut pos: SmallVec<[SynValue; 4]> = SmallVec::with_capacity(args.len());
                         let mut kw: SynMap = SynMap::new();
                         for (name, v) in args.drain(..) {
@@ -9550,7 +9707,7 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
         if let Some(hook) = &self.declassify_cap_hook {
             let removed = labels::difference(&from, &to);
             if !removed.is_empty() && !hook(&removed[..], &self.safe_label(&from)) {
-                return Err(declassify_not_granted(&self.safe_label(&from), loc));
+                return Err(declassify_not_granted(&self.safe_label(&from), self.in_trusted_scope(), self.current_agent(), loc));
             }
         }
         // T5 (ronda 7) — el `from` que sale al log NO es la etiqueta de ESTE valor. Varía con
@@ -9564,10 +9721,13 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
         // (ronda 4, M5). La entrada queda en el registro interno, marcada.
         let under_private_pc = self.pc_is_private();
         if let (Some(hook), false) = (&self.log_hook, under_private_pc) {
+            // v0.6.49 (§C): sin principales declarados (los marcó el host) decía `from […]`.
+            let declared = self.safe_label(&from);
+            let from_text = if declared == "…" { "principals the program does not declare".to_string() } else { format!("[{}]", declared) };
             hook(&format!(
-                "[INF] declassify: {} (from [{}] to [{}]) at {}:{}",
+                "[INF] declassify: {} (from {} to [{}]) at {}:{}",
                 reason,
-                self.safe_label(&from),
+                from_text,
                 label_display_raw(&to),
                 loc.file,
                 loc.line
@@ -9828,6 +9988,17 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                 // etiquetas, así que el despacho genérico ya empujó al PC la etiqueta del prompt:
                 // este chequeo cubre un prompt privado y uno dentro de una rama privada. Leer sin
                 // prompt en una rama privada sigue permitido.
+                // v0.6.49 (B10): si el PC privado lo puso sólo esta llamada (el despacho empuja la
+                // etiqueta del prompt), lo privado es el prompt, no una rama: decirlo así.
+                if self.labels && !self.pc_is_empty() && !self.outer_pc_private() && self.cut_by_agent().is_none() {
+                    return Err(err_labels(
+                        format!(
+                            "label_violation: the read_line prompt is private (to {}) and the prompt goes to stdout, which is public. Ask with a public prompt, or declassify(<the prompt>, \"<why it may be published>\")",
+                            self.safe_label(&self.pc_label())
+                        ),
+                        loc,
+                    ));
+                }
                 self.stdout_flow_check("read_line prompt", loc)?;
                 if self.labels {
                     // v0.6.47 (T1): con etiquetas el prompt se junta como `print`: si saliera en
@@ -10090,6 +10261,13 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
         if let SynValue::Task(t) = &func {
             if t.parameters.iter().any(|p| p.ty.is_some()) {
                 check_typed_args("call_tool", t, &named, loc)?;
+            }
+        }
+        if let SynValue::Builtin(b) = &func {
+            if let Some(t) = b.trusted.as_ref().map(|tool| &tool.task) {
+                if t.parameters.iter().any(|p| p.ty.is_some()) {
+                    check_typed_args("call_tool", t, &named, loc)?;
+                }
             }
         }
         // Las caps que la tool declaró (vacío si no es una task o no declara ninguna).
@@ -11345,8 +11523,9 @@ fn secret_concat(left: &SynValue, right: &SynValue, loc: &SourceLocation) -> Res
     for s in [&sl, &sr].into_iter().flatten() {
         parts.extend(s.atoms());
     }
+    let from_config = [&sl, &sr].into_iter().flatten().all(|s| s.is_from_config());
     Ok(SynValue::Secret(crate::types::Obj::new(
-        crate::secret::SecretInner::new(name, format!("{}{}", lp, rp)).with_binding(bound, public_prefix, parts),
+        crate::secret::SecretInner::new(name, format!("{}{}", lp, rp)).with_binding(bound, public_prefix, parts).from_config(from_config),
     )))
 }
 
@@ -11355,30 +11534,39 @@ fn secret_concat(left: &SynValue, right: &SynValue, loc: &SourceLocation) -> Res
 /// argumentos son datos: un callable adentro correría con las capabilities de la tool (el
 /// "confused deputy"), así que es error.
 fn trusted_wrapper(module: &str, export: &str, task: Rc<SynTaskValue>, hook: TrustedScopeHook) -> SynValue {
-    let module = module.to_string();
     let label = format!("trusted:{}.{}", module, export);
-    let shown = label.clone();
+    let tool = Rc::new(TrustedTool { module: module.to_string(), label: label.clone(), task, hook });
+    let t = tool.clone();
     let func: BuiltinFn = Rc::new(move |i: &mut Interpreter, args: &[SynValue], loc: &SourceLocation| {
-        if let Some(kind) = args.iter().find_map(callable_inside) {
-            return Err(err_at(
-                format!(
-                    "{}: a trusted tool takes data, not code — an argument holds a {}, which would run with the tool's capabilities; pass the values it needs instead",
-                    shown, kind
-                ),
-                loc,
-            ));
-        }
-        i.stdout_verdict = None;
-        hook(Some((&module, &task.required_capabilities)));
-        debug_assert!(!i.shortcuts, "a trusted scope opened with the VM on (it has no origin check)");
-        i.trusted_depth += 1;
-        let r = i.call_value(SynValue::Task(task.clone()), args.to_vec(), loc);
-        i.trusted_depth -= 1;
-        hook(None);
-        i.stdout_verdict = None;
-        r
+        let mut named: CallArgs = args.iter().map(|v| (None, v.clone())).collect();
+        call_trusted(i, &t, &mut named, loc)
     });
-    SynValue::Builtin(Rc::new(BuiltinTask::new(label, -1, None, func)))
+    let mut b = BuiltinTask::new(label, -1, None, func);
+    b.trusted = Some(tool);
+    SynValue::Builtin(Rc::new(b))
+}
+
+/// Una llamada a una task de confianza, posicional o con nombres: los argumentos son datos, y la
+/// task corre en el scope de su módulo.
+fn call_trusted(i: &mut Interpreter, tool: &TrustedTool, args: &mut CallArgs, loc: &SourceLocation) -> Result<SynValue, Control> {
+    if let Some(kind) = args.iter().find_map(|(_, v)| callable_inside(v)) {
+        return Err(err_at(
+            format!(
+                "{}: a trusted tool takes data, not code — an argument holds a {}, which would run with the tool's capabilities; pass the values it needs instead",
+                tool.label, kind
+            ),
+            loc,
+        ));
+    }
+    i.stdout_verdict = None;
+    (tool.hook)(Some((&tool.module, &tool.task.required_capabilities)));
+    debug_assert!(!i.shortcuts, "a trusted scope opened with the VM on (it has no origin check)");
+    i.trusted_depth += 1;
+    let r = i.call_value_named(SynValue::Task(tool.task.clone()), args, loc);
+    i.trusted_depth -= 1;
+    (tool.hook)(None);
+    i.stdout_verdict = None;
+    r
 }
 
 /// v0.6.46 (ronda 1, A1): un agente corre en otro intérprete, con los globales del programa, y la
@@ -11422,12 +11610,45 @@ fn llm_data_not_granted(op: &str, judge: bool, declared: &str, loc: &SourceLocat
     )
 }
 
+/// v0.6.49 (A3): un secreto creado o elegido con el PC privado (`mnemonic_generate`, `hd_derive`,
+/// `secret(...)` en una rama privada; un secreto asignado dentro de ella).
+const SECRET_UNDER_PRIVATE_PC: &str = "label_violation: a secret cannot be created or chosen under private control flow — a secret carries no label, so the branch would be lost in it; create or pick the secret before the `when` (or the loop) that depends on the private value";
+/// v0.6.49 (A3): un secreto hecho de, combinado con o elegido por un valor privado, con el PC público.
+const SECRET_FROM_PRIVATE_VALUE: &str = "label_violation: a secret cannot be made from, combined with or chosen by a private value — a secret carries no label, so the private data would be lost in it; keep secrets and private data apart, and choose a secret with a public value";
+
 /// v0.6.46 (E3): el error de un `declassify` que el host no concede (frío, fuera de `b_declassify`).
 #[cold]
-fn declassify_not_granted(declared: &str, loc: &SourceLocation) -> Control {
+fn declassify_not_granted(declared: &str, trusted: bool, agent: Option<&str>, loc: &SourceLocation) -> Control {
+    // v0.6.49 (ronda 2, B3): una task de confianza tiene su `require` y su techo, aunque la llame un
+    // agente (el agente puede tener el suyo; lo que falta es el de la task). Ronda 3 (B2): también
+    // corre acá el nivel superior del módulo al cargarlo, donde no se puede declarar nada; el texto
+    // cubre los dos casos.
+    if trusted {
+        return err_labels(
+            format!(
+                "label_violation: declassify is not granted for what this value is private to ({}). This runs in a trusted module, which declares its capabilities per exported task: add `require declassify(\"<principal>\")` to the exported task that runs it (while the module loads nothing is declared, not even by a task its top level calls: move the declassify into an exported task and call it from the program), and the host's ceiling for trusted modules has to allow it too (`--trusted-cap-set declassify=<principal>`)",
+                declared
+            ),
+            loc,
+        );
+    }
+    // v0.6.49 (ronda 1, M2): un agente declara sus propias capabilities (el `require` del programa
+    // no le llega), así que el remedio nombra al agente en vez del preámbulo.
+    if let Some(agent) = agent {
+        return err_labels(
+            format!(
+                "label_violation: declassify is not granted for what this value is private to ({}). An agent declares its own capabilities (the program's `require` does not reach it): add `require declassify(\"<principal>\")` to the body of agent {}, and the host's ceiling has to allow it too (`--cap-set declassify=<principal>`)",
+                declared, agent
+            ),
+            loc,
+        );
+    }
+    // Ronda 2 (B3): un worker de `parallel_map` hereda las capabilities de quien lo lanzó, no su
+    // nombre de agente, así que acá no se sabe si lo lanzó un agente: se nombran los dos lugares.
+    // Ronda 3 (B1): `spawn` lanza un agente, que tiene su contexto y cae en la rama de arriba.
     err_labels(
         format!(
-            "label_violation: declassify is not granted for what this value is private to ({}). With a ceiling the host names what a program may publish (`--cap-set declassify=<principal>`), and inside a `sandbox` only a `sandbox under` that delegates `declassify` allows it",
+            "label_violation: declassify is not granted for what this value is private to ({}). With a ceiling the program declares what it publishes (`require declassify(\"<principal>\")` in the program's preamble, or in the body of the agent that runs this code: an agent declares its own, also for its `parallel_map`) and the host's ceiling has to allow it too (`--cap-set declassify=<principal>`); inside a `sandbox` only a `sandbox under` that delegates `declassify` allows it",
             declared
         ),
         loc,
@@ -11481,6 +11702,10 @@ fn make_unique_n(slot: &mut SynValue, extra: usize) {
         }
         SynValue::Map(rc) if crate::types::MapRef::strong_count(rc) > owners && module_env_of_map(rc).is_none() => {
             let copy = rc.borrow().to_ref();
+            // La copia de la vista de un módulo de confianza sigue siendo esa vista (B8).
+            if is_trusted_view(rc) {
+                register_trusted_view(&copy);
+            }
             *slot = SynValue::Map(copy);
         }
         SynValue::Private(p) => {

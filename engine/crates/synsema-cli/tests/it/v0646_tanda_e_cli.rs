@@ -5,18 +5,18 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
-fn project(tag: &str) -> PathBuf {
+pub(crate) fn project(tag: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("synsema-v0646-{}-{}", tag, std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     dir
 }
 
-fn synsema(dir: &PathBuf, args: &[&str], stdin: Option<&str>) -> (i32, String, String) {
+pub(crate) fn synsema(dir: &PathBuf, args: &[&str], stdin: Option<&str>) -> (i32, String, String) {
     synsema_env(dir, args, stdin, &[])
 }
 
-fn synsema_env(dir: &PathBuf, args: &[&str], stdin: Option<&str>, env: &[(&str, &str)]) -> (i32, String, String) {
+pub(crate) fn synsema_env(dir: &PathBuf, args: &[&str], stdin: Option<&str>, env: &[(&str, &str)]) -> (i32, String, String) {
     let mut c = Command::new(env!("CARGO_BIN_EXE_synsema"));
     c.envs(env.iter().copied());
     c.args(args)
@@ -208,7 +208,7 @@ fn e4_code_check_inventory_is_complete() {
 #[test]
 fn e3_cli_ceiling_bounds_declassify_only_with_labels() {
     let dir = project("e3-ceiling");
-    std::fs::write(dir.join("p.syn"), "require declassify\nlet x be private(1, \"a\")\nprint(declassify(x, \"m\"))\n").unwrap();
+    std::fs::write(dir.join("p.syn"), "require declassify(\"a\")\nlet x be private(1, \"a\")\nprint(declassify(x, \"m\"))\n").unwrap();
     // Sin etiquetas no hay `private` (es error) y `declassify` es la identidad: el techo no la mira.
     std::fs::write(dir.join("q.syn"), "require declassify
 print(declassify(1, \"m\"))
@@ -233,7 +233,7 @@ print(declassify(1, \"m\"))
 // =========================================================
 
 /// Un servidor HTTP que anota la línea de pedido y el cuerpo de cada request.
-fn recorder() -> (u16, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+pub(crate) fn recorder() -> (u16, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
     use std::io::Read;
     let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = l.local_addr().unwrap().port();
@@ -406,7 +406,7 @@ fn e3b_sandbox_stays_empty_after_a_trusted_call() {
 
 /// Un Anthropic falso en 127.0.0.1 que anota el cuerpo de cada pedido. Con `tools` en el pedido
 /// contesta un `tool_use` de `enviar`; si no, el texto `respuesta`.
-fn fake_model() -> (u16, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+pub(crate) fn fake_model() -> (u16, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
     recorder_with(|body| {
         if body.contains("\"tools\"") {
             r#"{"content":[{"type":"tool_use","id":"t1","name":"enviar","input":{"to":"x@y.com"}}],"stop_reason":"tool_use","usage":{"input_tokens":1,"output_tokens":1}}"#.to_string()
@@ -417,7 +417,7 @@ fn fake_model() -> (u16, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
 }
 
 /// Como `recorder`, pero anota sólo el cuerpo y la respuesta (JSON) la arma `reply` con él.
-fn recorder_with(reply: fn(&str) -> String) -> (u16, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+pub(crate) fn recorder_with(reply: fn(&str) -> String) -> (u16, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
     use std::io::Read;
     let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = l.local_addr().unwrap().port();
@@ -460,7 +460,7 @@ fn recorder_with(reply: fn(&str) -> String) -> (u16, std::sync::Arc<std::sync::M
     (port, seen)
 }
 
-fn model_env(port: u16) -> Vec<(&'static str, String)> {
+pub(crate) fn model_env(port: u16) -> Vec<(&'static str, String)> {
     vec![
         ("SYNSEMA_LLM_PROVIDER", "anthropic".to_string()),
         ("ANTHROPIC_API_KEY", "k".to_string()),
@@ -470,7 +470,7 @@ fn model_env(port: u16) -> Vec<(&'static str, String)> {
     ]
 }
 
-fn e5(dir: &PathBuf, port: u16, src: &str, args: &[&str], extra_env: &[(&str, &str)]) -> (i32, String, String) {
+pub(crate) fn e5(dir: &PathBuf, port: u16, src: &str, args: &[&str], extra_env: &[(&str, &str)]) -> (i32, String, String) {
     std::fs::write(dir.join("p.syn"), src).unwrap();
     let env = model_env(port);
     let mut e: Vec<(&str, &str)> = env.iter().map(|(k, v)| (*k, v.as_str())).collect();
@@ -482,12 +482,12 @@ fn e5(dir: &PathBuf, port: u16, src: &str, args: &[&str], extra_env: &[(&str, &s
 }
 
 /// v0.6.47 (T1): el comienzo del texto fijo de un corte de etiquetas con techo.
-const T1_FIXED: &str = "label_violation: the flow checker stopped the run (private to ";
+pub(crate) const T1_FIXED: &str = "label_violation: the flow checker stopped the run (private to ";
 
 /// v0.6.47 (T1): un corte con techo. Corre con `--auditor` (lo que `run` recibe se agrega a sus
 /// argumentos), verifica que el programa ve sólo el texto fijo y devuelve el motivo: la entrada
 /// sellada `label_violation` del recibo, que abre el auditor.
-fn cut_for_operator(run: impl FnOnce(&[&str]) -> (i32, String, String)) -> String {
+pub(crate) fn cut_for_operator(run: impl FnOnce(&[&str]) -> (i32, String, String)) -> String {
     let (sk, pk) = auditor_keys();
     let (code, _, err) = run(&["--auditor", &pk]);
     assert!(code != 0 && err.contains(T1_FIXED), "{}", err);
@@ -610,6 +610,12 @@ fn e5_public_data_and_the_audit_of_private_data() {
         "{}",
         text
     );
+    // v0.6.49 (A9): el `reason` nombra el permiso (antes, la operación: `reason`).
+    assert!(
+        text.lines().any(|l| l.contains("llm-data") && l.contains(r#"Granted by llm(\"a@127.0.0.1\")"#)),
+        "{}",
+        text
+    );
 }
 
 #[test]
@@ -648,7 +654,7 @@ fn e5_private_answer_lineage_is_salted() {
 
 const LISTA: &str = "let lista be private([\"ana@cliente.com 4111-1111\", \"beto@cliente.com 5500-0000\"], \"clientes\")\nlet cliente be private({\"email\": \"ana@cliente.com\"}, \"clientes\")\n";
 
-fn trusted_run(dir: &PathBuf, tools: &[(&str, &str)], app: &str) -> (i32, String, String) {
+pub(crate) fn trusted_run(dir: &PathBuf, tools: &[(&str, &str)], app: &str) -> (i32, String, String) {
     std::fs::write(dir.join("app.syn"), app).unwrap();
     let mut args: Vec<String> = vec!["run".into(), "--labels".into(), "--cap-set".into(), "stdout".into()];
     for (name, src) in tools {
@@ -706,15 +712,17 @@ fn e3b_trusted_module_does_not_see_the_program_globals() {
     assert!(code == 2 && err.contains("--trusted runs under `synsema run` and `synsema test`"), "{}", err);
 }
 
-/// A2: la vista de un módulo de confianza no se escribe desde afuera: `set h.x to …` (una task, una
-/// variable, un elemento de una lista) cambia sólo la copia del programa, y otro `use` ve la original.
+/// A2: la vista de un módulo de confianza no se escribe desde afuera: `set h.x to …` (una variable,
+/// un elemento de una lista) cambia sólo la copia del programa, y otro `use` ve la original; una
+/// task no se reemplaza (v0.6.49, B8).
 #[test]
 fn e3b_program_cannot_rebind_or_mutate_a_trusted_module() {
     let dir = project("r1-a2");
     let tools = "export let dominio be \"cliente.com\"\nexport task formato(t)\n    give \"Re: \" + t\nexport task responder(cliente, texto)\n    require declassify(\"clientes\")\n    require stdout\n    let cuerpo be formato(texto)\n    give cuerpo\nexport task publicar_si_es_del_dominio(cliente)\n    require declassify(\"clientes\")\n    require stdout\n    let e be declassify(cliente.email, \"se publica sólo el dominio permitido\")\n    when ends_with(e, dominio)\n        give e\n    give \"no\"\n";
     let app = format!("{LISTA}use \"trusted:h\" as h\ntask malo(t)\n    print(\"FUGA3: \" + text(declassify(lista, \"exfil\")))\n    give t\nset h.formato to malo\nprint(h.responder(cliente, \"hola\"))\n");
+    // v0.6.49 (B8): reemplazar una task de confianza ya no cambia la copia en silencio: es error.
     let (code, out, err) = trusted_run(&dir, &[("h", tools)], &app);
-    assert_eq!((code, out.trim()), (0, "Re: hola"), "{}", err);
+    assert!(code != 0 && err.contains("cannot replace the trusted task 'formato'") && !out.contains("FUGA3"), "{}{}", out, err);
     let app = "let otro be private({\"email\": \"x@evil.com\"}, \"clientes\")\nuse \"trusted:h\" as h\nprint(h.publicar_si_es_del_dominio(otro))\nset h.dominio to \"evil.com\"\nprint(h.publicar_si_es_del_dominio(otro))\n";
     let (code, out, err) = trusted_run(&dir, &[("h", tools)], app);
     assert_eq!((code, out.trim()), (0, "no\nno"), "{}", err);
@@ -891,12 +899,12 @@ print(h.recibo({\"nombre\": \"Ana\", \"tarjeta\": \"4111-1111-1111-1111\"}))
 // ---------------------------------------------------------------------------------------------
 
 /// Un par de claves de auditor: `(privada, pública)` en base64url.
-fn auditor_keys() -> (String, String) {
+pub(crate) fn auditor_keys() -> (String, String) {
     synsema_stdlib::sealed::generate_keypair()
 }
 
 /// El recibo que `run` escribió en stderr (la última línea JSON con `synsema_receipt`).
-fn receipt_in(stderr: &str) -> serde_json::Value {
+pub(crate) fn receipt_in(stderr: &str) -> serde_json::Value {
     stderr
         .lines()
         .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
@@ -905,7 +913,7 @@ fn receipt_in(stderr: &str) -> serde_json::Value {
         .unwrap_or_else(|| panic!("no hay recibo en stderr:\n{}", stderr))
 }
 
-fn open_receipt(r: &serde_json::Value, sk: &str) -> serde_json::Value {
+pub(crate) fn open_receipt(r: &serde_json::Value, sk: &str) -> serde_json::Value {
     let sk = synsema_core::bytesutil::b64url_decode(sk).unwrap();
     synsema_stdlib::sealed::open_receipt(r, &sk).expect("el auditor abre el recibo")
 }

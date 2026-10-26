@@ -160,6 +160,7 @@ pub(crate) fn register_run_program_builtin(
                     source: "run_program()".to_string(),
                     reason: ABOVE_PARENT_PROFILE.to_string(),
                     origin: "program",
+                    context: None,
                 });
                 child_profile = Profile::Pure;
             }
@@ -214,6 +215,7 @@ pub(crate) fn register_run_program_builtin(
                         source: "run_program()".to_string(),
                         reason: ABOVE_PARENT_CEILING.to_string(),
                         origin: "program",
+                        context: None,
                     });
                 }
             }

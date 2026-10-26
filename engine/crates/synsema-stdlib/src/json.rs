@@ -18,11 +18,52 @@ fn err(msg: impl Into<String>) -> Control {
     Control::Error(RuntimeError::new(msg.into()))
 }
 
+/// `synsema serve` corre en este proceso (top-level, workers, cron, agentes). Lo que `shutdown()`
+/// necesita para distinguir "sólo bajo serve" de "todavía no hay nada corriendo" (lo marca
+/// `server::mark_under_serve`). Vive acá, y no en `server.rs`, porque este módulo compila también en
+/// wasm y el aviso de redacción lo mira (v0.6.49, B4).
+pub(crate) static UNDER_SERVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// v0.6.49 (B4): el aviso de un valor redactado al serializar. Decía siempre `[serve] warning: …
+/// in a serialized response/SSE body`, también bajo `synsema run` (un `evm_rpc` con la URL atada,
+/// un `push_send`): el prefijo y el lugar se eligen según el proceso corra `serve` o no.
+#[cold]
+fn warn_redacted(what: &str, tail: &str) {
+    eprintln!("{}", redacted_warning(what, tail, UNDER_SERVE.load(std::sync::atomic::Ordering::Relaxed)));
+}
+
+fn redacted_warning(what: &str, tail: &str, under_serve: bool) -> String {
+    let (prefix, place) = if under_serve {
+        ("[serve] warning", "a serialized response/SSE body")
+    } else {
+        ("synsema: warning", "a value serialized to JSON")
+    };
+    format!("{}: {} was redacted in {}{}", prefix, what, place, tail)
+}
+
 /// Un task o un generador no es un dato: `json_encode` lo escribía como texto
 /// (`"builtin:rng(1)"`, con la semilla y sin el estado) sin avisar. Es un error que nombra
 /// dónde está, como `canonical_json` y el `TypeError` de Python. (Los bodies de `serve`
 /// siguen su propio contrato, en `syn_to_json`.)
 fn reject_code(v: &SynValue, who: &str, path: &str) -> Result<(), Control> {
+    reject_code_with(v, who, path, &|name| {
+        format!(
+            "pass the value to the request itself (in a header; in the body or the URL once it is bound: \
+             `require secret(\"{}\") for net(\"host\")`) and the engine writes it at the socket, or leave it \
+             out of what you encode",
+            name
+        )
+    })
+}
+
+/// [`reject_code`] con el remedio de un secreto propio de quien llama: v0.6.49 (A4) `push_send`, cuyo
+/// payload va al navegador (otro dueño) y no tiene host al que atar un secreto.
+pub(crate) fn reject_code_with(
+    v: &SynValue,
+    who: &str,
+    path: &str,
+    secret_remedy: &dyn Fn(&str) -> String,
+) -> Result<(), Control> {
     match v {
         SynValue::Task(_) | SynValue::Builtin(_) => Err(err(format!(
             "{}: {} is {}, not data — JSON cannot hold code; store what it computes, or leave it out",
@@ -35,13 +76,11 @@ fn reject_code(v: &SynValue, who: &str, path: &str) -> Result<(), Control> {
         // el dato (el mismo principio de HB4; como `secrecy` en Rust, que no serializa un secreto
         // sin un opt-in). El único borde que lo pone es el motor, en el socket.
         SynValue::Secret(s) => Err(err(format!(
-            "{}: {} is secret({}), and a secret is never written as text — pass the value to the request \
-             itself (in a header; in the body or the URL once it is bound: `require secret(\"{}\") for \
-             net(\"host\")`) and the engine writes it at the socket, or leave it out of what you encode",
+            "{}: {} is secret({}), and a secret is never written as text — {}",
             who,
             path,
             s.name(),
-            s.name()
+            secret_remedy(s.name())
         ))),
         SynValue::List(l) => {
             // Una lista sin caja tiene números, no código: leerla con `list_values` la pasaba a
@@ -50,7 +89,7 @@ fn reject_code(v: &SynValue, who: &str, path: &str) -> Result<(), Control> {
             let Some(xs) = b.as_values() else { return Ok(()) };
             for (i, x) in xs.iter().enumerate() {
                 if matches!(x, SynValue::Task(_) | SynValue::Builtin(_) | SynValue::Secret(_) | SynValue::List(_) | SynValue::Map(_)) {
-                    reject_code(x, who, &format!("{}[{}]", path, i))?;
+                    reject_code_with(x, who, &format!("{}[{}]", path, i), secret_remedy)?;
                 }
             }
             Ok(())
@@ -58,7 +97,7 @@ fn reject_code(v: &SynValue, who: &str, path: &str) -> Result<(), Control> {
         SynValue::Map(m) => {
             for (k, x) in m.borrow().iter() {
                 if matches!(x, SynValue::Task(_) | SynValue::Builtin(_) | SynValue::Secret(_) | SynValue::List(_) | SynValue::Map(_)) {
-                    reject_code(x, who, &format!("{}[{:?}]", path, k))?;
+                    reject_code_with(x, who, &format!("{}[{:?}]", path, k), secret_remedy)?;
                 }
             }
             Ok(())
@@ -428,10 +467,7 @@ pub fn syn_to_json(v: &SynValue) -> Json {
         // no se tumba la API por un descuido). Este brazo SÓLO corre si hay un secret
         // en la respuesta → el request promedio (sin secretos) no paga nada (§8).
         SynValue::Secret(s) => {
-            eprintln!(
-                "[serve] warning: secret({}) was redacted in a serialized response/SSE body",
-                s.name()
-            );
+            warn_redacted(&format!("secret({})", s.name()), "");
             Json::Str("[redacted]".to_string())
         }
         // `bytes` dentro de un body JSON → string base64 (JSON no tiene tipo binario;
@@ -452,10 +488,7 @@ pub fn syn_to_json(v: &SynValue) -> Json {
         SynValue::Private(p) => {
             // T5 (ronda 8): el aviso nombra los principales DECLARADOS, no los de ESTE valor.
             let _ = p;
-            eprintln!(
-                "[serve] warning: {} was redacted in a serialized response/SSE body (the sink did not check_flow/strip_deep)",
-                synsema_core::labels::redacted_display()
-            );
+            warn_redacted(&synsema_core::labels::redacted_display(), " (the sink did not check_flow/strip_deep)");
             Json::Str("[redacted]".to_string())
         }
         SynValue::Server(s) => match &**s {
@@ -706,6 +739,19 @@ mod tests {
     use super::*;
     use synsema_core::tokens::SourceLocation;
     use synsema_core::types::syn_text;
+
+    /// v0.6.49 (B4): `[serve]` y "response/SSE body" sólo bajo serve; fuera de serve el aviso dice lo
+    /// que pasó sin nombrar un servidor que no existe.
+    #[test]
+    fn b4_redaction_warning_names_serve_only_under_serve() {
+        assert_eq!(
+            redacted_warning("secret(K)", "", true),
+            "[serve] warning: secret(K) was redacted in a serialized response/SSE body"
+        );
+        let w = redacted_warning("secret(K)", "", false);
+        assert_eq!(w, "synsema: warning: secret(K) was redacted in a value serialized to JSON");
+        assert!(!w.contains("serve") && !w.contains("SSE"), "{}", w);
+    }
 
     /// `Control` no es Debug a propósito (transporta valores del lenguaje): desempaquetar con
     /// el mensaje del error, no con `unwrap`.

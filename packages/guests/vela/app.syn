@@ -19,9 +19,13 @@
 -- `error` is a CODE (`insufficient_balance`), never a sentence with a balance in it — the
 -- sentence goes in `error_detail`, which the adapter keeps in the Executor's log — and there is
 -- ONE fuel constant for the whole app (the adapter reports one value per app anyway).
--- No `now()`, no `random()`: the guest runs under a stdout-only ceiling — determinism by construction.
+-- No `now()`, no `random()`: the guest runs under the ceiling `stdout,declassify=app` — determinism by construction.
 -- Test it natively before building the module: `synsema test app.syn`.
 intent: "vela guest example: private balances per account"
+
+-- The adapter runs the app under the ceiling `stdout,declassify=app`; since v0.6.49 a program under a
+-- ceiling publishes only what it declares, so the outcome codes and receipts it publishes need this:
+require declassify("app")
 
 let ETH be "0x0000000000000000000000000000000000000000"
 -- One fuel for every entry point: the fee is public on-chain, a per-branch value would tell an

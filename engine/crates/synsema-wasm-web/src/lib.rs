@@ -676,7 +676,14 @@ fn audit_json(audit: &[synsema_wasm::AuditEntry]) -> Value {
     Value::Array(
         audit
             .iter()
-            .map(|a| json!({"capability": a.capability, "granted": a.granted, "source": a.source, "reason": a.reason, "origin": a.origin}))
+            .map(|a| {
+                let mut e = json!({"capability": a.capability, "granted": a.granted, "source": a.source, "reason": a.reason, "origin": a.origin});
+                // v0.6.49 (B2): dentro de una tool de confianza, `context: "trusted:<módulo>"`.
+                if let Some(c) = &a.context {
+                    e["context"] = json!(c);
+                }
+                e
+            })
             .collect(),
     )
 }
@@ -711,6 +718,11 @@ fn dispatch(req: &Map<String, Value>) -> Value {
                 // El prefijo lo pone cada opción (`ceiling: …`, `max_steps must be …`).
                 Err(e) => return err_response(&e),
             };
+            // v0.6.49 (ronda 1, M4): sólo `run` sella un recibo; en `test`/`handle` el `auditor` se
+            // ignoraba en silencio y el host creía tener uno.
+            if op != "run" && (opts.auditor.is_some() || req.contains_key("sealed_bytes")) {
+                return err_response("auditor: only run seals a receipt (test and handle build none)");
+            }
             fence_clock(opts.labels);
             install_host(req);
             match op {
@@ -937,7 +949,8 @@ mod tests {
         assert_eq!(v["ok"], true);
         // Con `labels` y `result`, el valor final vuelve CON etiquetas y el
         // `print` de un privado sale redactado; la lista de declassify acompaña.
-        let src = "let s be private({\"amount\": 5, \"note\": \"x\"}, \"app\")
+        let src = "require declassify(\"app\")
+let s be private({\"amount\": 5, \"note\": \"x\"}, \"app\")
 let out be {\"state\": s, \"fee\": 3, \"pub\": declassify(s[\"amount\"] + 1, \"fee is public\")}
 print(s)";
         let req = json!({"op":"run","source":src,"labels":true,"result":"out","ceiling":"stdout,declassify=app"});

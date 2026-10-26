@@ -678,7 +678,8 @@ fn private_plus_secret_in_an_operation_is_refused() {
     interp.set_labels_detail_to_program(true); // el diagnóstico, como el CLI sin techo (v0.6.47 T1)
     interp.set_global("k", synsema_core::types::syn_secret("K", "plain"));
     match interp.execute(&program) {
-        Err(Control::Error(e)) => assert!(e.message.contains("a secret is already opaque"), "{}", e),
+        // v0.6.49 (A3): el texto dice la regla y qué hacer (era "a secret is already opaque").
+        Err(Control::Error(e)) => assert!(e.message.contains("a secret cannot be made from, combined with or chosen by a private value"), "{}", e),
         _ => panic!("se esperaba error"),
     }
 }
@@ -1185,7 +1186,7 @@ fn audit_m2_secret_under_pc_is_refused() {
     interp.set_global("k1", synsema_core::types::syn_secret("K1", "yes"));
     interp.set_global("k2", synsema_core::types::syn_secret("K2", "no"));
     match interp.execute(&program) {
-        Err(Control::Error(e)) => assert!(e.message.contains("private(a)") || e.message.contains("a secret is already opaque"), "{}", e),
+        Err(Control::Error(e)) => assert!(e.message.contains("a secret cannot be created or chosen under private control flow"), "{}", e),
         _ => panic!("se esperaba error"),
     }
     // También un `let` nuevo de un secret dentro de la rama.

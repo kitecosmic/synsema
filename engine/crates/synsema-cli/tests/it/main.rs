@@ -23,3 +23,4 @@ mod v0645_links_cli;
 mod v0645_serve_exit_cli;
 mod v0646_tanda_e_cli;
 mod v0647_t1_cli;
+mod v0649_cli;

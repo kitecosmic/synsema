@@ -119,10 +119,10 @@ fn bearer_headers_and_query_refuse_printed_forms() {
         ("bearer(123)", "bearer: the token must be text or a secret, got number"),
         ("bearer(as_secret(bytes(\"ffff\", \"hex\")))", "holds bytes that are not UTF-8"),
         ("require net(\"127.0.0.1\")\nfetch(\"http://127.0.0.1:9/\", {\"headers\": {\"X-Key\": nothing}})", "fetch: header \"X-Key\" is nothing"),
-        ("require net(\"127.0.0.1\")\nhttp_get(\"http://127.0.0.1:9/\", {\"X-Raw\": bytes(\"a\")})", "http_get: header \"X-Raw\" must be text, a number or a secret, got bytes"),
-        ("require net(\"127.0.0.1\")\nhttp_get(\"http://127.0.0.1:9/\", nothing, {\"token\": as_secret(\"s\")})", "query parameter \"token\" is secret(sealed), and an unbound secret only goes in a header"),
-        ("require net(\"127.0.0.1\")\nhttp_post(\"http://127.0.0.1:9/\", {\"client_secret\": as_secret(\"s\")})", "http_post: the body is secret(sealed), and an unbound secret only goes in a header"),
-        ("require net(\"127.0.0.1\")\nfetch(\"http://127.0.0.1:9/\", {\"method\": \"POST\", \"body\": [1, {\"k\": as_secret(\"s\")}]})", "fetch: the body is secret(sealed), and an unbound secret only goes in a header"),
+        ("require net(\"127.0.0.1\")\nhttp_get(\"http://127.0.0.1:9/\", {\"X-Raw\": bytes(\"a\")})", "http_get: header \"X-Raw\" must be text, a number, a bool or a secret, got bytes"),
+        ("require net(\"127.0.0.1\")\nhttp_get(\"http://127.0.0.1:9/\", nothing, {\"token\": as_secret(\"s\")})", "query parameter \"token\" is secret(sealed), made by the program"),
+        ("require net(\"127.0.0.1\")\nhttp_post(\"http://127.0.0.1:9/\", {\"client_secret\": as_secret(\"s\")})", "http_post: the body is secret(sealed), made by the program"),
+        ("require net(\"127.0.0.1\")\nfetch(\"http://127.0.0.1:9/\", {\"method\": \"POST\", \"body\": [1, {\"k\": as_secret(\"s\")}]})", "fetch: the body is secret(sealed), made by the program"),
     ] {
         let r = run(&format!("{}\n", src));
         assert!(!r.success && r.errors.join(" ").contains(needle), "{}: {:?}", src, r.errors);

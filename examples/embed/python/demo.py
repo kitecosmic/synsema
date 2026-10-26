@@ -65,8 +65,13 @@ def http(req):
         return {"status": 0, "error": str(e)}
 
 
-def llm(op, prompt):
-    # Acá iría tu SDK (Anthropic/OpenAI/local). El mock devuelve algo reconocible.
+seen_principals = []
+
+
+def llm(op, prompt, principals):
+    # Acá iría tu SDK (Anthropic/OpenAI/local). El mock devuelve algo reconocible. `principals`:
+    # los dueños de lo privado del prompt; con datos de un cliente, elegí un proveedor que pueda verlos.
+    seen_principals.append(list(principals))
     return {"content": f"[{op}] {prompt[:40]}", "tokens": 12}
 
 
@@ -97,6 +102,9 @@ check("memoria: recall en otra corrida", r["ok"] and r["output"][0] == "responde
 r = syn.run('require llm\nprint(reason about "el clima")\nprint(llm_usage())', host=host)
 check("llm: reason va al host y llm_usage cuenta", r["ok"] and r["output"][0].startswith("[reason]") and r["output"][1] == "12", r)
 check("audit: cada chequeo de capability queda registrado", any(a["capability"] == "llm" for a in r["audit"]), r["audit"])
+check("llm: un prompt público llega sin principals", seen_principals[-1] == [], seen_principals)
+r = syn.run('require llm("clientes")\nlet c be private("ana@cliente.com", "clientes")\nprint(label_of(reason c))', host=host, labels=True, ceiling="stdout,llm=clientes@embedder")
+check("llm: el host ve de quién es lo privado del prompt", r["ok"] and seen_principals[-1] == ["clientes"], (r, seen_principals))
 
 # 4. Red del host, gateada: sin `require net` no se llama a urllib.
 r = syn.run('let r be fetch("https://example.com")', host=host)

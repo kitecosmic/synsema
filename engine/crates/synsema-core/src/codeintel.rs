@@ -500,6 +500,44 @@ fn caps_transitive(
     }
 }
 
+/// v0.6.49 (B6): la línea de la primera llamada de `body` que necesita `(cap, scope)` (directa o
+/// por una task que llama). El aviso de `code check` apuntaba al principio del símbolo.
+fn call_line(
+    body: &[Node],
+    want: &(String, Option<String>),
+    lookup: &dyn Fn(&str) -> Option<route_meta::TaskSrc>,
+    params_of: &HashMap<String, Vec<String>>,
+    ctx: &ScopeCtx,
+) -> Option<usize> {
+    let mut found = None;
+    for stmt in body {
+        walk(stmt, &mut |n| {
+            if found.is_some() {
+                return;
+            }
+            if matches!(
+                n.kind,
+                NodeKind::TaskCall { .. }
+                    | NodeKind::ReasonExpression { .. }
+                    | NodeKind::DecideExpression { .. }
+                    | NodeKind::AnalyzeExpression { .. }
+                    | NodeKind::GenerateExpression { .. }
+                    | NodeKind::JudgeExpression { .. }
+            ) {
+                let mut caps = Vec::new();
+                caps_transitive(std::slice::from_ref(n), lookup, params_of, ctx, &mut Vec::new(), &mut caps);
+                if caps.contains(want) {
+                    found = Some(n.location.line);
+                }
+            }
+        });
+        if found.is_some() {
+            break;
+        }
+    }
+    found
+}
+
 /// Templates referenciados por literal (`render("x.html")`, `page(...)`, `include`) en un cuerpo.
 fn templates_of(body: &[Node]) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
@@ -1498,7 +1536,7 @@ pub fn caps(root: &Root, path: Option<&str>) -> Value {
         // en el mismo archivo: sitios de llamada de todo el programa, recolectados una vez.
         let main_sites = call_sites(&sp.main.statements);
         let mut needed: Vec<Value> = Vec::new();
-        let mut missing: Vec<(String, Option<String>, String, usize)> = Vec::new();
+        let mut missing: Vec<(String, Option<String>, String, usize, usize)> = Vec::new();
         let mut consider = |label: String, line: usize, body: &[Node]| {
             let ctx = match label.strip_prefix("task ") {
                 Some(tname) => ScopeCtx {
@@ -1528,7 +1566,9 @@ pub fn caps(root: &Root, path: Option<&str>) -> Value {
             }
             for (c, s) in caps {
                 if !covered(&declared, &c, &s) && !covered(&own, &c, &s) {
-                    missing.push((c, s, label.clone(), line));
+                    let pair = (c, s);
+                    let at = call_line(body, &pair, &lookup, &params_of, &ctx).unwrap_or(line);
+                    missing.push((pair.0, pair.1, label.clone(), line, at));
                 }
             }
         };
@@ -1570,14 +1610,19 @@ pub fn caps(root: &Root, path: Option<&str>) -> Value {
         missing.sort();
         let mut i = 0;
         while i < missing.len() {
-            let (c, s, _, _) = missing[i].clone();
+            let (c, s, _, _, _) = missing[i].clone();
             let mut by: Vec<Value> = Vec::new();
             while i < missing.len() && missing[i].0 == c && missing[i].1 == s {
-                by.push(json!({"symbol": missing[i].2, "line": missing[i].3}));
+                by.push(json!({"symbol": missing[i].2, "line": missing[i].3, "at": missing[i].4}));
                 i += 1;
             }
             let hint = match &s {
                 Some(sc) => format!("add `require {}(\"{}\")`", c, sc),
+                // v0.6.49 (B7): sin scope sugería un `require declassify` desnudo, que permite
+                // publicar lo de cualquier principal (y `run` avisa por eso).
+                None if c == "declassify" => {
+                    "add `require declassify(\"<principal>\")` naming whose data it publishes (a bare `require declassify` allows any principal)".to_string()
+                }
                 None => format!("add `require {}` (or `require {}(\"<scope>\")` for the exact scope)", c, c),
             };
             // `time`/`llm`/`stdout` se auto-conceden bajo `synsema run` (ergonomía); bajo
@@ -1778,7 +1823,8 @@ pub fn check_with(root: &Root, path: Option<&str>, extra: ExtraLints<'_>) -> Val
             let file = f["file"].as_str().unwrap_or("");
             if let Some(ms) = f["missing"].as_array() {
                 for m in ms {
-                    let first_line = m["needed_by"].as_array().and_then(|a| a.first()).and_then(|x| x["line"].as_u64()).unwrap_or(0);
+                    // La línea de la llamada (`at`), no la del símbolo (B6).
+                    let first_line = m["needed_by"].as_array().and_then(|a| a.first()).and_then(|x| x["at"].as_u64().or(x["line"].as_u64())).unwrap_or(0);
                     let mut who: Vec<String> = m["needed_by"].as_array().map(|a| a.iter().filter_map(|x| x["symbol"].as_str().map(String::from)).collect()).unwrap_or_default();
                     if who.len() > 3 {
                         let extra = who.len() - 3;
@@ -1813,6 +1859,13 @@ pub fn check_with(root: &Root, path: Option<&str>, extra: ExtraLints<'_>) -> Val
 fn warning_json(rel: &str, abs: &str, w: &str) -> Value {
     let parsed = w.strip_prefix(abs).and_then(|r| r.strip_prefix(':')).and_then(|r| {
         let (line, msg) = r.split_once(": warning: ")?;
+        Some((line.parse::<usize>().ok()?, msg))
+    });
+    // v0.6.49 (B6): los de `deprecated.rs` (nombre viejo, `percentile` con fracción, `generate … +`)
+    // vienen como `warning: <ruta>:<línea>: <mensaje>`; salían en la línea 0 y con la ruta absoluta.
+    let parsed = parsed.or_else(|| {
+        let r = w.strip_prefix("warning: ")?.strip_prefix(abs)?.strip_prefix(':')?;
+        let (line, msg) = r.split_once(": ")?;
         Some((line.parse::<usize>().ok()?, msg))
     });
     match parsed {
