@@ -532,3 +532,128 @@ fn a_trusted_tool_renders_at_its_top_level_from_its_templates() {
     let (code, out, err) = synsema(&dir, &["run", "--trusted", "t=t.syn", "--trusted-templates", "t=tpl", "app.syn"], None);
     assert!(code == 0 && out.contains("<i>pie</i>") && !out.contains("DEL-PROGRAMA"), "{} {}", out, err);
 }
+
+// =========================================================
+// E: textos y la espera de los agentes (ítem 3; tabla en `specs/v0.6.50-a-modelo.md` § E)
+// =========================================================
+
+/// Filas E1–E3: `llm=P`/`judge=P` sin `@` avisa al arrancar; con el provider, o sin principal, no.
+#[test]
+fn a_ceiling_llm_item_without_a_provider_warns_at_start() {
+    let dir = project("e-a");
+    std::fs::write(dir.join("p.syn"), "print(\"ok\")\n").unwrap();
+    std::fs::write(dir.join("t.syn"), "export task f()\n    give 1\n").unwrap();
+    let (code, out, err) = synsema(&dir, &["run", "--cap-set", "stdout,llm=clientes", "p.syn"], None);
+    assert!(code == 0 && out.contains("ok"), "{}", err);
+    assert!(err.contains("warning: --cap-set llm=clientes:") && err.contains("llm=clientes@<provider host>"), "{}", err);
+    for quiet in ["stdout,llm=clientes@api.x", "stdout,llm", "stdout,llm=*@*"] {
+        let (code, _, err) = synsema(&dir, &["run", "--cap-set", quiet, "p.syn"], None);
+        assert!(code == 0 && !err.contains("warning"), "{}: {}", quiet, err);
+    }
+    let (_, _, err) = synsema(&dir, &["run", "--trusted", "t=t.syn", "--trusted-cap-set", "judge=P", "p.syn"], None);
+    assert!(err.contains("warning: --trusted-cap-set judge=P:"), "{}", err);
+}
+
+/// Filas E4–E6: el `require` que falta va donde corre el código.
+#[test]
+fn a_missing_require_points_to_where_the_code_runs() {
+    let dir = project("e-b");
+    std::fs::write(dir.join("x.txt"), "hola").unwrap();
+    // E4: en un agente, a su cuerpo.
+    std::fs::write(dir.join("a.syn"), "agent Lector\n    print(read_file(\"x.txt\"))\nspawn Lector\n").unwrap();
+    let (code, _, err) = synsema(&dir, &["run", "a.syn"], None);
+    assert!(code != 0 && err.contains("to the body of agent Lector") && !err.contains("preamble"), "{}", err);
+    // E5: un worker de `parallel_map` nombra los dos lugares, una vez cada uno.
+    std::fs::write(
+        dir.join("b.syn"),
+        "task leer(f)\n    give read_file(f)\nagent Lector\n    print(parallel_map(leer, [\"x.txt\"]))\nspawn Lector\n",
+    )
+    .unwrap();
+    let (code, _, err) = synsema(&dir, &["run", "b.syn"], None);
+    assert!(code != 0 && err.contains("to the program's preamble, or to the body of the agent that runs this code"), "{}", err);
+    assert_eq!(err.matches("preamble").count(), 1, "{}", err);
+    assert_eq!(err.matches("the body of the agent that runs this code").count(), 1, "{}", err);
+    // E6: el programa, a su preámbulo, como siempre.
+    std::fs::write(dir.join("c.syn"), "print(read_file(\"x.txt\"))\n").unwrap();
+    let (code, _, err) = synsema(&dir, &["run", "c.syn"], None);
+    assert!(code != 0 && err.contains("to the program's preamble (or to the importing file"), "{}", err);
+}
+
+/// Filas E7–E9: el `require` de una task que la tool no exporta avisa al cargar, una vez.
+#[test]
+fn a_require_in_a_task_the_tool_does_not_export_warns_at_load() {
+    let dir = project("e-c");
+    std::fs::write(dir.join("p.syn"), "use \"trusted:t\" as t\nuse \"trusted:t\" as t2\nprint(t.pub(1))\n").unwrap();
+    std::fs::write(
+        dir.join("t.syn"),
+        "task helper(c)\n    require time\n    give c\nexport task pub(c)\n    give helper(c)\n",
+    )
+    .unwrap();
+    let (code, out, err) = synsema(&dir, &["run", "--trusted", "t=t.syn", "p.syn"], None);
+    assert!(code == 0 && out.contains('1'), "{}", err);
+    let w = "warning: trusted:t:2: `require time` in task helper grants nothing";
+    assert_eq!(err.matches(w).count(), 1, "{}", err);
+    // E8 y E9: exportada (directo o con `export let`), sin aviso.
+    for src in [
+        "task helper(c)\n    require time\n    give c\nexport let pub be helper\n",
+        "export task pub(c)\n    require time\n    give c\n",
+    ] {
+        std::fs::write(dir.join("t.syn"), src).unwrap();
+        let (code, _, err) = synsema(&dir, &["run", "--trusted", "t=t.syn", "p.syn"], None);
+        assert!(code == 0 && !err.contains("grants nothing"), "{}: {}", src, err);
+    }
+}
+
+/// Fila E10: un agente lanzado por otro que termina antes: su salida sale.
+#[test]
+fn the_run_waits_for_an_agent_another_agent_spawned() {
+    let dir = project("e-d1");
+    std::fs::write(
+        dir.join("p.syn"),
+        "agent Pub\n    agent Sub\n        require time\n        sleep(0.5)\n        print(\"desde Sub\")\n    spawn Sub\nspawn Pub\n",
+    )
+    .unwrap();
+    let (code, out, err) = synsema(&dir, &["run", "p.syn"], None);
+    assert!(code == 0 && out.contains("desde Sub"), "{} {}", out, err);
+}
+
+/// Fila E10 bajo `synsema test` (`wait_all` al final de cada bloque): el error de un agente lanzado
+/// por otro que ya terminó hace fallar el test.
+#[test]
+fn a_test_block_waits_for_an_agent_another_agent_spawned() {
+    let dir = project("e-d1t");
+    std::fs::write(
+        dir.join("p.syn"),
+        "agent Pub\n    agent Sub\n        require time\n        sleep(0.5)\n        raise \"falla Sub\"\n    spawn Sub\ntest \"anidado\"\n    spawn Pub\n",
+    )
+    .unwrap();
+    let (code, out, err) = synsema(&dir, &["test", "p.syn"], None);
+    assert!(code != 0 && format!("{}{}", out, err).contains("falla Sub"), "{} {}", out, err);
+}
+
+/// Fila E11: ... y su corte llega aunque el de afuera haya terminado.
+#[test]
+fn the_cut_of_a_nested_agent_reaches_the_run() {
+    let dir = project("e-d2");
+    std::fs::write(
+        dir.join("p.syn"),
+        "agent Pub\n    agent Sub\n        require time\n        sleep(0.5)\n        let c be private({\"name\": \"Ana\"}, \"customers\")\n        print(declassify(c.name, \"public name\"))\n    spawn Sub\nspawn Pub\nprint(\"main\")\n",
+    )
+    .unwrap();
+    let (code, out, err) = synsema(&dir, &["run", "--labels", "--cap-set", "stdout,time", "p.syn"], None);
+    assert!(code != 0 && !out.contains("Ana") && !out.contains("main"), "{} {}", out, err);
+}
+
+/// Fila E12: con `exit`, el agente que lanzó otro y los dos se detienen: la corrida no queda colgada.
+#[test]
+fn exit_stops_the_agents_an_agent_spawned() {
+    let dir = project("e-d3");
+    std::fs::write(
+        dir.join("p.syn"),
+        "require time\nagent Pub\n    require time\n    agent Sub\n        require time\n        while true\n            sleep(0.05)\n    spawn Sub\n    while true\n        sleep(0.05)\nspawn Pub\nsleep(0.3)\nexit(3)\n",
+    )
+    .unwrap();
+    let t0 = Instant::now();
+    let (code, _, err) = synsema(&dir, &["run", "p.syn"], None);
+    assert!(code == 3 && t0.elapsed() < Duration::from_secs(20), "{} {:?}", err, t0.elapsed());
+}

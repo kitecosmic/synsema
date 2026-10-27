@@ -415,12 +415,23 @@ impl Swarm {
         self.threads.lock().unwrap().push(handle);
     }
 
-    /// Espera (join) a que todos los hilos de agentes terminen.
+    /// Espera (join) a que todos los hilos de agentes terminen, también los que un agente lanza
+    /// mientras se espera. v0.6.50: vaciaba la lista una vez, y el hilo de un agente lanzado por
+    /// otro después de eso no se esperaba (su salida y su corte se perdían si el de afuera
+    /// terminaba antes). El que lanza agrega el hilo antes de terminar, así que al juntar al de
+    /// afuera el de adentro ya está en la lista.
     pub fn wait_all(&self) {
+        while self.join_round() > 0 {}
+    }
+
+    /// Una ronda de `wait_all`: junta los hilos que hay ahora y dice cuántos eran.
+    pub fn join_round(&self) -> usize {
         let handles: Vec<JoinHandle<()>> = self.threads.lock().unwrap().drain(..).collect();
+        let n = handles.len();
         for h in handles {
             let _ = h.join();
         }
+        n
     }
 
     pub fn total_agents(&self) -> usize {

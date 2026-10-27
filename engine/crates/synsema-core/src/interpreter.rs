@@ -4356,6 +4356,8 @@ impl Interpreter {
         // antes de que llegue ningún dato, el texto se ve aunque los datos sean privados.
         crate::templates::check_tool_renders(&program, name, self.trusted_templates.get(name).map(|t| &**t))
             .map_err(err)?;
+        // v0.6.50 (E-c): el `require` de una task que el módulo no exporta no concede nada.
+        crate::deprecated::warn_trusted_unexported_requires(&program, name);
         self.loading_modules.insert(key.clone());
         // Ronda 1 (A1): hijo del preludio, no de `global_env`: los nombres libres del módulo son los
         // builtins, no lo que el programa definió antes o después del `use`.

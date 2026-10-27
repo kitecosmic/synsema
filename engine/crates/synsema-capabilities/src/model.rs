@@ -1062,6 +1062,9 @@ pub struct CapabilitySet {
     /// Grants del PROGRAMA que el techo rechazó: la capability está DECLARADA aunque no
     /// concedida — es lo que distingue "declared but above the ceiling" de "no grant".
     pub rejected_by_ceiling: Vec<Capability>,
+    /// v0.6.50 (E-b): el agente que corre con este set: un `require` que falta va en su cuerpo,
+    /// no en el preámbulo del programa (que no le llega). Lo heredan sus hijos.
+    pub agent: Option<String>,
 }
 
 impl CapabilitySet {
@@ -1075,6 +1078,7 @@ impl CapabilitySet {
             parent: None,
             ceiling: None,
             delegated: Vec::new(),
+            agent: None,
         }
     }
 
@@ -1610,14 +1614,27 @@ impl CapabilitySet {
     /// v0.6.49 (§C): dentro de una tool de confianza el `require` que falta va en la task del
     /// módulo, no en el preámbulo del programa (que no le da nada a la tool).
     fn where_to_require(&self, message: String) -> String {
-        let Some(module) = self.name.strip_prefix("trusted:") else { return message };
-        let there = format!(
-            "to the task of the trusted module `{}` that needs it (a trusted task has only what it declares, within the host's --trusted-cap-set)",
-            module
-        );
-        message
-            .replace("to the program's preamble (or to the importing file, when this code runs in a module)", &there)
-            .replace("to the program's preamble", &there)
+        let there = if let Some(module) = self.name.strip_prefix("trusted:") {
+            format!(
+                "to the task of the trusted module `{}` that needs it (a trusted task has only what it declares, within the host's --trusted-cap-set)",
+                module
+            )
+        } else if let Some(agent) = &self.agent {
+            // v0.6.50 (E-b): un agente declara las suyas; el `require` del programa no le llega.
+            format!("to the body of agent {} (an agent declares its own capabilities: the program's `require` does not reach it)", agent)
+        } else if self.name == "parallel" {
+            // Un worker de `parallel_map` hereda de quien lo lanzó y no sabe si fue un agente.
+            "to the program's preamble, or to the body of the agent that runs this code (an agent declares its own, also for its `parallel_map`)".to_string()
+        } else {
+            return message;
+        };
+        // Una sola vez: `there` puede nombrar el preámbulo (el de `parallel`).
+        const LONG: &str = "to the program's preamble (or to the importing file, when this code runs in a module)";
+        if message.contains(LONG) {
+            message.replacen(LONG, &there, 1)
+        } else {
+            message.replacen("to the program's preamble", &there, 1)
+        }
     }
 
     /// Chequea y devuelve error si no está otorgada.
@@ -1676,6 +1693,7 @@ impl CapabilitySet {
             parent: Some(parent.clone()),
             ceiling: parent.borrow().ceiling.clone(),
             delegated: parent.borrow().delegated.clone(),
+            agent: parent.borrow().agent.clone(),
         }
     }
 
@@ -2374,6 +2392,22 @@ pub fn build_ceiling(sandbox: bool, cap_set: Option<&str>) -> Result<Option<Vec<
         }
         (false, None) => Ok(None),
     }
+}
+
+/// v0.6.50 (E-a): los avisos de un techo ya armado. `llm=P`/`judge=P` sin `@` deja que el programa
+/// declare `require llm("P")`, pero no manda los datos de P a ningún modelo (`ceiling_names` pide el
+/// provider): se avisa al arrancar, no en la primera llamada. `flag` es el nombre del flag.
+pub fn ceiling_warnings(caps: &[Capability], flag: &str) -> Vec<String> {
+    caps.iter()
+        .filter(|c| matches!(c.ty, CapabilityType::Llm | CapabilityType::Judge))
+        .filter_map(|c| {
+            let p = c.scope.as_deref().filter(|s| !s.contains('@'))?;
+            let ty = c.ty.name_lower();
+            Some(format!(
+                "warning: {flag} {ty}={p}: the program may declare `require {ty}(\"{p}\")`, but data private to {p} goes to no model until the item names the provider: {ty}={p}@<provider host> (`@local` for a model in the process, `{p}@*` for any)"
+            ))
+        })
+        .collect()
 }
 
 /// v0.6.20 — techo DETERMINISTA: el de `--sandbox` sin `time` (y sin `random`, que el

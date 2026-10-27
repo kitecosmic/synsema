@@ -358,6 +358,64 @@ pub fn warn_once_at_load(program: &Program, file_path: &str) {
     }
 }
 
+/// v0.6.50 (E-c): en una tool de confianza, los `require` de las tasks que el módulo no exporta
+/// (`(task, capability, línea)`). No conceden nada: el scope lo abre la task exportada que el
+/// programa llama, con lo que ésa declara. Una task exportada con `export let h be helper` cuenta
+/// como exportada (`h` es `helper`).
+pub fn trusted_unexported_requires(program: &Program) -> Vec<(String, String, usize)> {
+    let mut exported = HashSet::new();
+    for st in &program.statements {
+        if let NodeKind::ExportDeclaration { declaration } = &st.kind {
+            match &declaration.kind {
+                NodeKind::TaskDefinition { name, .. } => {
+                    exported.insert(name.clone());
+                }
+                NodeKind::LetBinding { value, .. } => {
+                    if let NodeKind::Identifier { name } = &value.kind {
+                        exported.insert(name.to_string());
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut out = Vec::new();
+    for st in &program.statements {
+        crate::ast_api::walk(st, &mut |n| {
+            if let NodeKind::TaskDefinition { name, body, .. } = &n.kind {
+                if exported.contains(name) {
+                    return;
+                }
+                for b in body.iter() {
+                    if let NodeKind::RequireStatement { capability, .. } = &b.kind {
+                        out.push((name.clone(), capability.clone(), b.location.line));
+                    }
+                }
+            }
+        });
+    }
+    out
+}
+
+/// v0.6.50 (E-c): el aviso de `trusted_unexported_requires` al cargar la tool, una vez por sitio y
+/// por proceso (cada worker de `serve` la carga).
+pub fn warn_trusted_unexported_requires(program: &Program, module: &str) {
+    let dead = trusted_unexported_requires(program);
+    if dead.is_empty() {
+        return;
+    }
+    let mut guard = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    let seen = guard.get_or_insert_with(HashSet::new);
+    for (task, cap, line) in dead {
+        if seen.insert(format!("trusted-require:{}:{}", module, line)) {
+            eprintln!(
+                "warning: trusted:{}:{}: `require {}` in task {} grants nothing: the module does not export {}, and a trusted task runs with what the exported task the program calls declares. Declare it in that exported task",
+                module, line, cap, task, task
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

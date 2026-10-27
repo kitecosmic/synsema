@@ -143,7 +143,10 @@ fn main() {
     };
     // Techo del host: mismo parser que `synsema run` (synsema-capabilities::build_ceiling).
     let ceiling = match build_ceiling(sandbox, cap_set.as_deref()) {
-        Ok(c) => c,
+        Ok(c) => {
+            warn_ceiling(c.as_deref(), "--cap-set");
+            c
+        }
         Err(e) => {
             eprintln!("synsema-wasm: {}", e);
             std::process::exit(2);
@@ -171,7 +174,10 @@ fn main() {
     let trusted_ceiling = match trusted_cap_set.as_deref() {
         None => None,
         Some(spec) => match build_ceiling(false, Some(spec)) {
-            Ok(c) => c,
+            Ok(c) => {
+                warn_ceiling(c.as_deref(), "--trusted-cap-set");
+                c
+            }
             Err(e) => {
                 eprintln!("synsema-wasm: --trusted-cap-set: {}", e.trim_start_matches("--cap-set: "));
                 std::process::exit(2);
@@ -218,5 +224,12 @@ fn main() {
             eprintln!("{}", e);
         }
         std::process::exit(r.exit_code.unwrap_or(if r.ok { 0 } else { 1 }));
+    }
+}
+
+/// v0.6.50 (E-a): los avisos de un techo, como en `synsema run`.
+fn warn_ceiling(c: Option<&[synsema_capabilities::model::Capability]>, flag: &str) {
+    for w in synsema_capabilities::model::ceiling_warnings(c.unwrap_or_default(), flag) {
+        eprintln!("{}", w);
     }
 }

@@ -82,6 +82,13 @@ pub(crate) struct HostFlags {
     pub rest: Vec<String>,
 }
 
+/// v0.6.50 (E-a): los avisos de un techo (`ceiling_warnings`), por stderr al arrancar.
+fn warn_ceiling(c: Option<&[synsema_capabilities::model::Capability]>, flag: &str) {
+    for w in synsema_capabilities::model::ceiling_warnings(c.unwrap_or_default(), flag) {
+        eprintln!("{}", w);
+    }
+}
+
 impl HostFlags {
     /// El techo del host (`build_ceiling`), o el error de uso ya impreso.
     fn ceiling(&self, cmd: &str) -> Result<Option<Vec<synsema_capabilities::model::Capability>>, ExitCode> {
@@ -89,7 +96,10 @@ impl HostFlags {
             return Ok(Some(synsema_capabilities::model::build_ceiling_deterministic()));
         }
         match build_ceiling(self.sandbox, self.cap_set.as_deref()) {
-            Ok(c) => Ok(c),
+            Ok(c) => {
+                warn_ceiling(c.as_deref(), "--cap-set");
+                Ok(c)
+            }
             Err(e) => {
                 eprintln!("synsema {}: {}", cmd, e);
                 Err(ExitCode::from(2))
@@ -178,7 +188,10 @@ impl HostFlags {
         let ceiling = match self.trusted_cap_set.as_deref() {
             None => None,
             Some(spec) => match build_ceiling(false, Some(spec)) {
-                Ok(c) => c,
+                Ok(c) => {
+                    warn_ceiling(c.as_deref(), "--trusted-cap-set");
+                    c
+                }
                 Err(e) => {
                     eprintln!("synsema {}: --trusted-cap-set: {}", cmd, e.trim_start_matches("--cap-set: "));
                     return Err(ExitCode::from(2));
@@ -1593,7 +1606,10 @@ fn cmd_serve(args: &[String]) -> ExitCode {
             c.push(synsema_capabilities::model::Capability::new(synsema_capabilities::model::CapabilityType::Serve, None));
             Some(c)
         }
-        Ok(c) => c,
+        Ok(c) => {
+            warn_ceiling(c.as_deref(), "--cap-set");
+            c
+        }
         Err(e) => {
             eprintln!("synsema serve: {}", e);
             return ExitCode::from(2);

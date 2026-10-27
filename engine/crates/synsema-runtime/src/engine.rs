@@ -1461,13 +1461,21 @@ pub fn run_program_ceiled_opts(
     let exited = result.exit_code.is_some();
     // Los que `exit` detuvo: su error es la cancelación y no se informa. Un agente que ya había
     // fallado antes del `exit` sí (auditoría ronda 2: se descartaban todos).
-    let stopped: std::collections::HashSet<String> = if exited {
-        swarm.agents_info().into_iter().map(|(id, _)| id).filter(|id| swarm.stop_agent(id, "exit()")).collect()
-    } else {
-        Default::default()
-    };
-    // Joinea los agentes lanzados por el main; ya no hay nadie más que pueda spawnear.
-    swarm.wait_all();
+    // v0.6.50: por rondas, porque un agente que se detiene puede estar lanzando otro: el nuevo
+    // también se detiene, y se espera a todos (los lanzados por agentes incluidos).
+    let mut stopped: std::collections::HashSet<String> = Default::default();
+    loop {
+        if exited {
+            for (id, _) in swarm.agents_info() {
+                if !stopped.contains(&id) && swarm.stop_agent(&id, "exit()") {
+                    stopped.insert(id);
+                }
+            }
+        }
+        if swarm.join_round() == 0 {
+            break;
+        }
+    }
 
     // Refleja los agentes en ERROR (exit ≠0 + línea de error), sin tocar la salida del main.
     let mut agent_errors = collect_agent_errors(&swarm);
@@ -2284,6 +2292,8 @@ fn spawn_agent(
                     (interp, caps)
                 }
             };
+            // v0.6.50 (E-b): un `require` que le falta al agente va en su cuerpo.
+            caps.borrow_mut().agent = Some(agent_name.to_string());
             // T1: el agente corre EN NOMBRE del sujeto que lo spawneó, bajo su techo delegado
             // y sus presupuestos. El guard vive hasta el final del hilo.
             let _subject_scope = subject.apply(&mut interp, &caps);

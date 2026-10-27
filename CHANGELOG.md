@@ -73,6 +73,20 @@ Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the rele
   programs (an embedder, a test binary) has none, and the receipt carries `null`; before, the receipt
   of the second program carried the sha of the first. With one program per process (`synsema run`,
   `test`, `serve`) nothing changes, and under `serve --attested` the attested identity still decides.
+- A run waits for every agent, also the ones an agent spawns. Before, if `Pub` spawned `Sub` and
+  finished first, the run ended without `Sub`: its output was lost and its label cut could miss the
+  run (which then exited 0). The same under `synsema test`, `--explain` and `conform --swarm`. On
+  `exit`, an agent spawned while the others are being stopped is stopped too.
+- A missing `require` inside an agent now says to add it to the body of that agent (the program's
+  `require` does not reach an agent); before, it pointed to the program's preamble. In a
+  `parallel_map` worker, which inherits from whoever launched it, the text names both places.
+- Two startup warnings for lines that do nothing:
+  - `--cap-set llm=P` (or `judge=P`, also in `--trusted-cap-set`) without `@`: the program may
+    declare `require llm("P")`, but P's data goes to no model until the item names the provider
+    (`llm=P@<provider host>`, `P@*` for any). Before, it showed only at the first call.
+  - In a trusted tool, a `require` in a task the module does not export grants nothing (the exported
+    task the program calls opens the scope with what it declares). The tool now warns when it loads,
+    once per line.
 
 ## v0.6.49 — 2026-10-26
 

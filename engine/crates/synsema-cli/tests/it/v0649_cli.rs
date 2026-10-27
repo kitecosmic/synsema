@@ -983,18 +983,18 @@ fn r2_n2_replay_with_trusted_on_one_side_only() {
 #[test]
 fn r3_b1_an_agent_spawned_by_another_declares_its_own() {
     let dir = project("r3-b1");
-    // El `sleep(2)` espera a `Sub`: si `Pub` termina antes, la salida de `Sub` se pierde (fuera de
-    // alcance de v0.6.49; queda en la lista de la versión siguiente).
+    // Sin espera: `Pub` termina enseguida y la corrida igual espera a `Sub` (v0.6.50; antes llevaba
+    // un `sleep(2)` porque la salida de `Sub` se perdía).
     let run = |sub_require: &str, extra: &[&str]| {
         std::fs::write(
             dir.join("p.syn"),
             format!(
-                "agent Pub\n    require declassify(\"customers\")\n    require time\n    agent Sub\n{}        let c be private({{\"name\": \"Ana\"}}, \"customers\")\n        print(declassify(c.name, \"public name\"))\n    spawn Sub\n    sleep(2)\nspawn Pub\n",
+                "agent Pub\n    require declassify(\"customers\")\n    agent Sub\n{}        let c be private({{\"name\": \"Ana\"}}, \"customers\")\n        print(declassify(c.name, \"public name\"))\n    spawn Sub\nspawn Pub\n",
                 sub_require
             ),
         )
         .unwrap();
-        synsema(&dir, &[&["run", "--labels", "--cap-set", "stdout,declassify=customers,time"][..], extra, &["p.syn"]].concat(), None)
+        synsema(&dir, &[&["run", "--labels", "--cap-set", "stdout,declassify=customers"][..], extra, &["p.syn"]].concat(), None)
     };
     let d = cut_for_operator(|x| run("", x));
     assert!(d.contains("to the body of agent Sub"), "{}", d);
