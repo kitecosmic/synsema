@@ -698,7 +698,7 @@ fn e3b_trusted_module_does_not_see_the_program_globals() {
     assert!(code != 0 && err.contains("cron_after: a trusted tool cannot schedule"), "{}", err);
     std::fs::write(dir.join("otro.syn"), "export task g()\n    give 1\n").unwrap();
     let (code, _, err) = trusted_run(&dir, &[("t", "use \"./otro.syn\" as o\nexport task f(xs)\n    give o.g()\n")], app);
-    assert!(code != 0 && err.contains("a trusted module imports only other trusted modules"), "{}", err);
+    assert!(code != 0 && err.contains("a trusted module imports only other trusted modules") && err.contains("a file module is read from disk, where the program can write it"), "{}", err);
     // Un módulo de confianza sí importa otro de confianza.
     let (code, out, err) = trusted_run(
         &dir,

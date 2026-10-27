@@ -826,10 +826,12 @@ pub(crate) fn wire_common_with_state(
             let d = std::mem::take(&mut cs.denied);
             let p = cs.parent.take();
             saved.borrow_mut().push((g, d, p));
+            cs.sandbox_depth += 1;
         } else if let Some((g, d, p)) = saved.borrow_mut().pop() {
             cs.granted = g;
             cs.denied = d;
             cs.parent = p;
+            cs.sandbox_depth -= 1;
         }
     }));
     // Aislamiento por-tool (least-privilege): cuando el loop despacha una tool con
@@ -1461,8 +1463,23 @@ pub fn run_program_ceiled_opts(
     let exited = result.exit_code.is_some();
     // Los que `exit` detuvo: su error es la cancelación y no se informa. Un agente que ya había
     // fallado antes del `exit` sí (auditoría ronda 2: se descartaban todos).
-    // v0.6.50: por rondas, porque un agente que se detiene puede estar lanzando otro: el nuevo
-    // también se detiene, y se espera a todos (los lanzados por agentes incluidos).
+    let stopped = join_agents(&swarm, exited);
+
+    // Refleja los agentes en ERROR (exit ≠0 + línea de error), sin tocar la salida del main.
+    let agent_errors = agent_errors_but(&swarm, &stopped);
+    if !agent_errors.is_empty() {
+        result.success = false;
+        result.errors.extend(agent_errors);
+    }
+    close_swarm_run(&swarm, &mut result);
+    result
+}
+
+/// v0.6.50: espera a todos los agentes de la corrida, también a los que lanza un agente. Con
+/// `exited` (el programa llamó `exit`) los detiene antes, por rondas: uno que se detiene puede estar
+/// lanzando otro, y el nuevo también se detiene. Devuelve los que detuvo: su error es la cancelación
+/// y no se informa. Lo usan `run`, `--explain`, `synsema test` y `conform --swarm`.
+fn join_agents(swarm: &Swarm, exited: bool) -> std::collections::HashSet<String> {
     let mut stopped: std::collections::HashSet<String> = Default::default();
     loop {
         if exited {
@@ -1473,19 +1490,16 @@ pub fn run_program_ceiled_opts(
             }
         }
         if swarm.join_round() == 0 {
-            break;
+            return stopped;
         }
     }
+}
 
-    // Refleja los agentes en ERROR (exit ≠0 + línea de error), sin tocar la salida del main.
-    let mut agent_errors = collect_agent_errors(&swarm);
+/// Las líneas `Agent error [<id>]` de los agentes en error, salvo los que detuvo un `exit`.
+fn agent_errors_but(swarm: &Swarm, stopped: &std::collections::HashSet<String>) -> Vec<String> {
+    let mut agent_errors = collect_agent_errors(swarm);
     agent_errors.retain(|line| !stopped.iter().any(|id| line.starts_with(&format!("Agent error [{}]:", id))));
-    if !agent_errors.is_empty() {
-        result.success = false;
-        result.errors.extend(agent_errors);
-    }
-    close_swarm_run(&swarm, &mut result);
-    result
+    agent_errors
 }
 
 // =========================================================
@@ -1538,11 +1552,12 @@ fn run_tests_inner(source: &str, filename: &str, ceiling: Option<Vec<Capability>
     let ceiling_arc: Option<Arc<Vec<Capability>>> = ceiling.as_ref().map(|c| Arc::new(c.clone()));
     wire_swarm_hooks(&mut interp, swarm.clone(), "main", ceiling_arc, mem_ctx.clone(), None, &caps);
     let mut reported: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut after_each = |_name: &str| -> Option<String> {
-        swarm.wait_all();
+    let mut after_each = |_name: &str, exited: bool| -> Option<String> {
+        // Ronda 1 (M3): un bloque que llamó `exit` detiene sus agentes, como `run`.
+        let stopped = join_agents(&swarm, exited);
         let mut fresh: Vec<String> = Vec::new();
         for (id, st) in swarm.agent_states() {
-            if st == AgentState::Error && reported.insert(id.clone()) {
+            if st == AgentState::Error && !stopped.contains(&id) && reported.insert(id.clone()) {
                 let msg = swarm.agent_error(&id).unwrap_or_else(|| "agent error".to_string());
                 fresh.push(format!("Agent error [{}]: {}", id, msg));
             }
@@ -1623,6 +1638,10 @@ pub fn repl() {
         Rc::new(RefCell::new(AgentMemory::new())),
         repl_gate,
     );
+    // v0.6.50 (ronda 1, M1): la foto del preludio antes de la primera línea. Cada línea es un
+    // `execute`: sin foto, la del `use` traería lo que ligaron las anteriores, y sin ninguna, los
+    // builtins que quedan con su nombre (un `let upper be 3` previo dejaría al módulo sin `upper`).
+    interp.snapshot_module_base();
     println!("Synsema REPL — escribí sentencias; Ctrl+Z (Windows) / Ctrl+D para salir.");
     let stdin = io::stdin();
     let mut handle = stdin.lock();
@@ -1725,6 +1744,17 @@ fn run_diag_inner(source: &str, filename: &str, swarm: Option<Arc<Swarm>>, ceili
             result: RunResult { success: true, output: std::mem::take(&mut interp.output), errors: Vec::new(), ..Default::default() },
             diagnostics: Vec::new(),
         },
+        // Ronda 1 (N7): `exit(code)` es el fin pedido, como en `run`: sin diagnóstico y con su código.
+        Err(Control::Error(e)) if e.exit_code.is_some() => DiagRun {
+            result: RunResult {
+                success: e.exit_code == Some(0),
+                output: std::mem::take(&mut interp.output),
+                errors: Vec::new(),
+                exit_code: e.exit_code,
+                ..Default::default()
+            },
+            diagnostics: Vec::new(),
+        },
         Err(Control::Error(e)) => {
             let mut reporter = ErrorReporter::new();
             reporter.load_source(filename, source);
@@ -1781,8 +1811,9 @@ pub fn run_with_diagnostics_ceiled(source: &str, filename: &str, ceiling: Option
             diagnostics: Vec::new(),
         });
 
-    swarm.wait_all();
-    let agent_errors = collect_agent_errors(&swarm);
+    // Ronda 1 (M3): con `exit`, los agentes vivos se detienen, como en `run`.
+    let stopped = join_agents(&swarm, run.result.exit_code.is_some());
+    let agent_errors = agent_errors_but(&swarm, &stopped);
     if !agent_errors.is_empty() {
         run.result.success = false;
         run.result.errors.extend(agent_errors);
@@ -2509,7 +2540,8 @@ pub fn run_swarm_dump(source: &str, filename: &str) -> SwarmDump {
 pub fn run_swarm_dump_ceiled(source: &str, filename: &str, ceiling: Option<Vec<Capability>>) -> SwarmDump {
     let engine = Engine::new();
     let mut result = engine.run_ceiled(source, filename, ceiling);
-    engine.swarm.wait_all();
+    // Ronda 1 (M3): con `exit`, los agentes vivos se detienen, como en `run`.
+    join_agents(&engine.swarm, result.exit_code.is_some());
     // v0.6.47 (T1, A1): el volcado pasa por el mismo cierre que `run`. Con un corte no se vuelcan
     // los estados ni el blackboard: qué agente cortó (y qué escribió antes) es el dato.
     close_swarm_run(&engine.swarm, &mut result);

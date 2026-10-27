@@ -1933,6 +1933,9 @@ pub struct Interpreter {
     /// v0.6.50 (D): las tools en cuyo scope corre el código (la última es la actual), junto a
     /// `trusted_depth`.
     trusted_stack: Vec<String>,
+    /// v0.6.50 (ronda 1, M1): ya corrió un `execute`. Lo que haya en `global_env` desde entonces lo
+    /// ligó el programa, no es preludio: una foto tomada después son los builtins.
+    executed: bool,
 }
 
 /// v0.6.46 (ronda 1 de cf1, B2): el linaje que juntó un intérprete hijo (un worker de
@@ -2095,6 +2098,7 @@ impl Interpreter {
             module_base_env: None,
             trusted_templates: HashMap::new(),
             trusted_stack: Vec::new(),
+            executed: false,
             blackboard: HashMap::new(),
             agent_definitions: HashMap::new(),
             agent_context: Vec::new(),
@@ -2528,7 +2532,17 @@ impl Interpreter {
     /// `withhold_labels_detail` con el texto que va al sobre cuando difiere del del operador (B1:
     /// el real de un error redactado; el operador recibe el redactado).
     fn withhold_labels_detail_sealing(&self, e: &mut RuntimeError, sealed: Option<String>) {
-        if !self.labels || self.labels_detail_to_program || !e.is_fatal_for_labels() || e.is_halt() || e.operator_detail.is_some() {
+        if !self.labels || !e.is_fatal_for_labels() || e.is_halt() || e.operator_detail.is_some() {
+            return;
+        }
+        if self.labels_detail_to_program {
+            // Ronda 1 (B3): sin techo el programa ve el detalle de un corte, pero no el texto real
+            // de un error redactado; ése va igual al sobre, si hay auditor.
+            if let Some(real) = sealed {
+                if crate::sealed::active() {
+                    crate::sealed::push_sealed(serde_json::json!({"kind": "label_violation", "detail": real}).to_string());
+                }
+            }
             return;
         }
         let detail = e.to_string();
@@ -3714,15 +3728,6 @@ impl Interpreter {
         }
     }
 
-    /// `module_base` sin `&mut`, para quien ya reconstruyó los globales (`rebuild_globals` toma la
-    /// foto). Sin foto, los builtins con su nombre, sin guardarlos.
-    pub fn module_base_ref(&self) -> Rc<RefCell<Environment>> {
-        match &self.module_base_env {
-            Some(b) => b.clone(),
-            None => self.builtins_only("module-base"),
-        }
-    }
-
     /// Una copia de lo que hay hoy en `global_env`, en un entorno raíz propio.
     fn prelude_snapshot(&self, name: &str) -> Rc<RefCell<Environment>> {
         let base = Environment::root(name);
@@ -4279,7 +4284,7 @@ impl Interpreter {
         }
         if self.trusted_depth > 0 {
             return Err(err(format!(
-                "a trusted module imports only other trusted modules (`use \"trusted:…\"`), not '{}': a file module sees the program's names and would run with the tool's capabilities",
+                "a trusted module imports only other trusted modules (`use \"trusted:…\"`), not '{}': a file module is read from disk, where the program can write it, and it would run with the tool's capabilities",
                 raw_path
             )));
         }
@@ -4380,19 +4385,14 @@ impl Interpreter {
         let mut exports = SynMap::new();
         for export in names {
             if let Some(v) = env_get(&module_env, &export) {
-                let v = match v {
-                    SynValue::Task(t) => {
-                        // Consciente de etiquetas: los argumentos entran con la suya (la política
-                        // del dev decide qué publica) y el PC es el del llamador. El despacho
-                        // genérico los habría desetiquetado y corrido la task bajo su unión.
-                        let w = trusted_wrapper(name, &export, t, hook.clone());
-                        if let SynValue::Builtin(b) = &w {
-                            self.label_aware.insert(b.name.clone());
-                        }
-                        w
-                    }
-                    other => other,
-                };
+                // Consciente de etiquetas: los argumentos entran con la suya (la política del dev
+                // decide qué publica) y el PC es el del llamador. El despacho genérico los habría
+                // desetiquetado y corrido la task bajo su unión. Ronda 1 de v0.6.50 (B6): también
+                // una task que la tool expone dentro de un mapa o una lista (`export let M be
+                // {"f": helper}`): sin envolver corría con las capabilities del programa.
+                let mut aware = Vec::new();
+                let v = wrap_exposed_tasks(name, &export, v, &hook, &mut aware);
+                self.label_aware.extend(aware);
                 exports.insert(export, v);
             }
         }
@@ -5238,8 +5238,15 @@ impl Interpreter {
         let g = self.global_env.clone();
         self.snapshot_trusted_base();
         if program.has_file_use {
-            self.snapshot_module_base();
+            if self.executed {
+                // Ronda 1 (M1): un segundo `execute` (cada línea de la REPL, un embebedor) sin
+                // foto: los builtins. Una foto acá traería lo que ligaron los anteriores.
+                self.module_base();
+            } else {
+                self.snapshot_module_base();
+            }
         }
+        self.executed = true;
         self.control_taint = self.no_label.clone();
         self.loop_taint = self.no_label.clone();
         self.escaping_taint = self.no_label.clone();
@@ -5282,7 +5289,7 @@ impl Interpreter {
     /// cada test SIN abortar a los demás. Si el setup falla, devuelve un único outcome de
     /// error de setup. Las defs top-level quedan visibles dentro de cada test.
     pub fn run_test_blocks(&mut self, program: &Program) -> Vec<TestOutcome> {
-        self.run_test_blocks_with(program, &mut |_| None)
+        self.run_test_blocks_with(program, &mut |_, _| None)
     }
 
     /// Como `run_test_blocks`, con un hook `after_each(nombre)` que corre al terminar
@@ -5292,7 +5299,7 @@ impl Interpreter {
     pub fn run_test_blocks_with(
         &mut self,
         program: &Program,
-        after_each: &mut dyn FnMut(&str) -> Option<String>,
+        after_each: &mut dyn FnMut(&str, bool) -> Option<String>,
     ) -> Vec<TestOutcome> {
         let g = self.global_env.clone();
         self.snapshot_trusted_base();
@@ -5352,7 +5359,10 @@ impl Interpreter {
                 // Cada bloque `test` es su propia unidad — la tinta de continuación de uno
                 // No puede llegarle al siguiente (ni al setup).
                 let saved_taint = self.take_taint();
-                let mut outcome = match self.exec_block(body, &test_env) {
+                let result = self.exec_block(body, &test_env);
+                // Ronda 1 (M3): un bloque que llamó `exit` le pide al host que detenga sus agentes.
+                let exited = matches!(&result, Err(Control::Error(e)) if e.exit_code.is_some());
+                let mut outcome = match result {
                     Ok(_) => {
                         TestOutcome { name: name.clone(), passed: true, message: None, assertion: false }
                     }
@@ -5382,7 +5392,7 @@ impl Interpreter {
                 };
                 self.restore_taint(saved_taint);
                 // Agentes del test: se esperan y sus errores cuentan como fallo del test.
-                if let Some(msg) = after_each(name) {
+                if let Some(msg) = after_each(name, exited) {
                     outcome.passed = false;
                     outcome.message = Some(match outcome.message.take() {
                         Some(prev) => format!("{}; {}", prev, msg),
@@ -6295,10 +6305,17 @@ impl Interpreter {
                 // preámbulo. Ronda 2 (B2): con las dos formas, porque acá no se sabe todavía si
                 // el dato es privado.
                 let head = e.message.split(" — ").next().unwrap_or(&e.message);
+                // Ronda 1 de v0.6.50 (B4): el `require` va donde corre el código, como en
+                // `where_to_require` (en un agente, su cuerpo; en una tool, su task exportada).
+                let place = match (self.in_trusted_scope(), self.current_agent()) {
+                    (true, _) => "to the exported task of the trusted module that runs it".to_string(),
+                    (false, Some(a)) => format!("to the body of agent {} (the program's `require` does not reach it)", a),
+                    (false, None) => "to the program's preamble".to_string(),
+                };
                 return Err(err_at(
                     format!(
-                        "{} — a `decide` served by the judge (SYNSEMA_JUDGE_DECIDE) falls back to the model when the judge does not choose, so it needs `llm` as well as `judge`: add `require llm` to the program's preamble (with private data, `require llm(\"<principal>\")`), and the host's ceiling has to allow it too (`llm`, or `llm=<principal>@<provider host>` for private data), or unset the knob",
-                        head
+                        "{} — a `decide` served by the judge (SYNSEMA_JUDGE_DECIDE) falls back to the model when the judge does not choose, so it needs `llm` as well as `judge`: add `require llm` {} (with private data, `require llm(\"<principal>\")`), and the host's ceiling has to allow it too (`llm`, or `llm=<principal>@<provider host>` for private data), or unset the knob",
+                        head, place
                     ),
                     loc,
                 ));
@@ -11746,6 +11763,49 @@ fn secret_concat(left: &SynValue, right: &SynValue, loc: &SourceLocation) -> Res
 /// (lo que la task declaró ∩ el techo de confianza), la llama y sale, también por error. Los
 /// argumentos son datos: un callable adentro correría con las capabilities de la tool (el
 /// "confused deputy"), así que es error.
+/// v0.6.50 (ronda 1, B6): envuelve en el scope de la tool cada task que expone un export, también
+/// dentro de mapas y listas (`path` es `M.f`, `L[0]`). Un mapa o una lista sin tasks no se copia.
+/// `aware` junta los nombres de los envoltorios (son conscientes de etiquetas).
+fn wrap_exposed_tasks(module: &str, path: &str, v: SynValue, hook: &TrustedScopeHook, aware: &mut Vec<String>) -> SynValue {
+    fn has_task(v: &SynValue) -> bool {
+        match v {
+            SynValue::Task(_) => true,
+            SynValue::Map(m) => m.borrow().iter().any(|(_, x)| has_task(x)),
+            SynValue::List(l) => l.borrow().as_values().is_some_and(|v| v.iter().any(has_task)),
+            _ => false,
+        }
+    }
+    match v {
+        SynValue::Task(t) => {
+            let w = trusted_wrapper(module, path, t, hook.clone());
+            if let SynValue::Builtin(b) = &w {
+                aware.push(b.name.to_string());
+            }
+            w
+        }
+        SynValue::Map(m) if has_task(&SynValue::Map(m.clone())) => {
+            let mut out = SynMap::new();
+            for (k, x) in m.borrow().iter() {
+                let key = k.to_string();
+                let p = format!("{}.{}", path, key);
+                out.insert(key, wrap_exposed_tasks(module, &p, x.clone(), hook, aware));
+            }
+            SynValue::Map(out.into_ref())
+        }
+        SynValue::List(l) if has_task(&SynValue::List(l.clone())) => {
+            let items: Vec<SynValue> = l
+                .borrow()
+                .to_vec()
+                .into_iter()
+                .enumerate()
+                .map(|(i, x)| wrap_exposed_tasks(module, &format!("{}[{}]", path, i), x, hook, aware))
+                .collect();
+            syn_list(items)
+        }
+        other => other,
+    }
+}
+
 fn trusted_wrapper(module: &str, export: &str, task: Rc<SynTaskValue>, hook: TrustedScopeHook) -> SynValue {
     let label = format!("trusted:{}.{}", module, export);
     let tool = Rc::new(TrustedTool { module: module.to_string(), label: label.clone(), task, hook });

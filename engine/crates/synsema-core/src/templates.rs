@@ -727,8 +727,36 @@ fn open_template(interp: &Interpreter, path: &str, gated: bool) -> Result<(Strin
     Ok((filename, tree))
 }
 
+/// v0.6.50 (D): los templates que el host le da a una tool desde un directorio (`--trusted-templates
+/// t=dir`, en `synsema run` y en el CLI wasip1): los archivos regulares del árbol, ordenados, con su
+/// nombre relativo con `/`. Un symlink no se sigue: lo que la tool renderiza es lo que está en su
+/// directorio.
+pub fn read_template_dir(dir: &std::path::Path) -> Result<Vec<(String, String)>, String> {
+    fn walk(dir: &std::path::Path, prefix: &str, out: &mut Vec<(String, String)>) -> Result<(), String> {
+        let mut entries: Vec<_> = std::fs::read_dir(dir).map_err(|e| e.to_string())?.collect::<Result<_, _>>().map_err(|e| e.to_string())?;
+        entries.sort_by_key(|e| e.file_name());
+        for e in entries {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let rel = if prefix.is_empty() { name } else { format!("{}/{}", prefix, name) };
+            let meta = std::fs::symlink_metadata(e.path()).map_err(|e| e.to_string())?;
+            if meta.is_dir() {
+                walk(&e.path(), &rel, out)?;
+            } else if meta.is_file() {
+                let text = std::fs::read_to_string(e.path()).map_err(|err| format!("{}: {}", rel, err))?;
+                out.push((rel, text));
+            }
+        }
+        Ok(())
+    }
+    let mut out = Vec::new();
+    walk(dir, "", &mut out)?;
+    Ok(out)
+}
+
 /// v0.6.50 (D8): al cargar una tool, cada `render("literal")` de su fuente tiene que estar entre los
-/// templates que le dio el host (y parsear). Corre antes de que llegue ningún dato.
+/// templates que le dio el host. Corre antes de que llegue ningún dato. No los parsea (cada tool en
+/// cada intérprete pagaría el parseo de todos): un template con un error de sintaxis falla en su
+/// primer `render`, con su texto.
 pub fn check_tool_renders(program: &crate::ast::Program, module: &str, set: Option<&ToolTemplates>) -> Result<(), String> {
     use crate::ast::NodeKind as NK;
     let mut first_err: Option<String> = None;
@@ -769,7 +797,8 @@ struct Slots<'a> {
 /// un builtin desenvuelve. Antes `{upper(c.nombre)}` escribía el marcador `private(…)` (el
 /// resultado de `upper` lleva la etiqueta del PC del render) y `{c.nombre}` el valor.
 fn emit(interp: &mut Interpreter, value: &SynValue, escape: bool, out: &mut String) {
-    let l = crate::labels::label_deep(value);
+    // Ronda 1 (N4): sin etiquetas no hay valores etiquetados; no recorrer el valor dos veces.
+    let l = if interp.labels_enabled() { crate::labels::label_deep(value) } else { crate::labels::empty() };
     let s = if l.is_empty() {
         value.to_string()
     } else {
@@ -831,6 +860,14 @@ fn render_nodes(
             }
             TNode::When { cond, then, els } => {
                 let c = interp.eval(cond, env)?;
+                // Ronda 1 (M2): la condición decide qué texto sale, así que su etiqueta va al HTML
+                // también cuando no viene en los datos (un global privado).
+                if interp.labels_enabled() {
+                    let l = crate::labels::label_deep(&c);
+                    if !l.is_empty() {
+                        interp.note_seen(&l);
+                    }
+                }
                 let branch = if c.is_truthy() { then } else { els };
                 render_nodes(branch, interp, env, out, filename, slots, depth)?;
             }

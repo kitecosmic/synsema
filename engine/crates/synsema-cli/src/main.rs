@@ -178,11 +178,13 @@ impl HostFlags {
                 eprintln!("synsema {}: --trusted-templates {}: the name is given twice", cmd, name);
                 return Err(ExitCode::from(2));
             }
-            let mut files = Vec::new();
-            if let Err(e) = read_template_dir(std::path::Path::new(dir), "", &mut files) {
-                eprintln!("synsema {}: --trusted-templates {}: cannot read {}: {}", cmd, name, dir, e);
-                return Err(ExitCode::from(2));
-            }
+            let files = match synsema_core::templates::read_template_dir(std::path::Path::new(dir)) {
+                Ok(f) => f,
+                Err(e) => {
+                    eprintln!("synsema {}: --trusted-templates {}: cannot read {}: {}", cmd, name, dir, e);
+                    return Err(ExitCode::from(2));
+                }
+            };
             templates.push((name.clone(), files));
         }
         let ceiling = match self.trusted_cap_set.as_deref() {
@@ -216,25 +218,6 @@ impl HostFlags {
         }
         Ok(())
     }
-}
-
-/// v0.6.50 (D): los archivos regulares de `dir` (recursivo), con su nombre relativo con `/`. Un
-/// symlink no se sigue: lo que la tool renderiza es lo que está en su directorio.
-fn read_template_dir(dir: &std::path::Path, prefix: &str, out: &mut Vec<(String, String)>) -> Result<(), String> {
-    let mut entries: Vec<_> = std::fs::read_dir(dir).map_err(|e| e.to_string())?.collect::<Result<_, _>>().map_err(|e| e.to_string())?;
-    entries.sort_by_key(|e| e.file_name());
-    for e in entries {
-        let name = e.file_name().to_string_lossy().into_owned();
-        let rel = if prefix.is_empty() { name } else { format!("{}/{}", prefix, name) };
-        let meta = std::fs::symlink_metadata(e.path()).map_err(|e| e.to_string())?;
-        if meta.is_dir() {
-            read_template_dir(&e.path(), &rel, out)?;
-        } else if meta.is_file() {
-            let text = std::fs::read_to_string(e.path()).map_err(|err| format!("{}: {}", rel, err))?;
-            out.push((rel, text));
-        }
-    }
-    Ok(())
 }
 
 /// Separa los flags del host de `args` (los que siguen al subcomando). Un valor de flag
@@ -1872,6 +1855,15 @@ fn cmd_run(args: &[String]) -> ExitCode {
         let run = run_with_diagnostics_ceiled(&source, &filename, ceiling);
         for line in &run.result.output {
             println!("{}", line);
+        }
+        // Ronda 1 (N7): `exit(code)` sale con su código, como `run` (antes, 1).
+        if run.result.exit_code.is_some() {
+            for e in run.result.errors.iter().filter(|e| e.starts_with("Agent error [")) {
+                eprintln!("{}", e);
+            }
+            let code = run_exit_code(&run.result);
+            audit::summary(code as i32);
+            return ExitCode::from(code);
         }
         if !run.result.success {
             if let Some(diag) = run.diagnostics.first() {

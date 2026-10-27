@@ -1065,6 +1065,9 @@ pub struct CapabilitySet {
     /// v0.6.50 (E-b): el agente que corre con este set: un `require` que falta va en su cuerpo,
     /// no en el preámbulo del programa (que no le llega). Lo heredan sus hijos.
     pub agent: Option<String>,
+    /// v0.6.50 (ronda 1, B4): cuántos bloques `sandbox` hay abiertos sobre este set (el hook los
+    /// vacía y restaura): adentro, lo que falta no se arregla con un `require`.
+    pub sandbox_depth: u32,
 }
 
 impl CapabilitySet {
@@ -1079,6 +1082,7 @@ impl CapabilitySet {
             ceiling: None,
             delegated: Vec::new(),
             agent: None,
+            sandbox_depth: 0,
         }
     }
 
@@ -1653,6 +1657,14 @@ impl CapabilitySet {
                     c,
                     Self::require_line(requested)
                 )
+            } else if cause == DenyCause::NoGrant && self.sandbox_depth > 0 && !self.name.starts_with("trusted:") {
+                // v0.6.50 (ronda 1, B4): un `sandbox` deniega todo; un `require` (que puede estar
+                // ya) no lo arregla.
+                format!(
+                    "Capability not granted: {} — a `sandbox` block denies every capability, whatever the program declares: to allow it inside the block use `sandbox under {{\"{}\": …}}` (what the program already has, within those caps), or run this outside the block",
+                    requested,
+                    requested.ty.wire_name()
+                )
             } else {
                 Self::denial_message(requested, &cause)
             };
@@ -1694,6 +1706,7 @@ impl CapabilitySet {
             ceiling: parent.borrow().ceiling.clone(),
             delegated: parent.borrow().delegated.clone(),
             agent: parent.borrow().agent.clone(),
+            sandbox_depth: 0,
         }
     }
 
@@ -2402,6 +2415,14 @@ pub fn ceiling_warnings(caps: &[Capability], flag: &str) -> Vec<String> {
         .filter(|c| matches!(c.ty, CapabilityType::Llm | CapabilityType::Judge))
         .filter_map(|c| {
             let p = c.scope.as_deref().filter(|s| !s.contains('@'))?;
+            // Ronda 1 (N1): otro ítem del techo que nombra el provider para ese principal ya lo cubre.
+            let named = caps.iter().any(|a| {
+                a.ty == c.ty
+                    && a.scope.as_deref().and_then(|s| s.rsplit_once('@')).is_some_and(|(ap, _)| ap == p || fnmatch(p, ap))
+            });
+            if named {
+                return None;
+            }
             let ty = c.ty.name_lower();
             Some(format!(
                 "warning: {flag} {ty}={p}: the program may declare `require {ty}(\"{p}\")`, but data private to {p} goes to no model until the item names the provider: {ty}={p}@<provider host> (`@local` for a model in the process, `{p}@*` for any)"

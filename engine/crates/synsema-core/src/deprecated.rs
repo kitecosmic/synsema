@@ -360,8 +360,9 @@ pub fn warn_once_at_load(program: &Program, file_path: &str) {
 
 /// v0.6.50 (E-c): en una tool de confianza, los `require` de las tasks que el módulo no exporta
 /// (`(task, capability, línea)`). No conceden nada: el scope lo abre la task exportada que el
-/// programa llama, con lo que ésa declara. Una task exportada con `export let h be helper` cuenta
-/// como exportada (`h` es `helper`).
+/// programa llama, con lo que ésa declara. Una task nombrada en el valor de un `export let`
+/// (`export let h be helper`, `export let M be {"f": helper}`) cuenta como exportada: la tool la
+/// envuelve en su scope.
 pub fn trusted_unexported_requires(program: &Program) -> Vec<(String, String, usize)> {
     let mut exported = HashSet::new();
     for st in &program.statements {
@@ -370,10 +371,14 @@ pub fn trusted_unexported_requires(program: &Program) -> Vec<(String, String, us
                 NodeKind::TaskDefinition { name, .. } => {
                     exported.insert(name.clone());
                 }
+                // `export let h be helper`, y desde la ronda 1 (B6) también una task nombrada dentro
+                // del valor (`export let M be {"f": helper}`): la tool la envuelve en su scope.
                 NodeKind::LetBinding { value, .. } => {
-                    if let NodeKind::Identifier { name } = &value.kind {
-                        exported.insert(name.to_string());
-                    }
+                    crate::ast_api::walk(value, &mut |n| {
+                        if let NodeKind::Identifier { name } = &n.kind {
+                            exported.insert(name.to_string());
+                        }
+                    });
                 }
                 _ => {}
             }

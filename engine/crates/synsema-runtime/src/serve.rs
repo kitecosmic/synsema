@@ -684,6 +684,9 @@ pub(crate) enum GlobalVal {
         parameters: Vec<Param>,
         body: std::sync::Arc<[Node]>,
         required_capabilities: Vec<(String, Option<String>)>,
+        /// v0.6.50 (ronda 1, A1): de qué raíz léxica cuelga la task. Del otro lado cierra ahí, no
+        /// donde está guardada: una lambda del programa que un módulo guarda sigue viendo el programa.
+        root: TaskRoot,
     },
     /// v0.6.50 (B): una task exportada por una tool de confianza (el builtin que la envuelve). Viaja
     /// la task y el entorno de la tool (por id, una vez por foto, como un `Module`); del otro lado
@@ -824,6 +827,35 @@ fn snapshot_alias_entries(
         .collect()
 }
 
+/// v0.6.50 (ronda 1, A1): la raíz léxica de una task (ver `GlobalVal::Task`).
+#[derive(Clone, Debug)]
+pub enum TaskRoot {
+    /// Cuelga del global del programa (una task o lambda del programa).
+    Global,
+    /// Cuelga del env de un módulo (`module:<id>`).
+    Module(String),
+    /// Otra raíz (un fork, un template): cierra donde se reconstruye, como antes.
+    Here,
+}
+
+/// Sube por los padres del env de una task hasta un módulo o la raíz.
+fn task_root(env: &Rc<RefCell<Environment>>) -> TaskRoot {
+    let mut cur = env.clone();
+    loop {
+        let parent = {
+            let e = cur.borrow();
+            if e.name.starts_with("module:") {
+                return TaskRoot::Module(e.name.to_string());
+            }
+            match &e.parent {
+                Some(p) => p.clone(),
+                None => return if &*e.name == "global" { TaskRoot::Global } else { TaskRoot::Here },
+            }
+        };
+        cur = parent;
+    }
+}
+
 /// Núcleo recursivo de `val_to_global_shared`/`snapshot_globals_*`/`snapshot_module_env`.
 fn val_to_global_inner(v: &SynValue, state: &mut SnapState) -> GlobalVal {
     match v {
@@ -832,6 +864,7 @@ fn val_to_global_inner(v: &SynValue, state: &mut SnapState) -> GlobalVal {
             parameters: t.parameters.clone(),
             body: t.body.clone(),
             required_capabilities: t.required_capabilities.clone(),
+            root: task_root(&t.closure_env),
         },
         // Un generador dentro de un global (`{"g": rng(1)}`) tampoco se copia en silencio.
         SynValue::Builtin(b) if synsema_core::rng::snapshot(b).is_some() => GlobalVal::SharedRng(b.name.clone()),
@@ -972,6 +1005,8 @@ pub(crate) type ModuleRegistry = HashMap<String, Rc<RefCell<Environment>>>;
 /// que el intérprete tiene que anotar al terminar (las tasks envueltas, las vistas) se junta acá y
 /// lo aplica `finish`.
 pub(crate) struct Bases {
+    /// El global del intérprete: donde cierra una task de raíz `Global` (ronda 1, A1).
+    global: Rc<RefCell<Environment>>,
     module: Rc<RefCell<Environment>>,
     trusted: Option<Rc<RefCell<Environment>>>,
     hook: Option<synsema_core::interpreter::TrustedScopeHook>,
@@ -984,6 +1019,7 @@ impl Bases {
     pub(crate) fn of(interp: &mut Interpreter) -> Bases {
         interp.snapshot_module_base();
         Bases {
+            global: interp.global_env.clone(),
             module: interp.module_base(),
             trusted: interp.trusted_base_for_rebuild(),
             hook: interp.trusted_scope_hook(),
@@ -1060,12 +1096,20 @@ pub(crate) fn rebuild_global_val(
         GlobalVal::Value(sv) => from_send(sv),
         GlobalVal::Frozen(f) => f.get(),
         GlobalVal::Scoped(i) => scope.expect("un valor con alcance se reconstruye dentro de su alcance").get(*i),
-        GlobalVal::Task { name, parameters, body, required_capabilities } => {
+        GlobalVal::Task { name, parameters, body, required_capabilities, root } => {
+            // Ronda 1 (A1): cierra en su raíz, no donde está guardada. El módulo de una raíz
+            // `Module` ya está en el registro cuando la task vive en él (se registra antes de
+            // poblarlo); si no, donde se reconstruye, como antes.
+            let closure_env = match root {
+                TaskRoot::Global => base.global.clone(),
+                TaskRoot::Module(id) => registry.get(id).cloned().unwrap_or_else(|| closure_target.clone()),
+                TaskRoot::Here => closure_target.clone(),
+            };
             SynValue::Task(Rc::new(SynTaskValue {
                 name: name.clone(),
                 parameters: parameters.clone(),
                 body: body.clone(),
-                closure_env: closure_target.clone(),
+                closure_env,
                 origin: None,
                 required_capabilities: required_capabilities.clone(),
                 code: Default::default(),
@@ -1179,8 +1223,8 @@ pub(crate) fn rebuild_global_val(
             SynValue::Map(map)
         }
         GlobalVal::MapWithTasks(entries) => {
-            // Map de datos con callbacks: las tasks cierran donde estaba el map (el global para uno
-            // de nivel superior; el `module_env` para uno de un módulo, que no ve el global).
+            // Map de datos con callbacks: cada task cierra en su raíz (ronda 1, A1: una lambda del
+            // programa guardada en un módulo sigue viendo el programa; una del módulo, el módulo).
             let mut m = SynMap::new();
             for (k, gv) in entries {
                 m.insert(k.clone(), rebuild_global_val(gv, closure_target, base, registry, scope));

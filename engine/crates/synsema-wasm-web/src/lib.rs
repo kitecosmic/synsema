@@ -653,10 +653,18 @@ fn opts_from(req: &Map<String, Value>) -> Result<RunOptions, String> {
                 match templates {
                     None | Some(Value::Null) => {}
                     Some(Value::Object(t)) => {
-                        let files = t
-                            .iter()
-                            .map(|(n, text)| text.as_str().map(|s| (n.clone(), s.to_string())).ok_or_else(|| format!("trusted.{}.templates.{}: expected the template as text", k, n)))
-                            .collect::<Result<_, _>>()?;
+                        // Ronda 1 (N5): el nombre normalizado, como lo busca `render` (y como lee el CLI
+                        // un directorio): el conjunto y el sha del recibo usan la misma clave.
+                        let mut files: Vec<(String, String)> = Vec::new();
+                        for (n, text) in t {
+                            let text = text.as_str().ok_or_else(|| format!("trusted.{}.templates.{}: expected the template as text", k, n))?;
+                            let name = synsema_core::bundle::normalize_name(n)
+                                .ok_or_else(|| format!("trusted.{}.templates.{}: a template name is a relative path inside the set", k, n))?;
+                            if files.iter().any(|(f, _)| *f == name) {
+                                return Err(format!("trusted.{}.templates: '{}' and another name are the same template ({})", k, n, name));
+                            }
+                            files.push((name, text.to_string()));
+                        }
                         trusted_templates.push((k.clone(), files));
                     }
                     Some(_) => return Err(format!("trusted.{}.templates must be an object {{name: text}}", k)),
@@ -1063,6 +1071,24 @@ print(s)";
         let req = json!({"op":"run","source":src,"trusted":{"h":{"source":tool,"templates":{"s.html":1}}}});
         let v: Value = serde_json::from_str(&call_json(&req.to_string())).unwrap();
         assert!(v.to_string().contains("trusted.h.templates.s.html: expected the template as text"), "{}", v);
+    }
+
+    /// Ronda 1 (N5): el nombre de un template se normaliza como lo busca `render`: `./s.html` es
+    /// `s.html`; dos nombres que normalizan igual, o uno que sale del conjunto, son error.
+    #[test]
+    fn abi_trusted_template_names_are_normalized() {
+        let tool = "export task saludo(n)\n    give text(render(\"s.html\", {\"n\": n}))\n";
+        let src = "use \"trusted:h\" as h\nprint(h.saludo(\"ana\"))\n";
+        let run = |templates: Value| -> Value {
+            let req = json!({"op":"run","source":src,"filename":"t.syn","trusted":{"h":{"source":tool,"templates":templates}}});
+            serde_json::from_str(&call_json(&req.to_string())).unwrap()
+        };
+        let v = run(json!({"./s.html": "<p>{upper(n)}</p>"}));
+        assert!(v["ok"] == json!(true) && v["output"][0].as_str().unwrap_or("").contains("body: <p>ANA</p>"), "{}", v);
+        let v = run(json!({"s.html": "<p>a</p>", "./s.html": "<p>b</p>"}));
+        assert!(v.to_string().contains("are the same template (s.html)"), "{}", v);
+        let v = run(json!({"../s.html": "<p>a</p>"}));
+        assert!(v.to_string().contains("trusted.h.templates.../s.html: a template name is a relative path inside the set"), "{}", v);
     }
 
     #[test]

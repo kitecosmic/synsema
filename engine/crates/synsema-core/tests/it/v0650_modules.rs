@@ -77,3 +77,16 @@ fn the_base_without_a_snapshot_has_the_builtins_and_the_constants() {
     assert!(matches!(get("upper"), None), "un builtin que el programa religó no es un builtin");
     assert!(get("PROG").is_none());
 }
+
+/// Ronda 1 (M1): un embebedor que llama `execute` dos veces: el módulo del segundo no ve lo que ligó
+/// el primero (sin foto en el segundo, los builtins).
+#[test]
+fn a_second_execute_does_not_lend_the_first_one_names() {
+    let d = dir("two", "export task cobrar(n)\n    give n * TASA\n");
+    let main = d.join("main.syn").to_string_lossy().into_owned();
+    let mut interp = Interpreter::new();
+    assert!(interp.execute(&parse_source("let TASA be 2\n", &main).unwrap()).is_ok());
+    let r = interp.execute(&parse_source("use \"./lib.syn\" as lib\nprint(lib.cobrar(10))\n", &main).unwrap());
+    let Err(Control::Error(e)) = r else { panic!("TASA no es del módulo: {:?}", interp.output) };
+    assert!(e.to_string().contains("Undefined variable: 'TASA'"), "{}", e);
+}

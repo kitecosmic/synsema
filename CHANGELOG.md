@@ -18,8 +18,9 @@ Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the rele
   `tau`, `e`, `inf`, `nan`, and whatever the host registered before the program's first
   statement), like modules in Rust, OCaml, Go or Python (a module sees its globals and `builtins`,
   never `__main__`'s). Trusted modules already worked this way (v0.6.46). The same rule holds under
-  `serve`, `parallel_map`, agents and `synsema test`. A value the program passes in (an argument, a
-  callback, a lambda) keeps its own scope, as before.
+  `serve`, `parallel_map`, agents, `synsema test` and the REPL. A value the program passes in (an
+  argument, a callback, a lambda) keeps its own scope, as before, also when the module keeps it and
+  calls it later from a request, a worker or an agent.
   **Breaking:** a module that read a global of its importer now fails with `Undefined variable:
   'TASA' — 'TASA' is a name of the program that imports this module, and a module sees only its own
   names and the builtins: pass it as an argument or define it in the module`. Write `lib.cobrar(n,
@@ -29,15 +30,17 @@ Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the rele
 
 **New.**
 - **`--trusted` runs under `synsema serve`.** Each worker gets the same trusted tool the program
-  loaded: its tasks, its siblings and its top-level state (one copy per worker, like a file module),
+  loaded: its tasks, its siblings and its top-level state (each request starts from the state the tool had
+  when the program loaded it, as with a file module),
   hung from the trusted base of that worker and wrapped in that worker's trusted scope (the task's
   `require` ∩ `--trusted-cap-set`). The tool's top level runs once, when the program loads it, not
   per request; a `use "trusted:t"` inside a route gets that same tool. Everything that holds under
   `run` holds here: the tool does not see the program's globals, `set t.X` fails, a task of the
   program passed as an argument fails (a trusted tool takes data, not code), and with `--labels` the
   argument keeps its label and the tool declassifies only what its task declares.
-- **A trusted tool renders the templates the host gives it.** `--trusted-templates t=./dir` (in
-  wasm, `trusted: { t: { source, templates: { "r.html": "…" } } }`) reads the tool's templates at
+- **A trusted tool renders the templates the host gives it.** `--trusted-templates t=./dir` (also
+  in the wasip1 CLI; in wasm, `trusted: { t: { source, templates: { "r.html": "…" } } }`, where a
+  name is normalized as `render` looks it up and two names for one template are an error) reads the tool's templates at
   startup, before the program runs. Inside the tool, `render`, `include` and `layout` resolve only
   against that set: never the working directory (which the program can write) nor the program's
   bundle, and without `file.read` (they are part of the tool, as a bundle is part of its program).
@@ -59,11 +62,16 @@ Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the rele
 - In a template, a private value is written as its value whether it comes straight from the data
   (`{c.name}`) or from a call (`{upper(c.name)}`), and the HTML carries its label. Before, the call
   wrote the marker `private(customers)` (its result carried the label of the render) and the plain
-  field wrote the value. A private value the template reads from elsewhere also labels the HTML.
-- With labels and a ceiling, an error whose text was redacted because it touched private data
+  field wrote the value. A private value the template reads from elsewhere (written, or deciding a
+  `{ when }`) also labels the HTML.
+- With labels, an error whose text was redacted because it touched private data
   (`Runtime error: private(customers)`) now tells the auditor why: the real text goes to the sealed
-  receipt's envelope, which only the auditor opens. The program still sees the same fixed text, and
-  the operator detail (a log) stays redacted, with its location.
+  receipt's envelope, which only the auditor opens, with or without a ceiling. With a ceiling the
+  program still sees the same fixed text, and the operator detail (a log) stays redacted, with its
+  location.
+- **A task of a trusted tool that an export holds inside a map or a list** (`export let M be {"f":
+  helper}`, then `t.M["f"]()`) now runs in the tool's scope, with its `require` ∩
+  `--trusted-cap-set`, like an exported task. Before, it ran with the program's capabilities.
 - **Embedding (Rust API, breaking):** what describes a run travels with it. `RunResult` has
   `exit_code` (the code of `exit(code)`, if the program called it), `steps` and `touched_private`;
   `engine::last_run_exit_code()`, `last_run_steps()` and `last_run_touched_private()` are gone. They
@@ -72,21 +80,29 @@ Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the rele
 - A receipt's `program_sha` describes the program of the process. A process that ran two different
   programs (an embedder, a test binary) has none, and the receipt carries `null`; before, the receipt
   of the second program carried the sha of the first. With one program per process (`synsema run`,
-  `test`, `serve`) nothing changes, and under `serve --attested` the attested identity still decides.
+  `serve`) nothing changes, and under `serve --attested` the attested identity still decides;
+  `synsema test` on several files runs several programs, and only the first carries its sha.
 - A run waits for every agent, also the ones an agent spawns. Before, if `Pub` spawned `Sub` and
   finished first, the run ended without `Sub`: its output was lost and its label cut could miss the
   run (which then exited 0). The same under `synsema test`, `--explain` and `conform --swarm`. On
-  `exit`, an agent spawned while the others are being stopped is stopped too.
+  `exit`, an agent spawned while the others are being stopped is stopped too, and `exit` now stops
+  the live agents under `--explain`, `synsema test` and `conform --swarm` as well (before, they hung
+  waiting for an agent that never ends). `run --explain` exits with the code of `exit`, like `run`
+  (it exited 1).
 - A missing `require` inside an agent now says to add it to the body of that agent (the program's
   `require` does not reach an agent); before, it pointed to the program's preamble. In a
-  `parallel_map` worker, which inherits from whoever launched it, the text names both places.
+  `parallel_map` worker, which inherits from whoever launched it, the text names both places. A
+  `decide` served by the judge inside an agent names the agent's body too. Inside a `sandbox` block
+  the text says that the block denies every capability and to use `sandbox under {…}`; before, it
+  asked for a `require` that was already there.
 - Two startup warnings for lines that do nothing:
-  - `--cap-set llm=P` (or `judge=P`, also in `--trusted-cap-set`) without `@`: the program may
+  - `--cap-set llm=P` (or `judge=P`, also in `--trusted-cap-set`) without `@`, when no other item
+    names a provider for P: the program may
     declare `require llm("P")`, but P's data goes to no model until the item names the provider
     (`llm=P@<provider host>`, `P@*` for any). Before, it showed only at the first call.
   - In a trusted tool, a `require` in a task the module does not export grants nothing (the exported
     task the program calls opens the scope with what it declares). The tool now warns when it loads,
-    once per line.
+    once per line. A task the module exposes inside an exported map or list counts as exported.
 
 ## v0.6.49 — 2026-10-26
 

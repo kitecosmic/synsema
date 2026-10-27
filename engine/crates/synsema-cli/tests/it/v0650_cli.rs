@@ -8,6 +8,31 @@ use std::time::{Duration, Instant};
 
 const HINT: &str = "is a name of the program that imports this module";
 
+/// `synsema <args>` con un plazo: un binario que queda colgado (un agente que nadie detiene) se mata
+/// por su handle y da `None`, en vez de colgar el test.
+fn synsema_within(dir: &PathBuf, args: &[&str], secs: u64) -> Option<(i32, String, String)> {
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_synsema"))
+        .args(args)
+        .current_dir(dir)
+        .env("SYNSEMA_NO_UPDATE_CHECK", "1")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn synsema");
+    let t0 = Instant::now();
+    while child.try_wait().unwrap().is_none() {
+        if t0.elapsed() > Duration::from_secs(secs) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let o = child.wait_with_output().unwrap();
+    Some((o.status.code().unwrap_or(-1), String::from_utf8_lossy(&o.stdout).into_owned(), String::from_utf8_lossy(&o.stderr).into_owned()))
+}
+
 /// `lib.syn` y `main.syn` en un proyecto nuevo; corre `synsema <cmd> main.syn`.
 fn modules(tag: &str, lib: &str, main: &str, cmd: &str) -> (i32, String, String) {
     let dir = project(tag);
@@ -653,7 +678,159 @@ fn exit_stops_the_agents_an_agent_spawned() {
         "require time\nagent Pub\n    require time\n    agent Sub\n        require time\n        while true\n            sleep(0.05)\n    spawn Sub\n    while true\n        sleep(0.05)\nspawn Pub\nsleep(0.3)\nexit(3)\n",
     )
     .unwrap();
-    let t0 = Instant::now();
-    let (code, _, err) = synsema(&dir, &["run", "p.syn"], None);
-    assert!(code == 3 && t0.elapsed() < Duration::from_secs(20), "{} {:?}", err, t0.elapsed());
+    let (code, _, err) = synsema_within(&dir, &["run", "p.syn"], 20).expect("la corrida quedó colgada");
+    assert!(code == 3, "{}", err);
+}
+
+// =========================================================
+// Ronda 1 de la auditoría (`specs/auditoria-v0.6.50-ronda1.md`)
+// =========================================================
+
+/// A1 (fila 9b): una lambda del programa que un módulo guarda cierra sobre el programa también al
+/// cruzar a otro intérprete: un request de `serve`, un worker de `parallel_map` y un agente.
+#[test]
+fn a_program_lambda_kept_by_a_module_keeps_its_scope() {
+    let dir = project("r1-a1");
+    std::fs::write(dir.join("lib.syn"), "let CBS be {}\nexport task registrar(f)\n    set CBS to {\"f\": f}\n    give \"ok\"\nexport task llamar(x)\n    give CBS[\"f\"](x)\n").unwrap();
+    let head = "let PRE be \"hola\"\nuse \"./lib.syn\" as lib\nprint(lib.registrar((x) => PRE + x))\n";
+    std::fs::write(dir.join("r.syn"), format!("{head}print(lib.llamar(\"-run\"))\nprint(parallel_map((x) => lib.llamar(x), [\"-pm\"]))\n")).unwrap();
+    let (code, out, err) = synsema(&dir, &["run", "r.syn"], None);
+    assert!(code == 0 && out.contains("hola-run") && out.contains("[\"hola-pm\"]"), "{} {}", out, err);
+    std::fs::write(dir.join("ag.syn"), format!("{head}agent A\n    print(lib.llamar(\"-agente\"))\nspawn A\n")).unwrap();
+    let (code, out, err) = synsema(&dir, &["run", "ag.syn"], None);
+    assert!(code == 0 && out.contains("hola-agente"), "{} {}", out, err);
+    let main = format!("require serve({{p}})\n{head}serve on {{p}}\n    route \"GET /ping\"\n        give \"ok\"\n    route \"GET /c\"\n        give lib.llamar(\"-serve\")\n");
+    for r in serve_get(&dir, &main, &["/c", "/c"]) {
+        assert!(r.starts_with("HTTP/1.1 200") && r.contains("hola-serve"), "{}", r);
+    }
+}
+
+/// M1: en la REPL, un módulo tampoco ve los nombres que ligaron las líneas anteriores, y un builtin
+/// que una línea religó es el builtin para el módulo.
+#[test]
+fn the_repl_module_does_not_see_earlier_lines() {
+    let dir = project("r1-m1");
+    std::fs::write(dir.join("lib.syn"), "export task cobrar(n)\n    give n * TASA\nexport task up(s)\n    give upper(s)\n").unwrap();
+    let (_, out, err) = synsema(&dir, &["repl"], Some("let TASA be 2\nuse \"./lib.syn\" as lib\nprint(lib.cobrar(10))\n"));
+    let all = format!("{}{}", out, err);
+    assert!(all.contains("Undefined variable: 'TASA'") && all.contains(HINT) && !all.contains("20"), "{}", all);
+    let (_, out, err) = synsema(&dir, &["repl"], Some("let upper be 3\nuse \"./lib.syn\" as lib\nprint(lib.up(\"a\"))\n"));
+    let all = format!("{}{}", out, err);
+    assert!(out.contains(">>> A") && !all.contains("error"), "{}", all);
+}
+
+/// M2: un `{ when }` que decide con un global privado deja su etiqueta en el HTML, aunque el valor no
+/// llegue por los datos.
+#[test]
+fn a_when_on_private_data_labels_the_html() {
+    let dir = project("r1-m2");
+    std::fs::write(dir.join("w.html"), "<p>{ when VIP }VIP{ otherwise }normal{ end }</p>").unwrap();
+    std::fs::write(
+        dir.join("p.syn"),
+        "require file.read(\"./**\")\nlet VIP be private(true, \"clientes\")\nlet h be render(\"w.html\", {\"x\": 1})\nprint(text(h))\n",
+    )
+    .unwrap();
+    let (code, out, err) = synsema(&dir, &["run", "--labels", "p.syn"], None);
+    assert!(code == 0 && out.trim().starts_with("private(clientes)"), "{} {}", out, err);
+    assert!(!out.contains("VIP") && !out.contains("normal"), "{}", out);
+}
+
+/// M3 y N7: con `exit` y un agente vivo, `run --explain` y `synsema test` no quedan colgados, y
+/// `--explain` sale con el código del `exit`, como `run`.
+#[test]
+fn exit_stops_the_agents_under_explain_and_test() {
+    let dir = project("r1-m3");
+    let agent = "agent Pub\n    require time\n    while true\n        sleep(0.05)\n";
+    std::fs::write(dir.join("p.syn"), format!("require time\n{agent}spawn Pub\nsleep(0.3)\nexit(3)\n")).unwrap();
+    std::fs::write(dir.join("t.syn"), format!("{agent}test \"x\"\n    spawn Pub\n    exit(3)\n")).unwrap();
+    let (code, _, err) = synsema_within(&dir, &["run", "--explain", "p.syn"], 20).expect("--explain quedó colgado");
+    assert!(code == 3, "{}", err);
+    assert!(!err.contains("Agent error"), "el detenido no es un error: {}", err);
+    let (code, out, err) = synsema_within(&dir, &["test", "t.syn"], 20).expect("synsema test quedó colgado");
+    assert!(code != 0, "{} {}", out, err);
+    assert!(!format!("{}{}", out, err).contains("Agent error"), "{} {}", out, err);
+}
+
+/// B3: sin techo y con `--auditor`, el sobre lleva el texto real de un error que el corte redacta
+/// (con techo ya lo llevaba).
+#[test]
+fn without_a_ceiling_the_auditor_gets_the_real_error() {
+    let dir = project("r1-b3");
+    std::fs::write(dir.join("app.syn"), "let s be private(5, \"clientes\")\nwhen s == 5\n    let x be 1 / 0\nprint(\"fin\")\n").unwrap();
+    let (sk, pk) = super::v0646_tanda_e_cli::auditor_keys();
+    for cap in [&[][..], &["--cap-set", "stdout"][..]] {
+        let _ = std::fs::remove_file(dir.join("r.json"));
+        let args = [&["run", "--labels"][..], cap, &["--auditor", &pk, "--receipt", "r.json", "app.syn"]].concat();
+        let (code, _, _) = synsema(&dir, &args, None);
+        assert!(code != 0, "{:?}", cap);
+        let r: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.join("r.json")).unwrap()).unwrap();
+        let opened = super::v0646_tanda_e_cli::open_receipt(&r, &sk);
+        assert!(opened.to_string().contains("app.syn:3:16: Division by zero"), "{:?}: {}", cap, opened);
+    }
+}
+
+/// B4: un `sandbox` sin `under` dice que el bloque no concede nada (no «add require» con el
+/// `require` ya puesto), en el programa y en un agente; un `decide` del juez en un agente pide el
+/// `require llm` en el cuerpo del agente.
+#[test]
+fn a_sandbox_and_a_judge_decide_say_where_the_capability_goes() {
+    let dir = project("r1-b4");
+    std::fs::write(dir.join("d.txt"), "hola").unwrap();
+    let sb = "a `sandbox` block denies every capability, whatever the program declares: to allow it inside the block use `sandbox under {\"file.read\": …}`";
+    for src in [
+        "require file.read(\"./**\")\nprint(read_file(\"./d.txt\"))\nsandbox\n    print(read_file(\"./d.txt\"))\n",
+        "agent A\n    require file.read(\"./**\")\n    print(read_file(\"./d.txt\"))\n    sandbox\n        print(read_file(\"./d.txt\"))\nspawn A\n",
+    ] {
+        std::fs::write(dir.join("p.syn"), src).unwrap();
+        let (code, out, err) = synsema(&dir, &["run", "p.syn"], None);
+        assert!(code != 0 && out.contains("hola") && err.contains(sb), "{}: {}", src, err);
+        assert!(!err.contains("add `require"), "{}: {}", src, err);
+    }
+    // La forma que sugiere el texto anda.
+    std::fs::write(dir.join("p.syn"), "require file.read(\"./**\")\nsandbox under {\"file.read\": [\"./**\"]}\n    print(read_file(\"./d.txt\"))\n").unwrap();
+    let (code, out, err) = synsema(&dir, &["run", "p.syn"], None);
+    assert!(code == 0 && out.contains("hola"), "{}", err);
+    let env = [("SYNSEMA_JUDGE_PROVIDER", "mock"), ("SYNSEMA_JUDGE_DECIDE", "1"), ("SYNSEMA_ENV_FILE", "")];
+    std::fs::write(dir.join("p.syn"), "agent A\n    require judge\n    print(decide between [\"alpha\", \"beta\"] given \"x\")\nspawn A\n").unwrap();
+    let (code, _, err) = super::v0646_tanda_e_cli::synsema_env(&dir, &["run", "--cap-set", "stdout,judge", "p.syn"], None, &env);
+    assert!(code != 0 && err.contains("falls back to the model") && err.contains("add `require llm` to the body of agent A"), "{}", err);
+    assert!(!err.contains("preamble"), "{}", err);
+}
+
+/// B6 (E-c): una task de la tool que un export expone dentro de un mapa o una lista corre en el scope
+/// de la tool, con su `require` y el techo de confianza, no con las capabilities del programa; y el
+/// aviso de E-c no sale, porque está exportada.
+#[test]
+fn a_tool_task_exported_inside_a_map_runs_in_the_tool_scope() {
+    let dir = project("r1-b6");
+    std::fs::write(dir.join("d.txt"), "secreto").unwrap();
+    std::fs::write(
+        dir.join("t.syn"),
+        "task helper()\n    require file.read(\"./**\")\n    give read_file(\"./d.txt\")\nexport let M be {\"f\": helper, \"n\": 1}\nexport let L be [helper]\n",
+    )
+    .unwrap();
+    let run = |main: &str, tcap: &str| {
+        std::fs::write(dir.join("p.syn"), main).unwrap();
+        synsema(&dir, &["run", "--trusted", "t=t.syn", "--trusted-cap-set", tcap, "p.syn"], None)
+    };
+    // El programa tiene `file.read`; la tool, no: el permiso del programa no le llega.
+    let (code, out, err) = run("require file.read(\"./**\")\nuse \"trusted:t\" as t\nprint(t.M[\"f\"]())\n", "stdout");
+    assert!(code != 0 && !out.contains("secreto") && err.contains("above the host ceiling"), "{} {}", out, err);
+    // La tool sí, el programa no: corre con lo de la tool.
+    for call in ["t.M[\"f\"]()", "t.L[0]()"] {
+        let (code, out, err) = run(&format!("use \"trusted:t\" as t\nprint({})\nprint(t.M[\"n\"])\n", call), "stdout,file.read=./**");
+        assert!(code == 0 && out.contains("secreto") && out.contains('1'), "{}: {} {}", call, out, err);
+        assert!(!err.contains("grants nothing"), "{}: {}", call, err);
+    }
+}
+
+/// N1: `llm=P` sin `@` no avisa si el mismo techo tiene `llm=P@host`.
+#[test]
+fn a_ceiling_llm_item_with_its_provider_elsewhere_does_not_warn() {
+    let dir = project("r1-n1");
+    std::fs::write(dir.join("p.syn"), "print(\"ok\")\n").unwrap();
+    let (code, _, err) = synsema(&dir, &["run", "--cap-set", "stdout,llm=clientes,llm=clientes@local", "p.syn"], None);
+    assert!(code == 0 && !err.contains("warning"), "{}", err);
+    let (_, _, err) = synsema(&dir, &["run", "--cap-set", "stdout,llm=clientes,llm=otros@local", "p.syn"], None);
+    assert!(err.contains("warning: --cap-set llm=clientes:"), "{}", err);
 }

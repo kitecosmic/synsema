@@ -55,3 +55,27 @@ fn e3b_wasip1_bin_takes_trusted_modules() {
     let (code, _, err) = bin(&d, &["--trusted-cap-set", "stdout", "a.syn"]);
     assert!(code == 2 && err.contains("pass --trusted"), "{}", err);
 }
+
+/// v0.6.50 (ronda 1, N6): `--trusted-templates name=dir`, como en `synsema run`: la tool renderiza los
+/// templates del host (no los del directorio de trabajo); sin su `--trusted`, o repetido, es error de uso.
+#[test]
+fn wasip1_bin_takes_trusted_templates() {
+    let d = std::env::temp_dir().join(format!("synsema-wasm-tpl-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    std::fs::create_dir_all(d.join("tpl/parts")).unwrap();
+    std::fs::write(d.join("tpl/s.html"), "<p>{upper(n)}</p>{ include \"parts/pie.html\" }").unwrap();
+    std::fs::write(d.join("tpl/parts/pie.html"), "<i>pie</i>").unwrap();
+    std::fs::write(d.join("s.html"), "<p>DEL-PROGRAMA</p>").unwrap();
+    std::fs::write(d.join("h.syn"), "export task saludo(n)\n    give text(render(\"s.html\", {\"n\": n}))\n").unwrap();
+    std::fs::write(d.join("p.syn"), "use \"trusted:h\" as h\nprint(h.saludo(\"ana\"))\n").unwrap();
+    let (code, out, err) = bin(&d, &["--trusted", "h=h.syn", "--trusted-templates", "h=tpl", "p.syn"]);
+    assert!(code == 0 && out.contains("<p>ANA</p><i>pie</i>") && !out.contains("DEL-PROGRAMA"), "{} {}", out, err);
+    let (code, _, err) = bin(&d, &["--trusted", "h=h.syn", "p.syn"]);
+    assert!(code != 0 && err.contains("the trusted tool 'h' has no templates ('s.html')"), "{}", err);
+    let (code, _, err) = bin(&d, &["--trusted", "h=h.syn", "--trusted-templates", "x=tpl", "p.syn"]);
+    assert!(code == 2 && err.contains("--trusted-templates x: there is no --trusted x="), "{}", err);
+    let (code, _, err) = bin(&d, &["--trusted", "h=h.syn", "--trusted-templates", "h=tpl", "--trusted-templates", "h=tpl", "p.syn"]);
+    assert!(code == 2 && err.contains("--trusted-templates h: the name is given twice"), "{}", err);
+    let (code, _, err) = bin(&d, &["--trusted", "h=h.syn", "--trusted-templates", "h", "p.syn"]);
+    assert!(code == 2 && err.contains("--trusted-templates takes name=dir"), "{}", err);
+}

@@ -788,10 +788,12 @@ pub fn wire_pure(interp: &mut Interpreter, caps: &Rc<RefCell<CapabilitySet>>, ct
             let d = std::mem::take(&mut cs.denied);
             let p = cs.parent.take();
             saved.borrow_mut().push((g, d, p));
+            cs.sandbox_depth += 1;
         } else if let Some((g, d, p)) = saved.borrow_mut().pop() {
             cs.granted = g;
             cs.denied = d;
             cs.parent = p;
+            cs.sandbox_depth -= 1;
         }
     }));
 
