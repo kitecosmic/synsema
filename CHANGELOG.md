@@ -36,6 +36,17 @@ Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the rele
   `run` holds here: the tool does not see the program's globals, `set t.X` fails, a task of the
   program passed as an argument fails (a trusted tool takes data, not code), and with `--labels` the
   argument keeps its label and the tool declassifies only what its task declares.
+- **A trusted tool renders the templates the host gives it.** `--trusted-templates t=./dir` (in
+  wasm, `trusted: { t: { source, templates: { "r.html": "…" } } }`) reads the tool's templates at
+  startup, before the program runs. Inside the tool, `render`, `include` and `layout` resolve only
+  against that set: never the working directory (which the program can write) nor the program's
+  bundle, and without `file.read` (they are part of the tool, as a bundle is part of its program).
+  A template's free names are the builtins, not the program's (`{upper(x)}` is the builtin even if
+  the program defines `task upper`). Symlinks in the directory are not followed. Without templates
+  from the host, `render` inside a tool is still an error, now naming the flag, and a
+  `render("literal")` in the tool's source fails when the tool loads, before any data reaches it.
+  The sealed receipt's `trusted` sha of a tool with templates covers its source and its templates,
+  so `--replay` notices a changed template; a tool without templates keeps the sha of its source.
 - Under `run`, `parallel_map(t.f, xs)` and an agent that calls `t.f` now carry the trusted tool.
   Before, `parallel_map` failed with `Cannot call value of type nothing` and the agent did not find
   it.
@@ -45,6 +56,14 @@ Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the rele
   `export let M be armar()`) crossed into each request as plain data: its lambdas lost the module and
   a call to a private helper of the module failed with `Undefined variable` (under `run` it worked).
   The module is now recognized as such, and its callbacks close over it.
+- In a template, a private value is written as its value whether it comes straight from the data
+  (`{c.name}`) or from a call (`{upper(c.name)}`), and the HTML carries its label. Before, the call
+  wrote the marker `private(customers)` (its result carried the label of the render) and the plain
+  field wrote the value. A private value the template reads from elsewhere also labels the HTML.
+- With labels and a ceiling, an error whose text was redacted because it touched private data
+  (`Runtime error: private(customers)`) now tells the auditor why: the real text goes to the sealed
+  receipt's envelope, which only the auditor opens. The program still sees the same fixed text, and
+  the operator detail (a log) stays redacted, with its location.
 - **Embedding (Rust API, breaking):** what describes a run travels with it. `RunResult` has
   `exit_code` (the code of `exit(code)`, if the program called it), `steps` and `touched_private`;
   `engine::last_run_exit_code()`, `last_run_steps()` and `last_run_touched_private()` are gone. They

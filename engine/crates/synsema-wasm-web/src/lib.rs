@@ -633,15 +633,38 @@ fn opts_from(req: &Map<String, Value>) -> Result<RunOptions, String> {
     };
     let max_steps = limit("max_steps")?;
     let max_memory_mb = limit("max_memory_mb")?;
-    // v0.6.46 (E3b): `"trusted": {"nombre": "fuente"}` y `"trusted_ceiling": "<cap-set>"`.
-    let trusted: Vec<(String, String)> = match req.get("trusted") {
-        None | Some(Value::Null) => Vec::new(),
-        Some(Value::Object(m)) => m
-            .iter()
-            .map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())).ok_or_else(|| format!("trusted.{}: expected the module source as text", k)))
-            .collect::<Result<_, _>>()?,
+    // v0.6.46 (E3b): `"trusted": {"nombre": "fuente"}` y `"trusted_ceiling": "<cap-set>"`. v0.6.50 (D):
+    // o `{"nombre": {"source": "…", "templates": {"r.html": "…"}}}`, los templates de la tool.
+    let mut trusted: Vec<(String, String)> = Vec::new();
+    let mut trusted_templates: Vec<(String, Vec<(String, String)>)> = Vec::new();
+    match req.get("trusted") {
+        None | Some(Value::Null) => {}
+        Some(Value::Object(m)) => {
+            for (k, v) in m {
+                let (source, templates) = match v {
+                    Value::String(s) => (s.clone(), None),
+                    Value::Object(o) => match o.get("source") {
+                        Some(Value::String(s)) => (s.clone(), o.get("templates")),
+                        _ => return Err(format!("trusted.{}.source: expected the module source as text", k)),
+                    },
+                    _ => return Err(format!("trusted.{}: expected the module source as text, or {{source, templates}}", k)),
+                };
+                trusted.push((k.clone(), source));
+                match templates {
+                    None | Some(Value::Null) => {}
+                    Some(Value::Object(t)) => {
+                        let files = t
+                            .iter()
+                            .map(|(n, text)| text.as_str().map(|s| (n.clone(), s.to_string())).ok_or_else(|| format!("trusted.{}.templates.{}: expected the template as text", k, n)))
+                            .collect::<Result<_, _>>()?;
+                        trusted_templates.push((k.clone(), files));
+                    }
+                    Some(_) => return Err(format!("trusted.{}.templates must be an object {{name: text}}", k)),
+                }
+            }
+        }
         Some(_) => return Err("trusted must be an object {name: source}".to_string()),
-    };
+    }
     let trusted_ceiling = match req.get("trusted_ceiling") {
         Some(Value::String(s)) => synsema_wasm::parse_ceiling(s).map_err(|e| format!("trusted_ceiling: {}", e))?,
         _ => None,
@@ -657,7 +680,7 @@ fn opts_from(req: &Map<String, Value>) -> Result<RunOptions, String> {
         None | Some(Value::Null) => None,
         Some(v) => Some(synsema_stdlib::sealed::sealed_bytes_from(Some(&v.to_string())).map_err(|e| e.replace("SYNSEMA_RECEIPT_SEALED_BYTES", "sealed_bytes"))?),
     };
-    Ok(RunOptions { filename, env, ceiling, no_fs: true, labels, result, input, sources, max_steps, max_memory_mb, trusted, trusted_ceiling, auditor, sealed_bytes, labels_detail_to_program: false })
+    Ok(RunOptions { filename, env, ceiling, no_fs: true, labels, result, input, sources, max_steps, max_memory_mb, trusted, trusted_templates, trusted_ceiling, auditor, sealed_bytes, labels_detail_to_program: false })
 }
 
 fn install_host(req: &Map<String, Value>) {
@@ -1024,6 +1047,24 @@ print(s)";
 
     /// v0.6.47 (T1): el sitio de un corte de etiquetas va en `operator_detail`, no en lo que ve el
     /// programa (`errors`, `log`, `output`, el cuerpo de la respuesta).
+    /// v0.6.50 (D13): `trusted: {h: {source, templates}}` le da a la tool sus templates; sin ellos, el
+    /// `render` literal de la tool es error al cargarla.
+    #[test]
+    fn abi_trusted_tool_renders_its_templates() {
+        let tool = "export task saludo(n)\n    give text(render(\"s.html\", {\"n\": n}))\n";
+        let src = "task upper(s)\n    give \"FUGA\"\nuse \"trusted:h\" as h\nprint(h.saludo(\"ana\"))\n";
+        let req = json!({"op":"run","source":src,"filename":"t.syn","trusted":{"h":{"source":tool,"templates":{"s.html":"<p>{upper(n)}</p>"}}}});
+        let v: Value = serde_json::from_str(&call_json(&req.to_string())).unwrap();
+        assert_eq!(v["ok"], json!(true), "{}", v);
+        assert!(v["output"][0].as_str().unwrap_or("").contains("body: <p>ANA</p>"), "{}", v);
+        let req = json!({"op":"run","source":src,"filename":"t.syn","trusted":{"h":tool}});
+        let v: Value = serde_json::from_str(&call_json(&req.to_string())).unwrap();
+        assert!(v["errors"][0].as_str().unwrap_or("").contains("the trusted tool 'h' has no templates ('s.html')"), "{}", v);
+        let req = json!({"op":"run","source":src,"trusted":{"h":{"source":tool,"templates":{"s.html":1}}}});
+        let v: Value = serde_json::from_str(&call_json(&req.to_string())).unwrap();
+        assert!(v.to_string().contains("trusted.h.templates.s.html: expected the template as text"), "{}", v);
+    }
+
     #[test]
     fn abi_label_cut_detail_goes_to_operator_detail() {
         let src = "let s be private(1, \"app\")\nwhen s == 1\n    print(\"x\")\n";

@@ -377,3 +377,158 @@ fn a_receipt_carries_the_sha_of_its_program() {
     let want = synsema_core::bytesutil::hex_encode(&synsema_stdlib::attest::program_sha_of(src, "r.syn").unwrap());
     assert_eq!(out.trim(), want);
 }
+
+// =========================================================
+// D: los templates de una tool de confianza (`--trusted-templates`)
+// =========================================================
+
+/// La tool de D: renderiza `r.html` con el dato privado y declasifica lo que el template muestra.
+const TPL_TOOL: &str = "export task recibo(c)\n    require declassify(\"clientes\")\n    let html be render(\"r.html\", {\"c\": c})\n    give declassify(html, \"el template muestra los ultimos 4\")\nexport task hola()\n    give \"hola\"\n";
+
+fn tpl_project(tag: &str) -> PathBuf {
+    let dir = project(tag);
+    std::fs::create_dir_all(dir.join("tpl/parts")).unwrap();
+    std::fs::write(dir.join("tpl/r.html"), "{ layout \"l.html\" }<p>{upper(c.nombre)} **** {slice(c.tarjeta, 15)}</p>{ include \"parts/pie.html\" }").unwrap();
+    std::fs::write(dir.join("tpl/l.html"), "<main>{ slot }</main>").unwrap();
+    std::fs::write(dir.join("tpl/parts/pie.html"), "<i>pie</i>").unwrap();
+    // El del programa, en su directorio de trabajo: la tool no lo lee.
+    std::fs::write(dir.join("r.html"), "<p>{c.nombre} {c.tarjeta}</p>").unwrap();
+    std::fs::write(dir.join("propio.html"), "<b>{x}</b>").unwrap();
+    std::fs::write(dir.join("h.syn"), TPL_TOOL).unwrap();
+    dir
+}
+
+const TPL_FLAGS: [&str; 8] = [
+    "--trusted",
+    "h=h.syn",
+    "--trusted-templates",
+    "h=tpl",
+    "--trusted-cap-set",
+    "stdout,declassify=clientes",
+    "--cap-set",
+    "stdout,file.read,file.write",
+];
+
+/// Filas D1–D6 y D10: la tool renderiza los templates que le dio el host (con su layout y su
+/// include), no el `r.html` del programa ni lo que el programa escribe en `tpl/` después del
+/// arranque; no pide `file.read`, y `{upper(…)}` es el builtin aunque el programa defina `upper`.
+#[test]
+fn a_trusted_tool_renders_the_templates_the_host_gave_it() {
+    let dir = tpl_project("d-render");
+    std::fs::write(
+        dir.join("app.syn"),
+        "require file.read(\"propio.html\")\nrequire file.write(\"tpl/r.html\")\ntask upper(s)\n    give \"FUGA\"\nlet c be private({\"nombre\": \"Ana\", \"tarjeta\": \"4111-1111-1111-1111\"}, \"clientes\")\nprint(render(\"propio.html\", {\"x\": \"antes\"}))\nwrite_file(\"tpl/r.html\", \"<p>{c.tarjeta}</p>\")\nuse \"trusted:h\" as h\nprint(h.recibo(c))\nprint(render(\"propio.html\", {\"x\": \"despues\"}))\n",
+    )
+    .unwrap();
+    let mut a = vec!["run", "--labels"];
+    a.extend_from_slice(&TPL_FLAGS);
+    a.push("app.syn");
+    let (code, out, err) = synsema(&dir, &a, None);
+    assert_eq!(code, 0, "{} {}", out, err);
+    let lines: Vec<&str> = out.lines().map(str::trim).collect();
+    assert_eq!(lines.len(), 3, "{}", out);
+    assert!(lines[0].contains("<b>antes</b>") && lines[2].contains("<b>despues</b>"), "{}", out);
+    assert!(lines[1].contains("body: <main><p>ANA **** 1111</p><i>pie</i></main>"), "{}", out);
+    assert!(!out.contains("FUGA") && !out.contains("4111-"), "{}", out);
+}
+
+/// Filas D7, D8, D9 y D11: lo que no está en el conjunto es error; sin templates del host, un
+/// `render` literal falla al cargar la tool (antes de cualquier dato) y uno no literal al llamar,
+/// los dos con el flag en el texto; `--trusted-templates` sin su `--trusted` es error de uso.
+#[test]
+fn a_trusted_tool_without_its_templates_says_how_to_give_them() {
+    let dir = tpl_project("d-errors");
+    let run = |app: &str, flags: &[&str]| {
+        std::fs::write(dir.join("app.syn"), app).unwrap();
+        let mut a = vec!["run"];
+        a.extend_from_slice(flags);
+        a.push("app.syn");
+        synsema(&dir, &a, None)
+    };
+    // D8: literal y sin templates: falla en el `use`, con el dato todavía público.
+    let (code, out, err) = run("print(\"antes\")\nuse \"trusted:h\" as h\nprint(h.hola())\n", &["--trusted", "h=h.syn"]);
+    assert!(code != 0 && out.contains("antes") && !out.contains("hola"), "{} {}", out, err);
+    assert!(err.contains("the trusted tool 'h' has no templates ('r.html')") && err.contains("--trusted-templates h=<dir>"), "{}", err);
+    assert!(err.contains("trusted:h:3"), "la línea del render: {}", err);
+    // D9: no literal, sin templates: al llamar.
+    std::fs::write(dir.join("g.syn"), "export task pagina(n)\n    give render(n, {})\n").unwrap();
+    let (code, _, err) = run("use \"trusted:g\" as g\nprint(g.pagina(\"r.html\"))\n", &["--trusted", "g=g.syn"]);
+    assert!(code != 0 && err.contains("the trusted tool 'g' has no templates ('r.html')"), "{}", err);
+    // D7: uno que existe en el directorio de trabajo pero no en el conjunto.
+    let (code, _, err) = run("use \"trusted:g\" as g\nprint(g.pagina(\"propio.html\"))\n", &["--trusted", "g=g.syn", "--trusted-templates", "g=tpl"]);
+    assert!(code != 0 && err.contains("template 'propio.html' is not among the templates the host gave the trusted tool 'g'"), "{}", err);
+    // Y un `../` no sale del conjunto.
+    let (code, _, err) = run("use \"trusted:g\" as g\nprint(g.pagina(\"../r.html\"))\n", &["--trusted", "g=g.syn", "--trusted-templates", "g=tpl"]);
+    assert!(code != 0 && err.contains("is not among the templates"), "{}", err);
+    // D11.
+    let (code, _, err) = run("print(1)\n", &["--trusted", "g=g.syn", "--trusted-templates", "x=tpl"]);
+    assert!(code == 2 && err.contains("--trusted-templates x: there is no --trusted x="), "{}", err);
+}
+
+/// Fila D12: bajo `serve`, cada worker tiene los templates de la tool.
+#[test]
+fn serve_gives_a_trusted_tool_its_templates() {
+    let dir = tpl_project("d-serve");
+    let main = "require serve({p})\nuse \"trusted:h\" as h\nserve on {p}\n    route \"GET /ping\"\n        give \"ok\"\n    route \"GET /r\"\n        give h.recibo({\"nombre\": \"eva\", \"tarjeta\": \"0000-0000-0000-4242\"})\n";
+    let r = serve_get_with(&dir, &["--trusted", "h=h.syn", "--trusted-templates", "h=tpl"], main, &["/r", "/r"]);
+    for x in &r {
+        assert!(x.starts_with("HTTP/1.1 200") && x.contains("EVA **** 4242"), "{}", x);
+    }
+}
+
+/// N3: en un template, `{upper(c.nombre)}` y `{c.nombre}` con `c` privado escriben los dos el valor,
+/// y el HTML sale con la etiqueta (antes el primero escribía el marcador `private(…)`). Un global
+/// privado que el template lee también le deja su etiqueta.
+#[test]
+fn a_template_writes_a_private_value_and_the_html_carries_its_label() {
+    let dir = project("n3");
+    std::fs::write(dir.join("n3.html"), "<p>{upper(c.nombre)} / {c.nombre}</p>").unwrap();
+    std::fs::write(dir.join("g.html"), "<p>{SECRETO}</p>").unwrap();
+    std::fs::write(
+        dir.join("p.syn"),
+        "require file.read(\"*.html\")\nlet c be private({\"nombre\": \"ana\"}, \"clientes\")\nlet h be render(\"n3.html\", {\"c\": c})\nprint(declassify(h, \"prueba\"))\nlet SECRETO be private(\"tope\", \"otro\")\nlet g be render(\"g.html\", {})\nprint(g)\n",
+    )
+    .unwrap();
+    let (code, out, err) = synsema(&dir, &["run", "--labels", "p.syn"], None);
+    assert_eq!(code, 0, "{}", err);
+    let lines: Vec<&str> = out.lines().map(str::trim).collect();
+    assert!(lines[0].contains("body: <p>ANA / ana</p>"), "{}", out);
+    assert!(lines[1].starts_with("private("), "el HTML lleva la etiqueta del global: {}", out);
+    assert!(!out.contains("tope"), "{}", out);
+}
+
+/// Ronda 4 de v0.6.49, B1: con datos privados, el programa ve el texto fijo de un corte, el
+/// operador el redactado y el auditor (el sobre del recibo) el porqué real: antes era
+/// `private(clientes)` también en el sobre.
+#[test]
+fn a_render_error_with_private_data_tells_the_auditor_why() {
+    let dir = tpl_project("d-b1");
+    std::fs::write(dir.join("g.syn"), "export task pagina(c, n)\n    give render(n, {\"c\": c})\n").unwrap();
+    std::fs::write(
+        dir.join("app.syn"),
+        "let c be private({\"nombre\": \"Ana\"}, \"clientes\")\nuse \"trusted:g\" as g\nprint(g.pagina(c, \"noesta.html\"))\n",
+    )
+    .unwrap();
+    let (sk, pk) = super::v0646_tanda_e_cli::auditor_keys();
+    let args = [
+        "run", "--labels", "--cap-set", "stdout", "--auditor", &pk, "--receipt", "r.json", "--trusted", "g=g.syn", "--trusted-templates", "g=tpl",
+        "app.syn",
+    ];
+    let (code, _, err) = synsema(&dir, &args, None);
+    assert!(code != 0 && !err.contains("noesta"), "{}", err);
+    let r: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.join("r.json")).unwrap()).unwrap();
+    let opened = super::v0646_tanda_e_cli::open_receipt(&r, &sk);
+    assert!(opened.to_string().contains("template 'noesta.html' is not among the templates"), "{}", opened);
+}
+
+/// Fila D1 en el nivel superior de la tool: también resuelve contra sus templates (no el disco).
+#[test]
+fn a_trusted_tool_renders_at_its_top_level_from_its_templates() {
+    let dir = tpl_project("d-top");
+    std::fs::write(dir.join("t.syn"), "let PAGINA be render(\"parts/pie.html\", {})\nexport task pagina()\n    give text(PAGINA)\n").unwrap();
+    std::fs::create_dir_all(dir.join("parts")).unwrap();
+    std::fs::write(dir.join("parts/pie.html"), "<i>DEL-PROGRAMA</i>").unwrap();
+    std::fs::write(dir.join("app.syn"), "use \"trusted:t\" as t\nprint(t.pagina())\n").unwrap();
+    let (code, out, err) = synsema(&dir, &["run", "--trusted", "t=t.syn", "--trusted-templates", "t=tpl", "app.syn"], None);
+    assert!(code == 0 && out.contains("<i>pie</i>") && !out.contains("DEL-PROGRAMA"), "{} {}", out, err);
+}

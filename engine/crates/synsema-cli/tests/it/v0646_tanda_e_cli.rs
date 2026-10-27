@@ -801,12 +801,16 @@ fn e5_ceiling_without_host_does_not_send_private_data() {
 #[test]
 fn e3b_trusted_tool_does_not_run_program_code_through_builtins() {
     let dir = project("r2-builtins");
-    std::fs::write(dir.join("saludo.html"), "<p>Hola {upper(nombre)}</p>").unwrap();
-    let tools = "export task saludo(cliente)\n    require declassify(\"clientes\")\n    require file.read(\"saludo.html\")\n    let html be render(\"saludo.html\", {\"nombre\": cliente.nombre})\n    give contains(text(html), \"Hola ANA\")\n";
+    std::fs::create_dir_all(dir.join("tpl")).unwrap();
+    std::fs::write(dir.join("tpl/saludo.html"), "<p>Hola {upper(nombre)}</p>").unwrap();
+    let tools = "export task saludo(cliente)\n    let html be render(\"saludo.html\", {\"nombre\": cliente.nombre})\n    give contains(text(html), \"Hola ANA\")\n";
     let app = format!("{LISTA}task upper(s)\n    print(\"FUGA-TPL: \" + text(declassify(lista, \"exfil\")))\n    give s\nuse \"trusted:h\" as h\nprint(h.saludo({{\"nombre\": \"ana\"}}))\n");
-    let (code, out, err) = trusted_run(&dir, &[("h", tools)], &app);
-    // Ronda 3 (R3-A1): dentro de la tool `render` es error; la task `upper` del programa no corre.
-    assert!(code != 0 && err.contains("a trusted tool cannot render templates yet"), "{} {}", out, err);
+    std::fs::write(dir.join("app.syn"), &app).unwrap();
+    std::fs::write(dir.join("h.syn"), tools).unwrap();
+    // v0.6.50 (D14): con sus templates del host la tool renderiza, y `{upper(…)}` del template es el
+    // builtin (`template_parent`), no la `task upper` del programa.
+    let (code, out, err) = synsema(&dir, &["run", "--labels", "--cap-set", "stdout", "--trusted", "h=h.syn", "--trusted-templates", "h=tpl", "app.syn"], None);
+    assert!(code == 0 && out.trim() == "true", "{} {}", out, err);
     assert!(!out.contains("FUGA") && !err.contains("4111"), "{} {}", out, err);
 
     // Un server WebSocket que acepta el handshake y cierra enseguida: fuerza reconexiones.
@@ -838,8 +842,8 @@ fn e3b_trusted_tool_does_not_run_program_code_through_builtins() {
 
 /// R3-A1: el template de una tool lo podría escribir el programa (`file.write`, una corrida
 /// anterior, un proceso suyo) y correría con las capabilities de la tool; si la tool declasifica lo
-/// que renderiza, el template es la política. Dentro de una tool `render` es error. El programa
-/// sigue renderizando los suyos, antes y después de llamar a la tool.
+/// que renderiza, el template es la política. Dentro de una tool `render` es error. v0.6.50 (D):
+/// salvo los templates que el host le da (`--trusted-templates`), nunca los del directorio.
 #[test]
 fn e3b_trusted_tool_template_is_not_the_programs() {
     let dir = project("r3-tplfile");
@@ -876,7 +880,9 @@ print(h.recibo(c))
         let (code, out, err) = synsema(&dir, &a, None);
         assert!(code != 0 && !out.contains("4111") && !err.contains("4111"), "{} {}", out, err);
     }
-    // Con datos públicos se ve el porqué; y el programa renderiza los suyos antes y después.
+    // Con datos públicos se ve el porqué. v0.6.50 (D8): sin `--trusted-templates` un `render` literal
+    // de la tool es error al cargarla, antes de cualquier dato; el programa renderizó el suyo antes.
+    // Con sus templates, lo que la tool renderiza: `v0650_cli::a_trusted_tool_renders_the_templates_*`.
     std::fs::write(
         dir.join("pub.syn"),
         "require file.read(\"propio.html\")
@@ -889,8 +895,8 @@ print(h.recibo({\"nombre\": \"Ana\", \"tarjeta\": \"4111-1111-1111-1111\"}))
     )
     .unwrap();
     let (code, out, err) = synsema(&dir, &["run", "--labels", "--cap-set", "stdout,file.read", "--trusted", "h=h.syn", "pub.syn"], None);
-    assert!(out.contains("<b>antes</b>") && out.contains("hola") && out.contains("<b>después</b>"), "{} {}", out, err);
-    assert!(code != 0 && err.contains("a trusted tool cannot render templates yet ('recibo.html')"), "{} {}", out, err);
+    assert!(out.contains("<b>antes</b>") && !out.contains("hola"), "{} {}", out, err);
+    assert!(code != 0 && err.contains("the trusted tool 'h' has no templates ('recibo.html')"), "{} {}", out, err);
     assert!(!out.contains("4111"), "{} {}", out, err);
 }
 

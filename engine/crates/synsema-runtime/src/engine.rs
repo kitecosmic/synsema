@@ -598,7 +598,7 @@ pub(crate) fn wire_common_with_state(
     }
     // v0.6.46 (E3b): los módulos de confianza del host (`--trusted`), para `use "trusted:…"`.
     if let Some(t) = crate::host::trusted() {
-        synsema_stdlib::captoken::install_trusted_modules(interp, caps.clone(), &t.modules, t.ceiling.clone());
+        synsema_stdlib::captoken::install_trusted_modules(interp, caps.clone(), &t.modules, &t.templates, t.ceiling.clone());
     }
     register_secure_builtins(interp, caps.clone());
     // Secretos/env: carga el `.env` (antes de evaluar require/serve) y registra
@@ -735,13 +735,8 @@ pub(crate) fn wire_common_with_state(
         -1,
         Rc::new(|i, args, _loc| {
             let path = args.first().map(|v| v.to_string()).unwrap_or_default();
-            // Gate de `file.read` para la llamada de NIVEL SUPERIOR (el vector de LFI: el
-            // path puede venir de un request). Un template del bundle es el programa: sin
-            // gate. Los include/layout ANIDADOS pasan por el mismo gate en `templates.rs`
-            // (v0.6.45; antes sólo se los confinaba al cwd).
-            if synsema_core::bundle::get(&synsema_core::bundle::normalize_name(&path).unwrap_or_default()).is_none() {
-                i.gate_template_read(&path)?;
-            }
+            // El gate de `file.read` (y los templates de una tool de confianza) los decide
+            // `render_template`, el mismo para el nativo y wasm (v0.6.50).
             let html = synsema_core::templates::render_template(i, &path, args.get(1))?;
             Ok(synsema_core::templates::make_raw(html, "text/html; charset=utf-8", 200))
         }),

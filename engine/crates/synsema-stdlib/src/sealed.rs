@@ -338,12 +338,41 @@ fn parse_entries(list: &[(u64, String)]) -> Vec<(u64, Value)> {
 
 /// v0.6.49 (ronda 1, M3): el `trusted` del encabezado: el sha256 de cada módulo de confianza
 /// (`{nombre: sha}`), o `None` si la corrida no tuvo.
-pub fn trusted_shas(modules: &[(String, String)]) -> Option<Value> {
+pub fn trusted_shas(modules: &[(String, String)], templates: &[(String, Vec<(String, String)>)]) -> Option<Value> {
     if modules.is_empty() {
         return None;
     }
-    let map: Map<String, Value> = modules.iter().map(|(name, src)| (name.clone(), Value::String(hex_encode(&Sha256::digest(src.as_bytes()))))).collect();
+    let map: Map<String, Value> = modules
+        .iter()
+        .map(|(name, src)| {
+            let tpl = templates.iter().find(|(n, _)| n == name).map(|(_, f)| f.as_slice()).filter(|f| !f.is_empty());
+            (name.clone(), Value::String(hex_encode(&trusted_tool_sha(src, tpl))))
+        })
+        .collect();
     Some(Value::Object(map))
+}
+
+/// v0.6.50 (D15): el sha de una tool. Sin templates, el de su fuente (como siempre); con templates
+/// (`--trusted-templates`, parte de su política), el de fuente y templates en una codificación
+/// canónica: un prefijo de versión y cada campo con su longitud, los templates por nombre.
+fn trusted_tool_sha(source: &str, templates: Option<&[(String, String)]>) -> [u8; 32] {
+    let Some(files) = templates else {
+        return Sha256::digest(source.as_bytes()).into();
+    };
+    let mut h = Sha256::new();
+    let field = |h: &mut Sha256, b: &[u8]| {
+        h.update((b.len() as u64).to_be_bytes());
+        h.update(b);
+    };
+    h.update(b"synsema-trusted-tool-v1\0");
+    field(&mut h, source.as_bytes());
+    let mut sorted: Vec<&(String, String)> = files.iter().collect();
+    sorted.sort_by(|a, b| a.0.cmp(&b.0));
+    for (name, text) in sorted {
+        field(&mut h, name.as_bytes());
+        field(&mut h, text.as_bytes());
+    }
+    h.finalize().into()
 }
 
 /// Arma el recibo sellado de la corrida que registró `log`.
@@ -685,6 +714,23 @@ pub fn request_finish() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// v0.6.50 (D15): el sha de una tool sin templates es el de su fuente (los recibos de antes
+    /// siguen comparando); con templates los cubre, y cambiar uno lo cambia (el orden no).
+    #[test]
+    fn a_trusted_tool_sha_covers_its_templates() {
+        let m = vec![("h".to_string(), "export task f()\n    give 1\n".to_string())];
+        let plain = trusted_shas(&m, &[]).unwrap();
+        assert_eq!(plain["h"], hex_encode(&Sha256::digest(m[0].1.as_bytes())));
+        let t = |a: &str| vec![("h".to_string(), vec![("a.html".to_string(), a.to_string()), ("b.html".to_string(), "b".to_string())])];
+        let with = trusted_shas(&m, &t("a")).unwrap();
+        assert_ne!(with["h"], plain["h"]);
+        assert_ne!(trusted_shas(&m, &t("a2")).unwrap()["h"], with["h"]);
+        let reversed = vec![("h".to_string(), vec![("b.html".to_string(), "b".to_string()), ("a.html".to_string(), "a".to_string())])];
+        assert_eq!(trusted_shas(&m, &reversed).unwrap()["h"], with["h"]);
+        // Los templates de otra tool no cuentan.
+        assert_eq!(trusted_shas(&m, &[("x".to_string(), vec![("a.html".to_string(), "a".to_string())])]).unwrap()["h"], plain["h"]);
+    }
 
     /// Ronda final de v0.6.46: el CI vio `--replay` devolver `…7256043` donde la corrida leyó
     /// `…7256045`. Como texto, cada lectura vuelve bit a bit; como número, `serde_json` (sin

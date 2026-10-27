@@ -1927,6 +1927,12 @@ pub struct Interpreter {
     /// `snapshot_module_base`). Colgado de `global_env`, un módulo leía y escribía los globales de
     /// quien lo importaba. Al final del struct a propósito (no es camino caliente).
     module_base_env: Option<Rc<RefCell<Environment>>>,
+    /// v0.6.50 (D): los templates que el host le dio a cada tool de confianza
+    /// (`--trusted-templates`). Dentro del scope de una tool, `render` resuelve sólo contra éstos.
+    trusted_templates: HashMap<String, Rc<crate::templates::ToolTemplates>>,
+    /// v0.6.50 (D): las tools en cuyo scope corre el código (la última es la actual), junto a
+    /// `trusted_depth`.
+    trusted_stack: Vec<String>,
 }
 
 /// v0.6.46 (ronda 1 de cf1, B2): el linaje que juntó un intérprete hijo (un worker de
@@ -2087,6 +2093,8 @@ impl Interpreter {
             run_cut: std::sync::Arc::new(RunCut::default()),
             err_hook: None,
             module_base_env: None,
+            trusted_templates: HashMap::new(),
+            trusted_stack: Vec::new(),
             blackboard: HashMap::new(),
             agent_definitions: HashMap::new(),
             agent_context: Vec::new(),
@@ -2483,10 +2491,16 @@ impl Interpreter {
         }
         match r {
             Err(Control::Error(mut e)) => {
-                if !e.redact_label.is_empty() && !e.from_labels {
+                // v0.6.50 (ronda 4 de v0.6.49, B1): el texto real se toma ANTES de redactar y va al
+                // sobre del recibo (sólo lo abre el auditor): era `private(clientes)` en todas partes
+                // y quien escribió la tool no sabía que la causa era `render`. El operador sigue
+                // viendo el redactado con su ubicación: su log no es un destino de datos privados.
+                let real = (!e.redact_label.is_empty() && !e.from_labels && e.operator_detail.is_none())
+                    .then(|| e.to_string());
+                if real.is_some() {
                     e.message = format!("private({})", e.redact_label);
                 }
-                self.withhold_labels_detail(&mut e);
+                self.withhold_labels_detail_sealing(&mut e, real);
                 Err(Control::Error(e))
             }
             other => other,
@@ -2508,12 +2522,19 @@ impl Interpreter {
     #[cold]
     #[inline(never)]
     fn withhold_labels_detail(&self, e: &mut RuntimeError) {
+        self.withhold_labels_detail_sealing(e, None)
+    }
+
+    /// `withhold_labels_detail` con el texto que va al sobre cuando difiere del del operador (B1:
+    /// el real de un error redactado; el operador recibe el redactado).
+    fn withhold_labels_detail_sealing(&self, e: &mut RuntimeError, sealed: Option<String>) {
         if !self.labels || self.labels_detail_to_program || !e.is_fatal_for_labels() || e.is_halt() || e.operator_detail.is_some() {
             return;
         }
         let detail = e.to_string();
         // El detalle depende del dato privado, así que va al sobre (sólo lo abre el auditor).
-        crate::sealed::push_sealed(serde_json::json!({"kind": "label_violation", "detail": detail}).to_string());
+        let sealed = sealed.unwrap_or_else(|| detail.clone());
+        crate::sealed::push_sealed(serde_json::json!({"kind": "label_violation", "detail": sealed}).to_string());
         // Un solo texto para los dos tipos de corte: si un `label_violation` y un error bajo la rama
         // privada dijeran cosas distintas, cuál de los dos fue también lo elegiría el dato.
         e.message = labels::cut_text(&self.safe_label(&labels::empty()));
@@ -2900,7 +2921,7 @@ impl Interpreter {
     /// Anota que se desenvolvió un valor con etiqueta `l` (para el mensaje de error que
     /// atrape un `recover`, también cuando la operación falla antes de re-envolver).
     #[inline]
-    fn note_seen(&mut self, l: &Label) {
+    pub(crate) fn note_seen(&mut self, l: &Label) {
         if !l.is_empty() {
             self.seen = labels::union(&self.seen, l);
             self.seen_any = true;
@@ -3654,6 +3675,18 @@ impl Interpreter {
         self.shortcuts = false;
     }
 
+    /// v0.6.50 (D): los templates que el host le da a la tool `name` (`(nombre relativo, texto)`), ya
+    /// leídos: el programa no los puede cambiar después.
+    pub fn set_trusted_templates(&mut self, name: &str, files: &[(String, String)]) {
+        self.trusted_templates.insert(name.to_string(), Rc::new(crate::templates::ToolTemplates::new(files)));
+    }
+
+    /// v0.6.50 (D): dentro del scope de una tool, cuál es y sus templates (si el host le dio).
+    pub(crate) fn current_tool_templates(&self) -> Option<(&str, Option<Rc<crate::templates::ToolTemplates>>)> {
+        let module = self.trusted_stack.last()?;
+        Some((module, self.trusted_templates.get(module).cloned()))
+    }
+
     /// v0.6.46 (ronda 1, A1): ¿corre código de una tool de confianza? Lo miran los builtins que
     /// mandan una task a otro intérprete (`parallel_map`, `cron_every`): ahí vería los globales del
     /// programa con las capabilities de la tool.
@@ -4319,6 +4352,10 @@ impl Interpreter {
                 _ => {}
             }
         }
+        // v0.6.50 (D8): un `render("literal")` de la tool tiene que estar entre sus templates; acá,
+        // antes de que llegue ningún dato, el texto se ve aunque los datos sean privados.
+        crate::templates::check_tool_renders(&program, name, self.trusted_templates.get(name).map(|t| &**t))
+            .map_err(err)?;
         self.loading_modules.insert(key.clone());
         // Ronda 1 (A1): hijo del preludio, no de `global_env`: los nombres libres del módulo son los
         // builtins, no lo que el programa definió antes o después del `use`.
@@ -4329,7 +4366,9 @@ impl Interpreter {
         hook(Some((name, &[])));
         debug_assert!(!self.shortcuts, "a trusted scope opened with the VM on (it has no origin check)");
         self.trusted_depth += 1;
+        self.trusted_stack.push(name.to_string());
         let exec_res = self.exec_block(&program.statements, &module_env);
+        self.trusted_stack.pop();
         self.trusted_depth -= 1;
         hook(None);
         self.stdout_verdict = None;
@@ -11734,7 +11773,9 @@ fn call_trusted(i: &mut Interpreter, tool: &TrustedTool, args: &mut CallArgs, lo
     (tool.hook)(Some((&tool.module, &tool.task.required_capabilities)));
     debug_assert!(!i.shortcuts, "a trusted scope opened with the VM on (it has no origin check)");
     i.trusted_depth += 1;
+    i.trusted_stack.push(tool.module.clone());
     let r = i.call_value_named(SynValue::Task(tool.task.clone()), args, loc);
+    i.trusted_stack.pop();
     i.trusted_depth -= 1;
     (tool.hook)(None);
     i.stdout_verdict = None;

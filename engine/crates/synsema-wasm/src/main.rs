@@ -200,7 +200,7 @@ fn main() {
     // etiquetas va en el error (también en `--test`), como en `synsema run`; con techo, el programa
     // ve sólo el texto fijo.
     let owner = ceiling.is_none() && trusted.is_empty();
-    let opts = RunOptions { filename, env: None, ceiling, no_fs: false, labels, result: None, input: None, sources: Vec::new(), max_steps: None, max_memory_mb: None, trusted, trusted_ceiling, auditor: None, sealed_bytes: None, labels_detail_to_program: owner };
+    let opts = RunOptions { filename, env: None, ceiling, no_fs: false, labels, result: None, input: None, sources: Vec::new(), max_steps: None, max_memory_mb: None, trusted, trusted_templates: Vec::new(), trusted_ceiling, auditor: None, sealed_bytes: None, labels_detail_to_program: owner };
 
     if test_mode {
         let r = with_big_stack(move || synsema_wasm::test(&source, &opts));

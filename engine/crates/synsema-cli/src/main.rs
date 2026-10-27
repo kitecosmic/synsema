@@ -40,7 +40,7 @@ mod update;
 mod code;
 mod sealed_receipt;
 
-const USAGE: &str = "uso: synsema <conform [--swarm] [--flat] | serve [--secure] [--watch] [--port N] [--domain d1,d2] [--tls-auto <email> | --tls-cert <p> --tls-key <p>] [--bind addr] [--trust-proxy ip,cidr] [--health <path>] [--attested] [--auditor <X25519 public key> [--receipt <ruta|fd:N>]] | run [--flat] [--explain] [--format human|json] [--provider <name>] [--attest] [--auditor <X25519 public key> [--receipt <ruta|fd:N>] | --replay <recibo abierto> [--replay-any-program]] <archivo.syn | -> [-- args...] | receipt <open <recibo> --key <privada> | verify <recibo> | keygen> | test [-v] [--auditor <X25519 public key> [--receipt <ruta|fd:N>]] <archivo|dir> | build <main.syn> -o <salida> [--include <p>]... [--engine-binary <ruta>] [--serve [--bind addr] ...] [--no-console] [--icon <svg|png|ico>] [--bundle [--name <n>] [--id <id>]] | check | code <outline|symbol|refs|routes|caps|check|search|deps> [--json] | code --mcp | openapi [--out f] [--base-url URL] | tokens | ast | repl | daemon | init [dir] [--synfide | --pwa | --desktop] | llm status [--json] | version | update> [--sandbox | --cap-set <list> | --deterministic] [--trusted <nombre=ruta>]... [--trusted-cap-set <list>] [--labels] [--jitless] [--profile native|pure] [--audit json|<ruta>|fd:N|unix:<ruta>] [--env-file <path> | --no-env-file] <archivo.syn>";
+const USAGE: &str = "uso: synsema <conform [--swarm] [--flat] | serve [--secure] [--watch] [--port N] [--domain d1,d2] [--tls-auto <email> | --tls-cert <p> --tls-key <p>] [--bind addr] [--trust-proxy ip,cidr] [--health <path>] [--attested] [--auditor <X25519 public key> [--receipt <ruta|fd:N>]] | run [--flat] [--explain] [--format human|json] [--provider <name>] [--attest] [--auditor <X25519 public key> [--receipt <ruta|fd:N>] | --replay <recibo abierto> [--replay-any-program]] <archivo.syn | -> [-- args...] | receipt <open <recibo> --key <privada> | verify <recibo> | keygen> | test [-v] [--auditor <X25519 public key> [--receipt <ruta|fd:N>]] <archivo|dir> | build <main.syn> -o <salida> [--include <p>]... [--engine-binary <ruta>] [--serve [--bind addr] ...] [--no-console] [--icon <svg|png|ico>] [--bundle [--name <n>] [--id <id>]] | check | code <outline|symbol|refs|routes|caps|check|search|deps> [--json] | code --mcp | openapi [--out f] [--base-url URL] | tokens | ast | repl | daemon | init [dir] [--synfide | --pwa | --desktop] | llm status [--json] | version | update> [--sandbox | --cap-set <list> | --deterministic] [--trusted <nombre=ruta>]... [--trusted-cap-set <list>] [--trusted-templates <nombre=dir>]... [--labels] [--jitless] [--profile native|pure] [--audit json|<ruta>|fd:N|unix:<ruta>] [--env-file <path> | --no-env-file] <archivo.syn>";
 
 // `build_ceiling` (--sandbox/--cap-set → techo) vive en synsema-capabilities: lo comparten
 // este binario y `synsema-wasm` (mismas flags, misma semántica en los dos front-ends).
@@ -75,6 +75,8 @@ pub(crate) struct HostFlags {
     /// programa importa con `use "trusted:nombre"`, y `--trusted-cap-set`, su techo.
     pub trusted: Vec<(String, String)>,
     pub trusted_cap_set: Option<String>,
+    /// v0.6.50 (D): `--trusted-templates nombre=dir` (repetible), los templates de una tool.
+    pub trusted_templates: Vec<(String, String)>,
     pub filename: Option<String>,
     pub program_args: Vec<String>,
     pub rest: Vec<String>,
@@ -129,8 +131,8 @@ impl HostFlags {
     /// v0.6.46 (E3b): lee los módulos de `--trusted` (el programa no ve la ruta) y fija su techo.
     fn apply_trusted(&self, cmd: &str) -> Result<(), ExitCode> {
         if self.trusted.is_empty() {
-            if self.trusted_cap_set.is_some() {
-                eprintln!("synsema {}: --trusted-cap-set bounds the modules of --trusted; pass --trusted name=./file.syn too", cmd);
+            if self.trusted_cap_set.is_some() || !self.trusted_templates.is_empty() {
+                eprintln!("synsema {}: --trusted-cap-set and --trusted-templates go with the modules of --trusted; pass --trusted name=./file.syn too", cmd);
                 return Err(ExitCode::from(2));
             }
             return Ok(());
@@ -155,6 +157,24 @@ impl HostFlags {
                 }
             }
         }
+        // v0.6.50 (D): los templates de cada tool se leen ahora, antes de que corra el programa.
+        let mut templates: Vec<(String, Vec<(String, String)>)> = Vec::new();
+        for (name, dir) in &self.trusted_templates {
+            if !modules.iter().any(|(n, _)| n == name) {
+                eprintln!("synsema {}: --trusted-templates {}: there is no --trusted {}=… to give them to", cmd, name, name);
+                return Err(ExitCode::from(2));
+            }
+            if templates.iter().any(|(n, _)| n == name) {
+                eprintln!("synsema {}: --trusted-templates {}: the name is given twice", cmd, name);
+                return Err(ExitCode::from(2));
+            }
+            let mut files = Vec::new();
+            if let Err(e) = read_template_dir(std::path::Path::new(dir), "", &mut files) {
+                eprintln!("synsema {}: --trusted-templates {}: cannot read {}: {}", cmd, name, dir, e);
+                return Err(ExitCode::from(2));
+            }
+            templates.push((name.clone(), files));
+        }
         let ceiling = match self.trusted_cap_set.as_deref() {
             None => None,
             Some(spec) => match build_ceiling(false, Some(spec)) {
@@ -165,7 +185,7 @@ impl HostFlags {
                 }
             },
         };
-        host::set_trusted(host::Trusted { modules, ceiling });
+        host::set_trusted(host::Trusted { modules, ceiling, templates });
         Ok(())
     }
 
@@ -183,6 +203,25 @@ impl HostFlags {
         }
         Ok(())
     }
+}
+
+/// v0.6.50 (D): los archivos regulares de `dir` (recursivo), con su nombre relativo con `/`. Un
+/// symlink no se sigue: lo que la tool renderiza es lo que está en su directorio.
+fn read_template_dir(dir: &std::path::Path, prefix: &str, out: &mut Vec<(String, String)>) -> Result<(), String> {
+    let mut entries: Vec<_> = std::fs::read_dir(dir).map_err(|e| e.to_string())?.collect::<Result<_, _>>().map_err(|e| e.to_string())?;
+    entries.sort_by_key(|e| e.file_name());
+    for e in entries {
+        let name = e.file_name().to_string_lossy().into_owned();
+        let rel = if prefix.is_empty() { name } else { format!("{}/{}", prefix, name) };
+        let meta = std::fs::symlink_metadata(e.path()).map_err(|e| e.to_string())?;
+        if meta.is_dir() {
+            read_template_dir(&e.path(), &rel, out)?;
+        } else if meta.is_file() {
+            let text = std::fs::read_to_string(e.path()).map_err(|err| format!("{}: {}", rel, err))?;
+            out.push((rel, text));
+        }
+    }
+    Ok(())
 }
 
 /// Separa los flags del host de `args` (los que siguen al subcomando). Un valor de flag
@@ -230,6 +269,17 @@ pub(crate) fn take_host_flags(cmd: &str, args: &[String]) -> Result<HostFlags, E
             }
             "--trusted-cap-set" => {
                 h.trusted_cap_set = Some(need_value("--trusted-cap-set", args.get(i + 1))?);
+                i += 1;
+            }
+            "--trusted-templates" => {
+                let v = need_value("--trusted-templates", args.get(i + 1))?;
+                match v.split_once('=') {
+                    Some((n, p)) if !n.is_empty() && !p.is_empty() => h.trusted_templates.push((n.to_string(), p.to_string())),
+                    _ => {
+                        eprintln!("synsema {}: --trusted-templates takes name=dir, e.g. --trusted-templates tools=./tools-templates", cmd);
+                        return Err(ExitCode::from(2));
+                    }
+                }
                 i += 1;
             }
             "--jitless" => h.jitless = true,
@@ -1694,7 +1744,7 @@ fn cmd_run(args: &[String]) -> ExitCode {
     let path = match path {
         Some(p) => p,
         None => {
-            eprintln!("uso: synsema run [--flat] [--explain] [--format human|json] [--provider <name>] [--attest] [--auditor <X25519 public key> [--receipt <ruta|fd:N>] | --replay <recibo abierto> [--replay-any-program]] [--sandbox | --cap-set <list> | --deterministic] [--trusted <nombre=ruta>]... [--trusted-cap-set <list>] [--labels] [--profile native|pure] [--audit json|<ruta>|fd:N] <archivo.syn | -> [-- args...]");
+            eprintln!("uso: synsema run [--flat] [--explain] [--format human|json] [--provider <name>] [--attest] [--auditor <X25519 public key> [--receipt <ruta|fd:N>] | --replay <recibo abierto> [--replay-any-program]] [--sandbox | --cap-set <list> | --deterministic] [--trusted <nombre=ruta>]... [--trusted-cap-set <list>] [--trusted-templates <nombre=dir>]... [--labels] [--profile native|pure] [--audit json|<ruta>|fd:N] <archivo.syn | -> [-- args...]");
             return ExitCode::from(2);
         }
     };
@@ -2169,7 +2219,7 @@ fn cmd_test(args: &[String]) -> ExitCode {
         i += 1;
     }
     if paths.is_empty() {
-        eprintln!("uso: synsema test [-v] [--flat] [--auditor <X25519 public key> [--receipt <ruta|fd:N>]] [--sandbox | --cap-set <list>] [--trusted <nombre=ruta>]... [--trusted-cap-set <list>] [--profile native|pure] [--audit json|<ruta>|fd:N] <archivo.syn | dir>...");
+        eprintln!("uso: synsema test [-v] [--flat] [--auditor <X25519 public key> [--receipt <ruta|fd:N>]] [--sandbox | --cap-set <list>] [--trusted <nombre=ruta>]... [--trusted-cap-set <list>] [--trusted-templates <nombre=dir>]... [--profile native|pure] [--audit json|<ruta>|fd:N] <archivo.syn | dir>...");
         return ExitCode::from(2);
     }
     // Techo de capabilities del host (--sandbox/--cap-set): opt-in, defense-in-depth.

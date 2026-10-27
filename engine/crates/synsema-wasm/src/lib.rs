@@ -112,6 +112,8 @@ pub struct RunOptions {
     /// importa con `use "trusted:nombre"`, y sus tasks exportadas corren con sus `require` ∩
     /// `trusted_ceiling`, no con lo del programa.
     pub trusted: Vec<(String, String)>,
+    /// v0.6.50 (D): los templates de cada tool (`trusted: {nombre: {source, templates}}`).
+    pub trusted_templates: Vec<(String, Vec<(String, String)>)>,
     /// v0.6.46 (E3b) — el techo de los módulos de confianza (la gramática de `ceiling`).
     pub trusted_ceiling: Option<Vec<Capability>>,
     /// v0.6.46 (E6) — la pública X25519 del auditor que designa el host: con ella, `Report.receipt`
@@ -140,6 +142,7 @@ impl RunOptions {
             max_steps: None,
             max_memory_mb: None,
             trusted: Vec::new(),
+            trusted_templates: Vec::new(),
             trusted_ceiling: None,
             auditor: None,
             sealed_bytes: None,
@@ -703,10 +706,7 @@ pub fn wire_pure(interp: &mut Interpreter, caps: &Rc<RefCell<CapabilitySet>>, ct
         -1,
         Rc::new(|i, args, _loc| {
             let path = args.first().map(|v| v.to_string()).unwrap_or_default();
-            // Gate `file.read` de la llamada de nivel superior (paridad con el nativo).
-            if synsema_core::bundle::get(&synsema_core::bundle::normalize_name(&path).unwrap_or_default()).is_none() {
-                i.gate_template_read(&path)?;
-            }
+            // El gate `file.read` lo decide `render_template` (paridad con el nativo).
             let html = synsema_core::templates::render_template(i, &path, args.get(1))?;
             Ok(synsema_core::templates::make_raw(html, "text/html; charset=utf-8", 200))
         }),
@@ -1129,7 +1129,7 @@ pub(crate) fn prepare(program: &Program, opts: &RunOptions) -> (Interpreter, Rc<
     wire_pure(&mut interp, &caps, &ctx);
     // v0.6.46 (E3b): los módulos de confianza del embebedor, con el mismo helper que el nativo.
     if !opts.trusted.is_empty() {
-        synsema_stdlib::captoken::install_trusted_modules(&mut interp, caps.clone(), &opts.trusted, opts.trusted_ceiling.clone());
+        synsema_stdlib::captoken::install_trusted_modules(&mut interp, caps.clone(), &opts.trusted, &opts.trusted_templates, opts.trusted_ceiling.clone());
     }
     if opts.labels {
         interp.set_labels(true);
@@ -1328,7 +1328,7 @@ pub fn run(source: &str, opts: &RunOptions) -> Report {
             let log = log.lock().unwrap_or_else(|p| p.into_inner());
             match synsema_stdlib::sealed::build_receipt(
                 &log,
-                &synsema_stdlib::sealed::ReceiptContext { auditor, key: &key, program_sha, config_sha: None, trusted: synsema_stdlib::sealed::trusted_shas(&opts.trusted), started },
+                &synsema_stdlib::sealed::ReceiptContext { auditor, key: &key, program_sha, config_sha: None, trusted: synsema_stdlib::sealed::trusted_shas(&opts.trusted, &opts.trusted_templates), started },
             ) {
                 Ok(v) => Some(v),
                 // Sin recibo no hay salida: es lo que el host pidió al poner un auditor.

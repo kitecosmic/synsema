@@ -46,6 +46,8 @@ static LABELS_DETAIL: OnceLock<bool> = OnceLock::new();
 pub struct Trusted {
     pub modules: Vec<(String, String)>,
     pub ceiling: Option<Vec<synsema_capabilities::model::Capability>>,
+    /// v0.6.50 (D): los templates de cada tool (`--trusted-templates`), ya leídos.
+    pub templates: Vec<(String, Vec<(String, String)>)>,
 }
 
 static TRUSTED: OnceLock<Trusted> = OnceLock::new();

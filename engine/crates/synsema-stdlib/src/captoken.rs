@@ -1385,6 +1385,7 @@ pub fn install_trusted_modules(
     interp: &mut Interpreter,
     caps: Rc<RefCell<CapabilitySet>>,
     modules: &[(String, String)],
+    templates: &[(String, Vec<(String, String)>)],
     ceiling: Option<Vec<Capability>>,
 ) {
     let ceiling = ceiling.map(Rc::new);
@@ -1409,6 +1410,10 @@ pub fn install_trusted_modules(
     });
     for (name, source) in modules {
         interp.set_trusted_module(name, source, hook.clone());
+    }
+    // v0.6.50 (D): los templates que el host le dio a cada tool (`--trusted-templates`).
+    for (name, files) in templates {
+        interp.set_trusted_templates(name, files);
     }
 }
 
