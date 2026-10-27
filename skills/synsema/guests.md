@@ -68,13 +68,15 @@ audit log (`sign` and the signing builtins, `spend`, `reveal`, wallet operations
 branch they are a `label_violation` — declare capabilities at the top and decide signing with a
 public value ([labels.md](labels.md)). Vela's upload limit is 50 MB.
 
-**Publishing = `declassify` under the guest's ceiling (v0.6.46+).** `app` is the only principal in
-the guest (`ctx["state"]`, `ctx["payload"]` and what derives from them are private to `app`), and
-since v0.6.46 `declassify` is a capability a host ceiling bounds: the guest runs every app under
-`stdout,declassify=app`. Declassifying the app's own data (the outcome code in `error`, an app
-event, a withdrawal receipt) works as before; a value private to any OTHER principal (one the
-program made with `private(x, "other")`) cannot be published. Existing apps that only declassify
-their own data need no change.
+**Publishing = `declassify` under the guest's ceiling (v0.6.46+, v0.6.49+).** `app` is the only
+principal in the guest (`ctx["state"]`, `ctx["payload"]` and what derives from them are private to
+`app`), and `declassify` is a capability: the guest runs every app under `stdout,declassify=app`,
+and the app declares it in its preamble, `require declassify("app")` (v0.6.49+, like `require net`).
+Then the app's own data (the outcome code in `error`, an app event, a withdrawal receipt) can be
+published; a value private to any OTHER principal (one the program made with `private(x, "other")`)
+cannot. **Breaking in v0.6.49:** an app written for v0.6.48 has no such line, and on the v0.6.49
+guest each of its `declassify` calls is a `label_violation` (no request applies): add the line. The
+shipped `app.syn` and the example apps already have it.
 
 **What a failure looks like on chain and in the log (v0.6.47+).** The Executor's log is written
 outside the enclave, so it never says where a label cut fell (a private value can choose which of N

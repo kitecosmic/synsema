@@ -205,11 +205,15 @@ print(declassify(c.email, "direct"))          -- label_violation: declassify is 
   task that uses `net` without `require net("…")` fails like any program
   (`Capability not granted: net("…")`), even if the program has it; with a `--trusted-cap-set` that
   does not name it, `… declared but above the host ceiling`.
-- **`declassify` in a trusted task follows `--trusted-cap-set`**: with `declassify=customers` it
-  publishes `customers` and nothing else; without a `--trusted-cap-set` it declassifies like a
-  program without a ceiling — **any principal**. So give the trusted modules a ceiling. (Measured
-  on v0.6.46: the task's `require declassify("customers")` documents the policy, but the bound is
-  the trusted ceiling — a task without that `require` still declassifies within it.)
+- **`declassify` in a trusted task is what the task declares, within `--trusted-cap-set`**
+  (v0.6.49+): with `declassify=customers` a task with `require declassify("customers")` publishes
+  `customers` and nothing else, and a task **without** that line publishes nothing (v0.6.46–v0.6.48
+  the trusted ceiling alone allowed it). The refusal says ``This runs in a trusted module, which
+  declares its capabilities per exported task: add `require declassify("<principal>")` to the
+  exported task that runs it …``. While the module loads nothing is declared, not even by a task its
+  top level calls; a non-exported helper grants nothing. Without a `--trusted-cap-set` a trusted
+  task declassifies like a program without a ceiling — **any principal** — so give the trusted
+  modules a ceiling.
 - A trusted module can `use` another trusted module (`use "trusted:base" as base`); a file module
   (`use "./x.syn"`) is an error: `a trusted module imports only other trusted modules …`.
 - Its audit entries carry `context: "trusted:tools"` and `file: "trusted:tools"`, and its
@@ -222,20 +226,23 @@ print(declassify(c.email, "direct"))          -- label_violation: declassify is 
   would run with the tool's capabilities; pass the values it needs instead`.
 - **It never sees the program's names**: a program that defines `task upper(x)` before or after the
   `use` does not change what the tool's `upper(...)` runs.
-- **It cannot change the module**: `set t.config to …` changes only the program's own copy of the
-  exports; the tool's tasks and another `use` see the original.
+- **It cannot change the module**: `set t.config to …` (or `set t.config["limit"] to …`) changes
+  only the program's own copy of an exported value; the tool's tasks and another `use` see the
+  original. Replacing a task or adding a name is an error (v0.6.49+): `cannot replace the trusted
+  task 'reply' from outside the module`, `trusted module has no export 'nuevo' — its names are the
+  ones it exports, and the program cannot add one`.
 - **It cannot load one itself**: the name comes only from the host, and the program never sees the
   path. An unknown name is a load error: `no trusted module named 'tools': the host loads it
   (\`synsema run --trusted tools=./file.syn\`, or \`trusted: { tools: source }\` in wasm); a
   program cannot load one itself`. `print(t)` shows `{reply: builtin:trusted:tools.reply, …}`.
-- **Its tasks take positional arguments only**: `t.reply(customer = c)`, `call(t.reply, {...})` and
-  `call_tool(t.reply, {...})` fail with `trusted:tools.reply() does not accept named arguments (got
-  customer = …); pass it by position`, and `tool_spec(t.reply, …)` is refused (`tool_spec needs a
-  task of the program, not the builtin 'trusted:tools.reply'`). To offer a trusted tool to a model,
-  wrap it in a program task: `task reply(customer: map, body: text)` → `give t.reply(customer,
-  body)`, and put the wrapper in the allow-list and the catalog. Note that `call`/`call_tool` with
-  a private value in the argument map give a **private** result, even when the tool declassified
-  what it returns; call the wrapper directly (`reply(c, body)`) to keep the public result.
+- **Its tasks take named arguments** (v0.6.49+; before, by position only): `t.reply(c, body =
+  "hi")`, and they go to a model as they are: `tool_spec(t.reply, …)` lists the parameters (without
+  types: `["customer", "body"]`) and `call_tool(t.reply, {"customer": c, "body": "hi"})` dispatches
+  it, in the module's scope; typed parameters are checked, and a task or a lambda among the
+  arguments is still an error. To give the model the **types**, wrap it in a program task: `task
+  reply(customer: map, body: text)` → `give t.reply(customer, body)`. Note that `call(t.reply,
+  {…})` with a private value in the argument map gives a **private** result even when the tool
+  declassified what it returns; `call_tool` and the direct call keep the public result.
 
 **What it does not do yet** — each one is an error inside a trusted tool, naming the reason:
 defining or spawning an agent, `parallel_map`, `cron_every`/`cron_after`, a `use` of a file module

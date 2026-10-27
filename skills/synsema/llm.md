@@ -8,7 +8,7 @@ let email be generate "response email" given complaint with tone = "empathetic"
 let insight be reason about problem with context = background_data
 ```
 
-**`generate` takes a text literal as the instruction, and the data goes after `given`.** `generate "hello " + c` reads as `(generate "hello ") + c`: the model gets `"hello "` and `c` is glued onto its answer. Neither a variable (`generate p`) nor parentheses (`generate ("hello " + c)`) is accepted (`Expected TEXT`), and `{c}` inside the literal is sent as is, braces included. Write `generate "a greeting" given c` (any expression after `given`: `given "name: " + c`). `reason` and `analyze` take the whole expression (`reason "hello " + c` sends `hello Ana`).
+**`generate` takes a text literal as the instruction, and the data goes after `given`.** `generate "hello " + c` reads as `(generate "hello ") + c`: the model gets `"hello "` and `c` is glued onto its answer. Neither a variable (`generate p`) nor parentheses (`generate ("hello " + c)`) is accepted (`Expected TEXT`), and `{c}` inside the literal is sent as is, braces included. Write `generate "a greeting" given c` (any expression after `given`: `given "name: " + c`). Since v0.6.49 the engine warns at load (once per site, also in `check`/`code check`): ``warning: p.syn:3: `generate "…" + …` joins the model's answer with what follows the `+`; the model does not see it. To give it to the model: generate "…" given <expression>``. `reason` and `analyze` take the whole expression (`reason "hello " + c` sends `hello Ana`).
 
 ## Capability
 
@@ -558,7 +558,9 @@ when name == "add"
   collect into a private variable instead (`let parts be private([], "customers")` then
   `set parts to parts + [t]`).
 - **Audit**: each call writes an entry `llm("customers@api.anthropic.com")` (or
-  `judge("customers@local")`), `source: "llm-data"`, `reason` = the operation; a refused one is
+  `judge("customers@local")`), `source: "llm-data"`, `reason` = the permission, `Granted by llm("customers@api.anthropic.com")`
+  (v0.6.49+; before, the operation, `generate` — a tool reading old receipts accepts both), one
+  entry per call; a refused one is
   written with `granted: false` and `reason: "<op>: not in the host ceiling or not required"`. The
   principal in it is the program's declared set. The operation's own entry (`source: "llm operation"`)
   names `llm` for every call, public or private: the grant that let the data out is the

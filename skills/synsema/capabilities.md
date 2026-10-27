@@ -326,8 +326,11 @@ every run; with `require llm` and `require llm("clientes")`, a public `generate`
   IPv4 mapped/translated in IPv6 (`::ffff:a.b.c.d`, `64:ff9b::/96`) counts as that IPv4. **To reach a
   private address, every layer with a wildcard must name it:** the exact host (`net("db")`,
   `net("localhost")` — reached wherever it resolves), the literal address, or a CIDR
-  (`net("10.0.0.0/8")` covers literal addresses inside it; a *name* resolving inside a CIDR is reached
-  only together with a wildcard grant), or from config: `require net(env("CONTROL_URL"))`. Error (the
+  (`net("10.0.0.0/8")` covers literal addresses inside it, **never a name**, whatever it resolves to,
+  and a wildcard does not add names to it: the permission does not depend on DNS; v0.6.49+ the
+  error says so and gives the line, ``… net("127.0.0.0/8") covers the addresses inside it when the
+  URL writes the address, never a name … Name the host: add `require net("localhost:1")` …``), or
+  from config: `require net(env("CONTROL_URL"))`. Error (the
   `http*` builtins return it as a transport failure, `{status: 0, ok: false, error}`; `tcp_connect`,
   `ws_connect`, the chain RPC builtins and `push_send` raise it): ``http_get: `db` resolved to 10.0.0.5,
   a private address; a `net` grant with a wildcard reaches only public addresses. Name it: `require

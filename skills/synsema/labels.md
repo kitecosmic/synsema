@@ -88,22 +88,25 @@ v0.6.45 printed `{builtin:private: 1}`). A program that **binds the name to a va
 with or without `--labels` (`synsema run`, `synsema test`, `synsema code check`); plain
 `synsema check` (the parse check) does not report it.
 
-## `declassify` is a capability, and the host's ceiling bounds it (v0.6.46+)
+## `declassify` is a capability: the program declares it, the host bounds it (v0.6.46+, v0.6.49+)
 
-`declassify` is the one place private data leaves, so the **host** — not the program — decides
-which principals may be published. Think of it like `unsafe` in your own Rust crate: explicit, with
-its mandatory reason, listed in full by `synsema code check --json`.
+`declassify` is the one place private data leaves, so it works like `require net`: under a ceiling
+the **program** declares what it publishes (`require declassify("customers")`) and the **host's
+ceiling** has to allow it too (`declassify=customers`). Think of it like `unsafe` in your own Rust
+crate: explicit, with its mandatory reason, listed in full by `synsema code check --json`.
 
 | How the program runs (with `--labels`) | What `declassify` may remove |
 |---|---|
-| no ceiling (plain `run`/`test`/`serve`) | any principal — granted by the runtime, as before |
+| no ceiling (plain `run`/`test`/`serve`) | any principal — granted by the runtime, `require` or not |
 | `--cap-set …` without a `declassify` item | **nothing** |
-| `--cap-set "stdout,declassify=customers"` | `customers` only |
-| `--cap-set "stdout,declassify=cust*"` | principals matching the glob (as for `secret`) |
-| `--cap-set "stdout,declassify"` or `declassify=*` | any principal |
+| `--cap-set "stdout,declassify=customers"` + `require declassify("customers")` | `customers` only |
+| `--cap-set "stdout,declassify=customers"` **without** the `require` | **nothing** (v0.6.49+; v0.6.46–v0.6.48 the ceiling alone allowed it) |
+| `--cap-set "stdout,declassify=cust*"` + `require declassify("customers")` | `customers` (a `require declassify("cust*")` needs a glob in the ceiling) |
+| `--cap-set "stdout,declassify"` or `declassify=*` | what the program declares — a bare `require declassify` too, with a warning at start |
+| a scoped ceiling + a **bare** `require declassify` | **refused whole** (wider than the ceiling, as `require net` under `net=api.x.com`) |
 | `--sandbox`, `--deterministic` | nothing (they never grant it) |
 | inside a `sandbox` block | nothing |
-| inside `sandbox under {"declassify": "customers"}` | `customers` (globs work), still within the host ceiling |
+| inside `sandbox under {"declassify": "customers"}` | `customers` (globs work), still within the host ceiling and the program's `require` |
 | wasm: `ceiling: "stdout,declassify=customers"` | the same as `--cap-set` |
 
 ```sh
@@ -111,19 +114,28 @@ synsema run --labels --cap-set "stdout,declassify=customers" app.syn
 ```
 
 ```synsema
+require declassify("customers")                  -- what this program publishes (v0.6.49+ under a ceiling)
 let c be private(3, "customers")
 sandbox under {"declassify": "customers"}       -- delegate it to this block only
     print(declassify(c, "the count is public"))
 ```
+
+**Where the `require` goes** (v0.6.49+): in the program's preamble; in an **agent's** body (an agent
+declares its own capabilities, the preamble does not reach it; a `parallel_map` inside the agent
+inherits the agent's); in a **trusted task** (each exported task declares its own, within
+`--trusted-cap-set`; nothing is declared while the module loads, not even by a task its top level
+calls — move the `declassify` into an exported task the program calls). A non-exported helper
+grants nothing. The refusal says which of these applies.
 
 - **What is checked is what the call removes.** `declassify(v, "why")` removes every principal of
   `v`; the narrowing form `declassify(v, "why", ["bank"])` removes the rest, so with
   `declassify=app` a value private to `["app", "bank"]` can be narrowed to `["bank"]`. A
   `declassify` of a value that is not private removes nothing and always passes.
 - **Breaking:** a program that declassifies and runs with `--labels` under `--cap-set`, `--sandbox`
-  or `--deterministic` now stops at the `declassify`. Migrate by adding `declassify=<principal>` to
-  the `--cap-set` (for `--sandbox`/`--deterministic`, switch to an explicit `--cap-set`, e.g.
-  `--cap-set "stdout,time,declassify=app"`).
+  or `--deterministic` stops at the `declassify` (v0.6.46+). Migrate by adding
+  `declassify=<principal>` to the `--cap-set` (for `--sandbox`/`--deterministic`, switch to an
+  explicit `--cap-set`, e.g. `--cap-set "stdout,time,declassify=app"`) **and**, since v0.6.49,
+  `require declassify("<principal>")` to the program (or the agent, or the trusted task).
 - **A refusal is a `label_violation`, and `try`/`recover` cannot catch it** (whether it passes
   depends on the real label of the value — a catchable refusal would be an oracle). Like every label
   violation, it ends the run and withholds the buffered output. **Under a ceiling the error does not
@@ -132,26 +144,27 @@ sandbox under {"declassify": "customers"}       -- delegate it to this block onl
 
 ```
 Runtime error: app.syn:3:17: label_violation: declassify is not granted for what this value is
-private to (customers,others). With a ceiling the host names what a program may publish
-(`--cap-set declassify=<principal>`), and inside a `sandbox` only a `sandbox under` that delegates
-`declassify` allows it
+private to (customers,others). With a ceiling the program declares what it publishes (`require
+declassify("<principal>")` in the program's preamble, or in the body of the agent that runs this
+code: an agent declares its own, also for its `parallel_map`) and the host's ceiling has to allow
+it too (`--cap-set declassify=<principal>`); inside a `sandbox` only a `sandbox under` that
+delegates `declassify` allows it
 ```
 
   The set in parentheses is the program's **declared** set (every principal it marks anywhere),
   never the value's real label — the real one would tell which value it was. The
-  `[INF] declassify: … (from […] to […])` log line names the declared set too (`[…]` when the
-  program declares no principal).
+  `[INF] declassify: … (from […] to […])` log line names the declared set too (v0.6.49+: `from
+  principals the program does not declare` when it declares none).
 - **Without `--labels` nothing is checked**: `private(…)` raises (labels are off) and `declassify`
   is the identity.
-- **`require declassify("customers")`** is understood (v0.6.45 ignored it) and is what the review
-  and a trusted module declare ([modules.md](modules.md) § Trusted modules). What bounds the
-  publication is the **ceiling**: a `require declassify("P")` does not by itself stop a
-  `declassify` of another principal (measured on v0.6.46: with no ceiling, or with
-  `declassify=customers`, a program that requires `declassify("others")` still publishes
-  `customers`). A **bare** `require declassify` prints a warning at start:
+- **`require declassify("customers")`** grants it under a ceiling (v0.6.49+; v0.6.46–v0.6.48 only
+  the ceiling decided, and v0.6.45 ignored the line). Without a ceiling it changes nothing:
+  `declassify` is granted, like `unsafe` in your own crate. `synsema code check` suggests the line
+  for a `declassify` without it. A **bare** `require declassify` prints a warning at start:
   `synsema: warning: bare \`require declassify\` permits publishing data private to ANY principal;
   scope it with \`require declassify("principal")\` (the principal the call removes)`.
-- The Vela guest runs its app under `stdout,declassify=app` (its only principal is `app`).
+- The Vela guest runs its app under `stdout,declassify=app` (its only principal is `app`), so the
+  app declares `require declassify("app")` (v0.6.49+; see [guests.md](guests.md)).
 
 ## What a cut shows, and to whom (v0.6.47+)
 
@@ -216,8 +229,10 @@ with the program counter public and no `label_violation`):
 ## `read_line`, `flush` and the order of the output (v0.6.46+)
 
 - **The prompt of `read_line(prompt)` is a public sink, like `print`.** A private prompt, or a
-  prompt inside a private branch, is a `label_violation` (`read_line prompt under private control
-  flow (pc = [a]) …`; the message says "control flow" for a private prompt too). `read_line()`
+  prompt inside a private branch, is a `label_violation`: inside a branch, `read_line prompt under
+  private control flow (pc = [a]) …`; a private prompt outside one (v0.6.49+), `the read_line prompt
+  is private (to a) and the prompt goes to stdout, which is public. Ask with a public prompt, or
+  declassify(<the prompt>, "<why it may be published>")`. `read_line()`
   without a prompt inside a private branch is allowed.
 - **With `--labels`, `flush()` and `read_line` do not write the pending output live.** `print`
   already kept it until the end; now the prompts come out first and the printed lines at the end
