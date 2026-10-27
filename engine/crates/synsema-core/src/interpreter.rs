@@ -3722,6 +3722,18 @@ impl Interpreter {
     /// del programa (o, en un worker o un agente, antes de inyectarle los globales). Una vez por
     /// intérprete. Es otra base que la de confianza: `check_trusted_origin` distingue una task de una
     /// tool porque su cadena llega a ESA base.
+    /// Ronda 1 (M1) y ronda 2 (N1): la base de los módulos al entrar por `execute`, `run_block` o
+    /// los bloques de test. La primera entrada saca la foto del preludio; una siguiente (cada línea
+    /// de la REPL, un embebedor) no: la foto traería lo que ligaron las anteriores, así que sin foto
+    /// quedan los builtins.
+    fn first_module_base(&mut self) {
+        if self.executed {
+            self.module_base();
+        } else {
+            self.snapshot_module_base();
+        }
+    }
+
     pub fn snapshot_module_base(&mut self) {
         if self.module_base_env.is_none() {
             self.module_base_env = Some(self.prelude_snapshot("module-base"));
@@ -4150,8 +4162,9 @@ impl Interpreter {
         // v0.6.50 (A): como `execute`, la foto del preludio antes de que el bloque ligue nada (la
         // REPL, un embebedor). Un agente ya la trae de `rebuild_globals`.
         if self.module_base_env.is_none() && stmts_have_file_use(stmts) {
-            self.snapshot_module_base();
+            self.first_module_base();
         }
+        self.executed = true;
         let saved = self.take_taint();
         let r = self.exec_block(stmts, &g);
         self.restore_taint(saved);
@@ -4361,8 +4374,6 @@ impl Interpreter {
         // antes de que llegue ningún dato, el texto se ve aunque los datos sean privados.
         crate::templates::check_tool_renders(&program, name, self.trusted_templates.get(name).map(|t| &**t))
             .map_err(err)?;
-        // v0.6.50 (E-c): el `require` de una task que el módulo no exporta no concede nada.
-        crate::deprecated::warn_trusted_unexported_requires(&program, name);
         self.loading_modules.insert(key.clone());
         // Ronda 1 (A1): hijo del preludio, no de `global_env`: los nombres libres del módulo son los
         // builtins, no lo que el programa definió antes o después del `use`.
@@ -4383,6 +4394,7 @@ impl Interpreter {
         self.loading_modules.remove(&key);
         exec_res?;
         let mut exports = SynMap::new();
+        let mut wrapped: HashSet<usize> = HashSet::new();
         for export in names {
             if let Some(v) = env_get(&module_env, &export) {
                 // Consciente de etiquetas: los argumentos entran con la suya (la política del dev
@@ -4391,11 +4403,23 @@ impl Interpreter {
                 // una task que la tool expone dentro de un mapa o una lista (`export let M be
                 // {"f": helper}`): sin envolver corría con las capabilities del programa.
                 let mut aware = Vec::new();
-                let v = wrap_exposed_tasks(name, &export, v, &hook, &mut aware);
+                let v = wrap_exposed_tasks(name, &export, v, &hook, &mut aware, &mut wrapped);
                 self.label_aware.extend(aware);
                 exports.insert(export, v);
             }
         }
+        // v0.6.50 (E-c): el `require` de una task que el módulo no exporta no concede nada. Ronda 2
+        // (B1): cuenta como exportada la task de nivel superior que la carga envolvió, también la que
+        // llega a un export por otro nombre (`export let M be BASE`); una que sólo nombra una lambda
+        // o una llamada (`export let W be () => helper()`), no.
+        let exported: HashSet<String> = module_env
+            .borrow()
+            .bindings
+            .iter()
+            .filter(|(_, v)| matches!(v, SynValue::Task(t) if wrapped.contains(&(Rc::as_ptr(t) as usize))))
+            .map(|(k, _)| k.to_string())
+            .collect();
+        crate::deprecated::warn_trusted_unexported_requires(&program, name, &exported);
         // Ronda 1 (A2): sin `register_module`. La vista de un módulo común se escribe desde afuera
         // (`set m.X to v` religa su variable); la de uno de confianza es un mapa de datos.
         let map = exports.into_ref();
@@ -5238,13 +5262,7 @@ impl Interpreter {
         let g = self.global_env.clone();
         self.snapshot_trusted_base();
         if program.has_file_use {
-            if self.executed {
-                // Ronda 1 (M1): un segundo `execute` (cada línea de la REPL, un embebedor) sin
-                // foto: los builtins. Una foto acá traería lo que ligaron los anteriores.
-                self.module_base();
-            } else {
-                self.snapshot_module_base();
-            }
+            self.first_module_base();
         }
         self.executed = true;
         self.control_taint = self.no_label.clone();
@@ -5304,8 +5322,9 @@ impl Interpreter {
         let g = self.global_env.clone();
         self.snapshot_trusted_base();
         if program.has_file_use {
-            self.snapshot_module_base();
+            self.first_module_base();
         }
+        self.executed = true;
         // Preámbulo: intent/require al inicio, luego congelar intent (igual que execute).
         let mut split = 0;
         for stmt in &program.statements {
@@ -11765,8 +11784,16 @@ fn secret_concat(left: &SynValue, right: &SynValue, loc: &SourceLocation) -> Res
 /// "confused deputy"), así que es error.
 /// v0.6.50 (ronda 1, B6): envuelve en el scope de la tool cada task que expone un export, también
 /// dentro de mapas y listas (`path` es `M.f`, `L[0]`). Un mapa o una lista sin tasks no se copia.
-/// `aware` junta los nombres de los envoltorios (son conscientes de etiquetas).
-fn wrap_exposed_tasks(module: &str, path: &str, v: SynValue, hook: &TrustedScopeHook, aware: &mut Vec<String>) -> SynValue {
+/// `aware` junta los nombres de los envoltorios (son conscientes de etiquetas); `wrapped`, las tasks
+/// envueltas (para E-c, ronda 2).
+fn wrap_exposed_tasks(
+    module: &str,
+    path: &str,
+    v: SynValue,
+    hook: &TrustedScopeHook,
+    aware: &mut Vec<String>,
+    wrapped: &mut HashSet<usize>,
+) -> SynValue {
     fn has_task(v: &SynValue) -> bool {
         match v {
             SynValue::Task(_) => true,
@@ -11777,6 +11804,7 @@ fn wrap_exposed_tasks(module: &str, path: &str, v: SynValue, hook: &TrustedScope
     }
     match v {
         SynValue::Task(t) => {
+            wrapped.insert(Rc::as_ptr(&t) as usize);
             let w = trusted_wrapper(module, path, t, hook.clone());
             if let SynValue::Builtin(b) = &w {
                 aware.push(b.name.to_string());
@@ -11788,7 +11816,7 @@ fn wrap_exposed_tasks(module: &str, path: &str, v: SynValue, hook: &TrustedScope
             for (k, x) in m.borrow().iter() {
                 let key = k.to_string();
                 let p = format!("{}.{}", path, key);
-                out.insert(key, wrap_exposed_tasks(module, &p, x.clone(), hook, aware));
+                out.insert(key, wrap_exposed_tasks(module, &p, x.clone(), hook, aware, wrapped));
             }
             SynValue::Map(out.into_ref())
         }
@@ -11798,7 +11826,7 @@ fn wrap_exposed_tasks(module: &str, path: &str, v: SynValue, hook: &TrustedScope
                 .to_vec()
                 .into_iter()
                 .enumerate()
-                .map(|(i, x)| wrap_exposed_tasks(module, &format!("{}[{}]", path, i), x, hook, aware))
+                .map(|(i, x)| wrap_exposed_tasks(module, &format!("{}[{}]", path, i), x, hook, aware, wrapped))
                 .collect();
             syn_list(items)
         }

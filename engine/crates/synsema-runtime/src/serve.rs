@@ -687,6 +687,9 @@ pub(crate) enum GlobalVal {
         /// v0.6.50 (ronda 1, A1): de qué raíz léxica cuelga la task. Del otro lado cierra ahí, no
         /// donde está guardada: una lambda del programa que un módulo guarda sigue viendo el programa.
         root: TaskRoot,
+        /// Ronda 2 (R2): los envs entre la task y su raíz (los locales de quien la armó), del más
+        /// externo al más interno. Viajan copiados, como cualquier dato que cruza.
+        frames: Vec<FrameVal>,
     },
     /// v0.6.50 (B): una task exportada por una tool de confianza (el builtin que la envuelve). Viaja
     /// la task y el entorno de la tool (por id, una vez por foto, como un `Module`); del otro lado
@@ -741,6 +744,19 @@ pub(crate) enum GlobalVal {
     /// tasks cierran sobre el global del request como cualquier task top-level — sin el
     /// `module_env` compartido del caso módulo.
     MapWithTasks(Vec<(String, GlobalVal)>),
+    /// Ronda 2 (R2, B3): una lista con tasks. Cada task cruza por su cadena, como en `MapWithTasks`;
+    /// antes la lista viajaba como dato y sus tasks llegaban como texto.
+    ListWithTasks(Vec<GlobalVal>),
+}
+
+/// Ronda 2 (R2): un env intermedio de la cadena de una task. Se identifica por id (la identidad del
+/// env en la foto), como un módulo: la primera vez viaja con sus nombres; las siguientes, por id. Dos
+/// lambdas del mismo frame comparten la copia del otro lado, y una task local que se nombra a sí
+/// misma desde su frame se resuelve sin ciclo.
+pub(crate) struct FrameVal {
+    id: String,
+    name: String,
+    env: Option<Vec<(String, GlobalVal)>>,
 }
 
 /// Estado del ÁRBOL COMPLETO de un snapshot. Se comparte entre TODOS los bindings de
@@ -768,22 +784,28 @@ struct SnapState<'a> {
 /// Un dato (sin tareas): congelado si la foto congela y se puede; si no, la copia de siempre (un
 /// generador adentro cruza como stub).
 fn data_global(v: &SynValue, state: &mut SnapState) -> GlobalVal {
+    frozen_global(v, state).unwrap_or_else(|| GlobalVal::Value(synsema_core::rng::with_stubbed_globals(|| to_send(v))))
+}
+
+/// El dato congelado (para siempre, compartido o con alcance), si la foto congela y se puede. Lo
+/// que se congela no tiene tasks: el congelado las rechaza.
+fn frozen_global(v: &SynValue, state: &mut SnapState) -> Option<GlobalVal> {
     if state.freeze {
         if let Ok(f) = synsema_core::frozen::FrozenValue::new(v.clone()) {
-            return GlobalVal::Frozen(f);
+            return Some(GlobalVal::Frozen(f));
         }
     }
     if state.share {
         if let Ok(f) = synsema_core::frozen::FrozenValue::share(v.clone()) {
-            return GlobalVal::Frozen(f);
+            return Some(GlobalVal::Frozen(f));
         }
     }
     if let Some(scope) = state.scoped.as_deref_mut() {
         if let Ok(i) = scope.add(v.clone()) {
-            return GlobalVal::Scoped(i);
+            return Some(GlobalVal::Scoped(i));
         }
     }
-    GlobalVal::Value(synsema_core::rng::with_stubbed_globals(|| to_send(v)))
+    None
 }
 
 /// Convierte un `SynValue` a `GlobalVal` de forma recursiva, con un árbol de snapshot
@@ -828,44 +850,98 @@ fn snapshot_alias_entries(
 }
 
 /// v0.6.50 (ronda 1, A1): la raíz léxica de una task (ver `GlobalVal::Task`).
-#[derive(Clone, Debug)]
-pub enum TaskRoot {
+pub(crate) enum TaskRoot {
     /// Cuelga del global del programa (una task o lambda del programa).
     Global,
-    /// Cuelga del env de un módulo (`module:<id>`).
-    Module(String),
+    /// Cuelga del env de un módulo (`module:<id>`). Ronda 2 (R2, M1): el env viaja con la task si
+    /// todavía no viajó en esta foto, así que no depende del orden de los `use`.
+    Module { id: String, env: Option<Vec<(String, GlobalVal)>> },
     /// Otra raíz (un fork, un template): cierra donde se reconstruye, como antes.
     Here,
 }
 
-/// Sube por los padres del env de una task hasta un módulo o la raíz.
-fn task_root(env: &Rc<RefCell<Environment>>) -> TaskRoot {
-    let mut cur = env.clone();
-    loop {
-        let parent = {
+/// Las bindings de un env para la foto (sin los builtins, que cada intérprete tiene), marcado en
+/// curso mientras se recorren; `None` si ya viaja (o viajó) en este árbol.
+fn env_bindings(env: &Rc<RefCell<Environment>>, state: &mut SnapState) -> Option<Vec<(String, GlobalVal)>> {
+    let key = Rc::as_ptr(env) as usize;
+    if state.in_progress.contains(&key) || state.done.contains(&key) {
+        return None;
+    }
+    state.in_progress.push(key);
+    let entries: Vec<(String, GlobalVal)> = env
+        .borrow()
+        .bindings
+        .iter()
+        .filter(|(_, v)| !matches!(v, SynValue::Builtin(_)))
+        .map(|(k, v)| (k.to_string(), val_to_global_inner(v, state)))
+        .collect();
+    state.in_progress.pop();
+    state.done.insert(key);
+    Some(entries)
+}
+
+/// Ronda 2 (R2): la foto de una task con su cadena léxica: la raíz (el global, su módulo u otra) y
+/// los envs intermedios.
+fn task_global(t: &Rc<SynTaskValue>, state: &mut SnapState) -> GlobalVal {
+    let mut chain: Vec<Rc<RefCell<Environment>>> = Vec::new();
+    let mut cur = t.closure_env.clone();
+    let root = loop {
+        let (is_module, parent) = {
             let e = cur.borrow();
-            if e.name.starts_with("module:") {
-                return TaskRoot::Module(e.name.to_string());
-            }
-            match &e.parent {
-                Some(p) => p.clone(),
-                None => return if &*e.name == "global" { TaskRoot::Global } else { TaskRoot::Here },
-            }
+            (e.name.starts_with("module:"), e.parent.clone())
         };
-        cur = parent;
+        if is_module {
+            let id = cur.borrow().name.to_string();
+            break TaskRoot::Module { id, env: env_bindings(&cur, state) };
+        }
+        match parent {
+            Some(p) => {
+                chain.push(cur.clone());
+                cur = p;
+            }
+            None => break if &*cur.borrow().name == "global" { TaskRoot::Global } else { TaskRoot::Here },
+        }
+    };
+    let frames = chain
+        .iter()
+        .rev()
+        .map(|f| FrameVal {
+            id: format!("frame:{:x}", Rc::as_ptr(f) as usize),
+            name: f.borrow().name.to_string(),
+            env: env_bindings(f, state),
+        })
+        .collect();
+    GlobalVal::Task {
+        name: t.name.clone(),
+        parameters: t.parameters.clone(),
+        body: t.body.clone(),
+        required_capabilities: t.required_capabilities.clone(),
+        root,
+        frames,
     }
 }
 
-/// Núcleo recursivo de `val_to_global_shared`/`snapshot_globals_*`/`snapshot_module_env`.
+/// Ronda 2 (R2): la foto de la task que `parallel_map` aplica, con su cadena (los datos, congelados
+/// con el alcance del `parallel_map`).
+pub(crate) fn snapshot_task(t: &Rc<SynTaskValue>, scoped: Option<&mut synsema_core::frozen::ScopedFreeze>) -> GlobalVal {
+    task_global(t, &mut SnapState { scoped, ..SnapState::default() })
+}
+
+/// ¿Hay una task (o una task de confianza) en el valor? Sólo una lista de valores puede tenerla.
+fn has_callable(v: &SynValue) -> bool {
+    match v {
+        SynValue::Task(_) => true,
+        SynValue::Builtin(b) => synsema_core::interpreter::trusted_tool_parts(b).is_some(),
+        SynValue::Map(m) => m.borrow().iter().any(|(_, x)| has_callable(x)),
+        SynValue::List(l) => l.borrow().as_values().is_some_and(|xs| xs.iter().any(has_callable)),
+        _ => false,
+    }
+}
+
+/// Núcleo recursivo de `val_to_global_shared`/`snapshot_globals_*`/`snapshot_task`.
 fn val_to_global_inner(v: &SynValue, state: &mut SnapState) -> GlobalVal {
     match v {
-        SynValue::Task(t) => GlobalVal::Task {
-            name: t.name.clone(),
-            parameters: t.parameters.clone(),
-            body: t.body.clone(),
-            required_capabilities: t.required_capabilities.clone(),
-            root: task_root(&t.closure_env),
-        },
+        SynValue::Task(t) => task_global(t, state),
         // Un generador dentro de un global (`{"g": rng(1)}`) tampoco se copia en silencio.
         SynValue::Builtin(b) if synsema_core::rng::snapshot(b).is_some() => GlobalVal::SharedRng(b.name.clone()),
         SynValue::Builtin(b) if synsema_core::interpreter::trusted_tool_parts(b).is_some() => trusted_task_global(b, state),
@@ -881,30 +957,15 @@ fn val_to_global_inner(v: &SynValue, state: &mut SnapState) -> GlobalVal {
             // viajaba como un mapa común, con sus lambdas colgadas del global del request.
             let module_env = synsema_core::interpreter::module_env_of_map(m).or_else(|| module_env_of(&m.borrow()));
             if let Some(module_env) = module_env {
-                let key = Rc::as_ptr(&module_env) as usize;
                 let id = module_env.borrow().name.to_string();
                 let is_alias = synsema_core::interpreter::module_env_of_map(m).is_some();
-                if state.in_progress.contains(&key) || state.done.contains(&key) {
-                    // El env ya viaja (o viajó) en este árbol: referencia por id. Un solo
-                    // camino cubre el map auto-referencial (DE-032), el diamante B→D←C
-                    // (DE-033) y cualquier ciclo hipotético. En rebuild resuelve al MISMO
-                    // env vía el registro.
-                    let alias = snapshot_alias_entries(m, &module_env, state);
-                    return GlobalVal::Module { id, is_alias, alias, env: None };
-                }
-                // Primer encuentro: el env viaja inline (TODAS las bindings, DE-027).
-                state.in_progress.push(key);
-                let env: Vec<(String, GlobalVal)> = module_env
-                    .borrow()
-                    .bindings
-                    .iter()
-                    .filter(|(_, v)| !matches!(v, SynValue::Builtin(_)))
-                    .map(|(k, v)| (k.to_string(), val_to_global_inner(v, state)))
-                    .collect();
-                state.in_progress.pop();
-                state.done.insert(key);
+                // Primer encuentro: el env viaja inline (TODAS las bindings, DE-027). Si ya viaja (o
+                // viajó) en este árbol, referencia por id: un solo camino cubre el map
+                // auto-referencial (DE-032), el diamante B→D←C (DE-033) y cualquier ciclo
+                // hipotético. En rebuild resuelve al MISMO env vía el registro.
+                let env = env_bindings(&module_env, state);
                 let alias = snapshot_alias_entries(m, &module_env, state);
-                return GlobalVal::Module { id, is_alias, alias, env: Some(env) };
+                return GlobalVal::Module { id, is_alias, alias, env };
             }
             let entries: Vec<(String, GlobalVal)> = m
                 .borrow()
@@ -918,6 +979,15 @@ fn val_to_global_inner(v: &SynValue, state: &mut SnapState) -> GlobalVal {
             // Map de datos con callbacks (tasks que NO cierran sobre un módulo).
             GlobalVal::MapWithTasks(entries)
         }
+        // Ronda 2 (R2, B3): una lista con tasks cruza como un mapa con tasks. Primero el congelado
+        // (lo que congela no tiene tasks): una lista grande de datos no se recorre dos veces.
+        SynValue::List(l) => match frozen_global(v, state) {
+            Some(g) => g,
+            None if has_callable(v) => {
+                GlobalVal::ListWithTasks(l.borrow().to_vec().iter().map(|x| val_to_global_inner(x, state)).collect())
+            }
+            None => GlobalVal::Value(synsema_core::rng::with_stubbed_globals(|| to_send(v))),
+        },
         // Una lista (o lo que sea) con un generador adentro: el generador cruza como stub.
         other => data_global(other, state),
     }
@@ -928,23 +998,8 @@ fn val_to_global_inner(v: &SynValue, state: &mut SnapState) -> GlobalVal {
 fn trusted_task_global(b: &synsema_core::interpreter::BuiltinTask, state: &mut SnapState) -> GlobalVal {
     let (module, export, t) = synsema_core::interpreter::trusted_tool_parts(b).expect("una task de confianza");
     let module_env = t.closure_env.clone();
-    let key = Rc::as_ptr(&module_env) as usize;
     let env_id = module_env.borrow().name.to_string();
-    let env = if state.in_progress.contains(&key) || state.done.contains(&key) {
-        None
-    } else {
-        state.in_progress.push(key);
-        let entries: Vec<(String, GlobalVal)> = module_env
-            .borrow()
-            .bindings
-            .iter()
-            .filter(|(_, v)| !matches!(v, SynValue::Builtin(_)))
-            .map(|(k, v)| (k.to_string(), val_to_global_inner(v, state)))
-            .collect();
-        state.in_progress.pop();
-        state.done.insert(key);
-        Some(entries)
-    };
+    let env = env_bindings(&module_env, state);
     GlobalVal::TrustedTask {
         module: module.to_string(),
         export: export.to_string(),
@@ -966,31 +1021,6 @@ pub(crate) fn module_env_of(map: &MapObj) -> Option<Rc<RefCell<Environment>>> {
         }
     }
     None
-}
-
-/// Snapshotea TODAS las bindings de un `module_env` (saltando builtins) a `GlobalVal`,
-/// para que viajen `Send` a otro hilo/intérprete, con el env raíz marcado en curso (una
-/// referencia interna a él — map auto-referencial — viaja por id, no re-snapshotea).
-/// Reusa el mismo camino que la rama Module de `val_to_global_inner` — usado por
-/// `parallel_map` para capturar el módulo de la task aplicada (DE-030).
-pub(crate) fn snapshot_module_env(
-    module_env: &Rc<RefCell<Environment>>,
-    scoped: Option<&mut synsema_core::frozen::ScopedFreeze>,
-) -> Vec<(String, GlobalVal)> {
-    let mut state = SnapState {
-        in_progress: vec![Rc::as_ptr(module_env) as usize],
-        done: HashSet::new(),
-        freeze: false,
-        scoped,
-        share: false,
-    };
-    module_env
-        .borrow()
-        .bindings
-        .iter()
-        .filter(|(_, v)| !matches!(v, SynValue::Builtin(_)))
-        .map(|(k, v)| (k.to_string(), val_to_global_inner(v, &mut state)))
-        .collect()
 }
 
 /// Registro `id → module_env` de UN rebuild (per-request/per-worker): toda referencia
@@ -1096,15 +1126,33 @@ pub(crate) fn rebuild_global_val(
         GlobalVal::Value(sv) => from_send(sv),
         GlobalVal::Frozen(f) => f.get(),
         GlobalVal::Scoped(i) => scope.expect("un valor con alcance se reconstruye dentro de su alcance").get(*i),
-        GlobalVal::Task { name, parameters, body, required_capabilities, root } => {
-            // Ronda 1 (A1): cierra en su raíz, no donde está guardada. El módulo de una raíz
-            // `Module` ya está en el registro cuando la task vive en él (se registra antes de
-            // poblarlo); si no, donde se reconstruye, como antes.
-            let closure_env = match root {
+        GlobalVal::Task { name, parameters, body, required_capabilities, root, frames } => {
+            // Ronda 1 (A1) y ronda 2 (R2): cierra en su cadena, no donde está guardada. El módulo de
+            // la raíz viene inline la primera vez en la foto o ya está en el registro; si no está en
+            // ningún lado, un env vacío de ese módulo (el nombre falta; nunca el de otro módulo).
+            let mut closure_env = match root {
                 TaskRoot::Global => base.global.clone(),
-                TaskRoot::Module(id) => registry.get(id).cloned().unwrap_or_else(|| closure_target.clone()),
+                TaskRoot::Module { id, env: Some(entries) } => rebuild_module_env(id, entries, base, registry, scope),
+                TaskRoot::Module { id, env: None } => {
+                    registry.get(id).cloned().unwrap_or_else(|| Environment::child(base.for_id(id), id))
+                }
                 TaskRoot::Here => closure_target.clone(),
             };
+            for f in frames {
+                closure_env = match registry.get(&f.id) {
+                    Some(e) => e.clone(),
+                    None => {
+                        let e = Environment::child(&closure_env, &f.name);
+                        // Registrar ANTES de poblar: una task del frame que lo nombra resuelve acá.
+                        registry.insert(f.id.clone(), e.clone());
+                        for (k, gv) in f.env.iter().flatten() {
+                            let v = rebuild_global_val(gv, &e, base, registry, scope);
+                            e.borrow_mut().bindings.insert(k.clone(), v);
+                        }
+                        e
+                    }
+                };
+            }
             SynValue::Task(Rc::new(SynTaskValue {
                 name: name.clone(),
                 parameters: parameters.clone(),
@@ -1231,6 +1279,9 @@ pub(crate) fn rebuild_global_val(
             }
             SynValue::Map(m.into_ref())
         }
+        GlobalVal::ListWithTasks(items) => synsema_core::types::syn_list(
+            items.iter().map(|gv| rebuild_global_val(gv, closure_target, base, registry, scope)).collect(),
+        ),
         GlobalVal::Agent { .. } => {
             // Los agentes van a `agent_definitions`, nunca a bindings — no debería llegar aquí.
             SynValue::Nothing

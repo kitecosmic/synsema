@@ -90,3 +90,34 @@ fn a_second_execute_does_not_lend_the_first_one_names() {
     let Err(Control::Error(e)) = r else { panic!("TASA no es del módulo: {:?}", interp.output) };
     assert!(e.to_string().contains("Undefined variable: 'TASA'"), "{}", e);
 }
+
+/// Ronda 2 (N1): `run_block` después de un `execute` sigue la misma regla: el módulo no ve lo que ligó
+/// el `execute`.
+#[test]
+fn run_block_after_execute_does_not_lend_the_names() {
+    let d = dir("block", "export task g()\n    give PROG\n");
+    let main = d.join("main.syn").to_string_lossy().into_owned();
+    let mut interp = Interpreter::new();
+    assert!(interp.execute(&parse_source("let PROG be 1\n", &main).unwrap()).is_ok());
+    let block = parse_source("use \"./lib.syn\" as lib\nprint(lib.g())\n", &main).unwrap();
+    let Err(Control::Error(e)) = interp.run_block(&block.statements) else { panic!("PROG no es del módulo: {:?}", interp.output) };
+    assert!(e.to_string().contains("Undefined variable: 'PROG'"), "{}", e);
+}
+
+/// Ronda 2 (N3): `read_template_dir` da el nombre normalizado, como wasm (un archivo `a\b.html` en
+/// Linux es `a/b.html`). En Windows un nombre no lleva `\`.
+#[cfg(unix)]
+#[test]
+fn read_template_dir_normalizes_the_names() {
+    let d = std::env::temp_dir().join(format!("synsema-v0650-tpldir-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    std::fs::create_dir_all(d.join("sub")).unwrap();
+    std::fs::write(d.join("a\\b.html"), "x").unwrap();
+    std::fs::write(d.join("sub/c.html"), "y").unwrap();
+    let names: Vec<String> = synsema_core::templates::read_template_dir(&d).unwrap().into_iter().map(|(n, _)| n).collect();
+    assert_eq!(names, vec!["a/b.html".to_string(), "sub/c.html".to_string()]);
+    std::fs::create_dir_all(d.join("a")).unwrap();
+    std::fs::write(d.join("a/b.html"), "z").unwrap();
+    let e = synsema_core::templates::read_template_dir(&d).unwrap_err();
+    assert!(e.contains("are the same template (a/b.html)"), "{}", e);
+}

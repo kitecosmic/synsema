@@ -20,7 +20,8 @@ Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the rele
   never `__main__`'s). Trusted modules already worked this way (v0.6.46). The same rule holds under
   `serve`, `parallel_map`, agents, `synsema test` and the REPL. A value the program passes in (an
   argument, a callback, a lambda) keeps its own scope, as before, also when the module keeps it and
-  calls it later from a request, a worker or an agent.
+  calls it later from a request, a worker or an agent (a lambda of module `a` that module `b`
+  keeps closes over `a`, whatever the order of the `use` lines, and never reads a name of `b`).
   **Breaking:** a module that read a global of its importer now fails with `Undefined variable:
   'TASA' — 'TASA' is a name of the program that imports this module, and a module sees only its own
   names and the builtins: pass it as an argument or define it in the module`. Write `lib.cobrar(n,
@@ -40,7 +41,8 @@ Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the rele
   argument keeps its label and the tool declassifies only what its task declares.
 - **A trusted tool renders the templates the host gives it.** `--trusted-templates t=./dir` (also
   in the wasip1 CLI; in wasm, `trusted: { t: { source, templates: { "r.html": "…" } } }`, where a
-  name is normalized as `render` looks it up and two names for one template are an error) reads the tool's templates at
+  name is normalized as `render` looks it up and two names for one template are an error, as in a
+  directory) reads the tool's templates at
   startup, before the program runs. Inside the tool, `render`, `include` and `layout` resolve only
   against that set: never the working directory (which the program can write) nor the program's
   bundle, and without `file.read` (they are part of the tool, as a bundle is part of its program).
@@ -59,6 +61,14 @@ Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the rele
   `export let M be armar()`) crossed into each request as plain data: its lambdas lost the module and
   a call to a private helper of the module failed with `Undefined variable` (under `run` it worked).
   The module is now recognized as such, and its callbacks close over it.
+- **A task that crosses into another interpreter keeps the locals of whoever made it.** A lambda or
+  a local task that goes to a `parallel_map` worker, an agent or a `serve` request now carries the
+  locals of the task that built it (copied: a `set` on a captured local changes the worker's copy,
+  not the original). Before, `task f(n)` with `give parallel_map((x) => x * n, xs)` failed with
+  `Undefined variable: 'n'`, and so did a local task that called itself or wrote a local of its
+  task. A list that holds tasks now crosses like a map that holds them (`let L be [(x) => PRE + x]`
+  then `L[0](x)` in a worker failed with `Cannot call value of type text`), also inside a module
+  and in a trusted tool, whose task keeps the tool's scope.
 - In a template, a private value is written as its value whether it comes straight from the data
   (`{c.name}`) or from a call (`{upper(c.name)}`), and the HTML carries its label. Before, the call
   wrote the marker `private(customers)` (its result carried the label of the render) and the plain
@@ -93,8 +103,9 @@ Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the rele
   `require` does not reach an agent); before, it pointed to the program's preamble. In a
   `parallel_map` worker, which inherits from whoever launched it, the text names both places. A
   `decide` served by the judge inside an agent names the agent's body too. Inside a `sandbox` block
-  the text says that the block denies every capability and to use `sandbox under {…}`; before, it
-  asked for a `require` that was already there.
+  the text says that the block denies every capability and to use `sandbox under {…}` (or, for
+  stdout, stdin, time and random, which a `sandbox under` cannot carry, to run it outside the
+  block); before, it asked for a `require` that was already there. The same inside a trusted task.
 - Two startup warnings for lines that do nothing:
   - `--cap-set llm=P` (or `judge=P`, also in `--trusted-cap-set`) without `@`, when no other item
     names a provider for P: the program may
@@ -102,7 +113,8 @@ Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the rele
     (`llm=P@<provider host>`, `P@*` for any). Before, it showed only at the first call.
   - In a trusted tool, a `require` in a task the module does not export grants nothing (the exported
     task the program calls opens the scope with what it declares). The tool now warns when it loads,
-    once per line. A task the module exposes inside an exported map or list counts as exported.
+    once per line. A task the module exposes in an export (directly, by another name, or inside a
+    map or a list) counts as exported; one that an exported task or lambda only calls does not.
 
 ## v0.6.49 — 2026-10-26
 

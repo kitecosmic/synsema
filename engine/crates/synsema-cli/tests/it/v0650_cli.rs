@@ -749,6 +749,9 @@ fn exit_stops_the_agents_under_explain_and_test() {
     let (code, out, err) = synsema_within(&dir, &["test", "t.syn"], 20).expect("synsema test quedó colgado");
     assert!(code != 0, "{} {}", out, err);
     assert!(!format!("{}{}", out, err).contains("Agent error"), "{} {}", out, err);
+    // Ronda 2 (B4): `conform --swarm` también; el agente detenido sale STOPPED, no ERROR.
+    let (_, out, err) = synsema_within(&dir, &["conform", "--swarm", "p.syn"], 20).expect("conform --swarm quedó colgado");
+    assert!(out.contains("\"Pub_0\":\"STOPPED\"") && !out.contains("ERROR"), "{} {}", out, err);
 }
 
 /// B3: sin techo y con `--auditor`, el sobre lleva el texto real de un error que el corte redacta
@@ -833,4 +836,122 @@ fn a_ceiling_llm_item_with_its_provider_elsewhere_does_not_warn() {
     assert!(code == 0 && !err.contains("warning"), "{}", err);
     let (_, _, err) = synsema(&dir, &["run", "--cap-set", "stdout,llm=clientes,llm=otros@local", "p.syn"], None);
     assert!(err.contains("warning: --cap-set llm=clientes:"), "{}", err);
+}
+
+// =========================================================
+// Ronda 2 de la auditoría (`specs/auditoria-v0.6.50-ronda2.md`; regla R2 del modelo)
+// =========================================================
+
+/// R1–R4 (M1): una lambda del módulo A que guarda el módulo B cierra sobre A en cualquier orden de
+/// los `use`, y nunca lee un nombre igual de B.
+#[test]
+fn a_module_lambda_kept_by_another_module_keeps_its_module() {
+    let dir = project("r2-m1");
+    std::fs::write(dir.join("a.syn"), "let SECRETO_A be \"deA\"\nexport task make()\n    give (x) => SECRETO_A + x\n").unwrap();
+    let b = "let CB be nothing\nexport task reg(f)\n    set CB to f\n    give \"ok\"\nexport task call(x)\n    give CB(x)\n";
+    std::fs::write(dir.join("b.syn"), b).unwrap();
+    std::fs::write(dir.join("b2.syn"), format!("let SECRETO_A be \"deB\"\n{b}")).unwrap();
+    for (tag, first) in [("ba", "b.syn"), ("same", "b2.syn")] {
+        let head = format!("use \"./{first}\" as mb\nuse \"./a.syn\" as ma\nprint(mb.reg(ma.make()))\n");
+        std::fs::write(dir.join("p.syn"), format!("{head}print(mb.call(\"-run\"))\nprint(parallel_map((x) => mb.call(x), [\"-pm\"]))\nagent A\n    print(mb.call(\"-ag\"))\nspawn A\n")).unwrap();
+        let (code, out, err) = synsema(&dir, &["run", "p.syn"], None);
+        assert!(code == 0 && out.contains("deA-run") && out.contains("[\"deA-pm\"]") && out.contains("deA-ag"), "{}: {} {}", tag, out, err);
+        assert!(!out.contains("deB"), "{}: {}", tag, out);
+        let main = format!("require serve({{p}})\n{head}serve on {{p}}\n    route \"GET /ping\"\n        give \"ok\"\n    route \"GET /c\"\n        give mb.call(\"-serve\")\n");
+        for r in serve_get(&dir, &main, &["/c"]) {
+            assert!(r.starts_with("HTTP/1.1 200") && r.contains("deA-serve") && !r.contains("deB"), "{}: {}", tag, r);
+        }
+    }
+}
+
+/// R5–R9 (B3): una task que cruza lleva los locales de quien la armó, copiados: en `parallel_map`
+/// directo, desde una task de un módulo (con el nombre del módulo), una task local recursiva, y una
+/// lambda que una task devuelve y un módulo guarda (bajo `serve` también). Escribir un local
+/// capturado cambia la copia del worker, no el original.
+#[test]
+fn a_task_that_crosses_carries_the_locals_of_who_made_it() {
+    let dir = project("r2-b3-local");
+    std::fs::write(dir.join("m.syn"), "let BASE be 10\ntask hacer(n)\n    give parallel_map((x) => x * n + BASE, [1, 2])\nexport task correr(n)\n    give hacer(n)\n").unwrap();
+    std::fs::write(dir.join("lib.syn"), "let ONE be nothing\nexport task reg_one(f)\n    set ONE to f\n    give \"ok\"\nexport task call_one(x)\n    give ONE(x)\n").unwrap();
+    for (src, want) in [
+        ("task f(n)\n    give parallel_map((x) => x * n, [1, 2])\nprint(f(3))\n", "[3, 6]"),
+        ("use \"./m.syn\" as m\nprint(m.correr(3))\n", "[13, 16]"),
+        ("task outer(k)\n    task cuenta(j)\n        when j <= 0\n            give 0\n        give 1 + cuenta(j - 1)\n    give parallel_map((x) => cuenta(x) + k, [2, 3])\nprint(outer(10))\n", "[12, 13]"),
+        ("task g()\n    let c be 1\n    task inc(x)\n        set c to c + x\n        give c\n    print(parallel_map(inc, [10, 20]))\n    print(c)\ng()\n", "[11, 21]\n1"),
+        ("task make(n)\n    give (x) => text(n) + x\nuse \"./lib.syn\" as lib\nprint(lib.reg_one(make(5)))\nprint(parallel_map((x) => lib.call_one(x), [\"-pm\"]))\nagent A\n    print(lib.call_one(\"-ag\"))\nspawn A\n", "[\"5-pm\"]"),
+    ] {
+        std::fs::write(dir.join("p.syn"), src).unwrap();
+        let (code, out, err) = synsema(&dir, &["run", "p.syn"], None);
+        assert!(code == 0 && out.contains(want), "{}: {} {}", src, out, err);
+    }
+    let main = "require serve({p})\ntask make(n)\n    give (x) => text(n) + x\nuse \"./lib.syn\" as lib\nprint(lib.reg_one(make(5)))\nserve on {p}\n    route \"GET /ping\"\n        give \"ok\"\n    route \"GET /c\"\n        give lib.call_one(\"-serve\")\n";
+    for r in serve_get(&dir, main, &["/c"]) {
+        assert!(r.starts_with("HTTP/1.1 200") && r.contains("5-serve"), "{}", r);
+    }
+}
+
+/// R10 y R11 (B3): una lista con tasks cruza como un mapa con tasks: la del programa, la que guarda un
+/// módulo, y la de una tool de confianza (en el scope de la tool, también bajo `serve`).
+#[test]
+fn a_list_of_tasks_crosses_like_a_map() {
+    let dir = project("r2-b3-list");
+    std::fs::write(dir.join("lib.syn"), "let CBS be []\nexport task reg_list(f)\n    set CBS to [f]\n    give \"ok\"\nexport task call_list(x)\n    give CBS[0](x)\n").unwrap();
+    std::fs::write(
+        dir.join("p.syn"),
+        "let PRE be \"hola\"\nlet L be [(x) => PRE + x]\nprint(parallel_map((x) => L[0](x), [\"-pm\"]))\nuse \"./lib.syn\" as lib\nprint(lib.reg_list((x) => PRE + x))\nprint(parallel_map((x) => lib.call_list(x), [\"-pm-lib\"]))\nagent A\n    print(lib.call_list(\"-ag\"))\nspawn A\n",
+    )
+    .unwrap();
+    let (code, out, err) = synsema(&dir, &["run", "p.syn"], None);
+    assert!(code == 0 && out.contains("[\"hola-pm\"]") && out.contains("[\"hola-pm-lib\"]") && out.contains("hola-ag"), "{} {}", out, err);
+    std::fs::write(dir.join("d.txt"), "secreto").unwrap();
+    std::fs::write(dir.join("t.syn"), "task helper()\n    require file.read(\"./**\")\n    give read_file(\"./d.txt\")\nexport let L be [{\"f\": helper}]\n").unwrap();
+    let tool = ["--trusted", "t=t.syn", "--trusted-cap-set"];
+    std::fs::write(dir.join("q.syn"), "use \"trusted:t\" as t\nprint(parallel_map((k) => t.L[0][\"f\"](), [1]))\nagent A\n    print(t.L[0][\"f\"]())\nspawn A\n").unwrap();
+    let (code, out, err) = synsema(&dir, &[&["run"][..], &tool, &["stdout,file.read=./**", "q.syn"]].concat(), None);
+    assert!(code == 0 && out.contains("[\"secreto\"]") && out.contains("[A_0] secreto"), "{} {}", out, err);
+    // Con el techo de la tool sin `file.read`, el permiso del programa no le llega.
+    std::fs::write(dir.join("q.syn"), "require file.read(\"./**\")\nuse \"trusted:t\" as t\nprint(parallel_map((k) => t.L[0][\"f\"](), [1]))\n").unwrap();
+    let (code, out, err) = synsema(&dir, &[&["run"][..], &tool, &["stdout", "q.syn"]].concat(), None);
+    assert!(code != 0 && !out.contains("secreto") && err.contains("above the host ceiling"), "{} {}", out, err);
+    let main = "require serve({p})\nuse \"trusted:t\" as t\nserve on {p}\n    route \"GET /ping\"\n        give \"ok\"\n    route \"GET /l\"\n        give t.L[0][\"f\"]()\n";
+    for r in serve_get_with(&dir, &["--trusted", "t=t.syn", "--trusted-cap-set", "file.read=./**"], main, &["/l"]) {
+        assert!(r.starts_with("HTTP/1.1 200") && r.contains("secreto"), "{}", r);
+    }
+}
+
+/// B1 (E-c): el aviso cuenta lo que la carga envuelve: una task que sólo nombra una lambda o una
+/// llamada exportada no es exportada (avisa); la que llega a un export por otro nombre sí (no avisa).
+#[test]
+fn the_unexported_require_warning_counts_what_the_tool_wraps() {
+    let dir = project("r2-b1");
+    std::fs::write(dir.join("d.txt"), "secreto").unwrap();
+    let helper = "task helper()\n    require file.read(\"./**\")\n    give read_file(\"./d.txt\")\n";
+    for (tool, call, warns) in [
+        ("export let W be () => helper()\n", "t.W()", 1),
+        ("export task w()\n    give helper()\n", "t.w()", 1),
+        ("export let N be 1\nlet X be helper\nexport task w()\n    give X()\n", "t.N", 1),
+        ("let BASE be {\"f\": helper}\nexport let M be BASE\n", "t.M[\"f\"]()", 0),
+    ] {
+        std::fs::write(dir.join("t.syn"), format!("{helper}{tool}")).unwrap();
+        std::fs::write(dir.join("p.syn"), format!("use \"trusted:t\" as t\nprint({})\n", call)).unwrap();
+        let (_, out, err) = synsema(&dir, &["run", "--trusted", "t=t.syn", "--trusted-cap-set", "stdout,file.read=./**", "p.syn"], None);
+        assert_eq!(err.matches("grants nothing").count(), warns, "{}: {} {}", tool, out, err);
+    }
+}
+
+/// B2 y N2: dentro de un `sandbox`, una capability del proceso no se propone en `sandbox under` (que
+/// no la lleva); dentro de una task de confianza, el texto es el del bloque, no un `require` que ya está.
+#[test]
+fn a_sandbox_says_what_sandbox_under_cannot_carry() {
+    let dir = project("r2-b2");
+    std::fs::write(dir.join("d.txt"), "hola").unwrap();
+    std::fs::write(dir.join("p.syn"), "require time\nsandbox\n    print(now())\n").unwrap();
+    let (code, _, err) = synsema(&dir, &["run", "p.syn"], None);
+    assert!(code != 0 && err.contains("`sandbox under` cannot carry time") && err.contains("run this outside the block"), "{}", err);
+    assert!(!err.contains("sandbox under {\"time\""), "{}", err);
+    std::fs::write(dir.join("t.syn"), "export task leer()\n    require file.read(\"./**\")\n    sandbox\n        give read_file(\"./d.txt\")\n").unwrap();
+    std::fs::write(dir.join("p.syn"), "use \"trusted:t\" as t\nprint(t.leer())\n").unwrap();
+    let (code, _, err) = synsema(&dir, &["run", "--trusted", "t=t.syn", "--trusted-cap-set", "stdout,file.read=./**", "p.syn"], None);
+    assert!(code != 0 && err.contains("a `sandbox` block denies every capability, whatever the trusted task declares"), "{}", err);
+    assert!(!err.contains("add `require"), "{}", err);
 }

@@ -1657,14 +1657,27 @@ impl CapabilitySet {
                     c,
                     Self::require_line(requested)
                 )
-            } else if cause == DenyCause::NoGrant && self.sandbox_depth > 0 && !self.name.starts_with("trusted:") {
+            } else if cause == DenyCause::NoGrant && self.sandbox_depth > 0 {
                 // v0.6.50 (ronda 1, B4): un `sandbox` deniega todo; un `require` (que puede estar
-                // ya) no lo arregla.
-                format!(
-                    "Capability not granted: {} — a `sandbox` block denies every capability, whatever the program declares: to allow it inside the block use `sandbox under {{\"{}\": …}}` (what the program already has, within those caps), or run this outside the block",
-                    requested,
-                    requested.ty.wire_name()
-                )
+                // ya) no lo arregla. Ronda 2: también dentro de una task de confianza (N2), y una
+                // capability del proceso no se propone en `sandbox under`, que no la lleva (B2).
+                let who = if self.name.starts_with("trusted:") { "the trusted task" } else { "the program" };
+                if is_process_local(requested.ty) {
+                    format!(
+                        "Capability not granted: {} — a `sandbox` block denies every capability, whatever {} declares, and `sandbox under` cannot carry {} (stdout, stdin, time and random are the process's; the host ceiling governs them): run this outside the block",
+                        requested,
+                        who,
+                        requested.ty.wire_name()
+                    )
+                } else {
+                    format!(
+                        "Capability not granted: {} — a `sandbox` block denies every capability, whatever {} declares: to allow it inside the block use `sandbox under {{\"{}\": …}}` (what {} already has, within those caps), or run this outside the block",
+                        requested,
+                        who,
+                        requested.ty.wire_name(),
+                        who
+                    )
+                }
             } else {
                 Self::denial_message(requested, &cause)
             };

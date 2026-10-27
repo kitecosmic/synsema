@@ -748,8 +748,18 @@ pub fn read_template_dir(dir: &std::path::Path) -> Result<Vec<(String, String)>,
         }
         Ok(())
     }
-    let mut out = Vec::new();
-    walk(dir, "", &mut out)?;
+    let mut raw = Vec::new();
+    walk(dir, "", &mut raw)?;
+    // Ronda 2 (N3): el nombre normalizado, como lo busca `render` y como entra en wasm, así el sha
+    // del recibo es el mismo en los dos hosts (en Linux un archivo puede llamarse `a\b.html`).
+    let mut out: Vec<(String, String)> = Vec::with_capacity(raw.len());
+    for (rel, text) in raw {
+        let name = crate::bundle::normalize_name(&rel).ok_or_else(|| format!("{}: a template name is a relative path inside the set", rel))?;
+        if out.iter().any(|(n, _)| *n == name) {
+            return Err(format!("'{}' and another file are the same template ({})", rel, name));
+        }
+        out.push((name, text));
+    }
     Ok(out)
 }
 

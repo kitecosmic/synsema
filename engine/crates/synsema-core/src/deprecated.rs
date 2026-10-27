@@ -360,27 +360,16 @@ pub fn warn_once_at_load(program: &Program, file_path: &str) {
 
 /// v0.6.50 (E-c): en una tool de confianza, los `require` de las tasks que el módulo no exporta
 /// (`(task, capability, línea)`). No conceden nada: el scope lo abre la task exportada que el
-/// programa llama, con lo que ésa declara. Una task nombrada en el valor de un `export let`
-/// (`export let h be helper`, `export let M be {"f": helper}`) cuenta como exportada: la tool la
-/// envuelve en su scope.
-pub fn trusted_unexported_requires(program: &Program) -> Vec<(String, String, usize)> {
-    let mut exported = HashSet::new();
+/// programa llama, con lo que ésa declara. `wrapped` son las tasks de nivel superior que la carga
+/// envolvió en su scope (ronda 2, B1): las exportadas directo y las que un export expone por valor
+/// (`export let h be helper`, `export let M be {"f": helper}`, `export let M be BASE`). Una task que
+/// sólo nombra una lambda o una llamada exportada no está envuelta.
+pub fn trusted_unexported_requires(program: &Program, wrapped: &HashSet<String>) -> Vec<(String, String, usize)> {
+    let mut exported = wrapped.clone();
     for st in &program.statements {
         if let NodeKind::ExportDeclaration { declaration } = &st.kind {
-            match &declaration.kind {
-                NodeKind::TaskDefinition { name, .. } => {
-                    exported.insert(name.clone());
-                }
-                // `export let h be helper`, y desde la ronda 1 (B6) también una task nombrada dentro
-                // del valor (`export let M be {"f": helper}`): la tool la envuelve en su scope.
-                NodeKind::LetBinding { value, .. } => {
-                    crate::ast_api::walk(value, &mut |n| {
-                        if let NodeKind::Identifier { name } = &n.kind {
-                            exported.insert(name.to_string());
-                        }
-                    });
-                }
-                _ => {}
+            if let NodeKind::TaskDefinition { name, .. } = &declaration.kind {
+                exported.insert(name.clone());
             }
         }
     }
@@ -404,8 +393,8 @@ pub fn trusted_unexported_requires(program: &Program) -> Vec<(String, String, us
 
 /// v0.6.50 (E-c): el aviso de `trusted_unexported_requires` al cargar la tool, una vez por sitio y
 /// por proceso (cada worker de `serve` la carga).
-pub fn warn_trusted_unexported_requires(program: &Program, module: &str) {
-    let dead = trusted_unexported_requires(program);
+pub fn warn_trusted_unexported_requires(program: &Program, module: &str, wrapped: &HashSet<String>) {
+    let dead = trusted_unexported_requires(program, wrapped);
     if dead.is_empty() {
         return;
     }
