@@ -779,14 +779,15 @@ fn without_a_ceiling_the_auditor_gets_the_real_error() {
 fn a_sandbox_and_a_judge_decide_say_where_the_capability_goes() {
     let dir = project("r1-b4");
     std::fs::write(dir.join("d.txt"), "hola").unwrap();
-    let sb = "a `sandbox` block denies every capability, whatever the program declares: to allow it inside the block use `sandbox under {\"file.read\": …}`";
-    for src in [
-        "require file.read(\"./**\")\nprint(read_file(\"./d.txt\"))\nsandbox\n    print(read_file(\"./d.txt\"))\n",
-        "agent A\n    require file.read(\"./**\")\n    print(read_file(\"./d.txt\"))\n    sandbox\n        print(read_file(\"./d.txt\"))\nspawn A\n",
+    // Ronda 3 (N1): dentro de un agente, el texto nombra al agente.
+    let sb = |who: &str| format!("a `sandbox` block denies every capability, whatever {} declares: to allow it inside the block use `sandbox under {{\"file.read\": …}}`", who);
+    for (src, who) in [
+        ("require file.read(\"./**\")\nprint(read_file(\"./d.txt\"))\nsandbox\n    print(read_file(\"./d.txt\"))\n", "the program"),
+        ("agent A\n    require file.read(\"./**\")\n    print(read_file(\"./d.txt\"))\n    sandbox\n        print(read_file(\"./d.txt\"))\nspawn A\n", "the agent A"),
     ] {
         std::fs::write(dir.join("p.syn"), src).unwrap();
         let (code, out, err) = synsema(&dir, &["run", "p.syn"], None);
-        assert!(code != 0 && out.contains("hola") && err.contains(sb), "{}: {}", src, err);
+        assert!(code != 0 && out.contains("hola") && err.contains(&sb(who)), "{}: {}", src, err);
         assert!(!err.contains("add `require"), "{}: {}", src, err);
     }
     // La forma que sugiere el texto anda.
@@ -947,11 +948,93 @@ fn a_sandbox_says_what_sandbox_under_cannot_carry() {
     std::fs::write(dir.join("d.txt"), "hola").unwrap();
     std::fs::write(dir.join("p.syn"), "require time\nsandbox\n    print(now())\n").unwrap();
     let (code, _, err) = synsema(&dir, &["run", "p.syn"], None);
-    assert!(code != 0 && err.contains("`sandbox under` cannot carry time") && err.contains("run this outside the block"), "{}", err);
+    assert!(code != 0 && err.contains("time is the process's: a `sandbox under {…}` block (also `sandbox under {}`) lets it through") && err.contains("run this outside the block"), "{}", err);
     assert!(!err.contains("sandbox under {\"time\""), "{}", err);
+    // Ronda 3 (B2): lo que dice el texto anda.
+    std::fs::write(dir.join("p.syn"), "require time\nrequire random\nsandbox under {}\n    print(now() > 0, random() < 1)\n").unwrap();
+    let (code, out, err) = synsema(&dir, &["run", "p.syn"], None);
+    assert!(code == 0 && out.contains("true true"), "{} {}", out, err);
+    // Ronda 3 (N1): dentro de un agente vale lo que declara el agente.
+    std::fs::write(dir.join("p.syn"), "agent A\n    require file.read(\"./**\")\n    sandbox\n        print(read_file(\"./d.txt\"))\nspawn A\n").unwrap();
+    let (_, _, err) = synsema(&dir, &["run", "p.syn"], None);
+    assert!(err.contains("whatever the agent A declares") && err.contains("what the agent A already has"), "{}", err);
     std::fs::write(dir.join("t.syn"), "export task leer()\n    require file.read(\"./**\")\n    sandbox\n        give read_file(\"./d.txt\")\n").unwrap();
     std::fs::write(dir.join("p.syn"), "use \"trusted:t\" as t\nprint(t.leer())\n").unwrap();
     let (code, _, err) = synsema(&dir, &["run", "--trusted", "t=t.syn", "--trusted-cap-set", "stdout,file.read=./**", "p.syn"], None);
     assert!(code != 0 && err.contains("a `sandbox` block denies every capability, whatever the trusted task declares"), "{}", err);
     assert!(!err.contains("add `require"), "{}", err);
+}
+
+// =========================================================
+// Ronda 3 de la auditoría (`specs/auditoria-v0.6.50-ronda3.md`; regla R3 del modelo)
+// =========================================================
+
+/// R14–R17 (M1): un builtin ligado a otro nombre cruza por su nombre propio: un local que tapa una
+/// task global, un local, un global, el de un módulo y uno guardado en un mapa o una lista; en
+/// `parallel_map`, en un agente y bajo `serve`. Nunca se lee otro valor en su lugar.
+#[test]
+fn a_builtin_crosses_by_its_name() {
+    let dir = project("r3-m1");
+    std::fs::write(dir.join("m.syn"), "let up be upper\nexport task f(x)\n    give up(x)\n").unwrap();
+    for (src, want) in [
+        ("task f(x)\n    give \"GLOBAL-f\"\ntask mk()\n    let f be upper\n    give (x) => f(x)\nlet g be mk()\nprint(parallel_map((x) => g(x), [\"b\"]))\nprint(parallel_map(mk(), [\"c\"]))\n", "[\"B\"]\n[\"C\"]"),
+        ("let up be upper\nprint(parallel_map((x) => up(x), [\"g\"]))\n", "[\"G\"]"),
+        ("use \"./m.syn\" as m\nprint(parallel_map(m.f, [\"b\"]))\nprint(parallel_map((x) => m.f(x), [\"c\"]))\n", "[\"B\"]\n[\"C\"]"),
+        ("let L be [upper]\nlet M be {\"f\": upper}\nprint(parallel_map((x) => M[\"f\"](x) + L[0](x), [\"a\"]))\n", "[\"AA\"]"),
+        ("task mk()\n    let f be upper\n    give (x) => f(x)\nlet g be mk()\nagent A\n    print(g(\"ag\"))\nspawn A\n", "[A_0] AG"),
+    ] {
+        std::fs::write(dir.join("p.syn"), src).unwrap();
+        let (code, out, err) = synsema(&dir, &["run", "p.syn"], None);
+        assert!(code == 0 && out.contains(want) && !out.contains("GLOBAL"), "{}: {} {}", src, out, err);
+    }
+    let main = "require serve({p})\ntask mk()\n    let f be upper\n    give (x) => f(x)\nlet g be mk()\nserve on {p}\n    route \"GET /ping\"\n        give \"ok\"\n    route \"GET /u\"\n        give g(\"srv\")\n";
+    for r in serve_get(&dir, main, &["/u"]) {
+        assert!(r.starts_with("HTTP/1.1 200") && r.contains("SRV"), "{}", r);
+    }
+}
+
+/// R16, R18 y R19 (M1): un generador local da su texto; una task de confianza en un local o un
+/// global corre en el scope de su tool; un constructor de `type` o de variante se rearma con su
+/// aridad. Un cierre del motor (`read_body`) falla con texto.
+#[test]
+fn a_generator_a_trusted_task_and_a_constructor_cross() {
+    let dir = project("r3-m1b");
+    std::fs::write(dir.join("p.syn"), "task mk()\n    let r be rng(7)\n    give (x) => r()\nprint(parallel_map(mk(), [1]))\n").unwrap();
+    let (code, _, err) = synsema(&dir, &["run", "p.syn"], None);
+    assert!(code != 0 && err.contains("the generator rng(7) is a local of the task that made this lambda"), "{}", err);
+    std::fs::write(dir.join("d.txt"), "secreto").unwrap();
+    std::fs::write(dir.join("t.syn"), "export task leer()\n    require file.read(\"./**\")\n    give read_file(\"./d.txt\")\n").unwrap();
+    std::fs::write(dir.join("p.syn"), "use \"trusted:t\" as t\nlet G be t.leer\ntask mk()\n    let L be t.leer\n    give (x) => L()\nprint(parallel_map((x) => G(), [1]))\nprint(parallel_map(mk(), [1]))\n").unwrap();
+    let tool = ["run", "--trusted", "t=t.syn", "--trusted-cap-set"];
+    let (code, out, err) = synsema(&dir, &[&tool[..], &["stdout,file.read=./**", "p.syn"]].concat(), None);
+    assert!(code == 0 && out.matches("[\"secreto\"]").count() == 2, "{} {}", out, err);
+    let (code, out, err) = synsema(&dir, &[&tool[..], &["stdout", "p.syn"]].concat(), None);
+    assert!(code != 0 && !out.contains("secreto") && err.contains("above the host ceiling"), "{} {}", out, err);
+    std::fs::write(
+        dir.join("p.syn"),
+        "type Punto\n    x: number\nenum Forma\n    circulo(r)\n    vacio\ntask f()\n    let P be Punto\n    give parallel_map((x) => [Forma.circulo(x), P(x), Forma.vacio], [1])\nprint(f())\nprint(parallel_map((x) => Punto(x, 3), [2]))\n",
+    )
+    .unwrap();
+    let (code, out, err) = synsema(&dir, &["run", "p.syn"], None);
+    assert!(out.contains("[[{__variant: \"Forma.circulo\", r: 1}, {x: 1}, {__variant: \"Forma.vacio\"}]]"), "{} {}", out, err);
+    assert!(code != 0 && err.contains("Type Punto expects 1 fields, got 2"), "{}", err);
+    let main = "require serve({p})\nserve on {p}\n    route \"GET /ping\"\n        give \"ok\"\n    route \"GET /rb\"\n        let rb be read_body\n        give parallel_map((x) => rb(), [1])\n";
+    for r in serve_get(&dir, main, &["/rb"]) {
+        assert!(r.contains("'read_body' is a closure of the engine that does not cross into a worker"), "{}", r);
+    }
+}
+
+/// R20–R21 (B1): de un frame cruza lo que cada task nombra. Dos lambdas del mismo frame que nombran
+/// locales distintos cruzan en la misma foto, y un nombre que el intérprete busca por texto
+/// (`request`, para `expect`) llega a una task local que cruza.
+#[test]
+fn a_frame_carries_what_each_task_names() {
+    let dir = project("r3-b1");
+    std::fs::write(dir.join("p.syn"), "task mk()\n    let a be \"A\"\n    let b be \"B\"\n    give [() => a, () => b]\nlet fs be mk()\nprint(parallel_map((i) => fs[i](), [0, 1]))\n").unwrap();
+    let (code, out, err) = synsema(&dir, &["run", "p.syn"], None);
+    assert!(code == 0 && out.contains("[\"A\", \"B\"]"), "{} {}", out, err);
+    let main = "require serve({p})\nserve on {p}\n    route \"GET /ping\"\n        give \"ok\"\n    route \"GET /e\"\n        task chk(i)\n            expect body {item: text}\n            give i\n        give parallel_map(chk, [1])\n";
+    for r in serve_get(&dir, main, &["/e"]) {
+        assert!(r.contains("request body is not a JSON object"), "{}", r);
+    }
 }

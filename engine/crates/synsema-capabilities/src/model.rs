@@ -1659,12 +1659,18 @@ impl CapabilitySet {
                 )
             } else if cause == DenyCause::NoGrant && self.sandbox_depth > 0 {
                 // v0.6.50 (ronda 1, B4): un `sandbox` deniega todo; un `require` (que puede estar
-                // ya) no lo arregla. Ronda 2: también dentro de una task de confianza (N2), y una
-                // capability del proceso no se propone en `sandbox under`, que no la lleva (B2).
-                let who = if self.name.starts_with("trusted:") { "the trusted task" } else { "the program" };
+                // ya) no lo arregla. Ronda 2: también dentro de una task de confianza (N2). Ronda 3:
+                // dentro de un agente vale lo que declara el agente (N1), y una capability del
+                // proceso no se lista en `sandbox under`, pero cualquier `sandbox under {…}` la deja
+                // pasar (B2).
+                let who = match &self.agent {
+                    _ if self.name.starts_with("trusted:") => "the trusted task".to_string(),
+                    Some(a) => format!("the agent {}", a),
+                    None => "the program".to_string(),
+                };
                 if is_process_local(requested.ty) {
                     format!(
-                        "Capability not granted: {} — a `sandbox` block denies every capability, whatever {} declares, and `sandbox under` cannot carry {} (stdout, stdin, time and random are the process's; the host ceiling governs them): run this outside the block",
+                        "Capability not granted: {} — a `sandbox` block denies every capability, whatever {} declares; {} is the process's: a `sandbox under {{…}}` block (also `sandbox under {{}}`) lets it through within the host ceiling, though it cannot be listed in the caps, or run this outside the block",
                         requested,
                         who,
                         requested.ty.wire_name()

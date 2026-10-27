@@ -479,6 +479,20 @@ pub struct BuiltinTask {
     /// Con eso `tool_spec` lee la firma y una llamada con argumentos nombrados (`call_tool`) entra
     /// al scope igual que una posicional. Antes las tasks de confianza eran sólo posicionales.
     pub trusted: Option<Rc<TrustedTool>>,
+    /// v0.6.50 (ronda 3, R3): si es el constructor de un `type` o de una variante de `enum`, su
+    /// definición. Con eso cruza a otro intérprete (`parallel_map`, agentes, `serve`) y se rearma.
+    pub ctor: Option<Rc<CtorSpec>>,
+}
+
+/// Ver `BuiltinTask::ctor`: lo que define un constructor (`Punto(x)`, `Forma.circulo(r)`).
+#[derive(Clone, Debug)]
+pub struct CtorSpec {
+    /// El nombre del tipo, o `Enum.variante`.
+    pub name: String,
+    pub fields: Vec<String>,
+    /// Una variante etiqueta su valor con `__variant`; un tipo no.
+    pub variant: bool,
+    pub loc: SourceLocation,
 }
 
 /// Ver `BuiltinTask::trusted`.
@@ -501,6 +515,10 @@ pub struct BuiltinMeta {
     pub lineage_source: bool,
     /// Constructor de un tipo o de una variante (`Point(…)`, `Order.paid(…)`): cuenta sus campos él.
     pub constructor: bool,
+    /// v0.6.50 (ronda 3, R3): lo registró el motor o el host en el intérprete (`register_builtin`),
+    /// así que otro intérprete tiene uno con ese nombre. Un cierre del motor (`read_body`, un
+    /// agregado de tabla, un generador) no.
+    pub registered: bool,
 }
 
 impl BuiltinTask {
@@ -523,8 +541,9 @@ impl BuiltinTask {
             kwargs: crate::builtin_arity::kwargs_of(&name),
             lineage_source: LINEAGE_SOURCES.contains(&name.as_str()),
             constructor: name.starts_with(|c: char| c.is_ascii_uppercase()),
+            registered: false,
         };
-        BuiltinTask { name, func, param_count, param_names, meta, trusted: None }
+        BuiltinTask { name, func, param_count, param_names, meta, trusted: None, ctor: None }
     }
 }
 
@@ -3252,10 +3271,9 @@ impl Interpreter {
     }
 
     fn register(&self, name: &str, param_count: i32, func: BuiltinFn) {
-        self.global_env.borrow_mut().bindings.insert(
-            name.to_string(),
-            SynValue::Builtin(Rc::new(BuiltinTask::new(name, param_count, None, func))),
-        );
+        let mut b = BuiltinTask::new(name, param_count, None, func);
+        b.meta.registered = true;
+        self.global_env.borrow_mut().bindings.insert(name.to_string(), SynValue::Builtin(Rc::new(b)));
     }
 
     /// Registra un builtin externo (lo usa el motor para los builtins seguros).
@@ -3273,10 +3291,9 @@ impl Interpreter {
         param_names: Vec<&'static str>,
         func: BuiltinFn,
     ) {
-        self.global_env.borrow_mut().bindings.insert(
-            name.to_string(),
-            SynValue::Builtin(Rc::new(BuiltinTask::new(name, param_names.len() as i32, Some(param_names), func))),
-        );
+        let mut b = BuiltinTask::new(name, param_names.len() as i32, Some(param_names), func);
+        b.meta.registered = true;
+        self.global_env.borrow_mut().bindings.insert(name.to_string(), SynValue::Builtin(Rc::new(b)));
     }
 
     /// Las entradas que el programa leyó hasta ahora (DATOS-17), en orden.
@@ -3774,9 +3791,7 @@ impl Interpreter {
             let mut b = base.borrow_mut();
             for (k, v) in g.bindings.iter() {
                 if let SynValue::Builtin(bt) = v {
-                    let own = *bt.name == **k
-                        || crate::deprecated::DEPRECATED_NAMES.iter().any(|(old, new)| *old == &**k && *new == &*bt.name);
-                    if own {
+                    if is_own_builtin(k, bt) {
                         b.bindings.insert(k.clone(), v.clone());
                     }
                 }
@@ -6404,33 +6419,8 @@ impl Interpreter {
                 namespace.insert(variant_name.clone(), syn_map(m));
             } else {
                 // Variante con payload → constructor builtin de aridad EXACTA.
-                let field_names = fields.clone();
-                let count = field_names.len() as i32;
-                let q = qualified.clone();
-                let def_loc = loc.clone();
-                let func: BuiltinFn = Rc::new(move |_i, args, _l| {
-                    if args.len() != field_names.len() {
-                        return Err(err_at(
-                            format!(
-                                "variant {} expects {} fields, got {}",
-                                q,
-                                field_names.len(),
-                                args.len()
-                            ),
-                            &def_loc,
-                        ));
-                    }
-                    let mut m = SynMap::new();
-                    m.insert("__variant", syn_text(q.as_str()));
-                    for (n, val) in field_names.iter().zip(args.iter()) {
-                        m.insert(n.clone(), val.clone());
-                    }
-                    Ok(syn_map(m))
-                });
-                namespace.insert(
-                    variant_name.clone(),
-                    SynValue::Builtin(Rc::new(BuiltinTask::new(qualified.clone(), count, None, func))),
-                );
+                let spec = CtorSpec { name: qualified, fields: fields.clone(), variant: true, loc: loc.clone() };
+                namespace.insert(variant_name.clone(), constructor_value(spec));
             }
         }
         let value = syn_map(namespace);
@@ -7351,33 +7341,8 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
         let loc = &node.location;
         let NodeKind::TypeDefinition { name, fields } = &node.kind else { unreachable!("exec_type_definition: otro nodo") };
         {
-        let field_names: Vec<String> = fields.iter().map(|(n, _)| n.clone()).collect();
-        let count = field_names.len() as i32;
-        let type_name = name.clone();
-        let def_loc = loc.clone();
-        let func: BuiltinFn = Rc::new(move |_i, args, _l| {
-            if args.len() != field_names.len() {
-                return Err(err_at(
-                    format!(
-                        "Type {} expects {} fields, got {}",
-                        type_name,
-                        field_names.len(),
-                        args.len()
-                    ),
-                    &def_loc,
-                ));
-            }
-            let mut m = SynMap::new();
-            for (n, v) in field_names.iter().zip(args.iter()) {
-                m.insert(n.clone(), v.clone());
-            }
-            Ok(syn_map(m))
-        });
-        env_set(
-            env,
-            name,
-            SynValue::Builtin(Rc::new(BuiltinTask::new(name.clone(), count, None, func))),
-        );
+        let fields: Vec<String> = fields.iter().map(|(n, _)| n.clone()).collect();
+        env_set(env, name, constructor_value(CtorSpec { name: name.clone(), fields, variant: false, loc: loc.clone() }));
         Ok(SynValue::Nothing)
     }
     }
@@ -11832,6 +11797,64 @@ fn wrap_exposed_tasks(
         }
         other => other,
     }
+}
+
+/// v0.6.50 (ronda 3, R3): el constructor de un tipo (`Punto(x)`) o de una variante
+/// (`Forma.circulo(r)`), de aridad exacta. Lo arman `type`/`enum` y el rebuild de otro intérprete.
+pub fn constructor_value(spec: CtorSpec) -> SynValue {
+    let spec = Rc::new(spec);
+    let s = spec.clone();
+    let func: BuiltinFn = Rc::new(move |_i, args, _l| {
+        if args.len() != s.fields.len() {
+            let what = if s.variant { "variant" } else { "Type" };
+            return Err(err_at(format!("{} {} expects {} fields, got {}", what, s.name, s.fields.len(), args.len()), &s.loc));
+        }
+        let mut m = SynMap::new();
+        if s.variant {
+            m.insert("__variant", syn_text(s.name.as_str()));
+        }
+        for (n, v) in s.fields.iter().zip(args.iter()) {
+            m.insert(n.clone(), v.clone());
+        }
+        Ok(syn_map(m))
+    });
+    let mut b = BuiltinTask::new(spec.name.clone(), spec.fields.len() as i32, None, func);
+    b.ctor = Some(spec);
+    SynValue::Builtin(Rc::new(b))
+}
+
+/// ¿`k` liga al builtin del lenguaje de ese nombre (o a su alias deprecado)? Eso lo tiene todo
+/// intérprete: la foto de un módulo o de los globales no lo lleva, y `builtins_only` sólo copia eso.
+pub fn is_own_builtin(k: &str, b: &BuiltinTask) -> bool {
+    b.meta.registered
+        && (b.name == k || crate::deprecated::DEPRECATED_NAMES.iter().any(|(old, new)| *old == k && *new == b.name.as_str()))
+}
+
+/// Los nombres que el intérprete busca por texto, sin un `Identifier` en el cuerpo.
+const IMPLICIT_NAMES: &[&str] = &["request", "declassify", "range", "insert", "merge"];
+
+/// v0.6.50 (ronda 3, R3): los nombres que una task puede leer o escribir de afuera, por exceso:
+/// todo identificador de su cuerpo y de los defaults de sus parámetros (sin restar los propios),
+/// `spawn`/`observe` y los nombres que el intérprete busca por texto. De un frame que cruza viajan
+/// sólo éstos.
+pub fn task_free_names(t: &SynTaskValue) -> HashSet<String> {
+    let mut out: HashSet<String> = IMPLICIT_NAMES.iter().map(|n| n.to_string()).collect();
+    let mut visit = |n: &Node| match &n.kind {
+        NodeKind::Identifier { name } => {
+            out.insert(name.clone());
+        }
+        NodeKind::SpawnStatement { agent_name, .. } => {
+            out.insert(agent_name.clone());
+        }
+        NodeKind::ObserveStatement { variable, .. } => {
+            out.insert(variable.clone());
+        }
+        _ => {}
+    };
+    for n in t.body.iter().chain(t.parameters.iter().filter_map(|p| p.default.as_ref())) {
+        crate::ast_api::walk(n, &mut visit);
+    }
+    out
 }
 
 fn trusted_wrapper(module: &str, export: &str, task: Rc<SynTaskValue>, hook: TrustedScopeHook) -> SynValue {
