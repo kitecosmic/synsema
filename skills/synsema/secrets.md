@@ -93,7 +93,7 @@ surface**, with no flag to turn that off:
 | Surface | What you get |
 |---|---|
 | `print` / console / `show` / `log` | `secret(NAME)` |
-| `give` → JSON response body | `"[redacted]"` (+ a warning in the server log) |
+| `give` → JSON response body | `"[redacted]"` (+ a warning in the server log; outside `serve`, e.g. `evm_rpc` under `run`, v0.6.49+ says `synsema: warning: secret(K) was redacted in a value serialized to JSON`) |
 | Server-Sent Events (`send`) | `"[redacted]"` |
 | 500 error detail (dev mode) | redacted |
 | LLM context / `generate … given X` | the model never sees the plaintext |
@@ -101,6 +101,7 @@ surface**, with no flag to turn that off:
 | `text(secret)` / string coercion | `secret(NAME)` |
 | `json_encode` / `jsonl_encode` / `json_for_script` / `csv_encode` | **error** naming where it is (v0.6.46+; it was `"[redacted]"`) |
 | a list/map holding a secret in a template hole | **error** (v0.6.46+; it was the text `{k: secret(K)}`) |
+| a secret inside a `push_send` payload | **error** (v0.6.49+; it was `[redacted]`): `push_send: the payload["k"] is secret(K), … a push payload goes to the browser, another owner, so a secret cannot travel in it; leave it out of the payload` |
 | `"x" + secret` (concatenation) | stays a `secret` (taint propagates) |
 | SQL parametrized write | the **plaintext is written to the DB** (the DB is the trust border) |
 

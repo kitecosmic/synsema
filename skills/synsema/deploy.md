@@ -616,7 +616,8 @@ tried to read STRIPE_KEY" = `origin == "program" && !granted`; no need to re-par
    is the hook's job — resolve the name, check the address, connect to that one. The hook does not
    know whether the program named the host.
 4. **Ceilings with `labels`:** `declassify=<principal>` (globs) bounds `declassify` — breaking for
-   labelled code under a ceiling that declassifies; `llm=<p>@embedder` / `judge=<p>@embedder` let
+   labelled code under a ceiling that declassifies; since v0.6.49 the code also declares it,
+   `require declassify("<principal>")` (a trusted task in its own body, within `trustedCeiling`); `llm=<p>@embedder` / `judge=<p>@embedder` let
    private data of `<p>` reach the host's hook; `judge` is now gated by its capability (it ran even
    when the ceiling did not grant it).
 5. **`trusted: {name: source}` + `trustedCeiling`** (`use "trusted:name" as t`), in `run`, `runAsync`,
@@ -625,11 +626,13 @@ tried to read STRIPE_KEY" = `origin == "program" && !granted`; no need to re-par
    ran out of memory can depend on a private value).
 7. In `handle`, `receipt()`/`lineage()` list only that request's inputs (what the top level read is no
    longer in the first request's receipt).
-8. **`auditor`** (sealed receipts, [observability.md](observability.md) § Sealed receipts) exists in the
-   engine's `run` request and returns `receipt`, but **the 0.6.46 and 0.6.47 packages' `run()`/`test()`/`handle()`
-   do not pass `auditor`/`sealedBytes` through** — a known gap of the package. Until it is fixed, call
-   the low-level API as docs 72-wasm shows (`instantiateSync(syn.module, …).call({op: "run", …,
-   auditor})`).
+8. **`auditor`** (sealed receipts, [observability.md](observability.md) § Sealed receipts):
+   `syn.run(code, {labels: true, auditor: PUBLIC_KEY, sealedBytes: 65536})` (and `runAsync`) return
+   the sealed receipt in `result.receipt` (package v0.6.49+; 0.6.46–0.6.48 did not pass it, and only
+   the low-level API did). `synsema receipt verify` checks it natively. `test()`/`handle()` refuse
+   it: `auditor: only run seals a receipt (test and handle build none)`. Call `await syn.ready()`
+   before the synchronous `run`.
+9. The audit entries of a trusted tool carry `context: "trusted:<module>"` (v0.6.49+), as natively.
 - `state_merge`/`state_cas` with the host's `kv` are atomic only if the `kv` offers
   `cas(ns, key, expected, value)` → `true`/`false` (`expected` `null` = key missing); without it they
   fail saying so. Without a host `kv` the state belongs to the instance and is atomic.

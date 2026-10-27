@@ -233,6 +233,7 @@ SYNSEMA_JUDGE_PROVIDER=laya SYNSEMA_JUDGE_MODEL=/models/laya \
 
 ```synsema
 require judge("customers")                   -- whose data this program may send to the judge
+require declassify("customers")              -- what it publishes (needed under a ceiling, v0.6.49+)
 let ticket be private({"text": "I want my money back"}, "customers")
 let v be judge ticket
     refund: whether "The customer is asking for money back"
@@ -250,8 +251,15 @@ let route be declassify(v.refund.probability > 0.8, "whether to route to billing
   judge=<principal>@<provider host>\`, …) and the program declares \`require judge("<principal>")\``.
   A `judge` block under a private branch is refused first and writes no audit entry.
 - Each allowed call writes the audit entry `judge("customers@local")`, `source: "llm-data"`.
-- With `SYNSEMA_JUDGE_DECIDE=1`, a `decide` over private data is checked against `judge=` (and the
-  ceiling must still grant `llm`: `--cap-set "stdout,llm,judge=customers@local,…"`).
+- With `SYNSEMA_JUDGE_DECIDE=1`, a `decide` over private data is checked against `judge=`, and it
+  also needs `llm` in the program and the ceiling, because it falls back to the model when the judge
+  does not choose (`--cap-set "stdout,llm,judge=customers@local,…"`). Without it (v0.6.49+), at the
+  `decide`'s line: ``Capability not granted: llm — a `decide` served by the judge
+  (SYNSEMA_JUDGE_DECIDE) falls back to the model when the judge does not choose, so it needs `llm` as
+  well as `judge`: add `require llm` … (with private data, `require llm("<principal>")`), and the
+  host's ceiling has to allow it too (`llm`, or `llm=<principal>@<provider host>` …), or unset the
+  knob`` (before: `Runtime error: private(…)`). Give such a `decide` its own statement: one that
+  touched the private value earlier in the same statement still gets the redacted text.
 - What it does not give is the same as for the LLM ([llm.md](llm.md) § Private data to a model):
   the provider sees the state, and its answer is private but not trusted.
 

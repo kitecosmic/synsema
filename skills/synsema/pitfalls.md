@@ -2,7 +2,8 @@
 
 Read this FIRST if something fails. Each row is a real mistake that costs hours to debug.
 
-> **Just upgraded and something that worked now fails?** Start at *Upgrading to v0.6.47* (label cuts
+> **Just upgraded and something that worked now fails?** Start at *Upgrading to v0.6.49*
+> (`require declassify` under a ceiling, `--replay` and the program, trusted modules), then *v0.6.47* (label cuts
 > with no location, runs committed or undone under `serve --labels`, the audit's grant), then *v0.6.46* (secrets
 > in encodings, wildcards and private addresses, `declassify` under a ceiling, `watch`/`cwd`), then
 > *v0.6.45* (file scopes, `static`, templates), *v0.6.42*, *v0.6.29* and *v0.6.24*, right below.
@@ -13,6 +14,23 @@ Read this FIRST if something fails. Each row is a real mistake that costs hours 
 > Behavioral surprises · Anti-patterns · Secrets & config
 > Coming from Python? The traps that LOOK like Python but aren't are also collected in
 > [python-diff.md](python-diff.md).
+
+## Upgrading to v0.6.49 — what behaves differently
+
+| You see | What changed | What to write |
+|---|---|---|
+| with `--labels` under a ceiling (`--cap-set`, wasm `ceiling`) that names the principal, ``label_violation: declassify is not granted … With a ceiling the program declares what it publishes (`require declassify("<principal>")` …``) | the ceiling alone no longer grants it: the program declares it, like `require net` | `require declassify("customers")` in the preamble, the agent's body, or the trusted task (labels.md) |
+| a bare `require declassify` is refused under `--cap-set declassify=customers` | wider than the ceiling, refused whole | scope it: `require declassify("customers")` |
+| Vela: an app that worked on v0.6.48 answers `{"error": "label_violation"}` to everything | the guest runs under `stdout,declassify=app` and the app must declare it | `require declassify("app")` in the app's preamble (guests.md) |
+| `cannot replace the trusted task 'reply' from outside the module` / `trusted module has no export 'x' …` | `set t.task` and `set t.new` were silently a copy / a new key | don't; `set` of an exported value still changes only your copy |
+| `--replay: the receipt is of another program (program_sha …)`, exit 2 | `--replay` compares the program (and the `--trusted` modules) first | replay the same file, or `--replay-any-program` (not a verification) |
+| `replay: the run read the clock 2 times, the recorded run 1`, exit 1 | the clock readings are counted; an error run is not a match; `exit(n)` is compared | fix the program, or accept the difference |
+| `push_send: the payload["k"] is secret(K) …` | a secret inside the payload used to travel as `[redacted]` | leave it out of the payload |
+| ``Capability not granted: net("db:5432") — net("10.0.0.0/8") covers the addresses inside it when the URL writes the address, never a name …`` | a CIDR never covered a name; now the error says it | `require net("db:5432")` |
+| ``Capability not granted: llm — a `decide` served by the judge (SYNSEMA_JUDGE_DECIDE) …`` | the judge's `decide` falls back to the model | `require llm` (or `llm("P")`) and `llm` in the ceiling, or unset the knob |
+| a tool reading `llm-data` audit entries finds `Granted by llm("P@host")` in `reason` | it was the operation (`generate`) | accept both |
+| `@synsema/wasm`: `auditor: only run seals a receipt (test and handle build none)` | `test`/`handle` used to ignore `auditor` | pass `auditor` to `run`/`runAsync` only; the receipt is `result.receipt` |
+| ``warning: p.syn:3: `generate "…" + …` joins the model's answer …`` | new load warning | `generate "…" given c` |
 
 ## Upgrading to v0.6.47 — what behaves differently
 

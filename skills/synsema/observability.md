@@ -105,7 +105,8 @@ Every `write_file`, `append_file`, `edit_file`, `zip_extract`, `tar_extract`, in
   guessed by hashing candidates — don't write short secrets in a run whose receipt you publish.
 - With labels, a write in a private context is refused (sink) → never in `outputs`. An
   `append_file` that fails half-way can leave unlisted bytes. `print`/`log` are not outputs. The file
-  `edit_file` reads first is NOT an input. `lineage()` lists inputs only.
+  `edit_file` reads first IS an input (v0.6.49+; `source: "edit_file"`, the file before the edit).
+  `lineage()` lists inputs only.
 ```synsema
 require file.write("./out/**")
 
@@ -136,7 +137,10 @@ no padding). `--out f` → private to a NEW file, stdout `{"public","private_in"
 `cannot create f (it must not exist): <OS error>`, exit 1.
 
 **Turning it on.** `run --auditor <pub>` / `serve --auditor <pub>`, or `SYNSEMA_AUDITOR_KEY` in the environment or `.env` (flag
-wins; listed commented in `synsema init`'s `.env.example`); a `synsema build` binary reads the variable; wasm: the `auditor` option ([deploy.md](deploy.md) § WebAssembly / docs 72-wasm). `synsema test` has NO `--auditor` (unknown flag) and ignores the variable. Without
+wins; listed commented in `synsema init`'s `.env.example`); a `synsema build` binary reads the variable; wasm: the `auditor` option ([deploy.md](deploy.md) § WebAssembly / docs 72-wasm). `synsema test --auditor <pub> [--receipt <path>]` (v0.6.49+, reads the variable too) seals ONE
+run, so one test file (`--auditor seals one run; pass one test file (2 found)`); before v0.6.49 it
+had no `--auditor`. A bad `SYNSEMA_AUDITOR_KEY` is named as the variable (`SYNSEMA_AUDITOR_KEY: the
+auditor key is not base64url: …`). Without
 `--labels` it works too (all entries public; still a signed log + recorded seed/clock for replay).
 Pre-run errors (exit 2): `--auditor: the auditor key must be an X25519 public key of 32 bytes, got N`
 (hex is not accepted: use keygen's base64url) · `--auditor: the auditor key is not base64url: …`
@@ -218,16 +222,17 @@ per line; a restart appends). `inputs`/`outputs` = the request's. A `stream`/`so
 error: ``serve --auditor: route `GET /events` is a stream route: its body leaves while it runs, before
 the request's sealed receipt exists`` — serve those from a server without an auditor. Cron jobs /
 agents outside a request have no receipt → an audited op in a private branch there is still a
-`label_violation`. The file is opened at start: deleting it while running loses the receipts
-(requests still answer 200) — rotate by restarting.
+`label_violation`. The file is opened for each receipt (v0.6.49+): one deleted or moved while it
+runs is created again by the next request — rotate by moving it (before, on Windows, the following
+receipts were lost in silence).
 
 **In a private branch, with an auditor:**
 | | |
 |---|---|
 | `reveal`, `sign`/signing builtins | run; check + audit line sealed |
-| wallet ops | check + audit line sealed, but a builtin returning a NEW secret there (`mnemonic_generate`, `hd_derive`…) then fails `a secret is already opaque; use private on the value you compute` → make keys outside the branch |
+| wallet ops | check + audit line sealed, but a builtin returning a NEW secret there (`mnemonic_generate`, `hd_derive`…) fails `label_violation: a secret cannot be created or chosen under private control flow — …; create or pick the secret before the `when` (or the loop) that depends on the private value` (v0.6.49+; before `a secret is already opaque; …`) → make keys outside the branch. A secret made FROM a private value (`as_secret(p, "K")`): `a secret cannot be made from, combined with or chosen by a private value — …` |
 | `spend` | refused (`label_violation`): a shared budget would tell the branch |
-| a signature under `SYNSEMA_SIGN_CEILING` | refused; surfaces as `Runtime error: private(app)` |
+| a signature under `SYNSEMA_SIGN_CEILING` | refused: `label_violation: a signature that counts against SYNSEMA_SIGN_CEILING cannot run in a branch decided by a private value — …; sign outside the branch, or decide with a public value` (v0.6.49+; before `Runtime error: private(app)`) |
 | `secret()`, `print`, `write_file`, every sink | still `label_violation` (an auditor seals audit lines; it does not open the walls) — read secrets BEFORE the branch |
 | `declassify` | runs, recorded nowhere (no `[INF]` line, nothing sealed) |
 
@@ -262,14 +267,24 @@ here: `the chain does not verify: the entries are not the ones the run signed`).
 readings, comparing each input (source + sha256) in order; stops at the first difference:
 `replay: input #1 differs from the recorded run — read_file returned sha256 …, the recorded run read
 read_file with sha256 …`. Final stderr line: `replay: the N inputs match the recorded run (same
-seed, same clock readings)` (exit 0) / `replay: the run read 0 of the 1 inputs of the recorded run`
-(exit 1). Not opened → `--replay: f is not an opened receipt (run synsema receipt open <receipt>
+seed, the same 1 clock reading)` (exit 0) / `replay: the run read 0 of the 1 inputs of the recorded
+run` (exit 1). **It checks the program first** (v0.6.49+): `header.program_sha` against the
+program's (`synsema code sha`) and the `--trusted` modules' hashes (`trusted`) → another program
+does not run, exit 2: `--replay: the receipt is of another program (program_sha … in the receipt, …
+here); to run this program against it anyway, add --replay-any-program (the result is not a
+verification)`; no `program_sha` → `the receipt has no program_sha`. `--replay-any-program` runs it,
+warns, and the verdict ends `(another program: not a verification)`. **The clock counts**: more or
+fewer `now()` readings than recorded = a difference (exit 1, `replay: the run read the clock 2 times,
+the recorded run 1`), unless the envelope cut them (warning `the recorded run kept 36 clock readings
+and truncated 364; readings past those come from the real clock`; verdict `the 36 recorded clock
+readings and 364 from the real clock past the receipt's truncation`). A run that stops with an error
+is not a match (`replay: the run stopped with an error, so it was not compared to the end; …`, exit
+1); `exit(n)` is compared to the end, verdict `ended with exit(n)`, a match exits `n`, any
+difference 1. Not opened → `--replay: f is not an opened receipt (run synsema receipt open <receipt>
 --key <private> first)` (exit 2). With `--auditor`/`--explain`/`--format json`/`--attest` → exit 2;
-`serve` has no `--replay`. Pass `--labels` if the run had it. **It does NOT check the program**
-(compare `header.program_sha` with `synsema code sha` yourself) and **effects are real** (files are
-written again). Readings beyond the recorded ones come from the real clock silently (the final line
-still says "same clock readings"); if the envelope cut something it warns `the recorded run truncated
-N sealed entries; …`.
+`serve` has no `--replay`. Pass `--labels` if the run had it. **Effects are real** (files are
+written again). If the envelope cut sealed entries it warns `the recorded run truncated N sealed
+entries; …`.
 
 **What it does NOT hide:** that the run touched private data (`steps: null`), the run's wall-clock
 time (`started`, when the receipt appears), whether it stopped on an error/limit (exit code; an error
