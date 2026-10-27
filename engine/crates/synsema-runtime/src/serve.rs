@@ -1234,6 +1234,7 @@ pub(crate) fn rebuild_global_val(
                 origin: None,
                 required_capabilities: required_capabilities.clone(),
                 code: Default::default(),
+                free_names: Default::default(),
             }))
         }
         GlobalVal::Module { id, is_alias, alias, env } => {
@@ -5046,6 +5047,25 @@ let fs be mk(3)
         assert_eq!(names(&task_global(t1, &mut SnapState::default())), vec!["big".to_string()]);
         let a = synsema_core::interpreter::task_free_names(t0);
         assert!(Rc::ptr_eq(&a, &synsema_core::interpreter::task_free_names(t0)), "se recorrió dos veces");
+        // Ronda 5 (M1): viven con la task, no en una caché que la sobrevive.
+        let program = synsema_core::parser::parse_source("task inner(x)\n    require time\n    give x + k\n", "<r5m1>").expect("parse");
+        let synsema_core::ast::NodeKind::TaskDefinition { parameters, body, .. } = &program.statements[0].kind else { panic!("task") };
+        let t = Rc::new(SynTaskValue {
+            name: "inner".into(),
+            parameters: parameters.clone(),
+            body: body.iter().cloned().collect::<Vec<_>>().into(),
+            closure_env: Environment::root("t"),
+            origin: None,
+            required_capabilities: Vec::new(),
+            code: Default::default(),
+            free_names: Default::default(),
+        });
+        let n = synsema_core::interpreter::task_free_names(&t);
+        assert!(n.contains("k"));
+        let weak = Rc::downgrade(&n);
+        drop(n);
+        drop(t);
+        assert!(weak.upgrade().is_none(), "los nombres sobreviven a la task");
     }
 
     /// R2.4: la foto de un agente o de `cron` comparte lo que ya está congelado para siempre (las

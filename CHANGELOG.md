@@ -70,11 +70,14 @@ Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the rele
   then `L[0](x)` in a worker failed with `Cannot call value of type text`), also inside a module
   and in a trusted tool, whose task keeps the tool's scope. Only the locals the task names cross: a
   large local it does not use costs nothing.
-- **A `type` or `enum` defined at the top level now works in a `serve` route, and a builtin, a
-  constructor or a trusted task held under another name crosses too.** Under `serve`, `Punto(1)`
-  or `Forma.circulo(2)` in a route failed with `Undefined variable: 'Punto'`, and so did a global
-  alias of a builtin (`let SS be state_set`). A builtin bound to another name (`let up be upper`, `{"f": upper}`, in a local, a global or a
-  module) crosses by its own name; a `type`'s constructor or an `enum` variant's (`Punto(x)`,
+- **A `type` or `enum` defined at the top level or exported by a module now works in a `serve`
+  route, and a builtin, a constructor or a trusted task held under another name crosses too.**
+  Under `serve`, `Punto(1)` in a route failed with `Undefined variable: 'Punto'`; an `enum` variant
+  with a payload (`Forma.circulo(2)`) or the constructor of a module's `export type` or `export
+  enum` (`m.Punto2(3)`, `m.Estado.pago("x")`) failed with `Cannot call value of type text` (a
+  variant without one, `Forma.vacio`, already worked); and a global alias of a builtin (`let SS be
+  state_set`) failed with `Undefined variable: 'SS'`. A builtin bound to another name (`let up be
+  upper`, `{"f": upper}`, in a local, a global or a module) crosses by its own name; a `type`'s constructor or an `enum` variant's (`Punto(x)`,
   `Forma.circulo(r)`) crosses by its definition; a trusted task in a variable (`let G be t.leer`)
   keeps the tool's scope. Before, the name was missing in the worker (`Undefined variable: 'up'`)
   or arrived as text, and a local that shadowed an outer name read that other value without an
@@ -91,6 +94,10 @@ Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the rele
   receipt's envelope, which only the auditor opens, with or without a ceiling. With a ceiling the
   program still sees the same fixed text, and the operator detail (a log) stays redacted, with its
   location.
+- A task with `require` defined inside another task, a route, an agent or a loop no longer copies
+  its body each time its definition runs: every definition shares one body without the `require`
+  lines, like a task without them. Before, a 150-line task defined in each of 2 000 calls peaked
+  at 473 MB (20 MB now) and took three times as long.
 - **A task of a trusted tool that an export holds inside a map or a list** (`export let M be {"f":
   helper}`, then `t.M["f"]()`) now runs in the tool's scope, with its `require` ∩
   `--trusted-cap-set`, like an exported task. Before, it ran with the program's capabilities.

@@ -6051,6 +6051,7 @@ impl Interpreter {
                     origin: Some(loc.clone()),
                     required_capabilities: Vec::new(),
                     code: Default::default(),
+                    free_names: Default::default(),
                 });
                 Ok(SynValue::Task(task))
             }
@@ -6958,6 +6959,7 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                     origin: Some(r.location.clone()),
                     required_capabilities: Vec::new(),
                     code: Default::default(),
+                    free_names: Default::default(),
                 }));
                 map.insert(format!("_route_handler_{}", i), task);
                 let mut mm = SynMap::new();
@@ -7219,12 +7221,11 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
     #[inline(never)]
     fn exec_task_definition(&mut self, node: &Node, env: &Rc<RefCell<Environment>>) -> Result<SynValue, Control> {
         let loc = &node.location;
-        let NodeKind::TaskDefinition { name, parameters, body, .. } = &node.kind else { unreachable!("exec_task_definition: otro nodo") };
+        let NodeKind::TaskDefinition { name, parameters, body, run_body, .. } = &node.kind else { unreachable!("exec_task_definition: otro nodo") };
         {
         let mut required_caps = Vec::new();
-        let mut clean_body = Vec::new();
         // Sin `require` adentro (casi siempre), el cuerpo de la task ES el del AST, compartido
-        // (R2.5); con `require`, el cuerpo limpio se arma acá.
+        // (R2.5); con `require`, es el cuerpo limpio del nodo, armado una vez (ronda 5, M1).
         let has_requires = body.iter().any(|s| matches!(s.kind, NodeKind::RequireStatement { .. }));
         for stmt in body.iter() {
             if let NodeKind::RequireStatement { capability, scope, bound_to } = &stmt.kind {
@@ -7252,18 +7253,17 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                     scope_s = Some(self.bound_secret_scope(n, hosts, env, &stmt.location)?);
                 }
                 required_caps.push((capability.clone(), scope_s));
-            } else if has_requires {
-                clean_body.push(stmt.clone());
             }
         }
         let task = Rc::new(SynTaskValue {
             name: name.clone(),
             parameters: parameters.clone(),
-            body: if has_requires { clean_body.into() } else { body.clone() },
+            body: if has_requires { run_body.get(body) } else { body.clone() },
             closure_env: env.clone(),
             origin: Some(loc.clone()),
             required_capabilities: required_caps,
             code: Default::default(),
+            free_names: Default::default(),
         });
         let value = SynValue::Task(task);
         // Definir una task bajo PC es una asignación más (NSU estricto + el
@@ -11833,25 +11833,14 @@ pub fn is_own_builtin(k: &str, b: &BuiltinTask) -> bool {
 /// Los nombres que el intérprete busca por texto, sin un `Identifier` en el cuerpo.
 const IMPLICIT_NAMES: &[&str] = &["request", "declassify", "range", "insert", "merge"];
 
-thread_local! {
-    /// Ronda 4 (N1): `task_free_names` por cuerpo. El cuerpo es inmutable y lo comparten todas las
-    /// copias de la task (R2.5); la entrada guarda el `Arc`, así que su dirección no se reusa.
-    static FREE_NAMES: RefCell<HashMap<usize, (std::sync::Arc<[Node]>, Rc<HashSet<String>>)>> = RefCell::new(HashMap::new());
-}
-
 /// v0.6.50 (ronda 3, R3): los nombres que una task puede leer o escribir de afuera, por exceso:
 /// todo identificador de su cuerpo y de los defaults de sus parámetros (sin restar los propios),
 /// `spawn`/`observe` y los nombres que el intérprete busca por texto. De un frame que cruza viajan
-/// sólo éstos. Se calcula una vez por cuerpo (ronda 4, N1): una foto por `parallel_map` no lo
-/// vuelve a recorrer.
+/// sólo éstos. Se calculan una vez por valor (ronda 4, N1) y viven con él (ronda 5, M1): un global
+/// que cruza en cada `parallel_map` no se vuelve a recorrer, y una task que se define en cada
+/// llamada no deja nada en una caché.
 pub fn task_free_names(t: &SynTaskValue) -> Rc<HashSet<String>> {
-    let key = std::sync::Arc::as_ptr(&t.body) as *const Node as usize;
-    if let Some(n) = FREE_NAMES.with(|c| c.borrow().get(&key).map(|(_, n)| n.clone())) {
-        return n;
-    }
-    let names = Rc::new(walk_free_names(t));
-    FREE_NAMES.with(|c| c.borrow_mut().insert(key, (t.body.clone(), names.clone())));
-    names
+    t.free_names.get_or_init(|| Rc::new(walk_free_names(t))).clone()
 }
 
 fn walk_free_names(t: &SynTaskValue) -> HashSet<String> {
@@ -12977,6 +12966,7 @@ mod drop_tests {
                 origin: None,
                 required_capabilities: vec![],
                 code: Default::default(),
+                free_names: Default::default(),
             }));
             interp.set_global("f", task); // global_env → task (la otra mitad)
             weak = Rc::downgrade(&interp.global_env);
@@ -13010,6 +13000,7 @@ mod drop_tests {
                 origin: None,
                 required_capabilities: vec![],
                 code: Default::default(),
+                free_names: Default::default(),
             }));
             env.borrow_mut().bindings.insert("t", task); // child → task (otra mitad)
             weak = Rc::downgrade(&env);
@@ -14246,5 +14237,53 @@ mod bindings_find_tests {
         assert!(b.remove("v9").is_some());
         assert_eq!(b.find("v9"), Some(9));
         assert!(b.get("v9").is_none());
+    }
+}
+
+#[cfg(test)]
+mod run_body_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    /// Ronda 5 (M1): una task local con `require`, definida en cada llamada, corre el cuerpo limpio
+    /// de su nodo, armado una vez: dos definiciones comparten el `Arc`, sin los `require`. Un
+    /// `rename_task` (que muta el cuerpo en el lugar) lo vuelve a armar.
+    #[test]
+    fn a_task_with_require_runs_one_clean_body_per_definition() {
+        let src = "task mk(i)\n    task inner(x)\n        require time\n        give old(x)\n    give inner\nlet a be mk(1)\nlet b be mk(2)\n";
+        let mut program = crate::parser::parse_source(src, "<r5m1>").expect("parse");
+        let bodies = |program: &crate::ast::Program| {
+            let mut interp = Interpreter::new();
+            assert!(interp.execute(program).is_ok(), "falló");
+            let body = |n: &str| match env_get(&interp.global_env, n) {
+                Some(SynValue::Task(t)) => {
+                    assert_eq!(t.required_capabilities.len(), 1);
+                    t.body.clone()
+                }
+                other => panic!("{} no es una task: {:?}", n, other.map(|v| v.type_name())),
+            };
+            (body("a"), body("b"))
+        };
+        let (a, b) = bodies(&program);
+        assert!(Arc::ptr_eq(&a, &b), "cada definición copió el cuerpo");
+        assert_eq!(a.len(), 1);
+        assert!(!a.iter().any(|s| matches!(s.kind, NodeKind::RequireStatement { .. })));
+        drop((a, b));
+        // El nodo de `inner` en el AST (el que muta `rename_task`), con su cuerpo limpio ya armado.
+        let inner_clean = |program: &crate::ast::Program| {
+            let NodeKind::TaskDefinition { body, .. } = &program.statements[0].kind else { panic!("mk") };
+            let NodeKind::TaskDefinition { body, run_body, .. } = &body[0].kind else { panic!("inner") };
+            run_body.get(body)
+        };
+        drop(inner_clean(&program));
+        assert_eq!(crate::ast_api::rename_task(&mut program, "old", "new"), 1);
+        let a = inner_clean(&program);
+        let mut names = Vec::new();
+        crate::ast_api::walk(&a[0], &mut |n| {
+            if let NodeKind::Identifier { name } = &n.kind {
+                names.push(name.to_string());
+            }
+        });
+        assert!(names.contains(&"new".to_string()), "el cuerpo limpio no vio el rename: {:?}", names);
     }
 }

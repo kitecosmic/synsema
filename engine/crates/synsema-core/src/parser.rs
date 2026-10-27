@@ -1088,6 +1088,7 @@ The inline form belongs where a value is used: let x be when c then a otherwise 
                 body: crate::ast::seal_body(body),
                 return_type: None,
                 capabilities: Vec::new(),
+                run_body: Default::default(),
             },
         ))
     }

@@ -407,6 +407,8 @@ pub enum NodeKind {
         body: Arc<[Node]>,
         return_type: Option<String>,
         capabilities: Vec<String>,
+        /// El cuerpo que corre si `body` tiene `require` (ver `RunBody`).
+        run_body: RunBody,
     },
     TaskCall {
         name: Box<Node>, // Identifier o PropertyAccess
@@ -736,6 +738,39 @@ pub enum NodeKind {
 /// copiando el árbol entero duplicaba lo que se reserva al parsear y subía el pico del proceso.
 pub fn seal_body(body: Vec<Node>) -> Arc<[Node]> {
     body.into()
+}
+
+/// v0.6.50 (ronda 5, M1): el cuerpo de una task con `require` sin los `require`, armado una sola
+/// vez por definición. Antes se copiaba en cada ejecución de la definición: una task local con
+/// `require` definida en cada llamada copiaba su cuerpo entero cada vez. Quien muta `body` en el
+/// lugar (los walkers de `ast_api`) llama a `reset`. No cuenta para `==` ni para `Debug`.
+#[derive(Clone, Default)]
+pub struct RunBody(std::sync::OnceLock<Arc<[Node]>>);
+
+impl RunBody {
+    pub fn get(&self, body: &[Node]) -> Arc<[Node]> {
+        self.0
+            .get_or_init(|| {
+                body.iter().filter(|s| !matches!(s.kind, NodeKind::RequireStatement { .. })).cloned().collect::<Vec<_>>().into()
+            })
+            .clone()
+    }
+
+    pub fn reset(&mut self) {
+        self.0.take();
+    }
+}
+
+impl PartialEq for RunBody {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl std::fmt::Debug for RunBody {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("RunBody")
+    }
 }
 
 /// La expresión de una lambda: su cuerpo es `[give <expresión>]` (ver `NodeKind::LambdaExpression`).
