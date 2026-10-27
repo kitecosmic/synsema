@@ -826,7 +826,11 @@ fn val_to_global_inner(v: &SynValue, state: &mut SnapState) -> GlobalVal {
         SynValue::Map(m) => {
             // ¿El map cierra sobre un `module_env`? (alias de `use`, o map interno cuyas
             // tasks cierran sobre el módulo — heurística por el nombre "module:…").
-            if let Some(module_env) = module_env_of(&m.borrow()) {
+            // v0.6.50 (A): primero el registro (`use` lo anota): un módulo que exporta sólo datos —un
+            // mapa de callbacks que armó una de sus tasks— no tiene ninguna task que cierre sobre él, y
+            // viajaba como un mapa común, con sus lambdas colgadas del global del request.
+            let module_env = synsema_core::interpreter::module_env_of_map(m).or_else(|| module_env_of(&m.borrow()));
+            if let Some(module_env) = module_env {
                 let key = Rc::as_ptr(&module_env) as usize;
                 let id = module_env.borrow().name.to_string();
                 let is_alias = synsema_core::interpreter::module_env_of_map(m).is_some();
@@ -950,9 +954,9 @@ pub(crate) fn rebuild_module_env(
 
 /// Reconstruye un `SynValue` desde un `GlobalVal`. `closure_target` es el env que
 /// capturan las tasks (para top-level es el global; para una task de módulo es el
-/// `module_env` compartido). `base` es el padre para nuevos `module_env` (siempre el
-/// global del request, igual que `load_module_inner`, que cuelga todo module_env del
-/// global). Las tasks cierran sobre `closure_target` para que la recursión mutua entre
+/// `module_env` compartido). `base` es el padre para nuevos `module_env`: la foto del preludio
+/// del intérprete (`Interpreter::module_base`), igual que `load_module_inner` — v0.6.50 (A): un
+/// módulo no ve los globales del request. Las tasks cierran sobre `closure_target` para que la recursión mutua entre
 /// globales y la llamada a hermanas dentro de un módulo (DE-027) sigan funcionando.
 /// `registry` dedupea los `module_env` de este rebuild por id (DE-033).
 fn rebuild_global_val(
@@ -1042,11 +1046,11 @@ fn rebuild_global_val(
         }
         GlobalVal::SharedRng(name) => synsema_core::rng::top_level_stub(name),
         GlobalVal::MapWithTasks(entries) => {
-            // Map de datos con callbacks: las tasks cierran sobre el global (como cualquier
-            // task top-level), NO sobre un module_env compartido.
+            // Map de datos con callbacks: las tasks cierran donde estaba el map (el global para uno
+            // de nivel superior; el `module_env` para uno de un módulo, que no ve el global).
             let mut m = SynMap::new();
             for (k, gv) in entries {
-                m.insert(k.clone(), rebuild_global_val(gv, base, base, registry, scope));
+                m.insert(k.clone(), rebuild_global_val(gv, closure_target, base, registry, scope));
             }
             SynValue::Map(m.into_ref())
         }
@@ -1145,14 +1149,18 @@ pub(crate) fn rebuild_globals(
     // de `with_serve_interp` — para que build fresco y reset no puedan divergir (si
     // divergieran, el bug pocos-cores volvería sólo en uno de los dos caminos).
     restore_agents(interp, snapshot);
+    // v0.6.50 (A): la foto del preludio ANTES de inyectar los globales (ahora el global del
+    // intérprete es sólo el preludio). Una vez por intérprete: un worker que se reusa ya la tiene.
+    interp.snapshot_module_base();
+    let mbase = interp.module_base();
     for (k, gv) in snapshot {
         match gv {
             GlobalVal::Agent { .. } => {}
             other => {
-                // Top-level: las tasks cierran sobre el global (closure_target) y los
-                // nuevos module_env también cuelgan del global (base).
+                // Top-level: las tasks cierran sobre el global (closure_target); los nuevos
+                // module_env cuelgan de la foto del preludio (base).
                 let genv = interp.global_env.clone();
-                let v = rebuild_global_val(other, &genv, &genv, &mut registry, scope);
+                let v = rebuild_global_val(other, &genv, &mbase, &mut registry, scope);
                 interp.set_global(k, v);
             }
         }

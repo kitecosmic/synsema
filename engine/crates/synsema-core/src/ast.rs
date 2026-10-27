@@ -18,6 +18,9 @@ pub struct Program {
     /// Líneas con un literal que usa un escape `\u` (nuevo en v0.6.29): `synsema check` avisa,
     /// porque antes ese texto quedaba tal cual.
     pub escape_lines: Vec<usize>,
+    /// v0.6.50 (A): hay un `use` de archivo en algún lugar del programa. Sólo entonces se toma la
+    /// foto del preludio de la que cuelgan los módulos (`Interpreter::snapshot_module_base`).
+    pub has_file_use: bool,
 }
 
 /// Un nodo del AST. Todos llevan `location` para observabilidad.

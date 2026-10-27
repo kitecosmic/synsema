@@ -289,6 +289,25 @@ fn unknown_parameter<'a>(name: &str, params: impl Iterator<Item = &'a str>, loc:
 }
 
 /// El error de leer una variable que no existe (el mismo texto en el tree-walker y en la VM).
+/// v0.6.50 (A): ¿hay un `use` de archivo en algún lugar de estas sentencias? (`Program` lo trae
+/// del parser como `has_file_use`; esto es para un bloque suelto.)
+#[cold]
+fn stmts_have_file_use(stmts: &[Node]) -> bool {
+    let mut found = false;
+    for s in stmts {
+        crate::ast_api::walk(s, &mut |n| {
+            if let NodeKind::UseImport { path, .. } = &n.kind {
+                found |= !path.starts_with("trusted:");
+            }
+        });
+    }
+    found
+}
+
+/// Las constantes matemáticas del preludio: valores globales que se usan sin llamar.
+const PRELUDE_CONSTANTS: [(&str, f64); 5] =
+    [("pi", std::f64::consts::PI), ("tau", std::f64::consts::TAU), ("e", std::f64::consts::E), ("inf", f64::INFINITY), ("nan", f64::NAN)];
+
 fn undefined_variable(name: &str, loc: &SourceLocation) -> Control {
     // Batch DX (decisión #6): los bindings que serve inyecta SOLO en el
     // scope de un route handler (`request`/`query`/`params`/`read_body`/
@@ -1879,6 +1898,10 @@ pub struct Interpreter {
     /// proceso). Con agentes y etiquetas, al swarm: sale al cierre de la corrida, no cuando
     /// termina cada intérprete (cuándo terminó cada uno lo elegía el dato).
     pub err_hook: Option<std::sync::Arc<dyn Fn(&str) + Send + Sync>>,
+    /// v0.6.50 (A): el padre del entorno de un módulo de archivo, la foto del preludio (ver
+    /// `snapshot_module_base`). Colgado de `global_env`, un módulo leía y escribía los globales de
+    /// quien lo importaba. Al final del struct a propósito (no es camino caliente).
+    module_base_env: Option<Rc<RefCell<Environment>>>,
 }
 
 /// v0.6.46 (ronda 1 de cf1, B2): el linaje que juntó un intérprete hijo (un worker de
@@ -2038,6 +2061,7 @@ impl Interpreter {
             labels_detail_to_program: false,
             run_cut: std::sync::Arc::new(RunCut::default()),
             err_hook: None,
+            module_base_env: None,
             blackboard: HashMap::new(),
             agent_definitions: HashMap::new(),
             agent_context: Vec::new(),
@@ -3619,7 +3643,31 @@ impl Interpreter {
         if self.trusted_sources.is_empty() || self.trusted_base_env.is_some() {
             return;
         }
-        let base = Environment::root("trusted-base");
+        self.trusted_base_env = Some(self.prelude_snapshot("trusted-base"));
+    }
+
+    /// v0.6.50 (A): la foto del preludio para los módulos de archivo, antes de la primera sentencia
+    /// del programa (o, en un worker o un agente, antes de inyectarle los globales). Una vez por
+    /// intérprete. Es otra base que la de confianza: `check_trusted_origin` distingue una task de una
+    /// tool porque su cadena llega a ESA base.
+    pub fn snapshot_module_base(&mut self) {
+        if self.module_base_env.is_none() {
+            self.module_base_env = Some(self.prelude_snapshot("module-base"));
+        }
+    }
+
+    /// `module_base` sin `&mut`, para quien ya reconstruyó los globales (`rebuild_globals` toma la
+    /// foto). Sin foto, los builtins con su nombre, sin guardarlos.
+    pub fn module_base_ref(&self) -> Rc<RefCell<Environment>> {
+        match &self.module_base_env {
+            Some(b) => b.clone(),
+            None => self.builtins_only("module-base"),
+        }
+    }
+
+    /// Una copia de lo que hay hoy en `global_env`, en un entorno raíz propio.
+    fn prelude_snapshot(&self, name: &str) -> Rc<RefCell<Environment>> {
+        let base = Environment::root(name);
         {
             let g = self.global_env.borrow();
             let mut b = base.borrow_mut();
@@ -3627,7 +3675,82 @@ impl Interpreter {
                 b.bindings.insert(k.clone(), v.clone());
             }
         }
-        self.trusted_base_env = Some(base);
+        base
+    }
+
+    /// El padre de un módulo de archivo. Sin foto (un intérprete que no entró por `execute` ni por
+    /// `rebuild_globals`, como la REPL), los builtins con su nombre y las constantes.
+    #[cold]
+    pub fn module_base(&mut self) -> Rc<RefCell<Environment>> {
+        if let Some(b) = &self.module_base_env {
+            return b.clone();
+        }
+        let base = self.builtins_only("module-base");
+        self.module_base_env = Some(base.clone());
+        base
+    }
+
+    /// Los builtins con su propio nombre (o el alias deprecado de uno) y las constantes: lo que el
+    /// programa liga a un nombre es una task o un valor, nunca un builtin con ese nombre.
+    fn builtins_only(&self, name: &str) -> Rc<RefCell<Environment>> {
+        let base = Environment::root(name);
+        {
+            let g = self.global_env.borrow();
+            let mut b = base.borrow_mut();
+            for (k, v) in g.bindings.iter() {
+                if let SynValue::Builtin(bt) = v {
+                    let own = *bt.name == **k
+                        || crate::deprecated::DEPRECATED_NAMES.iter().any(|(old, new)| *old == &**k && *new == &*bt.name);
+                    if own {
+                        b.bindings.insert(k.clone(), v.clone());
+                    }
+                }
+            }
+            for (k, v) in PRELUDE_CONSTANTS {
+                b.bindings.insert(k, syn_float(v));
+            }
+        }
+        base
+    }
+
+    /// v0.6.50 (A): `Undefined variable` y, si el nombre se buscó desde un módulo de archivo y es
+    /// del programa, por qué no lo ve. Sólo en el camino del error.
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn undefined_in(&self, name: &str, loc: &SourceLocation, env: &Rc<RefCell<Environment>>) -> Control {
+        self.with_module_hint(undefined_variable(name, loc), name, env)
+    }
+
+    /// Lo mismo para `set` (`Cannot set undefined variable`).
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn set_undefined_in(&self, name: &str, env: &Rc<RefCell<Environment>>) -> Control {
+        self.with_module_hint(err(format!("Cannot set undefined variable: '{}'. Use 'let' first.", name)), name, env)
+    }
+
+    fn with_module_hint(&self, mut c: Control, name: &str, env: &Rc<RefCell<Environment>>) -> Control {
+        let Some(base) = &self.module_base_env else { return c };
+        let mut cur = env.clone();
+        let in_module = loop {
+            let next = {
+                let e = cur.borrow();
+                match &e.parent {
+                    Some(p) if Rc::ptr_eq(p, base) => break e.name.starts_with("module:"),
+                    Some(p) => p.clone(),
+                    None => break false,
+                }
+            };
+            cur = next;
+        };
+        if in_module && self.global_env.borrow().bindings.get(name).is_some() {
+            if let Control::Error(e) = &mut c {
+                e.message.push_str(&format!(
+                    " — '{}' is a name of the program that imports this module, and a module sees only its own names and the builtins: pass it as an argument or define it in the module",
+                    name
+                ));
+            }
+        }
+        c
     }
 
     /// Ronda 2: ¿la task es de una tool de confianza? Lo es si su entorno, subiendo por los padres,
@@ -3678,20 +3801,7 @@ impl Interpreter {
         if let Some(b) = &self.trusted_base_env {
             return b.clone();
         }
-        let base = Environment::root("trusted-base");
-        {
-            let g = self.global_env.borrow();
-            let mut b = base.borrow_mut();
-            for (k, v) in g.bindings.iter() {
-                if let SynValue::Builtin(bt) = v {
-                    let own = *bt.name == **k
-                        || crate::deprecated::DEPRECATED_NAMES.iter().any(|(old, new)| *old == &**k && *new == &*bt.name);
-                    if own {
-                        b.bindings.insert(k.clone(), v.clone());
-                    }
-                }
-            }
-        }
+        let base = self.builtins_only("trusted-base");
         self.trusted_base_env = Some(base.clone());
         base
     }
@@ -3941,6 +4051,11 @@ impl Interpreter {
     /// Sin preámbulo/freeze (eso es sólo para el programa top-level).
     pub fn run_block(&mut self, stmts: &[Node]) -> Result<SynValue, Control> {
         let g = self.global_env.clone();
+        // v0.6.50 (A): como `execute`, la foto del preludio antes de que el bloque ligue nada (la
+        // REPL, un embebedor). Un agente ya la trae de `rebuild_globals`.
+        if self.module_base_env.is_none() && stmts_have_file_use(stmts) {
+            self.snapshot_module_base();
+        }
         let saved = self.take_taint();
         let r = self.exec_block(stmts, &g);
         self.restore_taint(saved);
@@ -4237,7 +4352,10 @@ impl Interpreter {
 
         #[cfg(feature = "resolver-check")]
         crate::resolve::check::register(&program);
-        let module_env = Environment::child(&self.global_env, &format!("module:{}", resolved));
+        // v0.6.50 (A): hijo del preludio, no de `global_env`: un módulo no ve los nombres de quien lo
+        // importa (ni los que define antes o después del `use`).
+        let base = self.module_base();
+        let module_env = Environment::child(&base, &format!("module:{}", resolved));
         self.exports_collector.push(Vec::new());
         let exec_res = self.exec_block(&program.statements, &module_env);
         let names = self.exports_collector.pop().unwrap_or_default();
@@ -4745,11 +4863,9 @@ impl Interpreter {
         // Constantes matemáticas — VALORES globales (se usan sin llamar): pi/tau/e/inf/nan.
         {
             let mut g = self.global_env.borrow_mut();
-            g.bindings.insert("pi", syn_float(std::f64::consts::PI));
-            g.bindings.insert("tau", syn_float(std::f64::consts::TAU));
-            g.bindings.insert("e", syn_float(std::f64::consts::E));
-            g.bindings.insert("inf", syn_float(f64::INFINITY));
-            g.bindings.insert("nan", syn_float(f64::NAN));
+            for (k, v) in PRELUDE_CONSTANTS {
+                g.bindings.insert(k, syn_float(v));
+            }
         }
     }
 
@@ -5022,6 +5138,9 @@ impl Interpreter {
     fn execute_inner(&mut self, program: &Program) -> Result<SynValue, Control> {
         let g = self.global_env.clone();
         self.snapshot_trusted_base();
+        if program.has_file_use {
+            self.snapshot_module_base();
+        }
         self.control_taint = self.no_label.clone();
         self.loop_taint = self.no_label.clone();
         self.escaping_taint = self.no_label.clone();
@@ -5078,6 +5197,9 @@ impl Interpreter {
     ) -> Vec<TestOutcome> {
         let g = self.global_env.clone();
         self.snapshot_trusted_base();
+        if program.has_file_use {
+            self.snapshot_module_base();
+        }
         // Preámbulo: intent/require al inicio, luego congelar intent (igual que execute).
         let mut split = 0;
         for stmt in &program.statements {
@@ -5337,7 +5459,7 @@ impl Interpreter {
                 env_get(env, name)
             } {
                 Some(v) => Ok(v),
-                None => Err(undefined_variable(name, loc)),
+                None => Err(self.undefined_in(name, loc, env)),
             },
             NodeKind::PropertyAccess { property_name, object, via_of } => {
                 // Hint de precedencia de `of` (batch DX, decisión #7): `a of b.c` parsea
@@ -7679,21 +7801,13 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                 if self.labels && !escape_pc && !self.pc_is_empty() {
                     match env_get(env, name) {
                         Some(cur) => self.nsu_check(&labels::label(&cur), &format!("'{}'", name), loc)?,
-                        None => {
-                            return Err(err(format!(
-                                "Cannot set undefined variable: '{}'. Use 'let' first.",
-                                name
-                            )))
-                        }
+                        None => return Err(self.set_undefined_in(name, env)),
                     }
                 }
                 #[cfg(feature = "resolver-check")]
                 crate::resolve::check::at(&target.location, name, false, env);
                 if env_update(env, name, value.clone()).is_err() {
-                    return Err(err(format!(
-                        "Cannot set undefined variable: '{}'. Use 'let' first.",
-                        name
-                    )));
+                    return Err(self.set_undefined_in(name, env));
                 }
                 Ok(value)
             }

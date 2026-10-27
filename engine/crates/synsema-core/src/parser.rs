@@ -126,6 +126,8 @@ pub struct Parser {
     pos: usize,
     /// >0 mientras se parsea dentro de un bloque `stream`.
     stream_depth: i64,
+    /// v0.6.50 (A): vio un `use` de archivo (no `trusted:`). Ver `Program::has_file_use`.
+    file_use: bool,
 }
 
 impl Parser {
@@ -134,6 +136,7 @@ impl Parser {
             tokens,
             pos: 0,
             stream_depth: 0,
+            file_use: false,
         }
     }
 
@@ -362,7 +365,7 @@ impl Parser {
             .filter(|t| matches!(t.ty, TokenType::Text | TokenType::Template) && has_unicode_escape(&t.raw, t.ty == TokenType::Text))
             .map(|t| t.location.line)
             .collect();
-        Ok(Program { location: loc, statements, escape_lines })
+        Ok(Program { location: loc, statements, escape_lines, has_file_use: self.file_use })
     }
 
     // =========================================================
@@ -971,6 +974,9 @@ The inline form belongs where a value is used: let x be when c then a otherwise 
         let path_tok = self.expect(TokenType::Text, "Expected a module path string after 'use'")?;
         self.expect(TokenType::As, "Expected 'as' after the module path")?;
         let alias_tok = self.expect_name("module alias after 'as'")?;
+        if !path_tok.as_str().starts_with("trusted:") {
+            self.file_use = true;
+        }
         Ok(Node::new(
             loc,
             NodeKind::UseImport {

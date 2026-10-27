@@ -1,0 +1,5 @@
+-- v0.6.50 (A): un módulo no ve los globales de quien lo importa (specs/v0.6.50-a-modelo.md)
+export task leer()
+    give TASA
+export task poner()
+    set TASA to 5

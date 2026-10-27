@@ -165,7 +165,7 @@ fn reconstruct_task(
             // devuelve ESE env (la misma instancia — estado compartido); solo reconstruye
             // uno nuevo si no (p.ej. el binding global fue pisado con `set`).
             let closure_env = match module {
-                Some((id, env)) => rebuild_module_env(id, env, &interp.global_env, registry, Some(scope)),
+                Some((id, env)) => rebuild_module_env(id, env, &interp.module_base_ref(), registry, Some(scope)),
                 None => interp.global_env.clone(),
             };
             SynValue::Task(Rc::new(SynTaskValue {

@@ -1,0 +1,5 @@
+-- v0.6.50 (A, fila 1): el módulo no lee un global del programa, con la pista
+let TASA be 2
+use "mods/v0650_globals.syn" as g
+print(steps())
+print(g.leer())

@@ -6,6 +6,33 @@ Each says what changed, why, and what to write instead.
 
 Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the release date.
 
+## v0.6.50 — unreleased
+
+**Behavior changes (read these first).**
+- **A module sees only its own names and the builtins, never the names of the program that imports
+  it.** Until now a file module (`use "./lib.syn" as lib`) looked up a name it did not define in the
+  globals of whoever imported it: `lib.syn` could read (and `set`) the importer's `TASA` (defined
+  before or after the `use`), and a program that bound a builtin's name (`let upper be 3`) changed
+  that builtin for all its modules. The meaning of a module depended on who imported it. Now a
+  module resolves its free names in its own definitions and in the prelude (the builtins, `pi`,
+  `tau`, `e`, `inf`, `nan`, and whatever the host registered before the program's first
+  statement), like modules in Rust, OCaml, Go or Python (a module sees its globals and `builtins`,
+  never `__main__`'s). Trusted modules already worked this way (v0.6.46). The same rule holds under
+  `serve`, `parallel_map`, agents and `synsema test`. A value the program passes in (an argument, a
+  callback, a lambda) keeps its own scope, as before.
+  **Breaking:** a module that read a global of its importer now fails with `Undefined variable:
+  'TASA' — 'TASA' is a name of the program that imports this module, and a module sees only its own
+  names and the builtins: pass it as an argument or define it in the module`. Write `lib.cobrar(n,
+  TASA)`, or move `TASA` into the module (`export let TASA be 2` if the program needs it too). A
+  `set` from the module on the importer's variable fails the same way. Measured over 247 modules of
+  real programs: none depended on it.
+
+**Fixes.**
+- Under `serve`, a module that exports only data (a map of callbacks built by one of its tasks,
+  `export let M be armar()`) crossed into each request as plain data: its lambdas lost the module and
+  a call to a private helper of the module failed with `Undefined variable` (under `run` it worked).
+  The module is now recognized as such, and its callbacks close over it.
+
 ## v0.6.49 — 2026-10-26
 
 **Behavior changes (read these first).**
