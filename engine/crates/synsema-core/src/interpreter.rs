@@ -12638,10 +12638,22 @@ fn translate_replacement(s: &str) -> String {
 /// Resultado observable de un programa. Sólo lleva datos `Send` (el `SynValue`
 /// final y el intérprete viven y mueren dentro del hilo de ejecución, porque
 /// `SynValue` usa `Rc` y no es `Send`).
+///
+/// v0.6.50: el estado de la corrida viaja con ella (antes eran globales del proceso, "la última
+/// corrida": un embebedor que corría dos a la vez leía el de la otra).
+#[derive(Default)]
 pub struct RunResult {
     pub success: bool,
     pub output: Vec<String>,
     pub errors: Vec<String>,
+    /// El código que pidió `exit(code)`, si el programa lo llamó (`None` también tras un corte de
+    /// etiquetas: el código sería el dato).
+    pub exit_code: Option<i32>,
+    /// Pasos del intérprete del programa principal (`steps()`; determinista).
+    pub steps: u64,
+    /// ¿La corrida tocó datos privados? Si sí, el host no publica `steps` (después de una rama
+    /// privada el contador es el dato con aritmética encima).
+    pub touched_private: bool,
 }
 
 /// Resultado de un bloque `test` (Batch 3). `assertion` distingue una falla de aserción
@@ -12669,11 +12681,13 @@ fn run_inner(source: &str, filename: &str) -> RunResult {
             success: false,
             output: Vec::new(),
             errors: vec![format!("Lexer error: {}", e)],
+            ..Default::default()
         },
         Err(CompileError::Parse(e)) => RunResult {
             success: false,
             output: Vec::new(),
             errors: vec![format!("Parse error: {}", e)],
+            ..Default::default()
         },
         Ok(program) => {
             let mut interp = Interpreter::new();
@@ -12682,11 +12696,13 @@ fn run_inner(source: &str, filename: &str) -> RunResult {
                     success: true,
                     output: std::mem::take(&mut interp.output),
                     errors: Vec::new(),
+                    ..Default::default()
                 },
                 Err(Control::Error(e)) => RunResult {
                     success: false,
                     output: std::mem::take(&mut interp.output),
                     errors: vec![format!("Runtime error: {}", e)],
+                    ..Default::default()
                 },
                 // `give`/`stop` que escapan al top: error limpio (no "Internal error:").
                 Err(Control::Give(_)) | Err(Control::Stop(_)) => RunResult {
@@ -12695,6 +12711,7 @@ fn run_inner(source: &str, filename: &str) -> RunResult {
                     errors: vec![
                         "Runtime error: 'give'/'stop' used outside of a task or loop".to_string(),
                     ],
+                    ..Default::default()
                 },
             }
         }
@@ -12718,6 +12735,7 @@ pub fn run_source(source: &str, filename: &str) -> RunResult {
                 "internal error in the interpreter (a bug, not your program — please report it): {}",
                 p.downcast_ref::<&str>().map(|s| s.to_string()).or_else(|| p.downcast_ref::<String>().cloned()).unwrap_or_default()
             )],
+            ..Default::default()
         })
 }
 

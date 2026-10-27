@@ -10,7 +10,6 @@ use std::net::{TcpListener, TcpStream};
 use std::thread;
 use std::time::Duration;
 
-use synsema_runtime::engine::last_run_exit_code;
 use synsema_runtime::serve::run_serve_program;
 
 fn free_port() -> u16 {
@@ -49,14 +48,14 @@ fn exit_before_listening_ends_clean_and_after_listening_it_is_refused() {
     assert!(r.success, "{:?}", r.errors);
     assert!(r.errors.is_empty(), "{:?}", r.errors);
     assert_eq!(r.output, ["antes"]);
-    assert_eq!(last_run_exit_code(), Some(0));
+    assert_eq!(r.exit_code, Some(0));
     assert!(TcpStream::connect(("127.0.0.1", p)).is_err(), "no debía escuchar");
 
     // 2) Con otro código: el fin pedido, sin "Runtime error", y el código llega.
     let r = run_serve_program(&program(free_port(), "exit(3)"), "a5.syn", false);
     assert!(!r.success);
     assert!(r.errors.is_empty(), "{:?}", r.errors);
-    assert_eq!(last_run_exit_code(), Some(3));
+    assert_eq!(r.exit_code, Some(3));
 
     // 3) Ya escuchando, `exit` desde una ruta es error (500) y el server sigue sirviendo.
     let p = free_port();

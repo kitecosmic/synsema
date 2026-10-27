@@ -548,7 +548,7 @@ fn run_bundled(bundle: synsema_core::bundle::Bundle, program_args: Vec<String>) 
 /// v0.6.42 — el código de salida de una corrida: el de `exit(code)` si el programa lo pidió,
 /// si no 0 / 1 como siempre.
 fn run_exit_code(result: &synsema_core::interpreter::RunResult) -> u8 {
-    match synsema_runtime::engine::last_run_exit_code() {
+    match result.exit_code {
         Some(c) => c as u8,
         None if result.success => 0,
         None => 1,
@@ -1858,12 +1858,12 @@ fn cmd_run(args: &[String]) -> ExitCode {
             // lo que el programa recorrió, así que después de una rama privada es el dato
             // privado con aritmética encima — y esto lo publicaba solo, sin que el programa
             // pidiera nada.
-            "steps": steps_field(),
+            "steps": steps_field(&result),
         });
         // `--attest --format json`: la attestation va DENTRO del informe (sólo si el run
         // fue bien; no se atesta una salida fallida).
         if let (Some(input), true) = (&attest_input, result.success) {
-            match attest_run(&source, &filename, input, &result.output, &attest_drivers, run_pub) {
+            match attest_run(&source, &filename, input, &result, &attest_drivers, run_pub) {
                 Ok(fields) => {
                     for (k, v) in fields.as_object().into_iter().flatten() {
                         report[k] = v.clone();
@@ -1916,7 +1916,7 @@ fn cmd_run(args: &[String]) -> ExitCode {
         // v0.6.46 (E6): con auditor, el documento se pide antes, para que el recibo (que lleva su
         // `config_sha`) salga antes que la salida.
         let early = match (&auditor, result.success) {
-            (Some(a), true) => match attest_run(&source, &filename, input, &result.output, &attest_drivers, run_pub) {
+            (Some(a), true) => match attest_run(&source, &filename, input, &result, &attest_drivers, run_pub) {
                 Ok(fields) => {
                     let config_sha = fields.get("config_sha").and_then(|v| v.as_str()).map(str::to_string);
                     if let Err(code) = emit_receipt(a, config_sha) {
@@ -1954,7 +1954,7 @@ fn cmd_run(args: &[String]) -> ExitCode {
         }
         let attested = match early {
             Some(r) => r,
-            None => attest_run(&source, &filename, input, &result.output, &attest_drivers, run_pub),
+            None => attest_run(&source, &filename, input, &result, &attest_drivers, run_pub),
         };
         match attested {
             Ok(fields) => println!("{}", fields),
@@ -1992,7 +1992,7 @@ fn cmd_run(args: &[String]) -> ExitCode {
     }
     let mut code = run_exit_code(&result);
     if replay_flag.is_some() {
-        match sealed_receipt::replay_verdict(!result.success, synsema_runtime::engine::last_run_exit_code()) {
+        match sealed_receipt::replay_verdict(!result.success, result.exit_code) {
             Ok(m) => eprintln!("{}", m),
             Err(m) => {
                 // Si el corte ya salió como el error de la corrida, no se repite.
@@ -2029,11 +2029,11 @@ fn emit_receipt(a: &sealed_receipt::Auditor, config_sha: Option<String>) -> Resu
 /// secreto con una multiplicación y una suma encima: `(steps() - base - 24) / 4` lo reconstruía
 /// exacto. El builtin `steps()` ya sale etiquetado con lo que la corrida tocó, pero este campo no
 /// pasa por el programa — lo publica el host por su cuenta, y por eso se omite acá.
-fn steps_field() -> serde_json::Value {
-    if synsema_runtime::engine::last_run_touched_private() {
+fn steps_field(result: &synsema_core::interpreter::RunResult) -> serde_json::Value {
+    if result.touched_private {
         return serde_json::Value::Null;
     }
-    serde_json::json!(synsema_runtime::engine::last_run_steps())
+    serde_json::json!(result.steps)
 }
 
 /// El cierre de `run --attest`: hashea programa, entrada y salida, pide a la
@@ -2054,10 +2054,10 @@ fn steps_field() -> serde_json::Value {
 /// v0.6.46 (E6): con auditor, `run_pub` (la pública que firma el recibo sellado) entra al
 /// `report_data` como `sha256(run_pub)` al final de lo atado, y el JSON la trae en `run_key`: el
 /// documento de la plataforma responde por la clave que firmó el recibo. Sin auditor, nada cambia.
-fn attest_run(source: &str, filename: &str, input: &[u8], output: &[String], drivers: &[synsema_stdlib::attest::Driver], run_pub: Option<[u8; 32]>) -> Result<serde_json::Value, String> {
+fn attest_run(source: &str, filename: &str, input: &[u8], result: &synsema_core::interpreter::RunResult, drivers: &[synsema_stdlib::attest::Driver], run_pub: Option<[u8; 32]>) -> Result<serde_json::Value, String> {
     use synsema_core::bytesutil::{b64_encode, hex_encode};
     use synsema_stdlib::attest::{attest_documents_with, current_program_sha, document_json, keccak256, program_sha, sha256, AttestConfig, AttestRequest};
-    let joined = output.join("\n");
+    let joined = result.output.join("\n");
     let program_sha = program_sha(source, filename)?;
     // Lo que se atesta tiene que ser lo que corrió: los bytes que leyó el cargador de módulos.
     if let Some(ran) = current_program_sha() {
@@ -2110,7 +2110,7 @@ fn attest_run(source: &str, filename: &str, input: &[u8], output: &[String], dri
         // doble: el documento atestado es el artefacto cuyo propósito es que un tercero lo
         // verifique, y dos corridas con secretos distintos daban el MISMO `output_sha` con
         // `steps` distinto.
-        "steps": steps_field(),
+        "steps": steps_field(result),
         "state_root": hex_encode(&state_root),
         "program_sha": hex_encode(&program_sha),
         "input_sha": hex_encode(&input_sha),

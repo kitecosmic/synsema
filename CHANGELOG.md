@@ -45,6 +45,15 @@ Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the rele
   `export let M be armar()`) crossed into each request as plain data: its lambdas lost the module and
   a call to a private helper of the module failed with `Undefined variable` (under `run` it worked).
   The module is now recognized as such, and its callbacks close over it.
+- **Embedding (Rust API, breaking):** what describes a run travels with it. `RunResult` has
+  `exit_code` (the code of `exit(code)`, if the program called it), `steps` and `touched_private`;
+  `engine::last_run_exit_code()`, `last_run_steps()` and `last_run_touched_private()` are gone. They
+  were process globals ("the last run"): a host running two programs at once read the other's.
+  Building a `RunResult` by hand takes `..Default::default()`.
+- A receipt's `program_sha` describes the program of the process. A process that ran two different
+  programs (an embedder, a test binary) has none, and the receipt carries `null`; before, the receipt
+  of the second program carried the sha of the first. With one program per process (`synsema run`,
+  `test`, `serve`) nothing changes, and under `serve --attested` the attested identity still decides.
 
 ## v0.6.49 — 2026-10-26
 

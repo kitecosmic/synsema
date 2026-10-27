@@ -1202,18 +1202,20 @@ pub(crate) fn finish_keep(interp: &mut Interpreter, result: Result<SynValue, Con
     // líneas son el log del Executor, que vive FUERA del enclave.
     interp.redact_output_for_host(&result);
     match result {
-        Ok(_) => RunResult { success: true, output: std::mem::take(&mut interp.output), errors: Vec::new() },
+        Ok(_) => RunResult { success: true, output: std::mem::take(&mut interp.output), errors: Vec::new(), ..Default::default() },
         // Ronda 7: si el corte lo decidió el sistema de etiquetas, el error sale SIN ubicación —
         // cuál de N sitios murió depende del dato, y bajo el guest este texto cruza al Executor.
         Err(Control::Error(e)) => RunResult {
             success: false,
             output: std::mem::take(&mut interp.output),
             errors: vec![format!("Runtime error: {}", e.to_string_for_client())],
+            ..Default::default()
         },
         Err(Control::Give(_)) | Err(Control::Stop(_)) => RunResult {
             success: false,
             output: std::mem::take(&mut interp.output),
             errors: vec!["Runtime error: 'give'/'stop' used outside of a task or loop".to_string()],
+            ..Default::default()
         },
     }
 }

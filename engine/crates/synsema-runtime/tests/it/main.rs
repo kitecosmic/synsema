@@ -1,9 +1,14 @@
 //! Los tests de integración de la crate en un solo binario (v0.6.46): cada archivo era un
 //! ejecutable que se linkeaba entero, y la regresión se iba en linkear. Los que tocan estado
 //! global del proceso (variables de entorno, el modo referencia, el nivel nativo, un
-//! allocator propio, las etiquetas del host, el log y el techo de host de `serve`, `shutdown()`,
-//! lo que lee `last_run_exit_code()`) siguen en `tests/` como binarios propios: acá correrían al
-//! mismo tiempo que los demás.
+//! allocator propio, las etiquetas del host, el log y el techo de host de `serve`, `shutdown()`)
+//! siguen en `tests/` como binarios propios: acá correrían al mismo tiempo que los demás.
+//!
+//! Lo de cada corrida (`exit`, `steps`, si tocó privados) viaja en su `RunResult` (v0.6.50). Siguen
+//! siendo del proceso, y los fija el primero que los toca: `serve` (escucha, `shutdown()`), la
+//! identidad mTLS de cliente, el texto de redacción de respaldo y el pool de workers. El
+//! `program_sha` de un recibo también es del proceso: aquí corren varios programas, así que sale
+//! `null` (nunca el de otro programa). Un test que dependa de alguno va aparte.
 
 mod agentauth_e2e;
 mod agentic_bus_e2e;

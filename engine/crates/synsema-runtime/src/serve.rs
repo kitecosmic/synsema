@@ -4334,17 +4334,17 @@ fn serve_inner(source: &str, filename: &str, secure: bool, overrides: ServeOverr
     let program = match parse_source(source, filename) {
         Ok(p) => p,
         Err(CompileError::Lex(e)) => {
-            return RunResult { success: false, output: Vec::new(), errors: vec![format!("Lexer error: {}", e)] }
+            return RunResult { success: false, output: Vec::new(), errors: vec![format!("Lexer error: {}", e)], ..Default::default() }
         }
         Err(CompileError::Parse(e)) => {
-            return RunResult { success: false, output: Vec::new(), errors: vec![format!("Parse error: {}", e)] }
+            return RunResult { success: false, output: Vec::new(), errors: vec![format!("Parse error: {}", e)], ..Default::default() }
         }
     };
 
     // Validación de los flags de despliegue (fail-loud) y política de múltiples serve.
     if !overrides.is_empty() {
         if let Err(e) = overrides.validate() {
-            return RunResult { success: false, output: Vec::new(), errors: vec![format!("Runtime error: {}", e)] };
+            return RunResult { success: false, output: Vec::new(), errors: vec![format!("Runtime error: {}", e)], ..Default::default() };
         }
         // Los flags configuran UN despliegue: con varios bloques `serve` no hay forma
         // coherente de aplicar --port/--tls-* (cada uno bindea su propio puerto), así
@@ -4362,6 +4362,7 @@ fn serve_inner(source: &str, filename: &str, secure: bool, overrides: ServeOverr
                     "Runtime error: CLI serve flags (--port/--domain/--tls-*/--bind/--attested) require exactly one `serve` block, but found {}",
                     n_serve
                 )],
+                ..Default::default()
             };
         }
     }
@@ -4404,6 +4405,7 @@ fn serve_inner(source: &str, filename: &str, secure: bool, overrides: ServeOverr
                                 host.map(|_| " (in a host block)".to_string()).unwrap_or_default(),
                                 server::RESERVED_PATHS.join(", ")
                             )],
+                            ..Default::default()
                         };
                     }
                 }
@@ -4435,7 +4437,7 @@ fn serve_inner(source: &str, filename: &str, secure: bool, overrides: ServeOverr
         {
             Ok(()) => {}
             Err(e) => {
-                return RunResult { success: false, output: Vec::new(), errors: vec![format!("Runtime error: {}", e)] };
+                return RunResult { success: false, output: Vec::new(), errors: vec![format!("Runtime error: {}", e)], ..Default::default() };
             }
         }
     }
@@ -4472,6 +4474,7 @@ fn serve_inner(source: &str, filename: &str, secure: bool, overrides: ServeOverr
                 success: false,
                 output: Vec::new(),
                 errors: vec![format!("Runtime error: {}", msg)],
+                ..Default::default()
             }
         }
     };
@@ -4619,15 +4622,20 @@ fn serve_inner(source: &str, filename: &str, secure: bool, overrides: ServeOverr
         Err(Control::Error(e)) => e.exit_code,
         _ => None,
     };
-    crate::engine::note_exit_code(exit);
     if let Some(code) = exit {
-        return RunResult { success: code == 0, output: std::mem::take(&mut interp.output), errors: Vec::new() };
+        return RunResult {
+            success: code == 0,
+            output: std::mem::take(&mut interp.output),
+            exit_code: Some(code),
+            ..Default::default()
+        };
     }
     if let Err(Control::Error(e)) = &r {
         return RunResult {
             success: false,
             output: interp.output.clone(),
             errors: vec![format!("Runtime error: {}", e)],
+            ..Default::default()
         };
     }
 
@@ -4669,15 +4677,16 @@ fn serve_inner(source: &str, filename: &str, secure: bool, overrides: ServeOverr
             synsema_stdlib::server::park_cron_only();
             cron.sched.cancel_all();
             eprintln!("[serve] stopped");
-            return RunResult { success: true, output: std::mem::take(&mut interp.output), errors: Vec::new() };
+            return RunResult { success: true, output: std::mem::take(&mut interp.output), errors: Vec::new(), ..Default::default() };
         }
         // Sin server ni jobs: resultado normal (un programa serve sin bloque serve válido).
         return match r {
-            Ok(_) => RunResult { success: true, output: std::mem::take(&mut interp.output), errors: Vec::new() },
+            Ok(_) => RunResult { success: true, output: std::mem::take(&mut interp.output), errors: Vec::new(), ..Default::default() },
             Err(_) => RunResult {
                 success: false,
                 output: std::mem::take(&mut interp.output),
                 errors: vec!["Runtime error: 'give'/'stop' used outside of a task or loop".to_string()],
+                ..Default::default()
             },
         };
     }
@@ -4688,9 +4697,9 @@ fn serve_inner(source: &str, filename: &str, secure: bool, overrides: ServeOverr
     // T10: un `serve --attested` que se cerró porque sus documentos vencieron sin renovación
     // termina con error, no con un apagado normal.
     if let Some(reason) = synsema_stdlib::attest::renewal_failure() {
-        return RunResult { success: false, output: std::mem::take(&mut interp.output), errors: vec![format!("Runtime error: {}", reason)] };
+        return RunResult { success: false, output: std::mem::take(&mut interp.output), errors: vec![format!("Runtime error: {}", reason)], ..Default::default() };
     }
-    RunResult { success: true, output: std::mem::take(&mut interp.output), errors: Vec::new() }
+    RunResult { success: true, output: std::mem::take(&mut interp.output), errors: Vec::new(), ..Default::default() }
 }
 
 /// Corre un programa que contiene `serve on PORT`. Bindea (síncrono), imprime la
@@ -4756,6 +4765,7 @@ pub fn run_serve_program_with_overrides(
             success: false,
             output: Vec::new(),
             errors: vec![crate::engine::abort_message(&p)],
+            ..Default::default()
         })
 }
 

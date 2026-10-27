@@ -139,13 +139,35 @@ pub fn keccak256(data: &[u8]) -> [u8; 32] {
 /// (`loaded_modules`), sin releer ni reparsear. Un módulo que no llegó a cargarse (un `use` en una
 /// rama que no corrió) se lee entonces del bundle o del disco. Sin fuente anotado (REPL,
 /// embebido) el recibo lo omite.
-static NOTED_PROGRAM: std::sync::OnceLock<(String, String)> = std::sync::OnceLock::new();
+///
+/// v0.6.50: es del PROCESO, y un proceso que corre dos programas distintos (un embebedor, un binario
+/// de tests) no tiene uno: el recibo sale con `program_sha: null`. Antes ganaba el primero y el
+/// recibo del segundo decía el sha del otro.
+static NOTED_PROGRAM: std::sync::Mutex<Noted> = std::sync::Mutex::new(Noted::Nothing);
 static PROGRAM_SHA: std::sync::OnceLock<Option<[u8; 32]>> = std::sync::OnceLock::new();
 
-/// Anota el fuente principal de este proceso (no calcula nada; la primera anotación gana).
+#[derive(Clone, Debug, PartialEq)]
+enum Noted {
+    Nothing,
+    One(String, String),
+    /// Corrieron dos programas distintos: ninguno es "el del proceso".
+    Several,
+}
+
+fn noted_after(noted: Noted, source: &str, filename: &str) -> Noted {
+    match noted {
+        Noted::Nothing => Noted::One(source.to_string(), filename.to_string()),
+        Noted::One(s, f) if s == source && f == filename => Noted::One(s, f),
+        _ => Noted::Several,
+    }
+}
+
+/// Anota el fuente principal de este proceso (no calcula nada). El mismo programa otra vez no
+/// cambia nada; otro distinto deja al proceso sin programa.
 pub fn note_program_sha(source: &str, filename: &str) {
-    if NOTED_PROGRAM.get().is_none() {
-        let _ = NOTED_PROGRAM.set((source.to_string(), filename.to_string()));
+    if let Ok(mut g) = NOTED_PROGRAM.lock() {
+        let prev = std::mem::replace(&mut *g, Noted::Nothing);
+        *g = noted_after(prev, source, filename);
     }
 }
 
@@ -155,10 +177,12 @@ pub fn current_program_sha() -> Option<[u8; 32]> {
     if let Some(id) = attested_identity() {
         return Some(id.program_sha);
     }
-    *PROGRAM_SHA.get_or_init(|| {
-        let (source, filename) = NOTED_PROGRAM.get()?;
-        program_sha_of(source, filename)
-    })
+    let noted = NOTED_PROGRAM.lock().ok()?;
+    match &*noted {
+        // El caché vale porque el único `One` posible es éste: otro programa pasa a `Several`.
+        Noted::One(source, filename) => *PROGRAM_SHA.get_or_init(|| program_sha_of(source, filename)),
+        _ => None,
+    }
 }
 
 /// El `program_sha` de un fuente con el mismo cálculo que el recibo ([`current_program_sha`]), sin
@@ -2010,6 +2034,18 @@ pub fn register_attest_builtins(interp: &Interpreter, caps: Rc<RefCell<Capabilit
 mod tests {
     use super::*;
     use std::sync::Mutex;
+
+    /// v0.6.50 (C4/C5): el programa del proceso es uno; el mismo otra vez no cambia nada, otro
+    /// distinto lo deja sin programa (el recibo dice `null`, no el sha del otro).
+    #[test]
+    fn a_second_program_leaves_the_process_without_one() {
+        let one = noted_after(Noted::Nothing, "print(1)\n", "a.syn");
+        assert_eq!(one, Noted::One("print(1)\n".into(), "a.syn".into()));
+        assert_eq!(noted_after(one.clone(), "print(1)\n", "a.syn"), one);
+        assert_eq!(noted_after(one.clone(), "print(2)\n", "a.syn"), Noted::Several);
+        assert_eq!(noted_after(one, "print(1)\n", "b.syn"), Noted::Several);
+        assert_eq!(noted_after(Noted::Several, "print(1)\n", "a.syn"), Noted::Several);
+    }
 
     /// Serializa los tests que tocan las env-vars del mock.
     static ENV_LOCK: Mutex<()> = Mutex::new(());

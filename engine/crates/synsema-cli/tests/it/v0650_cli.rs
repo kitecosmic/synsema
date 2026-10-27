@@ -333,3 +333,47 @@ fn serve_hands_a_trusted_tool_the_labelled_argument() {
     );
     assert!(r[0].starts_with("HTTP/1.1 200") && r[0].ends_with("\"Ana\""), "{}", r[0]);
 }
+
+/// `RunResult`: el informe JSON publica `steps` de la corrida, y `null` si tocó datos privados (T5).
+#[test]
+fn the_json_report_takes_steps_from_its_run() {
+    let dir = project("rr-steps");
+    std::fs::write(dir.join("pub.syn"), "print(1 + 1)\n").unwrap();
+    std::fs::write(dir.join("priv.syn"), "let x be private(3, \"app\")\nwhen x > 1\n    let y be 1\nprint(\"ok\")\n").unwrap();
+    let report = |args: &[&str]| -> serde_json::Value {
+        let (_, out, err) = synsema(&dir, args, None);
+        serde_json::from_str(out.trim()).unwrap_or_else(|_| panic!("{} {}", out, err))
+    };
+    let j = report(&["run", "--format", "json", "pub.syn"]);
+    assert!(j["steps"].as_u64().is_some_and(|n| n > 0), "{}", j);
+    let j = report(&["run", "--labels", "--format", "json", "priv.syn"]);
+    assert_eq!(j["ok"], true, "{}", j);
+    assert!(j["steps"].is_null(), "{}", j);
+}
+
+/// `RunResult`: si un agente se cortó por etiquetas, la corrida termina con ese corte aunque el
+/// principal pida `exit(0)` después: el código de un corte, no el de `exit` (sería el dato).
+#[test]
+fn an_agent_cut_wins_over_a_later_exit() {
+    let dir = project("rr-cut");
+    std::fs::write(
+        dir.join("c.syn"),
+        "require time\nlet t be private(\"7\", \"app\")\nagent A\n    when t == \"7\"\n        print(\"x\")\nspawn A\nsleep(1)\nexit(0)\n",
+    )
+    .unwrap();
+    let (code, out, err) = synsema(&dir, &["run", "--labels", "c.syn"], None);
+    assert_eq!(code, 1, "{}{}", out, err);
+    assert!(!out.contains('x'), "{}", out);
+}
+
+/// C4/C5: con un programa por proceso, el recibo trae el sha de ese programa.
+#[test]
+fn a_receipt_carries_the_sha_of_its_program() {
+    let dir = project("rr-receipt");
+    let src = "print(receipt()[\"credentialSubject\"][\"program_sha\"])\n";
+    std::fs::write(dir.join("r.syn"), src).unwrap();
+    let (code, out, err) = synsema(&dir, &["run", "r.syn"], None);
+    assert_eq!(code, 0, "{}", err);
+    let want = synsema_core::bytesutil::hex_encode(&synsema_stdlib::attest::program_sha_of(src, "r.syn").unwrap());
+    assert_eq!(out.trim(), want);
+}
