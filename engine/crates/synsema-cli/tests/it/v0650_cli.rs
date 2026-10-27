@@ -1033,6 +1033,11 @@ fn a_frame_carries_what_each_task_names() {
     std::fs::write(dir.join("p.syn"), "task mk()\n    let a be \"A\"\n    let b be \"B\"\n    give [() => a, () => b]\nlet fs be mk()\nprint(parallel_map((i) => fs[i](), [0, 1]))\n").unwrap();
     let (code, out, err) = synsema(&dir, &["run", "p.syn"], None);
     assert!(code == 0 && out.contains("[\"A\", \"B\"]"), "{} {}", out, err);
+    // Un local que la lambda no nombra pero lee una task local que la lambda llama: cruza (con la
+    // task), y nunca se lee el global del mismo nombre.
+    std::fs::write(dir.join("p.syn"), "let k be \"GLOBAL\"\ntask mk()\n    let k be \"LOCAL\"\n    task helper(x)\n        give k + x\n    give (x) => helper(x)\nprint(parallel_map(mk(), [\"-a\"]))\n").unwrap();
+    let (code, out, err) = synsema(&dir, &["run", "p.syn"], None);
+    assert!(code == 0 && out.contains("[\"LOCAL-a\"]"), "{} {}", out, err);
     let main = "require serve({p})\nserve on {p}\n    route \"GET /ping\"\n        give \"ok\"\n    route \"GET /e\"\n        task chk(i)\n            expect body {item: text}\n            give i\n        give parallel_map(chk, [1])\n";
     for r in serve_get(&dir, main, &["/e"]) {
         assert!(r.contains("request body is not a JSON object"), "{}", r);
