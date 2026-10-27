@@ -958,6 +958,10 @@ fn a_sandbox_says_what_sandbox_under_cannot_carry() {
     std::fs::write(dir.join("p.syn"), "agent A\n    require file.read(\"./**\")\n    sandbox\n        print(read_file(\"./d.txt\"))\nspawn A\n").unwrap();
     let (_, _, err) = synsema(&dir, &["run", "p.syn"], None);
     assert!(err.contains("whatever the agent A declares") && err.contains("what the agent A already has"), "{}", err);
+    // Ronda 4 (N3): un worker de `parallel_map` hereda de quien lo lanzó (acá, un agente).
+    std::fs::write(dir.join("p.syn"), "agent A\n    require file.read(\"./**\")\n    print(parallel_map((x) => sbx_read(), [1]))\ntask sbx_read()\n    sandbox\n        give read_file(\"./d.txt\")\nspawn A\n").unwrap();
+    let (_, _, err) = synsema(&dir, &["run", "p.syn"], None);
+    assert!(err.contains("whatever the program, or the agent that launched this `parallel_map`, declares"), "{}", err);
     std::fs::write(dir.join("t.syn"), "export task leer()\n    require file.read(\"./**\")\n    sandbox\n        give read_file(\"./d.txt\")\n").unwrap();
     std::fs::write(dir.join("p.syn"), "use \"trusted:t\" as t\nprint(t.leer())\n").unwrap();
     let (code, _, err) = synsema(&dir, &["run", "--trusted", "t=t.syn", "--trusted-cap-set", "stdout,file.read=./**", "p.syn"], None);
@@ -1022,6 +1026,14 @@ fn a_generator_a_trusted_task_and_a_constructor_cross() {
     for r in serve_get(&dir, main, &["/rb"]) {
         assert!(r.contains("'read_body' is a closure of the engine that does not cross into a worker"), "{}", r);
     }
+    // Ronda 4: un `type`/`enum` de nivel superior en un route de `serve` (N4: en v0.6.49,
+    // `Undefined variable: 'Punto'`), y un alias de un builtin que sólo tiene el request
+    // (`state_get`) en un worker, con un texto que no culpa al host (N2).
+    let main = "require serve({p})\ntype Punto\n    x: number\nenum Forma\n    circulo(r)\nlet SG be state_get\nserve on {p}\n    route \"GET /ping\"\n        give \"ok\"\n    route \"GET /c\"\n        give [Punto(1), Forma.circulo(2)]\n    route \"GET /bad\"\n        give Punto(1, 2)\n    route \"GET /s\"\n        give parallel_map((x) => SG(\"k\"), [1])\n";
+    let rs = serve_get(&dir, main, &["/c", "/bad", "/s"]);
+    assert!(rs[0].starts_with("HTTP/1.1 200") && rs[0].contains("[{\"x\": 1}, {\"__variant\": \"Forma.circulo\", \"r\": 2}]"), "{}", rs[0]);
+    assert!(rs[1].contains("Type Punto expects 1 fields, got 2"), "{}", rs[1]);
+    assert!(rs[2].contains("'state_get' is a builtin this worker does not have (it exists only where the program runs"), "{}", rs[2]);
 }
 
 /// R20–R21 (B1): de un frame cruza lo que cada task nombra. Dos lambdas del mismo frame que nombran

@@ -1666,6 +1666,8 @@ impl CapabilitySet {
                 let who = match &self.agent {
                     _ if self.name.starts_with("trusted:") => "the trusted task".to_string(),
                     Some(a) => format!("the agent {}", a),
+                    // Ronda 4 (N3): un worker hereda de quien lo lanzó (el programa o un agente).
+                    None if self.name == "parallel" => "the program, or the agent that launched this `parallel_map`,".to_string(),
                     None => "the program".to_string(),
                 };
                 if is_process_local(requested.ty) {

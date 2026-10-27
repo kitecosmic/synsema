@@ -11833,11 +11833,28 @@ pub fn is_own_builtin(k: &str, b: &BuiltinTask) -> bool {
 /// Los nombres que el intérprete busca por texto, sin un `Identifier` en el cuerpo.
 const IMPLICIT_NAMES: &[&str] = &["request", "declassify", "range", "insert", "merge"];
 
+thread_local! {
+    /// Ronda 4 (N1): `task_free_names` por cuerpo. El cuerpo es inmutable y lo comparten todas las
+    /// copias de la task (R2.5); la entrada guarda el `Arc`, así que su dirección no se reusa.
+    static FREE_NAMES: RefCell<HashMap<usize, (std::sync::Arc<[Node]>, Rc<HashSet<String>>)>> = RefCell::new(HashMap::new());
+}
+
 /// v0.6.50 (ronda 3, R3): los nombres que una task puede leer o escribir de afuera, por exceso:
 /// todo identificador de su cuerpo y de los defaults de sus parámetros (sin restar los propios),
 /// `spawn`/`observe` y los nombres que el intérprete busca por texto. De un frame que cruza viajan
-/// sólo éstos.
-pub fn task_free_names(t: &SynTaskValue) -> HashSet<String> {
+/// sólo éstos. Se calcula una vez por cuerpo (ronda 4, N1): una foto por `parallel_map` no lo
+/// vuelve a recorrer.
+pub fn task_free_names(t: &SynTaskValue) -> Rc<HashSet<String>> {
+    let key = std::sync::Arc::as_ptr(&t.body) as *const Node as usize;
+    if let Some(n) = FREE_NAMES.with(|c| c.borrow().get(&key).map(|(_, n)| n.clone())) {
+        return n;
+    }
+    let names = Rc::new(walk_free_names(t));
+    FREE_NAMES.with(|c| c.borrow_mut().insert(key, (t.body.clone(), names.clone())));
+    names
+}
+
+fn walk_free_names(t: &SynTaskValue) -> HashSet<String> {
     let mut out: HashSet<String> = IMPLICIT_NAMES.iter().map(|n| n.to_string()).collect();
     let mut visit = |n: &Node| match &n.kind {
         NodeKind::Identifier { name } => {

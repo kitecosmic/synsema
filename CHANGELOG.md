@@ -70,14 +70,17 @@ Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the rele
   then `L[0](x)` in a worker failed with `Cannot call value of type text`), also inside a module
   and in a trusted tool, whose task keeps the tool's scope. Only the locals the task names cross: a
   large local it does not use costs nothing.
-- **A builtin, a type's constructor or a trusted task held under another name crosses too.** A
-  builtin bound to another name (`let up be upper`, `{"f": upper}`, in a local, a global or a
+- **A `type` or `enum` defined at the top level now works in a `serve` route, and a builtin, a
+  constructor or a trusted task held under another name crosses too.** Under `serve`, `Punto(1)`
+  or `Forma.circulo(2)` in a route failed with `Undefined variable: 'Punto'`, and so did a global
+  alias of a builtin (`let SS be state_set`). A builtin bound to another name (`let up be upper`, `{"f": upper}`, in a local, a global or a
   module) crosses by its own name; a `type`'s constructor or an `enum` variant's (`Punto(x)`,
   `Forma.circulo(r)`) crosses by its definition; a trusted task in a variable (`let G be t.leer`)
   keeps the tool's scope. Before, the name was missing in the worker (`Undefined variable: 'up'`)
   or arrived as text, and a local that shadowed an outer name read that other value without an
   error. A generator held in a local is an error that says so, like one at the top level, and a
-  closure of the engine (`read_body`) fails when called in the worker, naming itself.
+  closure of the engine (`read_body`) fails when called in the worker, naming itself, as does a
+  builtin the worker does not have (`state_get` in a `parallel_map` worker of a request).
 - In a template, a private value is written as its value whether it comes straight from the data
   (`{c.name}`) or from a call (`{upper(c.name)}`), and the HTML carries its label. Before, the call
   wrote the marker `private(customers)` (its result carried the label of the render) and the plain
@@ -115,7 +118,8 @@ Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the rele
   the text says that the block denies every capability and to use `sandbox under {…}` (stdout,
   stdin, time and random cannot be listed there, but any `sandbox under`, also `sandbox under {}`,
   lets them through), or to run it outside the block; before, it asked for a `require` that was
-  already there. It names what decides there: the program, the agent, or the trusted task.
+  already there. It names what decides there: the program, the agent, the trusted task, or, in a
+  `parallel_map` worker, the program or the agent that launched it.
 - Two startup warnings for lines that do nothing:
   - `--cap-set llm=P` (or `judge=P`, also in `--trusted-cap-set`) without `@`, when no other item
     names a provider for P: the program may

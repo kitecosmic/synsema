@@ -948,7 +948,7 @@ fn task_global(t: &Rc<SynTaskValue>, state: &mut SnapState) -> GlobalVal {
             None => break if &*cur.borrow().name == "global" { TaskRoot::Global } else { TaskRoot::Here },
         }
     };
-    let names = if chain.is_empty() { HashSet::new() } else { synsema_core::interpreter::task_free_names(t) };
+    let names = if chain.is_empty() { Rc::new(HashSet::new()) } else { synsema_core::interpreter::task_free_names(t) };
     let frames = chain
         .iter()
         .rev()
@@ -1305,7 +1305,7 @@ pub(crate) fn rebuild_global_val(
             Some(v @ SynValue::Builtin(b)) if b.name == *name => v.clone(),
             _ => uncrossable_stub(
                 name,
-                "is a builtin this worker does not have (the host registered it only where the program runs)",
+                "is a builtin this worker does not have (it exists only where the program runs: a `serve` request, an agent, or the host's interpreter): call it there and pass its result",
             ),
         },
         GlobalVal::Constructor(c) => synsema_core::interpreter::constructor_value(c.clone()),
@@ -5040,9 +5040,12 @@ let fs be mk(3)
         let SynValue::Task(t0) = &fs[0] else { panic!("lambda") };
         let SynValue::Task(t1) = &fs[1] else { panic!("lambda") };
         assert_eq!(names(&task_global(t0, &mut state)), vec!["k".to_string(), "n".to_string()]);
-        // La segunda, en la misma foto, agrega sólo `big`; sola, lleva sólo `big`.
+        // La segunda, en la misma foto, agrega sólo `big`; sola, lleva sólo `big`. Ronda 4 (N1): los
+        // nombres de un cuerpo se calculan una vez.
         assert_eq!(names(&task_global(t1, &mut state)), vec!["big".to_string()]);
         assert_eq!(names(&task_global(t1, &mut SnapState::default())), vec!["big".to_string()]);
+        let a = synsema_core::interpreter::task_free_names(t0);
+        assert!(Rc::ptr_eq(&a, &synsema_core::interpreter::task_free_names(t0)), "se recorrió dos veces");
     }
 
     /// R2.4: la foto de un agente o de `cron` comparte lo que ya está congelado para siempre (las
