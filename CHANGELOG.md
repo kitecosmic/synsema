@@ -27,6 +27,19 @@ Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the rele
   `set` from the module on the importer's variable fails the same way. Measured over 247 modules of
   real programs: none depended on it.
 
+**New.**
+- **`--trusted` runs under `synsema serve`.** Each worker gets the same trusted tool the program
+  loaded: its tasks, its siblings and its top-level state (one copy per worker, like a file module),
+  hung from the trusted base of that worker and wrapped in that worker's trusted scope (the task's
+  `require` ∩ `--trusted-cap-set`). The tool's top level runs once, when the program loads it, not
+  per request; a `use "trusted:t"` inside a route gets that same tool. Everything that holds under
+  `run` holds here: the tool does not see the program's globals, `set t.X` fails, a task of the
+  program passed as an argument fails (a trusted tool takes data, not code), and with `--labels` the
+  argument keeps its label and the tool declassifies only what its task declares.
+- Under `run`, `parallel_map(t.f, xs)` and an agent that calls `t.f` now carry the trusted tool.
+  Before, `parallel_map` failed with `Cannot call value of type nothing` and the agent did not find
+  it.
+
 **Fixes.**
 - Under `serve`, a module that exports only data (a map of callbacks built by one of its tasks,
   `export let M be armar()`) crossed into each request as plain data: its lambdas lost the module and

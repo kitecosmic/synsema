@@ -48,8 +48,8 @@ use synsema_core::types::{from_send, syn_list, to_send, SendValue, SynTaskValue,
 
 use crate::engine::{wire_common, MemoryCtx, INTERP_STACK_SIZE};
 use crate::serve::{
-    rebuild_globals, rebuild_module_env, snapshot_globals_scoped, snapshot_module_env, GlobalVal,
-    ModuleRegistry,
+    rebuild_global_val, rebuild_globals, rebuild_module_env, snapshot_globals_scoped, snapshot_module_env, val_to_global_shared,
+    Bases, GlobalVal, ModuleRegistry,
 };
 use synsema_core::frozen::{ScopeCtx, ScopedFreeze};
 
@@ -95,6 +95,9 @@ enum TaskSnapshot {
         module: Option<(String, Vec<(String, GlobalVal)>)>,
     },
     Builtin(String),
+    /// v0.6.50 (B): una task de una tool de confianza: en el worker, la tool reconstruida colgada de
+    /// SU base de confianza y envuelta con SU hook (`GlobalVal::TrustedTask`).
+    Trusted(GlobalVal),
 }
 
 /// Intérprete worker fresco: builtins + caps heredadas + globales reconstruidos.
@@ -150,7 +153,7 @@ fn build_worker_interp(
 }
 
 fn reconstruct_task(
-    interp: &Interpreter,
+    interp: &mut Interpreter,
     snap: &TaskSnapshot,
     registry: &mut ModuleRegistry,
     scope: &ScopeCtx,
@@ -165,7 +168,12 @@ fn reconstruct_task(
             // devuelve ESE env (la misma instancia — estado compartido); solo reconstruye
             // uno nuevo si no (p.ej. el binding global fue pisado con `set`).
             let closure_env = match module {
-                Some((id, env)) => rebuild_module_env(id, env, &interp.module_base_ref(), registry, Some(scope)),
+                Some((id, env)) => {
+                    let bases = Bases::of(interp);
+                    let e = rebuild_module_env(id, env, &bases, registry, Some(scope));
+                    bases.finish(interp);
+                    e
+                }
                 None => interp.global_env.clone(),
             };
             SynValue::Task(Rc::new(SynTaskValue {
@@ -177,6 +185,13 @@ fn reconstruct_task(
                 required_capabilities: required_capabilities.clone(),
                 code: Default::default(),
             }))
+        }
+        TaskSnapshot::Trusted(gv) => {
+            let bases = Bases::of(interp);
+            let genv = interp.global_env.clone();
+            let v = rebuild_global_val(gv, &genv, &bases, registry, Some(scope));
+            bases.finish(interp);
+            v
         }
         TaskSnapshot::Builtin(name) => {
             interp.global_env.borrow().bindings.get(name).cloned().unwrap_or(SynValue::Nothing)
@@ -252,7 +267,7 @@ fn run_parallel(
             }
             let (mut interp, mut registry, _subject_scope) =
                 build_worker_interp(&globals, &granted, &denied, secure, &ceiling, &mem, &bus, &subject, ctx, &providers);
-            let task_value = reconstruct_task(&interp, &task_snap, &mut registry, ctx);
+            let task_value = reconstruct_task(&mut interp, &task_snap, &mut registry, ctx);
             // Los entornos de módulo de este item quedan a cargo de su intérprete: se vacían
             // cuando muere (si no, cada item dejaba vivo el programa entero: la fuga de lampson).
             interp.adopt_module_envs(registry.values().cloned());
@@ -417,6 +432,9 @@ pub(crate) fn register_parallel_builtins(
                         required_capabilities: t.required_capabilities.clone(),
                         module,
                     }
+                }
+                SynValue::Builtin(b) if synsema_core::interpreter::trusted_tool_parts(b).is_some() => {
+                    TaskSnapshot::Trusted(val_to_global_shared(task))
                 }
                 SynValue::Builtin(b) => TaskSnapshot::Builtin(b.name.clone()),
                 _ => unreachable!(),

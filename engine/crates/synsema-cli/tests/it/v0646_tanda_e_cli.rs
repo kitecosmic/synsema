@@ -706,10 +706,10 @@ fn e3b_trusted_module_does_not_see_the_program_globals() {
         app,
     );
     assert_eq!((code, out.trim()), (0, "42"), "{}", err);
-    // Bajo `serve`, todavía no.
+    // Fuera de `run`, `test` y `serve` (v0.6.50: `serve` también, ver `v0650_cli`), no.
     std::fs::write(dir.join("t.syn"), "export task f()\n    give 1\n").unwrap();
-    let (code, _, err) = synsema(&dir, &["serve", "--trusted", "t=t.syn", "app.syn"], None);
-    assert!(code == 2 && err.contains("--trusted runs under `synsema run` and `synsema test`"), "{}", err);
+    let (code, _, err) = synsema(&dir, &["conform", "--trusted", "t=t.syn", "app.syn"], None);
+    assert!(code == 2 && err.contains("--trusted runs under `synsema run`, `synsema test` and `synsema serve`"), "{}", err);
 }
 
 /// A2: la vista de un módulo de confianza no se escribe desde afuera: `set h.x to …` (una variable,

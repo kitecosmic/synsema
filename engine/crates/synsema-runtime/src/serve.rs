@@ -685,6 +685,19 @@ pub(crate) enum GlobalVal {
         body: std::sync::Arc<[Node]>,
         required_capabilities: Vec<(String, Option<String>)>,
     },
+    /// v0.6.50 (B): una task exportada por una tool de confianza (el builtin que la envuelve). Viaja
+    /// la task y el entorno de la tool (por id, una vez por foto, como un `Module`); del otro lado
+    /// el entorno cuelga de la base de confianza de ESE intérprete y la task se envuelve con SU hook.
+    TrustedTask {
+        module: String,
+        export: String,
+        task: Box<GlobalVal>,
+        env_id: String,
+        env: Option<Vec<(String, GlobalVal)>>,
+    },
+    /// v0.6.50 (B): la vista de una tool (`use "trusted:t" as t`): del otro lado se registra como
+    /// vista (`set t.X` es error) y queda en el caché de módulos.
+    TrustedView(Vec<(String, GlobalVal)>),
     /// Definición de agente (Batch 6): las defs de agentes viven en
     /// `Interpreter.agent_definitions` (fuera de `global_env.bindings`), así que se
     /// snapshotean/restauran aparte para que un `spawn` desde una route las encuentre. El
@@ -822,7 +835,11 @@ fn val_to_global_inner(v: &SynValue, state: &mut SnapState) -> GlobalVal {
         },
         // Un generador dentro de un global (`{"g": rng(1)}`) tampoco se copia en silencio.
         SynValue::Builtin(b) if synsema_core::rng::snapshot(b).is_some() => GlobalVal::SharedRng(b.name.clone()),
+        SynValue::Builtin(b) if synsema_core::interpreter::trusted_tool_parts(b).is_some() => trusted_task_global(b, state),
         SynValue::Builtin(_) => GlobalVal::Value(to_send(v)),
+        SynValue::Map(m) if synsema_core::interpreter::is_trusted_view_map(m) => {
+            GlobalVal::TrustedView(m.borrow().iter().map(|(k, v)| (k.to_string(), val_to_global_inner(v, state))).collect())
+        }
         SynValue::Map(m) => {
             // ¿El map cierra sobre un `module_env`? (alias de `use`, o map interno cuyas
             // tasks cierran sobre el módulo — heurística por el nombre "module:…").
@@ -873,6 +890,37 @@ fn val_to_global_inner(v: &SynValue, state: &mut SnapState) -> GlobalVal {
     }
 }
 
+/// v0.6.50 (B): la foto de una task de confianza: la task y el entorno de su tool (inline la primera
+/// vez en este árbol de foto, por id después, como la rama `Module`).
+fn trusted_task_global(b: &synsema_core::interpreter::BuiltinTask, state: &mut SnapState) -> GlobalVal {
+    let (module, export, t) = synsema_core::interpreter::trusted_tool_parts(b).expect("una task de confianza");
+    let module_env = t.closure_env.clone();
+    let key = Rc::as_ptr(&module_env) as usize;
+    let env_id = module_env.borrow().name.to_string();
+    let env = if state.in_progress.contains(&key) || state.done.contains(&key) {
+        None
+    } else {
+        state.in_progress.push(key);
+        let entries: Vec<(String, GlobalVal)> = module_env
+            .borrow()
+            .bindings
+            .iter()
+            .filter(|(_, v)| !matches!(v, SynValue::Builtin(_)))
+            .map(|(k, v)| (k.to_string(), val_to_global_inner(v, state)))
+            .collect();
+        state.in_progress.pop();
+        state.done.insert(key);
+        Some(entries)
+    };
+    GlobalVal::TrustedTask {
+        module: module.to_string(),
+        export: export.to_string(),
+        task: Box::new(val_to_global_inner(&SynValue::Task(t.clone()), state)),
+        env_id,
+        env,
+    }
+}
+
 /// Devuelve el `module_env` de un map que es alias de módulo: el `closure_env` de
 /// cualquiera de sus tasks cuyo env se llame `module:…`. `None` si el map no es un alias
 /// de módulo (sus tasks cierran sobre el global u otro scope → map de datos con callbacks).
@@ -919,6 +967,48 @@ pub(crate) fn snapshot_module_env(
 /// `state_set`/SQL/`remember`).
 pub(crate) type ModuleRegistry = HashMap<String, Rc<RefCell<Environment>>>;
 
+/// v0.6.50: de qué cuelga lo que reconstruye un rebuild en ESTE intérprete. Un módulo de archivo, de
+/// la foto de su preludio (A); una tool de confianza, de su base de confianza, con su hook (B). Lo
+/// que el intérprete tiene que anotar al terminar (las tasks envueltas, las vistas) se junta acá y
+/// lo aplica `finish`.
+pub(crate) struct Bases {
+    module: Rc<RefCell<Environment>>,
+    trusted: Option<Rc<RefCell<Environment>>>,
+    hook: Option<synsema_core::interpreter::TrustedScopeHook>,
+    wrapped: RefCell<Vec<String>>,
+    views: RefCell<Vec<(String, synsema_core::types::MapRef)>>,
+}
+
+impl Bases {
+    /// Las bases de `interp`. Antes de inyectarle globales: la foto es su preludio.
+    pub(crate) fn of(interp: &mut Interpreter) -> Bases {
+        interp.snapshot_module_base();
+        Bases {
+            module: interp.module_base(),
+            trusted: interp.trusted_base_for_rebuild(),
+            hook: interp.trusted_scope_hook(),
+            wrapped: RefCell::new(Vec::new()),
+            views: RefCell::new(Vec::new()),
+        }
+    }
+
+    fn for_id(&self, id: &str) -> &Rc<RefCell<Environment>> {
+        match &self.trusted {
+            Some(t) if id.starts_with("module:trusted:") => t,
+            _ => &self.module,
+        }
+    }
+
+    pub(crate) fn finish(self, interp: &mut Interpreter) {
+        for name in self.wrapped.into_inner() {
+            interp.mark_label_aware(&name);
+        }
+        for (module, view) in self.views.into_inner() {
+            interp.adopt_trusted_view(&module, &view);
+        }
+    }
+}
+
 /// Reconstruye (o reusa del registro) el `module_env` compartido de un módulo, hijo de
 /// `base`, con cada task cerrando sobre ESE env → las hermanas (exportadas o no) se
 /// resuelven por nombre simple. Reproduce la estructura de `load_module_inner` de core.
@@ -927,7 +1017,7 @@ pub(crate) type ModuleRegistry = HashMap<String, Rc<RefCell<Environment>>>;
 pub(crate) fn rebuild_module_env(
     id: &str,
     env: &[(String, GlobalVal)],
-    base: &Rc<RefCell<Environment>>,
+    base: &Bases,
     registry: &mut ModuleRegistry,
     scope: Option<&synsema_core::frozen::ScopeCtx>,
 ) -> Rc<RefCell<Environment>> {
@@ -941,7 +1031,7 @@ pub(crate) fn rebuild_module_env(
     // placeholder: `module_env_of` y el check de `parallel_map` dependen del prefijo
     // "module:", y el dedup de un re-snapshot anidado (parallel_map dentro de un route
     // handler bajo serve) depende del nombre COMPLETO.
-    let module_env = Environment::child(base, id);
+    let module_env = Environment::child(base.for_id(id), id);
     // Registrar ANTES de poblar: un map interno auto-referencial (TOOL_ALLOW — DE-032)
     // que aparezca durante la población resuelve a ESTE env en construcción.
     registry.insert(id.to_string(), module_env.clone());
@@ -959,10 +1049,10 @@ pub(crate) fn rebuild_module_env(
 /// módulo no ve los globales del request. Las tasks cierran sobre `closure_target` para que la recursión mutua entre
 /// globales y la llamada a hermanas dentro de un módulo (DE-027) sigan funcionando.
 /// `registry` dedupea los `module_env` de este rebuild por id (DE-033).
-fn rebuild_global_val(
+pub(crate) fn rebuild_global_val(
     gv: &GlobalVal,
     closure_target: &Rc<RefCell<Environment>>,
-    base: &Rc<RefCell<Environment>>,
+    base: &Bases,
     registry: &mut ModuleRegistry,
     scope: Option<&synsema_core::frozen::ScopeCtx>,
 ) -> SynValue {
@@ -995,7 +1085,7 @@ fn rebuild_global_val(
                         // acá una mutación exótica post-load (inyectar en un map de módulo
                         // tasks de OTRO módulo no alcanzado por el snapshot). Se registra
                         // el env vacío para que al menos todas las referencias compartan.
-                        let e = Environment::child(base, id);
+                        let e = Environment::child(base.for_id(id), id);
                         registry.insert(id.clone(), e.clone());
                         e
                     }
@@ -1045,6 +1135,49 @@ fn rebuild_global_val(
             SynValue::Map(map)
         }
         GlobalVal::SharedRng(name) => synsema_core::rng::top_level_stub(name),
+        GlobalVal::TrustedTask { module, export, task, env_id, env } => {
+            let module_env = match env {
+                Some(entries) => rebuild_module_env(env_id, entries, base, registry, scope),
+                None => match registry.get(env_id) {
+                    Some(e) => e.clone(),
+                    None => {
+                        let e = Environment::child(base.for_id(env_id), env_id);
+                        registry.insert(env_id.clone(), e.clone());
+                        e
+                    }
+                },
+            };
+            match (rebuild_global_val(task, &module_env, base, registry, scope), &base.hook) {
+                (SynValue::Task(t), Some(hook)) => {
+                    let w = synsema_core::interpreter::wrap_trusted_task(module, export, t, hook.clone());
+                    if let SynValue::Builtin(b) = &w {
+                        base.wrapped.borrow_mut().push(b.name.clone());
+                    }
+                    w
+                }
+                // Sin hook este proceso no cargó tools (no puede pasar: la foto es del mismo proceso).
+                _ => SynValue::Nothing,
+            }
+        }
+        GlobalVal::TrustedView(entries) => {
+            let mut m = SynMap::new();
+            let mut module = None;
+            for (k, gv) in entries {
+                let v = rebuild_global_val(gv, closure_target, base, registry, scope);
+                if let SynValue::Builtin(b) = &v {
+                    if let Some((md, _, _)) = synsema_core::interpreter::trusted_tool_parts(b) {
+                        module.get_or_insert_with(|| md.to_string());
+                    }
+                }
+                m.insert(k.clone(), v);
+            }
+            let map = m.into_ref();
+            synsema_core::interpreter::register_rebuilt_trusted_view(&map);
+            if let Some(md) = module {
+                base.views.borrow_mut().push((md, map.clone()));
+            }
+            SynValue::Map(map)
+        }
         GlobalVal::MapWithTasks(entries) => {
             // Map de datos con callbacks: las tasks cierran donde estaba el map (el global para uno
             // de nivel superior; el `module_env` para uno de un módulo, que no ve el global).
@@ -1151,8 +1284,7 @@ pub(crate) fn rebuild_globals(
     restore_agents(interp, snapshot);
     // v0.6.50 (A): la foto del preludio ANTES de inyectar los globales (ahora el global del
     // intérprete es sólo el preludio). Una vez por intérprete: un worker que se reusa ya la tiene.
-    interp.snapshot_module_base();
-    let mbase = interp.module_base();
+    let bases = Bases::of(interp);
     for (k, gv) in snapshot {
         match gv {
             GlobalVal::Agent { .. } => {}
@@ -1160,11 +1292,12 @@ pub(crate) fn rebuild_globals(
                 // Top-level: las tasks cierran sobre el global (closure_target); los nuevos
                 // module_env cuelgan de la foto del preludio (base).
                 let genv = interp.global_env.clone();
-                let v = rebuild_global_val(other, &genv, &mbase, &mut registry, scope);
+                let v = rebuild_global_val(other, &genv, &bases, &mut registry, scope);
                 interp.set_global(k, v);
             }
         }
     }
+    bases.finish(interp);
     registry
 }
 

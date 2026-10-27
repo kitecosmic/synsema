@@ -135,10 +135,10 @@ impl HostFlags {
             }
             return Ok(());
         }
-        // Ronda 1 (A1): bajo `serve` cada worker reconstruye los módulos colgados de los globales del
-        // programa; ahí una tool de confianza no quedaría aislada.
-        if cmd != "run" && cmd != "test" {
-            eprintln!("synsema {}: --trusted runs under `synsema run` and `synsema test` for now (a trusted tool is not isolated in the workers of `{}` yet)", cmd, cmd);
+        // v0.6.50 (B): bajo `serve` cada worker reconstruye la tool colgada de SU base de confianza y la
+        // envuelve con SU hook (`GlobalVal::TrustedTask`), como `run`.
+        if cmd != "run" && cmd != "test" && cmd != "serve" {
+            eprintln!("synsema {}: --trusted runs under `synsema run`, `synsema test` and `synsema serve`", cmd);
             return Err(ExitCode::from(2));
         }
         let mut modules: Vec<(String, String)> = Vec::new();

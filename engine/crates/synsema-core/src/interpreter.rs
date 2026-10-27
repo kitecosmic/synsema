@@ -925,6 +925,31 @@ fn register_trusted_view(map: &crate::types::MapRef) {
     });
 }
 
+/// v0.6.50 (B): la vista de una tool reconstruida en otro intérprete (un worker, un agente) se
+/// registra como la original: `set t.X` sigue siendo error.
+pub fn register_rebuilt_trusted_view(map: &crate::types::MapRef) {
+    register_trusted_view(map);
+}
+
+/// v0.6.50 (B): ¿es `map` la vista de una tool de confianza (en este hilo)?
+pub fn is_trusted_view_map(map: &crate::types::MapRef) -> bool {
+    is_trusted_view(map)
+}
+
+/// v0.6.50 (B): envuelve una task de confianza reconstruida en otro intérprete con el hook de ese
+/// intérprete, como `load_trusted_module` (el que la recibe la marca con `mark_label_aware`).
+pub fn wrap_trusted_task(module: &str, export: &str, task: Rc<SynTaskValue>, hook: TrustedScopeHook) -> SynValue {
+    trusted_wrapper(module, export, task, hook)
+}
+
+/// v0.6.50 (B): las piezas de una task de confianza envuelta, para llevarla a otro intérprete:
+/// (módulo, nombre exportado, la task de la tool).
+pub fn trusted_tool_parts(b: &BuiltinTask) -> Option<(&str, &str, &Rc<SynTaskValue>)> {
+    let t = b.trusted.as_ref()?;
+    let export = t.label.strip_prefix("trusted:")?.strip_prefix(t.module.as_str())?.strip_prefix('.')?;
+    Some((t.module.as_str(), export, &t.task))
+}
+
 #[inline]
 fn is_trusted_view(map: &crate::types::MapRef) -> bool {
     ANY_TRUSTED_VIEW.load(std::sync::atomic::Ordering::Relaxed) && is_trusted_view_slow(map)
@@ -3751,6 +3776,39 @@ impl Interpreter {
             }
         }
         c
+    }
+
+    /// v0.6.50 (B): la base de confianza de ESTE intérprete para reconstruir una tool que llegó en
+    /// una foto (un worker, un agente): la foto del preludio antes de inyectar los globales. `None`
+    /// sin módulos de confianza en el proceso.
+    pub fn trusted_base_for_rebuild(&mut self) -> Option<Rc<RefCell<Environment>>> {
+        if self.trusted_sources.is_empty() {
+            return None;
+        }
+        self.snapshot_trusted_base();
+        Some(self.trusted_base())
+    }
+
+    /// v0.6.50 (B): el hook del scope de confianza de ESTE intérprete (para envolver una tool que
+    /// llegó en una foto con `wrap_trusted_task`).
+    pub fn trusted_scope_hook(&self) -> Option<TrustedScopeHook> {
+        self.trusted_scope_hook.clone()
+    }
+
+    /// v0.6.50 (B): la task envuelta `name` recibe los argumentos con su etiqueta, como las que
+    /// envuelve `load_trusted_module`.
+    pub fn mark_label_aware(&mut self, name: &str) {
+        self.label_aware.insert(name.to_string());
+    }
+
+    /// v0.6.50 (B): la vista reconstruida queda en el caché como la tool `module` de este
+    /// intérprete: un `use "trusted:<module>"` posterior (en una ruta) recibe una copia de ésta, sin
+    /// volver a correr el nivel superior de la tool.
+    pub fn adopt_trusted_view(&mut self, module: &str, view: &crate::types::MapRef) {
+        let key = format!("trusted:{}", module);
+        if !self.module_cache.contains_key(&key) {
+            self.module_cache.insert(key, SynValue::Map(view.borrow().to_ref()));
+        }
     }
 
     /// Ronda 2: ¿la task es de una tool de confianza? Lo es si su entorno, subiendo por los padres,
