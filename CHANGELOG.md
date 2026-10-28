@@ -96,8 +96,8 @@ Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the rele
   location.
 - A task with `require` defined inside another task, a route, an agent or a loop no longer copies
   its body each time its definition runs: every definition shares one body without the `require`
-  lines, like a task without them. Before, a 150-line task defined in each of 2 000 calls peaked
-  at 473 MB (20 MB now) and took three times as long.
+  lines, like a task without them. Before, each definition copied the whole body: in v0.6.49 a
+  150-line task defined in each of 2 000 calls peaked at about 390 MB.
 - **A task of a trusted tool that an export holds inside a map or a list** (`export let M be {"f":
   helper}`, then `t.M["f"]()`) now runs in the tool's scope, with its `require` ∩
   `--trusted-cap-set`, like an exported task. Before, it ran with the program's capabilities.

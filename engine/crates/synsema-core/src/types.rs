@@ -171,8 +171,9 @@ pub struct SynTaskValue {
     pub code: crate::interpreter::TaskCode,
     /// v0.6.50 (ronda 5, M1): los nombres libres de la task (`task_free_names`), calculados la
     /// primera vez que cruza. Viven con el valor: una task que se define en cada llamada no deja
-    /// nada atrás. Quien arma un `SynTaskValue` nuevo pone `Default::default()`.
-    pub free_names: std::cell::OnceCell<Rc<std::collections::HashSet<String>>>,
+    /// nada atrás. Quien arma un `SynTaskValue` nuevo pone `Default::default()`, salvo la copia de
+    /// una foto, que trae los de su original (ronda 6, N1: es un `Arc` para que la foto lo comparta).
+    pub free_names: std::cell::OnceCell<std::sync::Arc<std::collections::HashSet<String>>>,
 }
 
 impl SynValue {

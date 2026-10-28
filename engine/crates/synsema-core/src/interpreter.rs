@@ -11838,9 +11838,9 @@ const IMPLICIT_NAMES: &[&str] = &["request", "declassify", "range", "insert", "m
 /// `spawn`/`observe` y los nombres que el intérprete busca por texto. De un frame que cruza viajan
 /// sólo éstos. Se calculan una vez por valor (ronda 4, N1) y viven con él (ronda 5, M1): un global
 /// que cruza en cada `parallel_map` no se vuelve a recorrer, y una task que se define en cada
-/// llamada no deja nada en una caché.
-pub fn task_free_names(t: &SynTaskValue) -> Rc<HashSet<String>> {
-    t.free_names.get_or_init(|| Rc::new(walk_free_names(t))).clone()
+/// llamada no deja nada en una caché. La copia de una foto los trae de su original (ronda 6, N1).
+pub fn task_free_names(t: &SynTaskValue) -> std::sync::Arc<HashSet<String>> {
+    t.free_names.get_or_init(|| std::sync::Arc::new(walk_free_names(t))).clone()
 }
 
 fn walk_free_names(t: &SynTaskValue) -> HashSet<String> {

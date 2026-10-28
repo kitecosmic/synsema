@@ -701,6 +701,9 @@ pub(crate) enum GlobalVal {
         /// Ronda 2 (R2): los envs entre la task y su raíz (los locales de quien la armó), del más
         /// externo al más interno. Viajan copiados, como cualquier dato que cruza.
         frames: Vec<FrameVal>,
+        /// Ronda 6 (N1): los nombres libres, si el original ya los calculó. La copia los hereda y no
+        /// vuelve a recorrer el cuerpo (un `parallel_map` dentro de cada item de otro).
+        free_names: Option<std::sync::Arc<HashSet<String>>>,
     },
     /// v0.6.50 (B): una task exportada por una tool de confianza (el builtin que la envuelve). Viaja
     /// la task y el entorno de la tool (por id, una vez por foto, como un `Module`); del otro lado
@@ -948,7 +951,7 @@ fn task_global(t: &Rc<SynTaskValue>, state: &mut SnapState) -> GlobalVal {
             None => break if &*cur.borrow().name == "global" { TaskRoot::Global } else { TaskRoot::Here },
         }
     };
-    let names = if chain.is_empty() { Rc::new(HashSet::new()) } else { synsema_core::interpreter::task_free_names(t) };
+    let names = if chain.is_empty() { std::sync::Arc::new(HashSet::new()) } else { synsema_core::interpreter::task_free_names(t) };
     let frames = chain
         .iter()
         .rev()
@@ -965,6 +968,7 @@ fn task_global(t: &Rc<SynTaskValue>, state: &mut SnapState) -> GlobalVal {
         required_capabilities: t.required_capabilities.clone(),
         root,
         frames,
+        free_names: t.free_names.get().cloned(),
     }
 }
 
@@ -1197,7 +1201,7 @@ pub(crate) fn rebuild_global_val(
         GlobalVal::Value(sv) => from_send(sv),
         GlobalVal::Frozen(f) => f.get(),
         GlobalVal::Scoped(i) => scope.expect("un valor con alcance se reconstruye dentro de su alcance").get(*i),
-        GlobalVal::Task { name, parameters, body, required_capabilities, root, frames } => {
+        GlobalVal::Task { name, parameters, body, required_capabilities, root, frames, free_names } => {
             // Ronda 1 (A1) y ronda 2 (R2): cierra en su cadena, no donde está guardada. El módulo de
             // la raíz viene inline la primera vez en la foto o ya está en el registro; si no está en
             // ningún lado, un env vacío de ese módulo (el nombre falta; nunca el de otro módulo).
@@ -1234,7 +1238,7 @@ pub(crate) fn rebuild_global_val(
                 origin: None,
                 required_capabilities: required_capabilities.clone(),
                 code: Default::default(),
-                free_names: Default::default(),
+                free_names: free_names.clone().map(std::cell::OnceCell::from).unwrap_or_default(),
             }))
         }
         GlobalVal::Module { id, is_alias, alias, env } => {
@@ -5046,7 +5050,16 @@ let fs be mk(3)
         assert_eq!(names(&task_global(t1, &mut state)), vec!["big".to_string()]);
         assert_eq!(names(&task_global(t1, &mut SnapState::default())), vec!["big".to_string()]);
         let a = synsema_core::interpreter::task_free_names(t0);
-        assert!(Rc::ptr_eq(&a, &synsema_core::interpreter::task_free_names(t0)), "se recorrió dos veces");
+        assert!(std::sync::Arc::ptr_eq(&a, &synsema_core::interpreter::task_free_names(t0)), "se recorrió dos veces");
+        // Ronda 6 (N1): la copia de la foto hereda los nombres y no recorre (un `parallel_map`
+        // dentro de cada item de otro).
+        let mut base_interp = Interpreter::new();
+        let base = Bases::of(&mut base_interp);
+        let gv = task_global(t0, &mut SnapState::default());
+        let SynValue::Task(copy) = rebuild_global_val(&gv, &base.global.clone(), &base, &mut ModuleRegistry::default(), None) else {
+            panic!("una task")
+        };
+        assert!(copy.free_names.get().is_some_and(|n| std::sync::Arc::ptr_eq(n, &a)), "la copia vuelve a recorrer");
         // Ronda 5 (M1): viven con la task, no en una caché que la sobrevive.
         let program = synsema_core::parser::parse_source("task inner(x)\n    require time\n    give x + k\n", "<r5m1>").expect("parse");
         let synsema_core::ast::NodeKind::TaskDefinition { parameters, body, .. } = &program.statements[0].kind else { panic!("task") };
@@ -5062,7 +5075,7 @@ let fs be mk(3)
         });
         let n = synsema_core::interpreter::task_free_names(&t);
         assert!(n.contains("k"));
-        let weak = Rc::downgrade(&n);
+        let weak = std::sync::Arc::downgrade(&n);
         drop(n);
         drop(t);
         assert!(weak.upgrade().is_none(), "los nombres sobreviven a la task");
