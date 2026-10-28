@@ -289,6 +289,25 @@ fn unknown_parameter<'a>(name: &str, params: impl Iterator<Item = &'a str>, loc:
 }
 
 /// El error de leer una variable que no existe (el mismo texto en el tree-walker y en la VM).
+/// v0.6.50 (A): ¿hay un `use` de archivo en algún lugar de estas sentencias? (`Program` lo trae
+/// del parser como `has_file_use`; esto es para un bloque suelto.)
+#[cold]
+fn stmts_have_file_use(stmts: &[Node]) -> bool {
+    let mut found = false;
+    for s in stmts {
+        crate::ast_api::walk(s, &mut |n| {
+            if let NodeKind::UseImport { path, .. } = &n.kind {
+                found |= !path.starts_with("trusted:");
+            }
+        });
+    }
+    found
+}
+
+/// Las constantes matemáticas del preludio: valores globales que se usan sin llamar.
+const PRELUDE_CONSTANTS: [(&str, f64); 5] =
+    [("pi", std::f64::consts::PI), ("tau", std::f64::consts::TAU), ("e", std::f64::consts::E), ("inf", f64::INFINITY), ("nan", f64::NAN)];
+
 fn undefined_variable(name: &str, loc: &SourceLocation) -> Control {
     // Batch DX (decisión #6): los bindings que serve inyecta SOLO en el
     // scope de un route handler (`request`/`query`/`params`/`read_body`/
@@ -460,6 +479,20 @@ pub struct BuiltinTask {
     /// Con eso `tool_spec` lee la firma y una llamada con argumentos nombrados (`call_tool`) entra
     /// al scope igual que una posicional. Antes las tasks de confianza eran sólo posicionales.
     pub trusted: Option<Rc<TrustedTool>>,
+    /// v0.6.50 (ronda 3, R3): si es el constructor de un `type` o de una variante de `enum`, su
+    /// definición. Con eso cruza a otro intérprete (`parallel_map`, agentes, `serve`) y se rearma.
+    pub ctor: Option<Rc<CtorSpec>>,
+}
+
+/// Ver `BuiltinTask::ctor`: lo que define un constructor (`Punto(x)`, `Forma.circulo(r)`).
+#[derive(Clone, Debug)]
+pub struct CtorSpec {
+    /// El nombre del tipo, o `Enum.variante`.
+    pub name: String,
+    pub fields: Vec<String>,
+    /// Una variante etiqueta su valor con `__variant`; un tipo no.
+    pub variant: bool,
+    pub loc: SourceLocation,
 }
 
 /// Ver `BuiltinTask::trusted`.
@@ -482,6 +515,10 @@ pub struct BuiltinMeta {
     pub lineage_source: bool,
     /// Constructor de un tipo o de una variante (`Point(…)`, `Order.paid(…)`): cuenta sus campos él.
     pub constructor: bool,
+    /// v0.6.50 (ronda 3, R3): lo registró el motor o el host en el intérprete (`register_builtin`),
+    /// así que otro intérprete tiene uno con ese nombre. Un cierre del motor (`read_body`, un
+    /// agregado de tabla, un generador) no.
+    pub registered: bool,
 }
 
 impl BuiltinTask {
@@ -504,8 +541,9 @@ impl BuiltinTask {
             kwargs: crate::builtin_arity::kwargs_of(&name),
             lineage_source: LINEAGE_SOURCES.contains(&name.as_str()),
             constructor: name.starts_with(|c: char| c.is_ascii_uppercase()),
+            registered: false,
         };
-        BuiltinTask { name, func, param_count, param_names, meta, trusted: None }
+        BuiltinTask { name, func, param_count, param_names, meta, trusted: None, ctor: None }
     }
 }
 
@@ -904,6 +942,31 @@ fn register_trusted_view(map: &crate::types::MapRef) {
         }
         views.insert(crate::types::MapRef::as_ptr(map).cast::<()>() as usize, crate::types::MapRef::downgrade(map));
     });
+}
+
+/// v0.6.50 (B): la vista de una tool reconstruida en otro intérprete (un worker, un agente) se
+/// registra como la original: `set t.X` sigue siendo error.
+pub fn register_rebuilt_trusted_view(map: &crate::types::MapRef) {
+    register_trusted_view(map);
+}
+
+/// v0.6.50 (B): ¿es `map` la vista de una tool de confianza (en este hilo)?
+pub fn is_trusted_view_map(map: &crate::types::MapRef) -> bool {
+    is_trusted_view(map)
+}
+
+/// v0.6.50 (B): envuelve una task de confianza reconstruida en otro intérprete con el hook de ese
+/// intérprete, como `load_trusted_module` (el que la recibe la marca con `mark_label_aware`).
+pub fn wrap_trusted_task(module: &str, export: &str, task: Rc<SynTaskValue>, hook: TrustedScopeHook) -> SynValue {
+    trusted_wrapper(module, export, task, hook)
+}
+
+/// v0.6.50 (B): las piezas de una task de confianza envuelta, para llevarla a otro intérprete:
+/// (módulo, nombre exportado, la task de la tool).
+pub fn trusted_tool_parts(b: &BuiltinTask) -> Option<(&str, &str, &Rc<SynTaskValue>)> {
+    let t = b.trusted.as_ref()?;
+    let export = t.label.strip_prefix("trusted:")?.strip_prefix(t.module.as_str())?.strip_prefix('.')?;
+    Some((t.module.as_str(), export, &t.task))
 }
 
 #[inline]
@@ -1879,6 +1942,19 @@ pub struct Interpreter {
     /// proceso). Con agentes y etiquetas, al swarm: sale al cierre de la corrida, no cuando
     /// termina cada intérprete (cuándo terminó cada uno lo elegía el dato).
     pub err_hook: Option<std::sync::Arc<dyn Fn(&str) + Send + Sync>>,
+    /// v0.6.50 (A): el padre del entorno de un módulo de archivo, la foto del preludio (ver
+    /// `snapshot_module_base`). Colgado de `global_env`, un módulo leía y escribía los globales de
+    /// quien lo importaba. Al final del struct a propósito (no es camino caliente).
+    module_base_env: Option<Rc<RefCell<Environment>>>,
+    /// v0.6.50 (D): los templates que el host le dio a cada tool de confianza
+    /// (`--trusted-templates`). Dentro del scope de una tool, `render` resuelve sólo contra éstos.
+    trusted_templates: HashMap<String, Rc<crate::templates::ToolTemplates>>,
+    /// v0.6.50 (D): las tools en cuyo scope corre el código (la última es la actual), junto a
+    /// `trusted_depth`.
+    trusted_stack: Vec<String>,
+    /// v0.6.50 (ronda 1, M1): ya corrió un `execute`. Lo que haya en `global_env` desde entonces lo
+    /// ligó el programa, no es preludio: una foto tomada después son los builtins.
+    executed: bool,
 }
 
 /// v0.6.46 (ronda 1 de cf1, B2): el linaje que juntó un intérprete hijo (un worker de
@@ -2038,6 +2114,10 @@ impl Interpreter {
             labels_detail_to_program: false,
             run_cut: std::sync::Arc::new(RunCut::default()),
             err_hook: None,
+            module_base_env: None,
+            trusted_templates: HashMap::new(),
+            trusted_stack: Vec::new(),
+            executed: false,
             blackboard: HashMap::new(),
             agent_definitions: HashMap::new(),
             agent_context: Vec::new(),
@@ -2434,10 +2514,16 @@ impl Interpreter {
         }
         match r {
             Err(Control::Error(mut e)) => {
-                if !e.redact_label.is_empty() && !e.from_labels {
+                // v0.6.50 (ronda 4 de v0.6.49, B1): el texto real se toma ANTES de redactar y va al
+                // sobre del recibo (sólo lo abre el auditor): era `private(clientes)` en todas partes
+                // y quien escribió la tool no sabía que la causa era `render`. El operador sigue
+                // viendo el redactado con su ubicación: su log no es un destino de datos privados.
+                let real = (!e.redact_label.is_empty() && !e.from_labels && e.operator_detail.is_none())
+                    .then(|| e.to_string());
+                if real.is_some() {
                     e.message = format!("private({})", e.redact_label);
                 }
-                self.withhold_labels_detail(&mut e);
+                self.withhold_labels_detail_sealing(&mut e, real);
                 Err(Control::Error(e))
             }
             other => other,
@@ -2459,12 +2545,29 @@ impl Interpreter {
     #[cold]
     #[inline(never)]
     fn withhold_labels_detail(&self, e: &mut RuntimeError) {
-        if !self.labels || self.labels_detail_to_program || !e.is_fatal_for_labels() || e.is_halt() || e.operator_detail.is_some() {
+        self.withhold_labels_detail_sealing(e, None)
+    }
+
+    /// `withhold_labels_detail` con el texto que va al sobre cuando difiere del del operador (B1:
+    /// el real de un error redactado; el operador recibe el redactado).
+    fn withhold_labels_detail_sealing(&self, e: &mut RuntimeError, sealed: Option<String>) {
+        if !self.labels || !e.is_fatal_for_labels() || e.is_halt() || e.operator_detail.is_some() {
+            return;
+        }
+        if self.labels_detail_to_program {
+            // Ronda 1 (B3): sin techo el programa ve el detalle de un corte, pero no el texto real
+            // de un error redactado; ése va igual al sobre, si hay auditor.
+            if let Some(real) = sealed {
+                if crate::sealed::active() {
+                    crate::sealed::push_sealed(serde_json::json!({"kind": "label_violation", "detail": real}).to_string());
+                }
+            }
             return;
         }
         let detail = e.to_string();
         // El detalle depende del dato privado, así que va al sobre (sólo lo abre el auditor).
-        crate::sealed::push_sealed(serde_json::json!({"kind": "label_violation", "detail": detail}).to_string());
+        let sealed = sealed.unwrap_or_else(|| detail.clone());
+        crate::sealed::push_sealed(serde_json::json!({"kind": "label_violation", "detail": sealed}).to_string());
         // Un solo texto para los dos tipos de corte: si un `label_violation` y un error bajo la rama
         // privada dijeran cosas distintas, cuál de los dos fue también lo elegiría el dato.
         e.message = labels::cut_text(&self.safe_label(&labels::empty()));
@@ -2851,7 +2954,7 @@ impl Interpreter {
     /// Anota que se desenvolvió un valor con etiqueta `l` (para el mensaje de error que
     /// atrape un `recover`, también cuando la operación falla antes de re-envolver).
     #[inline]
-    fn note_seen(&mut self, l: &Label) {
+    pub(crate) fn note_seen(&mut self, l: &Label) {
         if !l.is_empty() {
             self.seen = labels::union(&self.seen, l);
             self.seen_any = true;
@@ -3168,10 +3271,9 @@ impl Interpreter {
     }
 
     fn register(&self, name: &str, param_count: i32, func: BuiltinFn) {
-        self.global_env.borrow_mut().bindings.insert(
-            name.to_string(),
-            SynValue::Builtin(Rc::new(BuiltinTask::new(name, param_count, None, func))),
-        );
+        let mut b = BuiltinTask::new(name, param_count, None, func);
+        b.meta.registered = true;
+        self.global_env.borrow_mut().bindings.insert(name.to_string(), SynValue::Builtin(Rc::new(b)));
     }
 
     /// Registra un builtin externo (lo usa el motor para los builtins seguros).
@@ -3189,10 +3291,9 @@ impl Interpreter {
         param_names: Vec<&'static str>,
         func: BuiltinFn,
     ) {
-        self.global_env.borrow_mut().bindings.insert(
-            name.to_string(),
-            SynValue::Builtin(Rc::new(BuiltinTask::new(name, param_names.len() as i32, Some(param_names), func))),
-        );
+        let mut b = BuiltinTask::new(name, param_names.len() as i32, Some(param_names), func);
+        b.meta.registered = true;
+        self.global_env.borrow_mut().bindings.insert(name.to_string(), SynValue::Builtin(Rc::new(b)));
     }
 
     /// Las entradas que el programa leyó hasta ahora (DATOS-17), en orden.
@@ -3605,6 +3706,18 @@ impl Interpreter {
         self.shortcuts = false;
     }
 
+    /// v0.6.50 (D): los templates que el host le da a la tool `name` (`(nombre relativo, texto)`), ya
+    /// leídos: el programa no los puede cambiar después.
+    pub fn set_trusted_templates(&mut self, name: &str, files: &[(String, String)]) {
+        self.trusted_templates.insert(name.to_string(), Rc::new(crate::templates::ToolTemplates::new(files)));
+    }
+
+    /// v0.6.50 (D): dentro del scope de una tool, cuál es y sus templates (si el host le dio).
+    pub(crate) fn current_tool_templates(&self) -> Option<(&str, Option<Rc<crate::templates::ToolTemplates>>)> {
+        let module = self.trusted_stack.last()?;
+        Some((module, self.trusted_templates.get(module).cloned()))
+    }
+
     /// v0.6.46 (ronda 1, A1): ¿corre código de una tool de confianza? Lo miran los builtins que
     /// mandan una task a otro intérprete (`parallel_map`, `cron_every`): ahí vería los globales del
     /// programa con las capabilities de la tool.
@@ -3619,7 +3732,34 @@ impl Interpreter {
         if self.trusted_sources.is_empty() || self.trusted_base_env.is_some() {
             return;
         }
-        let base = Environment::root("trusted-base");
+        self.trusted_base_env = Some(self.prelude_snapshot("trusted-base"));
+    }
+
+    /// v0.6.50 (A): la foto del preludio para los módulos de archivo, antes de la primera sentencia
+    /// del programa (o, en un worker o un agente, antes de inyectarle los globales). Una vez por
+    /// intérprete. Es otra base que la de confianza: `check_trusted_origin` distingue una task de una
+    /// tool porque su cadena llega a ESA base.
+    /// Ronda 1 (M1) y ronda 2 (N1): la base de los módulos al entrar por `execute`, `run_block` o
+    /// los bloques de test. La primera entrada saca la foto del preludio; una siguiente (cada línea
+    /// de la REPL, un embebedor) no: la foto traería lo que ligaron las anteriores, así que sin foto
+    /// quedan los builtins.
+    fn first_module_base(&mut self) {
+        if self.executed {
+            self.module_base();
+        } else {
+            self.snapshot_module_base();
+        }
+    }
+
+    pub fn snapshot_module_base(&mut self) {
+        if self.module_base_env.is_none() {
+            self.module_base_env = Some(self.prelude_snapshot("module-base"));
+        }
+    }
+
+    /// Una copia de lo que hay hoy en `global_env`, en un entorno raíz propio.
+    fn prelude_snapshot(&self, name: &str) -> Rc<RefCell<Environment>> {
+        let base = Environment::root(name);
         {
             let g = self.global_env.borrow();
             let mut b = base.borrow_mut();
@@ -3627,7 +3767,113 @@ impl Interpreter {
                 b.bindings.insert(k.clone(), v.clone());
             }
         }
-        self.trusted_base_env = Some(base);
+        base
+    }
+
+    /// El padre de un módulo de archivo. Sin foto (un intérprete que no entró por `execute` ni por
+    /// `rebuild_globals`, como la REPL), los builtins con su nombre y las constantes.
+    #[cold]
+    pub fn module_base(&mut self) -> Rc<RefCell<Environment>> {
+        if let Some(b) = &self.module_base_env {
+            return b.clone();
+        }
+        let base = self.builtins_only("module-base");
+        self.module_base_env = Some(base.clone());
+        base
+    }
+
+    /// Los builtins con su propio nombre (o el alias deprecado de uno) y las constantes: lo que el
+    /// programa liga a un nombre es una task o un valor, nunca un builtin con ese nombre.
+    fn builtins_only(&self, name: &str) -> Rc<RefCell<Environment>> {
+        let base = Environment::root(name);
+        {
+            let g = self.global_env.borrow();
+            let mut b = base.borrow_mut();
+            for (k, v) in g.bindings.iter() {
+                if let SynValue::Builtin(bt) = v {
+                    if is_own_builtin(k, bt) {
+                        b.bindings.insert(k.clone(), v.clone());
+                    }
+                }
+            }
+            for (k, v) in PRELUDE_CONSTANTS {
+                b.bindings.insert(k, syn_float(v));
+            }
+        }
+        base
+    }
+
+    /// v0.6.50 (A): `Undefined variable` y, si el nombre se buscó desde un módulo de archivo y es
+    /// del programa, por qué no lo ve. Sólo en el camino del error.
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn undefined_in(&self, name: &str, loc: &SourceLocation, env: &Rc<RefCell<Environment>>) -> Control {
+        self.with_module_hint(undefined_variable(name, loc), name, env)
+    }
+
+    /// Lo mismo para `set` (`Cannot set undefined variable`).
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn set_undefined_in(&self, name: &str, env: &Rc<RefCell<Environment>>) -> Control {
+        self.with_module_hint(err(format!("Cannot set undefined variable: '{}'. Use 'let' first.", name)), name, env)
+    }
+
+    fn with_module_hint(&self, mut c: Control, name: &str, env: &Rc<RefCell<Environment>>) -> Control {
+        let Some(base) = &self.module_base_env else { return c };
+        let mut cur = env.clone();
+        let in_module = loop {
+            let next = {
+                let e = cur.borrow();
+                match &e.parent {
+                    Some(p) if Rc::ptr_eq(p, base) => break e.name.starts_with("module:"),
+                    Some(p) => p.clone(),
+                    None => break false,
+                }
+            };
+            cur = next;
+        };
+        if in_module && self.global_env.borrow().bindings.get(name).is_some() {
+            if let Control::Error(e) = &mut c {
+                e.message.push_str(&format!(
+                    " — '{}' is a name of the program that imports this module, and a module sees only its own names and the builtins: pass it as an argument or define it in the module",
+                    name
+                ));
+            }
+        }
+        c
+    }
+
+    /// v0.6.50 (B): la base de confianza de ESTE intérprete para reconstruir una tool que llegó en
+    /// una foto (un worker, un agente): la foto del preludio antes de inyectar los globales. `None`
+    /// sin módulos de confianza en el proceso.
+    pub fn trusted_base_for_rebuild(&mut self) -> Option<Rc<RefCell<Environment>>> {
+        if self.trusted_sources.is_empty() {
+            return None;
+        }
+        self.snapshot_trusted_base();
+        Some(self.trusted_base())
+    }
+
+    /// v0.6.50 (B): el hook del scope de confianza de ESTE intérprete (para envolver una tool que
+    /// llegó en una foto con `wrap_trusted_task`).
+    pub fn trusted_scope_hook(&self) -> Option<TrustedScopeHook> {
+        self.trusted_scope_hook.clone()
+    }
+
+    /// v0.6.50 (B): la task envuelta `name` recibe los argumentos con su etiqueta, como las que
+    /// envuelve `load_trusted_module`.
+    pub fn mark_label_aware(&mut self, name: &str) {
+        self.label_aware.insert(name.to_string());
+    }
+
+    /// v0.6.50 (B): la vista reconstruida queda en el caché como la tool `module` de este
+    /// intérprete: un `use "trusted:<module>"` posterior (en una ruta) recibe una copia de ésta, sin
+    /// volver a correr el nivel superior de la tool.
+    pub fn adopt_trusted_view(&mut self, module: &str, view: &crate::types::MapRef) {
+        let key = format!("trusted:{}", module);
+        if !self.module_cache.contains_key(&key) {
+            self.module_cache.insert(key, SynValue::Map(view.borrow().to_ref()));
+        }
     }
 
     /// Ronda 2: ¿la task es de una tool de confianza? Lo es si su entorno, subiendo por los padres,
@@ -3678,20 +3924,7 @@ impl Interpreter {
         if let Some(b) = &self.trusted_base_env {
             return b.clone();
         }
-        let base = Environment::root("trusted-base");
-        {
-            let g = self.global_env.borrow();
-            let mut b = base.borrow_mut();
-            for (k, v) in g.bindings.iter() {
-                if let SynValue::Builtin(bt) = v {
-                    let own = *bt.name == **k
-                        || crate::deprecated::DEPRECATED_NAMES.iter().any(|(old, new)| *old == &**k && *new == &*bt.name);
-                    if own {
-                        b.bindings.insert(k.clone(), v.clone());
-                    }
-                }
-            }
-        }
+        let base = self.builtins_only("trusted-base");
         self.trusted_base_env = Some(base.clone());
         base
     }
@@ -3941,6 +4174,12 @@ impl Interpreter {
     /// Sin preámbulo/freeze (eso es sólo para el programa top-level).
     pub fn run_block(&mut self, stmts: &[Node]) -> Result<SynValue, Control> {
         let g = self.global_env.clone();
+        // v0.6.50 (A): como `execute`, la foto del preludio antes de que el bloque ligue nada (la
+        // REPL, un embebedor). Un agente ya la trae de `rebuild_globals`.
+        if self.module_base_env.is_none() && stmts_have_file_use(stmts) {
+            self.first_module_base();
+        }
+        self.executed = true;
         let saved = self.take_taint();
         let r = self.exec_block(stmts, &g);
         self.restore_taint(saved);
@@ -4073,7 +4312,7 @@ impl Interpreter {
         }
         if self.trusted_depth > 0 {
             return Err(err(format!(
-                "a trusted module imports only other trusted modules (`use \"trusted:…\"`), not '{}': a file module sees the program's names and would run with the tool's capabilities",
+                "a trusted module imports only other trusted modules (`use \"trusted:…\"`), not '{}': a file module is read from disk, where the program can write it, and it would run with the tool's capabilities",
                 raw_path
             )));
         }
@@ -4146,6 +4385,10 @@ impl Interpreter {
                 _ => {}
             }
         }
+        // v0.6.50 (D8): un `render("literal")` de la tool tiene que estar entre sus templates; acá,
+        // antes de que llegue ningún dato, el texto se ve aunque los datos sean privados.
+        crate::templates::check_tool_renders(&program, name, self.trusted_templates.get(name).map(|t| &**t))
+            .map_err(err)?;
         self.loading_modules.insert(key.clone());
         // Ronda 1 (A1): hijo del preludio, no de `global_env`: los nombres libres del módulo son los
         // builtins, no lo que el programa definió antes o después del `use`.
@@ -4156,7 +4399,9 @@ impl Interpreter {
         hook(Some((name, &[])));
         debug_assert!(!self.shortcuts, "a trusted scope opened with the VM on (it has no origin check)");
         self.trusted_depth += 1;
+        self.trusted_stack.push(name.to_string());
         let exec_res = self.exec_block(&program.statements, &module_env);
+        self.trusted_stack.pop();
         self.trusted_depth -= 1;
         hook(None);
         self.stdout_verdict = None;
@@ -4164,24 +4409,32 @@ impl Interpreter {
         self.loading_modules.remove(&key);
         exec_res?;
         let mut exports = SynMap::new();
+        let mut wrapped: HashSet<usize> = HashSet::new();
         for export in names {
             if let Some(v) = env_get(&module_env, &export) {
-                let v = match v {
-                    SynValue::Task(t) => {
-                        // Consciente de etiquetas: los argumentos entran con la suya (la política
-                        // del dev decide qué publica) y el PC es el del llamador. El despacho
-                        // genérico los habría desetiquetado y corrido la task bajo su unión.
-                        let w = trusted_wrapper(name, &export, t, hook.clone());
-                        if let SynValue::Builtin(b) = &w {
-                            self.label_aware.insert(b.name.clone());
-                        }
-                        w
-                    }
-                    other => other,
-                };
+                // Consciente de etiquetas: los argumentos entran con la suya (la política del dev
+                // decide qué publica) y el PC es el del llamador. El despacho genérico los habría
+                // desetiquetado y corrido la task bajo su unión. Ronda 1 de v0.6.50 (B6): también
+                // una task que la tool expone dentro de un mapa o una lista (`export let M be
+                // {"f": helper}`): sin envolver corría con las capabilities del programa.
+                let mut aware = Vec::new();
+                let v = wrap_exposed_tasks(name, &export, v, &hook, &mut aware, &mut wrapped);
+                self.label_aware.extend(aware);
                 exports.insert(export, v);
             }
         }
+        // v0.6.50 (E-c): el `require` de una task que el módulo no exporta no concede nada. Ronda 2
+        // (B1): cuenta como exportada la task de nivel superior que la carga envolvió, también la que
+        // llega a un export por otro nombre (`export let M be BASE`); una que sólo nombra una lambda
+        // o una llamada (`export let W be () => helper()`), no.
+        let exported: HashSet<String> = module_env
+            .borrow()
+            .bindings
+            .iter()
+            .filter(|(_, v)| matches!(v, SynValue::Task(t) if wrapped.contains(&(Rc::as_ptr(t) as usize))))
+            .map(|(k, _)| k.to_string())
+            .collect();
+        crate::deprecated::warn_trusted_unexported_requires(&program, name, &exported);
         // Ronda 1 (A2): sin `register_module`. La vista de un módulo común se escribe desde afuera
         // (`set m.X to v` religa su variable); la de uno de confianza es un mapa de datos.
         let map = exports.into_ref();
@@ -4237,7 +4490,10 @@ impl Interpreter {
 
         #[cfg(feature = "resolver-check")]
         crate::resolve::check::register(&program);
-        let module_env = Environment::child(&self.global_env, &format!("module:{}", resolved));
+        // v0.6.50 (A): hijo del preludio, no de `global_env`: un módulo no ve los nombres de quien lo
+        // importa (ni los que define antes o después del `use`).
+        let base = self.module_base();
+        let module_env = Environment::child(&base, &format!("module:{}", resolved));
         self.exports_collector.push(Vec::new());
         let exec_res = self.exec_block(&program.statements, &module_env);
         let names = self.exports_collector.pop().unwrap_or_default();
@@ -4745,11 +5001,9 @@ impl Interpreter {
         // Constantes matemáticas — VALORES globales (se usan sin llamar): pi/tau/e/inf/nan.
         {
             let mut g = self.global_env.borrow_mut();
-            g.bindings.insert("pi", syn_float(std::f64::consts::PI));
-            g.bindings.insert("tau", syn_float(std::f64::consts::TAU));
-            g.bindings.insert("e", syn_float(std::f64::consts::E));
-            g.bindings.insert("inf", syn_float(f64::INFINITY));
-            g.bindings.insert("nan", syn_float(f64::NAN));
+            for (k, v) in PRELUDE_CONSTANTS {
+                g.bindings.insert(k, syn_float(v));
+            }
         }
     }
 
@@ -5022,6 +5276,10 @@ impl Interpreter {
     fn execute_inner(&mut self, program: &Program) -> Result<SynValue, Control> {
         let g = self.global_env.clone();
         self.snapshot_trusted_base();
+        if program.has_file_use {
+            self.first_module_base();
+        }
+        self.executed = true;
         self.control_taint = self.no_label.clone();
         self.loop_taint = self.no_label.clone();
         self.escaping_taint = self.no_label.clone();
@@ -5064,7 +5322,7 @@ impl Interpreter {
     /// cada test SIN abortar a los demás. Si el setup falla, devuelve un único outcome de
     /// error de setup. Las defs top-level quedan visibles dentro de cada test.
     pub fn run_test_blocks(&mut self, program: &Program) -> Vec<TestOutcome> {
-        self.run_test_blocks_with(program, &mut |_| None)
+        self.run_test_blocks_with(program, &mut |_, _| None)
     }
 
     /// Como `run_test_blocks`, con un hook `after_each(nombre)` que corre al terminar
@@ -5074,10 +5332,14 @@ impl Interpreter {
     pub fn run_test_blocks_with(
         &mut self,
         program: &Program,
-        after_each: &mut dyn FnMut(&str) -> Option<String>,
+        after_each: &mut dyn FnMut(&str, bool) -> Option<String>,
     ) -> Vec<TestOutcome> {
         let g = self.global_env.clone();
         self.snapshot_trusted_base();
+        if program.has_file_use {
+            self.first_module_base();
+        }
+        self.executed = true;
         // Preámbulo: intent/require al inicio, luego congelar intent (igual que execute).
         let mut split = 0;
         for stmt in &program.statements {
@@ -5131,7 +5393,10 @@ impl Interpreter {
                 // Cada bloque `test` es su propia unidad — la tinta de continuación de uno
                 // No puede llegarle al siguiente (ni al setup).
                 let saved_taint = self.take_taint();
-                let mut outcome = match self.exec_block(body, &test_env) {
+                let result = self.exec_block(body, &test_env);
+                // Ronda 1 (M3): un bloque que llamó `exit` le pide al host que detenga sus agentes.
+                let exited = matches!(&result, Err(Control::Error(e)) if e.exit_code.is_some());
+                let mut outcome = match result {
                     Ok(_) => {
                         TestOutcome { name: name.clone(), passed: true, message: None, assertion: false }
                     }
@@ -5161,7 +5426,7 @@ impl Interpreter {
                 };
                 self.restore_taint(saved_taint);
                 // Agentes del test: se esperan y sus errores cuentan como fallo del test.
-                if let Some(msg) = after_each(name) {
+                if let Some(msg) = after_each(name, exited) {
                     outcome.passed = false;
                     outcome.message = Some(match outcome.message.take() {
                         Some(prev) => format!("{}; {}", prev, msg),
@@ -5337,7 +5602,7 @@ impl Interpreter {
                 env_get(env, name)
             } {
                 Some(v) => Ok(v),
-                None => Err(undefined_variable(name, loc)),
+                None => Err(self.undefined_in(name, loc, env)),
             },
             NodeKind::PropertyAccess { property_name, object, via_of } => {
                 // Hint de precedencia de `of` (batch DX, decisión #7): `a of b.c` parsea
@@ -5786,6 +6051,7 @@ impl Interpreter {
                     origin: Some(loc.clone()),
                     required_capabilities: Vec::new(),
                     code: Default::default(),
+                    free_names: Default::default(),
                 });
                 Ok(SynValue::Task(task))
             }
@@ -6074,10 +6340,17 @@ impl Interpreter {
                 // preámbulo. Ronda 2 (B2): con las dos formas, porque acá no se sabe todavía si
                 // el dato es privado.
                 let head = e.message.split(" — ").next().unwrap_or(&e.message);
+                // Ronda 1 de v0.6.50 (B4): el `require` va donde corre el código, como en
+                // `where_to_require` (en un agente, su cuerpo; en una tool, su task exportada).
+                let place = match (self.in_trusted_scope(), self.current_agent()) {
+                    (true, _) => "to the exported task of the trusted module that runs it".to_string(),
+                    (false, Some(a)) => format!("to the body of agent {} (the program's `require` does not reach it)", a),
+                    (false, None) => "to the program's preamble".to_string(),
+                };
                 return Err(err_at(
                     format!(
-                        "{} — a `decide` served by the judge (SYNSEMA_JUDGE_DECIDE) falls back to the model when the judge does not choose, so it needs `llm` as well as `judge`: add `require llm` to the program's preamble (with private data, `require llm(\"<principal>\")`), and the host's ceiling has to allow it too (`llm`, or `llm=<principal>@<provider host>` for private data), or unset the knob",
-                        head
+                        "{} — a `decide` served by the judge (SYNSEMA_JUDGE_DECIDE) falls back to the model when the judge does not choose, so it needs `llm` as well as `judge`: add `require llm` {} (with private data, `require llm(\"<principal>\")`), and the host's ceiling has to allow it too (`llm`, or `llm=<principal>@<provider host>` for private data), or unset the knob",
+                        head, place
                     ),
                     loc,
                 ));
@@ -6147,33 +6420,8 @@ impl Interpreter {
                 namespace.insert(variant_name.clone(), syn_map(m));
             } else {
                 // Variante con payload → constructor builtin de aridad EXACTA.
-                let field_names = fields.clone();
-                let count = field_names.len() as i32;
-                let q = qualified.clone();
-                let def_loc = loc.clone();
-                let func: BuiltinFn = Rc::new(move |_i, args, _l| {
-                    if args.len() != field_names.len() {
-                        return Err(err_at(
-                            format!(
-                                "variant {} expects {} fields, got {}",
-                                q,
-                                field_names.len(),
-                                args.len()
-                            ),
-                            &def_loc,
-                        ));
-                    }
-                    let mut m = SynMap::new();
-                    m.insert("__variant", syn_text(q.as_str()));
-                    for (n, val) in field_names.iter().zip(args.iter()) {
-                        m.insert(n.clone(), val.clone());
-                    }
-                    Ok(syn_map(m))
-                });
-                namespace.insert(
-                    variant_name.clone(),
-                    SynValue::Builtin(Rc::new(BuiltinTask::new(qualified.clone(), count, None, func))),
-                );
+                let spec = CtorSpec { name: qualified, fields: fields.clone(), variant: true, loc: loc.clone() };
+                namespace.insert(variant_name.clone(), constructor_value(spec));
             }
         }
         let value = syn_map(namespace);
@@ -6711,6 +6959,7 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                     origin: Some(r.location.clone()),
                     required_capabilities: Vec::new(),
                     code: Default::default(),
+                    free_names: Default::default(),
                 }));
                 map.insert(format!("_route_handler_{}", i), task);
                 let mut mm = SynMap::new();
@@ -6972,12 +7221,11 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
     #[inline(never)]
     fn exec_task_definition(&mut self, node: &Node, env: &Rc<RefCell<Environment>>) -> Result<SynValue, Control> {
         let loc = &node.location;
-        let NodeKind::TaskDefinition { name, parameters, body, .. } = &node.kind else { unreachable!("exec_task_definition: otro nodo") };
+        let NodeKind::TaskDefinition { name, parameters, body, run_body, .. } = &node.kind else { unreachable!("exec_task_definition: otro nodo") };
         {
         let mut required_caps = Vec::new();
-        let mut clean_body = Vec::new();
         // Sin `require` adentro (casi siempre), el cuerpo de la task ES el del AST, compartido
-        // (R2.5); con `require`, el cuerpo limpio se arma acá.
+        // (R2.5); con `require`, es el cuerpo limpio del nodo, armado una vez (ronda 5, M1).
         let has_requires = body.iter().any(|s| matches!(s.kind, NodeKind::RequireStatement { .. }));
         for stmt in body.iter() {
             if let NodeKind::RequireStatement { capability, scope, bound_to } = &stmt.kind {
@@ -7005,18 +7253,17 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                     scope_s = Some(self.bound_secret_scope(n, hosts, env, &stmt.location)?);
                 }
                 required_caps.push((capability.clone(), scope_s));
-            } else if has_requires {
-                clean_body.push(stmt.clone());
             }
         }
         let task = Rc::new(SynTaskValue {
             name: name.clone(),
             parameters: parameters.clone(),
-            body: if has_requires { clean_body.into() } else { body.clone() },
+            body: if has_requires { run_body.get(body) } else { body.clone() },
             closure_env: env.clone(),
             origin: Some(loc.clone()),
             required_capabilities: required_caps,
             code: Default::default(),
+            free_names: Default::default(),
         });
         let value = SynValue::Task(task);
         // Definir una task bajo PC es una asignación más (NSU estricto + el
@@ -7094,33 +7341,8 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
         let loc = &node.location;
         let NodeKind::TypeDefinition { name, fields } = &node.kind else { unreachable!("exec_type_definition: otro nodo") };
         {
-        let field_names: Vec<String> = fields.iter().map(|(n, _)| n.clone()).collect();
-        let count = field_names.len() as i32;
-        let type_name = name.clone();
-        let def_loc = loc.clone();
-        let func: BuiltinFn = Rc::new(move |_i, args, _l| {
-            if args.len() != field_names.len() {
-                return Err(err_at(
-                    format!(
-                        "Type {} expects {} fields, got {}",
-                        type_name,
-                        field_names.len(),
-                        args.len()
-                    ),
-                    &def_loc,
-                ));
-            }
-            let mut m = SynMap::new();
-            for (n, v) in field_names.iter().zip(args.iter()) {
-                m.insert(n.clone(), v.clone());
-            }
-            Ok(syn_map(m))
-        });
-        env_set(
-            env,
-            name,
-            SynValue::Builtin(Rc::new(BuiltinTask::new(name.clone(), count, None, func))),
-        );
+        let fields: Vec<String> = fields.iter().map(|(n, _)| n.clone()).collect();
+        env_set(env, name, constructor_value(CtorSpec { name: name.clone(), fields, variant: false, loc: loc.clone() }));
         Ok(SynValue::Nothing)
     }
     }
@@ -7679,21 +7901,13 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                 if self.labels && !escape_pc && !self.pc_is_empty() {
                     match env_get(env, name) {
                         Some(cur) => self.nsu_check(&labels::label(&cur), &format!("'{}'", name), loc)?,
-                        None => {
-                            return Err(err(format!(
-                                "Cannot set undefined variable: '{}'. Use 'let' first.",
-                                name
-                            )))
-                        }
+                        None => return Err(self.set_undefined_in(name, env)),
                     }
                 }
                 #[cfg(feature = "resolver-check")]
                 crate::resolve::check::at(&target.location, name, false, env);
                 if env_update(env, name, value.clone()).is_err() {
-                    return Err(err(format!(
-                        "Cannot set undefined variable: '{}'. Use 'let' first.",
-                        name
-                    )));
+                    return Err(self.set_undefined_in(name, env));
                 }
                 Ok(value)
             }
@@ -11533,6 +11747,122 @@ fn secret_concat(left: &SynValue, right: &SynValue, loc: &SourceLocation) -> Res
 /// (lo que la task declaró ∩ el techo de confianza), la llama y sale, también por error. Los
 /// argumentos son datos: un callable adentro correría con las capabilities de la tool (el
 /// "confused deputy"), así que es error.
+/// v0.6.50 (ronda 1, B6): envuelve en el scope de la tool cada task que expone un export, también
+/// dentro de mapas y listas (`path` es `M.f`, `L[0]`). Un mapa o una lista sin tasks no se copia.
+/// `aware` junta los nombres de los envoltorios (son conscientes de etiquetas); `wrapped`, las tasks
+/// envueltas (para E-c, ronda 2).
+fn wrap_exposed_tasks(
+    module: &str,
+    path: &str,
+    v: SynValue,
+    hook: &TrustedScopeHook,
+    aware: &mut Vec<String>,
+    wrapped: &mut HashSet<usize>,
+) -> SynValue {
+    fn has_task(v: &SynValue) -> bool {
+        match v {
+            SynValue::Task(_) => true,
+            SynValue::Map(m) => m.borrow().iter().any(|(_, x)| has_task(x)),
+            SynValue::List(l) => l.borrow().as_values().is_some_and(|v| v.iter().any(has_task)),
+            _ => false,
+        }
+    }
+    match v {
+        SynValue::Task(t) => {
+            wrapped.insert(Rc::as_ptr(&t) as usize);
+            let w = trusted_wrapper(module, path, t, hook.clone());
+            if let SynValue::Builtin(b) = &w {
+                aware.push(b.name.to_string());
+            }
+            w
+        }
+        SynValue::Map(m) if has_task(&SynValue::Map(m.clone())) => {
+            let mut out = SynMap::new();
+            for (k, x) in m.borrow().iter() {
+                let key = k.to_string();
+                let p = format!("{}.{}", path, key);
+                out.insert(key, wrap_exposed_tasks(module, &p, x.clone(), hook, aware, wrapped));
+            }
+            SynValue::Map(out.into_ref())
+        }
+        SynValue::List(l) if has_task(&SynValue::List(l.clone())) => {
+            let items: Vec<SynValue> = l
+                .borrow()
+                .to_vec()
+                .into_iter()
+                .enumerate()
+                .map(|(i, x)| wrap_exposed_tasks(module, &format!("{}[{}]", path, i), x, hook, aware, wrapped))
+                .collect();
+            syn_list(items)
+        }
+        other => other,
+    }
+}
+
+/// v0.6.50 (ronda 3, R3): el constructor de un tipo (`Punto(x)`) o de una variante
+/// (`Forma.circulo(r)`), de aridad exacta. Lo arman `type`/`enum` y el rebuild de otro intérprete.
+pub fn constructor_value(spec: CtorSpec) -> SynValue {
+    let spec = Rc::new(spec);
+    let s = spec.clone();
+    let func: BuiltinFn = Rc::new(move |_i, args, _l| {
+        if args.len() != s.fields.len() {
+            let what = if s.variant { "variant" } else { "Type" };
+            return Err(err_at(format!("{} {} expects {} fields, got {}", what, s.name, s.fields.len(), args.len()), &s.loc));
+        }
+        let mut m = SynMap::new();
+        if s.variant {
+            m.insert("__variant", syn_text(s.name.as_str()));
+        }
+        for (n, v) in s.fields.iter().zip(args.iter()) {
+            m.insert(n.clone(), v.clone());
+        }
+        Ok(syn_map(m))
+    });
+    let mut b = BuiltinTask::new(spec.name.clone(), spec.fields.len() as i32, None, func);
+    b.ctor = Some(spec);
+    SynValue::Builtin(Rc::new(b))
+}
+
+/// ¿`k` liga al builtin del lenguaje de ese nombre (o a su alias deprecado)? Eso lo tiene todo
+/// intérprete: la foto de un módulo o de los globales no lo lleva, y `builtins_only` sólo copia eso.
+pub fn is_own_builtin(k: &str, b: &BuiltinTask) -> bool {
+    b.meta.registered
+        && (b.name == k || crate::deprecated::DEPRECATED_NAMES.iter().any(|(old, new)| *old == k && *new == b.name.as_str()))
+}
+
+/// Los nombres que el intérprete busca por texto, sin un `Identifier` en el cuerpo.
+const IMPLICIT_NAMES: &[&str] = &["request", "declassify", "range", "insert", "merge"];
+
+/// v0.6.50 (ronda 3, R3): los nombres que una task puede leer o escribir de afuera, por exceso:
+/// todo identificador de su cuerpo y de los defaults de sus parámetros (sin restar los propios),
+/// `spawn`/`observe` y los nombres que el intérprete busca por texto. De un frame que cruza viajan
+/// sólo éstos. Se calculan una vez por valor (ronda 4, N1) y viven con él (ronda 5, M1): un global
+/// que cruza en cada `parallel_map` no se vuelve a recorrer, y una task que se define en cada
+/// llamada no deja nada en una caché. La copia de una foto los trae de su original (ronda 6, N1).
+pub fn task_free_names(t: &SynTaskValue) -> std::sync::Arc<HashSet<String>> {
+    t.free_names.get_or_init(|| std::sync::Arc::new(walk_free_names(t))).clone()
+}
+
+fn walk_free_names(t: &SynTaskValue) -> HashSet<String> {
+    let mut out: HashSet<String> = IMPLICIT_NAMES.iter().map(|n| n.to_string()).collect();
+    let mut visit = |n: &Node| match &n.kind {
+        NodeKind::Identifier { name } => {
+            out.insert(name.clone());
+        }
+        NodeKind::SpawnStatement { agent_name, .. } => {
+            out.insert(agent_name.clone());
+        }
+        NodeKind::ObserveStatement { variable, .. } => {
+            out.insert(variable.clone());
+        }
+        _ => {}
+    };
+    for n in t.body.iter().chain(t.parameters.iter().filter_map(|p| p.default.as_ref())) {
+        crate::ast_api::walk(n, &mut visit);
+    }
+    out
+}
+
 fn trusted_wrapper(module: &str, export: &str, task: Rc<SynTaskValue>, hook: TrustedScopeHook) -> SynValue {
     let label = format!("trusted:{}.{}", module, export);
     let tool = Rc::new(TrustedTool { module: module.to_string(), label: label.clone(), task, hook });
@@ -11562,7 +11892,9 @@ fn call_trusted(i: &mut Interpreter, tool: &TrustedTool, args: &mut CallArgs, lo
     (tool.hook)(Some((&tool.module, &tool.task.required_capabilities)));
     debug_assert!(!i.shortcuts, "a trusted scope opened with the VM on (it has no origin check)");
     i.trusted_depth += 1;
+    i.trusted_stack.push(tool.module.clone());
     let r = i.call_value_named(SynValue::Task(tool.task.clone()), args, loc);
+    i.trusted_stack.pop();
     i.trusted_depth -= 1;
     (tool.hook)(None);
     i.stdout_verdict = None;
@@ -12466,10 +12798,22 @@ fn translate_replacement(s: &str) -> String {
 /// Resultado observable de un programa. Sólo lleva datos `Send` (el `SynValue`
 /// final y el intérprete viven y mueren dentro del hilo de ejecución, porque
 /// `SynValue` usa `Rc` y no es `Send`).
+///
+/// v0.6.50: el estado de la corrida viaja con ella (antes eran globales del proceso, "la última
+/// corrida": un embebedor que corría dos a la vez leía el de la otra).
+#[derive(Default)]
 pub struct RunResult {
     pub success: bool,
     pub output: Vec<String>,
     pub errors: Vec<String>,
+    /// El código que pidió `exit(code)`, si el programa lo llamó (`None` también tras un corte de
+    /// etiquetas: el código sería el dato).
+    pub exit_code: Option<i32>,
+    /// Pasos del intérprete del programa principal (`steps()`; determinista).
+    pub steps: u64,
+    /// ¿La corrida tocó datos privados? Si sí, el host no publica `steps` (después de una rama
+    /// privada el contador es el dato con aritmética encima).
+    pub touched_private: bool,
 }
 
 /// Resultado de un bloque `test` (Batch 3). `assertion` distingue una falla de aserción
@@ -12497,11 +12841,13 @@ fn run_inner(source: &str, filename: &str) -> RunResult {
             success: false,
             output: Vec::new(),
             errors: vec![format!("Lexer error: {}", e)],
+            ..Default::default()
         },
         Err(CompileError::Parse(e)) => RunResult {
             success: false,
             output: Vec::new(),
             errors: vec![format!("Parse error: {}", e)],
+            ..Default::default()
         },
         Ok(program) => {
             let mut interp = Interpreter::new();
@@ -12510,11 +12856,13 @@ fn run_inner(source: &str, filename: &str) -> RunResult {
                     success: true,
                     output: std::mem::take(&mut interp.output),
                     errors: Vec::new(),
+                    ..Default::default()
                 },
                 Err(Control::Error(e)) => RunResult {
                     success: false,
                     output: std::mem::take(&mut interp.output),
                     errors: vec![format!("Runtime error: {}", e)],
+                    ..Default::default()
                 },
                 // `give`/`stop` que escapan al top: error limpio (no "Internal error:").
                 Err(Control::Give(_)) | Err(Control::Stop(_)) => RunResult {
@@ -12523,6 +12871,7 @@ fn run_inner(source: &str, filename: &str) -> RunResult {
                     errors: vec![
                         "Runtime error: 'give'/'stop' used outside of a task or loop".to_string(),
                     ],
+                    ..Default::default()
                 },
             }
         }
@@ -12546,6 +12895,7 @@ pub fn run_source(source: &str, filename: &str) -> RunResult {
                 "internal error in the interpreter (a bug, not your program — please report it): {}",
                 p.downcast_ref::<&str>().map(|s| s.to_string()).or_else(|| p.downcast_ref::<String>().cloned()).unwrap_or_default()
             )],
+            ..Default::default()
         })
 }
 
@@ -12616,6 +12966,7 @@ mod drop_tests {
                 origin: None,
                 required_capabilities: vec![],
                 code: Default::default(),
+                free_names: Default::default(),
             }));
             interp.set_global("f", task); // global_env → task (la otra mitad)
             weak = Rc::downgrade(&interp.global_env);
@@ -12649,6 +13000,7 @@ mod drop_tests {
                 origin: None,
                 required_capabilities: vec![],
                 code: Default::default(),
+                free_names: Default::default(),
             }));
             env.borrow_mut().bindings.insert("t", task); // child → task (otra mitad)
             weak = Rc::downgrade(&env);
@@ -13885,5 +14237,53 @@ mod bindings_find_tests {
         assert!(b.remove("v9").is_some());
         assert_eq!(b.find("v9"), Some(9));
         assert!(b.get("v9").is_none());
+    }
+}
+
+#[cfg(test)]
+mod run_body_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    /// Ronda 5 (M1): una task local con `require`, definida en cada llamada, corre el cuerpo limpio
+    /// de su nodo, armado una vez: dos definiciones comparten el `Arc`, sin los `require`. Un
+    /// `rename_task` (que muta el cuerpo en el lugar) lo vuelve a armar.
+    #[test]
+    fn a_task_with_require_runs_one_clean_body_per_definition() {
+        let src = "task mk(i)\n    task inner(x)\n        require time\n        give old(x)\n    give inner\nlet a be mk(1)\nlet b be mk(2)\n";
+        let mut program = crate::parser::parse_source(src, "<r5m1>").expect("parse");
+        let bodies = |program: &crate::ast::Program| {
+            let mut interp = Interpreter::new();
+            assert!(interp.execute(program).is_ok(), "falló");
+            let body = |n: &str| match env_get(&interp.global_env, n) {
+                Some(SynValue::Task(t)) => {
+                    assert_eq!(t.required_capabilities.len(), 1);
+                    t.body.clone()
+                }
+                other => panic!("{} no es una task: {:?}", n, other.map(|v| v.type_name())),
+            };
+            (body("a"), body("b"))
+        };
+        let (a, b) = bodies(&program);
+        assert!(Arc::ptr_eq(&a, &b), "cada definición copió el cuerpo");
+        assert_eq!(a.len(), 1);
+        assert!(!a.iter().any(|s| matches!(s.kind, NodeKind::RequireStatement { .. })));
+        drop((a, b));
+        // El nodo de `inner` en el AST (el que muta `rename_task`), con su cuerpo limpio ya armado.
+        let inner_clean = |program: &crate::ast::Program| {
+            let NodeKind::TaskDefinition { body, .. } = &program.statements[0].kind else { panic!("mk") };
+            let NodeKind::TaskDefinition { body, run_body, .. } = &body[0].kind else { panic!("inner") };
+            run_body.get(body)
+        };
+        drop(inner_clean(&program));
+        assert_eq!(crate::ast_api::rename_task(&mut program, "old", "new"), 1);
+        let a = inner_clean(&program);
+        let mut names = Vec::new();
+        crate::ast_api::walk(&a[0], &mut |n| {
+            if let NodeKind::Identifier { name } = &n.kind {
+                names.push(name.to_string());
+            }
+        });
+        assert!(names.contains(&"new".to_string()), "el cuerpo limpio no vio el rename: {:?}", names);
     }
 }

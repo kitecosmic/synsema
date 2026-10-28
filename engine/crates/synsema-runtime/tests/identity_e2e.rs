@@ -97,6 +97,17 @@ fn p256_fixture() -> P256Fixture {
 }
 
 /// Un PEM en una línea con `\n` literales, como va en un `.env` o en un literal `.syn`.
+/// v0.6.50 (C4): en este binario corren varios programas y el proceso no tiene uno: el recibo trae el
+/// `program_sha` de SU programa (si fue el único que corrió) o ninguno, nunca el de otro. Que lo traiga
+/// lo prueba `v0650_cli::a_receipt_carries_the_sha_of_its_program`, con un programa por proceso.
+fn assert_own_program_sha(subject: &serde_json::Value, prog: &str, filename: &str) {
+    let got = &subject["program_sha"];
+    if !got.is_null() {
+        let want = hex_encode(&synsema_stdlib::attest::program_sha_of(prog, filename).unwrap());
+        assert_eq!(got.as_str().unwrap(), want, "el sha de otro programa del proceso");
+    }
+}
+
 fn one_line(pem: &str) -> String {
     pem.replace('\n', "\\n")
 }
@@ -231,7 +242,7 @@ print("tampered: " + text(receipt_verify(r, did) == nothing))
     assert!(vf.starts_with("20") && vf.ends_with('Z') && vf.contains('T'), "{}", vf);
     assert_eq!(v["proof"]["created"], vf, "la prueba lleva la misma fecha derivada");
     let subj = &v["credentialSubject"];
-    assert_eq!(subj["program_sha"].as_str().unwrap().len(), 64, "sha256 del programa en hex");
+    assert_own_program_sha(subj, &prog, "identity_receipt.syn");
     assert_eq!(subj["declared_result_sha256"].as_str().unwrap().len(), 64, "declarado por el programa, y el nombre lo dice");
     assert!(subj.get("result_sha256").is_none());
     assert!(subj["engine"].as_str().unwrap().chars().any(|c| c.is_ascii_digit()), "engine version: {}", subj["engine"]);
@@ -273,8 +284,9 @@ serve on {port}
         did = p.did,
         mb = &p.did[8..],
     );
+    let served = prog.clone();
     thread::spawn(move || {
-        let _ = run_serve_program(&prog, "identity_card_e2e.syn", false);
+        let _ = run_serve_program(&served, "identity_card_e2e.syn", false);
     });
     wait_ready(port);
 
@@ -346,7 +358,7 @@ print("tampered: " + text(jwt_verify(tok2, {{"did": did}}, {{"now": 1750000000}}
     assert_eq!(receipt["type"][1], "SynsemaReceipt");
     assert_eq!(receipt["issuer"], p.did);
     assert_eq!(receipt["proof"]["cryptosuite"], "ecdsa-jcs-2019");
-    assert_eq!(receipt["credentialSubject"]["program_sha"].as_str().unwrap().len(), 64);
+    assert_own_program_sha(&receipt["credentialSubject"], &prog, "identity_card_e2e.syn");
     std::fs::write(format!("{}/receipt.json", dir), &body).unwrap();
     let verify = format!(
         r#"require file.read("{d}/*")

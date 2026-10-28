@@ -51,11 +51,7 @@ fn main() {
     synsema_runtime::engine::set_request_mode(request);
     let r = synsema_runtime::engine::run_program_ceiled_opts(&source, &path, None, false);
     // Si la corrida tocó datos privados, `steps` no se publica (igual que `run --format json`).
-    let steps = if synsema_runtime::engine::last_run_touched_private() {
-        serde_json::Value::Null
-    } else {
-        serde_json::json!(synsema_runtime::engine::last_run_steps())
-    };
+    let steps = if r.touched_private { serde_json::Value::Null } else { serde_json::json!(r.steps) };
     let mut report = serde_json::json!({
         "ok": r.success,
         "output": r.output,

@@ -645,17 +645,154 @@ fn load_template(
         }
         (None, None) => std::fs::read_to_string(target).map_err(|_| not_found())?,
     };
-    let segs = segments(&src, display)?;
+    let tree = parse_tree(&src, display)?;
+    TPL_CACHE.with(|c| {
+        c.borrow_mut().insert(key, CachedTpl { mtime, size, tree: Rc::clone(&tree) })
+    });
+    Ok(tree)
+}
+
+fn parse_tree(src: &str, display: &str) -> Result<Rc<Vec<TNode>>, Control> {
+    let segs = segments(src, display)?;
     let mut pos = 0;
     let (tree, term) = parse_block(&segs, &mut pos, display, &[])?;
     if !term.is_empty() {
         return Err(terr(display, 1, &format!("'{{ {} }}' without a matching block", term)));
     }
-    let tree = Rc::new(tree);
-    TPL_CACHE.with(|c| {
-        c.borrow_mut().insert(key, CachedTpl { mtime, size, tree: Rc::clone(&tree) })
-    });
-    Ok(tree)
+    Ok(Rc::new(tree))
+}
+
+/// v0.6.50 (D): los templates que el host le dio a una tool de confianza (`--trusted-templates`),
+/// leídos al arrancar. Cada uno se parsea la primera vez que se usa en este intérprete.
+pub struct ToolTemplates {
+    files: HashMap<String, (Rc<str>, std::cell::OnceCell<Rc<Vec<TNode>>>)>,
+}
+
+impl ToolTemplates {
+    pub fn new(files: &[(String, String)]) -> ToolTemplates {
+        let files = files
+            .iter()
+            .filter_map(|(name, text)| Some((crate::bundle::normalize_name(name)?, (Rc::from(text.as_str()), Default::default()))))
+            .collect();
+        ToolTemplates { files }
+    }
+
+    fn contains(&self, path: &str) -> bool {
+        crate::bundle::normalize_name(path).is_some_and(|k| self.files.contains_key(&k))
+    }
+}
+
+#[cold]
+fn tool_has_no_templates(module: &str, path: &str) -> String {
+    format!(
+        "render: the trusted tool '{module}' has no templates ('{path}'): a template is code, one read from the working directory could be written by the program, and it would run with the tool's capabilities; the host gives the tool its templates with `--trusted-templates {module}=<dir>` (in wasm, `trusted: {{ {module}: {{ source, templates }} }}`)"
+    )
+}
+
+#[cold]
+fn not_a_tool_template(module: &str, path: &str) -> String {
+    format!("template '{path}' is not among the templates the host gave the trusted tool '{module}' (`--trusted-templates`)")
+}
+
+/// v0.6.50 (D): abre un template para renderizar. Dentro del scope de una tool, sólo del conjunto
+/// que le dio el host (sin disco, sin el bundle del programa, sin `file.read`: es parte de la
+/// tool); si no, del bundle o del disco, con el gate `file.read` (`gated`: el de nivel superior lo
+/// gatea `render_template`, los anidados acá).
+fn open_template(interp: &Interpreter, path: &str, gated: bool) -> Result<(String, Rc<Vec<TNode>>), Control> {
+    if let Some((module, set)) = interp.current_tool_templates() {
+        let set = set.ok_or_else(|| Control::Error(RuntimeError::new(tool_has_no_templates(module, path))))?;
+        let entry = crate::bundle::normalize_name(path).and_then(|k| set.files.get_key_value(&k));
+        let Some((key, (src, tree))) = entry else {
+            return Err(Control::Error(RuntimeError::new(not_a_tool_template(module, path))));
+        };
+        let display = key.rsplit('/').next().unwrap_or(key).to_string();
+        let tree = match tree.get() {
+            Some(t) => t.clone(),
+            None => {
+                let parsed = parse_tree(src, &display)?;
+                tree.get_or_init(|| parsed).clone()
+            }
+        };
+        return Ok((display, tree));
+    }
+    if gated {
+        gate_nested_template(interp, path)?;
+    }
+    let target = resolve_template_path(path).map_err(|m| Control::Error(RuntimeError::new(m)))?;
+    let filename = target
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.to_string());
+    let tree = load_template(&target, &filename, path, interp.template_open_hook())?;
+    Ok((filename, tree))
+}
+
+/// v0.6.50 (D): los templates que el host le da a una tool desde un directorio (`--trusted-templates
+/// t=dir`, en `synsema run` y en el CLI wasip1): los archivos regulares del árbol, ordenados, con su
+/// nombre relativo con `/`. Un symlink no se sigue: lo que la tool renderiza es lo que está en su
+/// directorio.
+pub fn read_template_dir(dir: &std::path::Path) -> Result<Vec<(String, String)>, String> {
+    fn walk(dir: &std::path::Path, prefix: &str, out: &mut Vec<(String, String)>) -> Result<(), String> {
+        let mut entries: Vec<_> = std::fs::read_dir(dir).map_err(|e| e.to_string())?.collect::<Result<_, _>>().map_err(|e| e.to_string())?;
+        entries.sort_by_key(|e| e.file_name());
+        for e in entries {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let rel = if prefix.is_empty() { name } else { format!("{}/{}", prefix, name) };
+            let meta = std::fs::symlink_metadata(e.path()).map_err(|e| e.to_string())?;
+            if meta.is_dir() {
+                walk(&e.path(), &rel, out)?;
+            } else if meta.is_file() {
+                let text = std::fs::read_to_string(e.path()).map_err(|err| format!("{}: {}", rel, err))?;
+                out.push((rel, text));
+            }
+        }
+        Ok(())
+    }
+    let mut raw = Vec::new();
+    walk(dir, "", &mut raw)?;
+    // Ronda 2 (N3): el nombre normalizado, como lo busca `render` y como entra en wasm, así el sha
+    // del recibo es el mismo en los dos hosts (en Linux un archivo puede llamarse `a\b.html`).
+    let mut out: Vec<(String, String)> = Vec::with_capacity(raw.len());
+    for (rel, text) in raw {
+        let name = crate::bundle::normalize_name(&rel).ok_or_else(|| format!("{}: a template name is a relative path inside the set", rel))?;
+        if out.iter().any(|(n, _)| *n == name) {
+            return Err(format!("'{}' and another file are the same template ({})", rel, name));
+        }
+        out.push((name, text));
+    }
+    Ok(out)
+}
+
+/// v0.6.50 (D8): al cargar una tool, cada `render("literal")` de su fuente tiene que estar entre los
+/// templates que le dio el host. Corre antes de que llegue ningún dato. No los parsea (cada tool en
+/// cada intérprete pagaría el parseo de todos): un template con un error de sintaxis falla en su
+/// primer `render`, con su texto.
+pub fn check_tool_renders(program: &crate::ast::Program, module: &str, set: Option<&ToolTemplates>) -> Result<(), String> {
+    use crate::ast::NodeKind as NK;
+    let mut first_err: Option<String> = None;
+    for stmt in &program.statements {
+        crate::ast_api::walk(stmt, &mut |n| {
+            if first_err.is_some() {
+                return;
+            }
+            if let NK::TaskCall { name, arguments } = &n.kind {
+                if !matches!(&name.kind, NK::Identifier { name } if name == "render") {
+                    return;
+                }
+                let Some(NK::TextLiteral { value }) = arguments.first().filter(|a| a.name.is_none()).map(|a| &a.value.kind) else {
+                    return;
+                };
+                match set {
+                    None => first_err = Some(format!("{}:{}: {}", n.location.file, n.location.line, tool_has_no_templates(module, value))),
+                    Some(t) if !t.contains(value) => {
+                        first_err = Some(format!("{}:{}: {}", n.location.file, n.location.line, not_a_tool_template(module, value)))
+                    }
+                    Some(_) => {}
+                }
+            }
+        });
+    }
+    first_err.map_or(Ok(()), Err)
 }
 
 /// Contenido de slots durante el render: `default` es el HTML de la página (para
@@ -665,8 +802,19 @@ struct Slots<'a> {
     named: &'a HashMap<String, String>,
 }
 
-fn emit(value: &SynValue, escape: bool, out: &mut String) {
-    let s = value.to_string();
+/// v0.6.50 (N3): un valor con etiqueta se escribe como su valor, y su etiqueta queda anotada en lo
+/// que vio la llamada a `render` (`note_seen`): el HTML sale con ella, como con cualquier cosa que
+/// un builtin desenvuelve. Antes `{upper(c.nombre)}` escribía el marcador `private(…)` (el
+/// resultado de `upper` lleva la etiqueta del PC del render) y `{c.nombre}` el valor.
+fn emit(interp: &mut Interpreter, value: &SynValue, escape: bool, out: &mut String) {
+    // Ronda 1 (N4): sin etiquetas no hay valores etiquetados; no recorrer el valor dos veces.
+    let l = if interp.labels_enabled() { crate::labels::label_deep(value) } else { crate::labels::empty() };
+    let s = if l.is_empty() {
+        value.to_string()
+    } else {
+        interp.note_seen(&l);
+        crate::labels::strip_deep(value).to_string()
+    };
     if escape {
         out.push_str(&html_escape(&s));
     } else {
@@ -693,11 +841,11 @@ fn render_nodes(
                         filename, name
                     )))
                 })?;
-                emit(&val, *escape, out);
+                emit(interp, &val, *escape, out);
             }
             TNode::Expr { node, escape } => {
                 let val = interp.eval(node, env)?;
-                emit(&val, *escape, out);
+                emit(interp, &val, *escape, out);
             }
             TNode::Each { var, coll, body, els, line } => {
                 let c = interp.eval(coll, env)?;
@@ -722,6 +870,14 @@ fn render_nodes(
             }
             TNode::When { cond, then, els } => {
                 let c = interp.eval(cond, env)?;
+                // Ronda 1 (M2): la condición decide qué texto sale, así que su etiqueta va al HTML
+                // también cuando no viene en los datos (un global privado).
+                if interp.labels_enabled() {
+                    let l = crate::labels::label_deep(&c);
+                    if !l.is_empty() {
+                        interp.note_seen(&l);
+                    }
+                }
                 let branch = if c.is_truthy() { then } else { els };
                 render_nodes(branch, interp, env, out, filename, slots, depth)?;
             }
@@ -752,14 +908,7 @@ fn render_nodes(
                         "{}: template include nesting too deep", filename
                     ))));
                 }
-                gate_nested_template(interp, path)?;
-                let target = resolve_template_path(path)
-                    .map_err(|m| Control::Error(RuntimeError::new(m)))?;
-                let inc_name = target
-                    .file_name()
-                    .map(|s| s.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| path.clone());
-                let inc_tree = load_template(&target, &inc_name, path, interp.template_open_hook())?;
+                let (inc_name, inc_tree) = open_template(interp, path, true)?;
                 match with_expr {
                     None => {
                         render_nodes(&inc_tree, interp, env, out, &inc_name, slots, depth + 1)?;
@@ -804,16 +953,8 @@ fn render_file(
             "template layout nesting too deep ({})", path
         ))));
     }
-    // El de nivel superior lo gatea `render()`; un layout (depth > 0) se gatea acá.
-    if depth > 0 {
-        gate_nested_template(interp, path)?;
-    }
-    let target = resolve_template_path(path).map_err(|m| Control::Error(RuntimeError::new(m)))?;
-    let filename = target
-        .file_name()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| path.to_string());
-    let tree = load_template(&target, &filename, path, interp.template_open_hook())?;
+    // El de nivel superior lo gatea `render_template`; un layout (depth > 0) se gatea acá.
+    let (filename, tree) = open_template(interp, path, depth > 0)?;
     let layout_path = tree.iter().find_map(|n| match n {
         TNode::Layout { path } => Some(path.clone()),
         _ => None,
@@ -858,14 +999,15 @@ pub fn render_template(
 ) -> Result<String, Control> {
     // v0.6.46 (ronda 3, R3-A1): un template es código que se lee del directorio de trabajo en cada
     // llamada, donde el programa puede escribirlo (él, una corrida anterior o un proceso suyo), y
-    // correría con las capabilities de la tool. Hasta que el host le dé a la tool sus templates
-    // (como le da la fuente), dentro de una tool es error. Es la única entrada: `include` y los
-    // layouts se resuelven desde acá.
-    if interp.in_trusted_scope() {
-        return Err(Control::Error(RuntimeError::new(format!(
-            "render: a trusted tool cannot render templates yet ('{}'): the template file lives where the program can write it, and it would run with the tool's capabilities; build the text in the tool",
-            path
-        ))));
+    // correría con las capabilities de la tool. v0.6.50 (D): dentro de una tool, sólo los que le dio
+    // el host (`open_template`), sin `file.read`. Fuera, el gate `file.read` de la llamada de nivel
+    // superior (el vector de LFI: el path puede venir de un request); uno del bundle es el programa y
+    // no lo pide. Es la única entrada: `include` y los layouts se resuelven desde acá.
+    if !interp.in_trusted_scope() {
+        let bundled = crate::bundle::normalize_name(path).is_some_and(|k| crate::bundle::get(&k).is_some());
+        if !bundled {
+            interp.gate_template_read(path)?;
+        }
     }
     let named = HashMap::new();
     let slots = Slots { default: "", named: &named };

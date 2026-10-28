@@ -129,8 +129,11 @@ export interface RunOptions {
    * código escrito por un modelo, bajo un `ceiling` sin `declassify`, publique sólo lo que la
    * política de una persona publica. Los argumentos de una task de confianza son datos (una task
    * o una lambda entre ellos es error).
+   *
+   * v0.6.50 — `{ nombre: { source, templates: { "r.html": texto } } }` le da a la tool sus
+   * templates: dentro de ella `render`/`include`/`layout` resuelven sólo contra éstos.
    */
-  trusted?: Record<string, string>;
+  trusted?: Record<string, string | { source: string; templates?: Record<string, string> }>;
   /** El techo de los módulos de confianza, con la gramática de `ceiling` (`"stdout,declassify=clientes"`). */
   trustedCeiling?: string;
   /**

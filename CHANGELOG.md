@@ -6,6 +6,147 @@ Each says what changed, why, and what to write instead.
 
 Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the release date.
 
+## v0.6.50 — 2026-10-28
+
+**Behavior changes (read these first).**
+- **A module sees only its own names and the builtins, never the names of the program that imports
+  it.** Until now a file module (`use "./lib.syn" as lib`) looked up a name it did not define in the
+  globals of whoever imported it: `lib.syn` could read (and `set`) the importer's `TASA` (defined
+  before or after the `use`), and a program that bound a builtin's name (`let upper be 3`) changed
+  that builtin for all its modules. The meaning of a module depended on who imported it. Now a
+  module resolves its free names in its own definitions and in the prelude (the builtins, `pi`,
+  `tau`, `e`, `inf`, `nan`, and whatever the host registered before the program's first
+  statement), like modules in Rust, OCaml, Go or Python (a module sees its globals and `builtins`,
+  never `__main__`'s). Trusted modules already worked this way (v0.6.46). The same rule holds under
+  `serve`, `parallel_map`, agents, `synsema test` and the REPL. A value the program passes in (an
+  argument, a callback, a lambda) keeps its own scope, as before, also when the module keeps it and
+  calls it later from a request, a worker or an agent (a lambda of module `a` that module `b`
+  keeps closes over `a`, whatever the order of the `use` lines, and never reads a name of `b`).
+  **Breaking:** a module that read a global of its importer now fails with `Undefined variable:
+  'TASA' — 'TASA' is a name of the program that imports this module, and a module sees only its own
+  names and the builtins: pass it as an argument or define it in the module`. Write `lib.cobrar(n,
+  TASA)`, or move `TASA` into the module (`export let TASA be 2` if the program needs it too). A
+  `set` from the module on the importer's variable fails the same way. Measured over 247 modules of
+  real programs: none depended on it.
+
+**New.**
+- **`--trusted` runs under `synsema serve`.** Each worker gets the same trusted tool the program
+  loaded: its tasks, its siblings and its top-level state (each request starts from the state the tool had
+  when the program loaded it, as with a file module),
+  hung from the trusted base of that worker and wrapped in that worker's trusted scope (the task's
+  `require` ∩ `--trusted-cap-set`). The tool's top level runs once, when the program loads it, not
+  per request; a `use "trusted:t"` inside a route gets that same tool. Everything that holds under
+  `run` holds here: the tool does not see the program's globals, `set t.X` fails, a task of the
+  program passed as an argument fails (a trusted tool takes data, not code), and with `--labels` the
+  argument keeps its label and the tool declassifies only what its task declares.
+- **A trusted tool renders the templates the host gives it.** `--trusted-templates t=./dir` (also
+  in the wasip1 CLI; in wasm, `trusted: { t: { source, templates: { "r.html": "…" } } }`, where a
+  name is normalized as `render` looks it up and two names for one template are an error, as in a
+  directory) reads the tool's templates at
+  startup, before the program runs. Inside the tool, `render`, `include` and `layout` resolve only
+  against that set: never the working directory (which the program can write) nor the program's
+  bundle, and without `file.read` (they are part of the tool, as a bundle is part of its program).
+  A template's free names are the builtins, not the program's (`{upper(x)}` is the builtin even if
+  the program defines `task upper`). Symlinks in the directory are not followed. Without templates
+  from the host, `render` inside a tool is still an error, now naming the flag, and a
+  `render("literal")` in the tool's source fails when the tool loads, before any data reaches it.
+  The sealed receipt's `trusted` sha of a tool with templates covers its source and its templates,
+  so `--replay` notices a changed template; a tool without templates keeps the sha of its source.
+- Under `run`, `parallel_map(t.f, xs)` and an agent that calls `t.f` now carry the trusted tool.
+  Before, `parallel_map` failed with `Cannot call value of type nothing` and the agent did not find
+  it.
+
+**Fixes.**
+- Under `serve`, a module that exports only data (a map of callbacks built by one of its tasks,
+  `export let M be armar()`) crossed into each request as plain data: its lambdas lost the module and
+  a call to a private helper of the module failed with `Undefined variable` (under `run` it worked).
+  The module is now recognized as such, and its callbacks close over it.
+- **A task that crosses into another interpreter keeps the locals of whoever made it.** A lambda or
+  a local task that goes to a `parallel_map` worker, an agent or a `serve` request now carries the
+  locals of the task that built it (copied: a `set` on a captured local changes the worker's copy,
+  not the original). Before, `task f(n)` with `give parallel_map((x) => x * n, xs)` failed with
+  `Undefined variable: 'n'`, and so did a local task that called itself or wrote a local of its
+  task. A list that holds tasks now crosses like a map that holds them (`let L be [(x) => PRE + x]`
+  then `L[0](x)` in a worker failed with `Cannot call value of type text`), also inside a module
+  and in a trusted tool, whose task keeps the tool's scope. Only the locals the task names cross: a
+  large local it does not use costs nothing.
+- **A `type` or `enum` defined at the top level or exported by a module now works in a `serve`
+  route, and a builtin, a constructor or a trusted task held under another name crosses too.**
+  Under `serve`, `Punto(1)` in a route failed with `Undefined variable: 'Punto'`; an `enum` variant
+  with a payload (`Forma.circulo(2)`) or the constructor of a module's `export type` or `export
+  enum` (`m.Punto2(3)`, `m.Estado.pago("x")`) failed with `Cannot call value of type text` (a
+  variant without one, `Forma.vacio`, already worked); and a global alias of a builtin (`let SS be
+  state_set`) failed with `Undefined variable: 'SS'`. A builtin bound to another name (`let up be
+  upper`, `{"f": upper}`, in a local, a global or a module) crosses by its own name; a `type`'s constructor or an `enum` variant's (`Punto(x)`,
+  `Forma.circulo(r)`) crosses by its definition; a trusted task in a variable (`let G be t.leer`)
+  keeps the tool's scope. Before, the name was missing in the worker (`Undefined variable: 'up'`)
+  or arrived as text, and a local that shadowed an outer name read that other value without an
+  error. A generator held in a local is an error that says so, like one at the top level, and a
+  closure of the engine (`read_body`) fails when called in the worker, naming itself, as does a
+  builtin the worker does not have (`state_get` in a `parallel_map` worker of a request).
+- In a template, a private value is written as its value whether it comes straight from the data
+  (`{c.name}`) or from a call (`{upper(c.name)}`), and the HTML carries its label. Before, the call
+  wrote the marker `private(customers)` (its result carried the label of the render) and the plain
+  field wrote the value. A private value the template reads from elsewhere (written, or deciding a
+  `{ when }`) also labels the HTML.
+- With labels, an error whose text was redacted because it touched private data
+  (`Runtime error: private(customers)`) now tells the auditor why: the real text goes to the sealed
+  receipt's envelope, which only the auditor opens, with or without a ceiling. With a ceiling the
+  program still sees the same fixed text, and the operator detail (a log) stays redacted, with its
+  location.
+- A task with `require` defined inside another task, a route, an agent or a loop no longer copies
+  its body each time its definition runs: every definition shares one body without the `require`
+  lines, like a task without them. Before, each definition copied the whole body: in v0.6.49 a
+  150-line task defined in each of 2 000 calls peaked at about 390 MB.
+- **A task of a trusted tool that an export holds inside a map or a list** (`export let M be {"f":
+  helper}`, then `t.M["f"]()`) now runs in the tool's scope, with its `require` ∩
+  `--trusted-cap-set`, like an exported task. Before, it ran with the program's capabilities.
+- **Embedding (Rust API, breaking):** what describes a run travels with it. `RunResult` has
+  `exit_code` (the code of `exit(code)`, if the program called it), `steps` and `touched_private`;
+  `engine::last_run_exit_code()`, `last_run_steps()` and `last_run_touched_private()` are gone. They
+  were process globals ("the last run"): a host running two programs at once read the other's.
+  Building a `RunResult` by hand takes `..Default::default()`.
+- A receipt's `program_sha` describes the program of the process. A process that ran two different
+  programs (an embedder, a test binary) has none, and the receipt carries `null`; before, the receipt
+  of the second program carried the sha of the first. With one program per process (`synsema run`,
+  `serve`) nothing changes, and under `serve --attested` the attested identity still decides;
+  `synsema test` on several files runs several programs, and only the first carries its sha.
+- A run waits for every agent, also the ones an agent spawns. Before, if `Pub` spawned `Sub` and
+  finished first, the run ended without `Sub`: its output was lost and its label cut could miss the
+  run (which then exited 0). The same under `synsema test`, `--explain` and `conform --swarm`. On
+  `exit`, an agent spawned while the others are being stopped is stopped too, and `exit` now stops
+  the live agents under `--explain`, `synsema test` and `conform --swarm` as well (before, they hung
+  waiting for an agent that never ends). `run --explain` exits with the code of `exit`, like `run`
+  (it exited 1).
+- A missing `require` inside an agent now says to add it to the body of that agent (the program's
+  `require` does not reach an agent); before, it pointed to the program's preamble. In a
+  `parallel_map` worker, which inherits from whoever launched it, the text names both places. A
+  `decide` served by the judge inside an agent names the agent's body too. Inside a `sandbox` block
+  the text says that the block denies every capability and to use `sandbox under {…}` (stdout,
+  stdin, time and random cannot be listed there, but any `sandbox under`, also `sandbox under {}`,
+  lets them through), or to run it outside the block; before, it asked for a `require` that was
+  already there. It names what decides there: the program, the agent, the trusted task, or, in a
+  `parallel_map` worker, the program or the agent that launched it.
+- Two startup warnings for lines that do nothing:
+  - `--cap-set llm=P` (or `judge=P`, also in `--trusted-cap-set`) without `@`, when no other item
+    names a provider for P: the program may
+    declare `require llm("P")`, but P's data goes to no model until the item names the provider
+    (`llm=P@<provider host>`, `P@*` for any). Before, it showed only at the first call.
+  - In a trusted tool, a `require` in a task the module does not export grants nothing (the exported
+    task the program calls opens the scope with what it declares). The tool now warns when it loads,
+    once per line. A task the module exposes in an export (directly, by another name, or inside a
+    map or a list) counts as exported; one that an exported task or lambda only calls does not.
+
+**The `perf-guard` anchor was re-measured on CI** (`engine/perf/baseline.json`, from this release's
+PR). No function of arithmetic or of maps changed; the compiler stopped inlining two of them into
+the interpreter, whose code grew in this release:
+- `Number::add` is now a call in the tree-walker (`ref`): `loop`, `loop_each`, `o_plus` and `c_base`
+  rise 0.24–0.27 %, `s_spectral` 0.6 %;
+- `indexmap`'s lookup by text (`get_index_of`, `get_full`, `get_mut`) is a call in `s_words`: +1.4 %
+  (jit), +0.7 % (vm), +0.25 % (ref). The function now counted on its own accounts for more than the
+  whole rise: the rest is what the callers no longer count.
+- Other rows drop: `a_args*` and `a_name64` 0.4–0.6 % (vm, ref), `c_base` (vm) 0.5 %.
+
 ## v0.6.49 — 2026-10-26
 
 **Behavior changes (read these first).**

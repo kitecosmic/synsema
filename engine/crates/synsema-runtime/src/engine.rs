@@ -598,7 +598,7 @@ pub(crate) fn wire_common_with_state(
     }
     // v0.6.46 (E3b): los módulos de confianza del host (`--trusted`), para `use "trusted:…"`.
     if let Some(t) = crate::host::trusted() {
-        synsema_stdlib::captoken::install_trusted_modules(interp, caps.clone(), &t.modules, t.ceiling.clone());
+        synsema_stdlib::captoken::install_trusted_modules(interp, caps.clone(), &t.modules, &t.templates, t.ceiling.clone());
     }
     register_secure_builtins(interp, caps.clone());
     // Secretos/env: carga el `.env` (antes de evaluar require/serve) y registra
@@ -735,13 +735,8 @@ pub(crate) fn wire_common_with_state(
         -1,
         Rc::new(|i, args, _loc| {
             let path = args.first().map(|v| v.to_string()).unwrap_or_default();
-            // Gate de `file.read` para la llamada de NIVEL SUPERIOR (el vector de LFI: el
-            // path puede venir de un request). Un template del bundle es el programa: sin
-            // gate. Los include/layout ANIDADOS pasan por el mismo gate en `templates.rs`
-            // (v0.6.45; antes sólo se los confinaba al cwd).
-            if synsema_core::bundle::get(&synsema_core::bundle::normalize_name(&path).unwrap_or_default()).is_none() {
-                i.gate_template_read(&path)?;
-            }
+            // El gate de `file.read` (y los templates de una tool de confianza) los decide
+            // `render_template`, el mismo para el nativo y wasm (v0.6.50).
             let html = synsema_core::templates::render_template(i, &path, args.get(1))?;
             Ok(synsema_core::templates::make_raw(html, "text/html; charset=utf-8", 200))
         }),
@@ -831,10 +826,12 @@ pub(crate) fn wire_common_with_state(
             let d = std::mem::take(&mut cs.denied);
             let p = cs.parent.take();
             saved.borrow_mut().push((g, d, p));
+            cs.sandbox_depth += 1;
         } else if let Some((g, d, p)) = saved.borrow_mut().pop() {
             cs.granted = g;
             cs.denied = d;
             cs.parent = p;
+            cs.sandbox_depth -= 1;
         }
     }));
     // Aislamiento por-tool (least-privilege): cuando el loop despacha una tool con
@@ -1152,28 +1149,36 @@ fn finish(mut interp: Interpreter, result: Result<SynValue, Control>) -> RunResu
     // T5 (ronda 6, B2): la salida de una corrida cortada por el chequeo de flujo no se entrega
     // — la cantidad de líneas antes del corte depende del dato privado. Ver `redact_output_for_host`.
     interp.redact_output_for_host(&result);
-    // v0.6.42 — `exit(code)`: el fin pedido, no una falla. Sin "Runtime error"; el código lo
-    // lee el CLI con `last_run_exit_code()` (se pisa en cada corrida, nunca queda uno viejo).
+    // v0.6.42 — `exit(code)`: el fin pedido, no una falla. Sin "Runtime error"; el código viaja en
+    // el `RunResult` (v0.6.50: antes, en un global del proceso que pisaba la otra corrida).
     let exit = match &result {
         Err(Control::Error(e)) => e.exit_code,
         _ => None,
     };
-    LAST_RUN_EXIT.store(exit.unwrap_or(-1), std::sync::atomic::Ordering::SeqCst);
-    RUN_EXIT.with(|c| c.set(exit));
+    let mut r = finish_result(&mut interp, result, exit);
+    r.exit_code = exit;
+    r.steps = interp.steps();
+    r.touched_private = interp.private_seen();
+    r
+}
+
+fn finish_result(interp: &mut Interpreter, result: Result<SynValue, Control>, exit: Option<i32>) -> RunResult {
     if let Some(code) = exit {
-        return RunResult { success: code == 0, output: std::mem::take(&mut interp.output), errors: Vec::new() };
+        return RunResult { success: code == 0, output: std::mem::take(&mut interp.output), errors: Vec::new(), ..Default::default() };
     }
     match result {
-        Ok(_) => RunResult { success: true, output: std::mem::take(&mut interp.output), errors: Vec::new() },
+        Ok(_) => RunResult { success: true, output: std::mem::take(&mut interp.output), errors: Vec::new(), ..Default::default() },
         Err(Control::Error(e)) => RunResult {
             success: false,
             output: std::mem::take(&mut interp.output),
             errors: vec![format!("Runtime error: {}", e)],
+            ..Default::default()
         },
         Err(Control::Give(_)) | Err(Control::Stop(_)) => RunResult {
             success: false,
             output: std::mem::take(&mut interp.output),
             errors: vec!["Runtime error: 'give'/'stop' used outside of a task or loop".to_string()],
+            ..Default::default()
         },
     }
 }
@@ -1205,11 +1210,13 @@ fn run_inner(
             success: false,
             output: Vec::new(),
             errors: vec![format!("Lexer error: {}", e)],
+            ..Default::default()
         },
         Err(CompileError::Parse(e)) => RunResult {
             success: false,
             output: Vec::new(),
             errors: vec![format!("Parse error: {}", e)],
+            ..Default::default()
         },
         Ok(program) => {
             let mut interp = Interpreter::new();
@@ -1238,6 +1245,7 @@ fn run_inner(
                         success: false,
                         output: Vec::new(),
                         errors: vec![format!("Runtime error: {}", msg)],
+                        ..Default::default()
                     }
                 }
             };
@@ -1297,7 +1305,6 @@ fn run_inner(
             } else {
                 interp.execute(&program)
             };
-            note_run_steps(&interp);
             finish(interp, r)
         }
     }
@@ -1331,6 +1338,7 @@ fn spawn_run_ceiled(source: &str, filename: &str, secure: bool, ceiling: Option<
             success: false,
             output: Vec::new(),
             errors: vec![abort_message(&p)],
+            ..Default::default()
         })
 }
 
@@ -1346,54 +1354,6 @@ pub fn set_request_mode(on: bool) {
 
 /// Modo no-secure (default real): auto-concede STDOUT y TIME. Lo que usa `conform`.
 /// Camino de un solo hilo: `spawn` corre el agente in-process (sin swarm).
-/// v0.6.20 — pasos del intérprete del ÚLTIMO programa ejecutado en este proceso (`run`,
-/// `test`, `conform`): lo que `run --format json` reporta como `steps`. Determinista.
-static LAST_RUN_STEPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-/// T5 (ronda 5): ¿esa corrida tocó datos privados? El contador de pasos es lineal en lo que el
-/// programa recorrió, así que después de una rama privada ES el dato privado con otra aritmética
-/// encima — y el host lo publica solo, en `run --format json` y en el documento de `run --attest`,
-/// que es justo el artefacto que un tercero verifica. Con esto el host puede omitirlo.
-static LAST_RUN_PRIVATE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-/// v0.6.42 — el código que pidió `exit(code)` en la última corrida (-1 = no llamó a `exit`).
-static LAST_RUN_EXIT: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
-
-thread_local! {
-    /// v0.6.46 — el `exit(code)` de la corrida de ESTE hilo del motor (lo fija `finish`). El motor
-    /// decide con éste, no con `LAST_RUN_EXIT`: con dos corridas a la vez en un proceso (un
-    /// embebedor, un binario de tests), la otra lo pisaba en el medio y un agente vivo quedaba
-    /// corriendo para siempre. `LAST_RUN_EXIT` queda para la CLI, que corre una por proceso.
-    static RUN_EXIT: std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) };
-}
-
-/// v0.6.45 (A5) — `serve` anota el código de un `exit(code)` del preámbulo (antes de escuchar),
-/// o que no lo hubo, por el mismo canal que `run`.
-pub(crate) fn note_exit_code(code: Option<i32>) {
-    LAST_RUN_EXIT.store(code.unwrap_or(-1), std::sync::atomic::Ordering::SeqCst);
-}
-
-/// El código de `exit(code)` de la última corrida, si el programa lo llamó.
-pub fn last_run_exit_code() -> Option<i32> {
-    match LAST_RUN_EXIT.load(std::sync::atomic::Ordering::SeqCst) {
-        c if c >= 0 => Some(c),
-        _ => None,
-    }
-}
-
-fn note_run_steps(interp: &Interpreter) {
-    LAST_RUN_STEPS.store(interp.steps(), std::sync::atomic::Ordering::SeqCst);
-    LAST_RUN_PRIVATE.store(interp.private_seen(), std::sync::atomic::Ordering::SeqCst);
-}
-
-pub fn last_run_steps() -> u64 {
-    LAST_RUN_STEPS.load(std::sync::atomic::Ordering::SeqCst)
-}
-
-/// ¿La última corrida tocó datos privados? Si sí, `steps` no se publica (ver `LAST_RUN_PRIVATE`).
-pub fn last_run_touched_private() -> bool {
-    LAST_RUN_PRIVATE.load(std::sync::atomic::Ordering::SeqCst)
-}
-
 pub fn run_source(source: &str, filename: &str) -> RunResult {
     spawn_run(source, filename, false)
 }
@@ -1452,7 +1412,9 @@ fn close_swarm_run(swarm: &Swarm, result: &mut RunResult) {
         result.success = false;
         result.output = vec![synsema_core::interpreter::LABELS_WITHHELD_OUTPUT.to_string()];
         result.errors = vec![format!("Runtime error: {}", message)];
-        LAST_RUN_EXIT.store(-1, std::sync::atomic::Ordering::SeqCst);
+        // El principal ya adoptó el corte (`redact_for_host`); esto cubre un corte que llegue después
+        // de su `exit`, antes de que se detenga el agente.
+        result.exit_code = None;
         return;
     }
     if !echo.is_empty() {
@@ -1487,42 +1449,57 @@ pub fn run_program_ceiled_opts(
     let sw = swarm.clone();
     let src = source.to_string();
     let fname = filename.to_string();
-    let result = std::thread::Builder::new()
+    let mut result = std::thread::Builder::new()
         .stack_size(INTERP_STACK_SIZE)
-        .spawn(move || {
-            RUN_EXIT.with(|c| c.set(None));
-            let r = run_inner(&src, &fname, false, Some(sw), live_output, ceiling);
-            (r, RUN_EXIT.with(|c| c.get()))
-        })
+        .spawn(move || run_inner(&src, &fname, false, Some(sw), live_output, ceiling))
         .expect("no se pudo crear el hilo del motor")
         .join()
         .unwrap_or_else(|p| {
-            (RunResult { success: false, output: Vec::new(), errors: vec![abort_message(&p)] }, None)
+            RunResult { success: false, output: Vec::new(), errors: vec![abort_message(&p)], ..Default::default() }
         });
-    let (mut result, run_exit) = result;
 
     // v0.6.42 (auditoría) — `exit(code)` termina el programa: los agentes vivos se detienen (si
     // no, `wait_all` esperaba a uno en bucle para siempre) y el código lo decide `exit`.
-    let exited = run_exit.is_some();
+    let exited = result.exit_code.is_some();
     // Los que `exit` detuvo: su error es la cancelación y no se informa. Un agente que ya había
     // fallado antes del `exit` sí (auditoría ronda 2: se descartaban todos).
-    let stopped: std::collections::HashSet<String> = if exited {
-        swarm.agents_info().into_iter().map(|(id, _)| id).filter(|id| swarm.stop_agent(id, "exit()")).collect()
-    } else {
-        Default::default()
-    };
-    // Joinea los agentes lanzados por el main; ya no hay nadie más que pueda spawnear.
-    swarm.wait_all();
+    let stopped = join_agents(&swarm, exited);
 
     // Refleja los agentes en ERROR (exit ≠0 + línea de error), sin tocar la salida del main.
-    let mut agent_errors = collect_agent_errors(&swarm);
-    agent_errors.retain(|line| !stopped.iter().any(|id| line.starts_with(&format!("Agent error [{}]:", id))));
+    let agent_errors = agent_errors_but(&swarm, &stopped);
     if !agent_errors.is_empty() {
         result.success = false;
         result.errors.extend(agent_errors);
     }
     close_swarm_run(&swarm, &mut result);
     result
+}
+
+/// v0.6.50: espera a todos los agentes de la corrida, también a los que lanza un agente. Con
+/// `exited` (el programa llamó `exit`) los detiene antes, por rondas: uno que se detiene puede estar
+/// lanzando otro, y el nuevo también se detiene. Devuelve los que detuvo: su error es la cancelación
+/// y no se informa. Lo usan `run`, `--explain`, `synsema test` y `conform --swarm`.
+fn join_agents(swarm: &Swarm, exited: bool) -> std::collections::HashSet<String> {
+    let mut stopped: std::collections::HashSet<String> = Default::default();
+    loop {
+        if exited {
+            for (id, _) in swarm.agents_info() {
+                if !stopped.contains(&id) && swarm.stop_agent(&id, "exit()") {
+                    stopped.insert(id);
+                }
+            }
+        }
+        if swarm.join_round() == 0 {
+            return stopped;
+        }
+    }
+}
+
+/// Las líneas `Agent error [<id>]` de los agentes en error, salvo los que detuvo un `exit`.
+fn agent_errors_but(swarm: &Swarm, stopped: &std::collections::HashSet<String>) -> Vec<String> {
+    let mut agent_errors = collect_agent_errors(swarm);
+    agent_errors.retain(|line| !stopped.iter().any(|id| line.starts_with(&format!("Agent error [{}]:", id))));
+    agent_errors
 }
 
 // =========================================================
@@ -1575,11 +1552,12 @@ fn run_tests_inner(source: &str, filename: &str, ceiling: Option<Vec<Capability>
     let ceiling_arc: Option<Arc<Vec<Capability>>> = ceiling.as_ref().map(|c| Arc::new(c.clone()));
     wire_swarm_hooks(&mut interp, swarm.clone(), "main", ceiling_arc, mem_ctx.clone(), None, &caps);
     let mut reported: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut after_each = |_name: &str| -> Option<String> {
-        swarm.wait_all();
+    let mut after_each = |_name: &str, exited: bool| -> Option<String> {
+        // Ronda 1 (M3): un bloque que llamó `exit` detiene sus agentes, como `run`.
+        let stopped = join_agents(&swarm, exited);
         let mut fresh: Vec<String> = Vec::new();
         for (id, st) in swarm.agent_states() {
-            if st == AgentState::Error && reported.insert(id.clone()) {
+            if st == AgentState::Error && !stopped.contains(&id) && reported.insert(id.clone()) {
                 let msg = swarm.agent_error(&id).unwrap_or_else(|| "agent error".to_string());
                 fresh.push(format!("Agent error [{}]: {}", id, msg));
             }
@@ -1660,6 +1638,10 @@ pub fn repl() {
         Rc::new(RefCell::new(AgentMemory::new())),
         repl_gate,
     );
+    // v0.6.50 (ronda 1, M1): la foto del preludio antes de la primera línea. Cada línea es un
+    // `execute`: sin foto, la del `use` traería lo que ligaron las anteriores, y sin ninguna, los
+    // builtins que quedan con su nombre (un `let upper be 3` previo dejaría al módulo sin `upper`).
+    interp.snapshot_module_base();
     println!("Synsema REPL — escribí sentencias; Ctrl+Z (Windows) / Ctrl+D para salir.");
     let stdin = io::stdin();
     let mut handle = stdin.lock();
@@ -1710,14 +1692,14 @@ fn run_diag_inner(source: &str, filename: &str, swarm: Option<Arc<Swarm>>, ceili
         Err(CompileError::Lex(e)) => {
             let msg = e.to_string();
             return DiagRun {
-                result: RunResult { success: false, output: Vec::new(), errors: vec![format!("Lexer error: {}", e)] },
+                result: RunResult { success: false, output: Vec::new(), errors: vec![format!("Lexer error: {}", e)], ..Default::default() },
                 diagnostics: vec![ErrorReporter::new().build_diagnostic("LexerError", &msg, None, None)],
             };
         }
         Err(CompileError::Parse(e)) => {
             let msg = e.to_string();
             return DiagRun {
-                result: RunResult { success: false, output: Vec::new(), errors: vec![format!("Parse error: {}", e)] },
+                result: RunResult { success: false, output: Vec::new(), errors: vec![format!("Parse error: {}", e)], ..Default::default() },
                 diagnostics: vec![ErrorReporter::new().build_diagnostic("ParseError", &msg, None, None)],
             };
         }
@@ -1745,6 +1727,7 @@ fn run_diag_inner(source: &str, filename: &str, swarm: Option<Arc<Swarm>>, ceili
                     success: false,
                     output: Vec::new(),
                     errors: vec![format!("Runtime error: {}", msg)],
+                    ..Default::default()
                 },
                 diagnostics: vec![ErrorReporter::new().build_diagnostic("RuntimeError", &msg, None, None)],
             }
@@ -1758,7 +1741,18 @@ fn run_diag_inner(source: &str, filename: &str, swarm: Option<Arc<Swarm>>, ceili
     }
     match interp.execute(&program) {
         Ok(_) => DiagRun {
-            result: RunResult { success: true, output: std::mem::take(&mut interp.output), errors: Vec::new() },
+            result: RunResult { success: true, output: std::mem::take(&mut interp.output), errors: Vec::new(), ..Default::default() },
+            diagnostics: Vec::new(),
+        },
+        // Ronda 1 (N7): `exit(code)` es el fin pedido, como en `run`: sin diagnóstico y con su código.
+        Err(Control::Error(e)) if e.exit_code.is_some() => DiagRun {
+            result: RunResult {
+                success: e.exit_code == Some(0),
+                output: std::mem::take(&mut interp.output),
+                errors: Vec::new(),
+                exit_code: e.exit_code,
+                ..Default::default()
+            },
             diagnostics: Vec::new(),
         },
         Err(Control::Error(e)) => {
@@ -1776,7 +1770,7 @@ fn run_diag_inner(source: &str, filename: &str, swarm: Option<Arc<Swarm>>, ceili
                 .collect();
             let diag = reporter.build_diagnostic("RuntimeError", &e.message, e.location.as_ref(), Some(&vars));
             DiagRun {
-                result: RunResult { success: false, output: interp.output.clone(), errors: vec![format!("Runtime error: {}", e)] },
+                result: RunResult { success: false, output: interp.output.clone(), errors: vec![format!("Runtime error: {}", e)], ..Default::default() },
                 diagnostics: vec![diag],
             }
         }
@@ -1785,6 +1779,7 @@ fn run_diag_inner(source: &str, filename: &str, swarm: Option<Arc<Swarm>>, ceili
                 success: false,
                 output: std::mem::take(&mut interp.output),
                 errors: vec!["Runtime error: 'give'/'stop' used outside of a task or loop".to_string()],
+                ..Default::default()
             },
             diagnostics: Vec::new(),
         },
@@ -1812,12 +1807,13 @@ pub fn run_with_diagnostics_ceiled(source: &str, filename: &str, ceiling: Option
         .expect("no se pudo crear el hilo del motor")
         .join()
         .unwrap_or_else(|p| DiagRun {
-            result: RunResult { success: false, output: Vec::new(), errors: vec![abort_message(&p)] },
+            result: RunResult { success: false, output: Vec::new(), errors: vec![abort_message(&p)], ..Default::default() },
             diagnostics: Vec::new(),
         });
 
-    swarm.wait_all();
-    let agent_errors = collect_agent_errors(&swarm);
+    // Ronda 1 (M3): con `exit`, los agentes vivos se detienen, como en `run`.
+    let stopped = join_agents(&swarm, run.result.exit_code.is_some());
+    let agent_errors = agent_errors_but(&swarm, &stopped);
     if !agent_errors.is_empty() {
         run.result.success = false;
         run.result.errors.extend(agent_errors);
@@ -1844,11 +1840,13 @@ fn run_configured(source: &str, filename: &str, configure: impl FnOnce(&mut Inte
             success: false,
             output: Vec::new(),
             errors: vec![format!("Lexer error: {}", e)],
+            ..Default::default()
         },
         Err(CompileError::Parse(e)) => RunResult {
             success: false,
             output: Vec::new(),
             errors: vec![format!("Parse error: {}", e)],
+            ..Default::default()
         },
         Ok(program) => {
             let mut interp = Interpreter::new();
@@ -1862,13 +1860,13 @@ fn run_configured(source: &str, filename: &str, configure: impl FnOnce(&mut Inte
                         success: false,
                         output: Vec::new(),
                         errors: vec![format!("Runtime error: {}", msg)],
+                        ..Default::default()
                     }
                 }
             };
             wire_common(&mut interp, &caps, false, mem_ctx.as_ref(), &suggested_memory_name(filename));
             configure(&mut interp);
             let r = interp.execute(&program);
-            note_run_steps(&interp);
             finish(interp, r)
         }
     }
@@ -1888,7 +1886,7 @@ pub fn run_with_human(source: &str, filename: &str, default_approve: bool) -> Ru
         })
         .expect("hilo del motor")
         .join()
-        .unwrap_or_else(|p| RunResult { success: false, output: Vec::new(), errors: vec![abort_message(&p)] })
+        .unwrap_or_else(|p| RunResult { success: false, output: Vec::new(), errors: vec![abort_message(&p)], ..Default::default() })
 }
 
 /// Host-config de test: corre con un callback de texto que GRABA `(op, prompt)` de cada
@@ -1914,7 +1912,7 @@ pub fn run_capturing_llm(source: &str, filename: &str) -> (RunResult, Vec<(Strin
         })
         .expect("hilo del motor")
         .join()
-        .unwrap_or_else(|p| RunResult { success: false, output: Vec::new(), errors: vec![abort_message(&p)] });
+        .unwrap_or_else(|p| RunResult { success: false, output: Vec::new(), errors: vec![abort_message(&p)], ..Default::default() });
     let pairs = cap_outer.lock().unwrap().clone();
     (result, pairs)
 }
@@ -1946,7 +1944,7 @@ pub fn run_capturing_decide(
         })
         .expect("hilo del motor")
         .join()
-        .unwrap_or_else(|p| RunResult { success: false, output: Vec::new(), errors: vec![abort_message(&p)] });
+        .unwrap_or_else(|p| RunResult { success: false, output: Vec::new(), errors: vec![abort_message(&p)], ..Default::default() });
     let pairs = cap_outer.lock().unwrap().clone();
     (result, pairs)
 }
@@ -1973,7 +1971,7 @@ pub fn run_with_llm(source: &str, filename: &str, responses: HashMap<String, Str
         })
         .expect("hilo del motor")
         .join()
-        .unwrap_or_else(|p| RunResult { success: false, output: Vec::new(), errors: vec![abort_message(&p)] })
+        .unwrap_or_else(|p| RunResult { success: false, output: Vec::new(), errors: vec![abort_message(&p)], ..Default::default() })
 }
 
 /// Corre con un proveedor LLM tool-aware GUIONADO (host-config, FASE 1): cablea
@@ -1998,7 +1996,7 @@ pub fn run_with_llm_steps(source: &str, filename: &str, steps: Vec<LlmStepRespon
         })
         .expect("hilo del motor")
         .join()
-        .unwrap_or_else(|p| RunResult { success: false, output: Vec::new(), errors: vec![abort_message(&p)] })
+        .unwrap_or_else(|p| RunResult { success: false, output: Vec::new(), errors: vec![abort_message(&p)], ..Default::default() })
 }
 
 /// Corre con un callback de STREAMING guionado (host-config, F2): `llm_stream` recibe
@@ -2029,7 +2027,7 @@ pub fn run_with_llm_stream(source: &str, filename: &str, chunks: Vec<String>) ->
         })
         .expect("hilo del motor")
         .join()
-        .unwrap_or_else(|p| RunResult { success: false, output: Vec::new(), errors: vec![abort_message(&p)] })
+        .unwrap_or_else(|p| RunResult { success: false, output: Vec::new(), errors: vec![abort_message(&p)], ..Default::default() })
 }
 
 // =========================================================
@@ -2325,6 +2323,8 @@ fn spawn_agent(
                     (interp, caps)
                 }
             };
+            // v0.6.50 (E-b): un `require` que le falta al agente va en su cuerpo.
+            caps.borrow_mut().agent = Some(agent_name.to_string());
             // T1: el agente corre EN NOMBRE del sujeto que lo spawneó, bajo su techo delegado
             // y sus presupuestos. El guard vive hasta el final del hilo.
             let _subject_scope = subject.apply(&mut interp, &caps);
@@ -2446,11 +2446,13 @@ fn run_swarm_inner(
             success: false,
             output: Vec::new(),
             errors: vec![format!("Lexer error: {}", e)],
+            ..Default::default()
         },
         Err(CompileError::Parse(e)) => RunResult {
             success: false,
             output: Vec::new(),
             errors: vec![format!("Parse error: {}", e)],
+            ..Default::default()
         },
         Ok(program) => {
             // Identidad declarada (DB-M1): también en el camino con swarm retenido
@@ -2466,13 +2468,13 @@ fn run_swarm_inner(
                         success: false,
                         output: Vec::new(),
                         errors: vec![format!("Runtime error: {}", msg)],
+                        ..Default::default()
                     }
                 }
             };
             let (mut interp, caps) = setup_swarm_interpreter(swarm, "main", ceiling, mem_ctx, false);
             let _operator_scope = crate::subject::Subject::operator().apply(&mut interp, &caps);
             let r = interp.execute(&program);
-            note_run_steps(&interp);
             finish(interp, r)
         }
     }
@@ -2515,6 +2517,7 @@ impl Engine {
                 success: false,
                 output: Vec::new(),
                 errors: vec![abort_message(&p)],
+                ..Default::default()
             })
     }
 }
@@ -2537,7 +2540,8 @@ pub fn run_swarm_dump(source: &str, filename: &str) -> SwarmDump {
 pub fn run_swarm_dump_ceiled(source: &str, filename: &str, ceiling: Option<Vec<Capability>>) -> SwarmDump {
     let engine = Engine::new();
     let mut result = engine.run_ceiled(source, filename, ceiling);
-    engine.swarm.wait_all();
+    // Ronda 1 (M3): con `exit`, los agentes vivos se detienen, como en `run`.
+    join_agents(&engine.swarm, result.exit_code.is_some());
     // v0.6.47 (T1, A1): el volcado pasa por el mismo cierre que `run`. Con un corte no se vuelcan
     // los estados ni el blackboard: qué agente cortó (y qué escribió antes) es el dato.
     close_swarm_run(&engine.swarm, &mut result);

@@ -436,6 +436,21 @@ pub fn top_level_stub(name: &str) -> SynValue {
     )))
 }
 
+/// v0.6.50 (ronda 3, R3): lo mismo para un generador que es un local de quien armó la lambda que
+/// cruza: la copia del otro lado repetiría la misma secuencia en cada request o worker.
+pub fn captured_stub(name: &str) -> SynValue {
+    let msg = format!(
+        "the generator {} is a local of the task that made this lambda; here it would restart the same sequence in every request/worker — create it inside the lambda, or give each parallel_map item its own with rng_spawn(g, n)",
+        name
+    );
+    SynValue::Builtin(Rc::new(BuiltinTask::new(
+        name,
+        0,
+        None,
+        Rc::new(move |_i, _a, _l| Err(crate::interpreter::Control::Error(crate::interpreter::RuntimeError::new(msg.clone())))),
+    )))
+}
+
 /// ¿`v` es un generador de `rng()`/`rng_spawn()`? (Para nombrarlo bien en un error: por
 /// fuera es un builtin, pero no es una función cualquiera.)
 pub fn is_generator(v: &SynValue) -> bool {

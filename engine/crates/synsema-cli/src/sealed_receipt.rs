@@ -126,7 +126,8 @@ fn rfc3339_now() -> String {
 /// `None` si no hay. Va al encabezado del recibo, y `--replay` lo compara: una tool de confianza
 /// cambiada cambia lo que el programa hace sin cambiar su `program_sha`.
 fn trusted_shas() -> Option<serde_json::Value> {
-    sealed::trusted_shas(&synsema_runtime::host::trusted()?.modules)
+    let t = synsema_runtime::host::trusted()?;
+    sealed::trusted_shas(&t.modules, &t.templates)
 }
 
 impl Auditor {

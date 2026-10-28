@@ -425,6 +425,7 @@ pub fn extract_task(
             body: extracted.into(),
             return_type: None,
             capabilities: Vec::new(),
+            run_body: Default::default(),
         },
     };
     program.statements.insert(start, task.clone());
@@ -601,7 +602,8 @@ fn children_mut(n: &mut Node) -> Vec<&mut Node> {
         }
         MapPattern { fields } => fields.iter_mut().filter_map(|(_, p)| p.as_mut()).collect(),
         StopStatement { value } => value.iter_mut().map(|b| b.as_mut()).collect(),
-        TaskDefinition { parameters, body, .. } => {
+        TaskDefinition { parameters, body, run_body, .. } => {
+            run_body.reset();
             let mut v: Vec<&mut Node> =
                 parameters.iter_mut().filter_map(|p| p.default.as_mut()).collect();
             v.extend(std::sync::Arc::make_mut(body).iter_mut());

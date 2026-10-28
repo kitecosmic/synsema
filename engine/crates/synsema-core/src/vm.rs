@@ -2643,7 +2643,7 @@ impl Interpreter {
         match parent.and_then(|p| env_get(&p, name)) {
             Some(v) => Ok(v),
             None => Err(match loc {
-                Some(l) => undefined_variable(name, l),
+                Some(l) => self.undefined_in(name, l, frame),
                 None => err(format!("Undefined variable: '{}'", name)),
             }),
         }
@@ -2939,7 +2939,7 @@ impl Interpreter {
                         self.put(base, dst, v);
                         Ok(())
                     }
-                    None => Err(undefined_variable(&chunk.names[name as usize], &chunk.locs[chunk.loc[at] as usize])),
+                    None => Err(self.undefined_in(&chunk.names[name as usize], &chunk.locs[chunk.loc[at] as usize], &env)),
                 },
                 Ins::Binary { dst, op, a, b, fb } => self.vm_binary_adapt(&chunk, &env, base, at, dst, op, a, b, fb),
                 Ins::BinaryAny { dst, op, a, b } => (|| {
@@ -3183,7 +3183,7 @@ impl Interpreter {
                             }
                     };
                     if !done && !self.set_free(&chunk, &env, name, ic, v.clone()) {
-                        return Err(set_undefined(&chunk.names[name as usize]));
+                        return Err(self.set_undefined_in(&chunk.names[name as usize], &env));
                     }
                     self.put(base, dst, v);
                     Ok(())
@@ -3191,7 +3191,7 @@ impl Interpreter {
                 Ins::SetName { src, name, dst, ic } => (|| {
                     let v = self.opnd(&chunk, &env, base, src, at)?;
                     if !self.set_free(&chunk, &env, name, ic, v.clone()) {
-                        return Err(set_undefined(&chunk.names[name as usize]));
+                        return Err(self.set_undefined_in(&chunk.names[name as usize], &env));
                     }
                     self.put(base, dst, v);
                     Ok(())
@@ -3930,7 +3930,7 @@ impl Interpreter {
                 self.put(base, dst, v);
                 Ok(())
             }
-            None => Err(undefined_variable(&chunk.names[name as usize], &chunk.locs[chunk.loc[at] as usize])),
+            None => Err(self.undefined_in(&chunk.names[name as usize], &chunk.locs[chunk.loc[at] as usize], env)),
         }
     }
 

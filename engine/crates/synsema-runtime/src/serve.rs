@@ -679,12 +679,45 @@ pub(crate) enum GlobalVal {
     /// cada worker) sería una copia que REPITE la misma secuencia, así que llega como un valor
     /// que al usarse explica qué hacer. El `String` es su nombre (`rng(42)`).
     SharedRng(String),
+    /// Ronda 3 (R3): un generador que es un local de quien armó la task (un frame): lo mismo, con
+    /// el texto de un local.
+    CapturedRng(String),
+    /// Ronda 3 (R3): un builtin del lenguaje ligado a otro nombre (`let up be upper`) o guardado en
+    /// un dato: cruza por su nombre propio y del otro lado es el builtin de ese intérprete.
+    Builtin(String),
+    /// Ronda 3 (R3): el constructor de un `type` o de una variante: cruza su definición.
+    Constructor(synsema_core::interpreter::CtorSpec),
+    /// Ronda 3 (R3): un cierre del motor (`read_body`, un agregado de tabla) que no tiene cómo
+    /// cruzar: del otro lado falla con texto al llamarlo, nunca se lee otro valor en su lugar.
+    Uncrossable(String),
     Task {
         name: String,
         parameters: Vec<Param>,
         body: std::sync::Arc<[Node]>,
         required_capabilities: Vec<(String, Option<String>)>,
+        /// v0.6.50 (ronda 1, A1): de qué raíz léxica cuelga la task. Del otro lado cierra ahí, no
+        /// donde está guardada: una lambda del programa que un módulo guarda sigue viendo el programa.
+        root: TaskRoot,
+        /// Ronda 2 (R2): los envs entre la task y su raíz (los locales de quien la armó), del más
+        /// externo al más interno. Viajan copiados, como cualquier dato que cruza.
+        frames: Vec<FrameVal>,
+        /// Ronda 6 (N1): los nombres libres, si el original ya los calculó. La copia los hereda y no
+        /// vuelve a recorrer el cuerpo (un `parallel_map` dentro de cada item de otro).
+        free_names: Option<std::sync::Arc<HashSet<String>>>,
     },
+    /// v0.6.50 (B): una task exportada por una tool de confianza (el builtin que la envuelve). Viaja
+    /// la task y el entorno de la tool (por id, una vez por foto, como un `Module`); del otro lado
+    /// el entorno cuelga de la base de confianza de ESE intérprete y la task se envuelve con SU hook.
+    TrustedTask {
+        module: String,
+        export: String,
+        task: Box<GlobalVal>,
+        env_id: String,
+        env: Option<Vec<(String, GlobalVal)>>,
+    },
+    /// v0.6.50 (B): la vista de una tool (`use "trusted:t" as t`): del otro lado se registra como
+    /// vista (`set t.X` es error) y queda en el caché de módulos.
+    TrustedView(Vec<(String, GlobalVal)>),
     /// Definición de agente (Batch 6): las defs de agentes viven en
     /// `Interpreter.agent_definitions` (fuera de `global_env.bindings`), así que se
     /// snapshotean/restauran aparte para que un `spawn` desde una route las encuentre. El
@@ -725,6 +758,19 @@ pub(crate) enum GlobalVal {
     /// tasks cierran sobre el global del request como cualquier task top-level — sin el
     /// `module_env` compartido del caso módulo.
     MapWithTasks(Vec<(String, GlobalVal)>),
+    /// Ronda 2 (R2, B3): una lista con tasks. Cada task cruza por su cadena, como en `MapWithTasks`;
+    /// antes la lista viajaba como dato y sus tasks llegaban como texto.
+    ListWithTasks(Vec<GlobalVal>),
+}
+
+/// Ronda 2 (R2): un env intermedio de la cadena de una task. Se identifica por id (la identidad del
+/// env en la foto), como un módulo: la primera vez viaja con sus nombres; las siguientes, por id. Dos
+/// lambdas del mismo frame comparten la copia del otro lado, y una task local que se nombra a sí
+/// misma desde su frame se resuelve sin ciclo.
+pub(crate) struct FrameVal {
+    id: String,
+    name: String,
+    env: Option<Vec<(String, GlobalVal)>>,
 }
 
 /// Estado del ÁRBOL COMPLETO de un snapshot. Se comparte entre TODOS los bindings de
@@ -747,27 +793,38 @@ struct SnapState<'a> {
     /// Lo que YA está congelado para siempre se comparte (`GlobalVal::Frozen`) sin congelar nada
     /// nuevo; lo demás se copia (agentes y `cron`, R2.4).
     share: bool,
+    /// Ronda 3 (R3): por frame (identidad del `Rc`), los nombres que ya viajan en esta foto. Una
+    /// segunda task del mismo frame agrega sólo lo que le falta.
+    frame_names: HashMap<usize, HashSet<String>>,
+    /// Ronda 3 (R3): se está copiando un local de un frame (un generador ahí es un local).
+    in_frame: bool,
 }
 
 /// Un dato (sin tareas): congelado si la foto congela y se puede; si no, la copia de siempre (un
 /// generador adentro cruza como stub).
 fn data_global(v: &SynValue, state: &mut SnapState) -> GlobalVal {
+    frozen_global(v, state).unwrap_or_else(|| GlobalVal::Value(synsema_core::rng::with_stubbed_globals(|| to_send(v))))
+}
+
+/// El dato congelado (para siempre, compartido o con alcance), si la foto congela y se puede. Lo
+/// que se congela no tiene tasks: el congelado las rechaza.
+fn frozen_global(v: &SynValue, state: &mut SnapState) -> Option<GlobalVal> {
     if state.freeze {
         if let Ok(f) = synsema_core::frozen::FrozenValue::new(v.clone()) {
-            return GlobalVal::Frozen(f);
+            return Some(GlobalVal::Frozen(f));
         }
     }
     if state.share {
         if let Ok(f) = synsema_core::frozen::FrozenValue::share(v.clone()) {
-            return GlobalVal::Frozen(f);
+            return Some(GlobalVal::Frozen(f));
         }
     }
     if let Some(scope) = state.scoped.as_deref_mut() {
         if let Ok(i) = scope.add(v.clone()) {
-            return GlobalVal::Scoped(i);
+            return Some(GlobalVal::Scoped(i));
         }
     }
-    GlobalVal::Value(synsema_core::rng::with_stubbed_globals(|| to_send(v)))
+    None
 }
 
 /// Convierte un `SynValue` a `GlobalVal` de forma recursiva, con un árbol de snapshot
@@ -811,46 +868,168 @@ fn snapshot_alias_entries(
         .collect()
 }
 
-/// Núcleo recursivo de `val_to_global_shared`/`snapshot_globals_*`/`snapshot_module_env`.
+/// v0.6.50 (ronda 1, A1): la raíz léxica de una task (ver `GlobalVal::Task`).
+pub(crate) enum TaskRoot {
+    /// Cuelga del global del programa (una task o lambda del programa).
+    Global,
+    /// Cuelga del env de un módulo (`module:<id>`). Ronda 2 (R2, M1): el env viaja con la task si
+    /// todavía no viajó en esta foto, así que no depende del orden de los `use`.
+    Module { id: String, env: Option<Vec<(String, GlobalVal)>> },
+    /// Otra raíz (un fork, un template): cierra donde se reconstruye, como antes.
+    Here,
+}
+
+/// Ronda 3 (R3, B1): de un frame, las bindings que la task nombra (`names`) y que todavía no viajan
+/// en esta foto. Se anotan antes de copiar los valores: una task local recursiva que vuelve a este
+/// frame no las repite. `None` si no hay nada nuevo.
+fn frame_bindings(f: &Rc<RefCell<Environment>>, names: &HashSet<String>, state: &mut SnapState) -> Option<Vec<(String, GlobalVal)>> {
+    let key = Rc::as_ptr(f) as usize;
+    let picked: Vec<(String, SynValue)> = {
+        let sent = state.frame_names.entry(key).or_default();
+        let e = f.borrow();
+        let mut out = Vec::new();
+        for n in names {
+            if !sent.contains(n) {
+                if let Some(v) = e.bindings.get(n) {
+                    sent.insert(n.clone());
+                    out.push((n.clone(), v.clone()));
+                }
+            }
+        }
+        out
+    };
+    if picked.is_empty() {
+        return None;
+    }
+    let in_frame = std::mem::replace(&mut state.in_frame, true);
+    let entries = picked.into_iter().map(|(k, v)| (k, val_to_global_inner(&v, state))).collect();
+    state.in_frame = in_frame;
+    Some(entries)
+}
+
+/// Las bindings de un env para la foto (sin los builtins, que cada intérprete tiene), marcado en
+/// curso mientras se recorren; `None` si ya viaja (o viajó) en este árbol.
+fn env_bindings(env: &Rc<RefCell<Environment>>, state: &mut SnapState) -> Option<Vec<(String, GlobalVal)>> {
+    let key = Rc::as_ptr(env) as usize;
+    if state.in_progress.contains(&key) || state.done.contains(&key) {
+        return None;
+    }
+    state.in_progress.push(key);
+    let in_frame = std::mem::replace(&mut state.in_frame, false);
+    let entries: Vec<(String, GlobalVal)> = env
+        .borrow()
+        .bindings
+        .iter()
+        .filter(|(k, v)| !matches!(v, SynValue::Builtin(b) if synsema_core::interpreter::is_own_builtin(k, b)))
+        .map(|(k, v)| (k.to_string(), val_to_global_inner(v, state)))
+        .collect();
+    state.in_frame = in_frame;
+    state.in_progress.pop();
+    state.done.insert(key);
+    Some(entries)
+}
+
+/// Ronda 2 (R2): la foto de una task con su cadena léxica: la raíz (el global, su módulo u otra) y
+/// los envs intermedios.
+fn task_global(t: &Rc<SynTaskValue>, state: &mut SnapState) -> GlobalVal {
+    let mut chain: Vec<Rc<RefCell<Environment>>> = Vec::new();
+    let mut cur = t.closure_env.clone();
+    let root = loop {
+        let (is_module, parent) = {
+            let e = cur.borrow();
+            (e.name.starts_with("module:"), e.parent.clone())
+        };
+        if is_module {
+            let id = cur.borrow().name.to_string();
+            break TaskRoot::Module { id, env: env_bindings(&cur, state) };
+        }
+        match parent {
+            Some(p) => {
+                chain.push(cur.clone());
+                cur = p;
+            }
+            None => break if &*cur.borrow().name == "global" { TaskRoot::Global } else { TaskRoot::Here },
+        }
+    };
+    let names = if chain.is_empty() { std::sync::Arc::new(HashSet::new()) } else { synsema_core::interpreter::task_free_names(t) };
+    let frames = chain
+        .iter()
+        .rev()
+        .map(|f| FrameVal {
+            id: format!("frame:{:x}", Rc::as_ptr(f) as usize),
+            name: f.borrow().name.to_string(),
+            env: frame_bindings(f, &names, state),
+        })
+        .collect();
+    GlobalVal::Task {
+        name: t.name.clone(),
+        parameters: t.parameters.clone(),
+        body: t.body.clone(),
+        required_capabilities: t.required_capabilities.clone(),
+        root,
+        frames,
+        free_names: t.free_names.get().cloned(),
+    }
+}
+
+/// Ronda 2 (R2): la foto de la task que `parallel_map` aplica, con su cadena (los datos, congelados
+/// con el alcance del `parallel_map`).
+pub(crate) fn snapshot_task(t: &Rc<SynTaskValue>, scoped: Option<&mut synsema_core::frozen::ScopedFreeze>) -> GlobalVal {
+    task_global(t, &mut SnapState { scoped, ..SnapState::default() })
+}
+
+/// ¿Hay una task (o una task de confianza) en el valor? Sólo una lista de valores puede tenerla.
+fn has_callable(v: &SynValue) -> bool {
+    match v {
+        SynValue::Task(_) => true,
+        // Ronda 3 (R3): todo builtin; uno que no es de confianza cruza por su nombre o falla.
+        SynValue::Builtin(_) => true,
+        SynValue::Map(m) => m.borrow().iter().any(|(_, x)| has_callable(x)),
+        SynValue::List(l) => l.borrow().as_values().is_some_and(|xs| xs.iter().any(has_callable)),
+        _ => false,
+    }
+}
+
+/// Núcleo recursivo de `val_to_global_shared`/`snapshot_globals_*`/`snapshot_task`.
 fn val_to_global_inner(v: &SynValue, state: &mut SnapState) -> GlobalVal {
     match v {
-        SynValue::Task(t) => GlobalVal::Task {
-            name: t.name.clone(),
-            parameters: t.parameters.clone(),
-            body: t.body.clone(),
-            required_capabilities: t.required_capabilities.clone(),
-        },
+        SynValue::Task(t) => task_global(t, state),
         // Un generador dentro de un global (`{"g": rng(1)}`) tampoco se copia en silencio.
-        SynValue::Builtin(b) if synsema_core::rng::snapshot(b).is_some() => GlobalVal::SharedRng(b.name.clone()),
-        SynValue::Builtin(_) => GlobalVal::Value(to_send(v)),
+        SynValue::Builtin(b) if synsema_core::rng::snapshot(b).is_some() => {
+            if state.in_frame {
+                GlobalVal::CapturedRng(b.name.clone())
+            } else {
+                GlobalVal::SharedRng(b.name.clone())
+            }
+        }
+        SynValue::Builtin(b) if synsema_core::interpreter::trusted_tool_parts(b).is_some() => trusted_task_global(b, state),
+        // Ronda 3 (R3): un constructor cruza su definición; un builtin del lenguaje, su nombre; un
+        // cierre del motor no cruza (falla con texto del otro lado).
+        SynValue::Builtin(b) => match (&b.ctor, b.meta.registered) {
+            (Some(c), _) => GlobalVal::Constructor((**c).clone()),
+            (None, true) => GlobalVal::Builtin(b.name.clone()),
+            (None, false) => GlobalVal::Uncrossable(b.name.clone()),
+        },
+        SynValue::Map(m) if synsema_core::interpreter::is_trusted_view_map(m) => {
+            GlobalVal::TrustedView(m.borrow().iter().map(|(k, v)| (k.to_string(), val_to_global_inner(v, state))).collect())
+        }
         SynValue::Map(m) => {
             // ¿El map cierra sobre un `module_env`? (alias de `use`, o map interno cuyas
             // tasks cierran sobre el módulo — heurística por el nombre "module:…").
-            if let Some(module_env) = module_env_of(&m.borrow()) {
-                let key = Rc::as_ptr(&module_env) as usize;
+            // v0.6.50 (A): primero el registro (`use` lo anota): un módulo que exporta sólo datos —un
+            // mapa de callbacks que armó una de sus tasks— no tiene ninguna task que cierre sobre él, y
+            // viajaba como un mapa común, con sus lambdas colgadas del global del request.
+            let module_env = synsema_core::interpreter::module_env_of_map(m).or_else(|| module_env_of(&m.borrow()));
+            if let Some(module_env) = module_env {
                 let id = module_env.borrow().name.to_string();
                 let is_alias = synsema_core::interpreter::module_env_of_map(m).is_some();
-                if state.in_progress.contains(&key) || state.done.contains(&key) {
-                    // El env ya viaja (o viajó) en este árbol: referencia por id. Un solo
-                    // camino cubre el map auto-referencial (DE-032), el diamante B→D←C
-                    // (DE-033) y cualquier ciclo hipotético. En rebuild resuelve al MISMO
-                    // env vía el registro.
-                    let alias = snapshot_alias_entries(m, &module_env, state);
-                    return GlobalVal::Module { id, is_alias, alias, env: None };
-                }
-                // Primer encuentro: el env viaja inline (TODAS las bindings, DE-027).
-                state.in_progress.push(key);
-                let env: Vec<(String, GlobalVal)> = module_env
-                    .borrow()
-                    .bindings
-                    .iter()
-                    .filter(|(_, v)| !matches!(v, SynValue::Builtin(_)))
-                    .map(|(k, v)| (k.to_string(), val_to_global_inner(v, state)))
-                    .collect();
-                state.in_progress.pop();
-                state.done.insert(key);
+                // Primer encuentro: el env viaja inline (TODAS las bindings, DE-027). Si ya viaja (o
+                // viajó) en este árbol, referencia por id: un solo camino cubre el map
+                // auto-referencial (DE-032), el diamante B→D←C (DE-033) y cualquier ciclo
+                // hipotético. En rebuild resuelve al MISMO env vía el registro.
+                let env = env_bindings(&module_env, state);
                 let alias = snapshot_alias_entries(m, &module_env, state);
-                return GlobalVal::Module { id, is_alias, alias, env: Some(env) };
+                return GlobalVal::Module { id, is_alias, alias, env };
             }
             let entries: Vec<(String, GlobalVal)> = m
                 .borrow()
@@ -864,8 +1043,33 @@ fn val_to_global_inner(v: &SynValue, state: &mut SnapState) -> GlobalVal {
             // Map de datos con callbacks (tasks que NO cierran sobre un módulo).
             GlobalVal::MapWithTasks(entries)
         }
+        // Ronda 2 (R2, B3): una lista con tasks cruza como un mapa con tasks. Primero el congelado
+        // (lo que congela no tiene tasks): una lista grande de datos no se recorre dos veces.
+        SynValue::List(l) => match frozen_global(v, state) {
+            Some(g) => g,
+            None if has_callable(v) => {
+                GlobalVal::ListWithTasks(l.borrow().to_vec().iter().map(|x| val_to_global_inner(x, state)).collect())
+            }
+            None => GlobalVal::Value(synsema_core::rng::with_stubbed_globals(|| to_send(v))),
+        },
         // Una lista (o lo que sea) con un generador adentro: el generador cruza como stub.
         other => data_global(other, state),
+    }
+}
+
+/// v0.6.50 (B): la foto de una task de confianza: la task y el entorno de su tool (inline la primera
+/// vez en este árbol de foto, por id después, como la rama `Module`).
+fn trusted_task_global(b: &synsema_core::interpreter::BuiltinTask, state: &mut SnapState) -> GlobalVal {
+    let (module, export, t) = synsema_core::interpreter::trusted_tool_parts(b).expect("una task de confianza");
+    let module_env = t.closure_env.clone();
+    let env_id = module_env.borrow().name.to_string();
+    let env = env_bindings(&module_env, state);
+    GlobalVal::TrustedTask {
+        module: module.to_string(),
+        export: export.to_string(),
+        task: Box::new(val_to_global_inner(&SynValue::Task(t.clone()), state)),
+        env_id,
+        env,
     }
 }
 
@@ -883,37 +1087,57 @@ pub(crate) fn module_env_of(map: &MapObj) -> Option<Rc<RefCell<Environment>>> {
     None
 }
 
-/// Snapshotea TODAS las bindings de un `module_env` (saltando builtins) a `GlobalVal`,
-/// para que viajen `Send` a otro hilo/intérprete, con el env raíz marcado en curso (una
-/// referencia interna a él — map auto-referencial — viaja por id, no re-snapshotea).
-/// Reusa el mismo camino que la rama Module de `val_to_global_inner` — usado por
-/// `parallel_map` para capturar el módulo de la task aplicada (DE-030).
-pub(crate) fn snapshot_module_env(
-    module_env: &Rc<RefCell<Environment>>,
-    scoped: Option<&mut synsema_core::frozen::ScopedFreeze>,
-) -> Vec<(String, GlobalVal)> {
-    let mut state = SnapState {
-        in_progress: vec![Rc::as_ptr(module_env) as usize],
-        done: HashSet::new(),
-        freeze: false,
-        scoped,
-        share: false,
-    };
-    module_env
-        .borrow()
-        .bindings
-        .iter()
-        .filter(|(_, v)| !matches!(v, SynValue::Builtin(_)))
-        .map(|(k, v)| (k.to_string(), val_to_global_inner(v, &mut state)))
-        .collect()
-}
-
 /// Registro `id → module_env` de UN rebuild (per-request/per-worker): toda referencia
 /// al mismo módulo (diamante, alias, task aplicada) resuelve al MISMO env, igual que
 /// `module_cache` bajo `run`. Vive lo que dura ese rebuild — NUNCA se comparte entre
 /// requests o workers (el aislamiento CSP no cambia; el estado entre requests es
 /// `state_set`/SQL/`remember`).
 pub(crate) type ModuleRegistry = HashMap<String, Rc<RefCell<Environment>>>;
+
+/// v0.6.50: de qué cuelga lo que reconstruye un rebuild en ESTE intérprete. Un módulo de archivo, de
+/// la foto de su preludio (A); una tool de confianza, de su base de confianza, con su hook (B). Lo
+/// que el intérprete tiene que anotar al terminar (las tasks envueltas, las vistas) se junta acá y
+/// lo aplica `finish`.
+pub(crate) struct Bases {
+    /// El global del intérprete: donde cierra una task de raíz `Global` (ronda 1, A1).
+    global: Rc<RefCell<Environment>>,
+    module: Rc<RefCell<Environment>>,
+    trusted: Option<Rc<RefCell<Environment>>>,
+    hook: Option<synsema_core::interpreter::TrustedScopeHook>,
+    wrapped: RefCell<Vec<String>>,
+    views: RefCell<Vec<(String, synsema_core::types::MapRef)>>,
+}
+
+impl Bases {
+    /// Las bases de `interp`. Antes de inyectarle globales: la foto es su preludio.
+    pub(crate) fn of(interp: &mut Interpreter) -> Bases {
+        interp.snapshot_module_base();
+        Bases {
+            global: interp.global_env.clone(),
+            module: interp.module_base(),
+            trusted: interp.trusted_base_for_rebuild(),
+            hook: interp.trusted_scope_hook(),
+            wrapped: RefCell::new(Vec::new()),
+            views: RefCell::new(Vec::new()),
+        }
+    }
+
+    fn for_id(&self, id: &str) -> &Rc<RefCell<Environment>> {
+        match &self.trusted {
+            Some(t) if id.starts_with("module:trusted:") => t,
+            _ => &self.module,
+        }
+    }
+
+    pub(crate) fn finish(self, interp: &mut Interpreter) {
+        for name in self.wrapped.into_inner() {
+            interp.mark_label_aware(&name);
+        }
+        for (module, view) in self.views.into_inner() {
+            interp.adopt_trusted_view(&module, &view);
+        }
+    }
+}
 
 /// Reconstruye (o reusa del registro) el `module_env` compartido de un módulo, hijo de
 /// `base`, con cada task cerrando sobre ESE env → las hermanas (exportadas o no) se
@@ -923,7 +1147,7 @@ pub(crate) type ModuleRegistry = HashMap<String, Rc<RefCell<Environment>>>;
 pub(crate) fn rebuild_module_env(
     id: &str,
     env: &[(String, GlobalVal)],
-    base: &Rc<RefCell<Environment>>,
+    base: &Bases,
     registry: &mut ModuleRegistry,
     scope: Option<&synsema_core::frozen::ScopeCtx>,
 ) -> Rc<RefCell<Environment>> {
@@ -937,7 +1161,7 @@ pub(crate) fn rebuild_module_env(
     // placeholder: `module_env_of` y el check de `parallel_map` dependen del prefijo
     // "module:", y el dedup de un re-snapshot anidado (parallel_map dentro de un route
     // handler bajo serve) depende del nombre COMPLETO.
-    let module_env = Environment::child(base, id);
+    let module_env = Environment::child(base.for_id(id), id);
     // Registrar ANTES de poblar: un map interno auto-referencial (TOOL_ALLOW — DE-032)
     // que aparezca durante la población resuelve a ESTE env en construcción.
     registry.insert(id.to_string(), module_env.clone());
@@ -948,17 +1172,28 @@ pub(crate) fn rebuild_module_env(
     module_env
 }
 
+/// Ronda 3 (R3): lo que un worker recibe en lugar de un builtin que no tiene: falla al llamarlo.
+fn uncrossable_stub(name: &str, why: &str) -> SynValue {
+    let msg = format!("'{}' {}", name, why);
+    SynValue::Builtin(Rc::new(synsema_core::interpreter::BuiltinTask::new(
+        name,
+        -1,
+        None,
+        Rc::new(move |_i, _a, _l| Err(synsema_core::interpreter::Control::Error(synsema_core::interpreter::RuntimeError::new(msg.clone())))),
+    )))
+}
+
 /// Reconstruye un `SynValue` desde un `GlobalVal`. `closure_target` es el env que
 /// capturan las tasks (para top-level es el global; para una task de módulo es el
-/// `module_env` compartido). `base` es el padre para nuevos `module_env` (siempre el
-/// global del request, igual que `load_module_inner`, que cuelga todo module_env del
-/// global). Las tasks cierran sobre `closure_target` para que la recursión mutua entre
+/// `module_env` compartido). `base` es el padre para nuevos `module_env`: la foto del preludio
+/// del intérprete (`Interpreter::module_base`), igual que `load_module_inner` — v0.6.50 (A): un
+/// módulo no ve los globales del request. Las tasks cierran sobre `closure_target` para que la recursión mutua entre
 /// globales y la llamada a hermanas dentro de un módulo (DE-027) sigan funcionando.
 /// `registry` dedupea los `module_env` de este rebuild por id (DE-033).
-fn rebuild_global_val(
+pub(crate) fn rebuild_global_val(
     gv: &GlobalVal,
     closure_target: &Rc<RefCell<Environment>>,
-    base: &Rc<RefCell<Environment>>,
+    base: &Bases,
     registry: &mut ModuleRegistry,
     scope: Option<&synsema_core::frozen::ScopeCtx>,
 ) -> SynValue {
@@ -966,15 +1201,44 @@ fn rebuild_global_val(
         GlobalVal::Value(sv) => from_send(sv),
         GlobalVal::Frozen(f) => f.get(),
         GlobalVal::Scoped(i) => scope.expect("un valor con alcance se reconstruye dentro de su alcance").get(*i),
-        GlobalVal::Task { name, parameters, body, required_capabilities } => {
+        GlobalVal::Task { name, parameters, body, required_capabilities, root, frames, free_names } => {
+            // Ronda 1 (A1) y ronda 2 (R2): cierra en su cadena, no donde está guardada. El módulo de
+            // la raíz viene inline la primera vez en la foto o ya está en el registro; si no está en
+            // ningún lado, un env vacío de ese módulo (el nombre falta; nunca el de otro módulo).
+            let mut closure_env = match root {
+                TaskRoot::Global => base.global.clone(),
+                TaskRoot::Module { id, env: Some(entries) } => rebuild_module_env(id, entries, base, registry, scope),
+                TaskRoot::Module { id, env: None } => {
+                    registry.get(id).cloned().unwrap_or_else(|| Environment::child(base.for_id(id), id))
+                }
+                TaskRoot::Here => closure_target.clone(),
+            };
+            for f in frames {
+                let e = match registry.get(&f.id) {
+                    Some(e) => e.clone(),
+                    None => {
+                        let e = Environment::child(&closure_env, &f.name);
+                        // Registrar ANTES de poblar: una task del frame que lo nombra resuelve acá.
+                        registry.insert(f.id.clone(), e.clone());
+                        e
+                    }
+                };
+                // Ronda 3 (R3): lo que esta task nombra y todavía no estaba en la copia del frame.
+                for (k, gv) in f.env.iter().flatten() {
+                    let v = rebuild_global_val(gv, &e, base, registry, scope);
+                    e.borrow_mut().bindings.insert(k.clone(), v);
+                }
+                closure_env = e;
+            }
             SynValue::Task(Rc::new(SynTaskValue {
                 name: name.clone(),
                 parameters: parameters.clone(),
                 body: body.clone(),
-                closure_env: closure_target.clone(),
+                closure_env,
                 origin: None,
                 required_capabilities: required_capabilities.clone(),
                 code: Default::default(),
+                free_names: free_names.clone().map(std::cell::OnceCell::from).unwrap_or_default(),
             }))
         }
         GlobalVal::Module { id, is_alias, alias, env } => {
@@ -991,7 +1255,7 @@ fn rebuild_global_val(
                         // acá una mutación exótica post-load (inyectar en un map de módulo
                         // tasks de OTRO módulo no alcanzado por el snapshot). Se registra
                         // el env vacío para que al menos todas las referencias compartan.
-                        let e = Environment::child(base, id);
+                        let e = Environment::child(base.for_id(id), id);
                         registry.insert(id.clone(), e.clone());
                         e
                     }
@@ -1041,15 +1305,74 @@ fn rebuild_global_val(
             SynValue::Map(map)
         }
         GlobalVal::SharedRng(name) => synsema_core::rng::top_level_stub(name),
+        GlobalVal::CapturedRng(name) => synsema_core::rng::captured_stub(name),
+        GlobalVal::Builtin(name) => match base.module.borrow().bindings.get(name) {
+            Some(v @ SynValue::Builtin(b)) if b.name == *name => v.clone(),
+            _ => uncrossable_stub(
+                name,
+                "is a builtin this worker does not have (it exists only where the program runs: a `serve` request, an agent, or the host's interpreter): call it there and pass its result",
+            ),
+        },
+        GlobalVal::Constructor(c) => synsema_core::interpreter::constructor_value(c.clone()),
+        GlobalVal::Uncrossable(name) => uncrossable_stub(
+            name,
+            "is a closure of the engine that does not cross into a worker: call it before and pass its result",
+        ),
+        GlobalVal::TrustedTask { module, export, task, env_id, env } => {
+            let module_env = match env {
+                Some(entries) => rebuild_module_env(env_id, entries, base, registry, scope),
+                None => match registry.get(env_id) {
+                    Some(e) => e.clone(),
+                    None => {
+                        let e = Environment::child(base.for_id(env_id), env_id);
+                        registry.insert(env_id.clone(), e.clone());
+                        e
+                    }
+                },
+            };
+            match (rebuild_global_val(task, &module_env, base, registry, scope), &base.hook) {
+                (SynValue::Task(t), Some(hook)) => {
+                    let w = synsema_core::interpreter::wrap_trusted_task(module, export, t, hook.clone());
+                    if let SynValue::Builtin(b) = &w {
+                        base.wrapped.borrow_mut().push(b.name.clone());
+                    }
+                    w
+                }
+                // Sin hook este proceso no cargó tools (no puede pasar: la foto es del mismo proceso).
+                _ => SynValue::Nothing,
+            }
+        }
+        GlobalVal::TrustedView(entries) => {
+            let mut m = SynMap::new();
+            let mut module = None;
+            for (k, gv) in entries {
+                let v = rebuild_global_val(gv, closure_target, base, registry, scope);
+                if let SynValue::Builtin(b) = &v {
+                    if let Some((md, _, _)) = synsema_core::interpreter::trusted_tool_parts(b) {
+                        module.get_or_insert_with(|| md.to_string());
+                    }
+                }
+                m.insert(k.clone(), v);
+            }
+            let map = m.into_ref();
+            synsema_core::interpreter::register_rebuilt_trusted_view(&map);
+            if let Some(md) = module {
+                base.views.borrow_mut().push((md, map.clone()));
+            }
+            SynValue::Map(map)
+        }
         GlobalVal::MapWithTasks(entries) => {
-            // Map de datos con callbacks: las tasks cierran sobre el global (como cualquier
-            // task top-level), NO sobre un module_env compartido.
+            // Map de datos con callbacks: cada task cierra en su raíz (ronda 1, A1: una lambda del
+            // programa guardada en un módulo sigue viendo el programa; una del módulo, el módulo).
             let mut m = SynMap::new();
             for (k, gv) in entries {
-                m.insert(k.clone(), rebuild_global_val(gv, base, base, registry, scope));
+                m.insert(k.clone(), rebuild_global_val(gv, closure_target, base, registry, scope));
             }
             SynValue::Map(m.into_ref())
         }
+        GlobalVal::ListWithTasks(items) => synsema_core::types::syn_list(
+            items.iter().map(|gv| rebuild_global_val(gv, closure_target, base, registry, scope)).collect(),
+        ),
         GlobalVal::Agent { .. } => {
             // Los agentes van a `agent_definitions`, nunca a bindings — no debería llegar aquí.
             SynValue::Nothing
@@ -1112,11 +1435,10 @@ fn snapshot_globals_mode(
     // el env inline) siempre se procesa antes que sus referencias.
     let mut state = SnapState { freeze, scoped, share, ..SnapState::default() };
     for (k, v) in env.bindings.iter() {
-        if let SynValue::Builtin(b) = v {
-            if synsema_core::rng::snapshot(b).is_some() {
-                out.push((k.to_string(), GlobalVal::SharedRng(b.name.clone())));
-            }
-            continue; // re-registrados por wire_common
+        // Ronda 3 (R3): sólo el builtin del lenguaje con su propio nombre lo vuelve a registrar
+        // `wire_common`; un alias, un constructor o una task de confianza cruzan.
+        if matches!(v, SynValue::Builtin(b) if synsema_core::interpreter::is_own_builtin(k, b)) {
+            continue;
         }
         out.push((k.to_string(), val_to_global_inner(v, &mut state)));
     }
@@ -1145,18 +1467,22 @@ pub(crate) fn rebuild_globals(
     // de `with_serve_interp` — para que build fresco y reset no puedan divergir (si
     // divergieran, el bug pocos-cores volvería sólo en uno de los dos caminos).
     restore_agents(interp, snapshot);
+    // v0.6.50 (A): la foto del preludio ANTES de inyectar los globales (ahora el global del
+    // intérprete es sólo el preludio). Una vez por intérprete: un worker que se reusa ya la tiene.
+    let bases = Bases::of(interp);
     for (k, gv) in snapshot {
         match gv {
             GlobalVal::Agent { .. } => {}
             other => {
-                // Top-level: las tasks cierran sobre el global (closure_target) y los
-                // nuevos module_env también cuelgan del global (base).
+                // Top-level: las tasks cierran sobre el global (closure_target); los nuevos
+                // module_env cuelgan de la foto del preludio (base).
                 let genv = interp.global_env.clone();
-                let v = rebuild_global_val(other, &genv, &genv, &mut registry, scope);
+                let v = rebuild_global_val(other, &genv, &bases, &mut registry, scope);
                 interp.set_global(k, v);
             }
         }
     }
+    bases.finish(interp);
     registry
 }
 
@@ -4193,17 +4519,17 @@ fn serve_inner(source: &str, filename: &str, secure: bool, overrides: ServeOverr
     let program = match parse_source(source, filename) {
         Ok(p) => p,
         Err(CompileError::Lex(e)) => {
-            return RunResult { success: false, output: Vec::new(), errors: vec![format!("Lexer error: {}", e)] }
+            return RunResult { success: false, output: Vec::new(), errors: vec![format!("Lexer error: {}", e)], ..Default::default() }
         }
         Err(CompileError::Parse(e)) => {
-            return RunResult { success: false, output: Vec::new(), errors: vec![format!("Parse error: {}", e)] }
+            return RunResult { success: false, output: Vec::new(), errors: vec![format!("Parse error: {}", e)], ..Default::default() }
         }
     };
 
     // Validación de los flags de despliegue (fail-loud) y política de múltiples serve.
     if !overrides.is_empty() {
         if let Err(e) = overrides.validate() {
-            return RunResult { success: false, output: Vec::new(), errors: vec![format!("Runtime error: {}", e)] };
+            return RunResult { success: false, output: Vec::new(), errors: vec![format!("Runtime error: {}", e)], ..Default::default() };
         }
         // Los flags configuran UN despliegue: con varios bloques `serve` no hay forma
         // coherente de aplicar --port/--tls-* (cada uno bindea su propio puerto), así
@@ -4221,6 +4547,7 @@ fn serve_inner(source: &str, filename: &str, secure: bool, overrides: ServeOverr
                     "Runtime error: CLI serve flags (--port/--domain/--tls-*/--bind/--attested) require exactly one `serve` block, but found {}",
                     n_serve
                 )],
+                ..Default::default()
             };
         }
     }
@@ -4263,6 +4590,7 @@ fn serve_inner(source: &str, filename: &str, secure: bool, overrides: ServeOverr
                                 host.map(|_| " (in a host block)".to_string()).unwrap_or_default(),
                                 server::RESERVED_PATHS.join(", ")
                             )],
+                            ..Default::default()
                         };
                     }
                 }
@@ -4294,7 +4622,7 @@ fn serve_inner(source: &str, filename: &str, secure: bool, overrides: ServeOverr
         {
             Ok(()) => {}
             Err(e) => {
-                return RunResult { success: false, output: Vec::new(), errors: vec![format!("Runtime error: {}", e)] };
+                return RunResult { success: false, output: Vec::new(), errors: vec![format!("Runtime error: {}", e)], ..Default::default() };
             }
         }
     }
@@ -4331,6 +4659,7 @@ fn serve_inner(source: &str, filename: &str, secure: bool, overrides: ServeOverr
                 success: false,
                 output: Vec::new(),
                 errors: vec![format!("Runtime error: {}", msg)],
+                ..Default::default()
             }
         }
     };
@@ -4478,15 +4807,20 @@ fn serve_inner(source: &str, filename: &str, secure: bool, overrides: ServeOverr
         Err(Control::Error(e)) => e.exit_code,
         _ => None,
     };
-    crate::engine::note_exit_code(exit);
     if let Some(code) = exit {
-        return RunResult { success: code == 0, output: std::mem::take(&mut interp.output), errors: Vec::new() };
+        return RunResult {
+            success: code == 0,
+            output: std::mem::take(&mut interp.output),
+            exit_code: Some(code),
+            ..Default::default()
+        };
     }
     if let Err(Control::Error(e)) = &r {
         return RunResult {
             success: false,
             output: interp.output.clone(),
             errors: vec![format!("Runtime error: {}", e)],
+            ..Default::default()
         };
     }
 
@@ -4528,15 +4862,16 @@ fn serve_inner(source: &str, filename: &str, secure: bool, overrides: ServeOverr
             synsema_stdlib::server::park_cron_only();
             cron.sched.cancel_all();
             eprintln!("[serve] stopped");
-            return RunResult { success: true, output: std::mem::take(&mut interp.output), errors: Vec::new() };
+            return RunResult { success: true, output: std::mem::take(&mut interp.output), errors: Vec::new(), ..Default::default() };
         }
         // Sin server ni jobs: resultado normal (un programa serve sin bloque serve válido).
         return match r {
-            Ok(_) => RunResult { success: true, output: std::mem::take(&mut interp.output), errors: Vec::new() },
+            Ok(_) => RunResult { success: true, output: std::mem::take(&mut interp.output), errors: Vec::new(), ..Default::default() },
             Err(_) => RunResult {
                 success: false,
                 output: std::mem::take(&mut interp.output),
                 errors: vec!["Runtime error: 'give'/'stop' used outside of a task or loop".to_string()],
+                ..Default::default()
             },
         };
     }
@@ -4547,9 +4882,9 @@ fn serve_inner(source: &str, filename: &str, secure: bool, overrides: ServeOverr
     // T10: un `serve --attested` que se cerró porque sus documentos vencieron sin renovación
     // termina con error, no con un apagado normal.
     if let Some(reason) = synsema_stdlib::attest::renewal_failure() {
-        return RunResult { success: false, output: std::mem::take(&mut interp.output), errors: vec![format!("Runtime error: {}", reason)] };
+        return RunResult { success: false, output: std::mem::take(&mut interp.output), errors: vec![format!("Runtime error: {}", reason)], ..Default::default() };
     }
-    RunResult { success: true, output: std::mem::take(&mut interp.output), errors: Vec::new() }
+    RunResult { success: true, output: std::mem::take(&mut interp.output), errors: Vec::new(), ..Default::default() }
 }
 
 /// Corre un programa que contiene `serve on PORT`. Bindea (síncrono), imprime la
@@ -4615,6 +4950,7 @@ pub fn run_serve_program_with_overrides(
             success: false,
             output: Vec::new(),
             errors: vec![crate::engine::abort_message(&p)],
+            ..Default::default()
         })
 }
 
@@ -4679,6 +5015,70 @@ let f be (x) => x + 1
         // Y la task del AST es la misma que la definida: definir no copia.
         let synsema_core::ast::NodeKind::TaskDefinition { body, .. } = &program.statements[0].kind else { panic!("task") };
         assert!(std::sync::Arc::ptr_eq(body, &body_of(&interp, "doble")));
+    }
+
+    /// Ronda 3 (R3, B1): de un frame cruzan sólo los nombres que la task menciona. Un local grande
+    /// que la lambda no nombra no viaja; una segunda task del mismo frame agrega lo suyo.
+    #[test]
+    fn a_frame_carries_only_the_names_the_task_mentions() {
+        let mut interp = Interpreter::new();
+        let program = synsema_core::parser::parse_source(
+            "task mk(n)
+    let big be [1, 2, 3]
+    let k be 2
+    give [(x) => x * n + k, () => big]
+let fs be mk(3)
+",
+            "<r3b1>",
+        )
+        .expect("parse");
+        assert!(interp.execute(&program).is_ok());
+        let Some(SynValue::List(l)) = synsema_core::interpreter::env_get(&interp.global_env, "fs") else { panic!("fs") };
+        let fs = l.borrow().to_vec();
+        let names = |gv: &GlobalVal| -> Vec<String> {
+            let GlobalVal::Task { frames, .. } = gv else { panic!("una task") };
+            let mut v: Vec<String> = frames.iter().flat_map(|f| f.env.iter().flatten().map(|(k, _)| k.clone())).collect();
+            v.sort();
+            v
+        };
+        let mut state = SnapState::default();
+        let SynValue::Task(t0) = &fs[0] else { panic!("lambda") };
+        let SynValue::Task(t1) = &fs[1] else { panic!("lambda") };
+        assert_eq!(names(&task_global(t0, &mut state)), vec!["k".to_string(), "n".to_string()]);
+        // La segunda, en la misma foto, agrega sólo `big`; sola, lleva sólo `big`. Ronda 4 (N1): los
+        // nombres de un cuerpo se calculan una vez.
+        assert_eq!(names(&task_global(t1, &mut state)), vec!["big".to_string()]);
+        assert_eq!(names(&task_global(t1, &mut SnapState::default())), vec!["big".to_string()]);
+        let a = synsema_core::interpreter::task_free_names(t0);
+        assert!(std::sync::Arc::ptr_eq(&a, &synsema_core::interpreter::task_free_names(t0)), "se recorrió dos veces");
+        // Ronda 6 (N1): la copia de la foto hereda los nombres y no recorre (un `parallel_map`
+        // dentro de cada item de otro).
+        let mut base_interp = Interpreter::new();
+        let base = Bases::of(&mut base_interp);
+        let gv = task_global(t0, &mut SnapState::default());
+        let SynValue::Task(copy) = rebuild_global_val(&gv, &base.global.clone(), &base, &mut ModuleRegistry::default(), None) else {
+            panic!("una task")
+        };
+        assert!(copy.free_names.get().is_some_and(|n| std::sync::Arc::ptr_eq(n, &a)), "la copia vuelve a recorrer");
+        // Ronda 5 (M1): viven con la task, no en una caché que la sobrevive.
+        let program = synsema_core::parser::parse_source("task inner(x)\n    require time\n    give x + k\n", "<r5m1>").expect("parse");
+        let synsema_core::ast::NodeKind::TaskDefinition { parameters, body, .. } = &program.statements[0].kind else { panic!("task") };
+        let t = Rc::new(SynTaskValue {
+            name: "inner".into(),
+            parameters: parameters.clone(),
+            body: body.iter().cloned().collect::<Vec<_>>().into(),
+            closure_env: Environment::root("t"),
+            origin: None,
+            required_capabilities: Vec::new(),
+            code: Default::default(),
+            free_names: Default::default(),
+        });
+        let n = synsema_core::interpreter::task_free_names(&t);
+        assert!(n.contains("k"));
+        let weak = std::sync::Arc::downgrade(&n);
+        drop(n);
+        drop(t);
+        assert!(weak.upgrade().is_none(), "los nombres sobreviven a la task");
     }
 
     /// R2.4: la foto de un agente o de `cron` comparte lo que ya está congelado para siempre (las

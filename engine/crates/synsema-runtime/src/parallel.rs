@@ -41,15 +41,14 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use synsema_capabilities::model::{Capability, CapabilitySet};
-use synsema_core::ast::{Node, Param};
 use synsema_core::interpreter::{Control, Interpreter, RuntimeError};
 use synsema_core::number::Number;
-use synsema_core::types::{from_send, syn_list, to_send, SendValue, SynTaskValue, SynValue};
+use synsema_core::types::{from_send, syn_list, to_send, SendValue, SynValue};
 
 use crate::engine::{wire_common, MemoryCtx, INTERP_STACK_SIZE};
 use crate::serve::{
-    rebuild_globals, rebuild_module_env, snapshot_globals_scoped, snapshot_module_env, GlobalVal,
-    ModuleRegistry,
+    rebuild_global_val, rebuild_globals, snapshot_globals_scoped, snapshot_task, val_to_global_shared,
+    Bases, GlobalVal, ModuleRegistry,
 };
 use synsema_core::frozen::{ScopeCtx, ScopedFreeze};
 
@@ -81,20 +80,14 @@ fn control_to_error(c: Control) -> RuntimeError {
 
 /// Snapshot `Send` del task a aplicar (task de usuario con su AST, o un builtin por nombre).
 enum TaskSnapshot {
-    User {
-        name: String,
-        parameters: Vec<Param>,
-        body: std::sync::Arc<[Node]>,
-        required_capabilities: Vec<(String, Option<String>)>,
-        /// Si la task aplicada venía de un módulo (su `closure_env` era el `module_env`),
-        /// el ID estable de ese módulo (`"module:<resolved>"`) + el snapshot COMPLETO de
-        /// su env (todas las hermanas) para reconstruirlo en el worker; si no, `None` y
-        /// la task cierra sobre el global (DE-030). El ID permite que, si el módulo
-        /// TAMBIÉN es alcanzable desde los globales, la task cierre sobre EL MISMO
-        /// `module_env` que ellos (identidad task-aplicada ↔ módulo global, DE-033).
-        module: Option<(String, Vec<(String, GlobalVal)>)>,
-    },
+    /// Una task de usuario con su cadena léxica (ronda 2, R2): su raíz —el global, o su módulo con
+    /// todas las hermanas (DE-030), reconstruido por id para que sea EL MISMO `module_env` que el
+    /// de los globales si también llega por ahí (DE-033)— y los locales de quien la armó.
+    User(GlobalVal),
     Builtin(String),
+    /// v0.6.50 (B): una task de una tool de confianza: en el worker, la tool reconstruida colgada de
+    /// SU base de confianza y envuelta con SU hook (`GlobalVal::TrustedTask`).
+    Trusted(GlobalVal),
 }
 
 /// Intérprete worker fresco: builtins + caps heredadas + globales reconstruidos.
@@ -150,33 +143,18 @@ fn build_worker_interp(
 }
 
 fn reconstruct_task(
-    interp: &Interpreter,
+    interp: &mut Interpreter,
     snap: &TaskSnapshot,
     registry: &mut ModuleRegistry,
     scope: &ScopeCtx,
 ) -> SynValue {
     match snap {
-        TaskSnapshot::User { name, parameters, body, required_capabilities, module } => {
-            // DE-030: si la task vino de un módulo, cerrarla sobre el `module_env` de
-            // ese módulo (con todas las hermanas) en vez del global del worker — así
-            // una task de módulo aplicada que llame a una hermana resuelve, igual que
-            // las tasks de los globales (DE-027). Registry-first (DE-033): si el módulo
-            // TAMBIÉN es alcanzable desde los globales del worker, `rebuild_module_env`
-            // devuelve ESE env (la misma instancia — estado compartido); solo reconstruye
-            // uno nuevo si no (p.ej. el binding global fue pisado con `set`).
-            let closure_env = match module {
-                Some((id, env)) => rebuild_module_env(id, env, &interp.global_env, registry, Some(scope)),
-                None => interp.global_env.clone(),
-            };
-            SynValue::Task(Rc::new(SynTaskValue {
-                name: name.clone(),
-                parameters: parameters.clone(),
-                body: body.clone(),
-                closure_env,
-                origin: None,
-                required_capabilities: required_capabilities.clone(),
-                code: Default::default(),
-            }))
+        TaskSnapshot::User(gv) | TaskSnapshot::Trusted(gv) => {
+            let bases = Bases::of(interp);
+            let genv = interp.global_env.clone();
+            let v = rebuild_global_val(gv, &genv, &bases, registry, Some(scope));
+            bases.finish(interp);
+            v
         }
         TaskSnapshot::Builtin(name) => {
             interp.global_env.borrow().bindings.get(name).cloned().unwrap_or(SynValue::Nothing)
@@ -252,7 +230,7 @@ fn run_parallel(
             }
             let (mut interp, mut registry, _subject_scope) =
                 build_worker_interp(&globals, &granted, &denied, secure, &ceiling, &mem, &bus, &subject, ctx, &providers);
-            let task_value = reconstruct_task(&interp, &task_snap, &mut registry, ctx);
+            let task_value = reconstruct_task(&mut interp, &task_snap, &mut registry, ctx);
             // Los entornos de módulo de este item quedan a cargo de su intérprete: se vacían
             // cuando muere (si no, cada item dejaba vivo el programa entero: la fuga de lampson).
             interp.adopt_module_envs(registry.values().cloned());
@@ -395,28 +373,12 @@ pub(crate) fn register_parallel_builtins(
             // hilos los leen sin copiarlos y vuelven a ser objetos comunes al terminar.
             let mut scope = ScopedFreeze::new();
             let task_snap = match task {
-                SynValue::Task(t) => {
-                    // DE-030: si el mapper es una task de módulo (cierra sobre un env
-                    // "module:…"), snapshotear su `module_env` completo para reconstruir
-                    // las hermanas en el worker; si no, `None` (cierra sobre el global).
-                    // El nombre del env ES el ID estable del módulo (DE-033) — también
-                    // dentro de un route handler bajo serve, porque el rebuild preserva
-                    // los nombres originales ("module:<resolved>", nunca un placeholder).
-                    let module = {
-                        let env_name = t.closure_env.borrow().name.to_string();
-                        if env_name.starts_with("module:") {
-                            Some((env_name, snapshot_module_env(&t.closure_env, Some(&mut scope))))
-                        } else {
-                            None
-                        }
-                    };
-                    TaskSnapshot::User {
-                        name: t.name.clone(),
-                        parameters: t.parameters.clone(),
-                        body: t.body.clone(),
-                        required_capabilities: t.required_capabilities.clone(),
-                        module,
-                    }
+                // DE-030 y ronda 2 (R2): la task con su cadena: su módulo entero (las hermanas) si es
+                // de un módulo, y los locales de quien la armó (`(x) => x * n` dentro de una task).
+                // El id del módulo es el nombre de su env (DE-033), también bajo serve.
+                SynValue::Task(t) => TaskSnapshot::User(snapshot_task(t, Some(&mut scope))),
+                SynValue::Builtin(b) if synsema_core::interpreter::trusted_tool_parts(b).is_some() => {
+                    TaskSnapshot::Trusted(val_to_global_shared(task))
                 }
                 SynValue::Builtin(b) => TaskSnapshot::Builtin(b.name.clone()),
                 _ => unreachable!(),

@@ -47,7 +47,7 @@ fn main() {
     // `webauth::begin_call_entropy`): `random_bytes(n)` con un `n` privado ya no le dice `n`.
     synsema_stdlib::webauth::begin_call_entropy();
     let args: Vec<String> = std::env::args().collect();
-    const USAGE: &str = "usage: synsema-wasm [--test] [--labels] [--sandbox | --cap-set <list>] [--trusted name=path]... [--trusted-cap-set <list>] <file.syn | ->";
+    const USAGE: &str = "usage: synsema-wasm [--test] [--labels] [--sandbox | --cap-set <list>] [--trusted name=path]... [--trusted-cap-set <list>] [--trusted-templates name=dir]... <file.syn | ->";
     let mut test_mode = false;
     let mut sandbox = false;
     let mut labels = false;
@@ -56,6 +56,8 @@ fn main() {
     // en `synsema run`.
     let mut trusted_paths: Vec<(String, String)> = Vec::new();
     let mut trusted_cap_set: Option<String> = None;
+    // v0.6.50 (ronda 1, N6): los templates de cada tool, como `synsema run --trusted-templates`.
+    let mut trusted_template_dirs: Vec<(String, String)> = Vec::new();
     let mut path: Option<String> = None;
     let mut i = 1;
     while i < args.len() {
@@ -71,6 +73,16 @@ fn main() {
                 }
                 _ => {
                     eprintln!("synsema-wasm: --trusted takes name=path (a name of letters, digits, '_' or '-'), e.g. --trusted tools=./tools.syn");
+                    std::process::exit(2);
+                }
+            },
+            "--trusted-templates" => match args.get(i + 1).and_then(|v| v.split_once('=')) {
+                Some((n, d)) if !n.is_empty() && !d.is_empty() => {
+                    trusted_template_dirs.push((n.to_string(), d.to_string()));
+                    i += 1;
+                }
+                _ => {
+                    eprintln!("synsema-wasm: --trusted-templates takes name=dir, e.g. --trusted-templates tools=./tpl");
                     std::process::exit(2);
                 }
             },
@@ -143,7 +155,10 @@ fn main() {
     };
     // Techo del host: mismo parser que `synsema run` (synsema-capabilities::build_ceiling).
     let ceiling = match build_ceiling(sandbox, cap_set.as_deref()) {
-        Ok(c) => c,
+        Ok(c) => {
+            warn_ceiling(c.as_deref(), "--cap-set");
+            c
+        }
         Err(e) => {
             eprintln!("synsema-wasm: {}", e);
             std::process::exit(2);
@@ -168,10 +183,31 @@ fn main() {
             }
         }
     }
+    let mut trusted_templates: Vec<(String, Vec<(String, String)>)> = Vec::new();
+    for (name, dir) in &trusted_template_dirs {
+        if !trusted.iter().any(|(n, _)| n == name) {
+            eprintln!("synsema-wasm: --trusted-templates {}: there is no --trusted {}=… to give them to", name, name);
+            std::process::exit(2);
+        }
+        if trusted_templates.iter().any(|(n, _)| n == name) {
+            eprintln!("synsema-wasm: --trusted-templates {}: the name is given twice", name);
+            std::process::exit(2);
+        }
+        match synsema_core::templates::read_template_dir(std::path::Path::new(dir)) {
+            Ok(files) => trusted_templates.push((name.clone(), files)),
+            Err(e) => {
+                eprintln!("synsema-wasm: --trusted-templates {}: cannot read {}: {}", name, dir, e);
+                std::process::exit(2);
+            }
+        }
+    }
     let trusted_ceiling = match trusted_cap_set.as_deref() {
         None => None,
         Some(spec) => match build_ceiling(false, Some(spec)) {
-            Ok(c) => c,
+            Ok(c) => {
+                warn_ceiling(c.as_deref(), "--trusted-cap-set");
+                c
+            }
             Err(e) => {
                 eprintln!("synsema-wasm: --trusted-cap-set: {}", e.trim_start_matches("--cap-set: "));
                 std::process::exit(2);
@@ -200,7 +236,7 @@ fn main() {
     // etiquetas va en el error (también en `--test`), como en `synsema run`; con techo, el programa
     // ve sólo el texto fijo.
     let owner = ceiling.is_none() && trusted.is_empty();
-    let opts = RunOptions { filename, env: None, ceiling, no_fs: false, labels, result: None, input: None, sources: Vec::new(), max_steps: None, max_memory_mb: None, trusted, trusted_ceiling, auditor: None, sealed_bytes: None, labels_detail_to_program: owner };
+    let opts = RunOptions { filename, env: None, ceiling, no_fs: false, labels, result: None, input: None, sources: Vec::new(), max_steps: None, max_memory_mb: None, trusted, trusted_templates, trusted_ceiling, auditor: None, sealed_bytes: None, labels_detail_to_program: owner };
 
     if test_mode {
         let r = with_big_stack(move || synsema_wasm::test(&source, &opts));
@@ -218,5 +254,12 @@ fn main() {
             eprintln!("{}", e);
         }
         std::process::exit(r.exit_code.unwrap_or(if r.ok { 0 } else { 1 }));
+    }
+}
+
+/// v0.6.50 (E-a): los avisos de un techo, como en `synsema run`.
+fn warn_ceiling(c: Option<&[synsema_capabilities::model::Capability]>, flag: &str) {
+    for w in synsema_capabilities::model::ceiling_warnings(c.unwrap_or_default(), flag) {
+        eprintln!("{}", w);
     }
 }

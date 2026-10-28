@@ -267,7 +267,8 @@ fn echo_server() -> u16 {
     port
 }
 
-/// `last_run_exit_code` es del proceso: los tests que corren programas no se pisan.
+/// Los tests que corren programas van de a uno (agentes, sockets). Hasta v0.6.50 el código de `exit`
+/// era del proceso y lo pedía; ahora viaja en el `RunResult` (ver `each_run_keeps_its_own_exit_code`).
 static RUN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn run(src: &str) -> synsema_core::interpreter::RunResult {
@@ -324,13 +325,13 @@ fn exit_sets_the_code_of_the_run() {
     assert!(!r.success);
     assert!(r.errors.is_empty(), "exit no es un error: {:?}", r.errors);
     assert_eq!(r.output, vec!["antes"]);
-    assert_eq!(synsema_runtime::engine::last_run_exit_code(), Some(7));
+    assert_eq!(r.exit_code, Some(7));
     let r = run("exit(0)\n");
     assert!(r.success);
-    assert_eq!(synsema_runtime::engine::last_run_exit_code(), Some(0));
+    assert_eq!(r.exit_code, Some(0));
     let r = run("print(1)\n");
     assert!(r.success);
-    assert_eq!(synsema_runtime::engine::last_run_exit_code(), None);
+    assert_eq!(r.exit_code, None);
 }
 
 /// Upstream que lee el body por `Content-Length` y contesta cuántos bytes recibió.
@@ -681,7 +682,8 @@ fn exit_stops_live_agents_instead_of_hanging() {
     let (tx, rx) = std::sync::mpsc::channel();
     thread::spawn(move || {
         let r = run(src);
-        let _ = tx.send((r, synsema_runtime::engine::last_run_exit_code()));
+        let code = r.exit_code;
+        let _ = tx.send((r, code));
     });
     let (r, code) = rx.recv_timeout(Duration::from_secs(20)).expect("exit con un agente vivo se colgó");
     assert_eq!(r.output, vec!["main"]);
@@ -747,10 +749,38 @@ exit(3)
     let (tx, rx) = std::sync::mpsc::channel();
     thread::spawn(move || {
         let r = run(src);
-        let _ = tx.send((r, synsema_runtime::engine::last_run_exit_code()));
+        let code = r.exit_code;
+        let _ = tx.send((r, code));
     });
     let (r, code) = rx.recv_timeout(Duration::from_secs(20)).expect("exit se colgó");
     assert_eq!(code, Some(3));
     assert_eq!(r.errors.len(), 1, "{:?}", r.errors);
     assert!(r.errors[0].contains("Broken"), "{:?}", r.errors);
+}
+
+/// v0.6.50: el código de `exit` y los pasos son de la corrida (`RunResult`), no del proceso. Antes
+/// eran globales ("la última corrida"): un embebedor con dos corridas a la vez leía el de la otra.
+#[test]
+fn each_run_keeps_its_own_exit_code() {
+    let _g = RUN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let s2 = stop.clone();
+    let hammer = thread::spawn(move || {
+        let mut n = 0;
+        while !s2.load(std::sync::atomic::Ordering::SeqCst) {
+            let r = run("print(1)\n");
+            assert_eq!(r.exit_code, None);
+            n += 1;
+        }
+        n
+    });
+    let short = run("print(1)\n");
+    for _ in 0..20 {
+        let r = run("let a be 1\nlet b be a + 1\nlet c be b + 1\nexit(3)\n");
+        assert_eq!(r.exit_code, Some(3));
+        assert!(r.steps > short.steps, "{} {}", r.steps, short.steps);
+    }
+    stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    assert!(hammer.join().unwrap() > 0);
+    assert!(short.steps > 0 && !short.touched_private);
 }

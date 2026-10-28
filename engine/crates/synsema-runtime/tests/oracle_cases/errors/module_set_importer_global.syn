@@ -1,0 +1,5 @@
+-- v0.6.50 (A, fila 3): un `set` del módulo sobre un global del programa es error, con la pista
+let TASA be 2
+use "mods/v0650_globals.syn" as g
+print(steps())
+g.poner()
