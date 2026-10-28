@@ -2,7 +2,8 @@
 
 Read this FIRST if something fails. Each row is a real mistake that costs hours to debug.
 
-> **Just upgraded and something that worked now fails?** Start at *Upgrading to v0.6.49*
+> **Just upgraded and something that worked now fails?** Start at *Upgrading to v0.6.50* (a module
+> sees only its own names), then *v0.6.49*
 > (`require declassify` under a ceiling, `--replay` and the program, trusted modules), then *v0.6.47* (label cuts
 > with no location, runs committed or undone under `serve --labels`, the audit's grant), then *v0.6.46* (secrets
 > in encodings, wildcards and private addresses, `declassify` under a ceiling, `watch`/`cwd`), then
@@ -14,6 +15,18 @@ Read this FIRST if something fails. Each row is a real mistake that costs hours 
 > Behavioral surprises · Anti-patterns · Secrets & config
 > Coming from Python? The traps that LOOK like Python but aren't are also collected in
 > [python-diff.md](python-diff.md).
+
+## Upgrading to v0.6.50 — what behaves differently
+
+| You see | What changed | What to write |
+|---|---|---|
+| `Undefined variable: 'TASA' — 'TASA' is a name of the program that imports this module, and a module sees only its own names and the builtins: pass it as an argument or define it in the module` (or `Cannot set undefined variable: 'TASA'. Use 'let' first. — …` for a `set`) | **breaking:** a module no longer reads (or `set`s) the globals of the file that imports it; it sees its own names and the builtins only | pass it: `lib.charge(n, TASA)`, or move it into the module (`export let TASA be 2`, read `lib.TASA` in the program) — modules.md |
+| an agent's output (or its label cut) appears that used to be lost when it was spawned by another agent | the run waits for every agent, also nested ones | nothing; if it now never ends, the nested agent never finishes — `agent_stop` it or give it an end |
+| `run --explain` exits with the code of `exit(n)` (it exited 1) | same as `run` | check the code you expect |
+| `warning: --cap-set llm=P: the program may declare require llm("P"), but data private to P goes to no model until the item names the provider …` at startup | the warning moved from the first call to startup | `llm=P@<provider host>` (`@local`, `P@*`) |
+| `warning: trusted:tools:N: require … in task helper grants nothing …` | a `require` in a non-exported task of a trusted tool never granted anything; now it says so | move the `require` into the exported task |
+| Rust embedders: `engine::last_run_exit_code()` / `last_run_steps()` / `last_run_touched_private()` do not exist | **breaking:** they were process globals; the values travel in `RunResult` (`exit_code`, `steps`, `touched_private`) | read them from the `RunResult`; building one by hand takes `..Default::default()` |
+| a receipt's `program_sha` is `null` | the process ran two different programs (an embedder, `synsema test` on several files after the first) | one program per process (`run`/`serve`) always carries it |
 
 ## Upgrading to v0.6.49 — what behaves differently
 

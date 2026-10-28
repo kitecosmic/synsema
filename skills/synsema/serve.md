@@ -185,6 +185,17 @@ route "POST /upload"
 ⚠️ A missing map key errors (`Map has no key 'email'`) — check membership with
 `contains(keys(f), "campo")` before accessing optional fields.
 
+## What a route sees of the program (v0.6.50+)
+
+Everything defined at the top level **before** the `serve` block: tasks, values, `type`s and
+`enum`s (`Point(1)`, `Shape.circle(2)`), a builtin bound to another name (`let up be upper`), the
+modules and their exports (`m.Point2(3)`, `m.Status.paid("x")`, a map of callbacks a module built,
+`m.M["price"](3)`), and the trusted tools loaded with `--trusted` (modules.md § Trusted modules —
+under `serve` since v0.6.50). A lambda or local task passed to `parallel_map` in a route carries its
+locals (concurrency.md). Up to v0.6.49: `Undefined variable: 'Point'`, `Cannot call value of type
+text` for a variant with a payload or a module's constructor, `Undefined variable` for a global
+alias of a builtin.
+
 ## Shared mutable state across requests (`state_*`)
 
 ⚠️ A `set globalVar to ...` inside a route handler does NOT persist to the next request —

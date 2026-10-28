@@ -272,7 +272,14 @@ run` (exit 1). **It checks the program first** (v0.6.49+): `header.program_sha` 
 program's (`synsema code sha`) and the `--trusted` modules' hashes (`trusted`) → another program
 does not run, exit 2: `--replay: the receipt is of another program (program_sha … in the receipt, …
 here); to run this program against it anyway, add --replay-any-program (the result is not a
-verification)`; no `program_sha` → `the receipt has no program_sha`. `--replay-any-program` runs it,
+verification)`; no `program_sha` → `the receipt has no program_sha`. **v0.6.50+:** a tool with
+`--trusted-templates` hashes its source **and** its templates, so a changed template is refused
+(``--replay: the receipt's trusted modules ({"tools":"19deb…"}) are not the ones given here
+({"tools":"0346…"}); to run against it anyway, add --replay-any-program …``); a tool without
+templates keeps its source's sha. `program_sha` describes the program of the process: one that ran
+two different programs (an embedder; `synsema test` on several files after the first) carries
+`null` (before, the second carried the first one's sha). The real text of an error redacted for
+touching private data goes into the envelope as a sealed `label_violation` entry (labels.md). `--replay-any-program` runs it,
 warns, and the verdict ends `(another program: not a verification)`. **The clock counts**: more or
 fewer `now()` readings than recorded = a difference (exit 1, `replay: the run read the clock 2 times,
 the recorded run 1`), unless the envelope cut them (warning `the recorded run kept 36 clock readings
