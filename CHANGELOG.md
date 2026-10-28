@@ -137,6 +137,16 @@ Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the rele
     once per line. A task the module exposes in an export (directly, by another name, or inside a
     map or a list) counts as exported; one that an exported task or lambda only calls does not.
 
+**The `perf-guard` anchor was re-measured on CI** (`engine/perf/baseline.json`, from this release's
+PR). No function of arithmetic or of maps changed; the compiler stopped inlining two of them into
+the interpreter, whose code grew in this release:
+- `Number::add` is now a call in the tree-walker (`ref`): `loop`, `loop_each`, `o_plus` and `c_base`
+  rise 0.24–0.27 %, `s_spectral` 0.6 %;
+- `indexmap`'s lookup by text (`get_index_of`, `get_full`, `get_mut`) is a call in `s_words`: +1.4 %
+  (jit), +0.7 % (vm), +0.25 % (ref). The function now counted on its own accounts for more than the
+  whole rise: the rest is what the callers no longer count.
+- Other rows drop: `a_args*` and `a_name64` 0.4–0.6 % (vm, ref), `c_base` (vm) 0.5 %.
+
 ## v0.6.49 — 2026-10-26
 
 **Behavior changes (read these first).**
