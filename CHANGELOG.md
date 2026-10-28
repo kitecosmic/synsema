@@ -6,7 +6,7 @@ Each says what changed, why, and what to write instead.
 
 Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the release date.
 
-## v0.6.50 — unreleased
+## v0.6.50 — 2026-10-28
 
 **Behavior changes (read these first).**
 - **A module sees only its own names and the builtins, never the names of the program that imports
