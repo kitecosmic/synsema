@@ -2,6 +2,8 @@
 -- adentro TODO está denegado (random/secret/time), `require` adentro no re-concede,
 -- una task llamada desde adentro tampoco escapa, el estado se RESTAURA al salir
 -- (también tras un raise), anidado y como expresión. Misma salida nativo/wasm.
+-- Desde v0.6.51 un `sandbox` pelado también niega stdout: lo de adentro se guarda en variables
+-- y se imprime al salir.
 -- Con `--sandbox` (techo del host) la primera línea ya debe fallar: `require random`
 -- está por encima del techo [stdout, time].
 
@@ -11,29 +13,39 @@ require secret("ETH_KEY")
 print(`outside_random={type_of(random())}`)
 print(`outside_secret={type_of(secret("ETH_KEY"))}`)
 
+let s_random be ""
+let s_secret be ""
+let s_time be ""
+let s_require be ""
+let s_pure be ""
 sandbox
     try
         random()
-        print("sandbox_random=PERMITIDO")
+        set s_random to "PERMITIDO"
     recover e
-        print(`sandbox_random={e}`)
+        set s_random to `{e}`
     try
         secret("ETH_KEY")
-        print("sandbox_secret=PERMITIDO")
+        set s_secret to "PERMITIDO"
     recover e
-        print(`sandbox_secret={e}`)
+        set s_secret to `{e}`
     try
         now()
-        print("sandbox_time=PERMITIDO")
+        set s_time to "PERMITIDO"
     recover e
-        print(`sandbox_time={e}`)
+        set s_time to `{e}`
     require random
     try
         random()
-        print("sandbox_require=ESCAPO")
+        set s_require to "ESCAPO"
     recover e
-        print(`sandbox_require={e}`)
-    print(`sandbox_pure={sum([1, 2, 3])}`)
+        set s_require to `{e}`
+    set s_pure to `{sum([1, 2, 3])}`
+print(`sandbox_random={s_random}`)
+print(`sandbox_secret={s_secret}`)
+print(`sandbox_time={s_time}`)
+print(`sandbox_require={s_require}`)
+print(`sandbox_pure={s_pure}`)
 
 print(`after_random={type_of(random())}`)
 print(`after_secret={type_of(secret("ETH_KEY"))}`)
@@ -41,18 +53,22 @@ print(`after_secret={type_of(secret("ETH_KEY"))}`)
 let v be sandbox 2 + 3
 print(`sandbox_expr={v}`)
 
+let n_inner be ""
+let n_outer be ""
 sandbox
     sandbox
         try
             random()
-            print("nested_inner=PERMITIDO")
+            set n_inner to "PERMITIDO"
         recover e
-            print(`nested_inner={e}`)
+            set n_inner to `{e}`
     try
         random()
-        print("nested_outer=PERMITIDO")
+        set n_outer to "PERMITIDO"
     recover e
-        print(`nested_outer={e}`)
+        set n_outer to `{e}`
+print(`nested_inner={n_inner}`)
+print(`nested_outer={n_outer}`)
 print(`after_nested={type_of(random())}`)
 
 try
@@ -64,10 +80,12 @@ print(`after_raise={type_of(random())}`)
 
 task lee_secreto()
     give secret("ETH_KEY")
+let t_sandbox be ""
 sandbox
     try
         lee_secreto()
-        print("task_in_sandbox=PERMITIDO")
+        set t_sandbox to "PERMITIDO"
     recover e
-        print(`task_in_sandbox={e}`)
+        set t_sandbox to `{e}`
+print(`task_in_sandbox={t_sandbox}`)
 print(`after_task={type_of(lee_secreto())}`)
