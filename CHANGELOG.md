@@ -6,7 +6,7 @@ Each says what changed, why, and what to write instead.
 
 Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the release date.
 
-## v0.6.51 — unreleased
+## v0.6.51 — 2026-10-29
 
 **Behavior changes (read these first).**
 - **`print` inside a plain `sandbox` block fails, with or without a host ceiling.** The block denies
