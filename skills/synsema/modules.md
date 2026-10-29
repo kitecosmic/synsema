@@ -38,6 +38,29 @@ Run it: `synsema run main.syn`.
   print(text(keys(orders)))     -- ["total_orders", "greet_order"]   (only the exports)
   orders.secret_helper()        -- error: Map has no key 'secret_helper'
   ```
+- **A module sees only its own names and the builtins (v0.6.50+, breaking).** A name the module
+  does not define is looked up in the prelude (builtins, `pi`, `tau`, `e`, `inf`, `nan`, what the
+  host registered), **never in the program that imports it** — as in Rust, OCaml, Go or Python (a
+  Python module sees its globals and `builtins`, never `__main__`'s). A program that defines
+  `task upper(x)` or `let upper be 3` does not change its modules' `upper(…)`. Same under `serve`,
+  `parallel_map`, agents, `synsema test` and the REPL.
+  ```
+  -- lib.syn                          -- main.syn
+  export task charge(n)               use "./lib.syn" as lib
+      give n * RATE   -- not here!    let RATE be 2
+                                      print(lib.charge(5))   -- error (v0.6.50+)
+  ```
+  → `Undefined variable: 'RATE' — 'RATE' is a name of the program that imports this module, and a
+  module sees only its own names and the builtins: pass it as an argument or define it in the
+  module`. A `set RATE to …` in the module gives `Cannot set undefined variable: 'RATE'. Use 'let'
+  first. — 'RATE' is a name of the program …`. **Fix:** pass it (`export task charge(n, rate)` →
+  `lib.charge(5, RATE)`) or move it into the module (`export let RATE be 2`; the program reads
+  `lib.RATE`). Up to v0.6.49 the module read (and could `set`) the importer's globals, defined
+  before or after the `use`.
+- **What the program passes in keeps its own scope**: an argument, a callback or a lambda of the
+  program runs with the program's names, also when the module keeps it and calls it later (from a
+  request, a worker or an agent). A lambda of module `a` kept by module `b` closes over `a`,
+  whatever the order of the `use` lines.
 
 ## Export data and types, not just tasks
 ```synsema
@@ -90,6 +113,11 @@ print(lib.read_x())            -- 42
 - Only the module's variables are shared; a map of data you build (even one holding tasks,
   `{"f": lib.f}`) is an ordinary value, copied on write — what stays shared inside it is the module
   itself (`{"l": lib}`), not copies of its values.
+- **Under `serve`, a module that exports only data built by its tasks is still a module**
+  (v0.6.50+): with `export let M be build()` (a map of callbacks), `m.M["price"](3)` in a route runs
+  in the module and can call its private helpers (up to v0.6.49: `Undefined variable` under `serve`,
+  fine under `run`). Its `export type`/`export enum` constructors work in a route too
+  (`m.Point2(3)`, `m.Status.paid("x")`; up to v0.6.49 `Cannot call value of type text`).
 
 ```
 -- other.syn:  use "./lib.syn" as l2  /  export let L be l2
@@ -166,9 +194,11 @@ customer's data, but it can call `t.reply(customer, text)`, whose policy declass
 customer's own address.
 
 ```sh
-synsema run  --labels --cap-set stdout --trusted tools=./tools.syn app.syn
-synsema test --labels --cap-set stdout --trusted tools=./tools.syn app.test.syn
-synsema run  … --trusted tools=./tools.syn --trusted-cap-set "stdout,declassify=customers" app.syn
+synsema run   --labels --cap-set stdout --trusted tools=./tools.syn app.syn
+synsema test  --labels --cap-set stdout --trusted tools=./tools.syn app.test.syn
+synsema run   … --trusted tools=./tools.syn --trusted-cap-set "stdout,declassify=customers" app.syn
+synsema serve --labels --trusted tools=./tools.syn --trusted-cap-set "stdout,declassify=customers" app.syn   # v0.6.50+
+synsema run   --trusted tools=./tools.syn --trusted-templates tools=./tools-templates app.syn         # v0.6.50+
 ```
 
 ```synsema
@@ -188,14 +218,24 @@ print(declassify(c.email, "direct"))          -- label_violation: declassify is 
 ```
 
 **Flags.**
-- `--trusted <name>=<path>` (repeatable; on `synsema run` and `synsema test`): `name` is letters,
-  digits, `_` or `-`; the path is relative to the working directory. Errors: `--trusted takes
-  name=path (a name of letters, digits, '_' or '-'), e.g. --trusted tools=./tools.syn`,
-  `--trusted tools: cannot read ./x.syn: …`, `--trusted tools: the name is given twice`.
+- `--trusted <name>=<path>` (repeatable; on `synsema run`, `synsema test` and, v0.6.50+,
+  `synsema serve`; `conform` refuses it): `name` is letters, digits, `_` or `-`; the path is
+  relative to the working directory. Errors: `--trusted takes name=path (a name of letters, digits,
+  '_' or '-'), e.g. --trusted tools=./tools.syn`, `--trusted tools: cannot read ./x.syn: …`,
+  `--trusted tools: the name is given twice`.
 - `--trusted-cap-set "<list>"`: the ceiling of **every** trusted module (same syntax as
-  `--cap-set`). In wasm the options are `trusted: {tools: source}` and `trusted_ceiling`.
-- `synsema serve` refuses `--trusted`: `--trusted runs under \`synsema run\` and \`synsema test\`
-  for now (a trusted tool is not isolated in the workers of \`serve\` yet)`.
+  `--cap-set`). In wasm the options are `trusted: {tools: source}` (or `{tools: {source,
+  templates}}`) and `trustedCeiling`.
+- `--trusted-templates <name>=<dir>` (v0.6.50+, repeatable): the tool's templates — see *Templates
+  of a trusted tool* below. Errors: `--trusted-templates tools: cannot read ./tpl: …`,
+  `--trusted-templates x: there is no --trusted x=… to give them to`, and without any `--trusted`,
+  `--trusted-cap-set and --trusted-templates go with the modules of --trusted; pass --trusted
+  name=./file.syn too`.
+- **Under `synsema serve` (v0.6.50+; up to v0.6.49 it refused the flag)** each worker gets the same
+  tool the program loaded (its tasks, the tools it imports, its top-level state). The tool's top
+  level runs **once**, at load, and **each request starts from the state the tool had then** (a
+  call counter in the tool gives `1` in every request), like a file module. A `use "trusted:t"`
+  inside a route gets that same tool. Everything below holds as under `run`.
 
 **What a trusted task may do.**
 - Its capabilities are its own `require`s **inside each exported task** (a top-level `require` in
@@ -215,7 +255,18 @@ print(declassify(c.email, "direct"))          -- label_violation: declassify is 
   task declassifies like a program without a ceiling — **any principal** — so give the trusted
   modules a ceiling.
 - A trusted module can `use` another trusted module (`use "trusted:base" as base`); a file module
-  (`use "./x.syn"`) is an error: `a trusted module imports only other trusted modules …`.
+  (`use "./x.syn"`) is an error: `a trusted module imports only other trusted modules
+  (\`use "trusted:…"\`), not './x.syn': a file module is read from disk, where the program can
+  write it, and it would run with the tool's capabilities`.
+- **A `require` in a task the module does not export grants nothing — and warns at load**
+  (v0.6.50+, once per line, stderr): ``warning: trusted:tools:2: `require time` in task helper
+  grants nothing: the module does not export helper, and a trusted task runs with what the exported
+  task the program calls declares. Declare it in that exported task``. A task exposed in an export
+  (directly, under another name, or inside a map or a list) counts as exported; one an exported
+  task only calls does not.
+- **A tool task held in an export runs in the tool's scope** (v0.6.50+): `export let M be {"f":
+  helper}` → `t.M["f"]()` runs with the tool's `require` ∩ `--trusted-cap-set` (before: with the
+  program's capabilities).
 - Its audit entries carry `context: "trusted:tools"` and `file: "trusted:tools"`, and its
   `declassify` log lines say `at trusted:tools:<line>`.
 
@@ -231,6 +282,9 @@ print(declassify(c.email, "direct"))          -- label_violation: declassify is 
   original. Replacing a task or adding a name is an error (v0.6.49+): `cannot replace the trusted
   task 'reply' from outside the module`, `trusted module has no export 'nuevo' — its names are the
   ones it exports, and the program cannot add one`.
+- **It reaches workers and agents** (v0.6.50+, under `run`): `parallel_map(t.double, [1, 2, 3])` →
+  `[2, 4, 6]`, and an agent's body can call `t.double(21)` (before: `Cannot call value of type
+  nothing`, and the agent did not find the tool).
 - **It cannot load one itself**: the name comes only from the host, and the program never sees the
   path. An unknown name is a load error: `no trusted module named 'tools': the host loads it
   (\`synsema run --trusted tools=./file.syn\`, or \`trusted: { tools: source }\` in wasm); a
@@ -244,12 +298,43 @@ print(declassify(c.email, "direct"))          -- label_violation: declassify is 
   {…})` with a private value in the argument map gives a **private** result even when the tool
   declassified what it returns; `call_tool` and the direct call keep the public result.
 
+**Templates of a trusted tool (v0.6.50+).** A template is code (`{upper(x)}` calls a task), and one
+read from the working directory could be written by the program. So a tool renders **only the
+templates the host gives it**:
+```
+-- tools.syn; ./tools-templates/greeting.html holds <p>Hello {upper(name)}</p>
+export task greeting(name)
+    give render("greeting.html", {"name": name})
+```
+`synsema run --trusted tools=./tools.syn --trusted-templates tools=./tools-templates app.syn`, and
+`t.greeting("ana").body` is `<p>Hello ANA</p>` (`render` gives `{status, body, content_type}`;
+read the page as `.body` — `r["body"]` on a `render` result fails with `Cannot index into map`).
+- The directory is read **at startup**, before the program runs. Inside the tool `render`,
+  `include` and `layout` resolve only against that set — never the working directory or the
+  program's bundle — and need no `file.read`. Symlinks are not followed.
+- A template's free names are the **builtins**, not the program's (`{upper(x)}` is the builtin even
+  if the program defines `task upper`). A private value in the data is written as its value and the
+  HTML carries its label (labels.md).
+- Without templates from the host: ``render: the trusted tool 'tools' has no templates
+  ('greeting.html'): a template is code, … the host gives the tool its templates with
+  `--trusted-templates tools=<dir>` (in wasm, `trusted: { tools: { source, templates } }`)``. A
+  `render` with a literal name fails **when the tool loads**, before any data reaches it.
+- wasm: `trusted: { tools: { source, templates: { "greeting.html": "<p>…</p>" } } }`; names are
+  normalized as `render` looks them up, and two names for one template are an error
+  (`trusted.tools.templates: './greeting.html' and another name are the same template
+  (greeting.html)`).
+- `synsema check tools.syn` validates `render("literal.html")` from the **working directory**, as
+  for a program: run it from the templates directory (elsewhere: `template validation failed for
+  render("greeting.html"): template not found: greeting.html`).
+- The sealed receipt's `trusted` sha of a tool with templates covers source **and** templates, so
+  `--replay` refuses a run whose template changed (observability.md).
+
 **What it does not do yet** — each one is an error inside a trusted tool, naming the reason:
-defining or spawning an agent, `parallel_map`, `cron_every`/`cron_after`, a `use` of a file module
-(all of them would run in another interpreter next to the program's names), and `render` (with its
-`include`s and layouts: the template file lives where the program can write it — build the text in
-the tool). With trusted modules the **whole program runs on the tree-walker**, without the bytecode
-VM (measured: a 3 M-iteration loop, 0.07 s → 0.8 s).
+defining or spawning an agent, `parallel_map` (`parallel_map: a trusted tool cannot fan out yet —
+its workers would run with the tool's capabilities next to the program's names; loop over the items
+in the tool`), `cron_every`/`cron_after`, and a `use` of a file module. (`render` works since
+v0.6.50, with the host's templates.) With trusted modules the **whole program runs on the
+tree-walker**, without the bytecode VM (measured: a 3 M-iteration loop, 0.07 s → 0.8 s).
 
 ## Example layout (entry → core → data)
 ```
@@ -267,6 +352,9 @@ The entry calls `core.handle(...)`; `core` uses `data.LABELS`, etc. `core`'s int
 - Export **only what other files need**; keep everything else private.
 
 ## Gotchas
+- **`Undefined variable: 'X' — 'X' is a name of the program that imports this module …`** (v0.6.50+):
+  the module used a global of the file that imports it. Pass it as an argument or define it in the
+  module (see *How it works*).
 - Forgot `export`? The symbol simply **doesn't exist** for importers (`Map has no key '…'`). This is the
   #1 cause of "my module doesn't work".
 - Calls **within the same file** are direct (`foo()`); only **cross-file** calls need the alias prefix

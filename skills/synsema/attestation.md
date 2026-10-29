@@ -448,7 +448,7 @@ v0.6.24, `release.yml@refs/tags/v0.6.24` at commit `8284861`. This is the check 
 **3. Reproducibility — can someone else get the same bytes?** For the **Vela guest** the release
 rebuilds `synsema-vela-guest.wasm` on two different Ubuntu versions with the pinned toolchain and
 compares both against the asset it published; since v0.6.48 one of the two builds from another
-folder with another `CARGO_HOME`. On v0.6.49 all three agreed: `950b38a48bd320a3592f5467aaf224ff44723fdb0fd4efe1b3e59c4301a085ff`. It matters there because
+folder with another `CARGO_HOME`. On v0.6.50 all three agreed: `9ba6f31970c59db9e51f31d888abdbd30885e7932e5469fa7b7d80760ccc9ee5`. It matters there because
 the chain verifies a `wasmSha256`, so "rebuild it yourself and compare" is a real check a
 counterparty can run: from a checkout of the tag, on Linux or WSL, `SYNSEMA_VERSION=<the tag> bash
 packages/guests/vela/tools/build.sh out.wasm` from the repo root gives the published hash in any

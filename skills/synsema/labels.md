@@ -258,6 +258,19 @@ print(summary)                               -- private(customers): the answer c
 The full rules (`@local`, `@*`, `judge=`, `llm_step`, `llm_stream`, audit, lineage, what it does not
 give) are in [llm.md](llm.md) § Private data to a model.
 
+## Templates and redacted errors (v0.6.50+)
+
+- **A template writes a private value as its value, and the HTML carries its label.** With
+  `<p>{c.name} {upper(c.name)}</p>` and a private `c`, `render` gives `<p>Ana ANA</p>` labelled
+  `[private(customers)]`; the sink redacts or refuses the whole page. Up to v0.6.49 the call wrote
+  the marker (`<p>Ana private(customers)</p>`). A private value the template reads otherwise
+  (written, or deciding a `{ when }`) labels the HTML too.
+- **The auditor learns why an error was redacted.** An error redacted because it touched private
+  data (`when c.name == "Ana"` then `1 / 0` → `Runtime error: b.syn:3:16: private(customers)`
+  without a ceiling) puts its real text in the sealed receipt, with or without a ceiling: `synsema
+  receipt open` shows `{"sealed": true, "entry": {"kind": "label_violation", "detail": "b.syn:3:16:
+  Division by zero"}}`. The program still sees the fixed text under a ceiling.
+
 ## Trusted tools: code a person wrote, called by code a model wrote (v0.6.46+)
 
 Under a ceiling without `declassify`, a program written by a model cannot publish anything private.

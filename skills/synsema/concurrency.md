@@ -33,6 +33,31 @@ task safe_fetch(id)
 let results be parallel_map(safe_fetch, ids)   -- never aborts; each item is value-or-error
 ```
 
+**A lambda or a local task carries its locals (v0.6.50+).** The task you pass can use the locals
+of the task that built it; they cross **copied** (a `set` on a captured local changes the
+worker's copy, not the original), and only the ones it names (a big unused local costs nothing):
+```synsema
+task scale(xs, n)
+    give parallel_map((x) => x * n, xs)        -- [10, 20, 30] for scale([1, 2, 3], 10)
+
+task shift(xs)
+    let base be 7
+    task plus(x)                               -- a local task: also recursive ones work
+        give x + base
+    give parallel_map(plus, xs)                -- [8, 9] for shift([1, 2])
+```
+Up to v0.6.49 both failed with `Undefined variable: 'n'`. The same holds for agents and `serve`
+requests. Also crossing now: a **list of tasks** (`let L be [(x) => x + 1]`, then `L[0](x)` in a
+worker; before, `Cannot call value of type text`), a **builtin under another name** (`let up be
+upper`), a `type` constructor / `enum` variant, a trusted task in a variable (keeps the tool's
+scope), and `parallel_map(t.f, xs)` with a trusted tool. What cannot cross says so: a generator
+held in a local (`the generator rng(1) is a local of the task that made this lambda; here it would
+restart the same sequence in every request/worker — create it inside the lambda, or give each
+parallel_map item its own with rng_spawn(g, n)`), an engine closure (`'read_body' is a closure of
+the engine that does not cross into a worker: call it before and pass its result`), and a builtin
+the worker lacks (`state_*` in a `parallel_map` worker of a request → `Undefined variable:
+'state_get'`: call it in the route, pass the value).
+
 **Isolation:** each item runs in its own interpreter scope (CSP model — inputs are
 snapshot-copied, like `spawn`). It inherits the caller's capabilities under the frozen
 intent: a `fetch`/`read_file` inside still needs its `require`. A module's exported state is one

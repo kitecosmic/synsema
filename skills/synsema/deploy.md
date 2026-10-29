@@ -621,7 +621,9 @@ tried to read STRIPE_KEY" = `origin == "program" && !granted`; no need to re-par
    private data of `<p>` reach the host's hook; `judge` is now gated by its capability (it ran even
    when the ceiling did not grant it).
 5. **`trusted: {name: source}` + `trustedCeiling`** (`use "trusted:name" as t`), in `run`, `runAsync`,
-   `handle` and `test` — see [modules.md](modules.md) § Trusted modules.
+   `handle` and `test` — see [modules.md](modules.md) § Trusted modules. v0.6.50+: `trusted: {name:
+   {source, templates: {"r.html": "…"}}}` gives the tool its templates (`render`/`include`/`layout`
+   inside it resolve only against them).
 6. A run with `labels` that hits `maxMemoryMb` reports `steps: null, private_seen: true` (whether it
    ran out of memory can depend on a private value).
 7. In `handle`, `receipt()`/`lineage()` list only that request's inputs (what the top level read is no

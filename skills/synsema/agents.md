@@ -26,12 +26,35 @@ spawn Researcher with query = "AI safety"
   your top-level tasks directly, no HTTP needed. But it's a copy: mutating a value inside the
   agent does NOT affect the parent or other agents. Share state via the blackboard. (Secrets are
   redacted when they cross into an agent.)
-- **What the agent does NOT see**: tasks defined inside imported modules (only the entry
-  program's top-level bindings are snapshotted — re-export what the agent needs as a top-level
-  task), and a task passed as a `spawn` argument arrives as **text** (closures do not cross
-  threads — pass data, or the name of a top-level task and call it inside). Each agent is a
+- **The program's modules travel too**: the agent calls `lib.f(…)` through the alias, and the
+  module's task runs in the module (with its private helpers).
+- **A task passed as a `spawn` argument arrives as text**: `spawn A with g = f` → `g` is
+  `"task f(x)"` and `g(1)` fails with `Cannot call value of type text`. Pass data, or call the
+  top-level task by its name inside the agent. (A lambda or local task given to `parallel_map`
+  inside the agent does carry its locals — see concurrency.md.)
+- **An agent that starts another defines it in its own body** — the program's top-level agents are
+  not in the agent's interpreter (`spawn Sub` there → `No agent defined with name 'Sub'`):
+  ```
+  agent Pub
+      agent Sub
+          require time
+          sleep(0.3)
+          print("sub")
+      spawn Sub
+      print("pub")
+  spawn Pub
+  print("main")          -- main, [Pub_0] pub, [Sub_1] sub
+  ```
+  **The run waits for every agent, also the ones an agent spawns** (v0.6.50+; before, if `Pub`
+  ended first the run ended without `Sub`: lost output, and a label cut of `Sub` could miss the
+  run, which exited 0). Same under `synsema test`, `--explain` and `conform --swarm`. `exit` stops
+  the live agents there too (they used to hang), and `run --explain` exits with the code of `exit`
+  (it exited 1). Each agent is a
   fresh interpreter with its own capability set: it needs its **own `require`** lines in its
-  body (bounded by the host ceiling), the parent's grants are not inherited. The rule is
+  body (bounded by the host ceiling), the parent's grants are not inherited. The error says where
+  (v0.6.50+): ``Capability not granted: file_read("x.txt") — this is a permission, not a bug: add
+  `require file.read("x.txt")` to the body of agent A (an agent declares its own capabilities: the
+  program's `require` does not reach it)``. The rule is
   "a body of its own declares, a function inherits": `task` and `parallel_map` workers inherit
   the caller's grants; `agent`, `run_program` and a module declare their own (a module's are
   declared by the file that imports it).
