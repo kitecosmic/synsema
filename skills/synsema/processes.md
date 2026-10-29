@@ -144,6 +144,22 @@ key)})` runs the child under **that token's authority** — the third way the to
 give) unless the token carries `deterministic: true`; a plain `{capability: scopes}` map works the same way. This is the language-level "run the code the LLM generated, safely" — the ceiling is
 enforced by the child process itself. See [capabilities.md](capabilities.md) and [builtins.md](builtins.md).
 
+**The child inherits every layer that limited its caller (v0.6.51+)** — its grants, its host ceiling,
+its enclosing `sandbox under` blocks and its tokens (with all their blocks), plus the token passed as
+`ceiling`. That matters for private addresses: a caller with `require net("*")` reaches only public
+ones, so a child given `"ceiling": "stdout,net=127.0.0.1:47999"` does not reach `127.0.0.1` either
+(before v0.6.51 it did: the wildcard covered the name). The child's error says where the limit is:
+``http_get: `127.0.0.1` resolved to 127.0.0.1, a private address; the ceiling of the program that
+called run_program reaches only public addresses for it: name it there (`net("127.0.0.1:47999")`)``.
+
+**A caller whose limits do not fit is refused (v0.6.51+), on every platform.** What limits the caller
+travels to the child in an environment variable, and its ceiling and `filename` on the command line;
+Windows caps each near 32 767 characters. Past 30 000:
+- ``run_program: the caller's capabilities are too many to pass to the child (N bytes; the limit is 30000)``
+  — hundreds of long grants: grant a folder with `**` instead of each subfolder.
+- ``run_program: the child's command line would be N characters (its ceiling and filename); the limit is 30000``
+  — shorten the `filename` (it is only a label) or the ceiling.
+
 **What `run_program` refuses and where the child lives (v0.6.45+):**
 - An `env` that sets `SYNSEMA_*` or a variable the engine uses to pick host paths: `HOME`,
   `USERPROFILE`, `TMP`/`TEMP`/`TMPDIR`, `APPDATA`, `XDG_*`, `OLLAMA_MODELS`, `HF_*` (`SYNSEMA_AUDIT`
@@ -314,7 +330,9 @@ because there is nothing new to gate.
 `read_line` gives one cooked line at a time. `term_open` puts the terminal in raw mode and
 delivers **every key as an event** in the same hub as `proc_*`/`bus_*`/`watch` — so a chat
 CLI, a `/` command palette that filters as you type, a line editor with history, or a ↑↓ menu
-for `approve` is a `select` loop in Synsema, not a runtime feature. Gate: `require stdin`.
+for `approve` is a `select` loop in Synsema, not a runtime feature. Gate: `require stdin` to open it;
+`term_write` also needs `stdout`, like `print` (v0.6.51+; denied inside a plain `sandbox`, even with a
+terminal opened outside).
 
 ```synsema
 require stdin
@@ -350,7 +368,7 @@ otherwise
 | `term_open(opts?)` | handle (int) — in `select`, tagged `source: "term"`; **`nothing`** when stdin/stdout is not a TTY, under `serve`/`test`/`conform`, in wasm |
 | `term_recv(h, timeout?)` | next event or `nothing` (default timeout 30 s — pass one when waiting for a human) |
 | `term_size(h)` | `{cols, rows}` |
-| `term_write(h, text)` | writes to stdout immediately; ANSI escapes allowed |
+| `term_write(h, text)` | writes to stdout immediately (needs `stdout`); ANSI escapes allowed |
 | `term_stats(h)` | `{kitty, paste, ansi, keys, queued, dropped}` |
 | `term_close(h)` | restores the terminal; idempotent (the runtime restores anyway on drop/error/panic) |
 

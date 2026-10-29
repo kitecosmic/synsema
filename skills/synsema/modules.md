@@ -180,6 +180,9 @@ group's shape is validated when the serve is built. Full details in
   `state`/`config` module keeps one identity (write via one importer, read via another), same as
   `run`. Across requests/workers nothing is shared (CSP isolation): use `state_*`, SQL or
   `remember` for that.
+- **A module with no tasks is one instance too (v0.6.51+):** `set m.X to 5` in the program is seen
+  by another module that imports the same file (`a.X` is `5`), even when it only exports data; before
+  v0.6.51 that module's map became a copy once it finished loading and `b` kept seeing `1`.
 - **Cycles are detected:** a circular import gives a clear error (`circular import: …`), not a hang.
 - **A module must not contain a `serve` block or a top-level `require`** — those belong to the entry
   file. (A per-task `require` *inside* a task is fine.)
@@ -323,9 +326,14 @@ read the page as `.body` — `r["body"]` on a `render` result fails with `Cannot
   normalized as `render` looks them up, and two names for one template are an error
   (`trusted.tools.templates: './greeting.html' and another name are the same template
   (greeting.html)`).
-- `synsema check tools.syn` validates `render("literal.html")` from the **working directory**, as
-  for a program: run it from the templates directory (elsewhere: `template validation failed for
-  render("greeting.html"): template not found: greeting.html`).
+- `synsema check --templates <dir> tools.syn` (v0.6.51+) validates each `render("literal.html")`
+  (and its `include`/`layout`) against that folder, the way the tool reads the folder the host
+  gives it with `--trusted-templates name=<dir>` → `OK: 1 statements parsed. 1 template(s)
+  validated.` The tool's modules are still resolved from the file. Without the option `check`
+  looks in the working directory, and a missing template says to pass it: `template validation
+  failed for render("card.html"): template not found: card.html (render() reads templates from
+  the current directory; if this file is a trusted tool, check it against the folder the host
+  gives it: synsema check --templates <dir> tool.syn)`.
 - The sealed receipt's `trusted` sha of a tool with templates covers source **and** templates, so
   `--replay` refuses a run whose template changed (observability.md).
 

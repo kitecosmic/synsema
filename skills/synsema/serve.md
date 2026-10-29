@@ -707,11 +707,17 @@ GET /blog/hola.json                         # explicit → JSON (the node tree)
 - **Default is HTML** — including `Accept: */*` or no/unclear `Accept`.
   `Accept: text/markdown` → Markdown; `Accept: application/json` → JSON.
 - **Suffix** `.md`/`.json`/`.html` is an explicit selector. It is stripped before
-  matching, so it works with `:param` routes (`/blog/hola.json` → slug `hola`).
+  matching, so it works with `:param` routes (`/blog/hola.json` → slug `hola`) and
+  (v0.6.51+) with **literal** routes: `route "GET /historial"` answers
+  `/historial.md` and `/historial.json` (before v0.6.51 those were a 404). The suffix is
+  tried only when no route matches the whole path.
 - **No conflict with static files / literal routes.** A real file (`data.json`) or
   a route authored literally (`route "GET /report.json"`) is served **as-is** and
-  wins over negotiation — the suffix only re-interprets a path a `:param` captured.
-  A `*catch-all` keeps the dotted value too (it's not negotiated).
+  wins over negotiation. A `*catch-all` keeps the dotted value too (it's not negotiated).
+- **The runtime's URLs win over the suffix** (v0.6.51+): a route `GET /openapi` does not
+  take `/openapi.json` (nor `//openapi.json`) or `GET /.well-known/agent-card` the agent
+  card while the runtime publishes them; with `private` or `discovery off` it does, as a
+  `:param` route does; under `serve --attested` it never does.
 - Negotiation applies **only** to `content()` values; everything else is unchanged.
 
 ### Discoverability — `/llms.txt`, `/robots.txt`, `/sitemap.xml`, `/openapi.json`, `/docs`
@@ -1044,6 +1050,13 @@ serve on 8080
 
 `synsema run` is untouched (no listener). Under `serve --watch`, the supervisor restarts
 the child; Ctrl-C reaches both.
+
+**A preamble that fails after `serve on` (v0.6.51+)** ends the run the same way: the server
+already listening drains and stops, then the error comes back with its exit code. stderr:
+``[serve] the preamble failed after `serve on`: stopping the server``, `[serve] shutting down:
+draining …`, `[serve] stopped`, then `Runtime error: app.syn:5:12: Division by zero` (exit 1).
+Before v0.6.51 `synsema serve` exited at once, cutting the requests in flight (an embedded
+program kept serving).
 
 ## Rate limiting
 

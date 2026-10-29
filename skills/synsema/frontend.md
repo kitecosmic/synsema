@@ -193,8 +193,10 @@ or a `.md` / `.json` URL suffix). Nodes: `heading`, `prose`, `list`, `ordered_li
 `link`, `image`, `code`, `section`, `raw`.
 
 The HTML representation is wrapped in `<main class="...">` (default `prose`). Control it via
-the page `meta` — none of it leaks into the Markdown/JSON:
+the page `meta` — none of the presentation keys leak into the Markdown/JSON (v0.6.51+; before,
+the JSON `meta` carried `stylesheet`, `class` and the raw `header`/`footer` HTML):
 
+- `"lang"` (v0.6.51+): `<html lang="…">` (default `en`); the JSON keeps it in `meta`.
 - `"stylesheet"`: a CSS URL → `<link>` in `<head>`.
 - `"class"`: the container class (default `"prose"`; set your own).
 - `"header"` / `"footer"`: raw HTML wrapped around the content (e.g. your site nav/footer —
