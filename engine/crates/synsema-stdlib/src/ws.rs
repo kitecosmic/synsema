@@ -3260,8 +3260,12 @@ fn term_size(args: &[SynValue], reg: &Registry) -> Result<SynValue, Control> {
 }
 
 /// `term_write(h, text)`: a stdout YA, sin pasar por el buffer de `print`.
-fn term_write(args: &[SynValue], reg: &Registry) -> Result<SynValue, Control> {
+fn term_write(i: &mut Interpreter, args: &[SynValue], reg: &Registry) -> Result<SynValue, Control> {
     const F: &str = "term_write";
+    // v0.6.51 (ronda 1, B2): escribe a stdout, así que pasa por el mismo gate que `print`: un
+    // terminal abierto antes de un `sandbox` pelado no escribe adentro. Afuera el veredicto está
+    // memoizado (el bucle de una TUI no lo paga).
+    i.ensure_stdout()?;
     term_handle(reg, args.first(), F)?;
     let text = match args.get(1) {
         Some(SynValue::Text(t)) => t.to_string(),
@@ -3403,7 +3407,7 @@ pub fn register_ws_builtins(interp: &Interpreter, caps: Rc<RefCell<CapabilitySet
     reg_fn_interp!("term_open", -1, term_open);
     reg_fn_interp!("term_recv", -1, term_recv);
     reg_fn!("term_size", 1, term_size);
-    reg_fn!("term_write", 2, term_write);
+    reg_fn_interp!("term_write", 2, term_write);
     reg_fn!("term_stats", 1, term_stats);
     reg_fn!("term_close", 1, term_close);
 

@@ -6,6 +6,183 @@ Each says what changed, why, and what to write instead.
 
 Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the release date.
 
+## v0.6.51 — 2026-10-29
+
+**Behavior changes (read these first).**
+- **`print` inside a plain `sandbox` block fails, with or without a host ceiling.** The block denies
+  every capability, and the message has said so since v0.6.50, but without `--sandbox`/`--cap-set`
+  `print` still went through (`time` and `random` did not). With a ceiling, `print` was denied
+  only if it was the program's first `print`: one before the block let the ones inside through.
+  Now `print`, `eprint`, `show`, `log` and `term_write` inside a plain `sandbox` fail with
+  `Capability not granted: stdout — a sandbox block denies every capability…`, every time.
+  `term_write` used to skip the `stdout` check altogether (a terminal opened before the block wrote
+  inside it, and under `--cap-set` without `stdout`); it now asks for `stdout` like `print`.
+  **Breaking:** compute the value in the
+  block and print it after (`let r be 0` / `sandbox` / `set r to f(x)` / `print(r)`), or use
+  `sandbox under {}`, which lets the process's capabilities (`stdout`, `stdin`, `time`, `random`)
+  through within the host ceiling, as before.
+- **`list_dir` no longer looks behind a link the program cannot follow.** Since v0.6.45 a link's row
+  (`is_link: true`) carried the `is_dir` of what it points to, and the engine read that from disk
+  even when the link led outside the program's `file.read`: listing a folder told the program
+  whether a place it had no access to was a folder. Now the target is looked at only if the
+  program could read it (the same decision `file_info` makes on the link's path, judged on disk);
+  otherwise the row says `is_dir: false`, `size: 0`. This also applies when the grant is the folder
+  alone (`file.read("./proj")` without `./proj/*`): `file_info` of the link was already denied
+  there. A program that walks a tree checks `is_link` first; following such a link with `list_dir`
+  or `read_file` is denied with the message that names the link, as before.
+
+**Security.**
+- **An attenuated capability token no longer reaches what its root token could not.** A token
+  minted with `{"net": "*"}` (or `net` without a scope) reaches only public addresses: a wildcard
+  never names a private one. Its holder could attenuate it, without the key, to
+  `{"net": "127.0.0.1:…"}` or `10.0.0.0/8`, and `captoken_verify` gave back only the last block's
+  caps, so the root's rule was lost: under `auth with`, `sandbox under` or `run_program`, the holder
+  reached the internal network through a program that declared it. Now a token is the intersection
+  of all its blocks, like Biscuit tokens and macaroons: `captoken_verify` also returns `chain` (each
+  block's caps, root first), and every block is a layer that a private address has to be named by,
+  including a name that resolves to one. `captoken_attenuate` refuses a private address the parent
+  reaches only through a wildcard, saying why, and `captoken_verify` treats a hand-made block that
+  does it as invalid. Since `captoken_attenuate` exists.
+- **A `run_program` child no longer reaches a private address its caller could not.** The child's
+  ceiling travelled as a flat `--cap-set` (what both allow, compared by name), which loses that
+  same rule: a caller with `require net("*")` (public addresses only) could give its child
+  `net("127.0.0.1:…")`, which the wildcard covers by name, and the child connected. Now the child
+  also inherits, layer by layer, everything that limited its caller: its grants, its host ceiling,
+  its `sandbox under` blocks and its tokens (with all their blocks), plus the token passed as
+  `ceiling`. A denial in the child says it is outside what the calling program could do.
+
+**Fixes.**
+- **A task that defines a task (or binds a lambda) no longer keeps every call's frame alive.**
+  `task mk(i)` with `task inner(x)` inside (or `let f be (x) => x + i`) left each call's variables in
+  memory: the frame binds `inner` and `inner` closes over the frame, a reference cycle nothing
+  freed. v0.6.50 release: 38 MB after 32 000 calls, ~1.4 KB per call (since v0.6.49 or before). Now,
+  when a call ends and the only things holding its frame are closures bound in that same frame,
+  the frame is freed on the spot, like a frame without closures (the same probe: 38 MB → 13 MB
+  after 32 000 calls, and still 13 MB after 64 000). A closure that left the frame
+  (given back, stored in a global or a list) keeps it alive and sees its variables, as before; when
+  that escaped closure dies, the cycle it had with its frame is still not collected (there is no
+  cycle collector).
+- **A module with no tasks is one instance, like any other module.** With `use "./a.syn" as m` in the
+  program and `use "./a.syn" as a` in a module `b`, `set m.X to 5` was not seen by `b` (`a.X` stayed
+  `1`) when `a.syn` only exported data: nothing kept that module's scope alive, so once it finished
+  loading its map stopped being a module, and `set m.X` copied it into the program's `m`. With a
+  task in the module it already worked. Now the interpreter keeps every module it loads, and every
+  view of it (`use` in the program, in another module, an alias, a `parallel_map` worker, a `serve`
+  request) reads the same variable, like Python's `import`. Since v0.6.49 or before.
+- **What `render`, `respond`, `ok` and the other server values return reads like the map it says it
+  is.** `type_of(r)` said `map` and `r.body` worked, but `r["body"]` failed with `Cannot index into
+  map` and `keys(r)` with `keys() requires a map, got map`. Now `r["body"]` is `r.body`, and
+  `keys`, `values` and `contains` see its fields (`body`, `content_type`, `status` for `render`;
+  `status`, `value` for `ok`). It stays read-only, as before.
+- **`content()` honors the page's `lang` and keeps presentation out of its JSON.** The HTML page
+  always said `<html lang="en">`; now `"lang": "es"` in the meta goes there (screen readers,
+  translators and search engines read it), and without it the page is still `en`. The JSON form
+  (`Accept: application/json` or `.json`) carried the raw HTML of `header`/`footer`, the `class`
+  and the stylesheet URL in its `meta`, which the docs said it did not: they are how the HTML looks,
+  not data of the page. They are left out now; `title`, `description`, `lang` and the rest stay.
+- **A long decimal read from JSON outside `json_decode` is the nearest number.** `json_decode` has
+  always read `1792711237.7256045` exactly, but the engine's other JSON readers (a persisted agent's
+  state, the arguments of an LLM's tool call, a MySQL `JSON` column, a sealed receipt) could read it
+  1 ULP off (`…7256043`). They all read the nearest `f64` now. Measured cost: +10 % parse time on a
+  document made only of 17-digit decimals, +1 % on a typical mixed one.
+
+- **Two programs in one process no longer share what belongs to each run.** Whether the program is
+  a `serve`, whether it already listens, its `shutdown()`, the mTLS identity it declared with
+  `mtls_identity`, the names it redacts private values with, and the `serve --sandbox`/`--cap-set`
+  ceiling were process-wide, and the first program to set one set it for every other. A
+  `shutdown()` drained every `serve` in the process and ended it, the next `serve` started already
+  draining, a `run` beside a `serve` could shut the `serve` down, and a second `serve` ran under the
+  first one's ceiling. A `synsema` process runs one program, so the CLI was not affected; an
+  embedder or a test binary that runs several was. Now each run carries its own state, and
+  everything that works for it shares it: its `serve` workers, cron jobs, agents and `parallel_map`
+  workers, and the `test` blocks of `synsema test`. Signals (Ctrl+C, SIGTERM) still reach every `serve` in the process. For Rust embedders:
+  `run_serve_program` now returns its result when the run's servers finish draining, instead of
+  ending the process, and lets go of what served the run outside its listeners: the :80 redirect
+  and the ACME challenge listener close their ports, certificate renewal stops (one in progress
+  finishes first), and each worker of the interpreter pool drops the interpreters it kept for the
+  run and the database they held open (a busy one, when it takes its next request), as does the
+  registry `openapi_json()` reads (a finished `serve` no longer counts as another server of the
+  process). A preamble that fails after a `serve on` is already listening ends the run the same
+  way: the server drains and stops, and the error comes back; before, it kept serving. With
+  `synsema serve` the process used to exit at once and cut the requests in flight; now they finish,
+  within `SYNSEMA_SHUTDOWN_GRACE`, before it exits with the same code. Before the error, stderr says
+  that the preamble failed after `serve on` and the server is stopping.
+- **A `serve` under load no longer leaks a little memory per request.** The constructor a request's
+  interpreter keeps for the agents it spawns held itself through a cell it owned, a reference cycle:
+  every interpreter built for a request on an extra pool thread (one per request while others wait
+  on I/O) left behind that constructor and the references it held. Each interpreter now gets a new
+  constructor over the same shared state, with no cycle. Since v0.6.42 (from v0.6.7, once per
+  worker).
+
+**Messages.**
+- **`state_get` and the other `state_*` outside a `serve` request say where they live.** In a
+  `parallel_map` worker launched by a route, in an agent, or in a program without `serve`, they
+  failed with a bare `Undefined variable: 'state_get'`. The message now adds that they are the
+  shared state of `serve`, which exists in a request (the route and the tasks it calls), and to
+  call it in the route and pass the value in.
+- **`synsema update` and `synsema init` point to the skill installer every agent uses.** They named
+  `install-skill.sh | bash`, which installs only into `~/.claude/skills`. Now `init`'s `hello.syn`
+  and `.env.example` say `npx skills add kitecosmic/synsema -g -y` (once per machine, for every
+  agent it finds), and `update` says `npx skills update -g`. Without Node, both give the `curl`
+  installer and its `-s -- --agents` option for Codex and opencode.
+
+- **A `run_program` whose child does not fit says so.** What limits the caller travels to the child
+  in an environment variable, and its ceiling and `filename` on the command line; Windows caps each
+  near 32 767 characters, and a caller with hundreds of long grants (or a very long `filename`)
+  failed to start the child with a system error (`os error 206`). Now, past 30 000, on every
+  platform, it fails with `run_program: the caller's capabilities are too many to pass to the
+  child (N bytes; the limit is 30000)` or `run_program: the child's command line would be N
+  characters (its ceiling and filename); the limit is 30000`.
+
+**New.**
+- **`synsema check --templates <dir> <file>`** checks every `render("…")` with a literal path (and
+  its `include`/`layout`) against that folder, the way a trusted tool reads the folder the host gives
+  it with `--trusted-templates name=<dir>`. Before, `check` of a tool looked for its templates in the
+  current directory and failed unless it ran from inside that folder. Without the option, a missing
+  template now says to pass it. The program's modules are still resolved from the file.
+- **The `.md`, `.json` and `.html` suffix works on literal routes.** `route "GET /historial"` that
+  gives `content(…)` now answers `GET /historial.md` with Markdown and `GET /historial.json` with
+  JSON, as a route ending in a `:param` already did; before, those URLs were a 404. The suffix is
+  tried only when no route matches the whole path, and a real static file at that path still wins,
+  and so do the URLs the runtime publishes (`/openapi.json`, the agent card): a route named
+  `/openapi` does not take `/openapi.json` while the runtime publishes it (with `private` or
+  `discovery off` the route takes it, as a `:param` route does; under `serve --attested` it never
+  does, since the program cannot declare those URLs there either).
+  Same in `serve` and in the embeddable wasm handler. A route that gives
+  something other than `content()` ignores the suffix, as with `:param` routes.
+
+**Correction to the v0.6.50 notes.** They said that under `serve` a trusted tool's `set t.X` fails.
+Measured, it does what it does under `run`: it changes the program's copy of `t.X` (the tool keeps
+seeing its own value), and what fails is adding a name the tool does not export (`set t.Y`). The
+docs already say this.
+
+**Performance.**
+- **Building a set of capabilities costs less than half.** Since v0.6.47 the grants are kept in
+  their canonical order (most specific first), and every comparison recomputed how specific each
+  grant was by walking its scope. That set is built on every `serve` request, every tool call and
+  every `parallel_map` worker. Now each capability computes it once when it is created: building a
+  set of 11 grants went from 2.5 µs to 1.0 µs. The order and every decision stay the same.
+- **For Rust embedders:** `Capability`'s fields are private now; read them with `ty()` and
+  `scope()`, and use `with_scope` to get one with another scope.
+
+**Release pipeline.** Nothing a program sees changes; what changes is how the binaries are built.
+- Every GitHub Action moved to its Node 24 release (`checkout` v7, `setup-node` v7, `setup-go` v7,
+  `cache` v6, `upload-artifact` v7, `download-artifact` v8, `attest-build-provenance` v4,
+  `action-gh-release` v3), still pinned by commit SHA. GitHub was running the old ones on Node 24
+  by force with a deprecation warning. `download-artifact` v8 now fails on a digest mismatch
+  instead of warning.
+- The jobs that ran on `ubuntu-latest` now name `ubuntu-26.04`: GitHub moves that label to 26.04
+  between 2026-10-19 and 2026-11-19, and a release whose legs land on different images is harder
+  to reason about. `perf-guard` stays on `ubuntu-24.04` (its anchor was measured there) and the
+  second Vela guest leg on `ubuntu-22.04`. The Linux binary still asks for glibc 2.17 at most (it
+  is built against 2.17 with zig, and the release fails if that floor rises).
+- The Windows build no longer installs NASM: `ring` 0.17 from crates.io ships its assembly already
+  assembled for Windows, and nothing else in the tree calls NASM. The action that installed it had
+  no Node 24 release.
+- The npm jobs no longer write an `.npmrc` with a placeholder token and `always-auth` (npm 12 says
+  `always-auth` stops working in its next major). They publish with the token npm exchanges through
+  OIDC (trusted publishing), as before, and nothing else.
+
 ## v0.6.50 — 2026-10-28
 
 **Behavior changes (read these first).**

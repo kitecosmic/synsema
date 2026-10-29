@@ -904,9 +904,10 @@ mod tests {
     }
     #[test]
     fn a_run_snapshot_does_not_copy_the_history_and_an_undo_keeps_the_live_one() {
-        // La foto de la cadena no trae `history` (copiarlo hacía cada escritura O(escrituras previas));
-        // deshacer restaura valor y `version` de la foto y deja el `history` vivo (el «Ojo» de
-        // `Chain`). Escribir fuera de una corrida, o de nuevo en la misma, no abre versión.
+        // La foto de la cadena no trae `history` (copiarlo hacía cada escritura O(escrituras
+        // previas)); deshacer restaura valor y `version` de la foto y deja el `history` vivo (el
+        // «Ojo» de `Chain`). Escribir fuera de una corrida, o de nuevo en la misma, no abre
+        // versión.
         let bb = Arc::new(Blackboard::new());
         for i in 0..3 {
             bb.write("k", num(i), "");
@@ -932,7 +933,8 @@ mod tests {
     #[test]
     fn an_undo_puts_back_the_deleted_keys_in_a_fixed_order() {
         // Auditoría T2, N4: deshacer reinserta en `data` las claves que la corrida borró; con un
-        // `HashSet` en `RunState.keys` el orden lo elegía la semilla. Ahora es el de las escrituras.
+        // `HashSet` en `RunState.keys` el orden lo elegía la semilla. Ahora es el de las
+        // escrituras.
         let mut seen = std::collections::HashSet::new();
         for _ in 0..16 {
             let bb = Arc::new(Blackboard::new());

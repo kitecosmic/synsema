@@ -48,11 +48,27 @@ fn sandbox_restores_capabilities_after() {
 }
 
 #[test]
-fn sandbox_print_works_inside() {
-    // `print` NO está gateado → el sandbox puede imprimir y computar.
+fn sandbox_print_is_denied_inside_and_sandbox_under_lets_it_through() {
+    // v0.6.51 (N5): un `sandbox` pelado deniega toda capability, `stdout` también (antes `print`
+    // pasaba); `sandbox under {}` deja pasar las del proceso dentro del techo del host.
     let r = run_source("sandbox\n    print(\"inside\")\n", "<t>");
+    assert!(!r.success);
+    assert!(r.errors.join("\n").contains("Capability not granted: stdout"), "{:?}", r.errors);
+    let r = run_source("sandbox under {}\n    print(\"inside\")\n", "<t>");
     assert!(r.success, "{:?}", r.errors);
     assert_eq!(r.output, vec!["inside".to_string()]);
+}
+
+#[test]
+fn term_write_goes_through_the_stdout_gate_inside_a_sandbox() {
+    // v0.6.51 (ronda 1, B2): `term_write` escribe a stdout, como `print`: dentro de un `sandbox`
+    // pelado se niega antes de mirar el handle (un terminal abierto afuera no escribe adentro).
+    let r = run_source("sandbox\n    term_write(1, \"inside\")\n", "<t>");
+    assert!(!r.success);
+    assert!(r.errors.join("\n").contains("Capability not granted: stdout"), "{:?}", r.errors);
+    // Afuera, sin terminal abierto, el error es el del handle.
+    let r = run_source("term_write(1, \"x\")\n", "<t>");
+    assert!(r.errors.join("\n").contains("unknown or closed terminal handle"), "{:?}", r.errors);
 }
 
 #[test]

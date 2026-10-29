@@ -710,7 +710,11 @@ pub fn delegation_of(user: &SynValue) -> Option<synsema_capabilities::model::Del
         Some(SynValue::Map(cav)) => matches!(cav.borrow().get("deterministic"), Some(SynValue::Bool(true))),
         _ => false,
     };
-    Some(synsema_capabilities::model::Delegation::token(id, caps, deterministic))
+    // v0.6.51 (C1): cada bloque del token es una capa. Un `chain` mal formado cierra: una capa vacía
+    // no cubre nada.
+    let earlier = crate::captoken::earlier_layers(&m, |c| Ok(crate::captoken::delegated_ceiling_from_caps_map(c)))
+        .unwrap_or_else(|_| vec![Vec::new()]);
+    Some(synsema_capabilities::model::Delegation::token(id, caps, deterministic).with_earlier(earlier))
 }
 
 /// El presupuesto LLM DELEGADO al sujeto (caveat `llm_tokens` de un captoken verificado),
@@ -868,13 +872,21 @@ pub fn render_html(tree: &SynValue) -> String {
     // The content container class is overridable (default "prose") so the page author —
     // not the language — controls styling. The Markdown/JSON representations ignore it.
     let css_class = meta.as_ref().and_then(|m| meta_get(m, "class")).unwrap_or_else(|| "prose".to_string());
+    // v0.6.51: el idioma de la página (`"lang": "es"`), para lectores de pantalla, traductores y
+    // buscadores; sin él, inglés como antes. Va también en el JSON (es dato de la página).
+    let lang = meta
+        .as_ref()
+        .and_then(|m| meta_get(m, "lang"))
+        .filter(|l| !l.trim().is_empty())
+        .unwrap_or_else(|| "en".to_string());
     let body = if is_page {
         list_field(tree, "nodes").iter().filter(|n| is_node(n)).map(render_node_html).collect::<String>()
     } else {
         render_node_html(tree)
     };
     format!(
-        "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n{}\n</head>\n<body>\n{}<main class=\"{}\">\n{}</main>\n{}</body>\n</html>\n",
+        "<!DOCTYPE html>\n<html lang=\"{}\">\n<head>\n{}\n</head>\n<body>\n{}<main class=\"{}\">\n{}</main>\n{}</body>\n</html>\n",
+        esc(&lang),
         head.join("\n"),
         header,
         css_class,

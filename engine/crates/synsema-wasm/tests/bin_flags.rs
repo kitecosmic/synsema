@@ -79,3 +79,14 @@ fn wasip1_bin_takes_trusted_templates() {
     let (code, _, err) = bin(&d, &["--trusted", "h=h.syn", "--trusted-templates", "h", "p.syn"]);
     assert!(code == 2 && err.contains("--trusted-templates takes name=dir"), "{}", err);
 }
+
+/// v0.6.51 (N5): paridad con el nativo; un `sandbox` pelado deniega `print` también sin techo, y
+/// `sandbox under {}` lo deja pasar.
+#[test]
+fn a_plain_sandbox_denies_print_in_wasm_too() {
+    let r = synsema_wasm::run("print(\"antes\")\nsandbox\n    print(\"dentro\")\n", &synsema_wasm::RunOptions::new("s.syn"));
+    assert!(!r.ok && r.output == vec!["antes".to_string()], "{:?} {:?}", r.output, r.errors);
+    assert!(r.errors[0].contains("a `sandbox` block denies every capability"), "{:?}", r.errors);
+    let r = synsema_wasm::run("sandbox under {}\n    print(\"dentro\")\n", &synsema_wasm::RunOptions::new("s.syn"));
+    assert!(r.ok && r.output == vec!["dentro".to_string()], "{:?} {:?}", r.output, r.errors);
+}

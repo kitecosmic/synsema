@@ -50,7 +50,10 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 
-use synsema_capabilities::model::{capability_type_from_name, is_process_local, Capability, CapabilitySet, CapabilityType, Delegation};
+use synsema_capabilities::model::{
+    capability_type_from_name, is_process_local, is_public_ip, split_net_scope, Capability, CapabilitySet, CapabilityType,
+    Delegation,
+};
 use synsema_core::bytesutil::{b64url_decode, b64url_encode};
 use synsema_core::interpreter::{Control, Interpreter, RuntimeError};
 use synsema_core::secret::constant_time_eq;
@@ -398,6 +401,34 @@ fn decode_token(s: &str) -> Option<Token> {
 // álgebra: la atenuación jamás amplía
 // =========================================================
 
+/// v0.6.51 (C1): ¿el scope de `net` escribe una dirección privada? Una IP que no es pública, un CIDR
+/// cuya red no es pública, o `localhost`. Un nombre de host no se sabe hasta resolverlo: ése lo
+/// juzgan las capas al conectar.
+fn names_private_literal(scope: &str) -> bool {
+    let host = split_net_scope(scope).0.trim_start_matches('[').trim_end_matches(']');
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    let addr = host.split_once('/').map_or(host, |(ip, _)| ip);
+    addr.parse::<std::net::IpAddr>().is_ok_and(|ip| !is_public_ip(ip))
+}
+
+/// v0.6.51 (C1): la primera dirección privada escrita de `child` que el padre sólo cubre con un
+/// comodín (para el mensaje de `captoken_attenuate`).
+fn private_widening(parent: &[(String, Vec<String>)], child: &[(String, Vec<String>)]) -> Option<String> {
+    let parent_net: Vec<&String> = parent.iter().filter(|(n, _)| n == "net").flat_map(|(_, s)| s).collect();
+    let named = |s: &str| parent_net.iter().any(|ps| !split_net_scope(ps).0.contains(['*', '?']) && {
+        let (g, w) = (Capability::new(CapabilityType::Net, Some(ps.to_string())), Capability::new(CapabilityType::Net, Some(s.to_string())));
+        g.covers(&w)
+    });
+    child
+        .iter()
+        .filter(|(n, _)| n == "net")
+        .flat_map(|(_, s)| s)
+        .find(|s| names_private_literal(s) && !named(s))
+        .cloned()
+}
+
 /// Una capability concreta desde `(nombre, scope)`. El nombre debe existir en el
 /// vocabulario del lenguaje — un typo (`"nett"`) es error, no una capability
 /// desconocida que después no gatea nada.
@@ -432,11 +463,20 @@ fn caps_cover(parent: &[(String, Vec<String>)], child: &[(String, Vec<String>)],
         }
         for s in scopes {
             let want = to_capability(name, Some(s), who)?;
+            // v0.6.51 (C1): una dirección privada escrita (`127.0.0.1`, `10.0.0.0/8`, `localhost`)
+            // sólo la cubre un padre que la NOMBRA; un comodín (`*`, sin scope) llega sólo a lo
+            // público, y atenuarlo a lo privado ampliaba. El chequeo de verdad es al conectar (cada
+            // bloque es una capa); esto lo rechaza al atenuar (con el porqué: `private_widening`) y
+            // al verificar un token forjado a mano.
+            let private = want.ty() == CapabilityType::Net && names_private_literal(s);
             let covered = if parent_scopes.is_empty() {
-                true // padre sin scope = wildcard: cubre cualquier scope
+                !private // padre sin scope = wildcard: cubre cualquier scope público
             } else {
                 let mut any = false;
                 for ps in parent_scopes {
+                    if private && split_net_scope(ps).0.contains(['*', '?']) {
+                        continue;
+                    }
                     if to_capability(name, Some(ps), who)?.covers(&want) {
                         any = true;
                         break;
@@ -544,7 +584,7 @@ fn parse_caps(m: &MapObj, who: &str) -> Result<Vec<(String, Vec<String>)>, Contr
         let cap = to_capability(name, None, who)?;
         // Las capabilities LOCALES AL PROCESO no son autoridad transferible: nadie puede
         // delegar el stdout ni el reloj del proceso de otro. Fail-loud, como `caps` vacío.
-        if is_process_local(cap.ty) {
+        if is_process_local(cap.ty()) {
             return Err(err(format!(
                 "{}: {:?} is process-local (stdout, stdin, time, random): a token cannot delegate it. \
                  The host ceiling governs it; to run the holder without clock or entropy use the \
@@ -831,6 +871,12 @@ fn b_captoken_attenuate(args: &[SynValue], time_caps: &Rc<RefCell<CapabilitySet>
 
     // La atenuación JAMÁS amplía: se comprueba acá con un error que dice qué
     // sobra (y de nuevo en el verify, para un token forjado a mano).
+    if let Some(s) = private_widening(&parent.caps, &caps) {
+        return Err(err(format!(
+            "{}: {:?} is a private address and the token reaches it only where its issuer named it — a wildcard (`*`, or `net` without a scope) reaches only public addresses. The issuer has to mint a token that names it",
+            F, s
+        )));
+    }
     if !caps_cover(&parent.caps, &caps, F)? {
         return Err(err(format!(
             "{}: the new caps are not covered by the token's — attenuation can only narrow. \
@@ -1050,6 +1096,9 @@ fn verify_inner(
     let mut out = SynMap::new();
     out.insert("id", syn_text(t.id.as_str()));
     out.insert("caps", caps_to_syn(&last.caps));
+    // v0.6.51 (C1): los caps de cada bloque, de la raíz al último. El techo del token son TODOS (cada
+    // bloque es una capa): `auth with`, `sandbox under` y `run_program` los apilan.
+    out.insert("chain", syn_list(t.blocks.iter().map(|b| caps_to_syn(&b.caps)).collect()));
     out.insert("depth", syn_int(t.blocks.len() as i64));
     let mut cav = SynMap::new();
     cav.insert(
@@ -1275,6 +1324,28 @@ fn warn_unknown_delegated_once(name: &str) {
     });
 }
 
+/// v0.6.51 (C1): las capas anteriores al último bloque de un token verificado (su `chain` sin el
+/// último), cada una convertida con `convert`. Sin `chain` (un map armado a mano), ninguna. Un
+/// `chain` mal formado es error: nunca abre.
+pub fn earlier_layers(
+    m: &MapObj,
+    convert: impl Fn(&MapObj) -> Result<Vec<Capability>, String>,
+) -> Result<Vec<Vec<Capability>>, String> {
+    let Some(chain) = m.get("chain") else { return Ok(Vec::new()) };
+    let SynValue::List(l) = chain else {
+        return Err("the token's chain must be the list captoken_verify returns".to_string());
+    };
+    let blocks = list_values(l);
+    let n = blocks.len().saturating_sub(1);
+    blocks[..n]
+        .iter()
+        .map(|b| match b {
+            SynValue::Map(c) => convert(&c.borrow()),
+            _ => Err("the token's chain must be the list captoken_verify returns".to_string()),
+        })
+        .collect()
+}
+
 /// El techo delegado que expresa el valor de un `sandbox under <v>`: el map que devolvió
 /// `captoken_verify` (→ el techo de ESE token, con su `id` y su `deterministic`; una
 /// denegación adentro es "del token", como en un handler) o un map literal `{net: ["api.x"]}`
@@ -1292,7 +1363,8 @@ pub fn delegation_from_value(v: &SynValue) -> Result<Delegation, String> {
             m.get("caveats"),
             Some(SynValue::Map(cv)) if matches!(cv.borrow().get("deterministic"), Some(SynValue::Bool(true)))
         );
-        return Ok(Delegation::token(id.to_string(), ceiling_from_caps_map(&caps.borrow())?, deterministic));
+        let earlier = earlier_layers(&m, ceiling_from_caps_map)?;
+        return Ok(Delegation::token(id.to_string(), ceiling_from_caps_map(&caps.borrow())?, deterministic).with_earlier(earlier));
     }
     Ok(Delegation::block(ceiling_from_caps_map(&m)?))
 }
@@ -1694,6 +1766,77 @@ mod tests {
         assert!(matches!(ok(cv(&[text(""), text(KEY)])), SynValue::Nothing));
     }
 
+    /// v0.6.51 (C1, specs/v0.6.51-modelos.md): `{"net": "*"}` (o sin scope) llega sólo a lo
+    /// público; atenuarlo sin la clave a una dirección privada escrita ampliaba (C1-1..C1-3). Un
+    /// padre que la nombra sí la achica (C1-6); un host público o un nombre siguen valiendo (C1-7, y
+    /// C1-4 al atenuar: el nombre lo juzgan las capas al conectar).
+    #[test]
+    fn c1_a_wildcard_net_token_cannot_be_attenuated_to_a_private_address() {
+        for root in [text("*"), SynValue::Nothing] {
+            let t = mint(map(vec![("net", root.clone())]), SynValue::Nothing);
+            for private in ["127.0.0.1:18444", "10.0.0.0/8", "169.254.169.254", "localhost", "[::1]"] {
+                let e = err_of(ca(&[text(&t), map(vec![("net", text(private))])]));
+                assert!(e.contains("is a private address"), "{:?} -> {}: {}", root, private, e);
+            }
+            for public in ["api.example.com", "intranet.corp", "8.8.8.8"] {
+                ok(ca(&[text(&t), map(vec![("net", text(public))])]));
+            }
+        }
+        let t = mint(map(vec![("net", text("10.0.0.0/8"))]), SynValue::Nothing);
+        ok(ca(&[text(&t), map(vec![("net", text("10.1.2.3"))])]));
+    }
+
+    /// C1: un bloque forjado a mano que lleva un comodín a lo privado (la firma cierra) es inválido.
+    #[test]
+    fn c1_a_forged_block_from_a_wildcard_to_a_private_address_is_invalid() {
+        for root in [text("*"), SynValue::Nothing] {
+            let t = mint(map(vec![("net", root.clone())]), SynValue::Nothing);
+            let mut tok = decode_token(&t).unwrap();
+            let narrow = Block {
+                caps: vec![("net".to_string(), vec!["127.0.0.1".to_string()])],
+                caveats: tok.blocks[0].caveats.clone(),
+            };
+            let sig = hmac_compute(Algo::Sha256, &tok.sig, &block_bytes(tok.blocks.len(), &narrow));
+            tok.blocks.push(narrow);
+            tok.sig = sig;
+            assert!(matches!(ok(cv(&[text(&encode_token(&tok)), text(KEY)])), SynValue::Nothing), "{:?}", root);
+        }
+    }
+
+    /// C1-4, C1-5, C1-6: `verify` da la cadena y cada bloque es una capa. Un nombre que resuelve a
+    /// una dirección privada lo tiene que nombrar cada bloque: `*` y `*.corp` no nombran.
+    #[test]
+    fn c1_every_block_of_a_verified_token_is_a_layer() {
+        let ip: std::net::IpAddr = "10.1.2.3".parse().unwrap();
+        let layered = |root: &str, leaf: &str| {
+            let t = mint(map(vec![("net", text(root))]), SynValue::Nothing);
+            let a = match ok(ca(&[text(&t), map(vec![("net", text(leaf))])])) {
+                SynValue::Text(s) => s.to_string(),
+                other => panic!("{}", other),
+            };
+            let v = ok(cv(&[text(&a), text(KEY)]));
+            let chain = verified_map(&v).get("chain").cloned().expect("chain");
+            assert!(matches!(&chain, SynValue::List(l) if list_values(l).len() == 2), "{}", chain);
+            let d = delegation_from_value(&v).unwrap();
+            assert_eq!(d.earlier.len(), 1);
+            let mut cs = CapabilitySet::new("t");
+            cs.grant(Capability::new(CapabilityType::Net, Some(leaf.to_string())));
+            cs.push_delegation(d);
+            cs.net_layers().admits(leaf, ip)
+        };
+        assert!(layered("*", "intranet.corp").is_err(), "C1-4");
+        assert!(layered("*.corp", "db.corp").is_err(), "C1-5");
+        assert!(layered("10.0.0.0/8", "10.1.2.3").is_ok(), "C1-6");
+        // Lo mismo por `auth with` (`routing::delegation_of`).
+        let t = mint(map(vec![("net", text("*"))]), SynValue::Nothing);
+        let a = match ok(ca(&[text(&t), map(vec![("net", text("intranet.corp"))])])) {
+            SynValue::Text(s) => s.to_string(),
+            other => panic!("{}", other),
+        };
+        let d = crate::routing::delegation_of(&ok(cv(&[text(&a), text(KEY)]))).unwrap();
+        assert_eq!(d.earlier.len(), 1);
+    }
+
     #[test]
     fn forged_widening_block_is_rejected_at_verify() {
         // Un portador que conoce sig_n PUEDE firmar un bloque nuevo (así funciona
@@ -1920,7 +2063,7 @@ mod t1_tests {
         // sigue siendo el techo.
         let caps = delegated_ceiling_from_caps_map(&m(vec![("net", syn_text("api.example")), ("stdout", SynValue::Nothing)]));
         assert_eq!(caps.len(), 1);
-        assert_eq!(caps[0].ty, CapabilityType::Net);
+        assert_eq!(caps[0].ty(), CapabilityType::Net);
         // Un nombre desconocido cierra: techo vacío, no "sin techo".
         assert!(delegated_ceiling_from_caps_map(&m(vec![("net", syn_text("api.example")), ("teleport", SynValue::Nothing)])).is_empty());
         // Un scope mal formado también cierra.

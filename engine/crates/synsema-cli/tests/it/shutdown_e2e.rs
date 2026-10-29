@@ -1,5 +1,6 @@
 //! Shutdown ordenado de `synsema serve` (SIGINT/SIGTERM) contra el BINARIO real, como
-//! proceso hijo — la única forma de probarlo: el drain termina en `process::exit`.
+//! proceso hijo — la única forma de mandarle una señal (desde v0.6.51 el drain termina la corrida y
+//! la CLI sale con su código; ver `synsema-runtime/tests/it/v0651_run_scope_e2e.rs`).
 //! Sólo Unix (en Windows no hay forma portable de mandar Ctrl-C a un hijo desde un
 //! test; la ruta de código es la misma: `tokio::signal::ctrl_c`).
 //!

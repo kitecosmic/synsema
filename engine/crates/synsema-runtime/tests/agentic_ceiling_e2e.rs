@@ -55,9 +55,8 @@ fn shell() -> &'static str {
 
 #[test]
 fn host_ceiling_binds_the_whole_serve_under_the_host_ceiling() {
-    // UN solo serve por proceso: `SERVE_CEILING` es un `OnceLock` (política del proceso;
-    // en producción un `synsema serve` = un proceso = un techo). Este test cubre, contra
-    // ese único serve, las tres formas en que el programa podría intentar exceder el techo:
+    // El techo es de la corrida (v0.6.51, G1: antes un `OnceLock` del proceso, el primer serve
+    // fijaba el de todos). Este test cubre las tres formas en que el programa podría intentar exceder el techo:
     //   (1) el PREÁMBULO (statements antes de `serve on`) — regresión de la auditoría 2026-08-30;
     //   (2) un HANDLER, en el primer request Y en los siguientes (reúso de worker, §0 spec);
     //   (3) un AGENTE spawneado desde un handler.

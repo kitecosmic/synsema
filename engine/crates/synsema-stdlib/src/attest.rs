@@ -1897,7 +1897,7 @@ fn close_on_expiry(reason: String) {
         eprintln!("{}", reason);
     }
     #[cfg(feature = "native")]
-    crate::server::request_shutdown(&reason);
+    crate::server::request_shutdown_all(&reason);
 }
 
 // =========================================================

@@ -15,8 +15,11 @@ pub const HELLO_SYN: &str = r#"-- Mi primer programa Synsema.
 --
 -- ¿Desarrollás con un agente (Claude Code o similar)? Potencialo desde el minuto 0
 -- con DOS comandos (los pega el dev o el propio agente — sin clonar nada):
---   curl -sL https://raw.githubusercontent.com/kitecosmic/synsema/main/install-skill.sh | bash
---     (instala el skill: el agente escribe Synsema idiomático solo)
+--   npx skills add kitecosmic/synsema -g -y
+--     (instala el skill una vez por máquina, para cada agente que encuentra: el agente escribe
+--      Synsema idiomático solo; después de cada `synsema update`: npx skills update -g.
+--      Sin Node, con `-s -- --agents` al final para Codex y opencode:
+--      curl -fsSL https://raw.githubusercontent.com/kitecosmic/synsema/main/install-skill.sh | bash)
 --   claude mcp add --transport http synsema-docs https://synsema.dev/mcp
 --     (MCP de docs: busca doc con search/get y VERIFICA sus snippets con run/test en sandbox)
 --   El .mcp.json de esta carpeta ya registra `synsema-code` (synsema code --mcp): outline,
@@ -96,9 +99,12 @@ pub const ENV_EXAMPLE: &str = r#"# Config del proyecto — Synsema auto-carga el
 # (muestra cada valor RESUELTO con su fuente, y si está offline, qué variable falta)
 #
 # Agentes (Claude Code y similares) — desarrollo potenciado desde el minuto 0,
-# DOS comandos y listo (en Windows, desde Git Bash el primero):
-#   curl -sL https://raw.githubusercontent.com/kitecosmic/synsema/main/install-skill.sh | bash
+# DOS comandos y listo:
+#   npx skills add kitecosmic/synsema -g -y
 #   claude mcp add --transport http synsema-docs https://synsema.dev/mcp
+# Sin Node, el primero es (desde Git Bash en Windows; `-s -- --agents` para Codex y opencode):
+#   curl -fsSL https://raw.githubusercontent.com/kitecosmic/synsema/main/install-skill.sh | bash
+# Después de cada `synsema update`: npx skills update -g
 
 # ══ Provider LLM: elegí UN par (provider + SU key) y descomentá LAS DOS líneas ══
 # La key va SIEMPRE bajo la variable de SU provider (con provider=minimax, la key va
@@ -424,10 +430,14 @@ const HELLO_SYN_PAST: &[&str] = &[
     // 2026-09-20 (tanda judge): una version intermedia de hello.syn cuyo sha nunca entro a
     // `past` (el guard se saltea en CI shallow); latente hasta que el test corrio local.
     "cde4fed8b007164a55992a2b539eba4a4bb5428695c38664effe913ecc1ec3bb",
+    // v0.6.50: el skill se instalaba con `install-skill.sh` (sólo ~/.claude/skills).
+    "7ce3394e0971c4eeb86e9a4d7e017f1884c3430007a3c861fb282bcfe731da9e",
 ];
 
 /// sha256 de cada contenido histórico de `.env.example` (ver `InitFile::past`).
 const ENV_EXAMPLE_PAST: &[&str] = &[
+    // v0.6.50: el skill se instalaba con `install-skill.sh` (sólo ~/.claude/skills).
+    "9397e3ebc940e69afbd7bb3e548925e92d5ccd347b9dd65d8ccd4f797cd6fd65",
     // v0.6.46 (E6): antes de SYNSEMA_AUDITOR_KEY y SYNSEMA_RECEIPT_SEALED_BYTES (el recibo sellado).
     "799983d1cb05caee3d92f6c37cdeec0756039bb6f780b58b1e353c55d0a692aa",
     // v0.6.43 (rama, tras la auditoria): SYNSEMA_ATTEST sin `nitro-tpm` ni la lista de drivers.
@@ -1174,6 +1184,17 @@ mod tests {
     ///
     /// Se saltea si el repo es shallow o no hay git (tarball, sandbox): es un guard
     /// de desarrollo, no una dependencia dura del build.
+    /// v0.6.51: `init` instala el skill con `npx skills` (todos los agentes de la máquina), y el
+    /// camino sin Node nombra `--agents`; antes sólo el `install-skill.sh` de `~/.claude/skills`.
+    #[test]
+    fn init_points_to_npx_skills_and_the_curl_with_agents() {
+        for t in [HELLO_SYN, ENV_EXAMPLE] {
+            assert!(t.contains("npx skills add kitecosmic/synsema -g -y"), "{}", t);
+            assert!(t.contains("npx skills update -g") && t.contains("-s -- --agents"), "{}", t);
+            assert!(!t.contains("curl -sL "), "{}", t);
+        }
+    }
+
     #[test]
     fn init_file_history_is_complete() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))

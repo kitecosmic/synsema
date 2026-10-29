@@ -830,11 +830,20 @@ pub fn register_secure_builtins(interp: &Interpreter, caps: Rc<RefCell<Capabilit
                 // lo que apunta, igual que en `file_info` (antes una junction salía `is_dir: false`
                 // acá y `true` allá). Su `size` es 0: el tamaño de algo que puede estar fuera del
                 // scope no se da gratis; `file_info` lo da si el destino queda adentro.
+                // v0.6.51 (L1): el destino se mira sólo si el programa podría leerlo (la decisión de
+                // `file_info` sobre la ruta del link, juzgada en disco); uno que sale del permiso da
+                // `is_dir: false` sin que el motor haga stat afuera.
                 let mut entries: Vec<(String, bool, i64, bool)> = Vec::new();
                 for e in rd.flatten() {
                     let name = e.file_name().to_string_lossy().into_owned();
                     let is_link = e.file_type().map(|t| t.is_symlink()).unwrap_or(false);
-                    let md = if is_link { std::fs::metadata(e.path()).ok() } else { e.metadata().ok() };
+                    let md = if !is_link {
+                        e.metadata().ok()
+                    } else {
+                        let at = format!("{}/{}", path.trim_end_matches(['/', '\\']), name);
+                        let readable = caps.borrow_mut().check_silent(&Capability::new(CapabilityType::FileRead, Some(at)));
+                        if readable { std::fs::metadata(e.path()).ok() } else { None }
+                    };
                     let is_dir = md.as_ref().map(|m| m.is_dir()).unwrap_or(false);
                     let size = if is_dir || is_link {
                         0
@@ -2154,6 +2163,35 @@ mod v0646_e8_tests {
         wrote(atomic_write(&caps, &path, b"con un lector", &tys, "write_file()"));
         drop(held);
         assert_eq!(std::fs::read_to_string(d.join("proj/otra/f.txt")).unwrap(), "con un lector");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+    /// v0.6.51 (L1, specs/v0.6.51-modelos.md): la fila de un link lleva el `is_dir` de su destino
+    /// sólo si el programa podría leerlo; uno que sale del permiso dice `is_dir: false` sin mirar
+    /// afuera, igual con el grant de la carpeta sola.
+    #[test]
+    fn list_dir_does_not_look_past_a_link_that_leaves_the_grant() {
+        let d = std::env::temp_dir().join(format!("synsema-l1-list-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("proj/otra")).unwrap();
+        std::fs::create_dir_all(d.join("afuera")).unwrap();
+        std::fs::write(d.join("proj/f.txt"), "abc").unwrap();
+        link_dir(&d.join("proj/otra"), &d.join("proj/adentro"));
+        link_dir(&d.join("afuera"), &d.join("proj/sale"));
+        let root = d.to_string_lossy().replace('\\', "/");
+        let list = |grant: String| -> Vec<String> {
+            let mut interp = Interpreter::new();
+            let mut set = CapabilitySet::new("t");
+            set.grant(Capability::new(CapabilityType::FileRead, Some(grant)));
+            register_secure_builtins(&interp, Rc::new(RefCell::new(set)));
+            let src = format!("each e in list_dir(\"{}/proj\")\n    print(e.name + \" \" + text(e.is_dir) + \" \" + text(e.size) + \" \" + text(e.is_link))\n", root);
+            let program = synsema_core::parser::parse_source(&src, "<t>").unwrap();
+            assert!(interp.execute(&program).is_ok());
+            std::mem::take(&mut interp.output)
+        };
+        let all = list(format!("{}/proj/**", root));
+        assert_eq!(all, ["adentro true 0 true", "f.txt false 3 false", "otra true 0 false", "sale false 0 true"]);
+        let folder = list(format!("{}/proj", root));
+        assert_eq!(folder, ["adentro false 0 true", "f.txt false 3 false", "otra true 0 false", "sale false 0 true"]);
         let _ = std::fs::remove_dir_all(&d);
     }
 }

@@ -4,11 +4,12 @@
 //! allocator propio, las etiquetas del host, el log y el techo de host de `serve`, `shutdown()`)
 //! siguen en `tests/` como binarios propios: acá correrían al mismo tiempo que los demás.
 //!
-//! Lo de cada corrida (`exit`, `steps`, si tocó privados) viaja en su `RunResult` (v0.6.50). Siguen
-//! siendo del proceso, y los fija el primero que los toca: `serve` (escucha, `shutdown()`), la
-//! identidad mTLS de cliente, el texto de redacción de respaldo y el pool de workers. El
-//! `program_sha` de un recibo también es del proceso: aquí corren varios programas, así que sale
-//! `null` (nunca el de otro programa). Un test que dependa de alguno va aparte.
+//! Lo de cada corrida (`exit`, `steps`, si tocó privados) viaja en su `RunResult` (v0.6.50), y lo
+//! que era "el primero gana" —`serve` (escucha, `shutdown()`), la identidad mTLS de cliente, el
+//! texto de redacción de respaldo, el techo de host de `serve`— vive en el `RunScope` de cada
+//! corrida desde v0.6.51 (G1; `v0651_run_scope_e2e`). Siguen siendo del proceso el pool de workers
+//! y el `program_sha` de un recibo: aquí corren varios programas, así que sale `null` (nunca el de
+//! otro programa). Un test que dependa de alguno va aparte.
 
 mod agentauth_e2e;
 mod agentic_bus_e2e;
@@ -61,5 +62,6 @@ mod v0645_select_reset_e2e;
 mod v0645_state_atomic_e2e;
 mod v0646_tanda_c;
 mod v0646_f1;
+mod v0651_run_scope_e2e;
 mod webauth_e2e;
 mod webpush_e2e;

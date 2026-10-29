@@ -68,12 +68,24 @@ def parse_cachegrind(path):
     return per_fn
 
 
+def measure_env():
+    """El entorno de cada medición: fijo y mínimo, igual en toda corrida.
+
+    El entorno va al principio de la pila del proceso, así que su largo corre la alineación de lo
+    que el programa guarda ahí, y `memcmp` de glibc cuenta distinto según la alineación: con el
+    mismo motor, `s_csv|ref` medía +450 000 instrucciones (todas en `__memcmp_avx2_movbe`) en una
+    rama que se llama `main` frente a una que se llama `feat/v0650` (`GITHUB_REF`,
+    `GITHUB_HEAD_REF`). Con el entorno del runner, la fila dependía del nombre de la rama."""
+    # PATH fijo también: el del runner cambia con lo que agregan las acciones del job.
+    return {"PATH": "/usr/bin:/bin", "LC_ALL": "C", "HOME": "/tmp"}
+
+
 def measure(binary, prog, mode):
     with tempfile.TemporaryDirectory() as tmp:
         out = os.path.join(tmp, "cg.out")
         cmd = ["valgrind", "--tool=cachegrind", "--cache-sim=no", f"--cachegrind-out-file={out}",
                binary, *MODES[mode], prog + ".syn"]
-        r = subprocess.run(cmd, cwd=PROGS, capture_output=True, text=True)
+        r = subprocess.run(cmd, cwd=PROGS, capture_output=True, text=True, env=measure_env())
         if r.returncode != 0 or not os.path.exists(out):
             raise SystemExit(f"{prog} ({mode}) falló (código {r.returncode}):\n{r.stdout}\n{r.stderr}")
         # `run` escribe su tiempo (`[12.3 ms]`) por stderr; cualquier otra línea es un error.

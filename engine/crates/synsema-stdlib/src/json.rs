@@ -18,18 +18,18 @@ fn err(msg: impl Into<String>) -> Control {
     Control::Error(RuntimeError::new(msg.into()))
 }
 
-/// `synsema serve` corre en este proceso (top-level, workers, cron, agentes). Lo que `shutdown()`
-/// necesita para distinguir "sólo bajo serve" de "todavía no hay nada corriendo" (lo marca
-/// `server::mark_under_serve`). Vive acá, y no en `server.rs`, porque este módulo compila también en
-/// wasm y el aviso de redacción lo mira (v0.6.49, B4).
-pub(crate) static UNDER_SERVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
 /// v0.6.49 (B4): el aviso de un valor redactado al serializar. Decía siempre `[serve] warning: …
 /// in a serialized response/SSE body`, también bajo `synsema run` (un `evm_rpc` con la URL atada,
 /// un `push_send`): el prefijo y el lugar se eligen según el proceso corra `serve` o no.
 #[cold]
 fn warn_redacted(what: &str, tail: &str) {
-    eprintln!("{}", redacted_warning(what, tail, UNDER_SERVE.load(std::sync::atomic::Ordering::Relaxed)));
+    eprintln!("{}", redacted_warning(what, tail, under_serve()));
+}
+
+/// v0.6.51 (G1): ¿la corrida de este hilo es un `serve`? De la corrida, no del proceso: un `run` en el
+/// mismo proceso que un `serve` (un embebedor, los tests) no dice `[serve]`.
+fn under_serve() -> bool {
+    synsema_core::run_scope::current().is_some_and(|r| r.is_serve())
 }
 
 fn redacted_warning(what: &str, tail: &str, under_serve: bool) -> String {
@@ -648,11 +648,19 @@ pub(crate) fn meta_get(meta: &SynValue, key: &str) -> Option<String> {
 
 // -- JSON (el árbol como data) --
 
+/// v0.6.51: lo que sólo viste la página HTML (la hoja de estilos, la clase del contenedor, el
+/// `header`/`footer` del sitio) no es contenido: no va al JSON, como no va al Markdown.
+const PRESENTATION_META: [&str; 4] = ["stylesheet", "class", "header", "footer"];
+
 pub(crate) fn meta_to_json(meta: Option<&SynValue>) -> Json {
     match meta {
-        Some(SynValue::Map(m)) => {
-            Json::Object(m.borrow().iter().map(|(k, v)| (k.to_string(), syn_to_json(v))).collect())
-        }
+        Some(SynValue::Map(m)) => Json::Object(
+            m.borrow()
+                .iter()
+                .filter(|(k, _)| !PRESENTATION_META.contains(&k.as_str()))
+                .map(|(k, v)| (k.to_string(), syn_to_json(v)))
+                .collect(),
+        ),
         _ => Json::Object(Vec::new()),
     }
 }
@@ -839,6 +847,24 @@ mod tests {
         // Aridad fuera de rango: error claro.
         assert!(decode(&[]).is_err());
         assert!(decode(&[syn_text("1"), SynValue::Nothing, SynValue::Nothing]).is_err());
+    }
+
+    /// v0.6.51: todo lo que lee JSON con serde_json (estado de agentes, tool calls, jsonb, recibos)
+    /// lee un decimal como lo lee `json_decode`: el f64 más cercano, también con 17 dígitos.
+    #[test]
+    fn serde_json_reads_a_decimal_as_the_nearest_f64() {
+        let v: serde_json::Value = serde_json::from_str("[1792711237.7256045, 0.1, 2.2250738585072014e-308]").unwrap();
+        let got: Vec<f64> = v.as_array().unwrap().iter().map(|x| x.as_f64().unwrap()).collect();
+        assert_eq!(got, [1792711237.7256045, 0.1, 2.2250738585072014e-308]);
+        let mut x: u64 = 0x9e3779b97f4a7c15;
+        for _ in 0..20_000 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let f = f64::from_bits(x >> 2);
+            let back: f64 = serde_json::from_str(&format!("{:?}", f)).unwrap();
+            assert_eq!(back.to_bits(), f.to_bits(), "{:?}", f);
+        }
     }
 }
 

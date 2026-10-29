@@ -134,7 +134,7 @@ fn acme_http01_end_to_end_against_pebble() {
     let chal = TcpListener::bind(("127.0.0.1", challenge_port)).unwrap();
     {
         let s = store.clone();
-        thread::spawn(move || server::serve_acme_http(chal, https_port, s));
+        thread::spawn(move || server::serve_acme_http(chal, https_port, s, Arc::new(server::ServeLife::default())));
     }
 
     // (6) Configura el flujo ACME contra Pebble (directorio + CA de confianza + dir de certs).

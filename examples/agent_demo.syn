@@ -67,9 +67,11 @@ let config be {"host": "localhost", "port": 8080, "debug": true}
 print("Host: " + host of config)
 print("Keys: " + text(keys(config)))
 
--- Sandbox block
+-- Sandbox block: no capability inside, `print` included; the block computes, the program prints
+let cleaned be ""
 sandbox
     let untrusted be "user input here"
-    print("Sandboxed: " + untrusted)
+    set cleaned to upper(untrusted)
+print("Sandboxed: " + cleaned)
 
 print("Done!")

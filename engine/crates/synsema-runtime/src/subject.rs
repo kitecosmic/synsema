@@ -18,7 +18,7 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use synsema_capabilities::model::{CapabilitySet, Delegation};
+use synsema_capabilities::model::{capability_type_from_name, Capability, CapabilitySet, Delegation, DelegationSource};
 use synsema_core::interpreter::Interpreter;
 use synsema_core::types::SynValue;
 
@@ -73,8 +73,9 @@ impl Subject {
         Subject { identity, ..Subject::default() }
     }
 
-    /// El sujeto como JSON para el protocolo padre → hijo de `run_program` (sin los techos
-    /// delegados: ésos viajan como `--cap-set`).
+    /// El sujeto como JSON para el protocolo padre → hijo de `run_program`. v0.6.51 (C1): con los
+    /// techos delegados, capa por capa (antes viajaban sólo aplanados en el `--cap-set`, y una capa
+    /// que llegaba sólo a lo público dejaba de existir en el hijo).
     pub fn to_env_json(&self) -> String {
         let limits: Vec<serde_json::Value> = self
             .spend_limits
@@ -85,6 +86,7 @@ impl Subject {
             "identity": self.identity,
             "spend_limits": limits,
             "llm_tokens": self.llm_tokens,
+            "delegations": self.delegations.iter().map(delegation_to_json).collect::<Vec<_>>(),
         })
         .to_string()
     }
@@ -102,7 +104,16 @@ impl Subject {
             })
             .unwrap_or_default();
         let llm_tokens = v.get("llm_tokens").and_then(|x| x.as_u64());
-        Some(Subject { identity, spend_limits, llm_tokens, delegations: Vec::new() })
+        // Una capa que no se entiende cierra (una capa vacía no cubre nada): nunca abre.
+        let delegations = match v.get("delegations") {
+            None => Vec::new(),
+            Some(serde_json::Value::Array(ds)) => ds
+                .iter()
+                .map(|d| delegation_from_json(d).unwrap_or_else(|| Delegation::caller(Vec::new())))
+                .collect(),
+            Some(_) => vec![Delegation::caller(Vec::new())],
+        };
+        Some(Subject { identity, spend_limits, llm_tokens, delegations })
     }
 
     /// Captura el sujeto VIGENTE de una unidad de trabajo (para propagarlo a lo que crea):
@@ -131,6 +142,48 @@ impl Subject {
     }
 }
 
+/// Un techo delegado para el protocolo de `run_program`: sus capas (raíz primero), cada capability
+/// como `{ty, scope}`; un token conserva su `id` (lo que se revoca y lo que nombran los mensajes).
+fn delegation_to_json(d: &Delegation) -> serde_json::Value {
+    let layer = |l: &Vec<Capability>| -> Vec<serde_json::Value> {
+        l.iter().map(|c| serde_json::json!({"ty": c.ty().wire_name(), "scope": c.scope()})).collect()
+    };
+    let id = match &d.source {
+        DelegationSource::Token(id) => Some(id.clone()),
+        _ => None,
+    };
+    serde_json::json!({
+        "token": id,
+        "deterministic": d.deterministic,
+        "layers": d.layers().map(layer).collect::<Vec<_>>(),
+    })
+}
+
+fn delegation_from_json(v: &serde_json::Value) -> Option<Delegation> {
+    let layer = |l: &serde_json::Value| -> Option<Vec<Capability>> {
+        l.as_array()?
+            .iter()
+            .map(|c| {
+                let ty = capability_type_from_name(c.get("ty")?.as_str()?)?;
+                let scope = match c.get("scope")? {
+                    serde_json::Value::Null => None,
+                    s => Some(s.as_str()?.to_string()),
+                };
+                Some(Capability::new(ty, scope))
+            })
+            .collect()
+    };
+    let mut layers: Vec<Vec<Capability>> = v.get("layers")?.as_array()?.iter().map(layer).collect::<Option<_>>()?;
+    let last = layers.pop()?;
+    let deterministic = v.get("deterministic")?.as_bool()?;
+    let d = match v.get("token")? {
+        serde_json::Value::String(id) => Delegation::token(id.clone(), last, deterministic),
+        serde_json::Value::Null => Delegation { deterministic, ..Delegation::caller(last) },
+        _ => return None,
+    };
+    Some(d.with_earlier(layers))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -152,5 +205,25 @@ mod tests {
         assert!(anon.identity.is_none() && anon.spend_limits.is_empty() && anon.llm_tokens.is_none());
         // Basura en la variable: no se inventa un sujeto.
         assert!(Subject::from_env_json("not json").is_none());
+    }
+
+    /// v0.6.51 (C1): los techos delegados viajan al hijo capa por capa (un token con sus bloques, lo
+    /// que limitaba al padre), y una capa que no se entiende cierra.
+    #[test]
+    fn the_delegated_layers_round_trip_and_a_bad_one_closes() {
+        use synsema_capabilities::model::CapabilityType;
+        let net = |s: &str| Capability::new(CapabilityType::Net, Some(s.to_string()));
+        let s = Subject {
+            delegations: vec![
+                Delegation::token("tok-1", vec![net("intranet.corp")], true).with_earlier(vec![vec![net("*")]]),
+                Delegation::caller(vec![net("*"), Capability::new(CapabilityType::Stdout, None)]),
+            ],
+            ..Subject::default()
+        };
+        let back = Subject::from_env_json(&s.to_env_json()).expect("json");
+        assert_eq!(back.delegations, s.delegations);
+        let bad = r#"{"identity": null, "spend_limits": [], "llm_tokens": null, "delegations": [{"token": null, "deterministic": false, "layers": [[{"ty": "teleport", "scope": null}]]}]}"#;
+        let back = Subject::from_env_json(bad).expect("json");
+        assert_eq!(back.delegations, vec![Delegation::caller(Vec::new())]);
     }
 }

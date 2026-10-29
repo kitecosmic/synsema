@@ -146,6 +146,9 @@ pub fn is_process_local(ty: CapabilityType) -> bool {
 pub enum DelegationSource {
     Token(String),
     Block,
+    /// v0.6.51 (C1): lo que limitaba al programa que lanzó éste con `run_program` (sus grants, su
+    /// techo de host, sus `sandbox under`), heredado como capa: el hijo nunca llega más lejos.
+    Caller,
 }
 
 impl DelegationSource {
@@ -154,6 +157,7 @@ impl DelegationSource {
         match self {
             DelegationSource::Token(_) => "token",
             DelegationSource::Block => "sandbox",
+            DelegationSource::Caller => "caller",
         }
     }
 }
@@ -165,20 +169,44 @@ impl DelegationSource {
 /// memory/sandbox_run/attest) y deja pasar lo local al proceso (`PROCESS_LOCAL`), salvo que
 /// el emisor haya pedido `deterministic`: entonces `time` y `random` se niegan, exactamente
 /// como el techo `--deterministic` del host.
+///
+/// v0.6.51 (C1): un captoken atenuado es la INTERSECCIÓN de sus bloques (como en Biscuit y en los
+/// macaroons): `caps` es el último y `earlier` los anteriores, de la raíz en adelante, y cada uno es
+/// una capa. Por nombre la atenuación ya garantiza que el último cabe en los anteriores; donde las
+/// capas importan es en `net`: una dirección privada tiene que estar NOMBRADA por cada bloque, y un
+/// comodín (`*`, sin scope) nunca nombra. Con sólo el último bloque, `{"net": "*"}` (sólo lo público)
+/// atenuado sin la clave a `127.0.0.1` llegaba a la red interna.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Delegation {
     pub caps: Vec<Capability>,
+    pub earlier: Vec<Vec<Capability>>,
     pub source: DelegationSource,
     pub deterministic: bool,
 }
 
 impl Delegation {
     pub fn token(id: impl Into<String>, caps: Vec<Capability>, deterministic: bool) -> Self {
-        Delegation { caps, source: DelegationSource::Token(id.into()), deterministic }
+        Delegation { caps, earlier: Vec::new(), source: DelegationSource::Token(id.into()), deterministic }
     }
 
     pub fn block(caps: Vec<Capability>) -> Self {
-        Delegation { caps, source: DelegationSource::Block, deterministic: false }
+        Delegation { caps, earlier: Vec::new(), source: DelegationSource::Block, deterministic: false }
+    }
+
+    /// v0.6.51 (C1): lo que limitaba al programa que llamó a `run_program`, como capa del hijo.
+    pub fn caller(caps: Vec<Capability>) -> Self {
+        Delegation { caps, earlier: Vec::new(), source: DelegationSource::Caller, deterministic: false }
+    }
+
+    /// Los bloques anteriores de la cadena (raíz primero), cada uno una capa más.
+    pub fn with_earlier(mut self, earlier: Vec<Vec<Capability>>) -> Self {
+        self.earlier = earlier;
+        self
+    }
+
+    /// Cada capa de este techo: los bloques anteriores y el último.
+    pub fn layers(&self) -> impl Iterator<Item = &Vec<Capability>> {
+        self.earlier.iter().chain(std::iter::once(&self.caps))
     }
 
     /// ¿Este techo delegado cubre la capability? Mismo `covers()` que gatea los `require`
@@ -187,7 +215,7 @@ impl Delegation {
         if is_process_local(cap.ty) {
             return !(self.deterministic && matches!(cap.ty, CapabilityType::Time | CapabilityType::Random));
         }
-        self.caps.iter().any(|allowed| allowed.covers(cap))
+        self.layers().all(|layer| layer.iter().any(|allowed| allowed.covers(cap)))
     }
 
     /// El `reason` de la entrada de audit (y el sufijo del mensaje) de un rechazo.
@@ -199,6 +227,7 @@ impl Delegation {
                 format!("denied by the deterministic caveat of token {}", id)
             }
             (DelegationSource::Block, _) => "above sandbox ceiling (sandbox under)".to_string(),
+            (DelegationSource::Caller, _) => "above the ceiling of the calling program (run_program)".to_string(),
         }
     }
 }
@@ -268,10 +297,18 @@ pub fn capability_type_from_name(name: &str) -> Option<CapabilityType> {
 }
 
 /// Una capability concreta: tipo + scope opcional.
+///
+/// v0.6.51 (O4): los campos son privados y se leen con `ty()`/`scope()`. La especificidad (la clave
+/// del orden del `CapSet`) se calcula una vez en `new` y viaja con el valor; antes se recalculaba en
+/// cada comparación del `BTreeSet` (recorrer el scope, buscar un CIDR). Con los campos públicos
+/// cualquiera podía cambiar el scope y dejar la clave vieja: el orden del set mentiría. Cambiar el
+/// scope es armar otra con `with_scope`. La clave sale de `ty` y `scope`, así que `Eq`/`Hash`
+/// derivados siguen diciendo lo mismo.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Capability {
-    pub ty: CapabilityType,
-    pub scope: Option<String>,
+    ty: CapabilityType,
+    scope: Option<String>,
+    key: (u8, bool, usize),
 }
 
 /// v0.6.47 (T2): los grants y denies de un set, en su orden canónico (`Capability::cmp`). Con un
@@ -327,13 +364,13 @@ impl Capability {
     /// Sólo depende del tipo y del texto del scope (no del cwd ni del entorno): el orden del `BTreeSet`
     /// no puede cambiar con el elemento adentro. Por eso una ruta relativa contra una absoluta se
     /// compara por el largo del texto (declarado).
-    fn specificity(&self) -> (u8, bool, usize) {
+    fn specificity(ty: CapabilityType, scope: &Option<String>) -> (u8, bool, usize) {
         let wild = |c: char| matches!(c, '*' | '?');
         let literals = |s: &str| s.chars().filter(|c| !wild(*c)).count();
-        let Some(s) = &self.scope else {
-            return (if Self::scoped_covers_unscoped(self.ty) { 2 } else { 0 }, true, 0);
+        let Some(s) = scope else {
+            return (if Self::scoped_covers_unscoped(ty) { 2 } else { 0 }, true, 0);
         };
-        match self.ty {
+        match ty {
             CapabilityType::Net => {
                 let (host, port) = split_net_scope(s);
                 let cidr = host.split_once('/').and_then(|(ip, bits)| {
@@ -362,8 +399,8 @@ impl Capability {
 impl Ord for Capability {
     fn cmp(&self, other: &Self) -> Ordering {
         other
-            .specificity()
-            .cmp(&self.specificity())
+            .key
+            .cmp(&self.key)
             .then_with(|| self.ty.cmp(&other.ty))
             .then_with(|| self.scope.cmp(&other.scope))
     }
@@ -403,7 +440,21 @@ impl Capability {
             }
             (_, s) => s,
         };
-        Self { ty, scope }
+        let key = Self::specificity(ty, &scope);
+        Self { ty, scope, key }
+    }
+
+    pub fn ty(&self) -> CapabilityType {
+        self.ty
+    }
+
+    pub fn scope(&self) -> Option<&str> {
+        self.scope.as_deref()
+    }
+
+    /// La misma capability con otro scope (normalizado como en `new`, con su clave).
+    pub fn with_scope(&self, scope: Option<String>) -> Self {
+        Self::new(self.ty, scope)
     }
 
     /// Serialización como item de `--cap-set` (`net=api.x`, `file.read=./data`,
@@ -756,7 +807,7 @@ impl NetLayers {
         if self.ceiling.as_ref().is_some_and(|c| !c.iter().any(names)) {
             return Err(DenyCause::AboveCeiling);
         }
-        if let Some(d) = self.delegated.iter().find(|d| !d.caps.iter().any(names)) {
+        if let Some(d) = self.delegated.iter().find(|d| d.layers().any(|layer| !layer.iter().any(names))) {
             return Err(DenyCause::Delegated(d.clone()));
         }
         if self.granted.iter().any(names) {
@@ -783,6 +834,7 @@ pub fn private_dest_message(who: &str, dest: &str, ip: std::net::IpAddr, cause: 
             match &d.source {
                 DelegationSource::Token(id) => format!("delegated ceiling of token {}", id),
                 DelegationSource::Block => "enclosing `sandbox under` block".to_string(),
+                DelegationSource::Caller => "ceiling of the program that called run_program".to_string(),
             },
             dest
         ),
@@ -1455,7 +1507,11 @@ impl CapabilitySet {
             delegated: self
                 .delegated
                 .iter()
-                .map(|d| Delegation { caps: d.caps.iter().filter(net).cloned().collect(), ..(**d).clone() })
+                .map(|d| Delegation {
+                    caps: d.caps.iter().filter(net).cloned().collect(),
+                    earlier: d.earlier.iter().map(|l| l.iter().filter(net).cloned().collect()).collect(),
+                    ..(**d).clone()
+                })
                 .collect(),
         };
         let mut collect = |set: &CapabilitySet| {
@@ -1469,6 +1525,35 @@ impl CapabilitySet {
             next = p.borrow().parent.clone();
         }
         layers
+    }
+
+    /// v0.6.51 (C1): lo que limita a este set, como capas para el hijo de `run_program`. El hijo
+    /// recibe su techo como `--cap-set` (la intersección por nombre), pero un techo plano pierde la
+    /// regla de `net`: una dirección privada tiene que estar nombrada por cada capa. Con
+    /// `require net("*")` (sólo lo público) el padre podía pedir para el hijo `net("127.0.0.1")`, que
+    /// el comodín cubre por nombre, y el hijo llegaba adonde el padre no. Viajan entonces, como capas:
+    /// los grants del padre (y de sus padres), su techo de host y sus techos delegados (un token con
+    /// todos sus bloques; un `sandbox under` pasa a ser "del que llamó").
+    /// Límite declarado: un `deny` del embebedor no viaja (no existe como sentencia del lenguaje).
+    pub fn layers_for_child(&self) -> Vec<Delegation> {
+        let mut grants: Vec<Capability> = self.granted.iter().cloned().collect();
+        let mut next = self.parent.clone();
+        while let Some(p) = next {
+            grants.extend(p.borrow().granted.iter().cloned());
+            next = p.borrow().parent.clone();
+        }
+        let mut out = vec![Delegation::caller(grants)];
+        if let Some(c) = &self.ceiling {
+            out.push(Delegation::caller(c.as_ref().clone()));
+        }
+        for d in &self.delegated {
+            let mut d = (**d).clone();
+            if d.source == DelegationSource::Block {
+                d.source = DelegationSource::Caller;
+            }
+            out.push(d);
+        }
+        out
     }
 
     /// v0.6.49 (A5): el primer grant de `net` con un CIDR (`net("10.0.0.0/8")`), propio o de un padre,
@@ -1604,6 +1689,10 @@ impl CapabilitySet {
                 ),
                 DelegationSource::Block => format!(
                     "Capability not granted: {} — outside the ceiling of the enclosing `sandbox under` block; add it to that block's caps or run this outside the block",
+                    requested
+                ),
+                DelegationSource::Caller => format!(
+                    "Capability not granted: {} — outside what the program that started this one with run_program could do; that program has to be able to do it first",
                     requested
                 ),
             },
@@ -1824,6 +1913,83 @@ pub fn validate_memory_name(name: &str) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod o4_tests {
+    use super::*;
+
+    fn eleven() -> Vec<Capability> {
+        let c = |t: CapabilityType, s: Option<&str>| Capability::new(t, s.map(|x| x.to_string()));
+        vec![
+            c(CapabilityType::Net, Some("api.example.com")),
+            c(CapabilityType::Net, Some("*.cdn.example.com")),
+            c(CapabilityType::Net, Some("10.0.0.0/8")),
+            c(CapabilityType::FileRead, Some("./data/**")),
+            c(CapabilityType::FileRead, Some("./templates/*")),
+            c(CapabilityType::FileWrite, Some("./out/*")),
+            c(CapabilityType::Secret, Some("OPENAI_KEY@api.openai.com")),
+            c(CapabilityType::Llm, None),
+            c(CapabilityType::Db, Some("./app.db")),
+            c(CapabilityType::Stdout, None),
+            c(CapabilityType::Time, None),
+        ]
+    }
+
+    /// v0.6.51 (O4): la clave guardada es la que daría recalcularla, y el orden del set no cambió.
+    #[test]
+    fn the_stored_key_is_the_specificity_of_ty_and_scope() {
+        for cap in eleven() {
+            assert_eq!(cap.key, Capability::specificity(cap.ty, &cap.scope), "{:?}", cap);
+            let moved = cap.with_scope(Some("./otro/*".to_string()));
+            assert_eq!(moved.key, Capability::specificity(moved.ty, &moved.scope), "{:?}", moved);
+        }
+        let set: CapSet = eleven().into_iter().collect();
+        let order: Vec<(u8, bool, usize)> = set.iter().map(|c| Capability::specificity(c.ty, &c.scope)).collect();
+        let mut sorted = order.clone();
+        sorted.sort_by(|a, b| b.cmp(a));
+        assert_eq!(order, sorted);
+    }
+
+    /// Medición (no corre sola): `cargo test --profile fast-release -p synsema-capabilities --lib
+    /// o4_build -- --ignored --nocapture`. Arma el set de 11 grants con la clave guardada y con la
+    /// de antes (recalculada en cada comparación).
+    #[test]
+    #[ignore]
+    fn o4_build_cost() {
+        #[derive(PartialEq, Eq)]
+        struct Old(Capability);
+        impl Ord for Old {
+            fn cmp(&self, o: &Self) -> Ordering {
+                Capability::specificity(o.0.ty, &o.0.scope)
+                    .cmp(&Capability::specificity(self.0.ty, &self.0.scope))
+                    .then_with(|| self.0.ty.cmp(&o.0.ty))
+                    .then_with(|| self.0.scope.cmp(&o.0.scope))
+            }
+        }
+        impl PartialOrd for Old {
+            fn partial_cmp(&self, o: &Self) -> Option<Ordering> {
+                Some(self.cmp(o))
+            }
+        }
+        let caps = eleven();
+        let n = 200_000;
+        for round in 0..3 {
+            let t = std::time::Instant::now();
+            for _ in 0..n {
+                let s: BTreeSet<Old> = caps.iter().cloned().map(Old).collect();
+                std::hint::black_box(s);
+            }
+            let old = t.elapsed().as_nanos() as f64 / n as f64;
+            let t = std::time::Instant::now();
+            for _ in 0..n {
+                let s: CapSet = caps.iter().cloned().collect();
+                std::hint::black_box(s);
+            }
+            let new = t.elapsed().as_nanos() as f64 / n as f64;
+            println!("ronda {}: antes {:.0} ns, ahora {:.0} ns por set de 11", round, old, new);
+        }
+    }
 }
 
 #[cfg(test)]

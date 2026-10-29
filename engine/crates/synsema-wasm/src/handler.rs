@@ -446,11 +446,12 @@ fn dispatch(app: &mut App, req: &HttpRequestIn) -> (HttpResponseOut, Vec<String>
             break;
         }
     }
-    // Negociación por sufijo (.md/.json/.html): sólo si un :param se tragó el sufijo.
+    // Negociación por sufijo (.md/.json/.html): si un :param se tragó el sufijo o (v0.6.51) si
+    // ninguna ruta casa el path entero (`GET /historial.md` → `/historial`).
     let mut explicit_fmt: Option<String> = None;
     let (logical_path, sfx) = split_format_suffix(&path);
-    if let (Some(s), Some(idx)) = (sfx, route_idx) {
-        if param_last_segment(&cap.routes[idx].path) {
+    if let Some(s) = sfx {
+        if route_idx.map_or(true, |idx| param_last_segment(&cap.routes[idx].path)) {
             for (i, r) in cap.routes.iter().enumerate() {
                 if r.method != method {
                     continue;

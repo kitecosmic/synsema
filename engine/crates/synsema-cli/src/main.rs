@@ -40,7 +40,7 @@ mod update;
 mod code;
 mod sealed_receipt;
 
-const USAGE: &str = "uso: synsema <conform [--swarm] [--flat] | serve [--secure] [--watch] [--port N] [--domain d1,d2] [--tls-auto <email> | --tls-cert <p> --tls-key <p>] [--bind addr] [--trust-proxy ip,cidr] [--health <path>] [--attested] [--auditor <X25519 public key> [--receipt <ruta|fd:N>]] | run [--flat] [--explain] [--format human|json] [--provider <name>] [--attest] [--auditor <X25519 public key> [--receipt <ruta|fd:N>] | --replay <recibo abierto> [--replay-any-program]] <archivo.syn | -> [-- args...] | receipt <open <recibo> --key <privada> | verify <recibo> | keygen> | test [-v] [--auditor <X25519 public key> [--receipt <ruta|fd:N>]] <archivo|dir> | build <main.syn> -o <salida> [--include <p>]... [--engine-binary <ruta>] [--serve [--bind addr] ...] [--no-console] [--icon <svg|png|ico>] [--bundle [--name <n>] [--id <id>]] | check | code <outline|symbol|refs|routes|caps|check|search|deps> [--json] | code --mcp | openapi [--out f] [--base-url URL] | tokens | ast | repl | daemon | init [dir] [--synfide | --pwa | --desktop] | llm status [--json] | version | update> [--sandbox | --cap-set <list> | --deterministic] [--trusted <nombre=ruta>]... [--trusted-cap-set <list>] [--trusted-templates <nombre=dir>]... [--labels] [--jitless] [--profile native|pure] [--audit json|<ruta>|fd:N|unix:<ruta>] [--env-file <path> | --no-env-file] <archivo.syn>";
+const USAGE: &str = "uso: synsema <conform [--swarm] [--flat] | serve [--secure] [--watch] [--port N] [--domain d1,d2] [--tls-auto <email> | --tls-cert <p> --tls-key <p>] [--bind addr] [--trust-proxy ip,cidr] [--health <path>] [--attested] [--auditor <X25519 public key> [--receipt <ruta|fd:N>]] | run [--flat] [--explain] [--format human|json] [--provider <name>] [--attest] [--auditor <X25519 public key> [--receipt <ruta|fd:N>] | --replay <recibo abierto> [--replay-any-program]] <archivo.syn | -> [-- args...] | receipt <open <recibo> --key <privada> | verify <recibo> | keygen> | test [-v] [--auditor <X25519 public key> [--receipt <ruta|fd:N>]] <archivo|dir> | build <main.syn> -o <salida> [--include <p>]... [--engine-binary <ruta>] [--serve [--bind addr] ...] [--no-console] [--icon <svg|png|ico>] [--bundle [--name <n>] [--id <id>]] | check [--templates <dir>] | code <outline|symbol|refs|routes|caps|check|search|deps> [--json] | code --mcp | openapi [--out f] [--base-url URL] | tokens | ast | repl | daemon | init [dir] [--synfide | --pwa | --desktop] | llm status [--json] | version | update> [--sandbox | --cap-set <list> | --deterministic] [--trusted <nombre=ruta>]... [--trusted-cap-set <list>] [--trusted-templates <nombre=dir>]... [--labels] [--jitless] [--profile native|pure] [--audit json|<ruta>|fd:N|unix:<ruta>] [--env-file <path> | --no-env-file] <archivo.syn>";
 
 // `build_ceiling` (--sandbox/--cap-set → techo) vive en synsema-capabilities: lo comparten
 // este binario y `synsema-wasm` (mismas flags, misma semántica en los dos front-ends).
@@ -2818,12 +2818,35 @@ fn capability_warnings(path: &str) -> Vec<String> {
 }
 
 fn cmd_check(args: &[String]) -> ExitCode {
-    let path = match args.get(2) {
-        Some(p) => p.clone(),
-        None => {
-            eprintln!("uso: synsema check <archivo.syn>");
-            return ExitCode::from(2);
+    // v0.6.51: `--templates <dir>` valida cada `render("…")` literal contra esa carpeta, como la lee
+    // una herramienta de confianza a la que el host le da `--trusted-templates nombre=<dir>`. Sin
+    // él, contra el directorio de trabajo, como `render` en un programa.
+    let mut path: Option<String> = None;
+    let mut templates: Option<String> = None;
+    let mut i = 2;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--templates" => match args.get(i + 1) {
+                Some(d) => {
+                    templates = Some(d.clone());
+                    i += 1;
+                }
+                None => {
+                    eprintln!("synsema check: --templates takes the folder of the templates, e.g. --templates ./tools-templates");
+                    return ExitCode::from(2);
+                }
+            },
+            other if path.is_none() => path = Some(other.to_string()),
+            other => {
+                eprintln!("synsema check: unexpected argument '{}'", other);
+                return ExitCode::from(2);
+            }
         }
+        i += 1;
+    }
+    let Some(mut path) = path else {
+        eprintln!("uso: synsema check [--templates <dir>] <archivo.syn>");
+        return ExitCode::from(2);
     };
     let source = match std::fs::read_to_string(&path) {
         Ok(s) => s,
@@ -2832,6 +2855,17 @@ fn cmd_check(args: &[String]) -> ExitCode {
             return ExitCode::from(1);
         }
     };
+    if let Some(dir) = &templates {
+        // El programa y sus módulos se resuelven desde su ruta (absoluta); los templates, desde
+        // la carpeta, que pasa a ser el directorio de trabajo del chequeo.
+        if let Ok(abs) = std::fs::canonicalize(&path) {
+            path = strip_verbatim(&abs);
+        }
+        if let Err(e) = std::env::set_current_dir(dir) {
+            eprintln!("synsema check: --templates {}: {}", dir, e);
+            return ExitCode::from(1);
+        }
+    }
     use synsema_core::parser::CompileError;
     match synsema_core::parser::parse_source(&source, &path) {
         Ok(program) => {
@@ -2890,6 +2924,11 @@ fn cmd_check(args: &[String]) -> ExitCode {
                 }
                 Err(e) => {
                     eprintln!("Error: {}", e);
+                    // Un template que no está, sin `--templates`: si el archivo es una herramienta
+                    // de confianza, sus templates son los que le da el host, no los del cwd.
+                    if templates.is_none() && e.contains("template validation failed") && e.contains("not found") {
+                        eprintln!("  (render() reads templates from the current directory; if this file is a trusted tool, check it against the folder the host gives it: synsema check --templates <dir> {})", path);
+                    }
                     ExitCode::from(1)
                 }
             }

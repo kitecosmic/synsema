@@ -733,22 +733,19 @@ mod tests {
     }
 
     /// Ronda final de v0.6.46: el CI vio `--replay` devolver `…7256043` donde la corrida leyó
-    /// `…7256045`. Como texto, cada lectura vuelve bit a bit; como número, `serde_json` (sin
-    /// `float_roundtrip`) no siempre.
+    /// `…7256045`. Como texto, cada lectura vuelve bit a bit; como número también desde v0.6.51
+    /// (`serde_json` con `float_roundtrip` en el workspace: antes no siempre). El recibo sigue
+    /// guardando el texto.
     #[test]
     fn clock_readings_come_back_bit_for_bit() {
-        let mut lossy = 0;
         let mut x = 1_792_711_237.725_604_5_f64;
         for i in 0..20_000u32 {
             let t = clock_text(x);
             assert_eq!(t.parse::<f64>().unwrap().to_bits(), x.to_bits(), "{}", t);
             let as_number: Value = serde_json::from_str(&serde_json::Number::from_f64(x).unwrap().to_string()).unwrap();
-            if as_number.as_f64().unwrap().to_bits() != x.to_bits() {
-                lossy += 1;
-            }
+            assert_eq!(as_number.as_f64().unwrap().to_bits(), x.to_bits(), "como número JSON: {}", t);
             x += 0.000_123_457 * f64::from(i % 97 + 1);
         }
-        assert!(lossy > 0, "control: como número JSON alguna lectura vuelve distinta");
     }
     use synsema_core::bytesutil::hex_decode;
 

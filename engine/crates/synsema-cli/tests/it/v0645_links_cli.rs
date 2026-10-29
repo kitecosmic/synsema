@@ -147,7 +147,8 @@ print("info real link=" + text(r["is_link"]))
     let (code, out, err) = synsema(&proj, &[], src);
     assert_eq!(code, 0, "{}", err);
     assert!(out.contains("alias dir=true link=true"), "{}", out);
-    assert!(out.contains("ext dir=true link=true"), "{}", out);
+    // v0.6.51 (L1): `ext` lleva afuera del permiso; el motor no mira lo que hay detrás.
+    assert!(out.contains("ext dir=false link=true"), "{}", out);
     assert!(out.contains("real dir=true link=false"), "{}", out);
     assert!(out.contains("info alias dir=true link=true"), "{}", out);
     assert!(out.contains("info real link=false"), "{}", out);

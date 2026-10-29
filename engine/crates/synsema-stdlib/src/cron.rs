@@ -199,53 +199,58 @@ impl CronScheduler {
                 *g = v;
             }
         };
-        let jh = thread::spawn(move || loop {
-            match &schedule {
-                Schedule::Every(secs) | Schedule::After(secs) => {
-                    let dur = Duration::from_secs_f64(secs.max(0.0));
-                    set_next(Some(now_secs_f64() + dur.as_secs_f64()));
-                    if Self::wait_parked(dur, &cancelled) {
-                        return;
-                    }
-                }
-                Schedule::At { expr, zone } => {
-                    // Próximo minuto de pared que matchea, DESPUÉS de ahora. Se espera
-                    // en tramos de ≤ 60 s recomputando contra el reloj de pared: un
-                    // salto del reloj (NTP) no deja al job dormido de más ni de menos.
-                    let target = match expr.next_after(now_secs_f64().floor() as i64, *zone) {
-                        Some(t) => t as f64,
-                        None => {
-                            set_next(None);
-                            return; // validado al registrar; defensivo
-                        }
-                    };
-                    set_next(Some(target));
-                    loop {
-                        let remaining = target - now_secs_f64();
-                        if remaining <= 0.0 {
-                            break;
-                        }
-                        let slice = Duration::from_secs_f64(remaining.min(60.0));
-                        if Self::wait_parked(slice, &cancelled) {
+        // v0.6.51 (G1): el job corre para la corrida que lo registró.
+        let run = synsema_core::run_scope::current();
+        let jh = thread::spawn(move || {
+            let _run = run.as_ref().map(|r| r.enter());
+            loop {
+                match &schedule {
+                    Schedule::Every(secs) | Schedule::After(secs) => {
+                        let dur = Duration::from_secs_f64(secs.max(0.0));
+                        set_next(Some(now_secs_f64() + dur.as_secs_f64()));
+                        if Self::wait_parked(dur, &cancelled) {
                             return;
                         }
                     }
+                    Schedule::At { expr, zone } => {
+                        // Próximo minuto de pared que matchea, DESPUÉS de ahora. Se espera
+                        // en tramos de ≤ 60 s recomputando contra el reloj de pared: un
+                        // salto del reloj (NTP) no deja al job dormido de más ni de menos.
+                        let target = match expr.next_after(now_secs_f64().floor() as i64, *zone) {
+                            Some(t) => t as f64,
+                            None => {
+                                set_next(None);
+                                return; // validado al registrar; defensivo
+                            }
+                        };
+                        set_next(Some(target));
+                        loop {
+                            let remaining = target - now_secs_f64();
+                            if remaining <= 0.0 {
+                                break;
+                            }
+                            let slice = Duration::from_secs_f64(remaining.min(60.0));
+                            if Self::wait_parked(slice, &cancelled) {
+                                return;
+                            }
+                        }
+                    }
                 }
-            }
-            if cancelled.load(Ordering::SeqCst) {
-                return;
-            }
-            set_next(None);
-            match task() {
-                Ok(()) => {
-                    run_count.fetch_add(1, Ordering::SeqCst);
+                if cancelled.load(Ordering::SeqCst) {
+                    return;
                 }
-                Err(()) => {
-                    errors.fetch_add(1, Ordering::SeqCst);
+                set_next(None);
+                match task() {
+                    Ok(()) => {
+                        run_count.fetch_add(1, Ordering::SeqCst);
+                    }
+                    Err(()) => {
+                        errors.fetch_add(1, Ordering::SeqCst);
+                    }
                 }
-            }
-            if !schedule.repeating() {
-                return;
+                if !schedule.repeating() {
+                    return;
+                }
             }
         });
         jh.thread().clone() // jh se dropea → hilo desacoplado (detached)
