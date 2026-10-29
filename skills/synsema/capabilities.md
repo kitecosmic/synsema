@@ -155,8 +155,8 @@ Plain `call`/normal invocation does NOT isolate — use `call_tool` for untruste
 ```synsema
 sandbox
     -- code here has NO capabilities (fully isolated): net/file/time/random/db/secret
-    -- are all DENIED inside, even if the program granted them. `require` inside is a
-    -- no-op (can't re-grant to escape). `print` works (not gated); restored on exit.
+    -- AND stdout are all DENIED inside, even if the program granted them. `require`
+    -- inside is a no-op (can't re-grant to escape). Restored on exit.
     let result be compute(untrusted_data)
 
 -- Sandbox can also be an EXPRESSION (returns the value of its body):
@@ -164,6 +164,24 @@ let enriched be sandbox transform(untrusted_data)   -- isolated AND returns a va
 ```
 Use it to run untrusted/enriching logic that must NOT touch the network, disk, or any
 capability — only pure computation in, value out.
+
+**No output inside a plain `sandbox` (engine v0.6.51+, breaking).** `print`, `eprint`, `show`, `log`
+and `term_write` inside the block fail, every time, with or without a host ceiling:
+``Capability not granted: stdout — a `sandbox` block denies every capability, whatever the program
+declares; stdout is the process's: a `sandbox under {…}` block (also `sandbox under {}`) lets it
+through within the host ceiling, though it cannot be listed in the caps, or run this outside the
+block`` (catchable with `try`/`recover`). Before v0.6.51 `print` went through without a ceiling.
+Two fixes:
+
+```synsema
+let r be 0
+sandbox
+    set r to compute(untrusted_data)      -- compute inside...
+print(r)                                  -- ...print after
+
+sandbox under {}                          -- or: nothing delegated, but the process's
+    print(compute(untrusted_data))        -- stdout/stdin/time/random pass (within the host ceiling)
+```
 
 **`sandbox under <caps>` (v0.6.28+) — a least-privilege block.** The body runs under a **delegated
 ceiling** instead of with nothing: what the map lists stays (still gated by the program's own
@@ -184,7 +202,9 @@ sandbox under agent                            -- run this step with the caller'
 ```
 
 Needs an indented body on the next line. Process-local capabilities (`stdout`, `stdin`, `time`,
-`random`) are not delegable and error at the block (`… is process-local`); a nested `sandbox under`
+`random`) cannot be listed in the map — ``sandbox under: "stdout" is process-local (stdout, stdin,
+time, random): a delegated ceiling cannot carry it; the host ceiling governs it`` — but they pass
+through every `sandbox under` block, `sandbox under {}` included, within the host ceiling; a nested `sandbox under`
 stacks (every ceiling on the stack must cover the use). A denial inside is `Capability not granted:
 X — outside the ceiling of the enclosing sandbox under block …` (catchable), or, when the block runs
 under a verified token, the token's own message.

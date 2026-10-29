@@ -2,8 +2,9 @@
 
 Read this FIRST if something fails. Each row is a real mistake that costs hours to debug.
 
-> **Just upgraded and something that worked now fails?** Start at *Upgrading to v0.6.50* (a module
-> sees only its own names), then *v0.6.49*
+> **Just upgraded and something that worked now fails?** Start at *Upgrading to v0.6.51* (no output
+> inside a plain `sandbox`, links in `list_dir`, tokens and `run_program` children with private
+> addresses), then *v0.6.50* (a module sees only its own names), then *v0.6.49*
 > (`require declassify` under a ceiling, `--replay` and the program, trusted modules), then *v0.6.47* (label cuts
 > with no location, runs committed or undone under `serve --labels`, the audit's grant), then *v0.6.46* (secrets
 > in encodings, wildcards and private addresses, `declassify` under a ceiling, `watch`/`cwd`), then
@@ -15,6 +16,24 @@ Read this FIRST if something fails. Each row is a real mistake that costs hours 
 > Behavioral surprises · Anti-patterns · Secrets & config
 > Coming from Python? The traps that LOOK like Python but aren't are also collected in
 > [python-diff.md](python-diff.md).
+
+## Upgrading to v0.6.51 — what behaves differently
+
+| You see | What changed | What to write |
+|---|---|---|
+| ``Capability not granted: stdout — a `sandbox` block denies every capability, whatever the program declares; stdout is the process's: a `sandbox under {…}` block (also `sandbox under {}`) lets it through …`` | **breaking:** `print`/`eprint`/`show`/`log`/`term_write` inside a plain `sandbox` fail, every time (without a ceiling `print` used to go through) | compute in the block and print after (`let r be 0` / `sandbox` / `set r to f(x)` / `print(r)`), or `sandbox under {}` (see capabilities.md § Sandbox blocks) |
+| `term_write` fails with `Capability not granted: stdout` under `--cap-set stdin` | `term_write` asks for `stdout` like `print` (it skipped the check) | add `stdout` to the ceiling; `require stdin` still opens the terminal |
+| a link's row in `list_dir` says `is_dir: false` where it said `true` | the target is looked at only if the program could read the link: one grant must cover both the link's path and where it leads | check `is_link` before walking; grant a folder that covers both (`file.read("./**")`) if the program should follow it |
+| ``captoken_attenuate: "127.0.0.1:8080" is a private address and the token reaches it only where its issuer named it — a wildcard (`*`, or `net` without a scope) reaches only public addresses …`` | a token is the intersection of all its blocks; a hand-made block that does it makes `captoken_verify` give `nothing` | the issuer mints a token that names the private address (`{"net": "127.0.0.1"}`) |
+| a `run_program` child gets ``… a private address; the ceiling of the program that called run_program reaches only public addresses for it: name it there …`` | the child inherits every layer of its caller; a caller with `net("*")` reaches only public addresses | name the address in the caller (`require net("127.0.0.1:47999")`) |
+| `run_program: the caller's capabilities are too many to pass to the child (N bytes; the limit is 30000)` / `… the child's command line would be N characters …` | it used to fail with `os error 206` on Windows only | fewer, wider grants (`**`); a shorter `filename` |
+| ``Undefined variable: 'state_get'. 'state_get' is the shared state of `serve`: it exists in a request …`` | the message says where `state_*` live (before: a bare `Undefined variable`) | read it in the route and pass the value into the worker, the agent or the task |
+| a `content()` page's JSON lacks `stylesheet`, `class`, `header`, `footer` in `meta` | presentation is left out of the JSON; `lang` is now honored in `<html lang>` | read them from your own config, not from the JSON |
+| `GET /x.md` / `/x.json` answers a literal route `GET /x` that gives `content()` (was 404) | the suffix works on literal routes; the runtime's URLs (`/openapi.json`, the agent card) still win while it publishes them | nothing; declare `GET /x.json` if that URL must be something else |
+| `set m.X to 5` is now seen by every module that imports the same file | a module with no tasks is one instance, like any other | nothing; copy the value if you wanted a private one |
+| `synsema serve` with a preamble that fails after `serve on`: ``[serve] the preamble failed after `serve on`: stopping the server``, then the error | the server drains and stops (it kept serving) | fix the preamble; the exit code is the error's |
+| Rust embedders: `cap.ty` / `cap.scope` do not compile | `Capability`'s fields are private | `cap.ty()`, `cap.scope()` (`Option<&str>`), `cap.with_scope(Some(..))` for a copy with another scope |
+| Rust embedders: `run_serve_program` returns a `RunResult` instead of ending the process; two programs in one process no longer share serve/shutdown/mTLS identity/ceiling | each run carries its own state; when its servers drain the call returns and the run's :80 redirect, ACME listener, renewal, pooled interpreters (and the databases they held) are let go | handle the returned `RunResult`; signals (Ctrl+C, SIGTERM) still reach every `serve` in the process |
 
 ## Upgrading to v0.6.50 — what behaves differently
 
@@ -680,6 +699,7 @@ byte-strings (text/bytes/number); structured data goes via `json_encode`/`json_d
 | Cron output appears after program ends | Output is buffered | Fixed in recent versions. Update to latest. Use `synsema serve` to keep the process alive for live output. |
 | An unknown `--flag` is ignored | (v0.6.14+) it's a **usage error, exit 2** on `run`/`test`/`conform` | Typos are caught, not silently dropped. `synsema run --audit json p.syn` now works; before, `--audit` was ignored and `json` taken as the path. |
 | `print` works under any `--cap-set` | (v0.6.14+) under a ceiling, `stdout` is a real capability | A `--cap-set` without `stdout` denies output at the first `print`/`show`/`log`. `--sandbox` includes it; no ceiling = output free. |
+| `print` inside a plain `sandbox` block works | (v0.6.51+) the block denies `stdout` too: `print`/`eprint`/`show`/`log`/`term_write` inside fail with ``Capability not granted: stdout — a `sandbox` block denies every capability…``, with or without a ceiling | Compute in the block and print after (`let r be 0` / `sandbox` / `set r to f(x)` / `print(r)`), or use `sandbox under {}`: the process's `stdout`/`stdin`/`time`/`random` pass through it within the host ceiling. |
 | `render("page.html")` needs no capability | (v0.6.14+) a **disk** template read needs `require file.read("page.html")`; since v0.6.45 so do nested `{ include }`/`{ layout }` | Closes reading arbitrary files via a request-derived path. **Bundled** (`synsema build`) templates need nothing; one line covers a tree: `require file.read("./templates/**")`. |
 | `run("printenv")` under `exec` dumps my API keys | (v0.6.14+) Synsema's secrets (provider keys + `.env` vars) are stripped from the child env — also with `proc_spawn(…, {"pty": true})` since v0.6.45 (the pty path used to skip it) | The base OS env (`PATH`…) is kept; pass a secret a child needs explicitly via `opts.env`. For NO inherited environment at all: `{"env_clean": true}` (v0.6.45+; pass `PATH` in `env` if the child starts other programs). |
 | A `--no-console` app opens a console window for each `run`/`proc_spawn` child (Windows) | Fixed in v0.6.45: children are created with `CREATE_NO_WINDOW` when the process has no console | Nothing to write; from a terminal the child still shares it (so `ssh` can ask for a password) |
