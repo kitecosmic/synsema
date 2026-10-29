@@ -10,7 +10,7 @@ const HINT: &str = "is a name of the program that imports this module";
 
 /// `synsema <args>` con un plazo: un binario que queda colgado (un agente que nadie detiene) se mata
 /// por su handle y da `None`, en vez de colgar el test.
-fn synsema_within(dir: &PathBuf, args: &[&str], secs: u64) -> Option<(i32, String, String)> {
+pub(super) fn synsema_within(dir: &PathBuf, args: &[&str], secs: u64) -> Option<(i32, String, String)> {
     let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_synsema"))
         .args(args)
         .current_dir(dir)
@@ -161,11 +161,11 @@ fn an_agent_rebuilds_the_module_without_the_program_globals() {
     assert!(err.contains("Undefined variable: 'TASA'"), "{}\n{}", out, err);
 }
 
-fn free_port() -> u16 {
+pub(super) fn free_port() -> u16 {
     std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
 }
 
-fn http_get(port: u16, path: &str) -> Option<String> {
+pub(super) fn http_get(port: u16, path: &str) -> Option<String> {
     let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).ok()?;
     s.set_read_timeout(Some(Duration::from_secs(10))).ok()?;
     s.write_all(format!("GET {} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", path).as_bytes()).ok()?;
@@ -175,12 +175,12 @@ fn http_get(port: u16, path: &str) -> Option<String> {
 }
 
 /// Levanta `main.syn` (con `{p}` por el puerto) y pide cada ruta.
-fn serve_get(dir: &PathBuf, main: &str, paths: &[&str]) -> Vec<String> {
+pub(super) fn serve_get(dir: &PathBuf, main: &str, paths: &[&str]) -> Vec<String> {
     serve_get_with(dir, &[], main, paths)
 }
 
 /// `serve_get` con flags antes de `main.syn` (`--trusted t=t.syn`).
-fn serve_get_with(dir: &PathBuf, flags: &[&str], main: &str, paths: &[&str]) -> Vec<String> {
+pub(super) fn serve_get_with(dir: &PathBuf, flags: &[&str], main: &str, paths: &[&str]) -> Vec<String> {
     let port = free_port();
     std::fs::write(dir.join("main.syn"), main.replace("{p}", &port.to_string())).unwrap();
     let mut args = vec!["serve"];

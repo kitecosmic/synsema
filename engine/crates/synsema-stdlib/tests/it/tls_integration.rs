@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::thread;
 
 use synsema_stdlib::server::{
-    build_tls_config, build_tls_config_sni, serve_forever_tls, serve_redirect, ServeRuntime,
+    build_tls_config, build_tls_config_sni, serve_forever_tls, serve_redirect, ServeLife, ServeRuntime,
 };
 
 /// Genera un cert+key self-signed para "localhost" y devuelve los PEM + el DER
@@ -124,7 +124,7 @@ fn tls_serves_static_with_hsts() {
 fn redirect_to_https_default_port() {
     let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
     let port = listener.local_addr().unwrap().port();
-    thread::spawn(move || serve_redirect(listener, 443));
+    thread::spawn(move || serve_redirect(listener, 443, Arc::new(ServeLife::default())));
 
     let mut sock = TcpStream::connect(("127.0.0.1", port)).unwrap();
     sock.write_all(b"GET /path?x=1 HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n")
@@ -141,11 +141,36 @@ fn redirect_to_https_default_port() {
     );
 }
 
+/// v0.6.51 (ronda 1, B1): el 301 de :80 es de su corrida: cuando termina, el hilo vuelve y suelta
+/// el puerto (antes seguía escuchando hasta que muriera el proceso, y un segundo `serve` del mismo
+/// proceso no podía bindear :80).
+#[test]
+fn redirect_lets_go_of_its_port_when_the_run_ends() {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let life = Arc::new(ServeLife::default());
+    let l2 = life.clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        serve_redirect(listener, 443, l2);
+        let _ = tx.send(());
+    });
+    let mut sock = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    sock.write_all(b"GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n").unwrap();
+    let mut resp = Vec::new();
+    let _ = sock.read_to_end(&mut resp);
+    assert!(String::from_utf8_lossy(&resp).starts_with("HTTP/1.1 301"));
+    assert!(rx.recv_timeout(std::time::Duration::from_millis(300)).is_err(), "volvió antes de que la corrida termine");
+    life.finish();
+    rx.recv_timeout(std::time::Duration::from_secs(5)).expect("el 301 siguió escuchando con la corrida terminada");
+    TcpListener::bind(("127.0.0.1", port)).expect("el puerto quedó tomado");
+}
+
 #[test]
 fn redirect_keeps_custom_https_port() {
     let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
     let port = listener.local_addr().unwrap().port();
-    thread::spawn(move || serve_redirect(listener, 8443));
+    thread::spawn(move || serve_redirect(listener, 8443, Arc::new(ServeLife::default())));
 
     let mut sock = TcpStream::connect(("127.0.0.1", port)).unwrap();
     // El Host trae el puerto :80; debe descartarse y usarse el puerto https.

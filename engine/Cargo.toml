@@ -49,7 +49,11 @@ rand = "0.8"
 serde = { version = "1", features = ["derive"] }
 # Sin `arbitrary_precision` a propósito: cambia el `Number` de serde_json para TODO el árbol
 # (candle, tokenizers, cualquier dep). Lo exacto de `json_decode` lo da `stdlib::json_exact`.
-serde_json = { version = "1", features = ["preserve_order"] }
+# v0.6.51: `float_roundtrip` — sin ella serde_json lee un decimal largo 1 ULP corrido
+# (`1792711237.7256045` → `…7256043`) en todo lo demás que lee JSON (estado de agentes, tool calls
+# de un LLM, jsonb, recibos sellados). Medido: +10 % en un documento hecho sólo de floats de 17
+# dígitos, +1 % en uno mixto.
+serde_json = { version = "1", features = ["preserve_order", "float_roundtrip"] }
 # Fecha/hora para los builtins de time (UTC). Sin feature `clock` → sin riesgo de C;
 # now() usa std::time. HTTP cliente: std::net + rustls para https (ver stdlib/src/http.rs);
 # cron usa std::thread.

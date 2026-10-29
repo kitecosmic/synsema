@@ -214,8 +214,11 @@ fn run_parallel(
         (0..n).map(|_| Mutex::new(None)).collect();
     // Lo que no es `Sync` (el contexto de memoria, el sujeto) se clona por hilo bajo un candado.
     let shared = Mutex::new((mem, subject));
+    // v0.6.51 (G1): los workers son de la corrida del llamador (su techo de serve, su mTLS).
+    let run = synsema_core::run_scope::current();
 
     let ran = scope.run(threads, INTERP_STACK_SIZE, |ctx, _t| {
+        let _run = run.as_ref().map(|r| r.enter());
         let (mem, subject) = {
             let g = shared.lock().unwrap();
             (g.0.clone(), g.1.clone())

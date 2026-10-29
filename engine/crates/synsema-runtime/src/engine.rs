@@ -872,15 +872,16 @@ pub(crate) fn wire_common_with_state(
 
     // args(): los argumentos del programa (proceso). Sin capability.
     interp.set_program_args(crate::host::program_args());
-    // Gate de stdout: SÓLO cuando el host puso un techo (`--sandbox`/`--cap-set`). Sin
-    // techo, `print` sigue libre como siempre (secure incluido); con techo, un
-    // `--cap-set` sin `stdout` deniega la salida en el primer `print` — si no, el audit
-    // diría "stdout rechazado por el techo" mientras la salida aparece.
+    // Gate de stdout: cuando el host puso un techo (`--sandbox`/`--cap-set`) o dentro de un
+    // `sandbox` pelado (v0.6.51: el bloque deniega todo, también sin techo). Si no, `print`
+    // sigue libre como siempre (secure incluido); con techo, un `--cap-set` sin `stdout`
+    // deniega la salida en el primer `print` — si no, el audit diría "stdout rechazado por el
+    // techo" mientras la salida aparece.
     {
         let caps_out = caps.clone();
         interp.set_stdout_hook(Rc::new(move || {
             let mut cs = caps_out.borrow_mut();
-            if cs.ceiling.is_none() {
+            if cs.ceiling.is_none() && cs.sandbox_depth == 0 {
                 return Ok(());
             }
             cs.require(&Capability::new(CapabilityType::Stdout, None), "print()")
@@ -1622,7 +1623,7 @@ pub fn repl() {
                 .borrow()
                 .granted
                 .iter()
-                .any(|c| c.ty == CapabilityType::Memory);
+                .any(|c| c.ty() == CapabilityType::Memory);
             if declared {
                 Ok(())
             } else {
@@ -2295,11 +2296,14 @@ fn spawn_agent(
     let id = instance_id.clone();
     // v0.6.46 (E6): el agente escribe en el registro sellado de la corrida que lo lanzó.
     let sealed_log = synsema_core::sealed::current();
+    // v0.6.51 (G1): y es de la corrida que lo lanzó (su techo de serve, su shutdown, su mTLS).
+    let run = synsema_core::run_scope::current();
     let handle = std::thread::Builder::new()
         .name(id.clone())
         .stack_size(INTERP_STACK_SIZE)
         .spawn(move || {
             let _sealed = sealed_log.map(synsema_core::sealed::install_thread);
+            let _run = run.as_ref().map(|r| r.enter());
             let (mut interp, caps) = match &builder {
                 // Bajo serve: el MISMO wiring que un tick de cron (state_*, DB, approvals,
                 // cron, bus, memoria, techo del host); los hooks se re-cablean con la

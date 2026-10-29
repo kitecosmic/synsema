@@ -323,14 +323,9 @@ thread_local! {
     static REDACTION_TEXT: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
 }
 
-/// Respaldo por PROCESO. El `serve` atiende en hilos worker cuyo intérprete se construye ahí, y
-/// el recorrido estático del programa lo hizo el hilo principal: sin esto el mensaje que va al
-/// cliente decía `private(…)` en vez de `private(app)`. Hay un programa por proceso, así que el
-/// conjunto es el mismo para todos; el thread-local sigue mandando para que dos tests en paralelo
-/// (cada uno con su programa) no se pisen.
-static REDACTION_FALLBACK: std::sync::RwLock<String> = std::sync::RwLock::new(String::new());
-
-/// Fija el texto de redacción de este hilo (y el respaldo del proceso). Idempotente.
+/// Fija el texto de redacción de este hilo. Idempotente. El de la corrida lo fija el intérprete en su
+/// `RunScope` (v0.6.51, G1): antes un respaldo por PROCESO cubría a los hilos worker del `serve`, y
+/// con dos corridas en un proceso la segunda redactaba con los principales de la primera.
 pub fn set_redaction_text(text: &str) {
     REDACTION_TEXT.with(|t| {
         let mut t = t.borrow_mut();
@@ -339,23 +334,16 @@ pub fn set_redaction_text(text: &str) {
             t.push_str(text);
         }
     });
-    if !text.is_empty() {
-        if let Ok(mut g) = REDACTION_FALLBACK.write() {
-            if *g != text {
-                g.clear();
-                g.push_str(text);
-            }
-        }
-    }
 }
 
-/// El texto efectivo: el de este hilo, o el del proceso si este hilo no lo tiene.
+/// El texto efectivo: el de este hilo, o el de la corrida para la que trabaja (un worker de `serve`
+/// cuyo intérprete se construyó ahí, sin recorrer el programa).
 fn redaction_text() -> String {
     let local = REDACTION_TEXT.with(|t| t.borrow().clone());
     if !local.is_empty() {
         return local;
     }
-    REDACTION_FALLBACK.read().map(|g| g.clone()).unwrap_or_default()
+    crate::run_scope::current().map(|r| r.redaction()).unwrap_or_default()
 }
 
 /// v0.6.47 (T1) — **el texto fijo de un corte de etiquetas**, el mismo para cualquier sitio y tipo de
@@ -775,6 +763,45 @@ fn check_map(
 mod tests {
     use super::*;
     use crate::types::{syn_int, syn_text};
+
+    /// v0.6.51 (G1-5): un hilo sin texto propio (un worker de `serve` cuyo intérprete no recorrió el
+    /// programa) redacta con el de SU corrida — no con el del primer programa del proceso.
+    #[test]
+    fn g1_5_a_thread_without_its_own_text_redacts_with_its_run() {
+        use crate::run_scope::RunScope;
+        let (a, b) = (RunScope::new(), RunScope::new());
+        a.set_redaction("app");
+        b.set_redaction("bank");
+        std::thread::spawn(move || {
+            assert_eq!(redaction_text(), "");
+            {
+                let _e = a.enter();
+                assert_eq!(redaction_text(), "app");
+            }
+            {
+                let _e = b.enter();
+                assert_eq!(redaction_text(), "bank");
+            }
+            // El del hilo sigue mandando.
+            set_redaction_text("local");
+            let _e = a.enter();
+            assert_eq!(redaction_text(), "local");
+        })
+        .join()
+        .unwrap();
+    }
+
+    /// v0.6.51 (G1-5): el intérprete que recorrió el programa le deja a su corrida el conjunto
+    /// declarado, que es lo que leen los demás hilos de esa corrida.
+    #[test]
+    fn g1_5_the_interpreter_gives_its_run_the_declared_set() {
+        let p = crate::parser::parse_source("let x be private(1, \"app\")\n", "g1.syn").unwrap();
+        let mut i = crate::interpreter::Interpreter::new();
+        let _ = i.execute(&p);
+        assert_eq!(i.run_scope().redaction(), "app");
+        let other = crate::interpreter::Interpreter::new();
+        assert_eq!(other.run_scope().redaction(), "", "otra corrida no lo ve");
+    }
 
     fn l(names: &[&str]) -> Label {
         label_from(names)

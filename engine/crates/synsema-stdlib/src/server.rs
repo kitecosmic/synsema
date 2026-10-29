@@ -654,6 +654,9 @@ pub struct ServeRuntime {
     active_cancels: Mutex<Vec<(CancelToken, bool)>>,
     /// Hook del runtime al iniciar el drain (parar cron, cancelar agentes).
     on_shutdown: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
+    /// v0.6.51 (G1): la corrida para la que atiende este server (la del hilo que lo armó). Sus
+    /// hilos trabajan para ella: el pool, los streams y los hilos del runtime async.
+    pub run_scope: Arc<synsema_core::run_scope::RunScope>,
 }
 
 /// El resultado de `dispatch`: una respuesta lista, o un hand-off a streaming SSE /
@@ -749,6 +752,7 @@ impl ServeRuntime {
             inflight: AtomicUsize::new(0),
             active_cancels: Mutex::new(Vec::new()),
             on_shutdown: Mutex::new(None),
+            run_scope: synsema_core::run_scope::current().unwrap_or_else(synsema_core::run_scope::RunScope::new),
         }
     }
 
@@ -1115,6 +1119,23 @@ impl ServeRuntime {
     /// Las superficies auto-generadas. Se consultan DESPUÉS de las rutas declaradas
     /// y de los estáticos (dispatch), así una `route "GET /docs"` propia gana. Con
     /// `private` sólo queda `/robots.txt` (y dice `Disallow: /`).
+    /// ¿El runtime publica `path` en este servidor? Las mismas condiciones que
+    /// [`ServeRuntime::discovery_response`], más la attestation, que se sirve antes del router y sólo
+    /// bajo `--attested` (ronda 3, N3).
+    fn publishes(&self, path: &str) -> bool {
+        if path == ATTESTATION_PATH {
+            return self.attestation_json.is_some();
+        }
+        if !self.discovery_enabled {
+            return false;
+        }
+        match path {
+            "/robots.txt" => true,
+            "/docs" => !self.private && self.docs_enabled,
+            _ => !self.private && (RESERVED_PATHS.contains(&path) || path == "/.well-known/synsema-auth"),
+        }
+    }
+
     fn discovery_response(
         &self,
         path: &str,
@@ -1531,12 +1552,26 @@ impl ServeRuntime {
             }
         }
 
-        // Negociación por sufijo de URL (.md/.json/.html): sólo si un :param se
-        // tragó el sufijo. Un estático real en el path exacto gana primero.
+        // Negociación por sufijo de URL (.md/.json/.html): si un :param se tragó el sufijo o
+        // (v0.6.51) si ninguna ruta casa el path entero (`GET /historial.md` → `/historial`).
+        // Un estático real en el path exacto gana primero.
         let mut explicit_fmt: Option<String> = None;
         let (logical_path, sfx) = split_format_suffix(path);
-        if let (Some(s), Some(idx)) = (sfx, route_idx) {
-            if param_last_segment(&host.routes[idx].path) {
+        // v0.6.51 (ronda 1, M1): una URL que publica el runtime no se negocia por sufijo contra una
+        // ruta del programa (`GET /openapi` no se lleva `/openapi.json`): sólo una ruta declarada
+        // PARA ella gana. Ronda 2 (N1): la que el runtime publica de verdad; con `private` o
+        // `discovery off` la ruta se la lleva, como una ruta con parámetros. Ronda 3 (N3): bajo
+        // `--attested` ninguna, como en el chequeo de carga (`reserved_route_collision`): ahí las URLs
+        // reservadas son del runtime aunque no las publique.
+        // Ronda 4 (N1): con el path normalizado, como la carga y el router (`//openapi.json`).
+        // Sólo con sufijo y sin ruta casada (un estático o un 404 no lo pagan).
+        let reserved = sfx.is_some() && route_idx.is_none() && {
+            let norm = normalize_route_path(path);
+            self.publishes(&norm)
+                || (self.attestation_json.is_some() && RESERVED_PATHS.contains(&norm.as_str()))
+        };
+        if let Some(s) = sfx {
+            if !reserved && route_idx.map_or(true, |idx| param_last_segment(&host.routes[idx].path)) {
                 if method == "GET" && !host.static_mounts.is_empty() {
                     if let Some(sr) = host.serve_static_full(path, &headers) {
                         return Dispatched::Response {
@@ -2086,6 +2121,8 @@ struct PoolShared {
     state: Mutex<PoolState>,
     cv: std::sync::Condvar,
     max_threads: usize,
+    /// Hilos fijos (los que cachean su intérprete).
+    fixed: usize,
 }
 
 #[derive(Default)]
@@ -2125,6 +2162,29 @@ fn pool_wait_hook(waiting: bool) {
     let pool = THREAD_POOL.with(|p| p.borrow().clone());
     if let Some(p) = pool {
         PoolShared::on_wait(&p, waiting);
+    }
+}
+
+/// Ronda 3 (N4): el permiso de CPU de este hilo del pool, prestado mientras vive el guard. A
+/// diferencia de una espera de I/O (`synsema_core::waiting`), no cuenta como alguien esperando, así
+/// que no crea hilos extra; al soltarlo se retoma a crédito, como al volver de una espera.
+struct LentPermit(Option<Arc<PoolShared>>);
+
+fn lend_permit() -> LentPermit {
+    let pool = THREAD_POOL.with(|p| p.borrow().clone());
+    if let Some(p) = &pool {
+        let mut st = p.lock();
+        st.permits += 1;
+        p.cv.notify_one();
+    }
+    LentPermit(pool)
+}
+
+impl Drop for LentPermit {
+    fn drop(&mut self) {
+        if let Some(p) = &self.0 {
+            p.lock().permits -= 1;
+        }
     }
 }
 
@@ -2277,6 +2337,7 @@ impl InterpreterPool {
             state: Mutex::new(PoolState { permits: workers as isize, ..Default::default() }),
             cv: std::sync::Condvar::new(),
             max_threads: workers + max_waiting,
+            fixed: workers,
         });
         for _ in 0..workers {
             shared.lock().threads += 1;
@@ -2285,7 +2346,10 @@ impl InterpreterPool {
         InterpreterPool { tx, shared }
     }
 
+    /// El job corre para la corrida del hilo que lo encola (v0.6.51, G1): el pool es del proceso y
+    /// atiende a varias, una por vez por hilo.
     fn submit(&self, job: InterpJob) {
+        let job: InterpJob = Box::new(synsema_core::run_scope::carry(job));
         let grow = {
             let mut st = self.shared.lock();
             st.queued += 1;
@@ -2294,6 +2358,35 @@ impl InterpreterPool {
         let _ = self.tx.send(job);
         if grow {
             PoolShared::spawn_worker(&self.shared, true);
+        }
+    }
+
+    /// Ver [`on_every_pool_worker`].
+    /// `window`: cuánto espera cada barrido a los demás antes de volver a la cola.
+    fn on_every_worker(&self, f: fn(), window: Duration) {
+        let n = self.shared.fixed;
+        let gate = Arc::new((Mutex::new(0usize), std::sync::Condvar::new()));
+        for _ in 0..n {
+            let gate = gate.clone();
+            self.submit(Box::new(move || {
+                f();
+                let (m, cv) = &*gate;
+                let mut g = m.lock().unwrap_or_else(|p| p.into_inner());
+                *g += 1;
+                cv.notify_all();
+                // Ronda 2 (N3): esperar a los demás no usa CPU: suelta su permiso y no demora los
+                // jobs de otra corrida. Ronda 3 (N4): sin abrir una espera de I/O, que haría crecer
+                // el pool con hilos extra que se llevaban los barridos de los fijos ocupados.
+                let _p = lend_permit();
+                let deadline = Instant::now() + window;
+                while *g < n {
+                    let now = Instant::now();
+                    if now >= deadline {
+                        break;
+                    }
+                    g = cv.wait_timeout(g, deadline - now).unwrap_or_else(|p| p.into_inner()).0;
+                }
+            }));
         }
     }
 
@@ -2341,6 +2434,54 @@ mod pool_tests {
         }
         assert!(wait_all(&rx, 5, 10), "deadlock: los jobs no terminaron");
         assert_eq!(*db.lock().unwrap(), 5);
+    }
+
+    /// Ronda 3 (N4): el barrido de una corrida terminada no hace crecer el pool. Con un fijo ocupado,
+    /// el barrido del libre esperaba a los demás dentro de una espera de I/O y el pool creaba un
+    /// extra que se llevaba el barrido del ocupado; ahora el ocupado lo toma al terminar lo suyo, y
+    /// el libre presta su permiso sin crecer.
+    #[test]
+    fn a_sweep_does_not_grow_the_pool() {
+        static SWEPT: AtomicUsize = AtomicUsize::new(0);
+        fn sweep() {
+            SWEPT.fetch_add(1, Ordering::SeqCst);
+        }
+        let pool = InterpreterPool::new(2, 16);
+        let (go, wait) = std::sync::mpsc::channel::<()>();
+        let (started, is_started) = std::sync::mpsc::channel::<()>();
+        let (tx, rx) = std::sync::mpsc::channel();
+        // Ocupado con CPU (no abre una espera: con una, el pool ya crece por su política de siempre).
+        pool.submit(Box::new(move || {
+            let _ = started.send(());
+            let _ = wait.recv();
+            let _ = tx.send(());
+        }));
+        assert!(wait_all(&is_started, 1, 5));
+        // Ronda 4 (N2): la ventana larga (en producción, 250 ms) deja al libre esperando mientras el
+        // test mira, sin depender de cuánto se estire un sleep; y se mira un segundo entero, para que
+        // un extra que tarde en crecer igual se vea.
+        pool.on_every_worker(sweep, Duration::from_secs(30));
+        // Ronda 5 (N2): primero el barrido del libre, para que la ventana de abajo no lo cuente.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while SWEPT.load(Ordering::SeqCst) < 1 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(SWEPT.load(Ordering::SeqCst) >= 1, "el libre no corrió su barrido");
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while Instant::now() < deadline && SWEPT.load(Ordering::SeqCst) < 2 && pool.threads() == 2 {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // El barrido del ocupado lo espera a él: si el pool hubiera crecido, un extra se lo habría
+        // llevado (y el ocupado, con su cache, se quedaba sin barrer).
+        assert_eq!(pool.threads(), 2, "el barrido creó hilos extra");
+        assert_eq!(SWEPT.load(Ordering::SeqCst), 1, "un hilo extra se llevó el barrido del ocupado");
+        let _ = go.send(());
+        assert!(wait_all(&rx, 1, 5));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while SWEPT.load(Ordering::SeqCst) < 2 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(SWEPT.load(Ordering::SeqCst), 2, "cada fijo corre su barrido");
     }
 
     /// La CPU queda acotada a los permisos: 8 jobs de CPU pura, nunca más de 2 a la vez.
@@ -2448,6 +2589,17 @@ mod pool_tests {
 }
 
 static INTERP_POOL: std::sync::OnceLock<InterpreterPool> = std::sync::OnceLock::new();
+
+/// v0.6.51 (ronda 1, B1): corre `f` una vez en cada hilo fijo del pool, para lo que cachean por
+/// hilo (los intérpretes de una corrida que terminó). No bloquea a quien llama. Cada job espera a los
+/// demás (hasta 250 ms, sin su permiso de CPU) para que un hilo no tome dos; uno ocupado lo corre al
+/// terminar lo suyo, y lo que se escape lo poda el hilo al tomar su próximo job. Sin pool arrancado,
+/// nada.
+pub fn on_every_pool_worker(f: fn()) {
+    if let Some(pool) = INTERP_POOL.get() {
+        pool.on_every_worker(f, Duration::from_millis(250));
+    }
+}
 
 /// El pool del intérprete, inicializado una vez. Permisos: `SYNSEMA_SERVE_WORKERS` si está
 /// seteado (>=1), si no `#cores` (mín. 2). Hilos extra mientras otros esperan I/O:
@@ -2598,7 +2750,7 @@ thread_local! {
     static CURRENT_SERVE_PORT: std::cell::Cell<Option<u16>> = const { std::cell::Cell::new(None) };
 }
 
-fn install_openapi_provider(rt: Arc<ServeRuntime>) {
+fn install_openapi_provider(rt: Arc<ServeRuntime>) -> Arc<dyn Fn() -> String + Send + Sync> {
     let port = rt.port;
     let f: Arc<dyn Fn() -> String + Send + Sync> = Arc::new(move || {
         let host = &rt.default_host;
@@ -2607,7 +2759,16 @@ fn install_openapi_provider(rt: Arc<ServeRuntime>) {
     });
     if let Ok(mut g) = OPENAPI_PROVIDERS.lock() {
         g.retain(|(p, _)| *p != port);
-        g.push((port, f));
+        g.push((port, f.clone()));
+    }
+    f
+}
+
+/// v0.6.51 (ronda 1, B1): el servidor terminó: su proveedor sale del registro (retenía su runtime, y
+/// con él sus handlers y la base abierta; y otro `serve` del proceso lo seguía contando).
+fn remove_openapi_provider(f: &Arc<dyn Fn() -> String + Send + Sync>) {
+    if let Ok(mut g) = OPENAPI_PROVIDERS.lock() {
+        g.retain(|(_, q)| !Arc::ptr_eq(q, f));
     }
 }
 
@@ -2634,103 +2795,231 @@ pub fn current_openapi_json() -> Result<String, String> {
     Ok(f())
 }
 
-static LIVE_SERVERS: AtomicUsize = AtomicUsize::new(0);
-
 // =========================================================
 // shutdown pedido por el PROGRAMA — `shutdown(reason?)` (tanda escritorio)
 // =========================================================
 //
 // El drain ordenado ya existía (SIGINT/SIGTERM); esto sólo agrega el otro disparador: el
 // programa mismo (una ventana que se cierra, un job que terminó). Mismo camino: no más
-// requests, drenar hasta la gracia, cancelar cron/agentes, exit 0.
+// requests, drenar hasta la gracia, cancelar cron/agentes, y la corrida termina.
 
-// `synsema serve` corre en este proceso: el flag vive en `json.rs` (v0.6.49, B4), que compila
-// también en wasm, para que el aviso de redacción diga `[serve]` sólo bajo serve.
-use crate::json::UNDER_SERVE;
-/// v0.6.45 (A5) — el bloque `serve` ya abrió su puerto (se marca en el hilo del programa, justo
-/// después del `bind`; `LIVE_SERVERS` sube recién dentro del hilo del server y dejaría una carrera).
-static SERVE_BOUND: AtomicBool = AtomicBool::new(false);
-
-pub fn mark_serve_bound() {
-    SERVE_BOUND.store(true, AtomicOrd::SeqCst);
+/// v0.6.51 (G1, `specs/v0.6.51-modelos.md`): la vida de los servidores de UNA corrida — su pedido
+/// de shutdown, cuántos listeners tiene vivos y el hilo del camino sólo-cron. Antes era del proceso
+/// (un `OnceLock` y dos `static`): un `shutdown()` dejaba drenando a cualquier otro `serve` del
+/// proceso y el segundo nacía drenando. Como el `http.Server` de Go, cada corrida tiene el suyo
+/// (en su `RunScope`); las señales siguen siendo del proceso y llegan a todos los listeners.
+pub struct ServeLife {
+    shutdown: (tokio::sync::watch::Sender<bool>, tokio::sync::watch::Receiver<bool>),
+    /// Listeners vivos de la corrida (sube antes de lanzar el hilo de accept, baja al salir de él).
+    live: Mutex<usize>,
+    stopped: std::sync::Condvar,
+    /// El hilo parkeado del camino sólo-cron (sin server), para despertarlo.
+    cron_only: Mutex<Option<std::thread::Thread>>,
+    /// La corrida terminó (ronda 1, B1): lo que la sirve por fuera de sus listeners (el 301 de :80,
+    /// el challenge ACME, la renovación, los intérpretes cacheados del pool) se suelta.
+    ended: AtomicBool,
+    /// Lo mismo para quien espera de forma asíncrona (el accept del 301 y del challenge ACME).
+    ended_watch: (tokio::sync::watch::Sender<bool>, tokio::sync::watch::Receiver<bool>),
 }
 
-/// El hilo parkeado del camino sólo-cron (sin server), para despertarlo.
-static CRON_ONLY: std::sync::Mutex<Option<std::thread::Thread>> = std::sync::Mutex::new(None);
+/// Sube cada vez que una corrida termina: un worker del pool que la ve cambiada poda su cache.
+static ENDED_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-fn shutdown_channel() -> &'static (tokio::sync::watch::Sender<bool>, tokio::sync::watch::Receiver<bool>) {
-    static CH: std::sync::OnceLock<(tokio::sync::watch::Sender<bool>, tokio::sync::watch::Receiver<bool>)> =
-        std::sync::OnceLock::new();
-    CH.get_or_init(|| tokio::sync::watch::channel(false))
-}
-
-pub fn mark_under_serve() {
-    UNDER_SERVE.store(true, AtomicOrd::SeqCst);
-}
-
-pub fn under_serve() -> bool {
-    UNDER_SERVE.load(AtomicOrd::SeqCst)
-}
-
-/// Cuántos listeners están vivos (0 = todavía no bindeó ninguno, o ya cerraron todos).
-pub fn servers_live() -> usize {
-    LIVE_SERVERS.load(AtomicOrd::SeqCst)
-}
-
-/// `true` si el camino sólo-cron está vivo (parkeado esperando).
-pub fn cron_only_live() -> bool {
-    CRON_ONLY.lock().map(|g| g.is_some()).unwrap_or(false)
-}
-
-/// `true` si el programa ya pidió el shutdown.
-pub fn shutdown_requested() -> bool {
-    *shutdown_channel().0.borrow()
-}
-
-/// Pide el shutdown ordenado desde el programa. Idempotente: `true` la primera vez.
-pub fn request_shutdown(reason: &str) -> bool {
-    let (tx, _) = shutdown_channel();
-    if *tx.borrow() {
-        return false;
-    }
-    let reason = if reason.trim().is_empty() { "no reason given" } else { reason };
-    eprintln!("[serve] shutdown requested by the program: {}", reason);
-    let _ = tx.send(true);
-    if let Ok(g) = CRON_ONLY.lock() {
-        if let Some(t) = g.as_ref() {
-            t.unpark();
+impl Default for ServeLife {
+    fn default() -> Self {
+        ServeLife {
+            shutdown: tokio::sync::watch::channel(false),
+            live: Mutex::new(0),
+            stopped: std::sync::Condvar::new(),
+            cron_only: Mutex::new(None),
+            ended: AtomicBool::new(false),
+            ended_watch: tokio::sync::watch::channel(false),
         }
     }
-    true
 }
 
-/// Camino sólo-cron: registra este hilo y bloquea (cero CPU) hasta que el programa pida el
-/// shutdown. Ctrl+C sigue matando el proceso como siempre (no hay runtime que lo intercepte).
-pub fn park_cron_only() {
-    if let Ok(mut g) = CRON_ONLY.lock() {
-        *g = Some(std::thread::current());
+/// Las vidas con algo corriendo, para lo que es del proceso y tiene que apagarlas a todas (el
+/// vencimiento de `serve --attested`, cuya identidad es del proceso).
+static LIVES: Mutex<Vec<std::sync::Weak<ServeLife>>> = Mutex::new(Vec::new());
+
+impl ServeLife {
+    /// La de la corrida (se crea la primera vez).
+    pub fn of(run: &synsema_core::run_scope::RunScope) -> Arc<ServeLife> {
+        run.ext::<ServeLife>()
     }
-    loop {
-        if shutdown_requested() {
-            break;
+
+    fn register(self: &Arc<Self>) {
+        let mut g = LIVES.lock().unwrap_or_else(|p| p.into_inner());
+        g.retain(|w| w.strong_count() > 0);
+        if !g.iter().any(|w| std::ptr::eq(w.as_ptr(), Arc::as_ptr(self))) {
+            g.push(Arc::downgrade(self));
         }
-        std::thread::park();
     }
-    if let Ok(mut g) = CRON_ONLY.lock() {
-        *g = None;
-    }
-}
 
-/// Resuelve cuando el programa pide el shutdown (nunca, si no lo pide).
-async fn program_shutdown() {
-    let mut rx = shutdown_channel().1.clone();
-    loop {
-        if *rx.borrow() {
+    /// Un listener de la corrida va a arrancar. Se cuenta ANTES de lanzar su hilo (quien espera
+    /// con [`ServeLife::wait_stopped`] no ve un cero que todavía no arrancó); lo descuenta el
+    /// guard al salir del hilo de accept, por donde salga.
+    pub fn server_starting(self: &Arc<Self>) -> LiveServer {
+        self.register();
+        *self.live.lock().unwrap_or_else(|p| p.into_inner()) += 1;
+        LiveServer(self.clone())
+    }
+
+    /// Cuántos listeners de la corrida están vivos.
+    pub fn servers_live(&self) -> usize {
+        *self.live.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Bloquea hasta que no quede ningún listener de la corrida (el drain terminó).
+    pub fn wait_stopped(&self) {
+        let mut g = self.live.lock().unwrap_or_else(|p| p.into_inner());
+        while *g > 0 {
+            g = self.stopped.wait(g).unwrap_or_else(|p| p.into_inner());
+        }
+    }
+
+    /// `true` si el camino sólo-cron está vivo (parkeado esperando).
+    pub fn cron_only_live(&self) -> bool {
+        self.cron_only.lock().map(|g| g.is_some()).unwrap_or(false)
+    }
+
+    /// `true` si la corrida ya pidió el shutdown.
+    pub fn shutdown_requested(&self) -> bool {
+        *self.shutdown.0.borrow()
+    }
+
+    /// Pide el shutdown ordenado de la corrida. Idempotente: `true` la primera vez.
+    pub fn request_shutdown(&self, reason: &str) -> bool {
+        let reason = if reason.trim().is_empty() { "no reason given" } else { reason };
+        self.shut_down(&format!("shutdown requested by the program: {}", reason))
+    }
+
+    /// El shutdown que pide el motor y no el programa (ronda 3, N2: un preámbulo que falló después
+    /// de `serve on`); `why` es lo que dice el aviso.
+    pub fn request_engine_shutdown(&self, why: &str) -> bool {
+        self.shut_down(why)
+    }
+
+    fn shut_down(&self, notice: &str) -> bool {
+        let tx = &self.shutdown.0;
+        if *tx.borrow() {
+            return false;
+        }
+        eprintln!("[serve] {}", notice);
+        let _ = tx.send(true);
+        if let Ok(g) = self.cron_only.lock() {
+            if let Some(t) = g.as_ref() {
+                t.unpark();
+            }
+        }
+        true
+    }
+
+    /// Camino sólo-cron: registra este hilo y bloquea (cero CPU) hasta que la corrida pida el
+    /// shutdown. Ctrl+C sigue matando el proceso como siempre (no hay runtime que lo intercepte).
+    pub fn park_cron_only(self: &Arc<Self>) {
+        self.register();
+        if let Ok(mut g) = self.cron_only.lock() {
+            *g = Some(std::thread::current());
+        }
+        loop {
+            if self.shutdown_requested() {
+                break;
+            }
+            std::thread::park();
+        }
+        if let Ok(mut g) = self.cron_only.lock() {
+            *g = None;
+        }
+    }
+
+    /// La corrida terminó: lo llama quien la empezó cuando sus listeners drenaron (o el camino
+    /// sólo-cron volvió). Despierta a quien duerme en [`ServeLife::sleep_while_running`].
+    pub fn finish(&self) {
+        let _g = self.live.lock().unwrap_or_else(|p| p.into_inner());
+        if self.ended.swap(true, AtomicOrd::SeqCst) {
             return;
         }
-        if rx.changed().await.is_err() {
-            std::future::pending::<()>().await;
+        ENDED_EPOCH.fetch_add(1, AtomicOrd::SeqCst);
+        let _ = self.ended_watch.0.send(true);
+        self.stopped.notify_all();
+    }
+
+    /// `true` si la corrida ya terminó.
+    pub fn ended(&self) -> bool {
+        self.ended.load(AtomicOrd::SeqCst)
+    }
+
+    /// Cuántas corridas terminaron en el proceso (cambia con cada [`ServeLife::finish`]).
+    pub fn ended_epoch() -> u64 {
+        ENDED_EPOCH.load(AtomicOrd::SeqCst)
+    }
+
+    /// Duerme `d` o hasta que la corrida termine. `true` = la corrida sigue.
+    pub fn sleep_while_running(&self, d: Duration) -> bool {
+        let deadline = Instant::now() + d;
+        let mut g = self.live.lock().unwrap_or_else(|p| p.into_inner());
+        loop {
+            if self.ended() {
+                return false;
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return true;
+            }
+            g = self.stopped.wait_timeout(g, deadline - now).unwrap_or_else(|p| p.into_inner()).0;
         }
+    }
+
+    /// Resuelve cuando la corrida terminó ([`ServeLife::finish`]).
+    async fn run_ended(&self) {
+        let mut rx = self.ended_watch.1.clone();
+        loop {
+            if *rx.borrow() {
+                return;
+            }
+            if rx.changed().await.is_err() {
+                std::future::pending::<()>().await;
+            }
+        }
+    }
+
+    /// Resuelve cuando la corrida pide el shutdown (nunca, si no lo pide).
+    async fn program_shutdown(&self) {
+        let mut rx = self.shutdown.1.clone();
+        loop {
+            if *rx.borrow() {
+                return;
+            }
+            if rx.changed().await.is_err() {
+                std::future::pending::<()>().await;
+            }
+        }
+    }
+}
+
+/// Un listener vivo de una corrida (ver [`ServeLife::server_starting`]).
+pub struct LiveServer(Arc<ServeLife>);
+
+impl Drop for LiveServer {
+    fn drop(&mut self) {
+        let mut g = self.0.live.lock().unwrap_or_else(|p| p.into_inner());
+        *g = g.saturating_sub(1);
+        if *g == 0 {
+            self.0.stopped.notify_all();
+        }
+    }
+}
+
+/// Apaga TODAS las corridas con algo vivo (lo que es del proceso: el vencimiento de
+/// `serve --attested`). Lo de una sola corrida va por su [`ServeLife`].
+pub fn request_shutdown_all(reason: &str) {
+    let lives: Vec<Arc<ServeLife>> = {
+        let g = LIVES.lock().unwrap_or_else(|p| p.into_inner());
+        g.iter().filter_map(|w| w.upgrade()).collect()
+    };
+    for l in lives {
+        l.request_shutdown(reason);
     }
 }
 
@@ -2755,7 +3044,7 @@ pub fn register_shutdown_builtin(interp: &synsema_core::interpreter::Interpreter
     interp.register_builtin(
         "shutdown",
         -1,
-        Rc::new(|_i, args, _loc| {
+        Rc::new(|i, args, _loc| {
             if args.len() > 1 {
                 return Err(Control::Error(RuntimeError::new(format!(
                     "shutdown expects at most 1 argument (reason), got {}",
@@ -2770,36 +3059,39 @@ pub fn register_shutdown_builtin(interp: &synsema_core::interpreter::Interpreter
                 }
                 Some(other) => other.to_string(),
             };
-            if !under_serve() {
+            let run = i.run_scope();
+            if !run.is_serve() {
                 return Err(Control::Error(RuntimeError::new(
                     "shutdown() is only available under serve — a run program ends when its top level ends, or with exit(code) (use `stop` to leave a loop or a task)",
                 )));
             }
-            if servers_live() == 0 && !cron_only_live() {
+            let life = ServeLife::of(run);
+            if life.servers_live() == 0 && !life.cron_only_live() {
                 return Err(Control::Error(RuntimeError::new(
                     "shutdown(): nothing is running yet (call it from a route, a socket, a cron job or an agent)",
                 )));
             }
-            request_shutdown(&reason);
+            life.request_shutdown(&reason);
             Ok(SynValue::Nothing)
         }),
     );}
 
 /// v0.6.42 — `exit(code)` es de `synsema run`. En un intérprete de `serve` (handlers, cron,
 /// agentes) terminar el proceso cortaría los requests en vuelo: el camino es `shutdown(reason)`,
-/// que drena. Se registra POR INTÉRPRETE (lo llama el armado de serve), no por una marca global
-/// del proceso.
+/// que drena. Se registra POR INTÉRPRETE (lo llama el armado de serve) y mira la corrida de ese
+/// intérprete (v0.6.51, G1), no una marca del proceso.
 pub fn register_serve_exit_builtin(interp: &synsema_core::interpreter::Interpreter) {
     use std::rc::Rc;
     use synsema_core::interpreter::{Control, RuntimeError};
     interp.register_builtin(
         "exit",
         -1,
-        Rc::new(|_i, args, loc| {
+        Rc::new(|i, args, loc| {
             // v0.6.45 (A5): mientras nada escucha (el preámbulo antes de `serve on`), terminar no
             // corta ningún request: `exit(code)` vale como en `run` — el patrón de una app de una
             // sola instancia ("si ya estoy corriendo, mostrá la ventana y salí").
-            if !SERVE_BOUND.load(AtomicOrd::SeqCst) && !cron_only_live() {
+            let run = i.run_scope();
+            if !run.is_bound() && !ServeLife::of(run).cron_only_live() {
                 return synsema_core::interpreter::exit_builtin(args, loc);
             }
             Err(Control::Error(RuntimeError::at(
@@ -2845,9 +3137,14 @@ async fn shutdown_signal() {
     }
 }
 
+/// v0.6.51 (G1): termina cuando la corrida pide el shutdown (o llega una señal) y drenó; ya no termina
+/// el PROCESO — quien empezó la corrida la espera ([`ServeLife::wait_stopped`]) y decide.
 fn run_async(rt: Arc<ServeRuntime>, listener: TcpListener, tls: TlsMode) {
-    LIVE_SERVERS.fetch_add(1, AtomicOrd::SeqCst);
-    install_openapi_provider(rt.clone());
+    // Este hilo y los del runtime trabajan para la corrida del server (y sólo para ésa).
+    let run = rt.run_scope.clone();
+    let _run = run.enter();
+    let life = ServeLife::of(&run);
+    let openapi = install_openapi_provider(rt.clone());
     let _ = listener.set_nonblocking(true);
     // Arranca el pool del intérprete (stack grande, acotado) ANTES de aceptar conexiones.
     let _ = interp_pool();
@@ -2855,8 +3152,10 @@ fn run_async(rt: Arc<ServeRuntime>, listener: TcpListener, tls: TlsMode) {
     // (~MBs), no 64 MB. El stack grande vive solo en el pool del intérprete. Además cap
     // explícito del blocking pool (ya casi no se usa: el intérprete migró a su pool) y
     // keep-alive corto de hilos ociosos, como pidió el reporte de la arena.
+    let thread_run = run.clone();
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
+        .on_thread_start(move || thread_run.adopt())
         .max_blocking_threads(4)
         .thread_keep_alive(std::time::Duration::from_secs(10))
         .build()
@@ -2874,7 +3173,7 @@ fn run_async(rt: Arc<ServeRuntime>, listener: TcpListener, tls: TlsMode) {
         let graceful = hyper_util::server::graceful::GracefulShutdown::new();
         let mut shutdown = std::pin::pin!(shutdown_signal());
         // El otro disparador: `shutdown()` desde el programa (mismo drain).
-        let mut from_program = std::pin::pin!(program_shutdown());
+        let mut from_program = std::pin::pin!(life.program_shutdown());
         loop {
             tokio::select! {
                 _ = &mut from_program => break,
@@ -2926,15 +3225,11 @@ fn run_async(rt: Arc<ServeRuntime>, listener: TcpListener, tls: TlsMode) {
             tokio::time::sleep(Duration::from_millis(300)).await;
         }
         eprintln!("[serve] stopped");
-        if LIVE_SERVERS.fetch_sub(1, AtomicOrd::SeqCst) == 1 {
-            // T10: un `serve --attested` que se cerró porque sus documentos vencieron sin
-            // renovación termina con error, no como un apagado pedido.
-            if crate::attest::renewal_failure().is_some() {
-                std::process::exit(1);
-            }
-            std::process::exit(0);
-        }
     });
+    // Lo que quede en el runtime (el aviso del segundo signal, conexiones canceladas) no retiene la
+    // salida: el drain ya terminó.
+    runtime.shutdown_background();
+    remove_openapi_provider(&openapi);
 }
 
 async fn serve_conn(
@@ -4501,7 +4796,7 @@ async fn handle_request(
         if std::thread::Builder::new()
             .name("synsema-stream".to_string())
             .stack_size(SERVE_STACK_SIZE)
-            .spawn(job)
+            .spawn(synsema_core::run_scope::carry(job))
             .is_err()
         {
             // Falló crear el hilo (sistema sin recursos): el job se dropeó → head_rx da Err
@@ -4654,19 +4949,49 @@ async fn handle_request(
 /// A2 batch 2 — Listener HTTP (típico :80) para auto-HTTPS: sirve el challenge
 /// ACME HTTP-01 (`/.well-known/acme-challenge/<token>` → key-authorization desde
 /// `store`) y redirige todo lo demás a https. Reúsa el rol del listener de redirect.
-pub fn serve_acme_http(listener: TcpListener, https_port: u16, store: ChallengeStore) {
-    for stream in listener.incoming() {
-        let stream = match stream {
-            Ok(s) => s,
-            Err(_) => continue,
-        };
+pub fn serve_acme_http(listener: TcpListener, https_port: u16, store: ChallengeStore, life: Arc<ServeLife>) {
+    accept_until_ended(listener, &life, |stream| {
         let store = store.clone();
         let _ = std::thread::Builder::new()
             .stack_size(1024 * 1024)
             .spawn(move || {
                 let _ = acme_http_one(stream, https_port, store);
             });
-    }
+    });
+}
+
+/// v0.6.51 (ronda 1, B1): el accept de un listener auxiliar de la corrida (el 301 de :80, el
+/// challenge ACME) hasta que la corrida termine; al volver suelta el puerto. Ronda 3 (N4 de la
+/// ronda 2): asíncrono, como el listener principal: espera una conexión o el fin de la corrida, sin
+/// despertarse mientras tanto. Cada conexión se atiende en su hilo, como antes.
+fn accept_until_ended(listener: TcpListener, life: &ServeLife, mut each: impl FnMut(TcpStream)) {
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build();
+    let listener = listener.set_nonblocking(true).ok().and(rt.as_ref().ok()).and_then(|rt| {
+        let _g = rt.enter();
+        tokio::net::TcpListener::from_std(listener).ok()
+    });
+    let (Ok(rt), Some(listener)) = (rt, listener) else {
+        eprintln!("[serve] could not start an auxiliary listener of this run");
+        return;
+    };
+    rt.block_on(async {
+        loop {
+            tokio::select! {
+                _ = life.run_ended() => return,
+                r = listener.accept() => {
+                    let Ok((stream, _)) = r else {
+                        // Un accept que falla (EMFILE): reintentar sin girar en vacío.
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                        continue;
+                    };
+                    if let Ok(stream) = stream.into_std() {
+                        let _ = stream.set_nonblocking(false);
+                        each(stream);
+                    }
+                }
+            }
+        }
+    });
 }
 
 fn acme_http_one(stream: TcpStream, https_port: u16, store: ChallengeStore) -> io::Result<()> {
@@ -4844,18 +5169,14 @@ pub fn build_tls_config_sni(
 
 /// A2 — Loop de redirección: escucha (típico :80) y responde 301 a https://host[:port].
 /// Lee sólo la request line + headers; un hilo liviano por request.
-pub fn serve_redirect(listener: TcpListener, https_port: u16) {
-    for stream in listener.incoming() {
-        let stream = match stream {
-            Ok(s) => s,
-            Err(_) => continue,
-        };
+pub fn serve_redirect(listener: TcpListener, https_port: u16, life: Arc<ServeLife>) {
+    accept_until_ended(listener, &life, |stream| {
         let _ = std::thread::Builder::new()
             .stack_size(1024 * 1024)
             .spawn(move || {
                 let _ = redirect_one(stream, https_port);
             });
-    }
+    });
 }
 
 fn redirect_one(stream: TcpStream, https_port: u16) -> io::Result<()> {

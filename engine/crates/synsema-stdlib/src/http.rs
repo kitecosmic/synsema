@@ -156,30 +156,27 @@ fn percent_decode(s: &str) -> Vec<u8> {
 // T5 — Identidad mTLS del cliente (SPIFFE-like)
 // =========================================================
 
-/// La identidad de cliente TLS de ESTE proceso: cadena de certs + clave privada,
-/// ya parseadas. `None` = sin identidad (comportamiento histórico, byte-idéntico).
+/// La identidad de cliente TLS de UNA corrida: cadena de certs + clave privada, ya
+/// parseadas. `None` = sin identidad (comportamiento histórico, byte-idéntico).
 ///
-/// Es del PROCESO y no de cada request a propósito: en una malla de servicios el
-/// certificado identifica al *workload* (el agente), no a la llamada — es la misma
-/// idea que SPIFFE, y la misma tesis de identidad de agente del diseño. Además
-/// evita colgar un slot de opciones nuevo en los seis builtins `http_*`.
+/// Es del programa que corre y no de cada request a propósito: en una malla de servicios
+/// el certificado identifica al *workload* (el agente), no a la llamada — es la misma
+/// idea que SPIFFE, y la misma tesis de identidad de agente del diseño. Además evita
+/// colgar un slot de opciones nuevo en los seis builtins `http_*`. Hasta v0.6.50 era del
+/// PROCESO: otro programa del mismo proceso (un embebedor, los tests) presentaba la
+/// identidad del primero. Desde v0.6.51 (G1) cuelga del `RunScope` de la corrida.
 type ClientIdentity = (
     Vec<rustls::pki_types::CertificateDer<'static>>,
     rustls::pki_types::PrivateKeyDer<'static>,
 );
 
-fn client_identity() -> &'static std::sync::Mutex<Option<ClientIdentity>> {
-    static ID: std::sync::OnceLock<std::sync::Mutex<Option<ClientIdentity>>> =
-        std::sync::OnceLock::new();
-    ID.get_or_init(|| std::sync::Mutex::new(None))
-}
-
-/// Hosts a los que SÍ se le presenta la identidad mTLS (`opts.hosts` de
-/// `mtls_identity`). Vacío = a cualquier host que el programa pueda alcanzar (que
-/// ya está acotado por `require net(...)`).
-fn client_identity_hosts() -> &'static std::sync::Mutex<Vec<String>> {
-    static HOSTS: std::sync::OnceLock<std::sync::Mutex<Vec<String>>> = std::sync::OnceLock::new();
-    HOSTS.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+#[derive(Default)]
+struct ClientTls {
+    identity: std::sync::Mutex<Option<ClientIdentity>>,
+    /// Hosts a los que SÍ se le presenta la identidad (`opts.hosts` de `mtls_identity`).
+    /// Vacío = a cualquier host que el programa pueda alcanzar (que ya está acotado por
+    /// `require net(...)`).
+    hosts: std::sync::Mutex<Vec<String>>,
 }
 
 /// ¿Se le presenta el certificado de cliente a este host? Sin `hosts` declarados,
@@ -211,9 +208,12 @@ fn tls_client_config(host: &str, verifier: Option<Arc<dyn rustls::client::danger
         Some(v) => rustls::ClientConfig::builder().dangerous().with_custom_certificate_verifier(v),
         None => rustls::ClientConfig::builder().with_root_certificates(root_cert_store()?),
     };
-    let guard = client_identity().lock().map_err(|_| "TLS identity lock poisoned".to_string())?;
-    let scopes =
-        client_identity_hosts().lock().map_err(|_| "TLS identity lock poisoned".to_string())?;
+    // Un hilo sin corrida no tiene identidad que presentar (cerrado por defecto).
+    let Some(tls) = synsema_core::run_scope::current().map(|r| r.ext::<ClientTls>()) else {
+        return Ok(builder.with_no_client_auth());
+    };
+    let guard = tls.identity.lock().map_err(|_| "TLS identity lock poisoned".to_string())?;
+    let scopes = tls.hosts.lock().map_err(|_| "TLS identity lock poisoned".to_string())?;
     match guard.as_ref() {
         Some((certs, key)) if client_auth && identity_applies_to(host, &scopes) => builder
             .with_client_auth_cert(certs.clone(), key.clone_key())
@@ -977,7 +977,7 @@ pub fn register_http_builtins(interp: &Interpreter, caps: Rc<RefCell<CapabilityS
         interp.register_builtin(
             "mtls_identity",
             -1,
-            Rc::new(move |_i, args, _loc| {
+            Rc::new(move |i, args, _loc| {
                 if !(2..=3).contains(&args.len()) {
                     return Err(Control::Error(RuntimeError::new(
                         "mtls_identity(cert_path, key_path, opts?) takes 2 or 3 arguments",
@@ -1075,7 +1075,8 @@ pub fn register_http_builtins(interp: &Interpreter, caps: Rc<RefCell<CapabilityS
                 let certs = load_client_certs(&cp, cf)?;
                 let (kp, kf) = open(&key_path, "private key")?;
                 let key = load_client_key(&kp, kf)?;
-                match (client_identity().lock(), client_identity_hosts().lock()) {
+                let tls = i.run_scope().ext::<ClientTls>();
+                match (tls.identity.lock(), tls.hosts.lock()) {
                     (Ok(mut guard), Ok(mut scope)) => {
                         *guard = Some((certs, key));
                         *scope = hosts;
@@ -1370,6 +1371,28 @@ mod tests {
     /// El certificado de cliente es la identidad del workload: sólo se presenta a
     /// los hosts declarados en `opts.hosts` (sin la opción, a todos los que
     /// `require net` permita).
+    /// v0.6.51 (G1-4): la identidad mTLS es de la corrida que la declaró: otra corrida del mismo
+    /// proceso (o un hilo sin corrida) no la presenta.
+    #[test]
+    fn g1_4_the_mtls_identity_belongs_to_the_run_that_declared_it() {
+        use synsema_core::run_scope::RunScope;
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let key = rcgen::KeyPair::generate().unwrap();
+        let cert = rcgen::CertificateParams::new(Vec::new()).unwrap().self_signed(&key).unwrap();
+        let der: rustls::pki_types::PrivateKeyDer<'static> =
+            rustls::pki_types::PrivatePkcs8KeyDer::from(key.serialize_der()).into();
+        let (a, b) = (RunScope::new(), RunScope::new());
+        *a.ext::<ClientTls>().identity.lock().unwrap() = Some((vec![cert.der().clone()], der));
+        let presents = |run: Option<&Arc<RunScope>>| {
+            let _e = run.map(|r| r.enter());
+            let v: Arc<dyn rustls::client::danger::ServerCertVerifier> = Arc::new(PinnedSpki::new(&[0]));
+            tls_client_config("api.example", Some(v), true).unwrap().client_auth_cert_resolver.has_certs()
+        };
+        assert!(presents(Some(&a)), "la corrida que la declaró la presenta");
+        assert!(!presents(Some(&b)), "otra corrida del proceso no");
+        assert!(!presents(None), "un hilo sin corrida tampoco");
+    }
+
     #[test]
     fn mtls_identity_is_scoped_to_its_hosts() {
         // Sin alcance declarado: se presenta a cualquier host alcanzable.

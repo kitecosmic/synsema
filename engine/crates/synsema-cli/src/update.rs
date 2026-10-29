@@ -225,8 +225,11 @@ pub fn cmd_update() -> ExitCode {
             // evita el skew silencioso (un agente con skill viejo "sabe" cosas que ya no
             // son verdad). En inglés: lo leen agentes de cualquier parte.
             println!(
-                "Using the AI skill (Claude Code etc.)? Refresh it to match this version:\n  \
-                 curl -sL https://raw.githubusercontent.com/kitecosmic/synsema/main/install-skill.sh | bash"
+                "Using the AI skill (Claude Code, Codex, …)? Refresh it to match this version:\n  \
+                 npx skills update -g\n\
+                 (installed without Node? run the installer again: curl -fsSL \
+                 https://raw.githubusercontent.com/kitecosmic/synsema/main/install-skill.sh | bash, \
+                 with `-s -- --agents` for ~/.agents/skills)"
             );
             ExitCode::SUCCESS
         }

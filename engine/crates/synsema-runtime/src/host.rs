@@ -1,7 +1,8 @@
 //! Ajustes del PROCESO que decide quien invoca el binario (la CLI o un binario
 //! `synsema build`): el perfil (`--profile native|pure`) y los argumentos del programa
-//! (`args()`). Viven en `OnceLock` — como `SERVE_CEILING` — porque son política del
-//! proceso, no un parámetro que viaje por seis firmas del motor. `run_program` se los
+//! (`args()`). Viven en `OnceLock` porque son política del proceso, no un parámetro que
+//! viaje por seis firmas del motor (lo que es de UNA corrida, como el techo de `serve`, vive
+//! en su `RunScope` desde v0.6.51). `run_program` se los
 //! transmite al hijo por flag/env (es otro proceso).
 
 use std::sync::OnceLock;

@@ -26,7 +26,7 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use synsema_capabilities::model::{
-    build_ceiling, Capability, CapabilityAuditEntry, CapabilitySet, CapabilityType,
+    build_ceiling, Capability, CapabilityAuditEntry, CapabilitySet, CapabilityType, Delegation,
 };
 use synsema_core::interpreter::{Control, Interpreter, RuntimeError};
 use synsema_core::types::{syn_bool, syn_int, syn_list, syn_map, syn_text, SynValue};
@@ -47,6 +47,35 @@ pub const DEPTH_VAR: &str = "SYNSEMA_RUN_DEPTH";
 /// gasto y presupuesto LLM delegados) en JSON. Lo fija el runtime DESPUÉS del `env` del
 /// programa: un programa no elige la identidad de su hijo. No es un knob del host.
 pub const RUN_SUBJECT_VAR: &str = "SYNSEMA_RUN_SUBJECT";
+
+/// v0.6.51 (ronda 1, N4): el máximo del sujeto (variable de entorno) y de la línea de comandos que
+/// se le pasan al hijo; debajo del tope de Windows para una variable y para la línea (32 767).
+pub const MAX_CHILD_CONTEXT_BYTES: usize = 30_000;
+
+/// Cota superior del largo de la línea de comandos que arma Windows con `exe` y `args`: cada uno
+/// entre comillas y separado por un espacio, con un escape por cada `"` y por cada `\`.
+fn command_line_len(exe: &str, args: &[&str]) -> usize {
+    std::iter::once(exe)
+        .chain(args.iter().copied())
+        .map(|a| a.len() + 3 + a.bytes().filter(|b| *b == b'"' || *b == b'\\').count())
+        .sum()
+}
+
+/// v0.6.45 — un scope de ruta relativo (`./data/*`) se decidió contra el cwd del PADRE; el hijo lo
+/// resolvería contra el suyo (con `cwd`, o un `cd` del hijo, el techo se anclaba en otro lado). Viaja
+/// absoluto. Una URL de base de datos o `:memory:` no es una ruta.
+fn absolute_paths(cap: &Capability) -> Capability {
+    let is_path = matches!(
+        cap.ty(),
+        CapabilityType::File | CapabilityType::FileRead | CapabilityType::FileWrite | CapabilityType::Db
+    );
+    match cap.scope() {
+        Some(s) if is_path && !(cap.ty() == CapabilityType::Db && (synsema_capabilities::model::is_db_url(s) || s == ":memory:")) => {
+            cap.with_scope(Some(synsema_core::capscope::absolute_scope(s)))
+        }
+        _ => cap.clone(),
+    }
+}
 pub const DEFAULT_MAX_DEPTH: u32 = 4;
 pub const DEFAULT_TIMEOUT_SECS: f64 = 30.0;
 
@@ -168,6 +197,8 @@ pub(crate) fn register_run_program_builtin(
             // 4) Techo pedido ∩ lo que el padre cubre. `check_silent` decide igual que un
             //    `check` (denials, techo del host, grants, padres, sandbox) sin auditar
             //    cada item; los recortados dejan UNA entrada con la razón.
+            // v0.6.51 (C1): el token del `ceiling`, con todos sus bloques, como capa del hijo.
+            let mut token_layer: Option<Delegation> = None;
             let requested: Vec<Capability> = match map_get(&opts, "ceiling") {
                 // T1 (identidad): el map que devolvió `captoken_verify` (o un map literal de
                 // caps): el hijo corre bajo ESA autoridad. Lo local al proceso sigue el
@@ -184,6 +215,11 @@ pub(crate) fn register_run_program_builtin(
                     };
                     let mut caps_list = synsema_stdlib::captoken::ceiling_from_caps_map(&caps_map)
                         .map_err(|e| rt(format!("run_program: ceiling: {}", e)))?;
+                    if let Some(SynValue::Text(id)) = m.get("id") {
+                        let earlier = synsema_stdlib::captoken::earlier_layers(&m, synsema_stdlib::captoken::ceiling_from_caps_map)
+                            .map_err(|e| rt(format!("run_program: ceiling: {}", e)))?;
+                        token_layer = Some(Delegation::token(id.to_string(), caps_list.clone(), deterministic).with_earlier(earlier));
+                    }
                     caps_list.push(Capability::new(CapabilityType::Stdout, None));
                     if !deterministic {
                         caps_list.push(Capability::new(CapabilityType::Time, None));
@@ -223,28 +259,20 @@ pub(crate) fn register_run_program_builtin(
             // hijo lo resolvería contra el suyo, y con `cwd` (o un `cd` del hijo) el techo se anclaba
             // en otro lado (`cwd: "/"` convertía `./data` en `/data`). Viajan absolutos.
             for cap in kept.iter_mut() {
-                let is_path = matches!(
-                    cap.ty,
-                    CapabilityType::File | CapabilityType::FileRead | CapabilityType::FileWrite | CapabilityType::Db
-                );
-                if let (true, Some(s)) = (is_path, cap.scope.as_ref()) {
-                    if !(cap.ty == CapabilityType::Db && (synsema_capabilities::model::is_db_url(s) || s == ":memory:")) {
-                        cap.scope = Some(synsema_core::capscope::absolute_scope(s));
-                    }
-                }
+                *cap = absolute_paths(cap);
             }
             // Ronda 2 (A5): el techo viaja como `--cap-set` separado por comas. Un scope con una
             // coma (`{"file.read": "data/x,exec,file.read=y"}`, o un cwd con coma al volverlo
             // absoluto) se partía en items y le daba al hijo `exec` sin scope. No viaja.
             // Ronda 3 (B4): un scope vacío o con espacios en los bordes tampoco viaja (`build_ceiling`
             // lo recorta y un `Some("")` se volvía una capability sin scope: total en el hijo).
-            if let Some(bad) = kept.iter().find(|c| c.scope.as_deref().is_some_and(|s| s.trim().is_empty() || s.trim() != s)) {
+            if let Some(bad) = kept.iter().find(|c| c.scope().is_some_and(|s| s.trim().is_empty() || s.trim() != s)) {
                 return Err(rt(format!(
                     "run_program: ceiling: the scope of {} is empty or has spaces at its ends, which cannot travel to the child",
                     bad
                 )));
             }
-            if let Some(bad) = kept.iter().find(|c| c.scope.as_deref().is_some_and(|s| s.contains(','))) {
+            if let Some(bad) = kept.iter().find(|c| c.scope().is_some_and(|s| s.contains(','))) {
                 return Err(rt(format!(
                     "run_program: ceiling: the scope of {} has a comma, which cannot travel to the child",
                     bad
@@ -290,7 +318,29 @@ pub(crate) fn register_run_program_builtin(
             // LLM delegados — por una variable interna que se pisa después del `env` del
             // programa (el programa no elige la identidad de su hijo). El techo delegado ya
             // viaja como `--cap-set`.
-            let subject = crate::subject::Subject::capture(i, &caps);
+            let mut subject = crate::subject::Subject::capture(i, &caps);
+            // v0.6.51 (C1): el `--cap-set` es la intersección por nombre y pierde la regla de `net` (una
+            // dirección privada la tiene que nombrar cada capa). Viaja además todo lo que limitaba al
+            // padre, capa por capa (`layers_for_child`), y el token del `ceiling` con sus bloques.
+            let mut layers = caps.borrow().layers_for_child();
+            layers.extend(token_layer);
+            for d in layers.iter_mut() {
+                d.caps = d.caps.iter().map(absolute_paths).collect();
+                d.earlier = d.earlier.iter().map(|l| l.iter().map(absolute_paths).collect()).collect();
+            }
+            subject.delegations = layers;
+            // v0.6.51 (ronda 1, N4): el sujeto viaja en una variable de entorno, y Windows corta una
+            // cerca de 32 767 caracteres: el `spawn` fallaba con un error del sistema. El mismo tope
+            // en todas las plataformas (un programa no anda en Linux y se rompe en Windows), con un
+            // mensaje del motor. La línea de comandos se mide entera más abajo.
+            let subject_json = subject.to_env_json();
+            if subject_json.len() > MAX_CHILD_CONTEXT_BYTES {
+                return Err(rt(format!(
+                    "run_program: the caller's capabilities are too many to pass to the child ({} bytes; the limit is {})",
+                    subject_json.len(),
+                    MAX_CHILD_CONTEXT_BYTES
+                )));
+            }
             env.retain(|(k, _)| k != "SYNSEMA_IDENTITY" && k != RUN_SUBJECT_VAR);
             let timeout_secs = match map_get(&opts, "timeout") {
                 None | Some(SynValue::Nothing) => DEFAULT_TIMEOUT_SECS,
@@ -319,19 +369,31 @@ pub(crate) fn register_run_program_builtin(
 
             // 6) El hijo: el mismo binario, en modo motor, fuente por stdin, informe JSON.
             let exe = std::env::current_exe().map_err(|e| rt(format!("run_program: cannot resolve the engine binary: {}", e)))?;
+            let args = [
+                "--engine",
+                "run",
+                "-",
+                "--format",
+                "json",
+                "--profile",
+                child_profile.name(),
+                "--cap-set",
+                cap_set.as_str(),
+                "--filename",
+                filename.as_str(),
+            ];
+            // Ronda 2 (N2): Windows corta la línea de comandos ENTERA (el ejecutable, cada argumento
+            // con sus comillas y escapes) en 32 767 caracteres. Se mide antes, en todas las
+            // plataformas, y no sólo el techo: un `filename` largo también la pasaba.
+            let line = command_line_len(&exe.to_string_lossy(), &args);
+            if line > MAX_CHILD_CONTEXT_BYTES {
+                return Err(rt(format!(
+                    "run_program: the child's command line would be {} characters (its ceiling and filename); the limit is {}",
+                    line, MAX_CHILD_CONTEXT_BYTES
+                )));
+            }
             let mut c = std::process::Command::new(&exe);
-            c.arg("--engine")
-                .arg("run")
-                .arg("-")
-                .arg("--format")
-                .arg("json")
-                .arg("--profile")
-                .arg(child_profile.name())
-                .arg("--cap-set")
-                .arg(&cap_set)
-                .arg("--filename")
-                .arg(&filename)
-                .env_clear();
+            c.args(args).env_clear();
             for (k, v) in &env {
                 c.env(k, v);
             }
@@ -352,7 +414,7 @@ pub(crate) fn register_run_program_builtin(
             // Ronda 5 (B1): padre e hijo comparten la base; lo que el hijo escribió se trae al volver.
             // Un hijo `pure` no toca el disco: no hay nada que recargar (ronda 6, N1).
             let shares_memory =
-                child_profile == Profile::Native && kept.iter().any(|c| c.ty == CapabilityType::Memory);
+                child_profile == Profile::Native && kept.iter().any(|c| c.ty() == CapabilityType::Memory);
             let _reload = ReloadOnDrop(if shares_memory { child.clone() } else { None });
             for k in ["TMP", "TEMP", "TMPDIR"] {
                 if let Ok(v) = std::env::var(k) {
@@ -360,7 +422,7 @@ pub(crate) fn register_run_program_builtin(
                 }
             }
             c.env(DEPTH_VAR, (depth + 1).to_string())
-                .env(RUN_SUBJECT_VAR, subject.to_env_json())
+                .env(RUN_SUBJECT_VAR, &subject_json)
                 .env("SYNSEMA_RUN_PROGRAM_MAX_DEPTH", max_depth.to_string())
                 .env("SYNSEMA_NO_UPDATE_CHECK", "1")
                 // Sin `.env` del cwd: el "reemplazo" de env no puede filtrar el del padre.

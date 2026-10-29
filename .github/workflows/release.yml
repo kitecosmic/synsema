@@ -29,7 +29,7 @@ jobs:
   # assets repartidos). El matrix ahora sólo ADJUNTA assets a una release que existe.
   prepare:
     name: create release
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       - name: Create the release once
         if: startsWith(github.ref, 'refs/tags/')
@@ -58,7 +58,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          - os: ubuntu-26.04
             target: x86_64-unknown-linux-gnu
             asset: synsema-linux-x86_64
           - os: macos-latest
@@ -73,7 +73,7 @@ jobs:
             target: x86_64-pc-windows-msvc
             asset: synsema-windows-x86_64.exe
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -94,12 +94,6 @@ jobs:
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
           "$HOME/.local/bin/cargo-zigbuild" --version
           python3 -m ziglang version
-
-      # ring (the rustls crypto backend) assembles with NASM on windows-msvc;
-      # the runners don't ship it. Linux/macOS use the system assembler (no-op here).
-      - name: Install NASM (Windows)
-        if: runner.os == 'Windows'
-        uses: ilammy/setup-nasm@72793074d3c8cdda771dba85f6deafe00623038b # v1.5.2
 
       # PGO (F1.12 de specs/compute-rendimiento.md; medido: −16 % a −32 % en el arnés, fib −23 %).
       # Un `synsema` instrumentado corre el corpus de engine/pgo/ y el binario publicado se compila
@@ -252,7 +246,7 @@ jobs:
       # Siempre como artefacto del run (así un workflow_dispatch sobre una rama valida el build
       # sin publicar nada); a la Release sólo cuando lo disparó un tag.
       - name: Upload build artifact
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ${{ matrix.asset }}
           path: |
@@ -261,7 +255,7 @@ jobs:
 
       - name: Upload to Release
         if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           files: |
             ${{ matrix.asset }}
@@ -278,13 +272,13 @@ jobs:
   attest-binaries:
     needs: build
     if: startsWith(github.ref, 'refs/tags/')
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     permissions:
       contents: read
       id-token: write
       attestations: write
     steps:
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           # Only the four platform binaries of this run; every other artifact (wasm-assets,
           # guest-sha-*, vela-guest-published-sha) has a name that does not start with `synsema-`.
@@ -303,7 +297,7 @@ jobs:
             echo "sha256 ok: $a"
           done
       - name: Attest build provenance (the four platform binaries)
-        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: |
             synsema-linux-x86_64
@@ -322,21 +316,21 @@ jobs:
   # centraliza para evitar (ver el comentario de `prepare`).
   wasm:
     needs: prepare
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       # Node 24, not 22: the Vela guest probe (tests/vela_guest.probe.mjs) runs here on the module the
       # release publishes, and Node 22.x segfaults intermittently inside V8 while executing it (see
       # packages/guests/vela/README.md).
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "24"
       # Go 1.24 + cgo for the two wasmtime-go probes (v1.0.0 = Vela v0.2.0's runtime, v47 = Vela dev's).
-      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: "1.24"
           cache-dependency-path: |
@@ -376,7 +370,7 @@ jobs:
       # The hash of the guest this run produced, handed to `guest-reproducible-compare` as a small
       # artifact of its own (it needs the hash, not the 7 MB module).
       - name: Hand the built guest's hash to the reproducibility check
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: vela-guest-published-sha
           path: synsema-vela-guest.wasm.sha256
@@ -400,7 +394,7 @@ jobs:
       # The three assets travel to `wasm-publish` as a run artifact, so the job that signs them does
       # not rebuild (or trust) anything: it re-checks every file against its .sha256 first.
       - name: Upload the wasm assets for the publishing job
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: wasm-assets
           path: |
@@ -423,20 +417,19 @@ jobs:
   wasm-publish:
     needs: wasm
     if: startsWith(github.ref, 'refs/tags/')
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     permissions:
       contents: write
       id-token: write
       attestations: write
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "24"
-          registry-url: "https://registry.npmjs.org"
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: wasm-assets
       - name: The artifacts are the files wasm built
@@ -446,14 +439,14 @@ jobs:
             sha256sum -c "$a.sha256"
           done
       - name: Attest build provenance (wasm assets)
-        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: |
             synsema-wasm-wasip1.wasm
             synsema-wasm-web.wasm
             synsema-vela-guest.wasm
       - name: Upload to Release
-        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           files: |
             synsema-wasm-wasip1.wasm
@@ -470,6 +463,10 @@ jobs:
       # publish (0.6.1) fue manual, como exige npm para poder configurar el trusted publisher.
       # npm ≥ 11.5.1 hace falta para trusted publishing; la versión va PINEADA y no `@latest`:
       # este es el job que tiene el token OIDC, y un `@latest` roto o comprometido entraría solo.
+      # `setup-node` va SIN `registry-url` (acá y en `npm-cli`): con él escribía un `.npmrc` con
+      # `_authToken=${NODE_AUTH_TOKEN}` + `always-auth` y exportaba un token de relleno; npm 12
+      # avisa que `always-auth` deja de existir en la próxima mayor. Sin `.npmrc`, npm publica en
+      # el registro por defecto con el token que canjea por OIDC, y no hay otro.
       - name: Publish @synsema/wasm
         run: |
           set -euo pipefail
@@ -499,18 +496,17 @@ jobs:
     # intact and nothing about who produced it.
     needs: [prepare, build, attest-binaries]
     if: startsWith(github.ref, 'refs/tags/')
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     permissions:
       contents: read
       id-token: write
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: "22"
-          registry-url: "https://registry.npmjs.org"
+          node-version: "24"
       - name: Download the release binaries and verify their provenance
         env:
           GH_TOKEN: ${{ github.token }}
@@ -548,7 +544,7 @@ jobs:
           done
 
   # Reproducibility of the published Vela guest, MEASURED rather than promised. The same commit is
-  # built and stubbed on two runners (ubuntu-latest and ubuntu-22.04) with the pinned toolchain:
+  # built and stubbed on two runners (ubuntu-26.04 and ubuntu-22.04) with the pinned toolchain:
   # `--locked` on both lockfiles and rustc 1.99.1 exactly — rust-toolchain.toml at the repo root
   # pins it for rustup, and the same version is passed to dtolnay/rust-toolchain, which does not
   # read that file. The compare job then puts THREE hashes side by side: the two rebuilds and the
@@ -567,7 +563,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          - os: ubuntu-26.04
             relocate: false
           - os: ubuntu-22.04
             relocate: true
@@ -575,7 +571,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master 2026-09-12; toolchain pinned below and in rust-toolchain.toml
@@ -603,7 +599,7 @@ jobs:
           sha256sum synsema-vela-guest.wasm | awk '{print $1}' > "$out/guest.sha256"
           sha256sum engine/target/wasm32-wasip1/wasm/synsema_vela_guest.wasm | awk '{print $1}' > "$out/guest-unstubbed.sha256"
           echo "${{ matrix.os }}: stubbed $(cat "$out/guest.sha256"), unstubbed $(cat "$out/guest-unstubbed.sha256")"
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: guest-sha-${{ matrix.os }}
           path: |
@@ -617,15 +613,15 @@ jobs:
     # the `wasm` job reported (stated as such in the log, never called "the published asset").
     needs: [guest-reproducible, wasm, wasm-publish]
     if: always() && needs.guest-reproducible.result == 'success' && needs.wasm.result == 'success'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     permissions:
       contents: read
     steps:
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: guest-sha-*
           path: shas
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: vela-guest-published-sha
           path: published
@@ -660,7 +656,7 @@ jobs:
           done
           distinct=$( { echo "$published"; cat shas/*/guest.sha256; } | sort -u | wc -l)
           if [ "$distinct" = "1" ]; then
-            echo "::notice title=Vela guest reproducible::ubuntu-latest, ubuntu-22.04 and the published asset agree on synsema-vela-guest.wasm: $published"
+            echo "::notice title=Vela guest reproducible::ubuntu-26.04, ubuntu-22.04 and the published asset agree on synsema-vela-guest.wasm: $published"
           else
             echo "::warning title=Vela guest NOT bit-for-bit reproducible::$summary — the release stays valid (its provenance attestation is what a verifier checks); reproducibility is reported, not promised"
           fi
@@ -681,7 +677,7 @@ jobs:
   # level hashFiles() runs before the workspace exists and is always empty.
   attested-image:
     needs: [prepare, build, attest-binaries]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     # `attestations`/`id-token` because measurements.json is what a client pins the image by: it
     # ships with its own .sha256 and its own provenance, like every other asset of the release.
     permissions:
@@ -689,7 +685,7 @@ jobs:
       id-token: write
       attestations: write
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Fetch the released binary and verify its provenance before it goes into an image
@@ -731,12 +727,12 @@ jobs:
           shasum -a 256 measurements.json > measurements.json.sha256
       - name: Attest build provenance (measurements.json)
         if: hashFiles('packages/attested/Dockerfile') != '' && startsWith(github.ref, 'refs/tags/')
-        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: measurements.json
       - name: Upload measurements.json to the Release
         if: hashFiles('packages/attested/Dockerfile') != '' && startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           files: |
             measurements.json

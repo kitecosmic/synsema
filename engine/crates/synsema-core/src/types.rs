@@ -153,6 +153,24 @@ impl ServerValue {
             ServerValue::Content(_) | ServerValue::Paged(_) => None,
         }
     }
+
+    /// v0.6.51: los campos que `get_field` lee, en orden (`keys(r)`, `values(r)`, `contains(r, k)`):
+    /// un valor del servidor se lee como el mapa que dice ser (`type_of` da `map`).
+    pub fn field_names(&self) -> Vec<String> {
+        let fixed = |f: &[&str]| f.iter().map(|s| s.to_string()).collect();
+        match self {
+            ServerValue::Raw { .. } | ServerValue::RawBytes { .. } => fixed(&["body", "content_type", "status"]),
+            ServerValue::Envelope { .. } => fixed(&["status", "value"]),
+            ServerValue::Node(m) => m.borrow().keys().map(|k| k.to_string()).collect(),
+            ServerValue::Redirect { .. } => fixed(&["location", "status"]),
+            ServerValue::WithHeaders { inner, .. } => match &**inner {
+                SynValue::Server(s) => s.field_names(),
+                SynValue::Map(m) => m.borrow().keys().map(|k| k.to_string()).collect(),
+                _ => Vec::new(),
+            },
+            ServerValue::Content(_) | ServerValue::Paged(_) => Vec::new(),
+        }
+    }
 }
 
 /// Un task definido por el usuario, con su entorno de cierre (closure).

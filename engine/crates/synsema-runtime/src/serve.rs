@@ -63,18 +63,24 @@ use synsema_stdlib::server::{
 use synsema_stdlib::routing::SocketHandler;
 use synsema_stdlib::ws::{adopt_server_socket, close_server_socket, ServerSocketLink};
 
-/// Techo del host para `serve` (`synsema serve --sandbox | --cap-set`): política del
-/// PROCESO (viene de la CLI), por eso vive en un slot global y no se enhebra por las
-/// firmas del motor. Lo leen los intérpretes de request, los ticks de cron y los
-/// agentes spawneados bajo serve — ninguno puede exceder lo que el operador fijó.
-static SERVE_CEILING: std::sync::OnceLock<Option<Arc<Vec<Capability>>>> = std::sync::OnceLock::new();
+/// Techo del host para `serve` (`synsema serve --sandbox | --cap-set`): política de la
+/// CORRIDA (viene de la CLI o del embebedor), por eso vive en su `RunScope` y no se enhebra
+/// por las firmas del motor. Lo leen los intérpretes de request, los ticks de cron y los
+/// agentes spawneados bajo serve — ninguno puede exceder lo que el operador fijó. Hasta
+/// v0.6.50 era un `OnceLock` del proceso: el primer `serve` fijaba el techo de todos los que
+/// vinieran después en el mismo proceso (v0.6.51, G1).
+#[derive(Default)]
+struct ServeCeiling(std::sync::OnceLock<Option<Arc<Vec<Capability>>>>);
 
-fn set_serve_ceiling(ceiling: Option<Vec<Capability>>) {
-    let _ = SERVE_CEILING.set(ceiling.map(Arc::new));
-}
-
+///
+/// Sólo lo llama el armado de intérpretes de `serve`, que siempre trabaja para una corrida. Un hilo
+/// sin corrida es un salto que nadie cableó (ver `run_scope::carry`): cierra con un techo vacío, que
+/// deniega todo y lo dice, en vez de correr sin el techo del operador.
 fn serve_ceiling() -> Option<Arc<Vec<Capability>>> {
-    SERVE_CEILING.get().cloned().flatten()
+    match synsema_core::run_scope::current() {
+        Some(r) => r.ext::<ServeCeiling>().0.get().cloned().flatten(),
+        None => Some(Arc::new(Vec::new())),
+    }
 }
 #[allow(unused_imports)]
 use synsema_stdlib::routing::{build_form_syn, build_request_syn, headers_map, request_bindings, str_map};
@@ -2138,6 +2144,68 @@ thread_local! {
     /// no puede compartirse entre hilos; por eso el cache es thread-local (uno por
     /// worker). Acotado: `#workers × #serves` (no por request) → no reintroduce el OOM.
     static SERVE_INTERPS: RefCell<HashMap<usize, BaseInterp>> = RefCell::new(HashMap::new());
+    /// Hasta qué `ServeLife::ended_epoch` podó este worker su cache.
+    static SWEPT_EPOCH: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Ronda 1, B1: suelta del cache de este hilo los intérpretes de corridas que terminaron (con
+/// ellos, su `RunScope` y la base que tenían abierta). Se dropean fuera del préstamo del cache.
+fn prune_ended_serve_interps() {
+    let dead: Vec<BaseInterp> = SERVE_INTERPS.with(|c| {
+        let mut c = c.borrow_mut();
+        let keys: Vec<usize> = c
+            .iter()
+            .filter(|(_, b)| server::ServeLife::of(b.interp.run_scope()).ended())
+            .map(|(k, _)| *k)
+            .collect();
+        keys.into_iter().filter_map(|k| c.remove(&k)).collect()
+    });
+    drop(dead);
+}
+
+/// Lo que comparte cada intérprete de un serve (ver [`serve_builder`]).
+struct ServeWiring {
+    swarm: Arc<Swarm>,
+    snapshot: Arc<Vec<(String, GlobalVal)>>,
+    caps_snap: Arc<Vec<Capability>>,
+    shared_db: SharedDb,
+    rules_snap: Arc<Vec<OwnerRule>>,
+    shared_memory: SharedMemoryStore,
+    on_write: OnWriteFn,
+    shared_progress: SharedProgressStore,
+    on_write_progress: OnWriteProgressFn,
+    shared_state: SharedState,
+    approvals: ServeApprovals,
+    cron: CronWiring,
+    secure: bool,
+    mem_name: Option<crate::engine::MemName>,
+}
+
+/// El constructor de intérpretes de un serve para sus agentes. Ronda 1 (B1): antes se pasaba a sí
+/// mismo por una celda que él mismo retenía, un ciclo de `Arc` que dejaba vivos para siempre el
+/// snapshot, la base abierta y el swarm de cada intérprete construido (uno por request en un hilo
+/// extra del pool). Ahora cada intérprete recibe un constructor nuevo sobre el mismo wiring.
+fn serve_builder(w: Arc<ServeWiring>) -> crate::engine::InterpBuilder {
+    Arc::new(move || {
+        let (interp, caps, _) = build_base_interp(
+            w.swarm.clone(),
+            &w.snapshot,
+            &w.caps_snap,
+            w.shared_db.clone(),
+            &w.rules_snap,
+            &w.shared_memory,
+            &w.on_write,
+            &w.shared_progress,
+            &w.on_write_progress,
+            &w.shared_state,
+            &w.approvals,
+            &w.cron,
+            w.secure,
+            &w.mem_name,
+            Some(serve_builder(w.clone())),
+        );
+        (interp, caps)
+    })
 }
 
 /// Corre `f` sobre el intérprete base de este serve (construyéndolo la primera vez en
@@ -2179,53 +2247,33 @@ fn with_serve_interp<R>(
     f: impl FnOnce(&mut Interpreter, &Rc<RefCell<CapabilitySet>>) -> R,
 ) -> R {
     let key = Arc::as_ptr(snapshot) as *const () as usize;
+    // Ronda 1, B1: si terminó alguna corrida desde la última vez, este worker suelta lo suyo.
+    let epoch = server::ServeLife::ended_epoch();
+    if SWEPT_EPOCH.with(|e| e.replace(epoch)) != epoch {
+        prune_ended_serve_interps();
+    }
     // Sacá el base del cache (o construilo la primera vez). Sacarlo (en vez de tomar
     // prestado) evita sostener el borrow del thread-local mientras corre `f`.
     let mut base = SERVE_INTERPS.with(|c| c.borrow_mut().remove(&key)).unwrap_or_else(|| {
         // Constructor `Send` de intérpretes de ESTE serve (para agentes spawneados desde
-        // handlers/cron): captura los Arcs compartidos y se pasa a sí mismo (los agentes
-        // de agentes heredan el mismo wiring).
-        let builder: crate::engine::InterpBuilder = {
-            let cell: Arc<std::sync::OnceLock<crate::engine::InterpBuilder>> = Arc::new(std::sync::OnceLock::new());
-            let cell2 = cell.clone();
-            let (sw, sn, cs, db, rs, sm, ow, sp, owp, st, ap, cr, mn) = (
-                swarm.clone(),
-                snapshot.clone(),
-                caps_snap.clone(),
-                shared_db.clone(),
-                rules_snap.clone(),
-                shared_memory.clone(),
-                on_write.clone(),
-                shared_progress.clone(),
-                on_write_progress.clone(),
-                shared_state.clone(),
-                approvals.clone(),
-                cron.clone(),
-                mem_name.clone(),
-            );
-            let b: crate::engine::InterpBuilder = Arc::new(move || {
-                let (interp, caps, _) = build_base_interp(
-                    sw.clone(),
-                    &sn,
-                    &cs,
-                    db.clone(),
-                    &rs,
-                    &sm,
-                    &ow,
-                    &sp,
-                    &owp,
-                    &st,
-                    &ap,
-                    &cr,
-                    secure,
-                    &mn,
-                    cell2.get().cloned(),
-                );
-                (interp, caps)
-            });
-            let _ = cell.set(b.clone());
-            b
-        };
+        // handlers/cron): captura los Arcs compartidos, y cada intérprete que arma recibe uno
+        // igual (los agentes de agentes heredan el mismo wiring).
+        let builder = serve_builder(Arc::new(ServeWiring {
+            swarm: swarm.clone(),
+            snapshot: snapshot.clone(),
+            caps_snap: caps_snap.clone(),
+            shared_db: shared_db.clone(),
+            rules_snap: rules_snap.clone(),
+            shared_memory: shared_memory.clone(),
+            on_write: on_write.clone(),
+            shared_progress: shared_progress.clone(),
+            on_write_progress: on_write_progress.clone(),
+            shared_state: shared_state.clone(),
+            approvals: approvals.clone(),
+            cron: cron.clone(),
+            secure,
+            mem_name: mem_name.clone(),
+        }));
         let (interp, caps, originals) = build_base_interp(
             swarm.clone(),
             snapshot,
@@ -4366,8 +4414,8 @@ fn make_serve_hook(
                 ))))
             }
         };
-        // v0.6.45 (A5): desde acá el proceso escucha; `exit()` deja de ser válido.
-        server::mark_serve_bound();
+        // v0.6.45 (A5): desde acá la corrida escucha; `exit()` deja de ser válido.
+        interp.run_scope().mark_bound();
         let scheme = if use_tls { "HTTPS" } else { "HTTP" };
         println!("Serving {} on port {} ({} route(s))", scheme, port_str, n_routes);
         if let Some(id) = &attested_identity {
@@ -4417,9 +4465,10 @@ fn make_serve_hook(
             let https_port = port_num as u16;
             {
                 let store2 = store.clone();
+                let life = server::ServeLife::of(&rt.run_scope);
                 let h = std::thread::Builder::new()
                     .name(format!("acme-http:{}", http_port))
-                    .spawn(move || server::serve_acme_http(chal, https_port, store2))
+                    .spawn(move || server::serve_acme_http(chal, https_port, store2, life))
                     .expect("hilo de challenge ACME");
                 servers.lock().unwrap().push(h);
             }
@@ -4465,9 +4514,13 @@ fn make_serve_hook(
             }
             mgr.spawn_renewal();
             let rt2 = rt.clone();
+            let live = server::ServeLife::of(&rt.run_scope).server_starting();
             let h = std::thread::Builder::new()
                 .name(format!("serve:{}", port_str))
-                .spawn(move || server::serve_forever_tls_managed(rt2, listener, mgr))
+                .spawn(move || {
+                    let _live = live;
+                    server::serve_forever_tls_managed(rt2, listener, mgr)
+                })
                 .expect("hilo de accept del server");
             servers.lock().unwrap().push(h);
             return Ok(syn_text(format!("serving:{}", port_str)));
@@ -4478,9 +4531,10 @@ fn make_serve_hook(
             match TcpListener::bind((bind_addr.as_str(), 80u16)) {
                 Ok(rl) => {
                     let https_port = port_num as u16;
+                    let life = server::ServeLife::of(&rt.run_scope);
                     let h = std::thread::Builder::new()
                         .name("serve:redirect:80".to_string())
-                        .spawn(move || server::serve_redirect(rl, https_port))
+                        .spawn(move || server::serve_redirect(rl, https_port, life))
                         .expect("hilo de redirección :80");
                     servers.lock().unwrap().push(h);
                 }
@@ -4493,19 +4547,26 @@ fn make_serve_hook(
             }
         }
 
+        let live = server::ServeLife::of(&rt.run_scope).server_starting();
         let handle = match tls_config {
             Some(cfg) => {
                 let rt2 = rt.clone();
                 std::thread::Builder::new()
                     .name(format!("serve:{}", port_str))
-                    .spawn(move || server::serve_forever_tls(rt2, listener, cfg))
+                    .spawn(move || {
+                        let _live = live;
+                        server::serve_forever_tls(rt2, listener, cfg)
+                    })
                     .expect("hilo de accept del server")
             }
             None => {
                 let rt2 = rt.clone();
                 std::thread::Builder::new()
                     .name(format!("serve:{}", port_str))
-                    .spawn(move || serve_forever(rt2, listener))
+                    .spawn(move || {
+                        let _live = live;
+                        serve_forever(rt2, listener)
+                    })
                     .expect("hilo de accept del server")
             }
         };
@@ -4808,6 +4869,7 @@ fn serve_inner(source: &str, filename: &str, secure: bool, overrides: ServeOverr
         _ => None,
     };
     if let Some(code) = exit {
+        end_serve_run_early(&interp, &servers, &cron);
         return RunResult {
             success: code == 0,
             output: std::mem::take(&mut interp.output),
@@ -4816,6 +4878,7 @@ fn serve_inner(source: &str, filename: &str, secure: bool, overrides: ServeOverr
         };
     }
     if let Err(Control::Error(e)) = &r {
+        end_serve_run_early(&interp, &servers, &cron);
         return RunResult {
             success: false,
             output: interp.output.clone(),
@@ -4859,8 +4922,10 @@ fn serve_inner(source: &str, filename: &str, secure: bool, overrides: ServeOverr
             // Bloquea (cero CPU) mientras los hilos de los jobs trabajan, hasta que maten el
             // proceso (Ctrl+C) o el programa pida `shutdown()` desde un job: entonces se
             // cancelan los jobs y se sale con 0, como el drain de un server.
-            synsema_stdlib::server::park_cron_only();
+            let life = server::ServeLife::of(interp.run_scope());
+            life.park_cron_only();
             cron.sched.cancel_all();
+            life.finish();
             eprintln!("[serve] stopped");
             return RunResult { success: true, output: std::mem::take(&mut interp.output), errors: Vec::new(), ..Default::default() };
         }
@@ -4876,15 +4941,46 @@ fn serve_inner(source: &str, filename: &str, secure: bool, overrides: ServeOverr
         };
     }
     println!("\n{} HTTP server(s) running. Press Ctrl+C to stop.", handles.len());
-    for h in handles {
-        let _ = h.join(); // bloquea para siempre (el accept loop nunca termina)
-    }
+    // v0.6.51 (G1): hasta que los listeners de ESTA corrida drenen (un `shutdown()` o una señal).
+    // Antes el último listener del proceso hacía `process::exit`, y el `shutdown()` de un `serve`
+    // terminaba cualquier otro del mismo proceso. Los jobs de cron se cancelan como en el camino
+    // sólo-cron.
+    // Ronda 1, B1: al terminar, la corrida suelta lo que la servía por fuera de sus listeners: el
+    // 301 de :80 y el challenge ACME cierran su puerto (se esperan acá), la renovación ACME termina
+    // y cada worker del pool poda los intérpretes que cacheaba para ella.
+    close_serve_run(&server::ServeLife::of(interp.run_scope()), handles, &cron);
     // T10: un `serve --attested` que se cerró porque sus documentos vencieron sin renovación
     // termina con error, no con un apagado normal.
     if let Some(reason) = synsema_stdlib::attest::renewal_failure() {
         return RunResult { success: false, output: std::mem::take(&mut interp.output), errors: vec![format!("Runtime error: {}", reason)], ..Default::default() };
     }
     RunResult { success: true, output: std::mem::take(&mut interp.output), errors: Vec::new(), ..Default::default() }
+}
+
+/// Cierra la corrida de un `serve` cuando sus listeners drenaron (ronda 1, B1): cancela el cron, la
+/// marca terminada, espera al 301 y al challenge ACME (sueltan su puerto) y le pide a cada worker del
+/// pool que suelte lo que cacheaba para ella.
+fn close_serve_run(life: &server::ServeLife, handles: Vec<JoinHandle<()>>, cron: &CronWiring) {
+    life.wait_stopped();
+    cron.sched.cancel_all();
+    life.finish();
+    for h in handles {
+        let _ = h.join();
+    }
+    server::on_every_pool_worker(prune_ended_serve_interps);
+}
+
+/// Ronda 2 (B1): el preámbulo terminó con un error (o un `exit`) después de un `serve on` que ya
+/// escucha. La corrida vuelve con ese resultado, así que su server no puede quedar atendiendo: se
+/// pide su shutdown (drena lo que tiene en vuelo, hasta la gracia) y se cierra como en el camino
+/// normal.
+fn end_serve_run_early(interp: &Interpreter, servers: &Servers, cron: &CronWiring) {
+    let handles: Vec<JoinHandle<()>> = std::mem::take(&mut *servers.lock().unwrap_or_else(|p| p.into_inner()));
+    let life = server::ServeLife::of(interp.run_scope());
+    if !handles.is_empty() {
+        life.request_engine_shutdown("the preamble failed after `serve on`: stopping the server");
+    }
+    close_serve_run(&life, handles, cron);
 }
 
 /// Corre un programa que contiene `serve on PORT`. Bindea (síncrono), imprime la
@@ -4937,13 +5033,19 @@ pub fn run_serve_program_with_overrides(
     let fname = filename.to_string();
     // T4: la medida del programa que sirve, para el recibo (`receipt()`) de cada request.
     synsema_stdlib::attest::note_program_sha(source, filename);
-    set_serve_ceiling(overrides.ceiling.clone());
+    // v0.6.51 (G1): la corrida (su techo, que es un `serve`) la crea quien la empieza, y todo lo que
+    // trabaje para ella la hereda (ver `synsema_core::run_scope`).
+    let run = synsema_core::run_scope::RunScope::new();
+    let _ = run.ext::<ServeCeiling>().0.set(overrides.ceiling.clone().map(Arc::new));
     // Desde acá `shutdown()` tiene sentido (bajo `run` es un error claro).
-    synsema_stdlib::server::mark_under_serve();
+    run.mark_serve();
     install_env_reload_on_sighup();
     std::thread::Builder::new()
         .stack_size(INTERP_STACK_SIZE)
-        .spawn(move || serve_inner(&src, &fname, secure, overrides))
+        .spawn(move || {
+            let _run = run.enter();
+            serve_inner(&src, &fname, secure, overrides)
+        })
         .expect("no se pudo crear el hilo del motor serve")
         .join()
         .unwrap_or_else(|p| RunResult {
@@ -4956,6 +5058,20 @@ pub fn run_serve_program_with_overrides(
 
 #[cfg(test)]
 mod tests {
+    /// v0.6.51 (G1): sin corrida en el hilo, el techo de `serve` cierra; con corrida, es el suyo.
+    #[test]
+    fn g1_a_thread_without_a_run_gets_a_closed_serve_ceiling() {
+        assert_eq!(super::serve_ceiling().map(|c| c.len()), Some(0));
+        let run = synsema_core::run_scope::RunScope::new();
+        let _e = run.enter();
+        assert!(super::serve_ceiling().is_none(), "una corrida sin techo de host no tiene techo");
+        let _ = run.ext::<super::ServeCeiling>().0.set(Some(super::Arc::new(vec![super::Capability::new(
+            synsema_capabilities::model::CapabilityType::Stdout,
+            None,
+        )])));
+        assert_eq!(super::serve_ceiling().map(|c| c.len()), Some(1));
+    }
+
     use super::*;
     use synsema_stdlib::secrets::EnvStore;
 

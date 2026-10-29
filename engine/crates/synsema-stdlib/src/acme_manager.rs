@@ -109,7 +109,9 @@ enum Why {
 
 /// Corre `f` (una task del programa) en un hilo propio con pila grande y espera hasta `timeout`.
 /// `None` si venció o si el hilo no arrancó; un hilo vencido termina solo cuando la task termina.
+/// La task corre para la corrida del que la pide (v0.6.51, G1: su techo de `serve`).
 async fn run_task<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static, timeout: Duration) -> Option<T> {
+    let f = synsema_core::run_scope::carry(f);
     let (tx, rx) = tokio::sync::oneshot::channel();
     let spawned = std::thread::Builder::new().name("acme-task".to_string()).stack_size(TASK_STACK).spawn(move || {
         let _ = tx.send(f());
@@ -726,7 +728,12 @@ impl CertManager {
     /// certificado de algún nombre fijo.
     pub fn spawn_renewal(self: &Arc<Self>) {
         let me = self.clone();
+        // La renovación llama a `domain ask`/`tls dns` del programa: es de la corrida que la lanzó.
+        // v0.6.51 (ronda 1, B1): y termina con ella (no llama a las tasks de una corrida que volvió).
+        let run = synsema_core::run_scope::current();
         let _ = std::thread::Builder::new().name("acme-renew".to_string()).spawn(move || {
+            let _run = run.as_ref().map(|r| r.enter());
+            let life = run.as_ref().map(|r| crate::server::ServeLife::of(r));
             let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
                 Ok(rt) => rt,
                 Err(e) => {
@@ -736,7 +743,15 @@ impl CertManager {
             };
             let mut missing = !me.missing_fixed().is_empty();
             loop {
-                std::thread::sleep(if missing { RETRY_MISSING_EVERY } else { Duration::from_secs(3600) });
+                let every = if missing { RETRY_MISSING_EVERY } else { Duration::from_secs(3600) };
+                match &life {
+                    Some(l) => {
+                        if !l.sleep_while_running(every) {
+                            return;
+                        }
+                    }
+                    None => std::thread::sleep(every),
+                }
                 missing = !rt.block_on(me.renew_due()).is_empty();
             }
         });

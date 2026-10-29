@@ -330,6 +330,17 @@ fn undefined_variable(name: &str, loc: &SourceLocation) -> Control {
             name, name
         ));
     }
+    // v0.6.51: el estado compartido de `serve` vive en el intérprete del request; un worker de
+    // `parallel_map` o un agente que lanzó la ruta no lo tiene (ni un programa sin `serve`).
+    if matches!(
+        name,
+        "state_get" | "state_set" | "state_incr" | "state_cas" | "state_delete" | "state_merge" | "state_all"
+    ) {
+        msg.push_str(&format!(
+            ". '{}' is the shared state of `serve`: it exists in a request (the route and the tasks it calls), not in a `parallel_map` worker, an agent or a program without `serve` — call it in the route and pass the value in",
+            name
+        ));
+    }
     err_at(msg, loc)
 }
 
@@ -1728,8 +1739,9 @@ pub struct Interpreter {
     /// exportados (un frame por módulo en carga; el frame base es el del
     /// entrypoint y nunca se cosecha → un `export` top-level del entrypoint se ignora).
     module_cache: HashMap<String, SynValue>,
-    /// Los entornos de módulo que el host reconstruyó para este intérprete (`parallel_map`, un
-    /// agente, un worker de `serve`: `adopt_module_envs`). Son suyos: el `Drop` los vacía.
+    /// Los entornos de módulo de este intérprete: los que cargó (`load_module_inner`, v0.6.51) y
+    /// los que el host reconstruyó para él (`parallel_map`, un agente, un worker de `serve`:
+    /// `adopt_module_envs`). Son suyos: el `Drop` los vacía.
     owned_module_envs: Vec<Rc<RefCell<Environment>>>,
     loading_modules: HashSet<String>,
     exports_collector: Vec<Vec<String>>,
@@ -1955,6 +1967,10 @@ pub struct Interpreter {
     /// v0.6.50 (ronda 1, M1): ya corrió un `execute`. Lo que haya en `global_env` desde entonces lo
     /// ligó el programa, no es preludio: una foto tomada después son los builtins.
     executed: bool,
+    /// v0.6.51 (G1): el estado de la corrida que antes era del proceso (`serve`, puerto abierto,
+    /// shutdown, mTLS, texto de redacción). Lo comparten todos los intérpretes de la corrida; ver
+    /// `run_scope.rs`. Al final del struct a propósito (no es camino caliente).
+    run_scope: std::sync::Arc<crate::run_scope::RunScope>,
 }
 
 /// v0.6.46 (ronda 1 de cf1, B2): el linaje que juntó un intérprete hijo (un worker de
@@ -2062,11 +2078,10 @@ impl Interpreter {
     /// lo retiene, se suelta como siempre: la closure sigue viendo sus variables.
     #[inline]
     fn release_frame(&mut self, frame: Rc<RefCell<Environment>>) {
-        if !self.shortcuts
-            || Rc::strong_count(&frame) != 1
-            || Rc::weak_count(&frame) != 0
-            || self.free_frames.len() >= MAX_FREE_FRAMES
-        {
+        if Rc::strong_count(&frame) != 1 {
+            return self.release_captured_frame(frame);
+        }
+        if !self.shortcuts || Rc::weak_count(&frame) != 0 || self.free_frames.len() >= MAX_FREE_FRAMES {
             return;
         }
         {
@@ -2075,6 +2090,33 @@ impl Interpreter {
             e.bindings.clear();
         }
         self.free_frames.push(frame);
+    }
+
+    /// v0.6.51 (F1 de specs/v0.6.51-modelos.md): un frame que alguien más retiene. Si los únicos
+    /// que lo retienen son closures ligadas en sus propias variables (`task inner` o `let f be
+    /// (x) => …` dentro de la task) que nadie más tiene, nada de afuera lo alcanza: el ciclo
+    /// frame ⇄ closure se corta vaciando las variables, y el frame se libera como uno sin capturar.
+    /// Cualquier otra referencia (una closure que salió, un scope hijo vivo, un `Weak`) suma uno
+    /// que la cuenta no explica, y el frame queda como estaba.
+    #[cold]
+    #[inline(never)]
+    fn release_captured_frame(&mut self, frame: Rc<RefCell<Environment>>) {
+        if Rc::weak_count(&frame) != 0 {
+            return;
+        }
+        let own = {
+            let e = frame.borrow();
+            e.bindings
+                .values()
+                .filter(|v| matches!(v, SynValue::Task(t) if Rc::strong_count(t) == 1 && Rc::ptr_eq(&t.closure_env, &frame)))
+                .count()
+        };
+        if own == 0 || Rc::strong_count(&frame) != 1 + own {
+            return;
+        }
+        let vars = std::mem::take(&mut frame.borrow_mut().bindings);
+        drop(vars);
+        self.release_frame(frame);
     }
 }
 
@@ -2118,6 +2160,9 @@ impl Interpreter {
             trusted_templates: HashMap::new(),
             trusted_stack: Vec::new(),
             executed: false,
+            // Un intérprete que nace dentro de una corrida (un worker, un agente, un tick de cron)
+            // es de esa corrida; uno que nace fuera empieza la suya.
+            run_scope: crate::run_scope::current().unwrap_or_else(crate::run_scope::RunScope::new),
             blackboard: HashMap::new(),
             agent_definitions: HashMap::new(),
             agent_context: Vec::new(),
@@ -2251,6 +2296,9 @@ impl Interpreter {
         names.dedup();
         let text = if names.is_empty() { String::new() } else { names.join(",") };
         crate::labels::set_redaction_text(&text);
+        if !text.is_empty() {
+            self.run_scope.set_redaction(&text);
+        }
         *self.redaction_text.borrow_mut() = text;
     }
     
@@ -3255,8 +3303,14 @@ impl Interpreter {
     }
 
     /// Primer `print`/`show`/`log`: consulta el gate una vez y memoiza el veredicto
-    /// (un chequeo por intérprete; el audit lo ve una vez, no por línea).
-    fn ensure_stdout(&mut self) -> Result<(), Control> {
+    /// (un chequeo por intérprete; el audit lo ve una vez, no por línea). Público para los caminos
+    /// a stdout que viven en otro crate (`term_write`, v0.6.51 ronda 1 B2).
+    pub fn ensure_stdout(&mut self) -> Result<(), Control> {
+        // v0.6.51: dentro de un `sandbox` se pregunta cada vez y no se guarda: el veredicto de
+        // afuera (memoizado en un `print` anterior) no vale adentro, y el de adentro no vale afuera.
+        if self.sandbox_depth > 0 {
+            return self.stdout_in_sandbox();
+        }
         if self.stdout_verdict.is_none() {
             let verdict = match self.stdout_hook.clone() {
                 Some(h) => h(),
@@ -3267,6 +3321,15 @@ impl Interpreter {
         match self.stdout_verdict.as_ref().unwrap() {
             Ok(()) => Ok(()),
             Err(m) => Err(Control::Error(RuntimeError::new(m.clone()))),
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn stdout_in_sandbox(&mut self) -> Result<(), Control> {
+        match self.stdout_hook.clone() {
+            Some(h) => h().map_err(|m| Control::Error(RuntimeError::new(m))),
+            None => Ok(()),
         }
     }
 
@@ -4104,6 +4167,8 @@ impl Interpreter {
     /// Llama a un valor invocable (task/builtin) con argumentos. Para el motor
     /// (p.ej. el verificador de auth de `serve`). Un `give` interno → valor de retorno.
     pub fn call_task(&mut self, func: SynValue, args: Vec<SynValue>) -> Result<SynValue, Control> {
+        // v0.6.51 (G1): una entrada del host, como `execute`: el hilo trabaja para esta corrida.
+        let _run = self.run_scope.enter();
         for a in &args {
             self.harvest_principals(a);
         }
@@ -4173,6 +4238,7 @@ impl Interpreter {
     /// Ejecuta un bloque de statements en el entorno global (cuerpo de un agente).
     /// Sin preámbulo/freeze (eso es sólo para el programa top-level).
     pub fn run_block(&mut self, stmts: &[Node]) -> Result<SynValue, Control> {
+        let _run = self.run_scope.enter();
         let g = self.global_env.clone();
         // v0.6.50 (A): como `execute`, la foto del preludio antes de que el bloque ligue nada (la
         // REPL, un embebedor). Un agente ya la trae de `rebuild_globals`.
@@ -4507,6 +4573,11 @@ impl Interpreter {
         }
         let map = exports.into_ref();
         register_module(&map, &module_env);
+        // v0.6.51 (F2): el módulo es una instancia que vive lo que vive el intérprete (que ya
+        // retiene su mapa en el caché). El registro sólo guarda `Weak`: sin esto, el entorno de un
+        // módulo sin tasks moría al terminar de cargar, el mapa dejaba de ser un módulo y `set m.X`
+        // del programa lo copiaba (la vista de otro módulo seguía leyendo el valor viejo).
+        self.owned_module_envs.push(module_env);
         Ok(SynValue::Map(map))
     }
 
@@ -5248,7 +5319,13 @@ impl Interpreter {
     // ejecución
     // =========================================================
 
+    /// v0.6.51 (G1): la corrida de este intérprete (ver `run_scope.rs`).
+    pub fn run_scope(&self) -> &std::sync::Arc<crate::run_scope::RunScope> {
+        &self.run_scope
+    }
+
     pub fn execute(&mut self, program: &Program) -> Result<SynValue, Control> {
+        let _run = self.run_scope.enter();
         // T5 (B8): nombres protegidos → error de carga, antes de correr nada.
         check_protected_names(program)?;
         // v0.6.29: nombres que cambiaron antes de v1.0 → un aviso por stderr, una vez.
@@ -5334,6 +5411,10 @@ impl Interpreter {
         program: &Program,
         after_each: &mut dyn FnMut(&str, bool) -> Option<String>,
     ) -> Vec<TestOutcome> {
+        // v0.6.51 (ronda 1, M2): una entrada del host, como `execute`: el setup y cada bloque `test`
+        // corren para la corrida de este intérprete (la identidad mTLS que declaró, sus agentes y
+        // workers).
+        let _run = self.run_scope.enter();
         let g = self.global_env.clone();
         self.snapshot_trusted_base();
         if program.has_file_use {
@@ -6998,8 +7079,8 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
         {
         // Aislamiento real: durante el cuerpo, todas las capabilities quedan
         // DENEGADAS (el hook vacía el CapabilitySet; `require` es no-op). Se
-        // restaura al salir, también en el camino de error. El `print` no está
-        // gateado, así que el sandbox puede computar y devolver un valor.
+        // restaura al salir, también en el camino de error. `print` también se deniega
+        // (v0.6.51, también sin techo del host): el bloque computa y devuelve un valor.
         let sandbox_env = Environment::child_scope(env, "sandbox");
         self.sandbox_depth += 1;
         if let Some(hook) = self.sandbox_hook.clone() {
@@ -8115,6 +8196,12 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                     Some(v) => Ok(v.clone()),
                     None => Err(err_at(format!("Map has no key '{}'", key), loc)),
                 }
+            }
+            // v0.6.51: un valor del servidor (`render`, `respond`, `ok`…) se lee como el mapa que
+            // dice ser: `r["body"]` es `r.body`.
+            SynValue::Server(s) => {
+                let key = idx.to_string();
+                s.get_field(&key).ok_or_else(|| err_at(format!("Map has no key '{}'", key), loc))
             }
             // `b[i]` → entero (valor del byte 0..=255); negativos desde el final.
             SynValue::Bytes(b) => {
@@ -9612,6 +9699,7 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                     "keys() requires a map — group_by returns a list of {key, items} (v0.6.29): the keys are apply(groups, (g) => g.key), the count is length(groups), or use count_by(rows, key)",
                 ))
             }
+            SynValue::Server(s) => Ok(syn_list(s.field_names().into_iter().map(syn_text).collect())),
             other => Err(err(format!("keys() requires a map, got {}", other.type_name()))),
         }
     }
@@ -9657,6 +9745,7 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                 let vals: Vec<SynValue> = m.borrow().values().cloned().collect();
                 Ok(syn_list(vals))
             }
+            SynValue::Server(s) => Ok(syn_list(s.field_names().iter().filter_map(|k| s.get_field(k)).collect())),
             _ => Err(err("values() requires a map")),
         }
     }
@@ -9676,6 +9765,7 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
             }
             SynValue::Text(s) => Ok(syn_bool(s.contains(&raw_str(item)))),
             SynValue::Map(m) => Ok(syn_bool(m.borrow().contains_key(&raw_str(item)))),
+            SynValue::Server(s) => Ok(syn_bool(s.get_field(&raw_str(item)).is_some())),
             SynValue::Bytes(b) => match item {
                 // Subsecuencia contigua de bytes; el vacío siempre está contenido.
                 SynValue::Bytes(needle) => {
@@ -13014,6 +13104,74 @@ mod drop_tests {
              intérprete lo filtraría por request)"
         );
     }
+
+    fn task_over(env: &Rc<RefCell<Environment>>) -> Rc<SynTaskValue> {
+        Rc::new(SynTaskValue {
+            name: "inner".to_string(),
+            parameters: vec![],
+            body: Vec::new().into(),
+            closure_env: env.clone(),
+            origin: None,
+            required_capabilities: vec![],
+            code: Default::default(),
+            free_names: Default::default(),
+        })
+    }
+
+    /// v0.6.51 (F1-1, F1-7): el frame de una llamada que liga una task que cierra sobre él
+    /// (`task mk(i)` con `task inner` adentro) se libera al salir, con atajos y sin ellos.
+    #[test]
+    fn a_frame_held_only_by_its_own_closure_is_freed_on_release() {
+        for shortcuts in [true, false] {
+            let mut interp = Interpreter::new();
+            interp.shortcuts = shortcuts;
+            let frame = Environment::child_scope(&interp.global_env, "call");
+            frame.borrow_mut().bindings.insert("i", SynValue::Number(Number::Int(7)));
+            let inner = task_over(&frame);
+            // Un `Weak` de la closure, no del frame: uno del frame cuenta como alguien de afuera.
+            let weak = Rc::downgrade(&inner);
+            frame.borrow_mut().bindings.insert("inner", SynValue::Task(inner));
+            let pooled = interp.free_frames.len();
+            interp.release_frame(frame);
+            if shortcuts {
+                // Vuelve al pool vacío: el ciclo se cortó y nadie más lo tiene.
+                assert_eq!(interp.free_frames.len(), pooled + 1);
+                let f = interp.free_frames.last().unwrap();
+                assert!(f.borrow().bindings.values().next().is_none(), "el frame del pool tiene que estar vacío");
+                assert_eq!(Rc::strong_count(f), 1);
+            }
+            assert!(weak.upgrade().is_none(), "FUGA: el ciclo frame ⇄ closure sigue vivo (shortcuts = {shortcuts})");
+        }
+    }
+
+    /// v0.6.51 (F1-3, F1-4): si la closure salió del frame (alguien más la tiene), el frame no se
+    /// toca: la closure sigue viendo sus variables.
+    #[test]
+    fn a_frame_whose_closure_escaped_keeps_its_variables() {
+        let mut interp = Interpreter::new();
+        let frame = Environment::child_scope(&interp.global_env, "call");
+        let inner = task_over(&frame);
+        frame.borrow_mut().bindings.insert("i", SynValue::Number(Number::Int(7)));
+        frame.borrow_mut().bindings.insert("inner", SynValue::Task(inner.clone()));
+        interp.release_frame(frame);
+        let env = inner.closure_env.borrow();
+        assert!(env.bindings.get("i").is_some(), "la closure que salió perdió sus variables");
+        assert!(env.bindings.get("inner").is_some());
+    }
+
+    /// v0.6.51 (F1): otra referencia al frame que no es una closure propia (un scope hijo vivo,
+    /// otro valor) también lo deja como está.
+    #[test]
+    fn a_frame_also_held_by_a_live_child_scope_keeps_its_variables() {
+        let mut interp = Interpreter::new();
+        let frame = Environment::child_scope(&interp.global_env, "call");
+        let child = Environment::child_scope(&frame, "each");
+        frame.borrow_mut().bindings.insert("i", SynValue::Number(Number::Int(7)));
+        frame.borrow_mut().bindings.insert("inner", SynValue::Task(task_over(&frame)));
+        interp.release_frame(frame);
+        let parent = child.borrow().parent.clone().unwrap();
+        assert!(parent.borrow().bindings.get("i").is_some(), "se vació un frame que un scope hijo todavía lee");
+    }
 }
 
 #[cfg(test)]
@@ -13029,6 +13187,50 @@ mod lambda_tests {
     #[test]
     fn lambda_is_task_type() {
         assert_eq!(out("print(type_of((x) => x))"), vec!["task"]);
+    }
+
+    /// v0.6.51 (F1-1..F1-6): liberar el frame que sólo retienen sus closures no cambia nada de lo
+    /// que ve el programa: la closure que salió, la guardada en un global, la recursiva por nombre
+    /// y la de una vuelta de `each` siguen viendo sus variables.
+    #[test]
+    fn closures_over_a_released_frame_still_see_their_variables() {
+        let src = "let g be nothing
+task mk(i)
+    task inner(x)
+        give x + i
+    give inner(1)
+task esc(i)
+    task inner(x)
+        give x + i
+    give inner
+task keep(i)
+    task inner(x)
+        give x * i
+    set g to inner
+    give 0
+task rec(n)
+    task down(k)
+        when k == 0
+            give 0
+        give k + down(k - 1)
+    give down(n)
+task loopy(n)
+    let s be 0
+    each k in range(n)
+        let f be (x) => x + k
+        set s to s + f(1)
+    give s
+let acc be 0
+each k in range(50)
+    set acc to acc + mk(k)
+print(acc)
+let e be esc(10)
+print(e(5))
+keep(3)
+print(g(4))
+print(rec(10))
+print(loopy(4))";
+        assert_eq!(out(src), vec!["1275", "15", "12", "55", "10"]);
     }
 
     #[test]

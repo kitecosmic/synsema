@@ -117,7 +117,7 @@ pub fn build_receipt(
             .iter()
             .filter_map(|d| match &d.source {
                 DelegationSource::Token(id) => Some(syn_text(id.clone())),
-                DelegationSource::Block => None,
+                DelegationSource::Block | DelegationSource::Caller => None,
             })
             .collect();
         let audit = cs.audit_log.iter().map(|e| audit_to_syn(&AuditEntry::from(e))).collect();
