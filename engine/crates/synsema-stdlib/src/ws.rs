@@ -539,11 +539,39 @@ fn conn_handle(v: &SynValue, fname: &str) -> Result<i64, Control> {
         SynValue::Number(n) => n
             .to_i64_trunc()
             .ok_or_else(|| err(format!("{}: the connection handle must be an integer", fname))),
-        other => Err(err(format!(
-            "{}: expected a connection handle from ws_connect(), got {}",
-            fname,
-            other.type_name()
-        ))),
+        other => {
+            let (what, from, note) = handle_source(fname);
+            Err(err(format!("{}: expected {} from {}, got {}{}", fname, what, from, other.type_name(), note)))
+        }
+    }
+}
+
+/// Qué handle espera `fname` y qué builtin lo da, para el error de un handle que no es un número.
+/// Antes decía siempre `ws_connect()`, también para `term_write(nothing, …)` (v0.6.52).
+#[cold]
+#[inline(never)]
+fn handle_source(fname: &str) -> (&'static str, &'static str, &'static str) {
+    if fname == "select" || fname == "ws_select" {
+        return (
+            "a handle",
+            "ws_connect() or a `socket` route, proc_spawn(), watch(), term_open(), bus_subscribe(), \
+             tcp_connect() or pipe()",
+            "",
+        );
+    }
+    match fname.split('_').next().unwrap_or(fname) {
+        "proc" => ("a process handle", "proc_spawn()", ""),
+        "watch" => ("a watch handle", "watch()", ""),
+        "term" => (
+            "a terminal handle",
+            "term_open()",
+            " — term_open() gives nothing when there is no terminal: stdin or stdout is not a TTY, or \
+             the program runs under serve, test or conform, or in wasm",
+        ),
+        "bus" => ("a subscription handle", "bus_subscribe()", ""),
+        "tcp" => ("a connection handle", "tcp_connect()", ""),
+        "pipe" => ("a pipe end", "pipe()", ""),
+        _ => ("a connection handle", "ws_connect() or a `socket` route", ""),
     }
 }
 
@@ -2592,6 +2620,12 @@ fn opt_usize(m: &MapObj, key: &str, fname: &str) -> Result<Option<usize>, Contro
     }
 }
 
+/// Las opciones de `proc_spawn` (`check_option_keys`).
+const PROC_SPAWN_OPTIONS: &[&str] = &[
+    "cwd", "env", "env_clean", "max_queue", "max_queue_bytes", "on_full", "line_mode", "stderr", "pty", "cols", "rows",
+    "term", "process_group",
+];
+
 fn proc_spawn(i: &Interpreter, args: &[SynValue], reg: &Registry) -> Result<SynValue, Control> {
     const F: &str = "proc_spawn";
     let cmd = match args.first() {
@@ -2611,6 +2645,17 @@ fn proc_spawn(i: &Interpreter, args: &[SynValue], reg: &Registry) -> Result<SynV
             .collect::<Result<Vec<_>, _>>()?,
         Some(_) => return Err(err(format!("{}: args must be a list", F))),
     };
+    // v0.6.52 (auditoría r1, M3): una opción que no conoce es error (no corre). `isolate` todavía no
+    // existe acá: se aceptaba y se ignoraba, y el hijo corría sin aislar.
+    if let Some(SynValue::Map(m)) = args.get(2) {
+        if m.borrow().contains_key("isolate") {
+            return Err(err(format!(
+                "{}: \"isolate\" comes in a later version — use run(…, {{\"isolate\": …}}) for an isolated child; nothing ran",
+                F
+            )));
+        }
+    }
+    synsema_capabilities::secure::check_option_keys(F, args.get(2), PROC_SPAWN_OPTIONS)?;
     // Gate: exec(cmd) — el MISMO de run(); sandbox lo deniega. Con `cwd`, el comando relativo se
     // resuelve contra él (`exec_target`): el gate va después de leer las opciones.
     let cwd_opt = match opt_map(args.get(2), F)? {
@@ -2620,6 +2665,7 @@ fn proc_spawn(i: &Interpreter, args: &[SynValue], reg: &Registry) -> Result<SynV
         },
         None => None,
     };
+    synsema_capabilities::secure::check_exec_path(F, &cmd, cwd_opt.as_deref())?;
     let (scope, cmd) = synsema_capabilities::secure::exec_target(&cmd, cwd_opt.as_deref());
     {
         let caps = reg.borrow().caps.clone();

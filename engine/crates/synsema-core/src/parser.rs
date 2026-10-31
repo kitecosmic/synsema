@@ -1414,6 +1414,14 @@ The inline form belongs where a value is used: let x be when c then a otherwise 
         if let Some(msg) = crate::capscope::unknown_capability_error(&capability) {
             return Err(ParseError::new(msg, cap_tok.location.clone()));
         }
+        // v0.6.52: un puerto que no es un puerto (`net("localhost:*")`) no concedía nada, callado.
+        if capability == "net" {
+            if let Some(NodeKind::TextLiteral { value }) = scope.as_deref().map(|s| &s.kind) {
+                if let Some(msg) = crate::capscope::net_scope_error(value) {
+                    return Err(ParseError::new(msg, loc));
+                }
+            }
+        }
         // DB-M1 decisión #1: la declaración ES la identidad — `require memory` sin
         // nombre no significa nada (¿qué .db abriría?). Error en el parse, no al
         // persistir, con el fix exacto en el mensaje (LLM-safe, decisión #8).

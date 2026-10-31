@@ -7,6 +7,8 @@ description = "Synsema capabilities: model, intent, enforcer, builtins"
 
 [dependencies]
 synsema-core.workspace = true
+# v0.6.52: `run(…, {"isolate": …})` — el aislamiento por el kernel (crate hoja, sin el intérprete).
+synsema-isolate.workspace = true
 chrono.workspace = true
 indexmap.workspace = true
 rand.workspace = true

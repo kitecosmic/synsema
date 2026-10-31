@@ -13,6 +13,7 @@ pub mod ast;
 pub mod ast_api;
 pub mod builtin_arity;
 pub mod audit_loc;
+pub mod op_hold;
 pub mod bundle;
 pub mod bytesutil;
 pub mod capscope;

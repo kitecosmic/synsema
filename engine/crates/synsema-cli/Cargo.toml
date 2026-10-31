@@ -33,6 +33,8 @@ synsema-stdlib.workspace = true
 synsema-agents.workspace = true
 synsema-llm.workspace = true
 synsema-runtime.workspace = true
+# Ronda 3 (B1): `SIGCHLD` en su acción por defecto al arrancar (Linux).
+synsema-isolate.workspace = true
 serde_json.workspace = true
 # `synsema update`: verifica el sha256 del release descargado (RustCrypto, puro Rust).
 sha2.workspace = true

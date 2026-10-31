@@ -39,6 +39,18 @@ jobs:
             ~/.cargo/git
             engine/target
           key: ${{ runner.os }}-cargo-${{ hashFiles('engine/Cargo.lock') }}
+      # v0.6.52: los tests de synsema-isolate se saltan sin decir nada donde el kernel no tiene
+      # Landlock ABI ≥ 6 (allí sólo comprueban que falle cerrado), y el de `unshare` donde no hay
+      # espacios de usuario sin privilegios (Ubuntu los restringe por AppArmor). Acá tienen que correr:
+      # si el runner no puede, el CI falla en vez de dar verde sin haber probado el aislamiento.
+      - name: The runner can test isolation (Landlock ABI >= 6, unprivileged user namespaces)
+        run: |
+          uname -r
+          python3 -c "import ctypes,sys; abi=ctypes.CDLL(None,use_errno=True).syscall(444,None,0,1); print('landlock abi', abi); sys.exit(0 if abi >= 6 else 1)"
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          unshare -Urpf --kill-child --mount-proc true
       - name: Test
         run: cargo test --locked --manifest-path engine/Cargo.toml --workspace
 
@@ -515,50 +527,7 @@ jobs:
       - name: Build native synsema
         run: cargo build --locked --manifest-path engine/Cargo.toml -p synsema-cli
       - name: Every versioned program loads
+        # The same script runs locally before a PR (see its header).
         env:
           SYN: engine/target/debug/synsema
-          # tests/wasm_pure.probe.syn and tests/wasm_sandbox.probe.syn read this key; it is the
-          # well-known test vector (private key 1), the same one the wasm job uses.
-          ETH_KEY: "0000000000000000000000000000000000000000000000000000000000000001"
-        run: |
-          set -uo pipefail
-          fail=0
-          mapfile -t ALL < <(git ls-files '*.syn' '*.fsyn' | sort)
-          echo "programs under gate: ${#ALL[@]}"
-          echo "== parse: synsema check (.syn only; check does not read the flat dialect)"
-          for f in "${ALL[@]}"; do
-            case "$f" in *.fsyn) continue ;; esac
-            if ! out=$("$SYN" check "$f" 2>&1); then
-              echo "::error file=$f::does not parse: $(echo "$out" | head -1)"; fail=1
-            fi
-          done
-          echo "== load + self-test: synsema test --labels"
-          for f in "${ALL[@]}"; do
-            # `shell: bash -e` mata el script si una ASIGNACION falla, y esta falla a proposito
-            # para un programa `serve` (que no corre bajo `test`). Sin el `|| rc=$?` el job moria
-            # en el primer caso esperado, antes de imprimir cual fue — que es lo que paso la
-            # primera vez que este gate corrio.
-            rc=0
-            out=$(timeout 120 "$SYN" test --labels "$f" 2>&1) || rc=$?
-            if [ $rc -eq 0 ]; then
-              printf '   ok   %-62s %s\n' "$f" "$(echo "$out" | tail -1)"; continue
-            fi
-            if echo "$out" | grep -q "serve is only available through the Synsema engine runtime"; then
-              printf '   load %-62s (serve program: loads, not runnable under test)\n' "$f"; continue
-            fi
-            if [ "$f" = "examples/error_demo.syn" ]; then
-              printf '   load %-62s (error demo: raises at top level on purpose)\n' "$f"; continue
-            fi
-            # Casos del oráculo diferencial que prueban caminos de ERROR (reference_oracle.rs compara
-            # el error de los dos caminos): terminan en error a propósito.
-            case "$f" in engine/crates/synsema-runtime/tests/oracle_cases/errors/*)
-              printf '   load %-62s (oracle error case: ends in an error on purpose)\n' "$f"; continue ;;
-            esac
-            echo "::error file=$f::failed to load or its tests failed"
-            echo "$out" | head -8 | sed 's/^/      /'
-            fail=1
-          done
-          if [ "$fail" != "0" ]; then
-            echo "::error::at least one versioned program no longer loads"; exit 1
-          fi
-          echo "all versioned programs load; every self-testing one is green"
+        run: bash tests/programs-load.sh

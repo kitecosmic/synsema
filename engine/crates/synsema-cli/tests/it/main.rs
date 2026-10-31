@@ -26,3 +26,4 @@ mod v0647_t1_cli;
 mod v0649_cli;
 mod v0650_cli;
 mod v0651_cli;
+mod v0652_cli;

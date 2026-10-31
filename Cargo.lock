@@ -2659,6 +2659,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "seccompiler"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a4ae55de56877481d112a559bbc12667635fdaf5e005712fd4e2b2fa50ffc884"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "selectors"
 version = "0.38.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3038,6 +3047,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "synsema-core",
+ "synsema-isolate",
  "windows-sys 0.52.0",
 ]
 
@@ -3072,6 +3082,14 @@ dependencies = [
 [[package]]
 name = "synsema-heap"
 version = "0.1.0"
+
+[[package]]
+name = "synsema-isolate"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "seccompiler",
+]
 
 [[package]]
 name = "synsema-stdlib"

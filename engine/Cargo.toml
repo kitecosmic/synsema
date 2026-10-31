@@ -5,6 +5,7 @@ members = [
     "crates/synsema-text",
     "crates/synsema-heap",
     "crates/synsema-capabilities",
+    "crates/synsema-isolate",
     "crates/synsema-stdlib",
     "crates/synsema-agents",
     "crates/synsema-llm",
@@ -349,6 +350,7 @@ ark-serialize = { version = "0.6", default-features = false }
 ark-std = { version = "0.6", default-features = false }
 synsema-core = { path = "crates/synsema-core" }
 synsema-capabilities = { path = "crates/synsema-capabilities" }
+synsema-isolate = { path = "crates/synsema-isolate" }
 synsema-stdlib = { path = "crates/synsema-stdlib" }
 synsema-agents = { path = "crates/synsema-agents" }
 synsema-llm = { path = "crates/synsema-llm" }

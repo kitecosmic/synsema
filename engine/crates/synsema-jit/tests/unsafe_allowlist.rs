@@ -31,6 +31,11 @@ const ALLOWED: &[&str] = &[
     // `main.rs`.
     "engine/crates/synsema-cli/src/sealed_receipt.rs",
     "engine/crates/synsema-stdlib/src/sealed.rs",
+    // v0.6.52: el hijo aislado de `run(…, {"isolate": …})` — Landlock por syscalls crudas, el
+    // `pre_exec` (entre `fork` y `exec`: sólo syscalls que no reservan memoria) y `kill` al grupo. Las
+    // sondas de escape del test lanzan syscalls prohibidas a propósito.
+    "engine/crates/synsema-isolate/src/linux.rs",
+    "engine/crates/synsema-isolate/tests/escape.rs",
     // Archivos de pesos mapeados en memoria y SIMD de la inferencia local.
     "engine/crates/synsema-infer/src/backend_rust.rs",
     "engine/crates/synsema-infer/src/mapped.rs",
