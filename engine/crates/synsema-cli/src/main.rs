@@ -613,6 +613,9 @@ fn jitless_requested(args: &[String]) -> bool {
 fn main() -> ExitCode {
     // Antes del primer print: una salida sin lector nunca es un pánico (stdio.rs).
     stdio::install_broken_pipe_guard();
+    // v0.6.52 (ronda 3, B1): heredado ignorado, `run` perdía el código de salida y un hijo aislado
+    // se esperaba hasta el timeout.
+    synsema_isolate::default_sigchld();
     let mut args: Vec<String> = std::env::args().collect();
     // F4: el nivel nativo para lo caliente (no cambia lo observable; ver synsema-jit), salvo con
     // `--jitless` o `serve --attested`: ahí no se crea el JIT (ni memoria ejecutable).
@@ -654,7 +657,7 @@ fn main() -> ExitCode {
     match args.get(1).map(String::as_str) {
         Some("conform") => cmd_conform(&args),
         Some("build") => match take_host_flags("build", &args[2..]) {
-            Ok(h) => build::cmd_build(h),
+            Ok(h) => on_engine_stack(|| build::cmd_build(h)),
             Err(code) => code,
         },
         Some("serve") => cmd_serve(&args),
@@ -662,11 +665,11 @@ fn main() -> ExitCode {
         // v0.6.46 (E6): abrir/verificar un recibo sellado y crear las claves de un auditor.
         Some("receipt") => sealed_receipt::cmd_receipt(&args),
         Some("test") => cmd_test(&args),
-        Some("check") => cmd_check(&args),
-        Some("code") => code::cmd_code(&args),
-        Some("openapi") => cmd_openapi(&args),
+        Some("check") => on_engine_stack(|| cmd_check(&args)),
+        Some("code") => on_engine_stack(|| code::cmd_code(&args)),
+        Some("openapi") => on_engine_stack(|| cmd_openapi(&args)),
         Some("tokens") => cmd_tokens(&args),
-        Some("ast") => cmd_ast(&args),
+        Some("ast") => on_engine_stack(|| cmd_ast(&args)),
         Some("repl") => {
             update::notify_if_outdated();
             repl();
@@ -696,6 +699,24 @@ fn main() -> ExitCode {
             ExitCode::from(2)
         }
     }
+}
+
+/// Corre un subcomando que parsea fuera del motor (check, code, openapi, ast, build) en un hilo
+/// con la pila del motor. En el hilo principal (1 MB en Windows) un programa con ~90 niveles de
+/// anidamiento desbordaba la pila, y bastaba con que estuviera en la misma carpeta: `check` parsea
+/// la carpeta para los avisos de capabilities (v0.6.52). `run`/`test`/`serve` ya tienen su hilo.
+fn on_engine_stack<F: FnOnce() -> ExitCode + Send>(f: F) -> ExitCode {
+    std::thread::scope(|s| {
+        match std::thread::Builder::new()
+            .stack_size(synsema_runtime::engine::INTERP_STACK_SIZE)
+            .spawn_scoped(s, f)
+            .expect("no se pudo crear el hilo del motor")
+            .join()
+        {
+            Ok(code) => code,
+            Err(p) => std::panic::resume_unwind(p),
+        }
+    })
 }
 
 /// Escribe UN archivo del scaffold con el patrón conffiles. Devuelve `true` si lo creó.

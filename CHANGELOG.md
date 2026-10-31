@@ -6,6 +6,104 @@ Each says what changed, why, and what to write instead.
 
 Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the release date.
 
+## v0.6.52 — (sin fecha: se pone en el corte)
+
+**Behavior changes (read these first).**
+- **A `net` scope whose port is not a port is an error.** `require net("localhost:*")` loaded and
+  granted nothing: `*` is not a port, so the scope named a host called `localhost:*` and
+  `localhost:8080` stayed `Capability not granted`. Now the port has to be a number from 1 to
+  65535, or absent, everywhere a `net` scope comes in: a literal `require` (a load error, so
+  `check` reports it too), a computed one, the host of `require secret(…) for net(…)`,
+  `--cap-set` and the caps of `captoken_mint`/`captoken_attenuate`. The port is written with
+  digits only (`8080`, not `08080` or `+8080`), an IPv6 address with a port goes in brackets
+  (`[::1]:8080`, not `::1:8080`), inside the brackets goes an IPv6 address, nothing may follow the
+  bracket but `:port`, and a CIDR's prefix is a number without leading zeros, from 0 to 128 for
+  IPv6 and 0 to 32 for IPv4 (`10.0.0.0/33` loaded and granted nothing). An IPv4 network written
+  as IPv6 (`::ffff:10.0.0.0/104`) needs a prefix from 96 to 128 and now contains those IPv4
+  addresses (`10.x`); before, it contained none. **Breaking:**
+  write `net("localhost")`, which already reaches every port of the host, or
+  `net("localhost:8080")` for one.
+- **A link to another granted place works with the two grants.** With `file.read("./proj/**")` and
+  `file.read("./outside/**")`, reading, listing or looking at `./proj/out_link/…` where `out_link`
+  leads to `outside` was refused since v0.6.45, and the message asked for a grant the program
+  already had. Now each side is judged by its own grant: the path by the one that covers its name,
+  where it really leads by the one that covers that place. Both have to be in the same layer
+  (program, host ceiling, `sandbox under`, token). Without the second grant it is refused as
+  before.
+- **`run` and `proc_spawn` reject an option they do not know.** `{"isolated": true}` ran the child
+  without isolation; now it is an error that lists the valid options, and nothing runs. Options that
+  are not a map (`run(cmd, args, 10, "isolate")`) are an error too.
+  **Breaking** for a program that passes keys of its own. `proc_spawn(…, {"isolate": …})` is an
+  error too: isolation for long-lived processes comes later.
+- **`..` after a folder in the program of `run`/`proc_spawn` is an error**, and in its `cwd` when
+  the program is named with a path. The permission check read `./x/../tool` by name as `./tool`,
+  and the system ran the `tool` next to wherever `x` leads. Write the path without it.
+- **`delete_file` of a link removes the link and is judged by where the link is**, not by where it
+  leads, like `unlink`. Deleting `./out/link` with `file.write("./out/**")` was refused when the
+  link led outside `./out`, although nothing outside is touched.
+- **`run` reports the exit code when synsema was started with `SIGCHLD` ignored** (Linux). It
+  inherited that from whoever launched it, and every `run` returned `-1`; synsema now restores the
+  default at start, so its children no longer inherit it ignored either.
+
+**New.**
+- **`run(cmd, args, timeout, {"isolate": …})` runs the child isolated by the kernel** (Linux 6.12+,
+  Landlock ABI 6). The child reads the system folders (`/usr`, `/bin`, `/sbin`, `/lib*`, `/etc`,
+  `/opt`) and writes nowhere but what the program delegates (`{"file.read": "./data/**",
+  "file.write": "./out/**"}`, each one covered by the program's own grants) and a temporary folder
+  of its own as `HOME`/`TMPDIR`. A folder or file delegated for writing is readable by the child
+  as well (it reads what it wrote), so it needs `file.read` too. Where it may write it creates files,
+  folders and links, but not FIFOs or sockets (FIFOs only in its temporary folder). It has no
+  network; it cannot signal or trace processes outside its tree, read `/proc` or the kernel log,
+  create namespaces, mount anything or use `io_uring`, and its environment is clean.
+  `"max_memory_mb"` caps the address space of each process the child runs. When `run` returns,
+  everything the child started has been killed too. The result says what was enforced:
+  `isolation: {landlock_abi, network: "none", max_memory_mb}`.
+  - Each delegated path is judged where it really leads, and the kernel is handed that same place
+    (opened once), so a link that changes between the check and the start does not move it. A
+    `..` after a folder is an error, and so is a folder with a `deny` (of reading or of writing)
+    that reaches inside it: the kernel cannot leave a hole in a delegated folder, so delegate the
+    parts the program may use.
+  - Once a folder has been delegated for writing, no path the program names that goes through a
+    link inside it is followed for the rest of the run: files, databases, the program to run and the
+    `cwd` of a child. The child could have replaced a folder there with a link to somewhere no grant
+    names. What the child wrote is read as usual, and a link it left can be deleted.
+  - While a child with write access to a folder runs, the folder is lent to it: no path the program
+    names that goes through the folder or ends in it is granted, under any name for that place
+    (other capitals where the file system ignores them, a bind mount), and no other child receives
+    it. Read or change it after `run` returns. Before the child starts, `run` waits up to 10 s for
+    what another task is already doing in the folder; if that has not finished, `run` fails with
+    `another task is still using …` and nothing runs. From the moment `run` asks for the folder,
+    any further path in it is refused to that task as well, as to a new one. When the child ends,
+    whatever it left running is killed; a process stuck in the kernel is waited for up to 2 s, and if
+    it outlives that, the folder stays lent for the rest of the run. Isolated `run`s start one at a
+    time, then run in parallel.
+  - It fails closed where it cannot be enforced: an older kernel, Windows and macOS give an error
+    and nothing runs. **An engine older than v0.6.52 ignores `isolate` and runs the child
+    unconfined.**
+  - It shares the host's kernel and its `/etc`. Unlike a container, the child sees the host's
+    `/etc` and the numbers of other processes; unlike Docker's default, it has no network. For
+    hostile code from several tenants on one machine the right tool is still a microVM. Network
+    through a proxy that enforces the program's `net` grants, Windows and macOS come later.
+
+**Fixes.**
+- **`synsema check` (and `ast`, `openapi`, `code`, `build`) no longer overflow the stack** on a
+  deeply nested program. On Windows the release died at about 90 levels, and `check` of a small file
+  died too when a deep one sat in the same folder. They now parse on the engine's thread, like
+  `run`.
+
+**Messages.**
+- **A missing handle names the builtin that gives it.** `term_write(nothing, "x")` said `expected a
+  connection handle from ws_connect()`, and the same for processes, watchers, subscriptions, TCP
+  connections and pipes. It now names `term_open()`, `proc_spawn()`, `watch()`, `bus_subscribe()`,
+  `tcp_connect()` or `pipe()`, and for a terminal says that `term_open()` gives `nothing` without
+  one.
+- **`set r["status"] to 500` on what `ok`/`respond`/`render`/… return** said `Cannot set index on
+  map`. It now says the value is read-only and how to build another one (`fail(500, msg)`,
+  `respond(r["body"], r["content_type"], 500)`, `with_header(r, name, value)`).
+- **`captoken_attenuate` speaks of a wildcard only when there was one.** From a token with
+  `net("10.0.0.0/8")`, asking for `127.0.0.1:8080` said a wildcard reaches only public addresses;
+  now it says the new caps are not covered, as it did before v0.6.51.
+
 ## v0.6.51 — 2026-10-29
 
 **Behavior changes (read these first).**

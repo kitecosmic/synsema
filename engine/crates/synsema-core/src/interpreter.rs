@@ -1011,6 +1011,26 @@ fn trusted_view_set(m: &crate::types::MapRef, name: &str, loc: &SourceLocation) 
     }
 }
 
+/// `set x.campo` / `set x[i]` sobre algo que no es un map (ni una lista). Lo que devuelven
+/// `ok`/`render`/`respond`/… se lee como un map pero es de sólo lectura: v0.6.51 decía `Cannot set
+/// index on map` sobre un valor cuyo `type_of` es `map` (v0.6.52).
+#[cold]
+#[inline(never)]
+fn cannot_set(obj: &SynValue, what: &str, loc: &SourceLocation) -> Control {
+    if let SynValue::Server(_) = obj {
+        return err_at(
+            format!(
+                "Cannot set {} on a server response: what ok/created/fail/html/respond/render/redirect/with_header \
+                 return reads like a map but is read-only — build a new one instead (`fail(500, msg)`, \
+                 `respond(r[\"body\"], r[\"content_type\"], 500)`; a header: `with_header(r, name, value)`)",
+                what
+            ),
+            loc,
+        );
+    }
+    err_at(format!("Cannot set {} on {}", what, obj.type_name()), loc)
+}
+
 /// La hoja de `set <camino>.campo to v` (sin etiquetas: ya se resolvieron), con el contenedor ya
 /// evaluado: lo mismo para el tree-walker y para la VM (F4.6a). Devuelve el valor escrito.
 pub(crate) fn set_leaf_prop(obj: &SynValue, property_name: &str, value: SynValue, loc: &SourceLocation) -> Result<SynValue, Control> {
@@ -1028,7 +1048,7 @@ pub(crate) fn set_leaf_prop(obj: &SynValue, property_name: &str, value: SynValue
             m.borrow_mut().set(property_name, value.clone());
             Ok(value)
         }
-        _ => Err(err_at(format!("Cannot set property on {}", obj.type_name()), loc)),
+        _ => Err(cannot_set(obj, "property", loc)),
     }
 }
 
@@ -1071,7 +1091,7 @@ pub(crate) fn set_leaf_index(
             m.borrow_mut().set_value_key(idx, value.clone());
             Ok(value)
         }
-        _ => Err(err_at(format!("Cannot set index on {}", obj.type_name()), loc)),
+        _ => Err(cannot_set(obj, "index", loc)),
     }
 }
 
@@ -3129,7 +3149,13 @@ impl Interpreter {
         args: &[SynValue],
         loc: &SourceLocation,
     ) -> Result<SynValue, Control> {
-        if !crate::audit_loc::enabled() {
+        let around = crate::audit_loc::around();
+        if around == 0 {
+            return f(self, args, loc);
+        }
+        // v0.6.52 (ronda 4, A1): lo que el builtin sostiene se suelta cuando vuelve (`op_hold`).
+        let _frame = (around & crate::audit_loc::HOLD != 0).then(crate::op_hold::enter);
+        if around & crate::audit_loc::AUDIT == 0 {
             return f(self, args, loc);
         }
         let prev = crate::audit_loc::replace(Some(loc.clone()));
@@ -6890,6 +6916,12 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
             )));
         }
         let mut scope_val = scope_v.map(|v| v.to_string());
+        // v0.6.52: el mismo error que el parser da a un scope literal, para uno calculado.
+        if capability == "net" {
+            if let Some(msg) = scope_val.as_deref().and_then(crate::capscope::net_scope_error) {
+                return Err(err_at(msg, loc));
+            }
+        }
         if let (Some(hosts), Some(name)) = (bound_to, scope_val.as_deref()) {
             scope_val = Some(self.bound_secret_scope(name, hosts, env, loc)?);
         }
@@ -6950,6 +6982,9 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                     loc,
                 ));
             };
+            if let Some(e) = crate::capscope::net_scope_error(t) {
+                return Err(err_at(format!("require secret({:?}) for {}", name, e), loc));
+            }
             let host = crate::capscope::net_host_scope(t);
             if let Some(e) = crate::capscope::bound_host_error(&host) {
                 return Err(err_at(format!("require secret({:?}) for net(...): {}", name, e), loc));

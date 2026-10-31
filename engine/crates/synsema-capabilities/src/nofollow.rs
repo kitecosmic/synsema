@@ -143,6 +143,13 @@ pub fn parent_checked<E>(path: &str, recheck: &dyn Fn(&str) -> Result<(), E>) ->
 }
 
 impl Beneath {
+    /// v0.6.52 (ronda 3, A1): borra la entrada `name` de la carpeta abierta sin seguirla (un link se
+    /// borra a sí mismo). En Linux relativo al handle (`unlinkat`): el nombre de la carpeta no se
+    /// vuelve a resolver. Donde no hay con qué, por nombre (`path`).
+    pub fn remove_entry(&self, path: &str) -> io::Result<()> {
+        sys::unlink_beneath(&self.dir, &self.name, path)
+    }
+
     /// Reemplaza el archivo con `data`: temporal nuevo al lado (un nombre al azar creado en
     /// exclusiva, que nunca sigue un link), escrito, y renombrado encima del nombre. En Unix el
     /// reemplazo conserva los permisos del archivo que reemplaza, aplicados antes de escribir.
@@ -168,6 +175,30 @@ impl Beneath {
         }
         Err(last.unwrap_or_else(|| io::Error::other("could not create a temporary file")))
     }
+}
+
+/// Borra un link por nombre, sin seguirlo (donde `parent_checked` no tiene con qué). En Windows un
+/// link a carpeta (o una junction) se borra como carpeta; ronda 3 (N3): sólo si la entrada ES un
+/// link a carpeta, así un error de `remove_file` no queda tapado y una carpeta de verdad que
+/// apareció en el medio no se borra.
+pub fn remove_link(path: &str) -> io::Result<()> {
+    if is_dir_link(std::fs::symlink_metadata(path).ok()) {
+        std::fs::remove_dir(path)
+    } else {
+        std::fs::remove_file(path)
+    }
+}
+
+/// ¿La entrada es un link a carpeta que Windows borra como carpeta?
+#[cfg(windows)]
+fn is_dir_link(m: Option<std::fs::Metadata>) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    m.is_some_and(|m| m.file_type().is_symlink() && m.file_attributes() & 0x10 != 0) // FILE_ATTRIBUTE_DIRECTORY
+}
+
+#[cfg(not(windows))]
+fn is_dir_link(_m: Option<std::fs::Metadata>) -> bool {
+    false
 }
 
 /// El resultado de una apertura sin links.
@@ -320,6 +351,10 @@ mod sys {
 
     pub(super) fn discard_beneath(dir: &File, _tmp_file: &File, tmp: &str) {
         let _ = rustix::fs::unlinkat(dir, tmp, rustix::fs::AtFlags::empty());
+    }
+
+    pub(super) fn unlink_beneath(dir: &File, name: &str, _path: &str) -> io::Result<()> {
+        rustix::fs::unlinkat(dir, name, rustix::fs::AtFlags::empty()).map_err(os)
     }
 }
 
@@ -595,6 +630,12 @@ mod sys {
         }
     }
 
+    pub(super) fn unlink_beneath(_dir: &File, _name: &str, path: &str) -> io::Result<()> {
+        // Por handle haría falta `NtCreateFile` con `RootDirectory` y `FILE_FLAG_OPEN_REPARSE_POINT`;
+        // en Windows no hay hijos aislados que cambien el link en el medio.
+        super::remove_link(path)
+    }
+
     pub(super) fn real_path(f: &File) -> Option<String> {
         let mut buf = vec![0u16; 512];
         loop {
@@ -688,6 +729,10 @@ mod sys {
     }
 
     pub(super) fn discard_beneath(_dir: &File, _tmp_file: &File, _tmp: &str) {}
+
+    pub(super) fn unlink_beneath(_dir: &File, _name: &str, path: &str) -> io::Result<()> {
+        super::remove_link(path)
+    }
 }
 
 #[cfg(all(test, any(target_os = "linux", windows)))]
@@ -723,6 +768,26 @@ mod tests {
 
     fn s(p: &Path) -> String {
         p.to_string_lossy().replace('\\', "/")
+    }
+
+    /// Ronda 3 (N3): sólo un link a carpeta se borra como carpeta. Una carpeta de verdad que apareció
+    /// en lugar del link no (`delete_file` de una carpeta es un error), y el error de un link de
+    /// archivo es el de `remove_file`.
+    #[test]
+    fn only_a_link_to_a_folder_is_removed_as_a_folder() {
+        let d = tmp("rmlink");
+        std::fs::create_dir_all(d.join("real")).unwrap();
+        std::fs::create_dir_all(d.join("plain")).unwrap();
+        std::fs::write(d.join("f.txt"), "x").unwrap();
+        link_dir(&d.join("real"), &d.join("j"));
+        let md = |p: &str| std::fs::symlink_metadata(d.join(p)).ok();
+        assert_eq!(is_dir_link(md("j")), cfg!(windows));
+        assert!(!is_dir_link(md("plain")) && !is_dir_link(md("f.txt")) && !is_dir_link(md("nada")));
+        assert!(remove_link(&s(&d.join("plain"))).is_err(), "una carpeta de verdad no se borra");
+        assert!(d.join("plain").exists());
+        remove_link(&s(&d.join("j"))).unwrap();
+        assert!(std::fs::symlink_metadata(d.join("j")).is_err() && d.join("real").exists());
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]

@@ -414,18 +414,25 @@ fn names_private_literal(scope: &str) -> bool {
 }
 
 /// v0.6.51 (C1): la primera dirección privada escrita de `child` que el padre sólo cubre con un
-/// comodín (para el mensaje de `captoken_attenuate`).
+/// comodín (para el mensaje de `captoken_attenuate`). v0.6.52: sólo si un comodín del padre la
+/// cubre; si ni eso (`10.0.0.0/8` contra `127.0.0.1`, `localhost:*` contra `127.0.0.1:8080`) es el
+/// «not covered» de siempre, no un problema de comodín.
 fn private_widening(parent: &[(String, Vec<String>)], child: &[(String, Vec<String>)]) -> Option<String> {
-    let parent_net: Vec<&String> = parent.iter().filter(|(n, _)| n == "net").flat_map(|(_, s)| s).collect();
-    let named = |s: &str| parent_net.iter().any(|ps| !split_net_scope(ps).0.contains(['*', '?']) && {
+    let parent_net: Vec<&Vec<String>> = parent.iter().filter(|(n, _)| n == "net").map(|(_, s)| s).collect();
+    let unscoped = parent_net.iter().any(|s| s.is_empty());
+    let scopes: Vec<&String> = parent_net.into_iter().flatten().collect();
+    let covers = |ps: &str, s: &str| {
         let (g, w) = (Capability::new(CapabilityType::Net, Some(ps.to_string())), Capability::new(CapabilityType::Net, Some(s.to_string())));
         g.covers(&w)
-    });
+    };
+    let wild = |ps: &str| split_net_scope(ps).0.contains(['*', '?']);
+    let named = |s: &str| scopes.iter().any(|ps| !wild(ps) && covers(ps, s));
+    let by_wildcard = |s: &str| unscoped || scopes.iter().any(|ps| wild(ps) && covers(ps, s));
     child
         .iter()
         .filter(|(n, _)| n == "net")
         .flat_map(|(_, s)| s)
-        .find(|s| names_private_literal(s) && !named(s))
+        .find(|s| names_private_literal(s) && !named(s) && by_wildcard(s))
         .cloned()
 }
 
@@ -621,6 +628,12 @@ fn parse_caps(m: &MapObj, who: &str) -> Result<Vec<(String, Vec<String>)>, Contr
                 )))
             }
         };
+        // v0.6.52: `{"net": "localhost:*"}` no cubría nada; es un error, como en `require`.
+        if cap.ty() == CapabilityType::Net {
+            if let Some(e) = scopes.iter().find_map(|s| synsema_core::capscope::net_scope_error(s)) {
+                return Err(err(format!("{}: {}", who, e)));
+            }
+        }
         out.push((name.to_string(), scopes));
     }
     out.sort_by(|a, b| a.0.cmp(&b.0));
@@ -1784,6 +1797,94 @@ mod tests {
         }
         let t = mint(map(vec![("net", text("10.0.0.0/8"))]), SynValue::Nothing);
         ok(ca(&[text(&t), map(vec![("net", text("10.1.2.3"))])]));
+    }
+
+    /// v0.6.52: un scope de `net` con un puerto que no es un puerto no cubría nada; acuñarlo o
+    /// atenuar a él es error, con la forma que sí sirve.
+    #[test]
+    fn a_net_scope_with_a_port_that_is_not_a_port_is_an_error() {
+        // Ronda 1 (B2): `+8080` (lo acepta `u16::from_str`), `08080` (se compara como texto), una
+        // IPv6 sin corchetes con algo que no es dirección y basura después de `]`.
+        for (bad, want) in [
+            ("localhost:*", "the port is a number from 1 to 65535"),
+            ("x.com:", "the port is a number from 1 to 65535"),
+            ("x.com:http", "the port is a number from 1 to 65535"),
+            ("[::1]:*", "the port is a number from 1 to 65535"),
+            ("x.com:70000", "the port is a number from 1 to 65535"),
+            ("x.com:0", "the port is a number from 1 to 65535"),
+            ("localhost:+8080", "the port is a number from 1 to 65535"),
+            ("localhost:08080", "without leading zeros (`localhost:8080`)"),
+            ("::1:*", "it has to be an IPv6 address or CIDR"),
+            ("a:b:c", "it has to be an IPv6 address or CIDR"),
+            ("[::1]x", "after `]` comes nothing or `:` and a port"),
+            // Ronda 2 (B4): adentro de los corchetes, y el prefijo de un CIDR de IPv6.
+            ("[]:80", "inside the brackets goes an IPv6 address"),
+            ("[nonsense]:80", "inside the brackets goes an IPv6 address"),
+            ("[a:b:c]:80", "inside the brackets goes an IPv6 address"),
+            ("[fe80::1%]:80", "inside the brackets goes an IPv6 address"),
+            ("::1/129", "a prefix from 0 to 128"),
+            ("fd00::/+8", "a prefix from 0 to 128"),
+            ("fd00::/", "a prefix from 0 to 128"),
+            // Ronda 3 (B2): el prefijo de un CIDR de IPv4, y sin ceros adelante en los dos.
+            ("10.0.0.0/33", "an IPv4 CIDR's prefix is a number from 0 to 32"),
+            ("10.0.0.0/", "an IPv4 CIDR's prefix is a number from 0 to 32"),
+            ("10.0.0.0/08", "an IPv4 CIDR's prefix is a number from 0 to 32"),
+            ("10.0.0.0/33:80", "an IPv4 CIDR's prefix is a number from 0 to 32"),
+            ("::1/012", "a prefix from 0 to 128 without leading zeros"),
+            // Ronda 4 (N2): una IPv4 escrita como IPv6 con un prefijo menor que 96 no contenía nada.
+            ("::ffff:10.0.0.0/64", "an IPv4 network written as IPv6"),
+            ("[::ffff:10.0.0.0/95]:80", "an IPv4 network written as IPv6"),
+        ] {
+            let e = err_of(cm(&[map(vec![("net", text(bad))]), text(KEY)]));
+            assert!(e.contains(want), "{}: {}", bad, e);
+            let t = mint(map(vec![("net", text("*"))]), SynValue::Nothing);
+            let e = err_of(ca(&[text(&t), map(vec![("net", text(bad))])]));
+            assert!(e.contains(want), "{}: {}", bad, e);
+        }
+        // Ronda 2 (N3): una IPv6 con zona (`%eth0`) carga, como en v0.6.51.
+        for good in [
+            "localhost",
+            "localhost:8080",
+            "[::1]:80",
+            "::1",
+            "fe80::1",
+            "[::1]",
+            "fd00::/8",
+            "::/0",
+            "::1/128",
+            "10.0.0.0/8",
+            "https://x.com:8443/p",
+            "fe80::1%eth0",
+            "[fe80::1%eth0]:80",
+            "[::1]:65535",
+            "::ffff:1.2.3.4",
+            "::ffff:1.2.3.0/120",
+            "::ffff:10.0.0.0/96",
+            "10.0.0.0/32",
+            "0.0.0.0/0",
+        ] {
+            ok(cm(&[map(vec![("net", text(good))]), text(KEY)]));
+        }
+    }
+
+    /// v0.6.52: el mensaje del comodín sale sólo cuando un comodín del padre cubre la dirección.
+    /// Si el padre no la cubre ni así (`10.0.0.0/8` contra `127.0.0.1`, `localhost` contra
+    /// `127.0.0.1:8080` —por nombre—, `*.internal`), es el «not covered» de siempre: v0.6.51 decía
+    /// «wildcard» sin que hubiera uno.
+    #[test]
+    fn the_wildcard_message_needs_a_wildcard_that_covers_the_address() {
+        for parent in ["10.0.0.0/8", "localhost", "*.internal"] {
+            let t = mint(map(vec![("net", text(parent))]), SynValue::Nothing);
+            let e = err_of(ca(&[text(&t), map(vec![("net", text("127.0.0.1:8080"))])]));
+            assert!(e.contains("the new caps are not covered") && !e.contains("wildcard"), "{}: {}", parent, e);
+        }
+        let t = mint(map(vec![("net", text("localhost"))]), SynValue::Nothing);
+        ok(ca(&[text(&t), map(vec![("net", text("localhost:8080"))])]));
+        for parent in [text("*"), text("127.*"), SynValue::Nothing] {
+            let t = mint(map(vec![("net", parent.clone())]), SynValue::Nothing);
+            let e = err_of(ca(&[text(&t), map(vec![("net", text("127.0.0.1:8080"))])]));
+            assert!(e.contains("is a private address") && e.contains("wildcard"), "{:?}: {}", parent, e);
+        }
     }
 
     /// C1: un bloque forjado a mano que lleva un comodín a lo privado (la firma cierra) es inválido.

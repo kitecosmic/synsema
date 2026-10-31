@@ -47,7 +47,9 @@ use synsema_stdlib::database::{register_database_builtins, DatabaseManager};
 use synsema_stdlib::http::register_http_builtins;
 use synsema_stdlib::secrets::{register_secret_builtins, EnvStore};
 
-pub(crate) const INTERP_STACK_SIZE: usize = 512 * 1024 * 1024;
+/// Pila de los hilos que parsean o corren un programa (el parser y el intérprete recursan por
+/// anidamiento). Pública para el CLI: sus subcomandos que parsean fuera del motor usan la misma.
+pub const INTERP_STACK_SIZE: usize = 512 * 1024 * 1024;
 
 // =========================================================
 // memoria declarada (DB-M1): identidad + stores compartidos

@@ -253,7 +253,7 @@ const MAX_LINK_HOPS: usize = 40;
 #[cfg(not(target_arch = "wasm32"))]
 pub fn physical_path(p: &str) -> Physical {
     match absolute_lexical(p) {
-        Some(abs) => match overridden(&abs) {
+        Some(abs) => match overridden(&abs).or_else(|| overridden_base(&abs)) {
             Some(real) => Physical::Path(real),
             None => resolve_physical(abs),
         },
@@ -272,6 +272,32 @@ thread_local! {
 #[cfg(not(target_arch = "wasm32"))]
 fn overridden(abs: &str) -> Option<String> {
     PHYSICAL_OVERRIDE.with(|o| o.borrow().as_ref().filter(|(k, _)| k == abs).map(|(_, v)| v.clone()))
+}
+
+/// v0.6.52 (ronda 2): el lugar fijado con `with_physical` para la ruta absoluta `abs` (o su base, si
+/// es un scope con patrón), si lo hay en este hilo.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn physical_override(abs: &str) -> Option<String> {
+    overridden(abs).or_else(|| overridden_base(abs))
+}
+
+#[cfg(target_arch = "wasm32")]
+pub fn physical_override(_abs: &str) -> Option<String> {
+    None
+}
+
+/// v0.6.52 (ronda 2, M2): un scope con patrón cuya base literal es la del override
+/// (`…/data/**` con el `pin` de `…/data`) se juzga por el lugar real con el patrón detrás. Sin esto
+/// el pedido volvía a resolver el nombre en disco, y una carpeta delegada no se juzgaba por el
+/// lugar que recibe el kernel.
+#[cfg(not(target_arch = "wasm32"))]
+fn overridden_base(abs: &str) -> Option<String> {
+    if !has_override() {
+        return None;
+    }
+    let (literal, pattern) = split_scope(abs);
+    let pattern = pattern?;
+    overridden(&literal).map(|real| format!("{}/{}", real.trim_end_matches('/'), pattern))
 }
 
 /// v0.6.46 (E8): corre `f` (el chequeo de capabilities) juzgando la ruta `req` por `real`, la
@@ -468,6 +494,12 @@ pub fn absolute_scope(scope: &str) -> String {
     }
 }
 
+/// v0.6.52: la parte literal de un scope en forma absoluta (cwd + normalizada, hasta el primer
+/// segmento con `*` o `?`): la carpeta o el archivo que nombra, sin el patrón.
+pub fn absolute_literal(scope: &str) -> String {
+    split_scope(&absolute_scope(scope)).0
+}
+
 /// `C:` sola es la raíz de la unidad, `C:/` (en Windows `C:` sin barra sería "el cwd de C:").
 fn drive_root(s: String) -> String {
     if matches!(s.as_bytes(), [c, b':'] if c.is_ascii_alphabetic()) {
@@ -615,6 +647,50 @@ pub fn physically_beneath(dir: &str, path: &str) -> bool {
     p == d || p.strip_prefix(d).is_some_and(|rest| rest.starts_with('/'))
 }
 
+/// v0.6.52 (ronda 2, N4): ¿el scope (un `deny`) puede nombrar, en disco, algo dentro de la carpeta
+/// `folder_real` (ya física)? Sí si su base literal está dentro de la carpeta, o es la carpeta. Si la
+/// base está arriba, sólo si el patrón puede nombrar la carpeta o algo debajo: `/u/*.txt` no llega
+/// a `/u/proj/data`; `/u/*/data`, `/u/**/*.key` y `/u/*/data/*` sí. Lo que no se resuelve cuenta
+/// como que llega (falla cerrado). Sin disco (wasm), sí.
+pub fn scope_reaches_inside(scope: &str, folder_real: &str) -> bool {
+    let (literal, pattern) = split_scope(&absolute_scope(scope));
+    let lit = match physical_path(&literal) {
+        Physical::Path(p) => p,
+        _ => return true,
+    };
+    #[cfg(any(windows, target_os = "macos"))]
+    let (lit, folder, pattern) = (lit.to_lowercase(), folder_real.to_lowercase(), pattern.map(|p| p.to_lowercase()));
+    #[cfg(not(any(windows, target_os = "macos")))]
+    let folder = folder_real.to_string();
+    let (l, f) = (lit.trim_end_matches('/'), folder.trim_end_matches('/'));
+    let beneath = |a: &str, b: &str| a == b || a.strip_prefix(b).is_some_and(|r| r.starts_with('/') || b.is_empty());
+    if beneath(l, f) {
+        return true;
+    }
+    if !beneath(f, l) {
+        return false;
+    }
+    let Some(pattern) = pattern else {
+        // Sin patrón nombra sólo su base, que está arriba de la carpeta.
+        return false;
+    };
+    let rel: Vec<&str> = f[l.len()..].split('/').filter(|s| !s.is_empty()).collect();
+    let pat: Vec<&str> = pattern.split('/').filter(|s| !s.is_empty()).collect();
+    // ¿El patrón nombra la carpeta misma (`rel`) o algo debajo (`rel/resto`)? Ronda 3 (N2): la
+    // carpeta misma también cuenta, como un `deny` sin patrón igual a ella: le niega listarla, y el
+    // kernel le daría `READ_DIR` al hijo.
+    fn reach(p: &[&str], r: &[&str]) -> bool {
+        match (p.split_first(), r.split_first()) {
+            (None, None) => true,
+            (None, Some(_)) => false,
+            (Some(_), None) => true,
+            (Some((&"**", rest)), Some((_, rrest))) => reach(rest, r) || reach(p, rrest),
+            (Some((&ps, rest)), Some((&rs, rrest))) => fnmatch(rs, ps) && reach(rest, rrest),
+        }
+    }
+    reach(&pat, &rel)
+}
+
 /// ¿La ruta física `r` queda bajo la base literal `base` y su resto coincide con `pattern`? La base
 /// se compara como prefijo LITERAL (con límite en `/`); el glob sólo se aplica al resto.
 fn physical_match(base: &str, pattern: Option<&str>, r: &str) -> bool {
@@ -698,6 +774,130 @@ pub fn split_host_port(scope: &str) -> (&str, Option<&str>) {
         Some((h, p)) if !h.contains(':') && !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()) => (h, Some(p)),
         _ => (scope, None),
     }
+}
+
+/// Una IPv6, con su zona (`fe80::1%eth0`, ronda 2 N3: v0.6.51 la aceptaba) o un prefijo de CIDR de
+/// 0 a 128 (`fd00::/8`; ronda 2 B4: `::1/129` cargaba y no concedía nada).
+fn ipv6_or_cidr(s: &str) -> bool {
+    let (addr, prefix) = match s.split_once('/') {
+        Some((a, p)) => (a, Some(p)),
+        None => (s, None),
+    };
+    let addr = addr.split_once('%').map_or(addr, |(a, zone)| if zone.is_empty() { "" } else { a });
+    prefix.is_none_or(|p| prefix_ok(p, 128)) && addr.parse::<std::net::Ipv6Addr>().is_ok()
+}
+
+/// El prefijo de un CIDR: dígitos, sin cero adelante (como el puerto), de 0 a `max`.
+fn prefix_ok(p: &str, max: u8) -> bool {
+    !p.is_empty()
+        && p.len() <= 3
+        && p.bytes().all(|b| b.is_ascii_digit())
+        && (p == "0" || !p.starts_with('0'))
+        && p.parse::<u8>().is_ok_and(|n| n <= max)
+}
+
+/// Ronda 4 (N2): una red IPv4 escrita como IPv6 (`::ffff:10.0.0.0/104`) se compara como IPv4, con
+/// el prefijo menos 96; con un prefijo menor que 96 cargaba y no contenía nada.
+fn mapped_prefix_error(scope: &str, host: &str) -> Option<String> {
+    let (a, p) = host.split_once('/')?;
+    let a = a.split_once('%').map_or(a, |(a, _)| a);
+    a.parse::<std::net::Ipv6Addr>().ok()?.to_ipv4_mapped()?;
+    if p.parse::<u8>().ok()? >= 96 {
+        return None;
+    }
+    Some(format!(
+        "net({:?}): an IPv4 network written as IPv6 (`::ffff:a.b.c.d/n`) needs a prefix from 96 to 128 (`::ffff:10.0.0.0/104` is `10.0.0.0/8`); this scope granted nothing",
+        scope
+    ))
+}
+
+/// Ronda 3 (B2): un CIDR de IPv4 con un prefijo que no es de 0 a 32 (`10.0.0.0/33`) cargaba y no
+/// concedía nada, como `::1/129` antes.
+fn ipv4_cidr_error(scope: &str, host: &str) -> Option<String> {
+    let (a, p) = host.split_once('/')?;
+    if a.parse::<std::net::Ipv4Addr>().is_err() || prefix_ok(p, 32) {
+        return None;
+    }
+    Some(format!(
+        "net({:?}): an IPv4 CIDR's prefix is a number from 0 to 32, without leading zeros (`10.0.0.0/8`); this scope granted nothing",
+        scope
+    ))
+}
+
+/// v0.6.52: el error de un scope de `net` que escribe un puerto que no es un puerto (`host:*`,
+/// `host:`, `host:http`, `[::1]:*`, `host:70000`). `split_host_port` no lo separa, así que el host
+/// quedaba con el `:*` adentro y no cubría nada: `require net("localhost:*")` se aceptaba y no
+/// concedía ni `localhost:8080`. Una URL (`http://…`) y una IPv6 sin corchetes no pasan por acá.
+pub fn net_scope_error(scope: &str) -> Option<String> {
+    if scope.contains("://") {
+        return None;
+    }
+    let (host, port) = match scope.strip_prefix('[') {
+        Some(inner) => {
+            let Some((h, after)) = inner.split_once(']') else {
+                return Some(format!("net({:?}): an IPv6 address in brackets closes them: `[::1]` or `[::1]:8080`", scope));
+            };
+            // Ronda 2 (B4): adentro va una IPv6 (con su zona, si tiene); otra cosa no concedía nada.
+            if !ipv6_or_cidr(h) {
+                return Some(format!(
+                    "net({:?}): inside the brackets goes an IPv6 address (`[::1]:8080`, `[fe80::1%eth0]`); this scope granted nothing",
+                    scope
+                ));
+            }
+            if let Some(e) = mapped_prefix_error(scope, h) {
+                return Some(e);
+            }
+            if after.is_empty() {
+                return None;
+            }
+            match after.strip_prefix(':') {
+                Some(p) => (h, p),
+                None => {
+                    return Some(format!(
+                        "net({:?}): after `]` comes nothing or `:` and a port (`[{}]:8080`); this scope granted nothing",
+                        scope, h
+                    ))
+                }
+            }
+        }
+        None => match scope.rsplit_once(':') {
+            Some((h, p)) if !h.contains(':') => {
+                if let Some(e) = ipv4_cidr_error(scope, h) {
+                    return Some(e);
+                }
+                (h, p)
+            }
+            // Dos o más `:` sin corchetes: una IPv6 (o un CIDR de IPv6), y nada más.
+            Some(_) => {
+                if ipv6_or_cidr(scope) {
+                    return mapped_prefix_error(scope, scope);
+                }
+                return Some(format!(
+                    "net({:?}): with more than one `:` it has to be an IPv6 address or CIDR (`::1`, `fe80::1%eth0`, `fd00::/8`, a prefix from 0 to 128 without leading zeros); with a port, in brackets: `[::1]:8080`. This scope granted nothing",
+                    scope
+                ));
+            }
+            None => return ipv4_cidr_error(scope, scope),
+        },
+    };
+    // Sólo dígitos ASCII (sin `+`), sin cero adelante, de 1 a 65535: el puerto se compara como texto.
+    let digits = !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit());
+    if digits && !port.starts_with('0') && port.parse::<u16>().is_ok() {
+        return None;
+    }
+    let host = if scope.starts_with('[') { format!("[{}]", host) } else { host.to_string() };
+    if digits && port.starts_with('0') && port.trim_start_matches('0').parse::<u16>().is_ok_and(|p| p > 0) {
+        return Some(format!(
+            "net({:?}): write the port without leading zeros (`{}:{}`); this scope granted nothing",
+            scope,
+            host,
+            port.trim_start_matches('0')
+        ));
+    }
+    Some(format!(
+        "net({:?}): the port is a number from 1 to 65535, written with digits only, or nothing — `net(\"{}\")` already reaches every port of {}, `net(\"{}:8080\")` only that one; this scope granted nothing",
+        scope, host, host, host
+    ))
 }
 
 /// El scope de `net` que nombra un texto, como lo guarda `Capability::new`: de una URL, su host (y

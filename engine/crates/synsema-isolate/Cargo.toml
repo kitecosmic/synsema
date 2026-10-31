@@ -1,0 +1,20 @@
+[package]
+name = "synsema-isolate"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Synsema — run a child process isolated by the kernel (Landlock + seccomp + rlimits), with no dependency on the interpreter"
+repository.workspace = true
+
+# Crate hoja (plan-de-versiones § Paso 2b): no depende de synsema-core ni del intérprete. Recibe una
+# `Policy` en Rust puro y prepara un `std::process::Command`. El adaptador vive en
+# synsema-capabilities (`run(…, {"isolate": …})`).
+[dependencies]
+
+# Sólo Linux. En el resto de los sistemas la crate es un stub que falla cerrado.
+# - libc: ya estaba en el árbol (stdlib).
+# - seccompiler 0.5.0 (rust-vmm, el de Firecracker; sólo depende de libc): arma el filtro BPF en el
+#   padre; el hijo sólo lo carga. Revisar en DEPS-supply-chain-vigilancia.md.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+seccompiler = "0.5.0"

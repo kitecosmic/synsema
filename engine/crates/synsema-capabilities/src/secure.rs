@@ -86,6 +86,355 @@ pub fn hide_child_window(c: &mut Command) {
     let _ = c;
 }
 
+/// v0.6.52 — ¿un `..` después de una carpeta (`./a/../b`)? El sistema lo resuelve en disco (si `a`
+/// es un link, sube desde su destino) y el chequeo lo resuelve por nombre (`b`): juzgarían dos
+/// lugares distintos. Un `..` al principio (`../x`) sube desde el cwd, que ya es físico.
+pub fn dotdot_after_folder(p: &str) -> bool {
+    let mut named = false;
+    for seg in p.split(['/', '\\']) {
+        match seg {
+            "" | "." => {}
+            ".." if named => return true,
+            ".." => {}
+            _ => named = true,
+        }
+    }
+    false
+}
+
+/// El error de un `..` después de una carpeta en `what` (la ruta de un programa o de `isolate`).
+pub fn dotdot_error(who: &str, what: &str, p: &str) -> Control {
+    Control::Error(RuntimeError::new(format!(
+        "{}: {} {:?} has `..` after a folder: the system resolves it on disk (from where a link in the path leads) and the permission check by name, so they would judge different places — write the path without it",
+        who, what, p
+    )))
+}
+
+/// Las opciones de `run` (`check_option_keys`).
+const RUN_OPTIONS: &[&str] = &["cwd", "stdin", "max_output", "env", "env_clean", "isolate", "max_memory_mb"];
+
+/// v0.6.52 (auditoría r1, M3) — una opción que `who` no conoce es error: una mal escrita no puede
+/// pasar callada (`"isolated"` corría el hijo sin aislar), y tampoco unas opciones que no son un
+/// mapa (ronda 2, B2: `"isolate"` como cuarto argumento). Público para `proc_spawn`.
+pub fn check_option_keys(who: &str, opts: Option<&SynValue>, valid: &[&str]) -> Result<(), Control> {
+    let m = match opts {
+        None | Some(SynValue::Nothing) => return Ok(()),
+        Some(SynValue::Map(m)) => m,
+        Some(o) => {
+            return Err(Control::Error(RuntimeError::new(format!(
+                "{}: options must be a map, got {} — nothing ran",
+                who,
+                o.type_name()
+            ))))
+        }
+    };
+    for (k, _) in m.borrow().iter() {
+        if !valid.contains(&k.as_str()) {
+            return Err(Control::Error(RuntimeError::new(format!(
+                "{}: unknown option {:?} (valid options: {}) — nothing ran",
+                who,
+                k.as_str(),
+                valid.join(", ")
+            ))));
+        }
+    }
+    Ok(())
+}
+
+/// v0.6.52 (auditoría r1) — el ejecutable de `run`/`proc_spawn` no puede tener un `..` después de
+/// una carpeta: `exec` lo juzga por nombre (`./lnk/../tool` es `./tool`) y el sistema ejecuta lo que
+/// hay en disco (desde el destino de `lnk`). Lo mismo con el `cwd` contra el que se resuelve.
+pub fn check_exec_path(who: &str, cmd: &str, cwd: Option<&str>) -> Result<(), Control> {
+    let has_sep = cmd.contains('/') || cmd.contains('\\');
+    if has_sep && dotdot_after_folder(cmd) {
+        return Err(dotdot_error(who, "the program", cmd));
+    }
+    if let Some(dir) = cwd {
+        if has_sep && !std::path::Path::new(cmd).is_absolute() && dotdot_after_folder(dir) {
+            return Err(dotdot_error(who, "cwd", dir));
+        }
+        // Ronda 2 (N1): el hijo no arranca donde lleva un link que dejó un hijo aislado (el
+        // ejecutable con ruta lo juzga `exec`, en `isolated_areas::crossing`).
+        match crate::isolated_areas::crossing_dir(dir) {
+            Some(crate::isolated_areas::Crossing::Link(area)) => {
+                return Err(Control::Error(RuntimeError::new(format!(
+                    "{}: cwd {:?} goes through a link inside {}, a folder an isolated child could write to (run with \"isolate\"): a link there leads nowhere — use the real place; nothing ran",
+                    who,
+                    dir,
+                    area.display()
+                ))));
+            }
+            Some(crate::isolated_areas::Crossing::InUse(area)) => {
+                return Err(Control::Error(RuntimeError::new(format!(
+                    "{}: cwd {:?} reaches {}, a folder a child isolated with write access is using right now (run with \"isolate\"): use it after that run returns; nothing ran",
+                    who,
+                    dir,
+                    area.display()
+                ))));
+            }
+            None => {}
+        }
+    }
+    Ok(())
+}
+
+/// v0.6.52 (ronda 2, B3): si `path` es un link, dónde está la entrada: su carpeta resuelta en disco
+/// más su nombre (sin seguir el link). `None` si no es un link o la carpeta no se resuelve (entonces
+/// se juzga como siempre, por donde lleva).
+fn link_entry(path: &str) -> Option<String> {
+    let p = std::path::Path::new(path);
+    if !std::fs::symlink_metadata(p).ok()?.file_type().is_symlink() {
+        return None;
+    }
+    let parent = match p.parent() {
+        Some(d) if !d.as_os_str().is_empty() => d,
+        _ => std::path::Path::new("."),
+    };
+    let dir = std::fs::canonicalize(parent).ok()?;
+    let dir = dir.to_string_lossy().replace('\\', "/");
+    let dir = dir.strip_prefix("//?/").unwrap_or(&dir);
+    Some(format!("{}/{}", dir.trim_end_matches('/'), p.file_name()?.to_string_lossy()))
+}
+
+/// Lo que `run` necesita de un hijo para esperarlo (un trait para probar el orden de `wait_step`).
+trait Waitable {
+    type Status;
+    fn try_wait(&mut self) -> std::io::Result<Option<Self::Status>>;
+    fn wait(&mut self) -> std::io::Result<Self::Status>;
+}
+
+impl Waitable for std::process::Child {
+    type Status = std::process::ExitStatus;
+    fn try_wait(&mut self) -> std::io::Result<Option<Self::Status>> {
+        std::process::Child::try_wait(self)
+    }
+    fn wait(&mut self) -> std::io::Result<Self::Status> {
+        std::process::Child::wait(self)
+    }
+}
+
+/// Un paso de la espera de `run`: `Ok(None)` sigue corriendo, `Ok(Some(st))` terminó. v0.6.52
+/// (auditoría r1 B3, r2 B1): aislado, la salida se mira sin recoger (`exited`, WNOWAIT), el grupo se
+/// mata mientras el zombie retiene el número y recién después se recoge. `try_wait` no se llama
+/// mientras corre: si el hijo salía entre `exited` y `try_wait`, se recogía sin matar al grupo.
+/// Ronda 3 (B1): si no hay zombie (`Gone`: synsema arrancó con `SIGCHLD` ignorado y el kernel lo
+/// recogió solo), se mata al grupo igual y `try_wait` da lo que se pueda (sin código, `-1`, como sin
+/// aislar); antes esperaba hasta el timeout.
+fn wait_step<C: Waitable>(
+    child: &mut C,
+    isolated: Option<u32>,
+    exited: impl Fn(u32) -> synsema_isolate::ChildState,
+    kill_group: impl Fn(u32),
+) -> std::io::Result<Option<Option<C::Status>>> {
+    use synsema_isolate::ChildState;
+    match isolated {
+        Some(pid) => match exited(pid) {
+            ChildState::Running => Ok(None),
+            ChildState::Exited => {
+                kill_group(pid);
+                Ok(Some(child.wait().ok()))
+            }
+            ChildState::Gone => {
+                kill_group(pid);
+                Ok(Some(child.try_wait().ok().flatten()))
+            }
+        },
+        None => Ok(child.try_wait()?.map(Some)),
+    }
+}
+
+/// ¿El archivo tiene algún bit de ejecución? (Para la pista de EACCES; fuera de Unix, sí.)
+fn is_executable(cmd: &str) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if !(cmd.contains('/')) {
+            return true;
+        }
+        std::fs::metadata(cmd).map(|m| m.permissions().mode() & 0o111 != 0).unwrap_or(true)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = cmd;
+        true
+    }
+}
+
+/// v0.6.52 — `run(…, {"isolate": …})`: lo que el programa le delega al hijo aislado. `true` = nada
+/// más que el sistema (programas y bibliotecas, lectura) y una carpeta temporal propia; un mapa con
+/// `"file.read"`/`"file.write"` (texto o lista) suma esas rutas, cada una con su permiso en el
+/// programa (no se delega lo que no se tiene). El kernel concede carpetas enteras o archivos sueltos:
+/// `"./data/**"` es la carpeta, `"./a.csv"` el archivo; otro glob no se puede imponer y es error.
+/// `program`: el ejecutable con ruta (`./tool`), que el hijo tiene que poder leer para arrancar; lo
+/// cubre el `exec` que ya pasó. Devuelve también dónde están de verdad las carpetas de escritura:
+/// se registran (`isolated_areas`) recién cuando el hijo va a correr.
+fn isolate_policy(
+    caps: &Rc<RefCell<CapabilitySet>>,
+    v: &SynValue,
+    max_memory_mb: Option<&SynValue>,
+    program: &str,
+) -> Result<(synsema_isolate::Policy, Vec<std::path::PathBuf>), Control> {
+    let err = |m: String| Control::Error(RuntimeError::new(m));
+    let mut policy = synsema_isolate::Policy::default();
+    let mut write_areas = Vec::new();
+    match v {
+        SynValue::Bool(true) => {}
+        SynValue::Map(m) => {
+            for (k, val) in m.borrow().iter() {
+                let ty = match k.as_str() {
+                    "file.read" => CapabilityType::FileRead,
+                    "file.write" => CapabilityType::FileWrite,
+                    "net" => {
+                        return Err(err(
+                            "run: an isolated child has no network yet (\"net\" in \"isolate\" comes with the proxy that enforces the program's net grants) — nothing ran".into(),
+                        ))
+                    }
+                    other => {
+                        return Err(err(format!(
+                            "run: \"isolate\" takes \"file.read\" and \"file.write\" (a path or a list), not {:?}",
+                            other
+                        )))
+                    }
+                };
+                let scopes: Vec<String> = match val {
+                    SynValue::Text(s) => vec![s.to_string()],
+                    SynValue::List(l) => l
+                        .borrow()
+                        .to_vec()
+                        .iter()
+                        .map(|s| match s {
+                            SynValue::Text(s) => Ok(s.to_string()),
+                            o => Err(err(format!("run: \"isolate\".{:?} lists paths (text), got {}", k.as_str(), o.type_name()))),
+                        })
+                        .collect::<Result<_, _>>()?,
+                    o => {
+                        return Err(err(format!(
+                            "run: \"isolate\".{:?} is a path or a list of paths, got {}",
+                            k.as_str(),
+                            o.type_name()
+                        )))
+                    }
+                };
+                for scope in scopes {
+                    let pinned = isolate_path(caps, ty, &scope)?;
+                    if ty == CapabilityType::FileWrite {
+                        if pinned.is_dir {
+                            write_areas.push(pinned.real.clone());
+                        }
+                        policy.write.push(pinned.place);
+                    } else {
+                        policy.read.push(pinned.place);
+                    }
+                }
+            }
+        }
+        o => {
+            return Err(err(format!(
+                "run: \"isolate\" is true or a map ({{\"file.read\": …, \"file.write\": …}}), got {}",
+                o.type_name()
+            )))
+        }
+    }
+    policy.max_memory_bytes = match max_memory_mb {
+        None | Some(SynValue::Nothing) => None,
+        Some(SynValue::Number(n)) if n.to_f64() >= 1.0 && n.to_f64().fract() == 0.0 && n.to_f64() <= (1u64 << 40) as f64 => {
+            Some(n.to_f64() as u64 * 1024 * 1024)
+        }
+        Some(o) => return Err(err(format!("run: max_memory_mb is a whole number of megabytes (1 or more), got {}", o))),
+    };
+    if program.contains('/') || program.contains('\\') {
+        // Atado como las rutas delegadas: el kernel concede el archivo que se resolvió acá.
+        let pinned = synsema_isolate::pin(std::path::Path::new(program))
+            .map_err(|e| err(format!("run: cannot resolve {:?}: {}", program, e)))?;
+        policy.read.push(pinned.place);
+    }
+    Ok((policy, write_areas))
+}
+
+/// Un permiso de `isolate` → el lugar que concede el kernel. Se juzga dos veces, como `open_checked`
+/// (E8): por nombre (`require`, con su audit) y, ya abierto (`pin`), por dónde quedó de verdad
+/// (`with_physical`). El kernel recibe ese mismo lugar abierto: un link cambiado después no mueve
+/// nada.
+fn isolate_path(
+    caps: &Rc<RefCell<CapabilitySet>>,
+    ty: CapabilityType,
+    scope: &str,
+) -> Result<synsema_isolate::Pin, Control> {
+    let err = |m: String| Control::Error(RuntimeError::new(m));
+    let (base, folder) = match scope.strip_suffix("/**") {
+        Some(b) => (if b.is_empty() { "/" } else { b }, true),
+        None => (scope, false),
+    };
+    if base.contains(['*', '?', '[']) {
+        return Err(err(format!(
+            "run: \"isolate\" path {:?}: the kernel grants whole folders (\"./data/**\") or single files (\"./data/a.csv\"), not a pattern — nothing ran",
+            scope
+        )));
+    }
+    if dotdot_after_folder(base) {
+        return Err(dotdot_error("run", "\"isolate\" path", scope));
+    }
+    // Ronda 2 (M1): para Landlock lo que se escribe también se lee (`WRITE_*_RIGHTS`), así que la
+    // escritura se delega sólo si el programa también puede leer ahí: el hijo no recibe nada que el
+    // programa no tenga.
+    let tys: &[CapabilityType] = if ty == CapabilityType::FileWrite {
+        &[CapabilityType::FileWrite, CapabilityType::FileRead]
+    } else {
+        &[ty]
+    };
+    for &t in tys {
+        require(caps, Capability::new(t, Some(scope.to_string())), "run() isolate").map_err(|e| {
+            if t == ty {
+                return e;
+            }
+            err(format!(
+                "run: \"isolate\" {{\"file.write\": {:?}}} also lets the child read it: the program needs `file.read({:?})` too — nothing ran",
+                scope, scope
+            ))
+        })?;
+    }
+    // Lo que se abre es la forma léxica (la que juzgó `require`).
+    let lexical = synsema_core::capscope::absolute_path(base).unwrap_or_else(|| base.to_string());
+    let pinned = synsema_isolate::pin(std::path::Path::new(&lexical)).map_err(|e| {
+        err(format!(
+            "run: \"isolate\" path {:?}: {} — the kernel grants what exists (make_dir() it first)",
+            scope, e
+        ))
+    })?;
+    let real = pinned.real.to_string_lossy();
+    let real = real.strip_prefix(r"\\?\").unwrap_or(&real).replace('\\', "/");
+    // El lugar fijado se juzga de nuevo con cada tipo (para una carpeta, `real/**`: `with_physical`
+    // mueve la base del pedido con su patrón).
+    if real.trim_end_matches('/') != lexical.trim_end_matches('/') {
+        for &t in tys {
+            let cap = Capability::new(t, Some(scope.to_string()));
+            synsema_core::capscope::with_physical(base, &real, || require(caps, cap, "run() isolate"))?;
+        }
+    }
+    if pinned.is_dir != folder {
+        return Err(err(if folder {
+            format!("run: \"isolate\" path {:?} is a file: grant it without \"/**\"", scope)
+        } else {
+            format!(
+                "run: \"isolate\" path {:?} is a folder: grant it as \"{}/**\" (the child gets everything inside)",
+                scope,
+                scope.trim_end_matches('/')
+            )
+        }));
+    }
+    // El kernel no deja agujeros en una carpeta: un `deny` adentro se cumple no delegándola.
+    if folder {
+        let d = tys.iter().find_map(|&t| caps.borrow().deny_crossing(t, &real));
+        if let Some(d) = d {
+            return Err(err(format!(
+                "run: \"isolate\" cannot delegate {:?}: `deny {}` lies inside it, and the kernel cannot leave a hole in a folder — delegate the parts the child may use",
+                scope, d
+            )));
+        }
+    }
+    Ok(pinned)
+}
+
 use chrono::{DateTime, Datelike, NaiveDateTime, Timelike, Utc};
 use regex::RegexBuilder;
 
@@ -1104,11 +1453,27 @@ pub fn register_secure_builtins(interp: &Interpreter, caps: Rc<RefCell<Capabilit
             1,
             Rc::new(move |_i, args, _loc| {
                 let path = normalize_path(&raw_str(arg(args, 0)?));
-                require(
-                    &caps,
-                    Capability::new(CapabilityType::FileWrite, Some(path.clone())),
-                    "delete_file()",
-                )?;
+                let cap = Capability::new(CapabilityType::FileWrite, Some(path.clone()));
+                // v0.6.52 (ronda 2, B3): borrar un link borra la entrada, no lo que apunta (como
+                // `unlink`): se juzga dónde está el link —su carpeta en disco, más su nombre—, no a
+                // dónde lleva. Así se puede sacar el link que dejó un hijo aislado.
+                if let Some(entry) = link_entry(&path) {
+                    let judge = |real: &str| synsema_core::capscope::with_physical(&path, real, || require(&caps, cap.clone(), "delete_file()"));
+                    judge(&entry)?;
+                    reject_bundled_write(&path)?;
+                    // Ronda 3 (A1): la carpeta se abre sin ventana (sin links, o siguiéndolos y
+                    // juzgando otra vez su lugar real con el nombre) y se borra relativo a ella.
+                    let gone = match crate::nofollow::parent_checked(&path, &judge) {
+                        Ok(Some(dir)) => dir.remove_entry(&path),
+                        Ok(None) => crate::nofollow::remove_link(&path),
+                        Err(crate::nofollow::Refused::Denied(e)) => return Err(e),
+                        Err(crate::nofollow::Refused::Io(e)) => Err(e),
+                    };
+                    return gone
+                        .map(|_| syn_bool(true))
+                        .map_err(|e| Control::Error(RuntimeError::new(format!("Cannot delete file {}: {}", path, e))));
+                }
+                require(&caps, cap, "delete_file()")?;
                 reject_bundled_write(&path)?;
                 match std::fs::metadata(&path) {
                     Err(_) => Err(Control::Error(RuntimeError::new(format!("File not found: {}", path)))),
@@ -1441,10 +1806,20 @@ pub fn register_secure_builtins(interp: &Interpreter, caps: Rc<RefCell<Capabilit
                         _ => None,
                     }
                 };
+                // v0.6.52 (auditoría r1, M3): una opción mal escrita (`"isolated"`) corría el hijo sin
+                // aislar y sin avisar. Las de seguridad no pueden fallar abiertas.
+                check_option_keys("run", args.get(3), RUN_OPTIONS)?;
+                // Ronda 5 (M2): un `run` aislado arranca de a uno, desde antes de juzgar nada hasta
+                // lanzar al hijo (`isolated_areas::startup`).
+                let turn = match opt("isolate") {
+                    None | Some(SynValue::Nothing) | Some(SynValue::Bool(false)) => None,
+                    Some(_) => Some(crate::isolated_areas::startup()),
+                };
                 let cwd = match opt("cwd") {
                     Some(SynValue::Text(s)) => Some(s.to_string()),
                     _ => None,
                 };
+                check_exec_path("run", &cmd, cwd.as_deref())?;
                 // capability: scope = cmd tal como se pasa (pre-PATH); con `cwd`, resuelto contra él.
                 let (scope, cmd) = exec_target(&cmd, cwd.as_deref());
                 require(&caps, Capability::new(CapabilityType::Exec, Some(scope)), "run()")?;
@@ -1456,6 +1831,19 @@ pub fn register_secure_builtins(interp: &Interpreter, caps: Rc<RefCell<Capabilit
                 let max_output = match opt("max_output") {
                     Some(SynValue::Number(n)) => n.to_f64() as usize,
                     _ => 10 * 1024 * 1024,
+                };
+                // v0.6.52: `{"isolate": …}` — el hijo corre aislado por el kernel, con lo que el
+                // programa le delega (`isolate_policy`). Donde no se puede imponer, falla cerrado.
+                let policy = match opt("isolate") {
+                    None | Some(SynValue::Nothing) | Some(SynValue::Bool(false)) => {
+                        if opt("max_memory_mb").is_some() {
+                            return Err(Control::Error(RuntimeError::new(
+                                "run: max_memory_mb is enforced only for an isolated child — add \"isolate\" (e.g. {\"isolate\": true, \"max_memory_mb\": 512})",
+                            )));
+                        }
+                        None
+                    }
+                    Some(v) => Some(isolate_policy(&caps, &v, opt("max_memory_mb").as_ref(), &cmd)?),
                 };
 
                 // construir el comando.
@@ -1479,6 +1867,29 @@ pub fn register_secure_builtins(interp: &Interpreter, caps: Rc<RefCell<Capabilit
                     c.env_clear();
                     c.envs(clean_env_keep());
                 }
+                // Aislado: entorno limpio (PATH, LANG, HOME/TMPDIR propios) y el aislamiento en el
+                // hijo. Tiene que vivir hasta que el hijo termine (su carpeta temporal).
+                let (prepared, mut borrowed) = match &policy {
+                    Some((p, areas)) => {
+                        let prepared = synsema_isolate::prepare(&mut c, p)
+                            .map_err(|e| Control::Error(RuntimeError::new(format!("run: {}", e))))?;
+                        // Desde acá el hijo puede poner links en sus carpetas de escritura: no se
+                        // siguen por el resto de la corrida, y mientras corre nadie más las toca
+                        // (ronda 4, A1): se sueltan cuando su grupo quedó vacío (`isolated_areas`).
+                        let borrowed = match areas.is_empty() {
+                            true => None,
+                            false => Some(crate::isolated_areas::borrow(areas).map_err(|busy| {
+                                Control::Error(RuntimeError::new(format!(
+                                    "run: another task is still using {}, which reaches {} (a folder this child would write to); try again when it finishes — nothing ran",
+                                    busy.held.display(),
+                                    busy.area.display()
+                                )))
+                            })?),
+                        };
+                        (Some(prepared), borrowed)
+                    }
+                    None => (None, None),
+                };
                 if let Some(SynValue::Map(m)) = opt("env") {
                     for (k, v) in m.borrow().iter() {
                         c.env(k.as_str(), raw_str(v)); // override explícito (gana sobre el strip)
@@ -1487,11 +1898,29 @@ pub fn register_secure_builtins(interp: &Interpreter, caps: Rc<RefCell<Capabilit
 
                 hide_child_window(&mut c);
                 let mut child = c.spawn().map_err(|e| {
+                    let hint = if prepared.is_some() && e.kind() == std::io::ErrorKind::PermissionDenied {
+                        if is_executable(&cmd) {
+                            " — an isolated child sees only the system folders and what \"isolate\" grants: the program has to be inside them (a venv: add its folder to \"file.read\")"
+                        } else {
+                            " — the file is not executable (chmod +x)"
+                        }
+                    } else {
+                        ""
+                    };
                     Control::Error(RuntimeError::new(format!(
-                        "run: cannot start \"{}\": {}",
-                        cmd, e
+                        "run: cannot start \"{}\": {}{}",
+                        cmd, e, hint
                     )))
                 })?;
+                let isolated_pid = prepared.as_ref().map(|_| child.id());
+                if let (Some(b), Some(pid)) = (borrowed.as_mut(), isolated_pid) {
+                    b.child_group(pid);
+                }
+                // Ronda 5 (M2): desde acá `run` sólo espera, no actúa por nombre sobre lo que juzgó
+                // (el ejecutable, el `cwd`, lo delegado ya quedó fijado): lo suelta, y suelta el turno.
+                // La carpeta del hijo la cuida su préstamo.
+                synsema_core::op_hold::release();
+                drop(turn);
 
                 // stdin: escribir en un thread (evita deadlock con stdin grande) y cerrar
                 // (EOF). Sin data → `si` se dropea acá y cierra stdin.
@@ -1516,17 +1945,26 @@ pub fn register_secure_builtins(interp: &Interpreter, caps: Rc<RefCell<Capabilit
                 // esperar con timeout (polling try_wait + kill); sin crate externa.
                 let deadline = Instant::now() + Duration::from_secs_f64(timeout_secs.max(0.0));
                 let mut timed_out = false;
+                // Aislado, se termina el grupo entero (el hijo no puede salir de él): lo que lanzó
+                // no queda vivo ni retiene las pipes.
+                let kill_tree = |pid: Option<u32>| {
+                    if let Some(pid) = pid {
+                        synsema_isolate::kill_group(pid);
+                    }
+                };
                 let status = loop {
-                    match child.try_wait() {
-                        Ok(Some(st)) => break Some(st),
+                    match wait_step(&mut child, isolated_pid, synsema_isolate::exited, synsema_isolate::kill_group) {
+                        Ok(Some(st)) => break st,
                         Ok(None) => {
                             // Cancelación cooperativa: no dejar el hijo huérfano.
                             if i.is_cancelled() {
+                                kill_tree(isolated_pid);
                                 let _ = child.kill();
                                 let _ = child.wait();
                                 i.check_cancel()?;
                             }
                             if Instant::now() >= deadline {
+                                kill_tree(isolated_pid);
                                 let _ = child.kill();
                                 let _ = child.wait();
                                 timed_out = true;
@@ -1534,7 +1972,10 @@ pub fn register_secure_builtins(interp: &Interpreter, caps: Rc<RefCell<Capabilit
                             }
                             std::thread::sleep(Duration::from_millis(15));
                         }
-                        Err(_) => break None,
+                        Err(_) => {
+                            kill_tree(isolated_pid);
+                            break None;
+                        }
                     }
                 };
 
@@ -1561,6 +2002,18 @@ pub fn register_secure_builtins(interp: &Interpreter, caps: Rc<RefCell<Capabilit
                 );
                 m.insert("stdout_truncated", syn_bool(out_trunc));
                 m.insert("stderr_truncated", syn_bool(err_trunc));
+                // Lo que se impuso de verdad (el kernel, no lo pedido).
+                if let Some(p) = &prepared {
+                    let mut iso = SynMap::new();
+                    iso.insert("landlock_abi", syn_int(p.report.landlock_abi as i64));
+                    iso.insert("network", syn_text(p.report.network.to_string()));
+                    iso.insert(
+                        "max_memory_mb",
+                        p.report.max_memory_bytes.map(|b| syn_int((b / (1024 * 1024)) as i64)).unwrap_or(SynValue::Nothing),
+                    );
+                    m.insert("isolation", syn_map(iso));
+                }
+                drop(prepared);
                 Ok(syn_map(m))
             }),
         );
@@ -2193,5 +2646,507 @@ mod v0646_e8_tests {
         let folder = list(format!("{}/proj", root));
         assert_eq!(folder, ["adentro false 0 true", "f.txt false 3 false", "otra true 0 false", "sale false 0 true"]);
         let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
+/// v0.6.52, auditoría r1: lo que juzga `isolate` antes de lanzar (en cualquier sistema: `pin` es
+/// `canonicalize` fuera de Linux).
+#[cfg(test)]
+mod v0652_isolate_tests {
+    use super::*;
+
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("synsema-caps-v0652-{}-{}", std::process::id(), tag));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("data").join("secret")).unwrap();
+        std::fs::create_dir_all(d.join("other")).unwrap();
+        d
+    }
+
+    fn slash(p: &std::path::Path) -> String {
+        let s = p.to_string_lossy().replace('\\', "/");
+        s.strip_prefix("//?/").map(str::to_string).unwrap_or(s)
+    }
+
+    fn caps_with(grant: &str, deny: Option<&str>) -> Rc<RefCell<CapabilitySet>> {
+        let mut set = CapabilitySet::new("test");
+        set.grant(Capability::new(CapabilityType::FileRead, Some(grant.to_string())));
+        if let Some(d) = deny {
+            set.deny(Capability::new(CapabilityType::FileRead, Some(d.to_string())));
+        }
+        Rc::new(RefCell::new(set))
+    }
+
+    fn msg(r: Result<synsema_isolate::Pin, Control>) -> String {
+        match r {
+            Ok(_) => "ok".into(),
+            Err(Control::Error(e)) => e.to_string(),
+            Err(_) => "otro control".into(),
+        }
+    }
+
+    /// M1: Landlock no tiene reglas de denegación. Un `deny` dentro de la carpeta delegada (o uno que
+    /// la abarca por un patrón) rechaza la delegación; uno afuera no.
+    #[test]
+    fn a_deny_inside_a_delegated_folder_refuses_it() {
+        let d = scratch("deny");
+        let r = slash(&d);
+        let data = format!("{}/data/**", r);
+        for (deny, want) in [
+            (Some(format!("{}/data/secret/**", r)), "lies inside it"),
+            (Some(format!("{}/**/*.key", r)), "lies inside it"),
+            (Some(format!("{}/*/secret/*", r)), "lies inside it"),
+            (Some(format!("{}/data", r)), "lies inside it"),
+            (Some(format!("{}/other/**", r)), "ok"),
+            // Ronda 2 (N4): un patrón que no baja más que la carpeta no la alcanza.
+            (Some(format!("{}/*.txt", r)), "ok"),
+            // Ronda 3 (N2): el patrón que nombra la carpeta misma, como el literal.
+            (Some(format!("{}/*", r)), "lies inside it"),
+            (Some(format!("{}/*/x", r)), "lies inside it"),
+            (Some(format!("{}/*/x", r).replace("/*/x", "/*.d/x")), "ok"),
+            (Some(r.clone()), "ok"),
+            (None, "ok"),
+        ] {
+            let caps = caps_with(&format!("{}/**", r), deny.as_deref());
+            let got = msg(isolate_path(&caps, CapabilityType::FileRead, &data));
+            assert!(got.contains(want), "{:?}: {}", deny, got);
+        }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A1: `..` después de una carpeta es error antes de juzgar (el `require` lo resolvería por
+    /// nombre y el sistema en disco). Al principio (`../x`) vale.
+    #[test]
+    fn dotdot_after_a_folder_is_refused() {
+        for (p, bad) in [
+            ("./lnk/../work/**", true),
+            ("a/b/..", true),
+            ("/x/../y", true),
+            ("../x/**", false),
+            ("../../x", false),
+            ("./data/**", false),
+            ("a..b/c", false),
+        ] {
+            assert_eq!(dotdot_after_folder(p), bad, "{}", p);
+        }
+        let caps = caps_with("./**", None);
+        let got = msg(isolate_path(&caps, CapabilityType::FileRead, "./x/../data/**"));
+        assert!(got.contains("has `..` after a folder"), "{}", got);
+        assert!(check_exec_path("run", "./lnk/../tool", None).is_err());
+        assert!(check_exec_path("run", "./tool", Some("./a/../b")).is_err());
+        assert!(check_exec_path("run", "python3", Some("./a/../b")).is_ok(), "sin ruta, el cwd no decide qué corre");
+        assert!(check_exec_path("run", "../tool", None).is_ok());
+    }
+
+    /// M3: una opción desconocida es error y nombra las válidas.
+    #[test]
+    fn an_unknown_option_is_an_error() {
+        let mut m = SynMap::new();
+        m.insert("isolated", syn_bool(true));
+        let opts = syn_map(m);
+        let Err(Control::Error(e)) = check_option_keys("run", Some(&opts), RUN_OPTIONS) else { panic!("aceptó") };
+        assert!(e.to_string().contains("unknown option \"isolated\" (valid options: cwd, stdin"), "{}", e);
+        let mut m = SynMap::new();
+        m.insert("isolate", syn_bool(true));
+        assert!(check_option_keys("run", Some(&syn_map(m)), RUN_OPTIONS).is_ok());
+        assert!(check_option_keys("run", Some(&SynValue::Nothing), RUN_OPTIONS).is_ok());
+        // Ronda 2 (B2): unas opciones que no son un mapa no se ignoran.
+        for bad in [syn_text("isolate".to_string()), syn_list(vec![syn_bool(true)])] {
+            let Err(Control::Error(e)) = check_option_keys("run", Some(&bad), RUN_OPTIONS) else { panic!("aceptó {:?}", bad) };
+            assert!(e.to_string().contains("run: options must be a map, got"), "{}", e);
+        }
+    }
+
+    fn caps_rw(read: Option<&str>, write: &str, deny_read: Option<&str>) -> Rc<RefCell<CapabilitySet>> {
+        let mut set = CapabilitySet::new("test");
+        if let Some(r) = read {
+            set.grant(Capability::new(CapabilityType::FileRead, Some(r.to_string())));
+        }
+        set.grant(Capability::new(CapabilityType::FileWrite, Some(write.to_string())));
+        if let Some(d) = deny_read {
+            set.deny(Capability::new(CapabilityType::FileRead, Some(d.to_string())));
+        }
+        Rc::new(RefCell::new(set))
+    }
+
+    /// Ronda 2 (M1): para el kernel una carpeta de escritura también se lee. Delegar escritura pide
+    /// también `file.read`, y un `deny file.read` adentro rechaza la delegación.
+    #[test]
+    fn delegating_write_needs_read_too() {
+        let d = scratch("write");
+        let r = slash(&d);
+        let all = format!("{}/**", r);
+        let data = format!("{}/data/**", r);
+        let got = msg(isolate_path(&caps_rw(None, &all, None), CapabilityType::FileWrite, &data));
+        assert!(got.contains("also lets the child read it: the program needs `file.read("), "{}", got);
+        assert_eq!(msg(isolate_path(&caps_rw(Some(&all), &all, None), CapabilityType::FileWrite, &data)), "ok");
+        let secret = format!("{}/data/secret/**", r);
+        let got = msg(isolate_path(&caps_rw(Some(&all), &all, Some(&secret)), CapabilityType::FileWrite, &data));
+        assert!(got.contains("lies inside it"), "{}", got);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Ronda 2 (M2): con el lugar fijado (`with_physical`), un scope de carpeta (`base/**`) se juzga
+    /// por ese lugar, no por una nueva resolución del nombre. Si la base es la de un grant (un link
+    /// legítimo), el grant va con ella.
+    #[test]
+    fn a_folder_is_judged_by_its_pinned_place() {
+        let d = scratch("pinned");
+        let r = slash(&d);
+        let check = |grant: &str, base: &str, real: &str, req: &str| {
+            let mut set = CapabilitySet::new("test");
+            set.grant(Capability::new(CapabilityType::FileRead, Some(grant.to_string())));
+            let req = Capability::new(CapabilityType::FileRead, Some(req.to_string()));
+            synsema_core::capscope::with_physical(base, real, || set.check_cause(&req, "t").is_ok())
+        };
+        let (data, other) = (format!("{}/data", r), format!("{}/other", r));
+        assert!(!check(&format!("{}/data/**", r), &format!("{}/data/secret", r), &other, &format!("{}/data/secret/**", r)));
+        assert!(!check(&format!("{}/data/**", r), &format!("{}/data/secret", r), &other, &format!("{}/data/secret", r)));
+        assert!(check(&format!("{}/data/**", r), &format!("{}/data/secret", r), &format!("{}/data/secret", r), &format!("{}/data/secret/**", r)));
+        assert!(check(&format!("{}/data/**", r), &data, &other, &format!("{}/data/**", r)), "la base del grant es el link");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Ronda 3 (A1): dentro de un área, el lugar fijado (el handle de E8, el `pin` de `isolate`) tiene
+    /// que ser adonde lleva el nombre sin seguir links del área. Con el link del hijo puesto se
+    /// deniega; si el link ya volvió a ser carpeta (la carrera de dos cambios), el nombre no llega al
+    /// lugar fijado y también. Sin cambios, el lugar de verdad pasa.
+    #[cfg(unix)]
+    #[test]
+    fn a_fixed_place_inside_an_area_must_be_where_the_name_leads() {
+        let d = scratch("fixed-area").canonicalize().unwrap();
+        let r = slash(&d);
+        std::fs::create_dir_all(d.join("work").join("sub")).unwrap();
+        std::fs::write(d.join("other").join("secret.txt"), "S").unwrap();
+        let run = synsema_core::run_scope::RunScope::new();
+        let _in = run.enter();
+        // Registrada y ya soltada: el hijo terminó.
+        drop(crate::isolated_areas::borrow(&[d.join("work")]).unwrap());
+        let judge = |base: &str, real: &str, req: &str| {
+            let mut set = CapabilitySet::new("test");
+            set.grant(Capability::new(CapabilityType::FileRead, Some(format!("{}/work/**", r))));
+            set.grant(Capability::new(CapabilityType::FileRead, Some(format!("{}/work/sub/**", r))));
+            let req = Capability::new(CapabilityType::FileRead, Some(req.to_string()));
+            synsema_core::capscope::with_physical(base, real, || set.check_cause(&req, "t"))
+        };
+        let (sub, other) = (format!("{}/work/sub", r), format!("{}/other", r));
+        let file = format!("{}/work/sub/secret.txt", r);
+        let area = |c: Result<(), crate::model::DenyCause>| matches!(c, Err(crate::model::DenyCause::IsolatedArea(_)));
+        // Carpeta de verdad: el lugar fijado es el suyo.
+        assert!(judge(&sub, &sub, &format!("{}/**", sub)).is_ok());
+        // La carrera de dos cambios: el pin/handle siguió el link, ahora es carpeta otra vez.
+        assert!(area(judge(&file, &format!("{}/secret.txt", other), &file)), "E8");
+        assert!(area(judge(&sub, &other, &format!("{}/**", sub))), "pin");
+        // Con el link del hijo puesto.
+        std::fs::remove_dir(d.join("work").join("sub")).unwrap();
+        std::os::unix::fs::symlink(d.join("other"), d.join("work").join("sub")).unwrap();
+        assert!(area(judge(&file, &format!("{}/secret.txt", other), &file)), "E8");
+        assert!(area(judge(&sub, &other, &format!("{}/**", sub))), "pin");
+        // Un link del programa que lleva a uno del hijo tampoco: `x` → `work/sub` → afuera.
+        std::os::unix::fs::symlink(d.join("work").join("sub"), d.join("x")).unwrap();
+        let mut set = CapabilitySet::new("test");
+        set.grant(Capability::new(CapabilityType::FileRead, Some(format!("{}/x/**", r))));
+        assert!(area(set.check_cause(&Capability::new(CapabilityType::FileRead, Some(format!("{}/x/secret.txt", r))), "t")));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Ronda 4 (A1): mientras un hijo con escritura corre, su carpeta está prestada: ninguna ruta que
+    /// pase por ella o termine en ella se concede (tampoco por un link del programa que lleva
+    /// adentro, ni con un lugar fijado adentro). Al soltar, vuelve a concederse; con dos hijos sobre
+    /// la misma carpeta, hasta que se suelten los dos.
+    #[cfg(unix)]
+    #[test]
+    fn a_folder_in_use_by_a_running_child_is_not_touched() {
+        let d = scratch("in-use").canonicalize().unwrap();
+        let r = slash(&d);
+        std::fs::create_dir_all(d.join("work")).unwrap();
+        std::fs::write(d.join("work").join("f.txt"), "x").unwrap();
+        std::fs::write(d.join("other").join("f.txt"), "x").unwrap();
+        std::os::unix::fs::symlink(d.join("work"), d.join("x")).unwrap();
+        let run = synsema_core::run_scope::RunScope::new();
+        let _in = run.enter();
+        let judge = |req: &str| {
+            let mut set = CapabilitySet::new("test");
+            set.grant(Capability::new(CapabilityType::FileRead, Some(format!("{}/**", r))));
+            set.check_cause(&Capability::new(CapabilityType::FileRead, Some(req.to_string())), "t")
+        };
+        let in_use = |c: Result<(), crate::model::DenyCause>| matches!(c, Err(crate::model::DenyCause::AreaInUse(_)));
+        let work = format!("{}/work", r);
+        let file = format!("{}/work/f.txt", r);
+        let first = crate::isolated_areas::borrow(&[d.join("work")]).unwrap();
+        let second = crate::isolated_areas::borrow(&[d.join("work")]).unwrap();
+        assert!(in_use(judge(&file)), "un archivo adentro");
+        assert!(in_use(judge(&work)), "la carpeta misma");
+        assert!(in_use(judge(&format!("{}/x/f.txt", r))), "por un link del programa");
+        assert!(in_use(synsema_core::capscope::with_physical(&file, &file, || judge(&file))), "lugar fijado");
+        assert!(judge(&format!("{}/other/f.txt", r)).is_ok(), "afuera no se toca");
+        drop(first);
+        assert!(in_use(judge(&file)), "el otro hijo sigue corriendo");
+        drop(second);
+        assert!(judge(&file).is_ok() && judge(&format!("{}/x/f.txt", r)).is_ok());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Ronda 4 (N1): un ciclo de links lejos de las áreas no se reporta como un link de un área (lo
+    /// deniega la regla de siempre, o el sistema al abrir).
+    #[cfg(unix)]
+    #[test]
+    fn a_link_cycle_away_from_the_areas_is_not_theirs() {
+        let d = scratch("cycle").canonicalize().unwrap();
+        let r = slash(&d);
+        std::fs::create_dir_all(d.join("work")).unwrap();
+        std::os::unix::fs::symlink(d.join("data").join("b"), d.join("data").join("a")).unwrap();
+        std::os::unix::fs::symlink(d.join("data").join("a"), d.join("data").join("b")).unwrap();
+        let run = synsema_core::run_scope::RunScope::new();
+        let _in = run.enter();
+        drop(crate::isolated_areas::borrow(&[d.join("work")]).unwrap());
+        let mut set = CapabilitySet::new("test");
+        set.grant(Capability::new(CapabilityType::FileRead, Some(format!("{}/data/**", r))));
+        let c = set.check_cause(&Capability::new(CapabilityType::FileRead, Some(format!("{}/data/a/f.txt", r))), "t");
+        assert!(!matches!(c, Err(crate::model::DenyCause::IsolatedArea(_))), "{:?}", c);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Ronda 4 (A1): lo que otra tarea ya juzgó dentro de la carpeta (y todavía no terminó de hacer)
+    /// se espera antes de prestarla; lo que juzgó afuera no.
+    #[cfg(unix)]
+    #[test]
+    fn a_borrow_waits_for_what_another_task_already_judged_inside() {
+        let d = scratch("hold-wait").canonicalize().unwrap();
+        let r = slash(&d);
+        std::fs::create_dir_all(d.join("work")).unwrap();
+        synsema_core::op_hold::enable();
+        let run = synsema_core::run_scope::RunScope::new();
+        let _in = run.enter();
+        // Otra tarea: juzga `req` dentro de un builtin que tarda `ms` en volver.
+        let task = |req: String, ms: u64| {
+            let run = run.clone();
+            let r = r.clone();
+            let (tx, rx) = std::sync::mpsc::channel();
+            let h = std::thread::spawn(move || {
+                let _in = run.enter();
+                let _frame = synsema_core::op_hold::enter();
+                let mut set = CapabilitySet::new("test");
+                set.grant(Capability::new(CapabilityType::FileRead, Some(format!("{}/**", r))));
+                assert!(set.check_cause(&Capability::new(CapabilityType::FileRead, Some(req)), "t").is_ok());
+                tx.send(()).unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(ms));
+            });
+            rx.recv().unwrap();
+            h
+        };
+        let t0 = std::time::Instant::now();
+        let h = task(format!("{}/other/f.txt", r), 400);
+        drop(crate::isolated_areas::borrow(&[d.join("work")]).unwrap());
+        assert!(t0.elapsed() < std::time::Duration::from_millis(300), "afuera no se espera: {:?}", t0.elapsed());
+        h.join().unwrap();
+        let t0 = std::time::Instant::now();
+        let h = task(format!("{}/work/f.txt", r), 400);
+        drop(crate::isolated_areas::borrow(&[d.join("work")]).unwrap());
+        assert!(t0.elapsed() >= std::time::Duration::from_millis(350), "adentro se espera: {:?}", t0.elapsed());
+        h.join().unwrap();
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Otra tarea: juzga cada una de `reqs` dentro de un mismo builtin que tarda `ms` en volver.
+    #[cfg(unix)]
+    fn judging_task(run: &std::sync::Arc<synsema_core::run_scope::RunScope>, root: &str, reqs: Vec<String>, ms: u64) -> std::thread::JoinHandle<()> {
+        let run = run.clone();
+        let root = root.to_string();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let h = std::thread::spawn(move || {
+            let _in = run.enter();
+            let _frame = synsema_core::op_hold::enter();
+            let mut set = CapabilitySet::new("test");
+            set.grant(Capability::new(CapabilityType::FileRead, Some(format!("{}/**", root))));
+            for req in reqs {
+                assert!(set.check_cause(&Capability::new(CapabilityType::FileRead, Some(req)), "t").is_ok());
+            }
+            tx.send(()).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(ms));
+        });
+        rx.recv().unwrap();
+        h
+    }
+
+    /// Ronda 5 (A1): un builtin que juzga varias rutas las sostiene todas. El préstamo espera la que
+    /// toca la carpeta aunque antes se haya juzgado otra lejos de ella (un extractor: sus entradas,
+    /// después las carpetas por nombre). Si no termina a tiempo (`HOLD_WAIT`, 1 s en los tests), el
+    /// error nombra esa ruta y la carpeta que toca (N1).
+    #[cfg(unix)]
+    #[test]
+    fn a_borrow_waits_for_every_path_a_task_judged() {
+        let d = scratch("hold-every").canonicalize().unwrap();
+        let r = slash(&d);
+        std::fs::create_dir_all(d.join("work")).unwrap();
+        synsema_core::op_hold::enable();
+        let run = synsema_core::run_scope::RunScope::new();
+        let _in = run.enter();
+        let t0 = std::time::Instant::now();
+        let h = judging_task(&run, &r, vec![format!("{}/other/f.txt", r), format!("{}/work/l/y", r)], 400);
+        drop(crate::isolated_areas::borrow(&[d.join("work")]).unwrap());
+        assert!(t0.elapsed() >= std::time::Duration::from_millis(350), "la segunda ruta se espera: {:?}", t0.elapsed());
+        h.join().unwrap();
+        let h = judging_task(&run, &r, vec![format!("{}/other/f.txt", r), format!("{}/work/f.txt", r)], 1600);
+        let e = crate::isolated_areas::borrow(&[d.join("work")]).err().expect("no terminó a tiempo");
+        assert_eq!((e.held, e.area), (d.join("work").join("f.txt"), d.join("work")));
+        h.join().unwrap();
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Ronda 5 (M1): una carpeta se reconoce por lo que es en disco, no sólo por su nombre. Prestada
+    /// con otro nombre (acá un link; en la WSL, `./WORK` sobre `/mnt/c`, que no distingue
+    /// mayúsculas), una ruta por el nombre de siempre igual llega a ella, un link del hijo adentro
+    /// igual no se sigue, y lo que otra tarea juzgó por ese nombre igual se espera.
+    #[cfg(unix)]
+    #[test]
+    fn a_folder_is_known_by_what_it_is_not_by_its_name() {
+        let d = scratch("alias").canonicalize().unwrap();
+        let r = slash(&d);
+        std::fs::create_dir_all(d.join("work")).unwrap();
+        std::fs::write(d.join("work").join("f.txt"), "x").unwrap();
+        std::fs::write(d.join("other").join("f.txt"), "x").unwrap();
+        std::os::unix::fs::symlink(d.join("work"), d.join("alias")).unwrap();
+        synsema_core::op_hold::enable();
+        let run = synsema_core::run_scope::RunScope::new();
+        let _in = run.enter();
+        let judge = |req: &str| {
+            let mut set = CapabilitySet::new("test");
+            set.grant(Capability::new(CapabilityType::FileRead, Some(format!("{}/**", r))));
+            set.check_cause(&Capability::new(CapabilityType::FileRead, Some(req.to_string())), "t")
+        };
+        let in_use = |c: Result<(), crate::model::DenyCause>| matches!(c, Err(crate::model::DenyCause::AreaInUse(_)));
+        let lent = crate::isolated_areas::borrow(&[d.join("alias")]).unwrap();
+        assert!(in_use(judge(&format!("{}/work/f.txt", r))), "adentro, por el otro nombre");
+        assert!(in_use(judge(&format!("{}/work", r))), "la carpeta misma");
+        assert!(judge(&format!("{}/other/f.txt", r)).is_ok(), "afuera no se toca");
+        drop(lent);
+        let t0 = std::time::Instant::now();
+        let h = judging_task(&run, &r, vec![format!("{}/work/f.txt", r)], 400);
+        drop(crate::isolated_areas::borrow(&[d.join("alias")]).unwrap());
+        assert!(t0.elapsed() >= std::time::Duration::from_millis(350), "se espera: {:?}", t0.elapsed());
+        h.join().unwrap();
+        std::os::unix::fs::symlink(d.join("other"), d.join("work").join("l")).unwrap();
+        let c = judge(&format!("{}/work/l/f.txt", r));
+        assert!(matches!(c, Err(crate::model::DenyCause::IsolatedArea(_))), "el link del hijo: {:?}", c);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Ronda 7 (N1): una carpeta delegada se borra y otra nueva toma su inodo (ext4 lo reusa): la
+    /// nueva no es un área, y un link que el programa pone adentro se sigue. Donde el inodo no se
+    /// reusa (tmpfs) no hay nada que probar.
+    #[cfg(unix)]
+    #[test]
+    fn a_folder_that_takes_the_inode_of_a_deleted_area_is_not_an_area() {
+        use std::os::unix::fs::MetadataExt;
+        let d = scratch("reused").canonicalize().unwrap();
+        let r = slash(&d);
+        std::fs::create_dir_all(d.join("v2")).unwrap();
+        std::fs::write(d.join("v2").join("x.txt"), "x").unwrap();
+        let run = synsema_core::run_scope::RunScope::new();
+        let _in = run.enter();
+        let judge = |req: &str| {
+            let mut set = CapabilitySet::new("test");
+            set.grant(Capability::new(CapabilityType::FileRead, Some(format!("{}/**", r))));
+            set.check_cause(&Capability::new(CapabilityType::FileRead, Some(req.to_string())), "t")
+        };
+        for i in 0..200 {
+            let (tmp, cache) = (d.join(format!("tmp{}", i)), d.join(format!("cache{}", i)));
+            std::fs::create_dir(&tmp).unwrap();
+            drop(crate::isolated_areas::borrow(&[tmp.clone()]).unwrap());
+            let ino = std::fs::metadata(&tmp).unwrap().ino();
+            std::fs::remove_dir(&tmp).unwrap();
+            std::fs::create_dir(&cache).unwrap();
+            if std::fs::metadata(&cache).unwrap().ino() != ino {
+                continue;
+            }
+            std::os::unix::fs::symlink(d.join("v2"), cache.join("current")).unwrap();
+            let c = judge(&format!("{}/cache{}/current/x.txt", r, i));
+            assert!(c.is_ok(), "la carpeta nueva no es el área borrada: {:?}", c);
+            // La de verdad sigue siendo un área: un link adentro no se sigue.
+            std::fs::create_dir(&tmp).unwrap();
+            std::os::unix::fs::symlink(d.join("v2"), tmp.join("l")).unwrap();
+            let c = judge(&format!("{}/tmp{}/l/x.txt", r, i));
+            assert!(matches!(c, Err(crate::model::DenyCause::IsolatedArea(_))), "por el nombre: {:?}", c);
+            // Y si la nueva se delega, es un área por sí misma (no «la misma» que la borrada).
+            drop(crate::isolated_areas::borrow(&[cache.clone()]).unwrap());
+            std::os::unix::fs::symlink(d.join("v2"), cache.join("l")).unwrap();
+            let c = judge(&format!("{}/cache{}/l/x.txt", r, i));
+            assert!(matches!(c, Err(crate::model::DenyCause::IsolatedArea(_))), "delegada: {:?}", c);
+            let _ = std::fs::remove_dir_all(&d);
+            return;
+        }
+        eprintln!("el inodo no se reusó: no se prueba");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Ronda 6 (N2): lo mismo con un lugar fijado (un handle abierto, un `pin`). La carpeta prestada
+    /// con otro nombre (`alias` → `work`), un fd en `work/f.txt` y un nombre que hoy lleva a otro
+    /// lado (`x` → `other`): mientras está prestada, `InUse` por el fd; después, no coinciden y el fd
+    /// está en un área, así que se deniega igual.
+    #[cfg(unix)]
+    #[test]
+    fn a_fixed_place_in_a_folder_known_by_another_name() {
+        let d = scratch("alias-fixed").canonicalize().unwrap();
+        let r = slash(&d);
+        std::fs::create_dir_all(d.join("work")).unwrap();
+        std::fs::write(d.join("work").join("f.txt"), "x").unwrap();
+        std::fs::write(d.join("other").join("f.txt"), "x").unwrap();
+        std::os::unix::fs::symlink(d.join("work"), d.join("alias")).unwrap();
+        std::os::unix::fs::symlink(d.join("other"), d.join("x")).unwrap();
+        let run = synsema_core::run_scope::RunScope::new();
+        let _in = run.enter();
+        let (lit, real) = (format!("{}/x/f.txt", r), format!("{}/work/f.txt", r));
+        let judge = || {
+            let mut set = CapabilitySet::new("test");
+            set.grant(Capability::new(CapabilityType::FileRead, Some(format!("{}/**", r))));
+            let req = Capability::new(CapabilityType::FileRead, Some(lit.clone()));
+            synsema_core::capscope::with_physical(&lit, &real, || set.check_cause(&req, "t"))
+        };
+        let lent = crate::isolated_areas::borrow(&[d.join("alias")]).unwrap();
+        let c = judge();
+        assert!(matches!(c, Err(crate::model::DenyCause::AreaInUse(_))), "prestada: {:?}", c);
+        drop(lent);
+        let c = judge();
+        assert!(matches!(c, Err(crate::model::DenyCause::IsolatedArea(_))), "después: {:?}", c);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Un hijo falso que anota qué se le pidió.
+    struct Fake {
+        calls: Rc<RefCell<Vec<&'static str>>>,
+    }
+
+    impl Waitable for Fake {
+        type Status = i32;
+        fn try_wait(&mut self) -> std::io::Result<Option<i32>> {
+            self.calls.borrow_mut().push("try_wait");
+            Ok(Some(0))
+        }
+        fn wait(&mut self) -> std::io::Result<i32> {
+            self.calls.borrow_mut().push("wait");
+            Ok(0)
+        }
+    }
+
+    /// Ronda 2 (B1): aislado, nunca se recoge sin matar al grupo antes: con `exited` en falso no se
+    /// llama a `try_wait` (que recogería al hijo que salió recién); con `exited`, `kill` antes de `wait`.
+    #[test]
+    fn an_isolated_child_is_reaped_only_after_its_group_dies() {
+        let calls = Rc::new(RefCell::new(Vec::new()));
+        let mut c = Fake { calls: calls.clone() };
+        let kill = |_| calls.borrow_mut().push("kill");
+        use synsema_isolate::ChildState;
+        assert_eq!(wait_step(&mut c, Some(7), |_| ChildState::Running, kill).unwrap(), None);
+        assert!(calls.borrow().is_empty(), "{:?}", calls.borrow());
+        assert_eq!(wait_step(&mut c, Some(7), |_| ChildState::Exited, kill).unwrap(), Some(Some(0)));
+        assert_eq!(*calls.borrow(), ["kill", "wait"]);
+        calls.borrow_mut().clear();
+        // Ronda 3 (B1): sin zombie (SIGCHLD ignorado) no se espera al timeout.
+        assert_eq!(wait_step(&mut c, Some(7), |_| ChildState::Gone, kill).unwrap(), Some(Some(0)));
+        assert_eq!(*calls.borrow(), ["kill", "try_wait"]);
+        calls.borrow_mut().clear();
+        assert_eq!(wait_step(&mut c, None, |_| panic!("sin aislar no hay grupo"), kill).unwrap(), Some(Some(0)));
+        assert_eq!(*calls.borrow(), ["try_wait"]);
     }
 }

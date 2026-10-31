@@ -215,7 +215,8 @@ impl Delegation {
         if is_process_local(cap.ty) {
             return !(self.deterministic && matches!(cap.ty, CapabilityType::Time | CapabilityType::Random));
         }
-        self.layers().all(|layer| layer.iter().any(|allowed| allowed.covers(cap)))
+        self.layers()
+            .all(|layer| layer.iter().any(|allowed| allowed.covers(cap)) || Capability::layer_covers_split(layer.iter(), cap))
     }
 
     /// El `reason` de la entrada de audit (y el sufijo del mensaje) de un rechazo.
@@ -500,6 +501,32 @@ impl Capability {
         }
     }
 
+    /// v0.6.52 (L2, `specs/v0.6.52-modelos.md`): la mitad «en disco» de `covers`, sola: el tipo de
+    /// este grant cubre el pedido (como en `covers_by_name`) y la ruta pedida queda, en disco, dentro
+    /// del scope con su patrón. Sólo para rutas; lo demás no tiene mitad en disco.
+    fn covers_physically(&self, other: &Capability) -> bool {
+        let ty_ok = self.ty == other.ty
+            || (self.ty == CapabilityType::File && matches!(other.ty, CapabilityType::FileRead | CapabilityType::FileWrite));
+        if !ty_ok || !self.physical_scope_pair(other) {
+            return false;
+        }
+        match (&self.scope, &other.scope) {
+            (None, _) => true,
+            (Some(g), Some(r)) => synsema_core::capscope::path_within_physically(g, r),
+            (Some(_), None) => false,
+        }
+    }
+
+    /// v0.6.52 (L2): ¿una capa (los grants de un set, el techo del host, una capa delegada) cubre una
+    /// ruta que pasa por un link? Alguno de sus grants la cubre por nombre y alguno —puede ser otro—
+    /// la cubre en disco. Con dos grants (`./proj/**`, `./outside/**`) y `proj/out_link` →
+    /// `outside`, la ruta pasa. El programa ya alcanza ese lugar escribiéndolo directo: no se abre
+    /// nada nuevo. Sólo dentro de UNA capa: entre capas, cada una tiene que cumplir sola.
+    pub fn layer_covers_split<'a>(layer: impl IntoIterator<Item = &'a Capability> + Clone, requested: &Capability) -> bool {
+        layer.clone().into_iter().any(|g| g.physical_scope_pair(requested) && g.covers_by_name(requested))
+            && layer.into_iter().any(|g| g.covers_physically(requested))
+    }
+
     /// ¿Los dos scopes son rutas de disco (file/file.read/file.write, o una base SQLite)?
     fn physical_scope_pair(&self, other: &Capability) -> bool {
         let path_ty = |t: CapabilityType| {
@@ -751,6 +778,19 @@ fn cidr_contains(scope: &str, ip: std::net::IpAddr) -> Option<bool> {
     let (net, bits) = scope.split_once('/')?;
     let net: IpAddr = net.trim_start_matches('[').trim_end_matches(']').parse().ok()?;
     let bits: u32 = bits.parse().ok()?;
+    // Ronda 3 (B2): una red IPv4 escrita como IPv6 (`::ffff:10.0.0.0/104`) se compara como IPv4 con
+    // el prefijo menos 96, como `trust proxy` (`TrustedNet`). Antes nunca contenía nada.
+    if let IpAddr::V6(n6) = net {
+        if let (Some(n4), true) = (n6.to_ipv4_mapped(), bits >= 96) {
+            let IpAddr::V4(i) = ip.to_canonical() else { return Some(false) };
+            let b = bits - 96;
+            if b > 32 {
+                return Some(false);
+            }
+            let m = if b == 0 { 0 } else { u32::MAX << (32 - b) };
+            return Some(u32::from(n4) & m == u32::from(i) & m);
+        }
+    }
     Some(match (net.to_canonical(), ip.to_canonical()) {
         (IpAddr::V4(n), IpAddr::V4(i)) if bits <= 32 => {
             let m = if bits == 0 { 0 } else { u32::MAX << (32 - bits) };
@@ -838,6 +878,7 @@ pub fn private_dest_message(who: &str, dest: &str, ip: std::net::IpAddr, cause: 
             },
             dest
         ),
+        DenyCause::IsolatedArea(_) | DenyCause::AreaInUse(_) => what,
         DenyCause::NoGrant => format!(
             "{}; a `net` grant with a wildcard reaches only public addresses. Name it: `require net(\"{}\")`, its address or its CIDR (the scope can come from the configuration: `require net(env(\"…_URL\"))`)",
             what, dest
@@ -901,6 +942,12 @@ pub enum DenyCause {
     /// CALLER (bajo `serve` → 403 genérico), no del programa ni del host.
     Delegated(Delegation),
     NoGrant,
+    /// v0.6.52: la ruta pasa por un link dentro de una carpeta que un hijo aislado pudo escribir
+    /// (`isolated_areas`). La carpeta, para el mensaje.
+    IsolatedArea(String),
+    /// v0.6.52 (ronda 4, A1): la ruta pasa por una carpeta que un hijo aislado con escritura tiene
+    /// prestada ahora (corre todavía). La carpeta, para el mensaje.
+    AreaInUse(String),
 }
 
 /// El texto del techo, idéntico en todas las ramas (los clasificadores del audit
@@ -1162,8 +1209,32 @@ impl CapabilitySet {
     fn within_ceiling(&self, cap: &Capability) -> bool {
         match &self.ceiling {
             None => true,
-            Some(c) => c.iter().any(|allowed| allowed.covers(cap)),
+            Some(c) => c.iter().any(|allowed| allowed.covers(cap)) || Capability::layer_covers_split(c.iter(), cap),
         }
+    }
+
+    /// v0.6.52 (L2): los grants de ESTE set cubren una ruta que pasa por un link, uno por nombre y
+    /// otro en disco (`Capability::layer_covers_split`). Fuera de línea: sólo corre cuando ningún
+    /// grant la cubre solo.
+    #[cold]
+    #[inline(never)]
+    fn granted_split(&mut self, requested: &Capability, source: &str, audit: bool) -> bool {
+        if !Capability::layer_covers_split(self.granted.iter(), requested) {
+            return false;
+        }
+        if audit {
+            let by_name = self.granted.iter().find(|g| g.covers_by_name(requested)).map(|g| g.to_string()).unwrap_or_default();
+            let there = self.granted.iter().find(|g| g.covers_physically(requested)).map(|g| g.to_string()).unwrap_or_default();
+            self.push_audit(CapabilityAuditEntry {
+                capability: requested.clone(),
+                granted: true,
+                source: source.to_string(),
+                reason: format!("Granted by {} (the path) and {} (where a link on it leads)", by_name, there),
+                origin: "program",
+                context: None,
+            });
+        }
+        true
     }
 
     /// El primer techo DELEGADO que NO cubre la capability (si hay alguno). Sin techos
@@ -1349,6 +1420,11 @@ impl CapabilitySet {
                 context: None,
             });
         }
+        // v0.6.52 (ronda 4, A1): con `exec` puede haber hijos aislados que presten una carpeta: desde
+        // acá cada builtin sostiene lo que juzgó hasta volver (`op_hold`). Sólo si entra (ronda 5).
+        if capability.ty() == CapabilityType::Exec {
+            synsema_core::op_hold::enable();
+        }
         self.granted.insert(capability);
     }
 
@@ -1452,8 +1528,39 @@ impl CapabilitySet {
             }
         }
 
+        // 1.7) v0.6.52 (A2): una ruta que pasa por un link puesto dentro de una carpeta que un hijo
+        // aislado pudo escribir. No cuesta nada si nunca hubo una (`isolated_areas::crossing`).
+        if let Some(c) = crate::isolated_areas::crossing(requested) {
+            let (cause, reason) = match c {
+                crate::isolated_areas::Crossing::Link(a) => {
+                    let a = a.display().to_string();
+                    let r = format!("goes through a link inside {}, which an isolated child could write", a);
+                    (DenyCause::IsolatedArea(a), r)
+                }
+                crate::isolated_areas::Crossing::InUse(a) => {
+                    let a = a.display().to_string();
+                    let r = format!("reaches {}, which an isolated child is writing to right now", a);
+                    (DenyCause::AreaInUse(a), r)
+                }
+            };
+            if audit {
+                self.push_audit(CapabilityAuditEntry {
+                    capability: requested.clone(),
+                    granted: false,
+                    source: source.to_string(),
+                    reason,
+                    origin: "program",
+                    context: None,
+                });
+            }
+            return Err(cause);
+        }
+
         // 2) Grants.
         let granted_by: Option<Capability> = Capability::first_covering(&self.granted, requested).cloned();
+        if granted_by.is_none() && self.granted_split(requested, source, audit) {
+            return Ok(());
+        }
         if let Some(c) = granted_by {
             if audit {
                 self.push_audit(CapabilityAuditEntry {
@@ -1495,6 +1602,24 @@ impl CapabilitySet {
             });
         }
         Err(DenyCause::NoGrant)
+    }
+
+    /// v0.6.52 (auditoría r1, M1): un `deny` de `ty` (o de `file`) que puede nombrar, en disco,
+    /// algo dentro de la carpeta `folder_real` (`scope_reaches_inside`). Landlock no tiene reglas de
+    /// denegación: un `deny` debajo de una carpeta delegada al kernel sólo se cumple no delegándola.
+    pub fn deny_crossing(&self, ty: CapabilityType, folder_real: &str) -> Option<Capability> {
+        let hit = |d: &&Capability| {
+            (d.ty == ty || d.ty == CapabilityType::File)
+                && match d.scope() {
+                    None => true,
+                    Some(s) => synsema_core::capscope::scope_reaches_inside(s, folder_real),
+                }
+        };
+        self.denied
+            .iter()
+            .find(hit)
+            .cloned()
+            .or_else(|| self.parent.as_ref().and_then(|p| p.borrow().deny_crossing(ty, folder_real)))
     }
 
     /// v0.6.46 (E7): las capas de `net` de este set y de sus padres (ver `NetLayers`).
@@ -1654,6 +1779,8 @@ impl CapabilitySet {
     fn is_declared(&self, requested: &Capability) -> bool {
         self.granted.iter().any(|c| c.covers(requested))
             || self.rejected_by_ceiling.iter().any(|c| c.covers(requested))
+            || Capability::layer_covers_split(self.granted.iter(), requested)
+            || Capability::layer_covers_split(self.rejected_by_ceiling.iter(), requested)
             || self.parent.as_ref().map(|p| p.borrow().is_declared(requested)).unwrap_or(false)
     }
 
@@ -1696,6 +1823,14 @@ impl CapabilitySet {
                     requested
                 ),
             },
+            DenyCause::IsolatedArea(area) => format!(
+                "Capability not granted: {} — the path goes through a link inside {}, a folder an isolated child could write to (run with \"isolate\"), so the child may have put it there. Links inside that folder are not followed for the rest of the run: read what the child wrote by its real place, and remove a link it left with delete_file()",
+                requested, area
+            ),
+            DenyCause::AreaInUse(area) => format!(
+                "Capability not granted: {} — the path reaches {}, a folder a child isolated with write access is using right now (run with \"isolate\"): while it runs, nothing else touches that folder. Use it after that run returns",
+                requested, area
+            ),
             DenyCause::NoGrant => format!(
                 "Capability not granted: {} — this is a permission, not a bug: add `{}` to the program's preamble (or to the importing file, when this code runs in a module)",
                 requested,
@@ -2294,6 +2429,109 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// v0.6.52 (L2, `specs/v0.6.52-modelos.md`): una capa cubre una ruta que pasa por un link si un
+    /// grant la cubre por nombre y otro —de la misma capa— la cubre en disco. Cada aserción es una
+    /// fila de la tabla.
+    #[test]
+    fn l2_a_link_to_another_granted_place_is_covered_by_the_two_grants() {
+        let root = std::env::temp_dir().join(format!("synsema-v0652-l2-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for d in ["proj", "outside/secret", "etc"] {
+            std::fs::create_dir_all(root.join(d)).unwrap();
+        }
+        std::fs::write(root.join("outside/a.txt"), "x").unwrap();
+        std::fs::write(root.join("outside/k.key"), "x").unwrap();
+        std::fs::write(root.join("etc/passwd"), "x").unwrap();
+        let link = |at: &str, to: &str| {
+            #[cfg(windows)]
+            assert!(std::process::Command::new("cmd")
+                .args(["/C", "mklink", "/J"])
+                .arg(root.join(at.replace('/', "\\")))
+                .arg(root.join(to.replace('/', "\\")))
+                .output()
+                .unwrap()
+                .status
+                .success());
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(root.join(to), root.join(at)).unwrap();
+        };
+        link("proj/out_link", "outside");
+        link("proj/etc_link", "etc");
+        std::fs::create_dir_all(root.join("mid")).unwrap();
+        link("mid/l2", "outside");
+        link("proj/l1", "mid/l2");
+        let r = root.to_string_lossy().replace('\\', "/");
+        let p = |ty: CapabilityType, s: &str| cap(ty, Some(&format!("{}/{}", r, s)));
+        use CapabilityType::{File, FileRead as R, FileWrite as W};
+        let via = |ty| p(ty, "proj/out_link/a.txt");
+        let set = |grants: &[Capability]| {
+            let mut s = CapabilitySet::new("t");
+            for g in grants {
+                s.grant(g.clone());
+            }
+            s
+        };
+        let ok = |s: &mut CapabilitySet, req: &Capability| s.check_cause(req, "t").is_ok();
+
+        // L2-1: los dos lugares concedidos → pasa, y el audit nombra los dos grants.
+        let mut s = set(&[p(R, "proj/**"), p(R, "outside/**")]);
+        assert!(ok(&mut s, &via(R)), "L2-1");
+        assert!(s.audit_log.iter().any(|e| e.granted && e.reason.contains("(the path) and") && e.reason.contains("outside")), "L2-1 audit");
+        // L2-2: un grant que cubre los dos, como antes.
+        assert!(ok(&mut set(&[p(R, "**")]), &via(R)), "L2-2");
+        // L2-3: el patrón del destino se aplica en disco.
+        let mut s = set(&[p(R, "proj/**"), p(R, "outside/*.txt")]);
+        assert!(!ok(&mut s, &p(R, "proj/out_link/k.key")), "L2-3");
+        assert!(ok(&mut s, &via(R)), "L2-3 (.txt sí)");
+        // L2-4: el destino sin conceder, con el mensaje de siempre.
+        let mut s = set(&[p(R, "proj/**")]);
+        let e = s.require(&via(R), "t").unwrap_err();
+        assert!(e.message.contains("grant the place the link points to"), "L2-4: {}", e.message);
+        // L2-5: falta el nombre.
+        assert!(!ok(&mut set(&[p(R, "outside/**")]), &via(R)), "L2-5");
+        // L2-6 / L2-7: tipos distintos no se combinan.
+        assert!(!ok(&mut set(&[p(R, "proj/**"), p(W, "outside/**")]), &via(R)), "L2-6");
+        assert!(!ok(&mut set(&[p(W, "proj/**"), p(R, "outside/**")]), &via(W)), "L2-7");
+        // L2-8: `file` cubre `file.read` por nombre.
+        assert!(ok(&mut set(&[p(File, "proj/**"), p(R, "outside/**")]), &via(R)), "L2-8");
+        // L2-9: un `deny` del destino va primero.
+        let mut s = set(&[p(R, "proj/**"), p(R, "outside/**")]);
+        s.deny(p(R, "outside/secret/**"));
+        assert!(matches!(s.check_cause(&p(R, "proj/out_link/secret/x"), "t"), Err(DenyCause::ExplicitlyDenied(_))), "L2-9");
+        // L2-10 / L2-11: el techo del host es una capa: tiene que cumplir sola.
+        let mut s = CapabilitySet::new("t");
+        s.ceiling = Some(Rc::new(vec![p(R, "proj/**")]));
+        s.grant(p(R, "proj/**"));
+        s.grant(p(R, "outside/**"));
+        assert!(!ok(&mut s, &via(R)), "L2-10");
+        let mut s = CapabilitySet::new("t");
+        s.ceiling = Some(Rc::new(vec![p(R, "proj/**"), p(R, "outside/**")]));
+        s.grant(p(R, "proj/**"));
+        s.grant(p(R, "outside/**"));
+        assert!(ok(&mut s, &via(R)), "L2-11");
+        // L2-12: una capa delegada que no cubre el destino.
+        let mut s = set(&[p(R, "proj/**"), p(R, "outside/**")]);
+        s.push_delegation(Delegation::block(vec![p(R, "proj/**")]));
+        assert!(!ok(&mut s, &via(R)), "L2-12");
+        let mut s = set(&[p(R, "proj/**"), p(R, "outside/**")]);
+        s.push_delegation(Delegation::block(vec![p(R, "proj/**"), p(R, "outside/**")]));
+        assert!(ok(&mut s, &via(R)), "L2-12 (con los dos)");
+        // L2-13: links encadenados (`proj/l1` → `mid/l2` → `outside`, `mid` sin conceder): cuenta el
+        // destino final.
+        assert!(ok(&mut set(&[p(R, "proj/**"), p(R, "outside/**")]), &p(R, "proj/l1/a.txt")), "L2-13");
+        assert!(!ok(&mut set(&[p(R, "proj/**"), p(R, "mid/**")]), &p(R, "proj/l1/a.txt")), "L2-13 (mid no es el destino)");
+        // L2-14: un archivo que todavía no existe (escritura).
+        assert!(ok(&mut set(&[p(W, "proj/**"), p(W, "outside/**")]), &p(W, "proj/out_link/nuevo.txt")), "L2-14");
+        // L2-15: el link a un lugar no concedido.
+        assert!(!ok(&mut set(&[p(R, "proj/**"), p(R, "outside/**")]), &p(R, "proj/etc_link/passwd")), "L2-15");
+        // Entre padre e hijo no se combinan (cada set es su capa).
+        let parent = Rc::new(RefCell::new(set(&[p(R, "outside/**")])));
+        let mut child = set(&[p(R, "proj/**")]);
+        child.parent = Some(parent);
+        assert!(!ok(&mut child, &via(R)), "padre + hijo");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn canon_url_strips_credentials_port_query_case() {
         assert_eq!(
@@ -2563,6 +2801,12 @@ pub fn build_ceiling(sandbox: bool, cap_set: Option<&str>) -> Result<Option<Vec<
                 };
                 match capability_type_from_name(name) {
                     Some(ty) => {
+                        // v0.6.52: `net=localhost:*` no concedía nada; es un error, como en `require`.
+                        if let (CapabilityType::Net, Some(e)) =
+                            (ty, scope.as_deref().and_then(synsema_core::capscope::net_scope_error))
+                        {
+                            return Err(format!("--cap-set: {}", e));
+                        }
                         let cap = Capability::new(ty, scope);
                         // v0.6.46 (E1): `secret=K@h` ata K a sus hosts, con la gramática de una
                         // atadura (nada de `*` suelto).
@@ -3243,5 +3487,25 @@ mod t2_tests {
             }
         }
         assert_eq!(seen.len(), 1, "{:?}", seen);
+    }
+}
+
+#[cfg(test)]
+mod v0652_cidr_tests {
+    use super::cidr_contains;
+
+    /// Ronda 3 (B2): una red IPv4 escrita como IPv6 se compara como IPv4 con el prefijo menos 96;
+    /// antes nunca contenía nada. Un prefijo fuera de rango no contiene nada (y no entra en pánico).
+    #[test]
+    fn an_ipv4_network_written_as_ipv6_contains_its_ipv4_addresses() {
+        let ip = |s: &str| s.parse::<std::net::IpAddr>().unwrap();
+        assert_eq!(cidr_contains("::ffff:10.0.0.0/104", ip("10.1.2.3")), Some(true));
+        assert_eq!(cidr_contains("::ffff:10.0.0.0/104", ip("::ffff:10.1.2.3")), Some(true));
+        assert_eq!(cidr_contains("::ffff:10.0.0.0/104", ip("11.0.0.1")), Some(false));
+        assert_eq!(cidr_contains("::ffff:10.0.0.0/129", ip("10.0.0.1")), Some(false));
+        assert_eq!(cidr_contains("::ffff:10.0.0.0/96", ip("192.168.0.1")), Some(true));
+        assert_eq!(cidr_contains("10.0.0.0/8", ip("10.9.9.9")), Some(true));
+        assert_eq!(cidr_contains("fd00::/8", ip("fd12::1")), Some(true));
+        assert_eq!(cidr_contains("fd00::/8", ip("10.0.0.1")), Some(false));
     }
 }
