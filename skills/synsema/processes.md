@@ -20,7 +20,16 @@ run(cmd, args_list?, timeout?, opts?) -> map
 - `cmd` (text): the command. **Capability scope is checked against `cmd` as written** (before PATH resolution).
 - `args_list` (list, optional): one argument per element. Absent = no args. Non-list → error.
 - `timeout` (number, optional): seconds. **Default 120.** On expiry: kill the process and **raise**.
-- `opts` (map, optional): `{cwd, env, stdin, max_output}`.
+- `opts` (map, optional): `{cwd, env, stdin, max_output, env_clean, isolate, max_memory_mb}`.
+  **An option `run` does not know is an error and nothing runs (v0.6.52+, breaking)** — a typo used
+  to pass silently (`{"isolated": true}` ran the child unconfined):
+  ``run: unknown option "isolated" (valid options: cwd, stdin, max_output, env, env_clean, isolate, max_memory_mb) — nothing ran``.
+  Options that are not a map are an error too: ``run: options must be a map, got text — nothing ran``.
+  `proc_spawn` checks its own options the same way.
+- **`..` after a folder in the program is an error (v0.6.52+)**, and in `cwd` when the program is
+  named with a path: the permission check read `./x/../tool` by name as `./tool`, but the system ran
+  the `tool` next to wherever `x` leads. Write the path without it:
+  ``run: the program "./data/../tool" has `..` after a folder: the system resolves it on disk (from where a link in the path leads) and the permission check by name, so they would judge different places — write the path without it``.
 - **`cwd` + a relative command (v0.6.46+, BREAKING):** a command with a path separator (`./tool`,
   `bin/tool`) resolves against `cwd`, like `cd sub && ./tool`, and **that** is the scope to grant:
   `run("./tool.bat", [], 60, {"cwd": "sub"})` (and `proc_spawn("./tool.bat", [], {"cwd": "sub"})`) ask
@@ -116,6 +125,103 @@ print(r["stdout"])
 create children with `CREATE_NO_WINDOW` when the process has no console — before, each child
 (`ssh`, `git`, `powershell`) got its own visible console window, and closing it killed the child.
 From a terminal nothing changes: the child shares the console, so `ssh` can still ask for a password.
+
+**Exit codes when synsema was started with `SIGCHLD` ignored (Linux, v0.6.52+).** A launcher that
+ignores `SIGCHLD` (some supervisors, `perl -e '$SIG{CHLD}="IGNORE"; exec …'`) used to make every
+`run` return `exit_code: -1`. synsema now restores the default at start, so `run` reports the real
+code, and its children no longer inherit `SIGCHLD` ignored either.
+
+## An untrusted child, isolated by the kernel — `{"isolate": …}` (v0.6.52+, Linux)
+
+`require exec` decides **which** program runs; it says nothing about what that program does once
+it runs. For code you don't trust — a script an LLM wrote, a user's plugin, a build step of a
+repository you just cloned — add `"isolate"`: the kernel confines the child (Landlock, seccomp,
+resource limits, its own process group), so it reads the system and only what you hand it, writes
+only where you say, and has no network.
+
+```synsema
+require exec("/bin/sh")
+require file.read("./data/**")
+require file.read("./out/**")
+require file.write("./out/**")
+let r be run("/bin/sh", ["-c", "cat data/in.csv > out/copy.csv"], 30,
+    {"isolate": {"file.read": "./data/**", "file.write": "./out/**"}})
+print(r["isolation"])     -- {landlock_abi: 7, network: "none", max_memory_mb: nothing}
+```
+
+- **`"isolate": true`** — nothing but the system: the child reads `/usr`, `/bin`, `/sbin`, `/lib*`,
+  `/etc` and `/opt`, uses `/dev/null`, `/dev/zero`, `/dev/full`, `/dev/random` and `/dev/urandom`, and
+  writes only in a temporary folder of its own, which is its `HOME` and `TMPDIR` and is deleted when
+  it ends.
+- **A map hands it more:** `{"file.read": …, "file.write": …}`, each a path or a list of paths.
+  - **The kernel grants whole folders or single files:** `"./data/**"` is the folder,
+    `"./data/a.csv"` the file. Anything else is an error, and nothing runs:
+    - a pattern: ``run: "isolate" path "./data/*.csv": the kernel grants whole folders ("./data/**") or single files ("./data/a.csv"), not a pattern — nothing ran``;
+    - a folder without `/**`: ``run: "isolate" path "./data" is a folder: grant it as "./data/**" (the child gets everything inside)``;
+    - a file with `/**`: ``run: "isolate" path "./data/in.csv/**" is a file: grant it without "/**"``;
+    - a path that does not exist: ``run: "isolate" path "./nope/**": No such file or directory (os error 2) — the kernel grants what exists (make_dir() it first)``.
+  - **You can only delegate what the program holds.** Each path needs the program's own grant;
+    without it, the usual ``Capability not granted: file_read("./data/**") … add `require file.read("./data/**")` ``.
+  - **A child reads what it may write**, so `file.write` needs `file.read` of the same path too:
+    ``run: "isolate" {"file.write": "./out/**"} also lets the child read it: the program needs `file.read("./out/**")` too — nothing ran``.
+  - **The paths are the program's, not the child's.** They resolve against the program's working
+    folder; `cwd` only moves where the child starts (`{"isolate": {"file.read": "./data/**"}, "cwd": "./data"}`
+    lets the child read `a.txt`).
+  - Where it may write, the child creates files, folders and links, but not FIFOs or sockets (FIFOs
+    only in its temporary folder).
+  - Other keys are errors: ``run: "isolate" takes "file.read" and "file.write" (a path or a list), not "exec"``,
+    and for `net`: ``run: an isolated child has no network yet ("net" in "isolate" comes with the proxy that enforces the program's net grants) — nothing ran``.
+- **The program itself.** One named with a path (`"./tools/build.sh"`) can always be read to start;
+  whatever else it reads (`data/a.txt`) has to be delegated. One found on the `PATH` outside the
+  system folders (a virtualenv, `~/.local/bin`) cannot start until its folder is in `file.read`:
+  ``run: cannot start "mytool": Permission denied (os error 13) — an isolated child sees only the system folders and what "isolate" grants: the program has to be inside them (a venv: add its folder to "file.read")``.
+  A file without the execute bit says so instead: ``… — the file is not executable (chmod +x)``.
+- **Its environment is clean:** `PATH` and `LANG` of the program, its own `HOME` and `TMPDIR`, plus
+  what `env` adds. Nothing else is inherited.
+- **No network:** opening a socket fails (`PermissionError: [Errno 1] Operation not permitted` in
+  Python). Pipes and `socketpair` between its own processes work.
+- **It cannot reach other processes:** it cannot signal or trace a process outside its own tree
+  (`kill: … Operation not permitted`), cannot read `/proc` or the kernel log, cannot create
+  namespaces, mount anything or use `io_uring`. So **`ps` does not work, and neither does Python's
+  `multiprocessing`** (its locks need `/dev/shm`): `PermissionError: [Errno 13] Permission denied`.
+- **Memory — `"max_memory_mb"`** caps the address space of each process the child runs
+  (`{"isolate": true, "max_memory_mb": 512}`; Python raises `MemoryError` past it). It works only
+  with `isolate`: ``run: max_memory_mb is enforced only for an isolated child — add "isolate" (e.g. {"isolate": true, "max_memory_mb": 512})``.
+- **The result says what the kernel enforced:** `isolation: {landlock_abi, network: "none", max_memory_mb}`
+  next to `exit_code`/`stdout`/`stderr`. `timeout` works as usual (``run: "/bin/sleep" timed out after 1s``).
+- **When `run` returns, everything the child started has been killed too** (`sh -c "sleep 37 & echo started"`
+  leaves no `sleep`). A process stuck in the kernel is waited for up to 2 s.
+
+**The folders it may write to are guarded for the rest of the run.** The child could replace a
+folder there with a link to somewhere no grant names, so:
+- **No path the program names that goes through a link inside such a folder is followed** — files,
+  databases, the program to `run` and its `cwd`. What the child wrote is read as usual; a link it
+  left is refused, and `delete_file` removes it:
+  ``Capability not granted: file_read("out/lnk/secret.txt") — the path goes through a link inside /…/out, a folder an isolated child could write to (run with "isolate"), so the child may have put it there. Links inside that folder are not followed for the rest of the run: read what the child wrote by its real place, and remove a link it left with delete_file()``.
+- **While the child runs, the folder is lent to it:** no path the program names that goes through
+  it or ends in it is granted — under any name for that place (other capitals where the file system
+  ignores them, a bind mount) — and no other isolated child receives it. Read it after `run`
+  returns. From another task or agent meanwhile:
+  ``Capability not granted: file_read("out/res.txt") — the path reaches /…/out, a folder a child isolated with write access is using right now (run with "isolate"): while it runs, nothing else touches that folder. Use it after that run returns``.
+- Before the child starts, `run` waits up to 10 s for what another task is already doing in the
+  folder; if it has not finished: ``run: another task is still using …, which reaches … (a folder this child would write to); try again when it finishes — nothing ran``.
+  If a process of the child outlives the 2 s after it ends, the folder stays lent for the rest of
+  the run.
+- Isolated `run`s start one at a time, then run in parallel.
+
+**Where it cannot be enforced, it fails closed — nothing runs:**
+- Windows and macOS: ``run: isolate is available on Linux only for now (this is windows); macOS and Windows are planned — nothing ran, rather than run without isolation``.
+- A kernel older than 6.12, or with Landlock off: an error that starts
+  ``run: isolate needs Landlock ABI 6 or newer (Linux 6.12+); this kernel …`` and says which ABI it
+  found (or that Landlock is off), ending in ``— nothing ran, rather than run without isolation``.
+- **An engine older than v0.6.52 ignores `isolate` and runs the child unconfined.** Pin the engine
+  (or check `r["isolation"]`) before you rely on it.
+- `proc_spawn` does not take it yet: ``proc_spawn: "isolate" comes in a later version — use run(…, {"isolate": …}) for an isolated child; nothing ran``.
+
+**What it is not.** It shares the host's kernel and its `/etc`: unlike a container, the child sees
+the host's `/etc` and the numbers of other processes; unlike Docker's default, it has no network. For
+hostile code from several tenants on one machine the right tool is still a microVM. Network through
+a proxy that enforces the program's `net` grants, `proc_spawn`, Windows and macOS come later.
 
 ## Run **Synsema** under a ceiling — `run_program` (v0.6.14+)
 
@@ -459,6 +565,8 @@ with the interpreter that opened it.
 - Cancellation (route `timeout`, shutdown, `agent_stop`) kills the children of `run`/`proc_spawn` — they don't survive the handler.
 - No pipes/redirects/globs in `run` itself — use a shell for those.
 - `run` has no TTY/interactivity (capture only) — for `vim`/prompts use `proc_spawn(..., {pty: true})`.
+- `exec` picks the program; it does not confine it. For code you don't trust add `{"isolate": …}` (Linux 6.12+, v0.6.52+): an older engine ignores the option and runs the child unconfined.
+- Under `isolate`: no network, no `/proc` (`ps` fails), no `/dev/shm` (Python `multiprocessing` fails), and a folder delegated for writing is lent to the child while it runs — read it after `run` returns.
 - `exit_code != 0` does NOT raise; `raise(...)` yourself if you want failure.
 - Default timeout 120s — pass a larger one for long commands.
 - Cross-platform: resolves via PATH (`.exe` on Windows); `bash` isn't on stock Windows (use powershell);

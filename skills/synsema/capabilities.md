@@ -374,6 +374,21 @@ every run; with `require llm` and `require llm("clientes")`, a public `generate`
   dotted (`file.raed` → `file.read`) and inside a task/agent; `synsema check` reports it too. The
   audit forms `file_read`/`file_write` still load.
 - `net` scope is a host, or `host:port` when a port is written (v0.6.29+): `net("api.x.com")` covers every port of that host; `net("localhost:8545")` or `net("http://localhost:8545/")` covers only port 8545, and a call to `http://localhost:8546/` is denied. IPv6 with a port is `net("[::1]:8545")`. A URL is stored without credentials, path or query.
+- **A port that is not a port is an error (v0.6.52+, breaking).** `net("localhost:*")` used to load and
+  grant nothing (it named a host called `localhost:*`). The port is a number from 1 to 65535 written
+  with digits only, or absent — `net("localhost")` already reaches every port. It holds wherever a
+  `net` scope comes in: a literal `require` (a load error, so `synsema check` reports it), a computed
+  one, `require secret(…) for net(…)`, `--cap-set` and the caps of `captoken_mint`/`captoken_attenuate`:
+  - ``net("localhost:*"): the port is a number from 1 to 65535, written with digits only, or nothing — `net("localhost")` already reaches every port of localhost, `net("localhost:8080")` only that one; this scope granted nothing``
+    (also `localhost:+8080`, `localhost:70000`);
+  - ``net("localhost:08080"): write the port without leading zeros (`localhost:8080`); this scope granted nothing``;
+  - ``net("[::1]x"): after `]` comes nothing or `:` and a port (`[::1]:8080`); this scope granted nothing``;
+  - ``net("10.0.0.0/33"): an IPv4 CIDR's prefix is a number from 0 to 32, without leading zeros (`10.0.0.0/8`); this scope granted nothing``
+    (IPv6: 0 to 128). An IPv4 network written as IPv6 (`::ffff:10.0.0.0/104`) needs a prefix from 96
+    to 128 and contains those IPv4 addresses.
+  - **IPv6 with a port goes in brackets.** Without them the whole text is the address:
+    `net("::1:8080")` loads, but it is the IPv6 address `::1:8080`, so `http_get("http://[::1]:8080/")`
+    is `Capability not granted: net("[::1]:8080")`. Write `net("[::1]:8080")`.
 - **Path scopes are globs by segment (v0.6.45+)**, like gitignore and shell globs:
   - `*` and `?` match **inside one path segment**: `file.read("./data/*")` = the files directly in `./data`; `file.read("*.csv")` = the `.csv` files of the working directory, not every `.csv` on the disk.
   - `**` crosses folders: `file.read("./data/**")` = everything below `./data` **and `./data` itself**.
@@ -385,6 +400,9 @@ every run; with `require llm` and `require llm("clientes")`, a public `generate`
 - **Links are judged where they lead (v0.6.45+).** `use`, the `file`/`file.read`/`file.write` scopes (the program's `require`, the host ceiling, a delegated ceiling) and `grep` check where a path really leads, not only its name:
   - A link that IS part of the granted path (the project reached through a link, `./data` itself a link) works.
   - A symlink or junction **below** the grant that leads outside is refused: `Capability not granted: file_read("data/ext/s.txt") — by name the path is inside the granted scope, but a link (symlink or junction) on the way leads outside it. … grant the place the link points to, or remove the link`. Same for `use "./ext/o.syn"` through a link.
+  - **A link to another granted place works with the two grants (v0.6.52+).** With `file.read("./proj/**")` and `file.read("./outside/**")`, reading, listing or looking at `./proj/out_link/x.txt` where `out_link` leads to `./outside` works: the path is judged by the grant that covers its name, where it really leads by the grant that covers that place. Both grants have to be in the same layer (the program, the host ceiling, a `sandbox under`, a token). With only `./proj/**` it is refused as above (before v0.6.52 it was refused even with both).
+  - **`delete_file` of a link removes the link and is judged where the link is (v0.6.52+)**, not where it leads, like `unlink`: with `file.write("./out/**")`, `delete_file("./out/link")` works even when the link leads outside `./out`, and the target is untouched.
+  - **Links inside a folder an isolated child may write to are not followed** for the rest of the run, and while that child runs the folder is lent to it — see [processes.md](processes.md) § An untrusted child, isolated by the kernel.
   - A `deny` of a place also catches a path that reaches it through a link. A broken link is judged where it points (writing through `data/log.txt -> ~/.ssh/authorized_keys` is refused); a path that cannot be resolved is refused.
   - `grep` does not follow links to folders (it skips them) and respects a `deny` inside the tree. `list_dir`/`file_info` mark links with `is_link`.
   - **A link swapped between the check and the open (v0.6.46+, Linux + Windows)** no longer escapes:

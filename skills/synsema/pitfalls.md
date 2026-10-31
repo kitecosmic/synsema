@@ -17,13 +17,28 @@ Read this FIRST if something fails. Each row is a real mistake that costs hours 
 > Coming from Python? The traps that LOOK like Python but aren't are also collected in
 > [python-diff.md](python-diff.md).
 
+## Upgrading to v0.6.52 — what behaves differently
+
+| You see | What changed | What to write |
+|---|---|---|
+| ``net("localhost:*"): the port is a number from 1 to 65535, written with digits only, or nothing — …`` (a load error; `synsema check` reports it) | a `net` scope whose port is not a port is an error everywhere a scope comes in (`require`, computed `require`, `secret … for net(…)`, `--cap-set`, captokens); it used to load and grant nothing | `net("localhost")` (every port) or `net("localhost:8080")`; no leading zeros; IPv6 with a port in brackets: `net("[::1]:8080")` |
+| ``run: unknown option "isolated" (valid options: …) — nothing ran`` / ``run: options must be a map, got text — nothing ran`` | `run` and `proc_spawn` reject options they do not know (a typo used to pass silently: `"isolated"` ran the child unconfined) | spell the option right; keep your own keys out of the options map |
+| ``proc_spawn: "isolate" comes in a later version — use run(…, {"isolate": …}) for an isolated child; nothing ran`` | `proc_spawn` used to accept `"isolate"` and ignore it | `run(…, {"isolate": …})`; isolation for long-lived processes comes later |
+| ``run: the program "./x/../tool" has `..` after a folder: … — write the path without it`` | `..` after a folder in the program of `run`/`proc_spawn` (and in `cwd` with a program named by path) is an error | write the path without `..` (`./tool`) |
+| reading `./proj/link/x.txt` works where it was refused | a link to another granted place works when one grant covers the path and another (in the same layer) where it leads | nothing; with only the first grant it is still refused |
+| `delete_file("./out/link")` works where it was refused | `delete_file` of a link removes the link and is judged where the link is, like `unlink` | nothing; the target is untouched |
+| `run` reports the real `exit_code` where it gave `-1` | synsema restores `SIGCHLD` at start when its launcher ignored it (Linux) | nothing |
+| ``Cannot set index on a server response: … read-only — build a new one instead (…)`` | the message says what to do (it was `Cannot set index on map`) | `fail(500, msg)`, `respond(r["body"], r["content_type"], 500)`, `with_header(r, name, value)` |
+| ``term_write: expected a terminal handle from term_open(), got nothing — term_open() gives nothing when there is no terminal …`` | a missing handle names the builtin that gives it (it said `… from ws_connect()` for every kind) | open it with the builtin the message names; for a terminal, fall back to `read_line` when `term_open()` gives `nothing` |
+| `synsema check`/`ast`/`openapi`/`code`/`build` of a deeply nested program parse it (v0.6.51 crashed with a stack overflow on a 400-level program) | they parse on the engine's thread, like `run` | nothing |
+
 ## Upgrading to v0.6.51 — what behaves differently
 
 | You see | What changed | What to write |
 |---|---|---|
 | ``Capability not granted: stdout — a `sandbox` block denies every capability, whatever the program declares; stdout is the process's: a `sandbox under {…}` block (also `sandbox under {}`) lets it through …`` | **breaking:** `print`/`eprint`/`show`/`log`/`term_write` inside a plain `sandbox` fail, every time (without a ceiling `print` used to go through) | compute in the block and print after (`let r be 0` / `sandbox` / `set r to f(x)` / `print(r)`), or `sandbox under {}` (see capabilities.md § Sandbox blocks) |
 | `term_write` fails with `Capability not granted: stdout` under `--cap-set stdin` | `term_write` asks for `stdout` like `print` (it skipped the check) | add `stdout` to the ceiling; `require stdin` still opens the terminal |
-| a link's row in `list_dir` says `is_dir: false` where it said `true` | the target is looked at only if the program could read the link: one grant must cover both the link's path and where it leads | check `is_link` before walking; grant a folder that covers both (`file.read("./**")`) if the program should follow it |
+| a link's row in `list_dir` says `is_dir: false` where it said `true` | the target is looked at only if the program could read the link: the link's path and where it leads must both be covered (by one grant, or since v0.6.52 by two in the same layer) | check `is_link` before walking; grant where the link leads too (`file.read("./outside/**")`, or one folder that covers both) if the program should follow it |
 | ``captoken_attenuate: "127.0.0.1:8080" is a private address and the token reaches it only where its issuer named it — a wildcard (`*`, or `net` without a scope) reaches only public addresses …`` | a token is the intersection of all its blocks; a hand-made block that does it makes `captoken_verify` give `nothing` | the issuer mints a token that names the private address (`{"net": "127.0.0.1"}`) |
 | a `run_program` child gets ``… a private address; the ceiling of the program that called run_program reaches only public addresses for it: name it there …`` | the child inherits every layer of its caller; a caller with `net("*")` reaches only public addresses | name the address in the caller (`require net("127.0.0.1:47999")`) |
 | `run_program: the caller's capabilities are too many to pass to the child (N bytes; the limit is 30000)` / `… the child's command line would be N characters …` | it used to fail with `os error 206` on Windows only | fewer, wider grants (`**`); a shorter `filename` |
