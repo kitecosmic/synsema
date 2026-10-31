@@ -39,6 +39,18 @@ jobs:
             ~/.cargo/git
             engine/target
           key: ${{ runner.os }}-cargo-${{ hashFiles('engine/Cargo.lock') }}
+      # v0.6.52: los tests de synsema-isolate se saltan sin decir nada donde el kernel no tiene
+      # Landlock ABI ≥ 6 (allí sólo comprueban que falle cerrado), y el de `unshare` donde no hay
+      # espacios de usuario sin privilegios (Ubuntu los restringe por AppArmor). Acá tienen que correr:
+      # si el runner no puede, el CI falla en vez de dar verde sin haber probado el aislamiento.
+      - name: The runner can test isolation (Landlock ABI >= 6, unprivileged user namespaces)
+        run: |
+          uname -r
+          python3 -c "import ctypes,sys; abi=ctypes.CDLL(None,use_errno=True).syscall(444,None,0,1); print('landlock abi', abi); sys.exit(0 if abi >= 6 else 1)"
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          unshare -Urpf --kill-child --mount-proc true
       - name: Test
         run: cargo test --locked --manifest-path engine/Cargo.toml --workspace
 
