@@ -6,7 +6,7 @@ Each says what changed, why, and what to write instead.
 
 Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the release date.
 
-## v0.6.53 — unreleased
+## v0.6.53 — 2026-11-01
 
 **Behavior changes (read these first).**
 - **A `secret()` passed to the child of `run` is an error.** In `env` the child got the text
