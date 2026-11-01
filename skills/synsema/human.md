@@ -77,7 +77,7 @@ serve on 8080
   that waits gives when nobody answers: `false`, or for `ask … with [options]` the first option
   **as text** (`""` without options). Console: `approval … timed out: ran decided`.
 - **It survives a restart.** What is pending is kept in `.synsema/state/approvals-<port>.json` (in
-  the folder `serve` runs from), or in `SYNSEMA_STATE_DIR`: one entry per approval with `id`,
+  the program's folder, not the working directory), or in `SYNSEMA_STATE_DIR`: one entry per approval with `id`,
   `type`, `message`, `options`, `task`, `expires_at` and **`token_sha256`** — a hash, never the
   token. After a restart the same `GET /approvals` lists it and the token printed before still
   answers it. A program that never uses `then` writes nothing there (no folder, no file).
