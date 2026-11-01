@@ -21,8 +21,10 @@ regex.workspace = true
 
 # v0.6.46 (E8): abrir sin seguir links (`nofollow.rs`). Las dos ya estaban en el árbol: rustix (Unix,
 # por crossterm/tempfile) y windows-sys 0.52 (stdlib, Job Objects). Sólo se suman features.
-[target.'cfg(target_os = "linux")'.dependencies]
-rustix = { version = "1", features = ["fs"] }
+# v0.6.53 (ronda 2, R2-3): rustix en todo Unix, para que macOS abra el estado privado igual que
+# Linux (`O_NOFOLLOW` + dueño).
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", features = ["fs", "process"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.52", features = ["Wdk_Foundation", "Wdk_Storage_FileSystem", "Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Kernel", "Win32_System_WindowsProgramming"] }

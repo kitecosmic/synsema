@@ -291,6 +291,13 @@ pub const ENV_EXAMPLE: &str = r#"# Config del proyecto — Synsema auto-carga el
 # cancelan. 0 = inmediato. Un segundo Ctrl-C durante el drain sale ya (codigo 130):
 # SYNSEMA_SHUTDOWN_GRACE=10
 
+# Traspaso sin corte (Linux/macOS): con 1, el puerto se abre con SO_REUSEPORT y un proceso
+# nuevo puede escuchar en el mismo puerto mientras el viejo drena (arrancar el nuevo,
+# esperar que responda, SIGTERM al viejo). Sin esto un segundo serve en el mismo puerto es
+# un error. Con systemctl restart conviene la activacion por socket (synsema.socket con
+# ListenStream=): systemd mantiene el puerto y synsema lo toma solo (LISTEN_FDS).
+# SYNSEMA_REUSE_PORT=1
+
 # Heartbeat de los `stream` SSE: comentario `: keepalive` (invisible para EventSource)
 # tras N segundos sin frames, asi proxies y browsers no cortan streams ociosos. 0 apaga:
 # SYNSEMA_SSE_KEEPALIVE=15
@@ -436,6 +443,8 @@ const HELLO_SYN_PAST: &[&str] = &[
 
 /// sha256 de cada contenido histórico de `.env.example` (ver `InitFile::past`).
 const ENV_EXAMPLE_PAST: &[&str] = &[
+    // v0.6.52: antes de SYNSEMA_REUSE_PORT (el traspaso sin corte).
+    "ec3524a98aaae12f54cf4857dbb5e3ddbf3cac7fe5e79f33921fe37c38b55163",
     // v0.6.50: el skill se instalaba con `install-skill.sh` (sólo ~/.claude/skills).
     "9397e3ebc940e69afbd7bb3e548925e92d5ccd347b9dd65d8ccd4f797cd6fd65",
     // v0.6.46 (E6): antes de SYNSEMA_AUDITOR_KEY y SYNSEMA_RECEIPT_SEALED_BYTES (el recibo sellado).

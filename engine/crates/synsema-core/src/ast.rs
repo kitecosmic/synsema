@@ -520,6 +520,9 @@ pub enum NodeKind {
         /// respuesta humana antes de denegar fail-closed. `None` = sin `within`
         /// (decide el knob/default del host).
         timeout: Option<f64>,
+        /// v0.6.53 (G3): `then <task>`: el gate no bloquea; devuelve el id de la pendiente y la
+        /// respuesta (o el vencimiento) llama `task(decisión, mensaje, id)`.
+        then: Option<String>,
     },
     ShowStatement {
         value: Box<Node>,
@@ -529,12 +532,16 @@ pub enum NodeKind {
         message: Box<Node>,
         /// `within` opcional (ver `ApproveStatement::timeout`).
         timeout: Option<f64>,
+        /// `then <task>` opcional (ver `ApproveStatement::then`).
+        then: Option<String>,
     },
     AskExpression {
         prompt: Box<Node>,
         options: Option<Box<Node>>,
         /// `within` opcional (ver `ApproveStatement::timeout`).
         timeout: Option<f64>,
+        /// `then <task>` opcional (ver `ApproveStatement::then`).
+        then: Option<String>,
     },
 
     // -- LLM / Razonamiento --

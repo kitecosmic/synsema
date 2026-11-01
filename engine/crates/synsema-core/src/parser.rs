@@ -128,6 +128,9 @@ pub struct Parser {
     stream_depth: i64,
     /// v0.6.50 (A): vio un `use` de archivo (no `trusted:`). Ver `Program::has_file_use`.
     file_use: bool,
+    /// v0.6.53 (G3): >0 mientras se parsea la condición de un `when`. Ahí un gate no toma
+    /// `then <task>`: `when approve "x" then a otherwise b` es la forma inline del `when`.
+    when_condition: u32,
 }
 
 impl Parser {
@@ -137,6 +140,7 @@ impl Parser {
             pos: 0,
             stream_depth: 0,
             file_use: false,
+            when_condition: 0,
         }
     }
 
@@ -699,6 +703,17 @@ impl Parser {
         ))
     }
 
+    /// v0.6.53 (ronda 1, B2): parsea algo encerrado (`(…)`, `[…]`, `{…}`, los argumentos de una
+    /// llamada) fuera de la condición de un `when`: ahí adentro el `then` del `when` no puede
+    /// estar, así que un gate vuelve a poder tomar su `then <task>`. El contador se restaura al
+    /// salir, también con error.
+    fn enclosed<T>(&mut self, f: impl FnOnce(&mut Self) -> Result<T, ParseError>) -> Result<T, ParseError> {
+        let saved = std::mem::take(&mut self.when_condition);
+        let r = f(self);
+        self.when_condition = saved;
+        r
+    }
+
     // -- when / otherwise --
 
     /// `stmt_pos`: este `when` se parsea como SENTENCIA (no como expresión). En esa posición
@@ -711,7 +726,10 @@ impl Parser {
     fn parse_when(&mut self, stmt_pos: bool) -> Result<Node, ParseError> {
         let loc = self.location();
         self.advance(); // 'when'
-        let condition = self.parse_expression()?;
+        self.when_condition += 1;
+        let condition = self.parse_expression();
+        self.when_condition -= 1;
+        let condition = condition?;
 
         if stmt_pos && self.check(TokenType::Then) {
             return Err(ParseError::new(
@@ -1601,17 +1619,33 @@ The inline form belongs where a value is used: let x be when c then a otherwise 
         Ok(Some(n.to_f64() * mult))
     }
 
+    /// v0.6.53 (G3): `then <task>` después de un gate (`approve`/`confirm`/`ask`), salvo en la
+    /// condición de un `when` (ahí `then` es del `when`).
+    fn parse_gate_then(&mut self) -> Result<Option<String>, ParseError> {
+        if self.when_condition > 0 || !self.check(TokenType::Then) {
+            return Ok(None);
+        }
+        self.advance();
+        let t = self.expect(
+            TokenType::Identifier,
+            "Expected the name of a task after 'then' (approve <message> then <task>: the task is called with the decision, the message and the id)",
+        )?;
+        Ok(Some(t.as_str().to_string()))
+    }
+
     fn parse_approve(&mut self) -> Result<Node, ParseError> {
         let loc = self.location();
         self.advance();
         let message = self.parse_expression()?;
         let timeout = self.parse_within_timeout()?;
+        let then = self.parse_gate_then()?;
         Ok(Node::new(
             loc,
             NodeKind::ApproveStatement {
                 message: Box::new(message),
                 context: None,
                 timeout,
+                then,
             },
         ))
     }
@@ -1638,11 +1672,13 @@ The inline form belongs where a value is used: let x be when c then a otherwise 
         self.advance();
         let message = self.parse_expression()?;
         let timeout = self.parse_within_timeout()?;
+        let then = self.parse_gate_then()?;
         Ok(Node::new(
             loc,
             NodeKind::ConfirmStatement {
                 message: Box::new(message),
                 timeout,
+                then,
             },
         ))
     }
@@ -2595,16 +2631,19 @@ The inline form belongs where a value is used: let x be when c then a otherwise 
             if self.check(TokenType::LParen) {
                 let loc = self.location();
                 self.advance();
-                let mut args = Vec::new();
-                if !self.check(TokenType::RParen) {
-                    args.push(self.parse_arg()?);
-                    while self.match_tok(TokenType::Comma).is_some() {
-                        if self.check(TokenType::RParen) {
-                            break; // coma final, como en listas y mapas (y en Python)
+                let args = self.enclosed(|p| {
+                    let mut args = Vec::new();
+                    if !p.check(TokenType::RParen) {
+                        args.push(p.parse_arg()?);
+                        while p.match_tok(TokenType::Comma).is_some() {
+                            if p.check(TokenType::RParen) {
+                                break; // coma final, como en listas y mapas (y en Python)
+                            }
+                            args.push(p.parse_arg()?);
                         }
-                        args.push(self.parse_arg()?);
                     }
-                }
+                    Ok(args)
+                })?;
                 self.expect(TokenType::RParen, "")?;
                 node = Node::new(
                     loc,
@@ -2883,47 +2922,53 @@ The inline form belongs where a value is used: let x be when c then a otherwise 
             }
             TokenType::LBracket => {
                 self.advance();
-                let mut elements = Vec::new();
-                if !self.check(TokenType::RBracket) {
-                    elements.push(self.parse_expression()?);
-                    while self.match_tok(TokenType::Comma).is_some() {
-                        if self.check(TokenType::RBracket) {
-                            break; // coma final
+                let elements = self.enclosed(|p| {
+                    let mut elements = Vec::new();
+                    if !p.check(TokenType::RBracket) {
+                        elements.push(p.parse_expression()?);
+                        while p.match_tok(TokenType::Comma).is_some() {
+                            if p.check(TokenType::RBracket) {
+                                break; // coma final
+                            }
+                            elements.push(p.parse_expression()?);
                         }
-                        elements.push(self.parse_expression()?);
                     }
-                }
+                    Ok(elements)
+                })?;
                 self.expect(TokenType::RBracket, "")?;
                 Ok(Node::new(loc, NodeKind::ListLiteral { elements: tight(elements) }))
             }
             TokenType::LBrace => {
                 self.advance();
-                let mut pairs = Vec::new();
-                if !self.check(TokenType::RBrace) {
-                    let key = self.parse_expression()?;
-                    self.expect(TokenType::Colon, "")?;
-                    let val = self.parse_expression()?;
-                    pairs.push((key, val));
-                    while self.match_tok(TokenType::Comma).is_some() {
-                        if self.check(TokenType::RBrace) {
-                            break;
-                        }
-                        let key = self.parse_expression()?;
-                        self.expect(TokenType::Colon, "")?;
-                        let val = self.parse_expression()?;
+                let pairs = self.enclosed(|p| {
+                    let mut pairs = Vec::new();
+                    if !p.check(TokenType::RBrace) {
+                        let key = p.parse_expression()?;
+                        p.expect(TokenType::Colon, "")?;
+                        let val = p.parse_expression()?;
                         pairs.push((key, val));
+                        while p.match_tok(TokenType::Comma).is_some() {
+                            if p.check(TokenType::RBrace) {
+                                break;
+                            }
+                            let key = p.parse_expression()?;
+                            p.expect(TokenType::Colon, "")?;
+                            let val = p.parse_expression()?;
+                            pairs.push((key, val));
+                        }
                     }
-                }
+                    Ok(pairs)
+                })?;
                 self.expect(TokenType::RBrace, "")?;
                 Ok(Node::new(loc, NodeKind::MapLiteral { pairs: tight(pairs) }))
             }
             TokenType::LParen => {
                 // Lambda `(params) => expr` o expresión agrupada `(expr)`.
                 if self.is_lambda_ahead() {
-                    self.parse_lambda()
+                    self.enclosed(|p| p.parse_lambda())
                 } else {
                     self.advance();
-                    let expr = self.parse_expression()?;
+                    let expr = self.enclosed(|p| p.parse_expression())?;
                     self.expect(TokenType::RParen, "")?;
                     Ok(expr)
                 }
@@ -3262,12 +3307,14 @@ The inline form belongs where a value is used: let x be when c then a otherwise 
             options = Some(Box::new(self.parse_expression()?));
         }
         let timeout = self.parse_within_timeout()?;
+        let then = self.parse_gate_then()?;
         Ok(Node::new(
             loc,
             NodeKind::AskExpression {
                 prompt: Box::new(prompt),
                 options,
                 timeout,
+                then,
             },
         ))
     }
@@ -3353,6 +3400,31 @@ mod tests {
 
     fn parse_ok(src: &str) -> Program {
         parse_source(src, "<test>").unwrap_or_else(|e| panic!("parse error: {}", e))
+    }
+
+    /// v0.6.53 (ronda 1, B2): dentro de la condición de un `when`, un gate encerrado (paréntesis,
+    /// lista, argumentos) toma su `then <task>`; sin encerrar, el `then` sigue siendo del `when`, y
+    /// eso vale también DESPUÉS de un paréntesis en la misma condición (el contador se restaura).
+    #[test]
+    fn an_enclosed_gate_in_a_when_condition_takes_its_then() {
+        for src in [
+            "let v be when (approve \"x\" then t) then \"si\" otherwise \"no\"
+",
+            "let v be when contains([approve \"q\" then t], \"x\") then 1 otherwise 2
+",
+            "let v be when f(confirm \"q\" then t) then 1 otherwise 2
+",
+            // Ronda 2, R2-6: cada rama de `enclosed` con su caso.
+            "let v be when [approve \"q\" then t] then 1 otherwise 2\n",
+            "let v be when {\"k\": approve \"q\" then t} then 1 otherwise 2\n",
+            "let v be when (x) => approve \"q\" then t then 1 otherwise 2\n",
+        ] {
+            let dbg = format!("{:?}", parse_ok(src));
+            assert!(dbg.contains("then: Some(\"t\")"), "{}: {}", src, dbg);
+        }
+        let dbg = format!("{:?}", parse_ok("let v be when (1 == 1) and approve \"x\" then 1 otherwise 2
+"));
+        assert!(dbg.contains("then: None") && !dbg.contains("then: Some("), "{}", dbg);
     }
 
     #[test]

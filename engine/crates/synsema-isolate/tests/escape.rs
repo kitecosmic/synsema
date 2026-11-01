@@ -45,7 +45,7 @@ impl Area {
         self.p(rel).to_string_lossy().into_owned()
     }
     fn policy(&self) -> Policy {
-        Policy { read: vec![self.p("inside").into()], write: vec![self.p("out").into()], max_memory_bytes: None }
+        Policy { read: vec![self.p("inside").into()], write: vec![self.p("out").into()], max_memory_bytes: None, max_file_bytes: None }
     }
 }
 
@@ -409,7 +409,7 @@ fn a_pinned_place_does_not_move_when_a_link_changes() {
     // Entre el juicio y el `prepare`, alguien cambia el lugar por un link afuera.
     std::fs::rename(a.p("tree/real"), a.p("tree/moved")).unwrap();
     std::os::unix::fs::symlink(a.p("outside"), a.p("tree/real")).unwrap();
-    let pol = Policy { read: vec![pinned.place], write: vec![], max_memory_bytes: None };
+    let pol = Policy { read: vec![pinned.place], write: vec![], max_memory_bytes: None, max_file_bytes: None };
     assert_eq!(probe(&pol, "read", &a.s("tree/moved/f.txt")), "ok", "el inodo juzgado");
     assert_eq!(probe(&pol, "read", &a.s("outside/secret.txt")), "EACCES", "no el destino nuevo");
     let _ = Place::Path(a.p("x")); // la otra forma sigue existiendo

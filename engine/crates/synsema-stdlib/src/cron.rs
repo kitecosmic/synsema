@@ -423,11 +423,15 @@ fn err(msg: &str) -> Control {
 
 /// v0.6.46 (ronda 1, A1): una tarea programada corre después, en otro intérprete, con los globales
 /// del programa; desde una tool de confianza la correría con las capabilities de la tool.
-fn not_in_trusted_tool(i: &Interpreter, name: &str) -> Result<(), Control> {
-    if i.in_trusted_scope() {
+/// v0.6.53 (ronda 1 de v0.6.53, A1 y su §5): la misma regla que `approve … then`: la task corre
+/// con las capacidades del programa, así que no se agenda desde un marco recortado (`sandbox`,
+/// tool de confianza, techo delegado de un captoken, agente). Bajo `serve`, desde un `sandbox`,
+/// la task escribía lo que el bloque no podía.
+fn not_in_a_narrowed_frame(i: &Interpreter, name: &str) -> Result<(), Control> {
+    if let Some(why) = i.frame_narrowing() {
         return Err(err(&format!(
-            "{}: a trusted tool cannot schedule tasks yet — the task would run with the tool's capabilities next to the program's names",
-            name
+            "{}: not allowed {} — the task would run later with the program's capabilities; schedule it outside",
+            name, why
         )));
     }
     Ok(())
@@ -506,7 +510,7 @@ pub fn register_cron_builtins(
                             py_float_str(interval)
                         )));
                     }
-                    not_in_trusted_tool(i, "cron_every")?;
+                    not_in_a_narrowed_frame(i, "cron_every")?;
                     let (name, task) = exec(i, task_v, "cron_every").map_err(|m| err(&m))?;
                     sched_of(&sched, "cron_every")?.every(interval, &name, task);
                     return Ok(syn_text(name));
@@ -556,7 +560,7 @@ pub fn register_cron_builtins(
                         expr_src.trim()
                     )));
                 }
-                not_in_trusted_tool(i, "cron_every")?;
+                not_in_a_narrowed_frame(i, "cron_every")?;
                 let (name, task) = exec(i, task_v, "cron_every").map_err(|m| err(&m))?;
                 sched_of(&sched, "cron_every")?.at(expr, zone, &name, task);
                 Ok(syn_text(name))
@@ -580,7 +584,7 @@ pub fn register_cron_builtins(
                     )));
                 }
                 let task_v = args.get(1).ok_or_else(|| err("missing argument"))?;
-                not_in_trusted_tool(i, "cron_after")?;
+                not_in_a_narrowed_frame(i, "cron_after")?;
                 let (name, task) =
                     exec(i, task_v, "cron_after").map_err(|m| err(&m))?;
                 sched_of(&sched, "cron_after")?.after(delay, &name, task);

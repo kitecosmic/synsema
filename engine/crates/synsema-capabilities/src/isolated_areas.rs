@@ -431,6 +431,17 @@ impl Borrow {
 /// Lo que se espera a que el grupo quede vacío después de matarlo (un `rename` en curso termina).
 const GROUP_GONE_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// v0.6.53 (1a): el grupo de un hijo aislado **sin** carpetas de escritura (sin [`Borrow`]). Al
+/// soltarse, si synsema recoge a los huérfanos (PID 1 o subreaper), recoge lo que el hijo dejó
+/// corriendo y se mató; si no, no espera nada. Se suelta por donde vuelva `run`.
+pub struct Adopted(pub u32);
+
+impl Drop for Adopted {
+    fn drop(&mut self) {
+        synsema_isolate::reap_adopted(self.0, GROUP_GONE_WAIT);
+    }
+}
+
 impl Drop for Borrow {
     fn drop(&mut self) {
         // Un proceso del grupo con el SIGKILL pendiente todavía puede terminar la syscall en la que

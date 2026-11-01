@@ -971,6 +971,136 @@ pub fn dest_check(host: &str, port: u16, ip: std::net::IpAddr) -> Result<(), Str
     })
 }
 
+/// v0.6.53: por qué no conectó [`connect_each`].
+#[cfg(feature = "native")]
+#[derive(Debug)]
+pub(crate) enum ConnectFail {
+    /// Ninguna dirección se probó: el chequeo las negó (el primer motivo).
+    Denied(String),
+    /// Se probaron y ninguna aceptó: el error de la última, y cuál era.
+    Io(std::io::Error, std::net::SocketAddr),
+}
+
+/// v0.6.53 (RFC 8305): cuánto se espera a una dirección antes de probar también la siguiente.
+pub(crate) const NEXT_ADDRESS_DELAY: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// v0.6.53: conecta a una de `addrs`, como Happy Eyeballs (RFC 8305): en el orden que dio el
+/// sistema (RFC 6724), cada una arranca cuando la anterior falló o lleva [`NEXT_ADDRESS_DELAY`] sin
+/// conectar, y gana la primera que conecta. Cada dirección pasa `check` (E7) antes de probarla; una
+/// negada no se prueba, como en `tcp_connect`. `localhost` da `::1` primero y un `serve` en
+/// `0.0.0.0` sólo escucha IPv4: antes se probaba sólo la primera, y en Windows el rechazo en
+/// loopback tarda unos 2 s, así que probarlas de a una tampoco alcanzaba. `timeout` es el plazo
+/// de todo el intento.
+#[cfg(feature = "native")]
+pub(crate) fn connect_each(
+    addrs: &[std::net::SocketAddr],
+    check: &dyn Fn(std::net::IpAddr) -> Result<(), String>,
+    timeout: std::time::Duration,
+) -> Result<std::net::TcpStream, ConnectFail> {
+    use std::time::Instant;
+    let mut denied = None;
+    let allowed: Vec<std::net::SocketAddr> = addrs
+        .iter()
+        .copied()
+        .filter(|a| match check(a.ip()) {
+            Ok(()) => true,
+            Err(m) => {
+                denied.get_or_insert(m);
+                false
+            }
+        })
+        .collect();
+    match allowed.as_slice() {
+        [] => {
+            return Err(match denied {
+                Some(m) => ConnectFail::Denied(m),
+                None => ConnectFail::Io(std::io::Error::other("the name gave no address"), std::net::SocketAddr::from(([0, 0, 0, 0], 0))),
+            })
+        }
+        // Una sola: sin hilos.
+        [a] => return std::net::TcpStream::connect_timeout(a, timeout).map_err(|e| ConnectFail::Io(e, *a)),
+        _ => {}
+    }
+    // Ronda 1, B6: los intentos son no bloqueantes y viven en este hilo (`mio`). Antes cada uno era
+    // un hilo con el plazo entero: el que perdía seguía hasta conectar o vencer (contra una AAAA
+    // que se traga los paquetes, el timeout entero por llamada) y, si conectaba tarde, abría una
+    // conexión de más. Ahora, al ganar uno, los demás se cierran ahí mismo.
+    use mio::{Events, Interest, Poll, Token};
+    let deadline = Instant::now() + timeout;
+    let mut poll = Poll::new().map_err(|e| ConnectFail::Io(e, allowed[0]))?;
+    let mut events = Events::with_capacity(allowed.len());
+    let mut attempts: Vec<Option<mio::net::TcpStream>> = (0..allowed.len()).map(|_| None).collect();
+    let mut next = 0;
+    let mut running = 0;
+    let mut next_at = Instant::now();
+    let mut last: Option<(std::io::Error, std::net::SocketAddr)> = None;
+    loop {
+        // Arranca la siguiente: la primera enseguida, y después cada `NEXT_ADDRESS_DELAY` o apenas
+        // no queda ninguna en curso.
+        while next < allowed.len() && (running == 0 || Instant::now() >= next_at) {
+            let a = allowed[next];
+            match mio::net::TcpStream::connect(a) {
+                Ok(mut s) => match poll.registry().register(&mut s, Token(next), Interest::WRITABLE) {
+                    Ok(()) => {
+                        attempts[next] = Some(s);
+                        running += 1;
+                    }
+                    Err(e) => last = Some((e, a)),
+                },
+                Err(e) => last = Some((e, a)),
+            }
+            next += 1;
+            next_at = Instant::now() + NEXT_ADDRESS_DELAY;
+        }
+        if running == 0 && next >= allowed.len() {
+            let (e, a) = last.expect("terminaron todos los intentos: hay un error");
+            return Err(ConnectFail::Io(e, a));
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            // Ronda 1, N3: la que colgó es la primera que sigue en curso, no la última que arrancó.
+            let hung = (0..allowed.len()).find(|&i| attempts[i].is_some()).map_or(allowed[0], |i| allowed[i]);
+            return Err(ConnectFail::Io(std::io::Error::from(std::io::ErrorKind::TimedOut), hung));
+        }
+        let wait = if next < allowed.len() { next_at.min(deadline) - now } else { deadline - now };
+        if let Err(e) = poll.poll(&mut events, Some(wait)) {
+            if e.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(ConnectFail::Io(e, allowed[0]));
+        }
+        for ev in events.iter() {
+            let i = ev.token().0;
+            let Some(s) = attempts[i].as_ref() else { continue };
+            let failed = match s.take_error() {
+                Ok(Some(e)) | Err(e) => Some(e),
+                Ok(None) => match s.peer_addr() {
+                    Ok(_) => None,
+                    // Todavía no conectó (un aviso de más): se sigue esperando.
+                    Err(e) if e.kind() == std::io::ErrorKind::NotConnected => continue,
+                    Err(e) => Some(e),
+                },
+            };
+            match failed {
+                Some(e) => {
+                    let _ = attempts[i].take().map(|mut s| poll.registry().deregister(&mut s));
+                    running -= 1;
+                    last = Some((e, allowed[i]));
+                }
+                None => {
+                    let mut won = attempts[i].take().expect("está");
+                    let _ = poll.registry().deregister(&mut won);
+                    // Los demás intentos se cierran al soltarse (`attempts`).
+                    drop(attempts);
+                    let std_stream = std::net::TcpStream::from(won);
+                    std_stream.set_nonblocking(false).map_err(|e| ConnectFail::Io(e, allowed[i]))?;
+                    return Ok(std_stream);
+                }
+            }
+        }
+    }
+}
+
 /// El destino como lo pide `net`: con el puerto siempre (un grant sin puerto cubre cualquiera).
 pub(crate) fn dest_scope(host: &str, port: u16) -> String {
     let h = host.trim_start_matches('[').trim_end_matches(']').to_ascii_lowercase();
@@ -1572,5 +1702,73 @@ mod v0646_e7_tests {
         caps.borrow_mut().grant(net(Some("localhost")));
         let _p = program_request(&caps, "http_get()", Vec::new());
         assert!(dest_check("localhost", 11434, lo).is_ok());
+    }
+}
+
+/// v0.6.53: `connect_each` prueba cada dirección hasta que una acepta, y una que el chequeo niega no
+/// se prueba.
+#[cfg(test)]
+mod v0653_connect_tests {
+    use super::*;
+    use std::net::{IpAddr, SocketAddr, TcpListener};
+    use std::time::Duration;
+
+    /// Ronda 1, B6: el intento que pierde se cierra al ganar otro: no sigue reintentando y no abre
+    /// una conexión de más. La primera dirección es un listener con la cola llena (Linux descarta
+    /// el SYN: el intento cuelga), la segunda acepta y gana. Después se vacía la cola de la primera
+    /// y se espera más que un reintento de SYN (1 s): no llega ninguna conexión nueva.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_losing_attempt_is_closed_and_never_connects() {
+        use socket2::{Domain, Socket, Type};
+        let a = Socket::new(Domain::IPV4, Type::STREAM, None).unwrap();
+        a.bind(&SocketAddr::from(([127, 0, 0, 1], 0)).into()).unwrap();
+        a.listen(0).unwrap();
+        let a_addr = a.local_addr().unwrap().as_socket().unwrap();
+        // Llenar la cola de aceptación de `a` (backlog 0 → una conexión, y una más por las dudas).
+        let fillers: Vec<_> = (0..2)
+            .filter_map(|_| std::net::TcpStream::connect_timeout(&a_addr, Duration::from_millis(300)).ok())
+            .collect();
+        let b = TcpListener::bind("127.0.0.1:0").unwrap();
+        let b_addr = b.local_addr().unwrap();
+        let ok = |_: IpAddr| Ok(());
+        let s = connect_each(&[a_addr, b_addr], &ok, Duration::from_secs(10)).expect("conecta a la segunda");
+        assert_eq!(s.peer_addr().unwrap(), b_addr);
+        // Vaciar la cola de `a` y dar tiempo a un reintento de SYN del perdedor.
+        a.set_nonblocking(true).unwrap();
+        let mut seen = 0;
+        let t0 = std::time::Instant::now();
+        while t0.elapsed() < Duration::from_millis(3500) {
+            if a.accept().is_ok() {
+                seen += 1;
+            } else {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+        assert_eq!(seen, fillers.len(), "el intento perdedor conectó igual");
+    }
+
+    #[test]
+    fn a_refused_address_moves_on_to_the_next() {
+        // Sólo IPv4, como un `serve` en 0.0.0.0; `::1` en ese puerto rechaza (o no hay IPv6).
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        let v6 = SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, port));
+        let v4 = SocketAddr::from(([127, 0, 0, 1], port));
+        let ok = |_: IpAddr| Ok(());
+        let t0 = std::time::Instant::now();
+        let s = connect_each(&[v6, v4], &ok, Duration::from_secs(5)).expect("no probó la segunda dirección");
+        assert_eq!(s.peer_addr().unwrap(), v4);
+        // En Windows el rechazo en loopback tarda ~2 s: la segunda arranca a los 250 ms, sin esperarlo.
+        assert!(t0.elapsed() < Duration::from_millis(1500), "tardó {:?}", t0.elapsed());
+        // La negada no se prueba: con `::1` negada conecta igual a la IPv4.
+        let no_v6 = |ip: IpAddr| if ip.is_ipv6() { Err("negada".to_string()) } else { Ok(()) };
+        assert!(connect_each(&[v6, v4], &no_v6, Duration::from_secs(5)).is_ok());
+        // Todas negadas: el motivo, sin probar ninguna.
+        let none = |_: IpAddr| Err("negada".to_string());
+        assert!(matches!(connect_each(&[v6, v4], &none, Duration::from_secs(5)), Err(ConnectFail::Denied(m)) if m == "negada"));
+        // Todas rechazan: el error de la última.
+        drop(l);
+        assert!(matches!(connect_each(&[v6, v4], &ok, Duration::from_secs(5)), Err(ConnectFail::Io(_, a)) if a == v4));
     }
 }

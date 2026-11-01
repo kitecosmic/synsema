@@ -100,6 +100,9 @@ pub mod routing;
 pub mod secrets;
 #[cfg(feature = "native")]
 pub mod server;
+/// v0.6.53 (G1): el socket donde escucha un `serve` (heredado, puerto compartido o bind común).
+#[cfg(feature = "native")]
+pub mod listen;
 #[cfg(feature = "native")]
 pub mod parquet_io;
 pub mod spend;

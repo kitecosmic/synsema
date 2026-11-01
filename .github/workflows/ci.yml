@@ -132,6 +132,10 @@ jobs:
       # cancelación y el invariante de memoria. En Linux x86-64 lo corre `cargo test --workspace`.
       - name: Native tier on aarch64 (synsema-jit)
         run: cargo test --locked --manifest-path engine/Cargo.toml -p synsema-jit
+      # v0.6.53: el estado de las aprobaciones (`approve … then`) se abre sin seguir links y tiene
+      # que ser privado y del usuario también en macOS (la misma rama de Unix que Linux).
+      - name: Private approvals state on macOS (synsema-llm)
+        run: cargo test --locked --manifest-path engine/Cargo.toml -p synsema-llm --lib human::tests
       - name: Real .app on Apple Silicon (appended bundle keeps running; open + curl + shutdown)
         run: |
           set -euo pipefail

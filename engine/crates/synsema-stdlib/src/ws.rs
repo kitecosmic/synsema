@@ -635,23 +635,22 @@ fn establish(
     require_net(caps, &dial.url)?;
 
     let addr = format!("{}:{}", dial.host, dial.port);
-    let sa = addr
+    let addrs: Vec<std::net::SocketAddr> = addr
         .to_socket_addrs()
         .map_err(|e| err(format!("ws_connect: cannot resolve {}: {}", dial.host, e)))?
-        .next()
-        .ok_or_else(|| err(format!("ws_connect: cannot resolve host {}", dial.host)))?;
-    // v0.6.46 (E7): la IP que se usa, chequeada antes de conectar, también en cada reconexión.
-    crate::http_common::dest_check_with(
-        &caps.borrow(),
-        &dial.bindings,
-        "ws_connect()",
-        // Ronda 1 (E7-M1): con los corchetes de una IPv6, como `http`/`tcp` (`::1:80` no nombraba nada).
-        &crate::http_common::dest_scope(&dial.host, dial.port),
-        sa.ip(),
-    )
-    .map_err(err)?;
-    let tcp = StdTcp::connect_timeout(&sa, dial.connect_timeout)
-        .map_err(|e| err(format!("ws_connect: cannot connect to {}: {}", addr, e)))?;
+        .collect();
+    if addrs.is_empty() {
+        return Err(err(format!("ws_connect: cannot resolve host {}", dial.host)));
+    }
+    // v0.6.46 (E7): cada IP se chequea antes de conectar, también en cada reconexión. v0.6.53: si
+    // una rechaza, se prueba la siguiente (`localhost` → `::1`, después `127.0.0.1`).
+    // Ronda 1 (E7-M1): con los corchetes de una IPv6, como `http`/`tcp` (`::1:80` no nombraba nada).
+    let scope = crate::http_common::dest_scope(&dial.host, dial.port);
+    let check = |ip: std::net::IpAddr| crate::http_common::dest_check_with(&caps.borrow(), &dial.bindings, "ws_connect()", &scope, ip);
+    let tcp = crate::http_common::connect_each(&addrs, &check, dial.connect_timeout).map_err(|f| match f {
+        crate::http_common::ConnectFail::Denied(m) => err(m),
+        crate::http_common::ConnectFail::Io(e, _) => err(format!("ws_connect: cannot connect to {}: {}", addr, e)),
+    })?;
     let _ = tcp.set_read_timeout(Some(dial.connect_timeout));
     let _ = tcp.set_write_timeout(Some(dial.connect_timeout));
     let _ = tcp.set_nodelay(true);

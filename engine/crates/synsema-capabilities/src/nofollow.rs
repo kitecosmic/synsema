@@ -150,6 +150,13 @@ impl Beneath {
         sys::unlink_beneath(&self.dir, &self.name, path)
     }
 
+    /// v0.6.53 (`make_dir`): crea la carpeta `name` en la carpeta abierta, sin seguir un link en el
+    /// nombre (si ya hay algo ahí, link o no, `AlreadyExists`). Relativa al handle en Linux
+    /// (`mkdirat`) y en Windows (`NtCreateFile` sin reparse); donde no hay con qué, por nombre.
+    pub fn make_dir(&self, path: &str) -> io::Result<()> {
+        sys::mkdir_beneath(&self.dir, &self.name, path)
+    }
+
     /// Reemplaza el archivo con `data`: temporal nuevo al lado (un nombre al azar creado en
     /// exclusiva, que nunca sigue un link), escrito, y renombrado encima del nombre. En Unix el
     /// reemplazo conserva los permisos del archivo que reemplaza, aplicados antes de escribir.
@@ -199,6 +206,81 @@ fn is_dir_link(m: Option<std::fs::Metadata>) -> bool {
 #[cfg(not(windows))]
 fn is_dir_link(_m: Option<std::fs::Metadata>) -> bool {
     false
+}
+
+/// v0.6.53 (ronda 1, M1): abre un archivo de estado PRIVADO del proceso (las aprobaciones
+/// pendientes y su lock). Nunca sigue un link en el último componente (Unix `O_NOFOLLOW`, Windows
+/// `FILE_FLAG_OPEN_REPARSE_POINT` y rechazo si es un reparse point), tiene que ser un archivo
+/// regular y, en Unix, privado (`mode & 0o077 == 0`) y del euid. Con `create`, lo crea
+/// con 0600 si no existe (lectura y escritura). El motivo de un rechazo va en el texto del error,
+/// redactado para seguir a la ruta (`… is a link; it is not followed`).
+pub fn open_private(path: &std::path::Path, create: bool) -> io::Result<File> {
+    let f = private_open(path, create)?;
+    let m = f.metadata()?;
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if m.file_attributes() & 0x400 != 0 {
+            // FILE_ATTRIBUTE_REPARSE_POINT: un symlink o una junction, abierto como tal.
+            return Err(io::Error::other("is a link; it is not followed"));
+        }
+    }
+    if !m.is_file() {
+        return Err(io::Error::other("is not a regular file"));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if m.mode() & 0o077 != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "can be read or written by other users (mode {:o}); it has to be private (chmod 600; a filesystem that does not keep Unix permissions, like a Windows drive mounted in WSL, cannot hold it)",
+                    m.mode() & 0o777
+                ),
+            ));
+        }
+        if m.uid() != rustix::process::geteuid().as_raw() {
+            return Err(io::Error::new(io::ErrorKind::PermissionDenied, "belongs to another user"));
+        }
+    }
+    Ok(f)
+}
+
+// Ronda 2, R2-3: la misma rama en todo Unix (macOS incluido: `O_NOFOLLOW` da `ELOOP` también ahí).
+#[cfg(unix)]
+fn private_open(path: &std::path::Path, create: bool) -> io::Result<File> {
+    use rustix::fs::{Mode, OFlags};
+    let mut flags = OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    flags |= if create { OFlags::RDWR | OFlags::CREATE } else { OFlags::RDONLY };
+    match rustix::fs::open(path, flags, Mode::from_raw_mode(0o600)) {
+        Ok(fd) => Ok(File::from(fd)),
+        Err(rustix::io::Errno::LOOP) => Err(io::Error::other("is a link; it is not followed")),
+        Err(e) => Err(e.into()),
+    }
+}
+
+#[cfg(windows)]
+fn private_open(path: &std::path::Path, create: bool) -> io::Result<File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    let mut o = std::fs::OpenOptions::new();
+    o.read(true);
+    if create {
+        o.write(true).create(true);
+    }
+    // FILE_FLAG_OPEN_REPARSE_POINT: un link se abre a sí mismo (y se rechaza arriba), no se sigue.
+    o.custom_flags(0x0020_0000);
+    o.open(path)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn private_open(path: &std::path::Path, create: bool) -> io::Result<File> {
+    let mut o = std::fs::OpenOptions::new();
+    o.read(true);
+    if create {
+        o.write(true).create(true);
+    }
+    o.open(path)
 }
 
 /// El resultado de una apertura sin links.
@@ -355,6 +437,10 @@ mod sys {
 
     pub(super) fn unlink_beneath(dir: &File, name: &str, _path: &str) -> io::Result<()> {
         rustix::fs::unlinkat(dir, name, rustix::fs::AtFlags::empty()).map_err(os)
+    }
+
+    pub(super) fn mkdir_beneath(dir: &File, name: &str, _path: &str) -> io::Result<()> {
+        rustix::fs::mkdirat(dir, name, Mode::from_raw_mode(0o777)).map_err(os)
     }
 }
 
@@ -630,6 +716,15 @@ mod sys {
         }
     }
 
+    pub(super) fn mkdir_beneath(dir: &File, name: &str, _path: &str) -> io::Result<()> {
+        // FILE_CREATE con OBJ_DONT_REPARSE: si el nombre ya existe (un link también) falla; el
+        // handle de la carpeta nueva se cierra enseguida.
+        let access = SYNCHRONIZE | FILE_LIST_DIRECTORY;
+        nt_create(dir.as_raw_handle() as HANDLE, name, access, FILE_CREATE, FILE_DIRECTORY_FILE)
+            .map(drop)
+            .map_err(io)
+    }
+
     pub(super) fn unlink_beneath(_dir: &File, _name: &str, path: &str) -> io::Result<()> {
         // Por handle haría falta `NtCreateFile` con `RootDirectory` y `FILE_FLAG_OPEN_REPARSE_POINT`;
         // en Windows no hay hijos aislados que cambien el link en el medio.
@@ -732,6 +827,10 @@ mod sys {
 
     pub(super) fn unlink_beneath(_dir: &File, _name: &str, path: &str) -> io::Result<()> {
         super::remove_link(path)
+    }
+
+    pub(super) fn mkdir_beneath(_dir: &File, _name: &str, path: &str) -> io::Result<()> {
+        std::fs::create_dir(path)
     }
 }
 

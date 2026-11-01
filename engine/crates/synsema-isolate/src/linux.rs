@@ -109,10 +109,7 @@ const WRITE_DIR_RIGHTS: u64 = FS_EXECUTE
     | FS_TRUNCATE;
 const WRITE_FILE_RIGHTS: u64 = FS_EXECUTE | FS_WRITE_FILE | FS_READ_FILE | FS_TRUNCATE;
 
-/// Las carpetas del sistema con programas, bibliotecas y configuración pública (certificados,
-/// zona horaria, `ld.so.cache`). Lectura y ejecución. Nada de `/home`, `/root`, `/proc`, `/sys`,
-/// `/run` ni `/var`: ahí viven las claves y los sockets de otros procesos.
-const SYSTEM_READ: &[&str] = &["/usr", "/bin", "/sbin", "/lib", "/lib32", "/lib64", "/libx32", "/etc", "/opt"];
+use crate::SYSTEM_READ;
 
 pub fn landlock_abi() -> Option<u32> {
     // SAFETY: la consulta de versión no lee el puntero (NULL, tamaño 0).
@@ -463,6 +460,7 @@ pub fn prepare(cmd: &mut Command, policy: &Policy) -> Result<(Report, Inner), Er
 
     let rs = ruleset.as_raw_fd();
     let mem = policy.max_memory_bytes;
+    let fsize = policy.max_file_bytes;
     // SAFETY: el cierre corre entre fork y exec. Sólo hace syscalls con valores ya armados (el fd
     // del ruleset, los programas BPF, enteros); no reserva memoria ni toma locks.
     unsafe {
@@ -484,6 +482,12 @@ pub fn prepare(cmd: &mut Command, policy: &Policy) -> Result<(Report, Inner), Er
                     return Err(io::Error::last_os_error());
                 }
             }
+            if let Some(b) = fsize {
+                let lim = libc::rlimit { rlim_cur: b as libc::rlim_t, rlim_max: b as libc::rlim_t };
+                if libc::setrlimit(libc::RLIMIT_FSIZE, &lim) != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+            }
             if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
                 return Err(io::Error::last_os_error());
             }
@@ -496,7 +500,7 @@ pub fn prepare(cmd: &mut Command, policy: &Policy) -> Result<(Report, Inner), Er
             Ok(())
         });
     }
-    let report = Report { landlock_abi: abi, network: "none", max_memory_bytes: mem };
+    let report = Report { landlock_abi: abi, network: "none", max_memory_bytes: mem, max_file_bytes: fsize };
     Ok((report, Inner { _ruleset: ruleset, tmp }))
 }
 
@@ -512,24 +516,53 @@ pub fn group_gone(pid: u32, wait: std::time::Duration) -> bool {
     let deadline = std::time::Instant::now() + wait;
     let reaper = reaps_orphans();
     let proc = Proc::new(Path::new("/proc"));
-    loop {
-        if reaper {
-            reap_group(pid);
-        }
+    let exists = || {
         // SAFETY: señal 0 a un grupo: sólo pregunta si existe; no toca memoria.
         let r = unsafe { libc::kill(-(pid as libc::pid_t), 0) };
-        if r != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
-            return true;
-        }
-        // Ronda 6 (M2): los que quedan pueden ser zombies que recoge otro proceso (o nadie: un
-        // lanzador que sólo espera a su hijo, como el de npm siendo PID 1). Un zombie no corre nada.
-        if proc.only_zombies(pid) {
+        !(r != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH))
+    };
+    loop {
+        if gone_step(reaper, || reap_group(pid), exists, || proc.only_zombies(pid)) {
             return true;
         }
         if std::time::Instant::now() >= deadline {
             return false;
         }
         std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+
+/// Una vuelta de [`group_gone`]: ¿el grupo ya quedó vacío? `reap` recoge a los del grupo que son
+/// hijos de este proceso, `exists` pregunta si el grupo existe y `only_zombies` si sólo le quedan
+/// zombies (inyectadas para los tests).
+///
+/// v0.6.53 (1b): cuando `only_zombies` dice que sí, se recoge otra vez antes de volver. La primera
+/// recogida pudo llegar con el SIGKILL todavía en camino (nada que recoger) y el proceso morir antes
+/// de la mirada a `/proc`: sin la segunda, quedaba zombie de este proceso, y nadie volvía a recoger
+/// ese grupo (lo vio el CI de `main`, run 41225157486). Los zombies que queden después son de otro.
+fn gone_step(reaper: bool, mut reap: impl FnMut(), exists: impl Fn() -> bool, only_zombies: impl Fn() -> bool) -> bool {
+    if reaper {
+        reap();
+    }
+    if !exists() {
+        return true;
+    }
+    // Ronda 6 (M2): los que quedan pueden ser zombies que recoge otro proceso (o nadie: un
+    // lanzador que sólo espera a su hijo, como el de npm siendo PID 1). Un zombie no corre nada.
+    if only_zombies() {
+        if reaper {
+            reap();
+        }
+        return true;
+    }
+    false
+}
+
+/// v0.6.53 (1a): si este proceso recoge a los huérfanos, espera (hasta `wait`) a que el grupo de
+/// `pid`, ya matado, quede vacío, y recoge a los que adoptó. Si no los recoge, vuelve enseguida.
+pub fn reap_adopted(pid: u32, wait: std::time::Duration) {
+    if reaps_orphans() {
+        group_gone(pid, wait);
     }
 }
 
@@ -645,6 +678,12 @@ fn reap_group(pgid: u32) {
     }
 }
 
+pub fn killed_by(status: &std::process::ExitStatus, report: &Report) -> Option<String> {
+    use std::os::unix::process::ExitStatusExt;
+    let sig = status.signal()?;
+    Some(if sig == libc::SIGXFSZ && report.max_file_bytes.is_some() { "max_file_mb".to_string() } else { format!("signal {}", sig) })
+}
+
 pub fn default_sigchld() {
     // SAFETY: SIG_DFL no instala ningún handler; se llama antes de lanzar hilos.
     unsafe {
@@ -662,6 +701,46 @@ pub fn kill_group(pid: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
+
+    /// v0.6.53 (1b): el nieto muere entre la primera recogida (que no encuentra a nadie) y la
+    /// mirada a `/proc` (que lo ve zombie). Siendo quien recoge a los huérfanos, se lo recoge igual
+    /// antes de dar el grupo por vacío; si no lo es, no se recoge nada.
+    #[test]
+    fn a_member_that_dies_after_the_reap_is_reaped_before_the_group_counts_as_empty() {
+        for reaper in [true, false] {
+            // 0: vivo con el SIGKILL en camino; 1: zombie hijo nuestro; 2: recogido.
+            let state = Cell::new(0);
+            let reaps = Cell::new(0);
+            let reap = || {
+                reaps.set(reaps.get() + 1);
+                if state.get() == 1 {
+                    state.set(2);
+                }
+            };
+            let exists = || {
+                if state.get() == 0 {
+                    state.set(1); // muere justo después de la recogida
+                }
+                state.get() != 2
+            };
+            let only_zombies = || state.get() == 1;
+            assert!(gone_step(reaper, reap, exists, only_zombies));
+            if reaper {
+                assert_eq!(state.get(), 2, "quedó zombie de este proceso");
+            } else {
+                assert_eq!((reaps.get(), state.get()), (0, 1), "no es quien recoge: no recoge");
+            }
+        }
+    }
+
+    /// Un miembro todavía vivo: no está vacío, y no se recoge dos veces en la vuelta.
+    #[test]
+    fn a_live_member_keeps_the_group() {
+        let reaps = Cell::new(0);
+        assert!(!gone_step(true, || reaps.set(reaps.get() + 1), || true, || false));
+        assert_eq!(reaps.get(), 1);
+    }
 
     /// Ronda 7 (B1): con el `/proc` propio, un grupo que `/proc` no muestra no es «sólo zombies».
     #[test]

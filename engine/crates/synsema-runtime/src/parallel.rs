@@ -416,7 +416,7 @@ pub(crate) fn register_parallel_builtins(
                 mem,
                 synsema_stdlib::ws::bus_of_interp(i),
                 subject,
-                crate::engine::wired_providers(i),
+                crate::engine::wired_providers(i).for_parallel_items(i),
                 synsema_core::sealed::current().map(|log| (log, synsema_capabilities::secure::run_rng_fork())),
             ) {
                 Ok(mut results) => {

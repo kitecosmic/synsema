@@ -4,7 +4,9 @@
 //!   programa (acá, la API de challtestsrv);
 //! - la cuenta ACME queda guardada en disco;
 //! - un SNI nuevo aprobado por `ask` se emite DURANTE el handshake, por TLS-ALPN-01, con el
-//!   servidor HTTPS administrado ya sirviendo; uno que `ask` rechaza no se emite.
+//!   servidor HTTPS administrado ya sirviendo; uno que `ask` rechaza no se emite;
+//! - v0.6.53 (G2): una IP fija sin `:80` se emite por TLS-ALPN-01 (la CA manda en el SNI su
+//!   nombre reverso, `1.0.0.127.in-addr.arpa`) aunque haya `tls dns`: una IP no tiene DNS-01.
 //!
 //! `#[ignore]` (necesita los binarios). Correr con:
 //!   go install github.com/letsencrypt/pebble/v2/cmd/pebble@latest
@@ -184,16 +186,21 @@ fn wildcard_by_dns01_and_on_demand_by_tls_alpn_against_pebble() {
     assert!(still.is_empty(), "sigue faltando: {:?}", still);
     assert!(late.cert_for("late.test").is_some(), "el nombre fijo se reintentó y se emitió");
     let ask: AskFn = Arc::new(|host: &str| host == "ok.test");
-    let mgr = CertManager::new(AcmeOptions {
-        email: Some("admin@example.test".to_string()),
-        domains: vec!["*.wild.test".to_string()],
-        ask: Some(ask),
-        dns: Some(dns),
-        http_store: None,
-    });
-
-    // (1) Arranque: el wildcard por DNS-01.
-    mgr.bootstrap().expect("wildcard por DNS-01 contra Pebble");
+    let mgr = CertManager::new_for_test(
+        AcmeOptions {
+            email: Some("admin@example.test".to_string()),
+            domains: vec!["*.wild.test".to_string(), "127.0.0.1".to_string()],
+            ask: Some(ask),
+            dns: Some(dns),
+            http_store: None,
+        },
+        Duration::ZERO,
+        Duration::from_secs(60),
+    );
+    // (1) Arranque: el wildcard por DNS-01. La IP no: sin `:80`, su reto es TLS-ALPN-01 y el HTTPS
+    //     todavía no sirve.
+    let missing = mgr.bootstrap().expect("wildcard por DNS-01 contra Pebble");
+    assert_eq!(missing, vec!["127.0.0.1".to_string()]);
     assert!(mgr.cert_for("k7f3q9.wild.test").is_some(), "el wildcard cubre un subdominio");
     assert!(certdir.join("_.wild.test.pem").is_file(), "el cert queda en disco");
     let account = std::fs::read_dir(&certdir)
@@ -218,6 +225,11 @@ fn wildcard_by_dns01_and_on_demand_by_tls_alpn_against_pebble() {
         thread::sleep(Duration::from_millis(200));
     }
     assert!(mgr.cert_for("ok.test").is_some(), "`ask` dijo que sí: se emite durante el handshake");
+    // (2b) G2: con el HTTPS sirviendo, la renovación emite la IP por TLS-ALPN-01.
+    let rt2 = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    let still = rt2.block_on(mgr.renew_due());
+    assert!(still.is_empty(), "la IP por TLS-ALPN-01: {:?}", still);
+    assert!(certdir.join("127.0.0.1.pem").is_file());
 
     // (3) `ask` dice que no: nada se emite.
     touch(https_port, "no.test");

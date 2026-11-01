@@ -574,6 +574,9 @@ pub enum ApprovalOutcome {
     NotFound,
     /// Token incorrecto → 403 (la pendiente sigue viva).
     BadToken,
+    /// v0.6.53 (ronda 1, M3): la pendiente es de un `approve … then` y este proceso ya no corre su
+    /// task (el `serve` está cerrando) → 503; la pendiente sigue para la próxima corrida.
+    Unavailable,
 }
 
 /// Backend de las rutas reservadas `/approvals` (cola de gates humanos bajo serve).
@@ -915,6 +918,8 @@ impl ServeRuntime {
         let https = self.tls_enabled
             || fwd.split(',').next().map(|s| s.trim().eq_ignore_ascii_case("https")).unwrap_or(false);
         let host = match &self.domain {
+            // Una IPv6 (`domain "2001:db8::1"`, un certificado para la IP) va entre corchetes.
+            Some(d) if d.parse::<std::net::Ipv6Addr>().is_ok() => format!("[{}]", d),
             Some(d) => d.clone(),
             None => {
                 let h = header_value(headers, "host");
@@ -1132,7 +1137,7 @@ impl ServeRuntime {
         match path {
             "/robots.txt" => true,
             "/docs" => !self.private && self.docs_enabled,
-            _ => !self.private && (RESERVED_PATHS.contains(&path) || path == "/.well-known/synsema-auth"),
+            _ => !self.private && RESERVED_PATHS.contains(&path),
         }
     }
 
@@ -1425,6 +1430,12 @@ impl ServeRuntime {
                     "The token in this link is not valid for this approval. The gate is \
                      still waiting for a HUMAN with the correct link.",
                 ),
+                ApprovalOutcome::Unavailable => Self::approval_link_page(
+                    503,
+                    "Restarting",
+                    "The server is restarting and cannot record this decision right now. The \
+                     approval is still pending: open this link again in a moment.",
+                ),
             };
         }
         let id = path.strip_prefix("/approvals/").unwrap_or_default();
@@ -1461,6 +1472,10 @@ impl ServeRuntime {
             ApprovalOutcome::BadToken => err(
                 403,
                 "invalid token for this approval — the gate is still waiting for a HUMAN with the correct token",
+            ),
+            ApprovalOutcome::Unavailable => err(
+                503,
+                "the server is restarting and cannot run this approval's task right now — it is still pending; answer again in a moment",
             ),
         }
     }
@@ -2673,6 +2688,8 @@ pub const SERVE_ENV_VARS: &[&str] = &[
     // v0.6.42 — hilos extra del pool mientras otros handlers esperan I/O.
     "SYNSEMA_SERVE_MAX_WAITING",
     "SYNSEMA_SHUTDOWN_GRACE",
+    // v0.6.53 (G1): `SO_REUSEPORT` para el traspaso sin corte (`listen.rs`).
+    "SYNSEMA_REUSE_PORT",
     "SYNSEMA_SSE_KEEPALIVE",
     "SYNSEMA_WS_SERVER_PING",
     "SYNSEMA_WS_SUBPROTOCOLS",
@@ -2696,7 +2713,10 @@ pub const SERVE_ENV_VARS: &[&str] = &[
 /// el shutdown ordenado sale del proceso cuando el ÚLTIMO terminó de drenar — no
 /// cuando el primero (que cortaría el drain de los demás).
 /// V0.6.20 — las URLs que el runtime publica solo: una ruta con parámetros no las captura.
-pub const RESERVED_PATHS: [&str; 8] = [
+///
+/// v0.6.53: `/.well-known/synsema-auth` también (antes `GET /*path` se la llevaba, y le perdía a
+/// las demás). Con `discovery off` o `private` no se publica y la ruta la atiende, como a las otras.
+pub const RESERVED_PATHS: [&str; 9] = [
     "/openapi.json",
     "/docs",
     "/llms.txt",
@@ -2705,6 +2725,7 @@ pub const RESERVED_PATHS: [&str; 8] = [
     ATTESTATION_PATH,
     discovery::AGENT_CARD_PATH,
     discovery::AGENT_CARD_LEGACY_PATH,
+    "/.well-known/synsema-auth",
 ];
 
 /// La URL donde un `serve --attested` publica su identidad
@@ -3104,7 +3125,7 @@ pub fn register_serve_exit_builtin(interp: &synsema_core::interpreter::Interpret
 
 /// Gracia del shutdown ordenado (segundos): `SYNSEMA_SHUTDOWN_GRACE`, default 10, `0` =
 /// inmediato.
-fn shutdown_grace() -> Duration {
+pub fn shutdown_grace() -> Duration {
     let secs = std::env::var("SYNSEMA_SHUTDOWN_GRACE")
         .ok()
         .and_then(|s| s.trim().parse::<f64>().ok())
@@ -3757,11 +3778,9 @@ async fn proxy_request(
             };
             // v0.6.46 (E7): se resuelve una vez, la IP se chequea contra las capas de `net` del
             // programa y se conecta a ésa.
-            let sa = match tokio::time::timeout(wait, tokio::net::lookup_host(addr.clone())).await {
-                Ok(Ok(mut it)) => match it.next() {
-                    Some(sa) => sa,
-                    None => return proxy_error_response(502, format!("proxy error: cannot resolve {}", addr), &extra, cors.as_deref(), hsts),
-                },
+            let t0 = tokio::time::Instant::now();
+            let addrs: Vec<std::net::SocketAddr> = match tokio::time::timeout(wait, tokio::net::lookup_host(addr.clone())).await {
+                Ok(Ok(it)) => it.collect(),
                 Ok(Err(e)) => return proxy_error_response(502, format!("proxy error: resolve {}: {}", addr, e), &extra, cors.as_deref(), hsts),
                 Err(_) => {
                     return proxy_error_response(
@@ -3773,30 +3792,80 @@ async fn proxy_request(
                     )
                 }
             };
-            if let Some(net) = &net {
-                let dest = addr.to_ascii_lowercase();
-                if let Err(cause) = net.admits(&dest, sa.ip()) {
-                    // Ronda 1 (E7-B1): el motivo (con la IP a la que resolvió) va al log del server; al
-                    // cliente, no: con un proxy dinámico, cualquiera de afuera averiguaba a qué IP
-                    // interna resuelve cada nombre.
-                    let m = synsema_capabilities::model::private_dest_message("proxy to", &dest, sa.ip(), &cause);
-                    eprintln!("[serve] proxy error: {}", m);
-                    return proxy_error_response(502, "proxy error: upstream not allowed".to_string(), &extra, cors.as_deref(), hsts);
+            if addrs.is_empty() {
+                return proxy_error_response(502, format!("proxy error: cannot resolve {}", addr), &extra, cors.as_deref(), hsts);
+            }
+            // v0.6.53: Happy Eyeballs (RFC 8305), como `http_get`: cada dirección arranca cuando la
+            // anterior falló o lleva 250 ms sin conectar, y gana la primera (`localhost` da `::1`
+            // primero, y un upstream en `0.0.0.0` sólo escucha IPv4). Todo dentro del mismo plazo.
+            // v0.6.46 (E7): cada IP se chequea contra las capas de `net` del programa antes de
+            // probarla; una negada no se prueba.
+            let dest = addr.to_ascii_lowercase();
+            let mut denied = false;
+            let allowed: Vec<std::net::SocketAddr> = addrs
+                .into_iter()
+                .filter(|sa| match &net {
+                    Some(net) => match net.admits(&dest, sa.ip()) {
+                        Ok(()) => true,
+                        Err(cause) => {
+                            // Ronda 1 (E7-B1): el motivo (con la IP a la que resolvió) va al log del
+                            // server; al cliente, no: con un proxy dinámico, cualquiera de afuera
+                            // averiguaba a qué IP interna resuelve cada nombre.
+                            let m = synsema_capabilities::model::private_dest_message("proxy to", &dest, sa.ip(), &cause);
+                            eprintln!("[serve] proxy error: {}", m);
+                            denied = true;
+                            false
+                        }
+                    },
+                    None => true,
+                })
+                .collect();
+            let mut attempts = tokio::task::JoinSet::new();
+            let mut next = 0;
+            let mut last: Option<std::io::Error> = None;
+            let deadline = t0 + wait;
+            let mut found = None;
+            while next < allowed.len() || !attempts.is_empty() {
+                if next < allowed.len() && attempts.is_empty() {
+                    attempts.spawn(tokio::net::TcpStream::connect(allowed[next]));
+                    next += 1;
+                    continue;
+                }
+                let more = next < allowed.len();
+                tokio::select! {
+                    r = attempts.join_next() => match r {
+                        Some(Ok(Ok(s))) => {
+                            found = Some(s);
+                            break;
+                        }
+                        Some(Ok(Err(e))) => last = Some(e),
+                        _ => {}
+                    },
+                    _ = tokio::time::sleep(crate::http_common::NEXT_ADDRESS_DELAY), if more => {
+                        attempts.spawn(tokio::net::TcpStream::connect(allowed[next]));
+                        next += 1;
+                    }
+                    _ = tokio::time::sleep_until(deadline) => {
+                        return proxy_error_response(
+                            504,
+                            format!("gateway timeout: the upstream {} did not accept the connection within {}s", addr, wait.as_secs_f64()),
+                            &extra,
+                            cors.as_deref(),
+                            hsts,
+                        )
+                    }
                 }
             }
-            let tcp = match tokio::time::timeout(wait, tokio::net::TcpStream::connect(sa)).await {
-                Ok(Ok(s)) => s,
-                Ok(Err(e)) => {
+            // Los intentos que perdieron se cancelan al soltar el `JoinSet`.
+            drop(attempts);
+            let tcp = match (found, last) {
+                (Some(s), _) => s,
+                (None, Some(e)) => {
                     return proxy_error_response(502, format!("proxy error: connect {}: {}", addr, e), &extra, cors.as_deref(), hsts)
                 }
-                Err(_) => {
-                    return proxy_error_response(
-                        504,
-                        format!("gateway timeout: the upstream {} did not accept the connection within {}s", addr, wait.as_secs_f64()),
-                        &extra,
-                        cors.as_deref(),
-                        hsts,
-                    )
+                (None, None) => {
+                    let why = if denied { "upstream not allowed" } else { "no address" };
+                    return proxy_error_response(502, format!("proxy error: {}", why), &extra, cors.as_deref(), hsts);
                 }
             };
             let _ = tcp.set_nodelay(true);

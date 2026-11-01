@@ -16,7 +16,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
-use synsema_llm::human::{AutoHandler, InteractionManager};
+use synsema_llm::human::AutoHandler;
 use synsema_llm::provider::{LLMProvider, LLMRequest, MockProvider};
 
 // Re-export de los tipos del provider tool-aware (FASE 1): los usa este módulo y, a
@@ -533,6 +533,21 @@ pub(crate) fn wire_common_with_state(
     mem: Option<MemoryCtx>,
 ) {
     let child_state = mem.as_ref().and_then(|m| m.child.clone());
+    // v0.6.53 (ronda 1, A1): lo que el core no sabe del recorte del marco: el techo delegado del
+    // captoken de la request y el agente. Se mira al momento del gate (el set cambia por request).
+    {
+        let c = caps.clone();
+        interp.set_frame_narrowing_hook(Rc::new(move || {
+            let c = c.borrow();
+            if c.agent.is_some() {
+                Some("inside an agent")
+            } else if !c.delegated.is_empty() {
+                Some("under a delegated capability token")
+            } else {
+                None
+            }
+        }));
+    }
     // Etiquetas de flujo por proceso (`--labels`, `serve --attested`). Se fijan
     // acá porque TODOS los intérpretes del runtime (run, serve por request, agentes, cron,
     // Parallel_map) pasan por este wiring: un intérprete sin etiquetas en un proceso con
@@ -1000,6 +1015,51 @@ fn wire_judge_with(
 pub(crate) struct WiredProviders {
     llm: Option<Arc<dyn LLMProvider>>,
     judge: Option<(Arc<crate::judge_provider::WiredJudgeProvider>, bool)>,
+    /// v0.6.53 (ronda 1, A3): el canal humano del llamador. Sin esto, un gate dentro de
+    /// `parallel_map` o de un agente no tenía canal y se aprobaba solo.
+    human: Option<HumanWire>,
+    /// v0.6.53 (ronda 1, A1): el llamador corría en un marco recortado (un `sandbox`, un techo
+    /// delegado, un agente): los items de su `parallel_map` también, aunque su set no lo diga.
+    narrowed: Option<&'static str>,
+}
+
+/// v0.6.53 (ronda 1, A3): el canal humano de un intérprete, para darle el mismo a sus hijos.
+#[derive(Clone)]
+pub(crate) struct HumanWire {
+    handler: Arc<dyn synsema_llm::human::HumanHandler>,
+    default_timeout: Option<f64>,
+    /// Si el gate con continuación (`approve … then`) se registra en la cola (`serve`).
+    defer: bool,
+}
+
+impl WiredProviders {
+    /// v0.6.53 (ronda 1, A1): lo que reciben los items de un `parallel_map` lanzado desde `interp`.
+    pub(crate) fn for_parallel_items(mut self, interp: &Interpreter) -> Self {
+        self.narrowed = interp.frame_narrowing();
+        self
+    }
+
+    /// Lo que recibe un agente: su propio set ya dice que es un agente.
+    pub(crate) fn for_agent(mut self) -> Self {
+        self.narrowed = None;
+        self
+    }
+}
+
+/// v0.6.53 (ronda 1, A3): cablea los gates humanos de `interp` con `handler` y lo anota para sus
+/// hijos (`parallel_map`, `spawn`), que reciben el mismo canal.
+pub(crate) fn wire_human(
+    interp: &mut Interpreter,
+    handler: Arc<dyn synsema_llm::human::HumanHandler>,
+    default_timeout: Option<f64>,
+    defer: bool,
+) {
+    let mgr = synsema_llm::human::InteractionManager::new(handler.clone()).with_default_timeout(default_timeout);
+    interp.set_human_callback(mgr.get_callback());
+    if defer {
+        interp.set_human_defer_callback(mgr.get_defer_callback());
+    }
+    provider_cell(interp).borrow_mut().human = Some(HumanWire { handler, default_timeout, defer });
 }
 
 const WIRED_PROVIDERS_KEY: &str = "synsema.wired_providers";
@@ -1034,6 +1094,13 @@ pub(crate) fn wire_providers(interp: &mut Interpreter, wired: &WiredProviders) {
     }
     if let Some((p, decide)) = &wired.judge {
         wire_judge_with(interp, p.clone(), *decide);
+    }
+    if let Some(h) = &wired.human {
+        wire_human(interp, h.handler.clone(), h.default_timeout, h.defer);
+    }
+    if let Some(why) = wired.narrowed {
+        interp.set_frame_narrowing_hook(Rc::new(move || Some(why)));
+        provider_cell(interp).borrow_mut().narrowed = Some(why);
     }
 }
 
@@ -1286,8 +1353,7 @@ fn run_inner(
                     } else {
                         Arc::new(synsema_llm::human::DenyHandler::new("non-interactive run, no TTY"))
                     };
-                let mgr = synsema_llm::human::InteractionManager::new(handler);
-                interp.set_human_callback(mgr.get_callback());
+                wire_human(&mut interp, handler, None, false);
             }
 
             // Swarm real (DE-011): los hooks de spawn/share/observe/signal/wait_for del
@@ -1883,8 +1949,7 @@ pub fn run_with_human(source: &str, filename: &str, default_approve: bool) -> Ru
         .stack_size(INTERP_STACK_SIZE)
         .spawn(move || {
             run_configured(&src, &fname, move |interp| {
-                let mgr = InteractionManager::new(Arc::new(AutoHandler::new(default_approve, "")));
-                interp.set_human_callback(mgr.get_callback());
+                wire_human(interp, Arc::new(AutoHandler::new(default_approve, "")), None, false);
             })
         })
         .expect("hilo del motor")
@@ -2199,7 +2264,7 @@ pub(crate) fn wire_swarm_hooks(
                 delegations: caps_spawn.borrow().delegations(),
             };
             // v0.6.45 (A1): el agente usa los mismos providers que el que lo spawnea.
-            let wired = providers.borrow().clone();
+            let wired = providers.borrow().clone().for_agent();
             let cut = SpawnCut { run_cut: spawn_subject.run_cut, principals: spawn_subject.principals };
             Ok(spawn_agent(sw.clone(), agent.to_string(), body, send_args, global_snap, ceiling.clone(), mem.clone(), builder.clone(), subject, wired, cut))
         })
@@ -2646,5 +2711,27 @@ mod v0646_e8_tests {
         unlink(&d.join("proj/sub"));
         link_dir(&d.join("proj/otra"), &d.join("proj/sub"));
         assert_eq!(read(open(&raw).unwrap()), "otra");
+    }
+}
+
+/// v0.6.53 (ronda 1, A1): lo que el runtime le dice al core sobre el recorte del marco.
+#[cfg(test)]
+mod frame_narrowing_tests {
+    use super::*;
+    use synsema_capabilities::model::Delegation;
+
+    /// Un techo delegado (el captoken de la request) y un agente recortan el marco: un `then` o un
+    /// `cron_*` ahí sería ampliarlo. El set se mira al momento (cambia por request).
+    #[test]
+    fn a_delegated_token_and_an_agent_narrow_the_frame() {
+        let mut interp = Interpreter::new();
+        let caps = Rc::new(RefCell::new(CapabilitySet::new("t")));
+        wire_common(&mut interp, &caps, false, None, "t");
+        assert_eq!(interp.frame_narrowing(), None);
+        caps.borrow_mut().delegated.push(Rc::new(Delegation::token("tok", Vec::new(), false)));
+        assert_eq!(interp.frame_narrowing(), Some("under a delegated capability token"));
+        caps.borrow_mut().delegated.clear();
+        caps.borrow_mut().agent = Some("a".into());
+        assert_eq!(interp.frame_narrowing(), Some("inside an agent"));
     }
 }

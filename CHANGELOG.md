@@ -6,6 +6,129 @@ Each says what changed, why, and what to write instead.
 
 Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the release date.
 
+## v0.6.53 — unreleased
+
+**Behavior changes (read these first).**
+- **A `secret()` passed to the child of `run` is an error.** In `env` the child got the text
+  `secret(K)`, as an argument too, and as `stdin` it was dropped without a word. Now each of them is
+  an error that names where the secret is, and nothing runs, as in `run_program` and `proc_spawn`.
+  **Breaking:** if the child really needs the value, pass `reveal(secret("K"))` (it needs
+  `require reveal("K")` and stays in the audit).
+- **`/.well-known/synsema-auth` is a reserved URL like `/llms.txt` or `/openapi.json`.** A route
+  with parameters (`route "GET /*path"`) took it, while it lost every other URL the engine
+  publishes. Now the engine answers it whenever it publishes it (a server with `auth with`, without
+  `private` or `discovery off`); with `private` or `discovery off` the route gets it, as before.
+  **Breaking** only under `serve --attested`, where a route declared for it is now a load error,
+  like the other reserved URLs.
+- **A gate inside `parallel_map` or an agent approved itself.** It had no human channel, and
+  without one a gate said yes. Now it uses the program's channel: under `serve` it waits (or, with
+  `then`, leaves a pending approval), and in a run without a terminal it is denied. In `conform`
+  and `test` nothing changes. **Breaking** for a program that relied on the `true`.
+- **`cron_every` and `cron_after` are an error inside a `sandbox`, a trusted tool, a tool run by
+  `call_tool`, an agent or a request authenticated with a capability token.** The task runs
+  later with the program's capabilities: under `serve`, a task scheduled from a `sandbox` wrote
+  what the block could not. The error says why. **Breaking** for a program that scheduled from one of those places (under
+  `run` the job had the block's capabilities and failed in the log).
+- **`ask … with [options]` that nobody answers gives the first option as text**, like an answer
+  typed by a person. A list of numbers gave the number, so a program that compared it with a
+  number passed when nobody answered and failed when someone did. **Breaking** for a program that
+  relied on the number.
+
+**New.**
+- **`make_dir(path)`** creates a folder and the ones above it that are missing (like `mkdir -p`)
+  and returns `true`, also when it already exists. It needs `file.write` for each folder it
+  creates, not only the last one, and a link on the way is judged by where it really leads. A file
+  on the way is an error.
+- **`run(…, {"isolate": …, "max_file_mb": N})`** caps the size of each file the isolated child
+  writes. It is a cap per file, not on the disk: many small files still fill it. A child that writes
+  past it is killed by the kernel (`SIGXFSZ`); then `r.killed_by` is `"max_file_mb"` and
+  `r.exit_code` is `-1`. Without `isolate` it is an error, like `max_memory_mb`.
+  `r.isolation.max_file_mb` says what was enforced.
+- **`approve <message> then <task>`** (also `confirm … then` and `ask … then`): an approval that
+  does not wait.
+  - Under `serve` the route goes on at once. The gate gives back the id of the pending approval,
+    which is listed and answered by the same `/approvals` routes, console line and webhook as
+    always.
+  - When a person answers, the engine calls `task(decision, message, id)`: `true`/`false` for
+    `approve`/`confirm`, the answer text for `ask`. When it expires (`within`, or
+    `SYNSEMA_HUMAN_TIMEOUT`, default 300 s), it calls the task with what a gate that waits gives
+    when nobody answers: `false`, or for `ask … with [options]` the first option as text (`""`
+    without options).
+  - What is pending is kept in the state folder (`.synsema/state/approvals-<port>.json`, or
+    `SYNSEMA_STATE_DIR`) with a hash of the token, never the token. It survives a restart, and the
+    token sent before still answers it. A program that does not use `then` writes nothing.
+  - The file is the truth for every process that shares it: two `serve` on the same port (the
+    handoff of `SYNSEMA_REUSE_PORT`) see the same pending approvals, and each one is answered or
+    expires once. While a `serve` is shutting down an answer gets 503 and stays pending.
+  - Only the tasks the program names in a `then` can be called from the file, and the file has to
+    be private and not a link (on Unix, owned by the user that runs `serve`, mode 600; on Windows
+    it takes the permissions of its folder). An entry that does not qualify is ignored with a
+    warning and left in the file. A filesystem that does not keep Unix permissions (a Windows drive
+    mounted in WSL) cannot hold it: the gate is an error that says so, and `SYNSEMA_STATE_DIR`
+    moves the file.
+  - The task runs at most once: once an answer is taken, a crash before the task finishes loses it.
+    A shutdown waits for a running task within `SYNSEMA_SHUTDOWN_GRACE`.
+  - The task has to be a task of the program that takes three parameters; anything else is an
+    error at the gate. Inside a `sandbox`, a trusted tool, a tool run by `call_tool`, an agent or a
+    request authenticated with a capability token it is an error too: the task would run with the
+    program's capabilities.
+  - If the port changes between runs, `serve` names the files of the other ports that still have
+    pending approvals.
+  - Outside `serve` the gate is answered on the spot, as without `then`, and the task runs right
+    away.
+  - `when approve "x" then a otherwise b` is still the inline `when`: inside the condition of a
+    `when`, `then` belongs to the `when`.
+- **`r.killed_by` in the result of an isolated `run`:** `nothing` when the child exited on its own,
+  `"max_file_mb"` as above, or `"signal N"` for any other signal.
+- **Restarting a `serve` without refusing connections** (Linux):
+  - **Socket activation:** when systemd passes the listening socket (`LISTEN_PID`/`LISTEN_FDS`,
+    a `.socket` unit with `ListenStream=`), `serve` listens on it instead of opening the port.
+    systemd keeps the port open between the old process and the new one, so with `systemctl
+    restart` the connections that arrive meanwhile wait instead of being refused. It takes the
+    socket of the port it serves on (the main port, the `:80` of `redirect https` and of the ACME
+    challenge).
+  - **`SYNSEMA_REUSE_PORT=1`** opens the port with `SO_REUSEPORT`: a new process listens on the
+    same port while the old one drains (start the new one, wait until it answers, send `SIGTERM`
+    to the old one, which stops accepting and finishes what it has). A few connections already
+    queued on the old process can be reset when it closes, unless `net.ipv4.tcp_migrate_req=1`;
+    socket activation does not have this gap. Without it, a second `serve` on the same port is
+    still "address in use". On Windows it is ignored (with a notice): there the handoff is the
+    drain of `SYNSEMA_SHUTDOWN_GRACE`.
+  - A gate that waits (without `then`) stays in the old process: it is not handed over, and while
+    both listen an answer can reach the new one and get 404. Approvals that have to survive a
+    restart use `then`.
+  - systemd passing two sockets for the same port is an error at start (one would never be
+    accepted). The sockets synsema does not take are not inherited by its children.
+- **`tls auto` for the server's IP, without a domain:** `domain "203.0.113.7"` (or a list with
+  domains and IPs) gets a certificate for the IP.
+  - It is ordered with the ACME profile `shortlived` when the CA offers it. Let's Encrypt issues
+    for an IP only with that profile, and the certificate lasts about six days.
+  - It is renewed by its own lifetime: a third of its life before it expires, at most 30 days
+    before. A 90-day certificate is still renewed at 30 days.
+  - A client that comes in by the IP sends no SNI; it gets the certificate of the IP even when a
+    domain is listed first. So it is one IP per `serve`: two IPs with `tls auto` are an error at
+    start.
+  - An IP is validated by HTTP-01 or TLS-ALPN-01, never DNS-01, even with `tls dns`. The
+    TLS-ALPN-01 challenge is found by the reverse name the CA sends (`7.113.0.203.in-addr.arpa`).
+  - With an IPv6 `domain`, the base URL of the sitemap, `robots.txt` and OpenAPI puts it in
+    brackets.
+- **A warning when the program of an isolated `run` is a link that leads out of what the child
+  sees** (the `python` of a venv made by uv or pyenv links to a base interpreter outside the
+  project). The child can run that file but not read the folder around it, and fails with an error
+  of its own; synsema now names the folder to add to `"file.read"`.
+
+**Fixes.**
+- **`http_get("http://localhost:…")` reaches a server that listens on IPv4 only.** `localhost`
+  resolves to `::1` first (Windows) and a `serve` on `0.0.0.0` listens on IPv4 only; the client
+  tried just the first address and failed. Now the HTTP client, `ws_connect` and `proxy to` try
+  every address the name gives, Happy Eyeballs style (RFC 8305): the next one starts when the
+  previous fails or has not connected in 250 ms, and the first to connect wins; the others are
+  closed then. Each address is
+  still checked against the program's `net` grants before it is tried.
+- **Zombies when synsema adopts orphans** (it is PID 1 in a container, or a subreaper). What an
+  isolated child left running and `run` killed was never reaped when the child had no folder to
+  write to, and could be missed with one; each stayed a zombie of synsema until it exited.
+
 ## v0.6.52 — 2026-10-31
 
 **Behavior changes (read these first).**

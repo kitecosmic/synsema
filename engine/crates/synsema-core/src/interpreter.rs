@@ -1430,6 +1430,10 @@ pub type ServeHook =
 /// Callback humano de los gates (approve/confirm/ask): (acción, mensaje,
 /// within_secs) → respuesta (bool para approve/confirm, texto para ask).
 pub type HumanCallback = Rc<dyn Fn(&str, &str, Option<f64>) -> SynValue>;
+/// v0.6.53 (G3): el gate con continuación (`approve … then <task>`): (acción, mensaje,
+/// within_secs, nombre de la task) → el id de la pendiente, sin esperar la respuesta. Lo cablea
+/// `serve`: la respuesta llega por `/approvals` y el runtime llama a la task.
+pub type HumanDeferCallback = Rc<dyn Fn(&str, &str, Option<f64>, &str, &[String]) -> Result<String, String>>;
 /// Sink de `send` en un handler SSE: (valor, event_name) → Ok, o corta el stream.
 pub type StreamEmitFn = Rc<dyn Fn(SynValue, Option<&str>) -> Result<(), Control>>;
 
@@ -1991,7 +1995,17 @@ pub struct Interpreter {
     /// shutdown, mTLS, texto de redacción). Lo comparten todos los intérpretes de la corrida; ver
     /// `run_scope.rs`. Al final del struct a propósito (no es camino caliente).
     run_scope: std::sync::Arc<crate::run_scope::RunScope>,
+    /// v0.6.53 (G3): el gate con continuación (`approve … then <task>`). Al final: no es camino
+    /// caliente.
+    human_defer_callback: Option<HumanDeferCallback>,
+    /// v0.6.53 (ronda 1, A1): lo que sólo sabe el host sobre si el marco actual corre con MENOS
+    /// que las capacidades del programa (un techo delegado, un agente). Ver `frame_narrowing`.
+    frame_narrowing_hook: Option<FrameNarrowingHook>,
 }
+
+/// v0.6.53 (ronda 1, A1): ¿el marco actual está recortado respecto del programa, y por qué? El
+/// texto completa «not allowed …» (p. ej. "inside an agent").
+pub type FrameNarrowingHook = Rc<dyn Fn() -> Option<&'static str>>;
 
 /// v0.6.46 (ronda 1 de cf1, B2): el linaje que juntó un intérprete hijo (un worker de
 /// `parallel_map`), para sumarlo al del padre con [`Interpreter::absorb_lineage`].
@@ -2201,6 +2215,8 @@ impl Interpreter {
             intent_frozen: false,
             swarm_hooks: None,
             human_callback: None,
+            human_defer_callback: None,
+            frame_narrowing_hook: None,
             llm_callback: None,
             llm_decide_callback: None,
             llm_step_callback: None,
@@ -3737,6 +3753,117 @@ impl Interpreter {
     /// `within` del gate en segundos (None = sin `within`).
     pub fn set_human_callback(&mut self, cb: HumanCallback) {
         self.human_callback = Some(cb);
+    }
+
+    /// v0.6.53 (G3): cablea el gate con continuación (ver `HumanDeferCallback`).
+    pub fn set_human_defer_callback(&mut self, cb: HumanDeferCallback) {
+        self.human_defer_callback = Some(cb);
+    }
+
+    /// v0.6.53 (ronda 1, A1): cablea lo que el host sabe del recorte del marco (ver
+    /// `frame_narrowing`).
+    pub fn set_frame_narrowing_hook(&mut self, hook: FrameNarrowingHook) {
+        self.frame_narrowing_hook = Some(hook);
+    }
+
+    /// v0.6.53 (ronda 1, A1): si el marco actual corre con MENOS que las capacidades del programa,
+    /// el motivo. Lo que corre DESPUÉS en nombre del programa (la task de un `then`, una task de
+    /// `cron_every`/`cron_after`) corre con las capacidades del programa, así que no se puede
+    /// agendar desde un marco recortado: sería ampliarlo. El core sabe de `sandbox` y de las tools
+    /// de confianza; el host, del techo delegado de un captoken y de los agentes.
+    pub fn frame_narrowing(&self) -> Option<&'static str> {
+        if self.sandbox_depth > 0 {
+            return Some("inside a sandbox");
+        }
+        if self.in_trusted_scope() {
+            return Some("inside a trusted tool");
+        }
+        // Ronda 2, R2-1: `call_tool` corre la tool con las caps que declaró (o las ambientes sin
+        // host): el error es conservador también sin hook.
+        if self.tool_scope_depth > 0 {
+            return Some("inside a tool run by call_tool");
+        }
+        self.frame_narrowing_hook.as_ref().and_then(|h| h())
+    }
+
+    /// v0.6.53 (G3): `approve|confirm|ask … then <task>`. La task tiene que ser del programa (top
+    /// level: la respuesta puede llegar después de un reinicio y se la busca por nombre) y recibir
+    /// (decisión, mensaje, id). Bajo `serve` no bloquea: registra la pendiente y devuelve su id.
+    /// Sin `serve` el gate se contesta como siempre y la task corre en el acto; devuelve el id igual.
+    fn gate_then(
+        &mut self,
+        action: &str,
+        message: &str,
+        timeout: Option<f64>,
+        task: &str,
+        options: Option<&Node>,
+        env: &Rc<RefCell<Environment>>,
+        loc: &SourceLocation,
+    ) -> Result<SynValue, Control> {
+        let t = self.global_env.borrow().bindings.get(task).cloned();
+        let tv = match t {
+            Some(SynValue::Task(tv)) => tv,
+            _ => {
+                return Err(err_at(
+                    format!("{} … then {}: \"{}\" is not a task of the program (it is called by name with the decision, the message and the id)", action, task, task),
+                    loc,
+                ))
+            }
+        };
+        // Ronda 1, A1: la task corre después con las capacidades del programa.
+        if let Some(why) = self.frame_narrowing() {
+            return Err(err_at(
+                format!(
+                    "{} … then {}: not allowed {} — the task would run later with the program's capabilities; use the gate that waits ({} without `then`), or move the gate out",
+                    action, task, why, action
+                ),
+                loc,
+            ));
+        }
+        let required = tv.parameters.iter().filter(|p| p.default.is_none()).count();
+        if required > 3 || tv.parameters.len() < 3 {
+            return Err(err_at(
+                format!(
+                    "{} … then {}: \"{}\" takes {} parameter(s); it is called with three (decision, message, id)",
+                    action,
+                    task,
+                    task,
+                    tv.parameters.len()
+                ),
+                loc,
+            ));
+        }
+        // Ronda 1, B3: las opciones de un `ask … with [...]` van con la pendiente: sin respuesta,
+        // la task recibe la primera, como el gate que espera.
+        let options = match options.map(|o| self.exec(o, env)).transpose()? {
+            Some(SynValue::List(l)) => list_values(&l).to_vec(),
+            _ => Vec::new(),
+        };
+        if let Some(cb) = self.human_defer_callback.clone() {
+            let texts: Vec<String> = options.iter().map(|o| o.to_string()).collect();
+            return cb(action, message, timeout, task, &texts).map(syn_text).map_err(|e| err_at(e, loc));
+        }
+        let answer = match self.human_callback.clone() {
+            Some(cb) => {
+                let _w = crate::waiting::waiting();
+                cb(action, message, timeout)
+            }
+            None if action == "ask" => syn_text(""),
+            None => syn_bool(true),
+        };
+        // `ask` sin respuesta: la primera opción como texto, como el gate sin `then`.
+        let answer = if action == "ask" && !answer.is_truthy() {
+            // Ronda 2, R2-7: texto, como bajo `serve` (lo que da un humano y lo que guarda el archivo).
+            options.first().map(|o| syn_text(o.to_string())).unwrap_or_else(|| syn_text(""))
+        } else if action == "ask" {
+            syn_text(answer.to_string())
+        } else {
+            answer
+        };
+        static NOW_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let id = format!("interact_now_{}", NOW_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1);
+        self.call_task(SynValue::Task(tv), vec![answer, syn_text(message), syn_text(id.as_str())])?;
+        Ok(syn_text(id))
     }
 
     /// Cablea el callback LLM (reason/decide/analyze/generate). La firma es
@@ -6354,11 +6481,14 @@ impl Interpreter {
     #[inline(never)]
     fn exec_approve_statement(&mut self, node: &Node, env: &Rc<RefCell<Environment>>) -> Result<SynValue, Control> {
         let loc = &node.location;
-        let NodeKind::ApproveStatement { message, timeout, .. } = &node.kind else { unreachable!("exec_approve_statement: otro nodo") };
+        let NodeKind::ApproveStatement { message, timeout, then, .. } = &node.kind else { unreachable!("exec_approve_statement: otro nodo") };
         {
         let m = self.exec(message, env)?;
         if self.labels {
             self.sink_check("approve", &[&m], loc)?;
+        }
+        if let Some(task) = then {
+            return self.gate_then("approve", &m.to_string(), *timeout, task, None, env, loc);
         }
         match self.human_callback.clone() {
             Some(cb) => {
@@ -6374,11 +6504,14 @@ impl Interpreter {
     #[inline(never)]
     fn exec_ask_expression(&mut self, node: &Node, env: &Rc<RefCell<Environment>>) -> Result<SynValue, Control> {
         let loc = &node.location;
-        let NodeKind::AskExpression { prompt, options, timeout } = &node.kind else { unreachable!("exec_ask_expression: otro nodo") };
+        let NodeKind::AskExpression { prompt, options, timeout, then } = &node.kind else { unreachable!("exec_ask_expression: otro nodo") };
         {
         let p = self.exec(prompt, env)?;
         if self.labels {
             self.sink_check("ask", &[&p], loc)?;
+        }
+        if let Some(task) = then {
+            return self.gate_then("ask", &p.to_string(), *timeout, task, options.as_deref(), env, loc);
         }
         if let Some(cb) = self.human_callback.clone() {
             let r = {
@@ -6389,12 +6522,13 @@ impl Interpreter {
                 return Ok(syn_text(r.to_string()));
             }
         }
-        // Fallback no-interactivo: primera opción si hay lista.
+        // Fallback no-interactivo: primera opción si hay lista, como texto (ronda 3, R3-1: lo que
+        // escribe una persona es texto, y `then` da lo mismo).
         if let Some(opts) = options {
             let o = self.exec(opts, env)?;
             if let SynValue::List(l) = &o {
                 if let Some(first) = list_values(&l).first() {
-                    return Ok(first.clone());
+                    return Ok(syn_text(first.to_string()));
                 }
             }
         }
@@ -6405,11 +6539,14 @@ impl Interpreter {
     #[inline(never)]
     fn exec_confirm_statement(&mut self, node: &Node, env: &Rc<RefCell<Environment>>) -> Result<SynValue, Control> {
         let loc = &node.location;
-        let NodeKind::ConfirmStatement { message, timeout } = &node.kind else { unreachable!("exec_confirm_statement: otro nodo") };
+        let NodeKind::ConfirmStatement { message, timeout, then } = &node.kind else { unreachable!("exec_confirm_statement: otro nodo") };
         {
         let m = self.exec(message, env)?;
         if self.labels {
             self.sink_check("confirm", &[&m], loc)?;
+        }
+        if let Some(task) = then {
+            return self.gate_then("confirm", &m.to_string(), *timeout, task, None, env, loc);
         }
         match self.human_callback.clone() {
             Some(cb) => {

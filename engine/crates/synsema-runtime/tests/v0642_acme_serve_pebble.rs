@@ -5,7 +5,10 @@
 //! - un nombre nuevo que aprueba la task de `domain ask` se emite durante el handshake, también
 //!   por HTTP-01;
 //! - la ruta contesta por HTTPS con el certificado de cada nombre; uno que `ask` rechaza no
-//!   tiene certificado (el handshake termina en un alerta TLS).
+//!   tiene certificado (el handshake termina en un alerta TLS);
+//! - v0.6.53 (G2): una IP fija (`domain [..., "127.0.0.1"]`) se emite con el profile
+//!   `shortlived` (el de un dominio no), y un cliente que entra por la IP (sin SNI) recibe ese
+//!   certificado aunque el dominio esté antes en la lista.
 //!
 //! `#[ignore]` (necesita los binarios). Correr con:
 //!   go install github.com/letsencrypt/pebble/v2/cmd/pebble@latest
@@ -135,6 +138,29 @@ fn names_in(der: &[u8]) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Las IPs de la SAN y la vida (segundos) del certificado.
+fn ips_and_lifetime(der: &[u8]) -> (Vec<String>, i64) {
+    let (_, x) = x509_parser::parse_x509_certificate(der).unwrap();
+    let ips = x
+        .subject_alternative_name()
+        .ok()
+        .flatten()
+        .map(|s| {
+            s.value
+                .general_names
+                .iter()
+                .filter_map(|g| match g {
+                    x509_parser::extensions::GeneralName::IPAddress(b) if b.len() == 4 => {
+                        Some(std::net::Ipv4Addr::new(b[0], b[1], b[2], b[3]).to_string())
+                    }
+                    _ => None,
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    (ips, x.validity().not_after.timestamp() - x.validity().not_before.timestamp())
+}
+
 #[test]
 #[ignore = "requiere pebble y pebble-challtestsrv (go install …); correr con --ignored"]
 fn serve_issues_fixed_and_on_demand_names_by_http01_against_pebble() {
@@ -173,7 +199,10 @@ fn serve_issues_fixed_and_on_demand_names_by_http01_against_pebble() {
         r#"{{"pebble": {{"listenAddress": "127.0.0.1:{d}", "managementListenAddress": "127.0.0.1:{m}",
   "certificate": "{c}", "privateKey": "{k}", "httpPort": {h}, "tlsPort": {t},
   "ocspResponderURL": "", "externalAccountBindingRequired": false,
-  "profiles": {{"default": {{"description": "default", "validityPeriod": 7776000}}}}}}}}"#,
+  "profiles": {{"default": {{"description": "default", "validityPeriod": 7776000}},
+                "classic": {{"description": "classic", "validityPeriod": 7776000}},
+                "tlsserver": {{"description": "tlsserver", "validityPeriod": 7776000}},
+                "shortlived": {{"description": "shortlived", "validityPeriod": 576000}}}}}}}}"#,
         d = dir_port,
         m = mgmt_port,
         c = fwd(&dir_cert_path),
@@ -212,7 +241,7 @@ task approve_host(host)
 
 serve on {p}
     tls auto "admin@example.test"
-    domain ["fixed.test"]
+    domain ["fixed.test", "127.0.0.1"]
     domain ask approve_host
     route "GET /"
         give "hola"
@@ -230,7 +259,7 @@ serve on {p}
     }
     // El puerto se abre antes de emitir: se espera al fijo (que se emite por HTTP-01).
     let deadline = Instant::now() + Duration::from_secs(60);
-    while !certdir.join("fixed.test.pem").is_file() && Instant::now() < deadline {
+    while !(certdir.join("fixed.test.pem").is_file() && certdir.join("127.0.0.1.pem").is_file()) && Instant::now() < deadline {
         thread::sleep(Duration::from_millis(100));
     }
     assert!(certdir.join("fixed.test.pem").is_file(), "el fijo se emitió al arrancar, por HTTP-01: {:?}", rx.try_recv());
@@ -239,6 +268,14 @@ serve on {p}
     let (cert, resp) = https_get(p, "fixed.test").expect("handshake con el fijo");
     assert!(names_in(&cert).contains(&"fixed.test".to_string()), "{:?}", names_in(&cert));
     assert!(resp.starts_with("HTTP/1.1 200") && resp.contains("hola"), "{}", resp);
+
+    // G2: por la IP no hay SNI; se sirve el certificado de la IP, de corta vida.
+    assert!(certdir.join("127.0.0.1.pem").is_file(), "la IP se emitió al arrancar: {:?}", rx.try_recv());
+    let (cert, resp) = https_get(p, "127.0.0.1").expect("handshake por la IP");
+    let (ips, life) = ips_and_lifetime(&cert);
+    assert_eq!(ips, vec!["127.0.0.1".to_string()], "{:?}", names_in(&cert));
+    assert!((life - 576000).abs() <= 60, "una IP va con el profile shortlived: {}", life);
+    assert!(resp.contains("hola"), "{}", resp);
 
     // Bajo demanda: el primer handshake dispara la emisión y espera el certificado.
     let (cert, resp) = https_get(p, "dyn.test").expect("handshake bajo demanda");

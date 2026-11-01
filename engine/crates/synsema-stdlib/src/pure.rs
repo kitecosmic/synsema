@@ -42,6 +42,8 @@ pub const FS: &[&str] = &[
     "file_info", "file_exists", "grep",
     // v0.6.20
     "delete_file", "delete_dir", "cwd",
+    // v0.6.53
+    "make_dir",
 ];
 /// v0.6.20 — archivos comprimidos: crear y extraer viven en el perfil native (archive.rs).
 pub const ARCHIVE: &[&str] = &["zip_create", "zip_extract", "tar_create", "tar_extract"];

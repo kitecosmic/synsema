@@ -616,6 +616,9 @@ fn main() -> ExitCode {
     // v0.6.52 (ronda 3, B1): heredado ignorado, `run` perdía el código de salida y un hijo aislado
     // se esperaba hasta el timeout.
     synsema_isolate::default_sigchld();
+    // v0.6.53 (G1): los sockets de la activación por socket de systemd, antes de cualquier hilo o
+    // hijo (se marcan para que ningún hijo los herede).
+    synsema_stdlib::listen::adopt_inherited();
     let mut args: Vec<String> = std::env::args().collect();
     // F4: el nivel nativo para lo caliente (no cambia lo observable; ver synsema-jit), salvo con
     // `--jitless` o `serve --attested`: ahí no se crea el JIT (ni memoria ejecutable).
