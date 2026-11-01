@@ -243,6 +243,29 @@ fn discovery_off_hands_every_reserved_url_to_the_program() {
     assert_eq!(get(port, "/robots.txt", "").2, "User-agent: *\nDisallow: /\n");
 }
 
+/// v0.6.53: `/.well-known/synsema-auth` es una URL reservada como las demás: una ruta con
+/// parámetros (`GET /*path`) no se la lleva cuando el motor la publica. Con `discovery off` o
+/// `private` no la publica y la recibe la ruta, como antes.
+#[test]
+fn a_route_with_params_does_not_take_synsema_auth() {
+    let prog = |port: u16, clause: &str| {
+        format!(
+            "require serve({p})\ntask check_token(req)\n    give nothing\nserve on {p}\n{clause}    auth with check_token\n    route \"POST /pedido\" requires auth\n        give {{\"ok\": true}}\n    route \"GET /*path\"\n        give \"RUTA \" + params.path\n",
+            p = port
+        )
+    };
+    let port = free_port();
+    start(prog(port, ""), port);
+    let (st, head, body) = get(port, "/.well-known/synsema-auth", "");
+    assert!(st == 200 && head.contains("application/json") && !body.contains("RUTA"), "{} {}", st, body);
+    assert_eq!(get(port, "/otra", "").2, "\"RUTA otra\"");
+    for clause in ["    discovery off\n", "    private\n"] {
+        let port = free_port();
+        start(prog(port, clause), port);
+        assert_eq!(get(port, "/.well-known/synsema-auth", "").2, "\"RUTA .well-known/synsema-auth\"", "{}", clause);
+    }
+}
+
 #[test]
 fn declared_route_and_domain_win() {
     let port = free_port();
@@ -271,4 +294,21 @@ serve on {p}
     assert!(!body.contains("/docs") && !body.contains("openapi"), "{}", body);
     let (_, _, body) = get(port, "/robots.txt", "");
     assert!(body.contains("Sitemap: http://books.example/sitemap.xml"), "{}", body);
+}
+
+/// v0.6.53 (G2): `domain` puede ser la IP del servidor (un certificado para la IP); una IPv6 va
+/// entre corchetes en la base URL.
+#[test]
+fn a_domain_that_is_an_ipv6_goes_in_brackets() {
+    for (domain, base) in [("2001:db8::7", "http://[2001:db8::7]"), ("203.0.113.7", "http://203.0.113.7")] {
+        let port = free_port();
+        let prog = format!(
+            "require serve({p})\nserve on {p}\n    domain \"{d}\"\n    route \"GET /about\"\n        give \"hi\"\n",
+            p = port,
+            d = domain
+        );
+        start(prog, port);
+        let (_, _, body) = get(port, "/sitemap.xml", "");
+        assert!(body.contains(&format!("<loc>{}/about</loc>", base)), "{}", body);
+    }
 }

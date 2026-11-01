@@ -57,7 +57,12 @@ pub struct AcmeOptions {
     pub http_store: Option<ChallengeStore>,
 }
 
+/// Cuánto antes del `notAfter` se renueva, como mucho: un certificado de corta vida (el de una
+/// IP dura días) se renueva a los dos tercios de su vida (`renew_window`).
 const RENEW_BEFORE: i64 = 30 * 24 * 3600;
+/// El profile ACME de corta vida (Let's Encrypt lo exige para una IP); se pide sólo para una IP y
+/// sólo si el directorio lo ofrece.
+const SHORT_PROFILE: &str = "shortlived";
 const ASK_YES_TTL: Duration = Duration::from_secs(3600);
 const ASK_NO_TTL: Duration = Duration::from_secs(600);
 const ASK_TIMEOUT: Duration = Duration::from_secs(10);
@@ -85,6 +90,18 @@ const RETRY_BASE: Duration = Duration::from_secs(60);
 /// Cada cuánto mira la renovación si falta el certificado de algún nombre fijo (cada nombre
 /// respeta su backoff); sin faltantes, cada hora.
 const RETRY_MISSING_EVERY: Duration = Duration::from_secs(60);
+
+/// Cuánto antes del `notAfter` se renueva un certificado con esa vigencia: un tercio de su vida,
+/// con un tope de `RENEW_BEFORE` (uno de 90 días, a los 30; uno de 6 días, a los 2).
+fn renew_window(not_before: i64, not_after: i64) -> i64 {
+    RENEW_BEFORE.min((not_after - not_before).max(0) / 3)
+}
+
+/// El profile ACME que se pide para ese identificador: `shortlived` para una IP si el directorio
+/// lo ofrece; si no, ninguno (la CA usa el suyo).
+fn order_profile<'a>(identifier: &Identifier, mut offered: impl Iterator<Item = &'a str>) -> Option<&'static str> {
+    (matches!(identifier, Identifier::Ip(_)) && offered.any(|p| p == SHORT_PROFILE)).then_some(SHORT_PROFILE)
+}
 
 fn now_unix() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
@@ -133,7 +150,8 @@ pub struct CertManager {
     name_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// El certificado de cada nombre y su `notAfter` (uno vencido no se sirve).
     certs: RwLock<HashMap<String, (Arc<CertifiedKey>, i64)>>,
-    not_after: Mutex<HashMap<String, i64>>,
+    /// Cuándo se renueva cada nombre (`notAfter` menos `renew_window`).
+    renew_at: Mutex<HashMap<String, i64>>,
     /// Certificados de reto TLS-ALPN-01 vigentes, por nombre.
     alpn: RwLock<HashMap<String, Arc<CertifiedKey>>>,
     failures: Mutex<HashMap<String, (Instant, u32)>>,
@@ -165,7 +183,7 @@ impl CertManager {
             account: tokio::sync::Mutex::new(None),
             name_locks: Mutex::new(HashMap::new()),
             certs: RwLock::new(HashMap::new()),
-            not_after: Mutex::new(HashMap::new()),
+            renew_at: Mutex::new(HashMap::new()),
             alpn: RwLock::new(HashMap::new()),
             failures: Mutex::new(HashMap::new()),
             issued: Mutex::new(VecDeque::new()),
@@ -212,14 +230,14 @@ impl CertManager {
         live(certs.get(&format!("*.{}", parent)))
     }
 
-    /// Sin SNI (acceso por IP): el primer nombre fijo que tenga certificado.
+    /// Sin SNI (un cliente que entra por la IP no lo manda): el certificado de una IP fija si hay
+    /// uno vigente; si no, el primer nombre fijo que tenga certificado.
     fn default_cert(&self) -> Option<Arc<CertifiedKey>> {
         let certs = self.certs.read().ok()?;
         let now = now_unix();
-        self.opts
-            .domains
-            .iter()
-            .find_map(|d| certs.get(&d.to_ascii_lowercase()).filter(|(_, t)| *t > now).map(|(c, _)| c.clone()))
+        let live = |d: &String| certs.get(&d.to_ascii_lowercase()).filter(|(_, t)| *t > now).map(|(c, _)| c.clone());
+        let is_ip = |d: &&String| d.parse::<std::net::IpAddr>().is_ok();
+        self.opts.domains.iter().filter(is_ip).find_map(live).or_else(|| self.opts.domains.iter().find_map(live))
     }
 
     /// ¿Tiene este nombre (exacto) un certificado vigente instalado?
@@ -234,7 +252,7 @@ impl CertManager {
 
     /// ¿Hay un certificado instalado para exactamente este nombre y lejos de vencer?
     fn fresh(&self, name: &str) -> bool {
-        self.not_after.lock().ok().and_then(|n| n.get(name).copied()).map(|t| t - now_unix() > RENEW_BEFORE).unwrap_or(false)
+        self.renew_at.lock().ok().and_then(|n| n.get(name).copied()).map(|t| now_unix() < t).unwrap_or(false)
     }
 
     // -------------------------------------------------------------------------
@@ -265,7 +283,7 @@ impl CertManager {
     /// Carga un certificado del disco: la clave firmante y su `notAfter`.
     /// Con la clave actual o, si no corresponde (una escritura cortada a mitad), la anterior; y
     /// sólo si el certificado cubre el nombre (un archivo de otro nombre no se sirve).
-    fn load(&self, name: &str) -> Option<(Arc<CertifiedKey>, i64)> {
+    fn load(&self, name: &str) -> Option<(Arc<CertifiedKey>, Validity)> {
         let (cert, key) = self.paths(name);
         let cert_pem = std::fs::read(&cert).ok()?;
         if !leaf_covers(&cert_pem, name) {
@@ -289,20 +307,20 @@ impl CertManager {
     /// Instala lo que haya en disco para `name` si todavía no venció. `true` si quedó instalado.
     fn load_installed(&self, name: &str) -> bool {
         match self.load(name) {
-            Some((ck, not_after)) if not_after > now_unix() => {
-                self.install(name, ck, not_after);
+            Some((ck, v)) if v.not_after > now_unix() => {
+                self.install(name, ck, v);
                 true
             }
             _ => false,
         }
     }
 
-    fn install(&self, name: &str, ck: Arc<CertifiedKey>, not_after: i64) {
+    fn install(&self, name: &str, ck: Arc<CertifiedKey>, v: Validity) {
         if let Ok(mut c) = self.certs.write() {
-            c.insert(name.to_ascii_lowercase(), (ck, not_after));
+            c.insert(name.to_ascii_lowercase(), (ck, v.not_after));
         }
-        if let Ok(mut n) = self.not_after.lock() {
-            n.insert(name.to_ascii_lowercase(), not_after);
+        if let Ok(mut n) = self.renew_at.lock() {
+            n.insert(name.to_ascii_lowercase(), v.not_after - renew_window(v.not_before, v.not_after));
         }
     }
 
@@ -450,8 +468,14 @@ impl CertManager {
             Ok(ip) => Identifier::Ip(ip),
             Err(_) => Identifier::Dns(name.to_string()),
         };
+        // Una IP con el profile de corta vida si la CA lo ofrece (Let's Encrypt no emite para una
+        // IP sin él); si no lo ofrece, la orden va sin profile y la CA decide.
+        let mut new_order = NewOrder::new(std::slice::from_ref(&identifier));
+        if let Some(profile) = order_profile(&identifier, account.profiles().map(|p| p.name)) {
+            new_order = new_order.profile(profile);
+        }
         let mut order = within(deadline, name, "new order", async {
-            account.new_order(&NewOrder::new(&[identifier])).await.map_err(|e| format!("ACME new order failed for {}: {}", name, e))
+            account.new_order(&new_order).await.map_err(|e| format!("ACME new order failed for {}: {}", name, e))
         })
         .await?;
         let mut dns_published: Vec<(String, String)> = Vec::new();
@@ -468,7 +492,11 @@ impl CertManager {
                 }
                 let ident = authz.identifier().to_string();
                 let base = ident.trim_start_matches("*.").to_string();
-                let use_dns = authz.wildcard || (self.opts.dns.is_some() && self.opts.http_store.is_none() && !self.on_demand());
+                let use_dns = uses_dns01(
+                    &base,
+                    authz.wildcard,
+                    self.opts.dns.is_some() && self.opts.http_store.is_none() && !self.on_demand(),
+                );
                 if use_dns {
                     let dns = self.opts.dns.clone().ok_or_else(|| format!("{}: DNS-01 needs `tls dns <task>`", ident))?;
                     let mut ch = authz
@@ -511,10 +539,12 @@ impl CertManager {
                 let mut ch = authz.challenge(ChallengeType::TlsAlpn01).expect("ofrecido");
                 let digest = ch.key_authorization().digest().as_ref().to_vec();
                 let ck = alpn_challenge_cert(&base, &digest)?;
+                // Bajo el SNI que manda la CA: el nombre mismo, o el reverso si es una IP.
+                let sni = challenge_sni(&base);
                 if let Ok(mut a) = self.alpn.write() {
-                    a.insert(base.to_ascii_lowercase(), Arc::new(ck));
+                    a.insert(sni.clone(), Arc::new(ck));
                 }
-                alpn_names.push(base.to_ascii_lowercase());
+                alpn_names.push(sni);
                 ch.set_ready().await.map_err(|e| format!("ACME set challenge ready failed: {}", e))?;
             }
             let status = order
@@ -558,7 +588,7 @@ impl CertManager {
         })
         .await?;
         // Validados ANTES de tocar el disco: la clave tiene que corresponder al certificado.
-        let (ck, not_after) = certified_from_pem(cert_pem.as_bytes(), key_pem.as_bytes())?;
+        let (ck, validity) = certified_from_pem(cert_pem.as_bytes(), key_pem.as_bytes())?;
         self.ensure_dir()?;
         let (cp, kp) = self.paths(name);
         // La clave primero y el certificado después, cada uno atómico. Antes, una copia de la clave
@@ -569,7 +599,7 @@ impl CertManager {
         }
         write_private(&kp, key_pem.as_bytes()).map_err(|e| format!("could not write key {}: {}", kp.display(), e))?;
         write_atomic(&cp, cert_pem.as_bytes(), false).map_err(|e| format!("could not write cert {}: {}", cp.display(), e))?;
-        self.install(name, ck, not_after);
+        self.install(name, ck, validity);
         Ok(())
     }
 
@@ -688,15 +718,16 @@ impl CertManager {
         self.opts.domains.iter().map(|d| d.to_ascii_lowercase()).filter(|d| !self.has_cert(d)).collect()
     }
 
-    /// Una pasada de renovación: lo que vence en menos de 30 días (o ya venció) y los nombres
+    /// Una pasada de renovación: lo que entró en su ventana (`renew_window`: 30 días antes de
+    /// vencer, o un tercio de la vida si es más corta) o ya venció y los nombres
     /// fijos sin certificado (un arranque con la CA caída), cada uno con su backoff. Un nombre
     /// bajo demanda se le vuelve a preguntar a `ask` antes de renovarlo. Devuelve los fijos que
     /// siguen sin certificado.
     pub async fn renew_due(self: &Arc<Self>) -> Vec<String> {
         let mut due: Vec<String> = self
-            .not_after
+            .renew_at
             .lock()
-            .map(|n| n.iter().filter(|(_, t)| **t - now_unix() < RENEW_BEFORE).map(|(k, _)| k.clone()).collect())
+            .map(|n| n.iter().filter(|(_, t)| now_unix() >= **t).map(|(k, _)| k.clone()).collect())
             .unwrap_or_default();
         for name in self.missing_fixed() {
             if !due.contains(&name) {
@@ -823,26 +854,57 @@ pub fn managed_server_config(mgr: Arc<CertManager>) -> Result<Arc<rustls::Server
     Ok(Arc::new(cfg))
 }
 
-/// Cadena PEM + clave PEM → la clave firmante de rustls y el `notAfter` (unix) de la hoja. Falla
-/// si la clave no corresponde al certificado.
-fn certified_from_pem(cert_pem: &[u8], key_pem: &[u8]) -> Result<(Arc<CertifiedKey>, i64), String> {
+/// La vigencia de la hoja (unix).
+#[derive(Clone, Copy, Debug)]
+struct Validity {
+    not_before: i64,
+    not_after: i64,
+}
+
+/// Cadena PEM + clave PEM → la clave firmante de rustls y la vigencia de la hoja. Falla si la
+/// clave no corresponde al certificado.
+fn certified_from_pem(cert_pem: &[u8], key_pem: &[u8]) -> Result<(Arc<CertifiedKey>, Validity), String> {
     let certs: Vec<rustls::pki_types::CertificateDer<'static>> = rustls_pemfile::certs(&mut &cert_pem[..])
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| format!("invalid certificate PEM: {}", e))?;
     let leaf = certs.first().ok_or_else(|| "no certificate in the PEM".to_string())?;
-    let not_after = x509_parser::parse_x509_certificate(leaf.as_ref())
-        .map_err(|e| format!("could not parse the certificate: {}", e))?
-        .1
-        .validity()
-        .not_after
-        .timestamp();
+    let (_, x509) =
+        x509_parser::parse_x509_certificate(leaf.as_ref()).map_err(|e| format!("could not parse the certificate: {}", e))?;
+    let validity = Validity { not_before: x509.validity().not_before.timestamp(), not_after: x509.validity().not_after.timestamp() };
     let key = rustls_pemfile::private_key(&mut &key_pem[..])
         .map_err(|e| format!("invalid key PEM: {}", e))?
         .ok_or_else(|| "no private key in the PEM".to_string())?;
     let signing = rustls::crypto::ring::sign::any_supported_type(&key).map_err(|e| format!("unsupported key: {}", e))?;
     let ck = CertifiedKey::new(certs, signing);
     ck.keys_match().map_err(|e| format!("the private key does not match the certificate: {}", e))?;
-    Ok((Arc::new(ck), not_after))
+    Ok((Arc::new(ck), validity))
+}
+
+/// ¿El reto de ese nombre va por DNS-01? Un wildcard siempre; uno exacto cuando `tls dns` es la
+/// única vía (sin `:80` ni emisión bajo demanda). Una IP nunca: no tiene DNS-01 (RFC 8738), va
+/// por HTTP-01 o TLS-ALPN-01 aunque haya `tls dns`.
+fn uses_dns01(base: &str, wildcard: bool, dns_only: bool) -> bool {
+    base.parse::<std::net::IpAddr>().is_err() && (wildcard || dns_only)
+}
+
+/// El SNI con el que la CA pide el reto TLS-ALPN-01 de ese nombre: el nombre mismo, o para una IP
+/// su nombre reverso (RFC 8738 §6: `7.113.0.203.in-addr.arpa`, o los nibbles de una IPv6 bajo
+/// `ip6.arpa`), porque una IP no va en el SNI.
+fn challenge_sni(name: &str) -> String {
+    match name.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(v4)) => {
+            let o = v4.octets();
+            format!("{}.{}.{}.{}.in-addr.arpa", o[3], o[2], o[1], o[0])
+        }
+        Ok(std::net::IpAddr::V6(v6)) => {
+            let mut out = String::new();
+            for b in v6.octets().iter().rev() {
+                out.push_str(&format!("{:x}.{:x}.", b & 0xf, b >> 4));
+            }
+            out + "ip6.arpa"
+        }
+        Err(_) => name.to_ascii_lowercase(),
+    }
 }
 
 /// El certificado de reto TLS-ALPN-01 (RFC 8737): autofirmado para `name` con la extensión
@@ -933,7 +995,8 @@ mod tests {
     #[test]
     fn the_real_expiry_is_read_from_the_certificate() {
         let (c, k) = self_signed("a.example");
-        let (_, not_after) = certified_from_pem(c.as_bytes(), k.as_bytes()).unwrap();
+        let (_, v) = certified_from_pem(c.as_bytes(), k.as_bytes()).unwrap();
+        let not_after = v.not_after;
         // rcgen pone notAfter en 4096: lo que importa es que sale del certificado, no de un archivo.
         assert!(not_after > now_unix() + 365 * 24 * 3600, "{}", not_after);
     }
@@ -1071,8 +1134,9 @@ mod tests {
         let m = manager(&["old.example"]);
         let (c, k) = self_signed("old.example");
         let (ck, _) = certified_from_pem(c.as_bytes(), k.as_bytes()).unwrap();
-        m.install("old.example", ck.clone(), now_unix() - 10);
-        m.install("*.w.example", ck, now_unix() - 10);
+        let gone = Validity { not_before: now_unix() - 1000, not_after: now_unix() - 10 };
+        m.install("old.example", ck.clone(), gone);
+        m.install("*.w.example", ck, gone);
         assert!(m.cert_for("old.example").is_none());
         assert!(m.cert_for("a.w.example").is_none());
         assert!(m.default_cert().is_none());
@@ -1116,6 +1180,70 @@ mod tests {
         assert_eq!(still, vec!["late.example".to_string()]);
         assert!(held.lock().unwrap().len() > before, "la renovación volvió a pedir el certificado");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// v0.6.53 (G2): un certificado de corta vida (el de una IP dura días) se renueva por su vida,
+    /// no 30 días antes de vencer (con eso no estaría nunca al día y se reemitiría cada hora).
+    #[test]
+    fn a_short_lived_certificate_is_renewed_by_its_own_lifetime() {
+        let day = 24 * 3600;
+        assert_eq!(renew_window(0, 90 * day), 30 * day);
+        assert_eq!(renew_window(0, 6 * day), 2 * day);
+        let m = manager(&["203.0.113.7"]);
+        let (c, k) = self_signed("x");
+        let (ck, _) = certified_from_pem(c.as_bytes(), k.as_bytes()).unwrap();
+        let now = now_unix();
+        let at = |born: i64, life: i64| Validity { not_before: now - born, not_after: now - born + life };
+        m.install("203.0.113.7", ck.clone(), at(0, 6 * day));
+        assert!(m.fresh("203.0.113.7"), "recién emitido, de 6 días");
+        assert!(m.renew_at.lock().unwrap().values().all(|t| *t > now), "la pasada de renovación no lo toma");
+        m.install("203.0.113.7", ck.clone(), at(5 * day, 6 * day));
+        assert!(!m.fresh("203.0.113.7"), "le queda un día de seis");
+        m.install("a.example", ck.clone(), at(50 * day, 90 * day));
+        assert!(m.fresh("a.example"), "uno de 90 días sigue igual que antes");
+        m.install("a.example", ck, at(61 * day, 90 * day));
+        assert!(!m.fresh("a.example"));
+    }
+
+    /// v0.6.53 (G2): una IP pide el profile de corta vida si la CA lo ofrece; un dominio nunca.
+    #[test]
+    fn an_ip_asks_for_the_short_lived_profile_when_the_ca_offers_it() {
+        let ip = Identifier::Ip("203.0.113.7".parse().unwrap());
+        let dns = Identifier::Dns("a.example".to_string());
+        let offered = ["classic", "shortlived", "tlsserver"];
+        assert_eq!(order_profile(&ip, offered.into_iter()), Some("shortlived"));
+        assert_eq!(order_profile(&dns, offered.into_iter()), None);
+        assert_eq!(order_profile(&ip, ["classic"].into_iter()), None, "sin el profile, la orden va sin profile");
+    }
+
+    /// v0.6.53 (G2): un cliente que entra por la IP no manda SNI; sin SNI se sirve el certificado
+    /// de la IP aunque haya un dominio fijo antes en la lista.
+    #[test]
+    fn without_sni_the_certificate_of_the_ip_is_served() {
+        let m = manager(&["a.example", "203.0.113.7"]);
+        let (c, k) = self_signed("a.example");
+        let (dns, v) = certified_from_pem(c.as_bytes(), k.as_bytes()).unwrap();
+        let (c, k) = self_signed("203.0.113.7");
+        let (ip, _) = certified_from_pem(c.as_bytes(), k.as_bytes()).unwrap();
+        m.install("a.example", dns.clone(), v);
+        assert!(Arc::ptr_eq(&m.default_cert().unwrap(), &dns), "sin certificado de la IP, el dominio");
+        m.install("203.0.113.7", ip.clone(), v);
+        assert!(Arc::ptr_eq(&m.default_cert().unwrap(), &ip));
+    }
+
+    /// v0.6.53 (G2): el reto TLS-ALPN-01 de una IP llega con el nombre reverso en el SNI.
+    #[test]
+    fn the_alpn_challenge_of_an_ip_is_found_by_its_reverse_name() {
+        assert_eq!(challenge_sni("203.0.113.7"), "7.113.0.203.in-addr.arpa");
+        assert_eq!(
+            challenge_sni("4321:0:1:2:3:4:567:89ab"),
+            "b.a.9.8.7.6.5.0.4.0.0.0.3.0.0.0.2.0.0.0.1.0.0.0.0.0.0.0.1.2.3.4.ip6.arpa",
+            "el ejemplo de RFC 3596"
+        );
+        assert_eq!(challenge_sni("A.Example"), "a.example");
+        assert!(!uses_dns01("203.0.113.7", false, true), "una IP no tiene DNS-01");
+        assert!(uses_dns01("a.example", false, true) && uses_dns01("x.example", true, false));
+        assert!(!uses_dns01("a.example", false, false));
     }
 
     #[test]

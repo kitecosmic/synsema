@@ -167,7 +167,7 @@ pub const BUILTIN_CAPS: &[(&str, &str)] = &[
     ("term_open", "stdin"),
     ("write_file", "file.write"), ("edit_file", "file.write"), ("append_file", "file.write"),
     // v0.6.20 — borrar bajo el MISMO scope que escribir (Tanda 2, secure.rs).
-    ("delete_file", "file.write"), ("delete_dir", "file.write"),
+    ("delete_file", "file.write"), ("delete_dir", "file.write"), ("make_dir", "file.write"),
     ("zip_extract", "file.write"), ("tar_extract", "file.write"),
     ("zip_create", "file.read"), ("tar_create", "file.read"), ("cwd", "file.read"),
     ("parquet_scan", "file.read"),

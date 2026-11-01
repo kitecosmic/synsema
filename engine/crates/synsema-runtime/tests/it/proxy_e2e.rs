@@ -129,3 +129,34 @@ fn proxy_to_a_private_upstream_needs_it_named() {
     }
     assert_eq!(hits.load(Ordering::SeqCst), 0, "el upstream privado recibió la conexión");
 }
+
+/// v0.6.53: `proxy to "http://localhost:…"` llega a un upstream que sólo escucha IPv4 aunque
+/// `localhost` dé `::1` primero (Windows): prueba la siguiente dirección (Happy Eyeballs), sin
+/// esperar los ~2 s que tarda el rechazo en loopback.
+#[test]
+fn proxy_to_localhost_reaches_an_ipv4_only_upstream() {
+    let up = spawn_upstream();
+    let port = free_port();
+    let prog = format!(
+        "require serve({p})\nrequire net(\"localhost\")\nserve on {p}\n    route \"GET /up/*path\"\n        proxy to \"http://localhost:{up}\"\n",
+        p = port,
+        up = up
+    );
+    thread::spawn(move || {
+        let _ = run_serve_program(&prog, "proxy_e2e.syn", false);
+    });
+    for _ in 0..60 {
+        if TcpStream::connect(("127.0.0.1", port)).is_ok() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    thread::sleep(Duration::from_millis(150));
+    let t0 = std::time::Instant::now();
+    let mut sock = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    sock.write_all(b"GET /up/hola HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n").unwrap();
+    let mut resp = String::new();
+    let _ = sock.read_to_string(&mut resp);
+    assert!(resp.starts_with("HTTP/1.1 200") && resp.contains("upstream saw: GET /up/hola"), "{}", resp);
+    assert!(t0.elapsed() < Duration::from_millis(1500), "tardó {:?}", t0.elapsed());
+}

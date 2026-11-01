@@ -11,7 +11,7 @@
 use synsema_core::synlist::{list_values};
 use std::cell::RefCell;
 use std::io::{Read, Write};
-use std::net::{TcpStream, ToSocketAddrs};
+use std::net::ToSocketAddrs;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
@@ -548,15 +548,18 @@ fn connect_and_send(
     };
 
     let addr = if host.contains(':') { format!("[{}]:{}", host, port) } else { format!("{}:{}", host, port) };
-    let sa = addr
-        .to_socket_addrs()
-        .map_err(|e| e.to_string())?
-        .next()
-        .ok_or_else(|| format!("could not resolve host: {}", host))?;
-    // v0.6.46 (E7): la IP que se usa, chequeada antes de conectar (no hay segunda resolución).
-    crate::http_common::dest_check(&host, port, sa.ip())?;
+    let addrs: Vec<std::net::SocketAddr> = addr.to_socket_addrs().map_err(|e| e.to_string())?.collect();
+    if addrs.is_empty() {
+        return Err(format!("could not resolve host: {}", host));
+    }
     let timeout = Duration::from_secs(timeout_secs);
-    let tcp = TcpStream::connect_timeout(&sa, timeout).map_err(|e| connect_error(e, &host, sa))?;
+    // v0.6.46 (E7): cada IP se chequea antes de conectar (no hay segunda resolución). v0.6.53: si
+    // una rechaza, se prueba la siguiente (`localhost` → `::1`, después `127.0.0.1`).
+    let check = |ip: std::net::IpAddr| crate::http_common::dest_check(&host, port, ip);
+    let tcp = crate::http_common::connect_each(&addrs, &check, timeout).map_err(|f| match f {
+        crate::http_common::ConnectFail::Denied(m) => m,
+        crate::http_common::ConnectFail::Io(e, sa) => connect_error(e, &host, sa),
+    })?;
     let _ = tcp.set_read_timeout(Some(timeout));
     let _ = tcp.set_write_timeout(Some(timeout));
 

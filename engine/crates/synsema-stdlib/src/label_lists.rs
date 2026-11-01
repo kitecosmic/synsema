@@ -21,7 +21,7 @@ pub const WASM_EXTRA_SINK_BUILTINS: &[&str] = &["sleep"];
 /// `every_effectful_family_is_a_label_sink` cruza esta lista con las familias registradas.
 pub const LABEL_SINK_BUILTINS: &[&str] = &[
     // Archivos y procesos (synsema-capabilities/secure.rs, stdlib/proc.rs, watch.rs, term.rs)
-    "write_file", "append_file", "edit_file", "delete_file", "delete_dir", "read_file", "read_file_bytes",
+    "write_file", "append_file", "edit_file", "delete_file", "delete_dir", "make_dir", "read_file", "read_file_bytes",
     "list_dir", "file_exists", "file_info", "grep", "run", "run_program", "parquet_scan",
     "proc_spawn", "proc_send", "proc_close_stdin", "proc_kill", "proc_resize", "proc_wait", "proc_close",
     "watch", "watch_close", "term_open", "term_write", "term_close", "shutdown",

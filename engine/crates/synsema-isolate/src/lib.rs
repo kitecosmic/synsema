@@ -24,6 +24,11 @@ mod linux;
 /// señales a otros procesos del usuario o hablar por sockets UNIX abstractos.
 pub const MIN_LANDLOCK_ABI: u32 = 6;
 
+/// Las carpetas del sistema con programas, bibliotecas y configuración pública (certificados,
+/// zona horaria, `ld.so.cache`), que el hijo puede leer y ejecutar siempre. Nada de `/home`,
+/// `/root`, `/proc`, `/sys`, `/run` ni `/var`: ahí viven las claves y los sockets de otros procesos.
+pub const SYSTEM_READ: &[&str] = &["/usr", "/bin", "/sbin", "/lib", "/lib32", "/lib64", "/libx32", "/etc", "/opt"];
+
 /// Un lugar que se le concede al hijo.
 #[derive(Clone, Debug)]
 pub enum Place {
@@ -52,6 +57,10 @@ pub struct Policy {
     pub write: Vec<Place>,
     /// Tope del espacio de direcciones del hijo (`RLIMIT_AS`), en bytes.
     pub max_memory_bytes: Option<u64>,
+    /// v0.6.53: tope del tamaño de **cada** archivo que el hijo escribe (`RLIMIT_FSIZE`), en bytes.
+    /// No es un tope del disco: muchos archivos chicos lo llenan igual. Pasado el tope, el kernel le
+    /// manda `SIGXFSZ` (lo mata, ver [`killed_by`]), o `EFBIG` si la ignora.
+    pub max_file_bytes: Option<u64>,
 }
 
 /// Lo que se impuso de verdad (para el resultado de `run` y el audit).
@@ -61,6 +70,7 @@ pub struct Report {
     /// `"none"`: el hijo no tiene red.
     pub network: &'static str,
     pub max_memory_bytes: Option<u64>,
+    pub max_file_bytes: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -184,6 +194,9 @@ pub fn exited(pid: u32) -> ChildState {
 ///
 /// Ronda 7 (B1): sólo si `/proc` es el de este espacio de pid (si no, sus números son otros) y
 /// muestra a alguien del grupo; si no, se espera a que el grupo desaparezca, como antes.
+///
+/// v0.6.53 (1b): con sólo zombies, se recoge otra vez antes de volver: alguien pudo morir después
+/// de la primera recogida.
 pub fn group_gone(pid: u32, wait: std::time::Duration) -> bool {
     #[cfg(target_os = "linux")]
     {
@@ -194,6 +207,33 @@ pub fn group_gone(pid: u32, wait: std::time::Duration) -> bool {
         let _ = (pid, wait);
         true
     }
+}
+
+/// v0.6.53: qué terminó a un hijo preparado, si lo terminó una señal: `"max_file_mb"` si fue
+/// `SIGXFSZ` y la política tenía tope de archivo (escribió más de lo permitido), `"signal N"` si
+/// fue otra. `None` si salió solo (su código está en el estado). Fuera de Linux, `None`.
+pub fn killed_by(status: &std::process::ExitStatus, report: &Report) -> Option<String> {
+    #[cfg(target_os = "linux")]
+    {
+        linux::killed_by(status, report)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (status, report);
+        None
+    }
+}
+
+/// v0.6.53 (1a): lo que hace [`group_gone`] con los huérfanos, sin esperar si no hace falta. Si
+/// este proceso los recoge (PID 1 de un contenedor, o subreaper), espera hasta `wait` a que el grupo
+/// de `pid` (ya matado con [`kill_group`]) quede vacío y recoge a los que adoptó; si no, vuelve
+/// enseguida. Para un hijo aislado sin carpetas de escritura, que no tiene nada que soltar: sin esto
+/// lo que dejó corriendo quedaba zombie de este proceso hasta que terminara. Fuera de Linux, nada.
+pub fn reap_adopted(pid: u32, wait: std::time::Duration) {
+    #[cfg(target_os = "linux")]
+    linux::reap_adopted(pid, wait);
+    #[cfg(not(target_os = "linux"))]
+    let _ = (pid, wait);
 }
 
 /// Ronda 3 (B1): vuelve `SIGCHLD` a su acción por defecto. Si el proceso arrancó con `SIGCHLD`

@@ -31,6 +31,8 @@ const ALLOWED: &[&str] = &[
     // `main.rs`.
     "engine/crates/synsema-cli/src/sealed_receipt.rs",
     "engine/crates/synsema-stdlib/src/sealed.rs",
+    // v0.6.53 (G1): los sockets que pasa systemd (`LISTEN_FDS`) se adoptan con `from_raw_fd`.
+    "engine/crates/synsema-stdlib/src/listen.rs",
     // v0.6.52: el hijo aislado de `run(…, {"isolate": …})` — Landlock por syscalls crudas, el
     // `pre_exec` (entre `fork` y `exec`: sólo syscalls que no reservan memoria) y `kill` al grupo. Las
     // sondas de escape del test lanzan syscalls prohibidas a propósito.

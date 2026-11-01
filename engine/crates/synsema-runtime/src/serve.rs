@@ -12,7 +12,6 @@ use synsema_core::synlist::{list_values};
 use synsema_core::types::{MapObj, SynMap};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
-use std::net::TcpListener;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex, RwLock};
 
@@ -135,6 +134,7 @@ impl server::ApprovalsGateway for QueueGateway {
             R::Accepted => server::ApprovalOutcome::Accepted,
             R::NotFound => server::ApprovalOutcome::NotFound,
             R::BadToken => server::ApprovalOutcome::BadToken,
+            R::Unavailable => server::ApprovalOutcome::Unavailable,
         }
     }
 }
@@ -2033,11 +2033,9 @@ fn build_base_interp(
     // del gate > SYNSEMA_HUMAN_TIMEOUT > 300 s); al vencer DENIEGA fail-closed con
     // aviso único. OJO: un `within` largo retiene el hilo del request toda la espera —
     // v2 es para minutos, no días (la persistencia para esperas largas es v3).
-    {
-        let mgr = synsema_llm::human::InteractionManager::new(approvals.queue.clone())
-            .with_default_timeout(approvals.default_timeout);
-        interp.set_human_callback(mgr.get_callback());
-    }
+    // v0.6.53 (G3): `approve … then <task>` no bloquea el hilo: registra y sigue. Ronda 1, A3:
+    // los hijos (`parallel_map`, agentes) reciben el mismo canal.
+    crate::engine::wire_human(&mut interp, approvals.queue.clone(), approvals.default_timeout, true);
     // Sobrescribir los builtins de memoria (remember/recall/forget_memory/memory_summary)
     // con versiones que usan el AgentMemory compartido entre hilos.
     register_serve_memory_builtins(&interp, shared_memory.clone(), on_write.clone(), mem_gate.clone());
@@ -2542,6 +2540,204 @@ fn proxy_outcome(
             )),
         },
     }
+}
+
+/// v0.6.53 (G3): dónde guarda `serve` las aprobaciones con continuación (`approve … then`): el
+/// directorio de estado del programa, como la memoria declarada (`SYNSEMA_STATE_DIR`, o
+/// `<dir del programa>/.synsema/state`). `<stdin>` sin `SYNSEMA_STATE_DIR` no tiene dónde.
+fn approvals_state_dir(filename: &str) -> Option<std::path::PathBuf> {
+    match std::env::var("SYNSEMA_STATE_DIR").ok().filter(|s| !s.is_empty()) {
+        Some(d) => Some(std::path::PathBuf::from(d)),
+        None if filename == "<stdin>" => None,
+        None => Some(
+            std::path::Path::new(filename)
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .map(|p| p.to_path_buf())
+                .unwrap_or_else(|| std::path::PathBuf::from("."))
+                .join(".synsema")
+                .join("state"),
+        ),
+    }
+}
+
+/// v0.6.53 (ronda 1, B8): `tls auto` con más de una IP en `domain` es un error (ver el llamador).
+fn more_than_one_ip(domains: &[String]) -> Option<String> {
+    let ips: Vec<&String> = domains
+        .iter()
+        .filter(|d| d.trim_start_matches('[').trim_end_matches(']').parse::<std::net::IpAddr>().is_ok())
+        .collect();
+    (ips.len() > 1).then(|| {
+        format!(
+            "tls auto: one IP per serve ({} are listed: {}). A client that connects to an IP sends no server name, so the server cannot tell which certificate to give; serve each IP on its own, or use names",
+            ips.len(),
+            ips.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
+        )
+    })
+}
+
+/// v0.6.53 (ronda 1, M1): las tasks que el programa nombra en un `then` (en el bloque `serve` y
+/// en las tasks del programa y de sus módulos). Sólo esas se pueden llamar desde el archivo de
+/// pendientes: una fila con otra task la plantó alguien más.
+fn then_tasks(interp: &Interpreter, serve_node: &Node) -> HashSet<String> {
+    let mut out = HashSet::new();
+    let mut visit = |n: &Node| match &n.kind {
+        NodeKind::ApproveStatement { then: Some(t), .. }
+        | NodeKind::ConfirmStatement { then: Some(t), .. }
+        | NodeKind::AskExpression { then: Some(t), .. } => {
+            out.insert(t.clone());
+        }
+        _ => {}
+    };
+    synsema_core::ast_api::walk(serve_node, &mut visit);
+    let bodies = |v: &SynValue, visit: &mut dyn FnMut(&Node)| {
+        if let SynValue::Task(tv) = v {
+            for n in tv.body.iter() {
+                synsema_core::ast_api::walk(n, visit);
+            }
+        }
+    };
+    for v in interp.global_env.borrow().bindings.values() {
+        match v {
+            SynValue::Map(m) => {
+                for x in m.borrow().values() {
+                    bodies(x, &mut visit);
+                }
+            }
+            other => bodies(other, &mut visit),
+        }
+    }
+    out
+}
+
+/// v0.6.53 (ronda 1, B7): si cambió el puerto, lo pendiente del puerto viejo no lo lee nadie. Un
+/// aviso que nombra esos archivos (no se migran: pueden ser de otro `serve` vivo del programa).
+fn note_other_approval_files(dir: &std::path::Path, mine: &str) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for e in entries.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        if name == mine || !name.starts_with("approvals-") || !name.ends_with(".json") {
+            continue;
+        }
+        let rows = std::fs::read_to_string(e.path())
+            .ok()
+            .and_then(|t| serde_json::from_str::<Vec<serde_json::Value>>(&t).ok())
+            .map(|v| v.len());
+        (serve_log_sink())(&format!(
+            "notice: {} has {} pending approval(s) of a `serve` on another port; this one ({}) does not answer them. Serve on that port again to resolve them, or remove the file",
+            e.path().display(),
+            rows.map_or_else(|| "some".to_string(), |n| n.to_string()),
+            mine
+        ));
+    }
+}
+
+/// v0.6.53 (G3): las colas de aprobaciones de una corrida. Al cerrarla, cada una suelta su
+/// continuación (que tiene lo del `serve`, y eso tiene la cola: sin soltarla, nada de la corrida se
+/// liberaba, ni su base abierta).
+/// También los hilos de las tasks de aprobaciones resueltas, para esperarlas al cerrar (ronda 1, N2).
+#[derive(Default)]
+struct ServeApprovalQueues {
+    queues: Mutex<Vec<std::sync::Weak<synsema_llm::human::QueueHandler>>>,
+    tasks: Mutex<Vec<JoinHandle<()>>>,
+}
+
+/// Pila de los hilos que corren la task de una aprobación resuelta (la del intérprete de `serve`).
+const APPROVAL_TASK_STACK: usize = 64 * 1024 * 1024;
+
+/// v0.6.53 (G3): corre la task de `approve … then <task>` cuando la pendiente se contesta o
+/// vence: `task(decisión, mensaje, id)` en un hilo propio, como un request (mismas caps, misma
+/// memoria compartida). La decisión es un bool (approve/confirm; vencida = false) o el texto
+/// de la respuesta (ask; vencida = ""). Un error de la task va al log.
+#[allow(clippy::too_many_arguments)]
+fn serve_continuation(
+    swarm: &Arc<Swarm>,
+    snapshot: &Arc<Vec<(String, GlobalVal)>>,
+    caps_snap: &Arc<Vec<Capability>>,
+    shared_db: &SharedDb,
+    rules_snap: &Arc<Vec<OwnerRule>>,
+    shared_memory: &SharedMemoryStore,
+    on_write: &OnWriteFn,
+    shared_progress: &SharedProgressStore,
+    on_write_progress: &OnWriteProgressFn,
+    shared_state: &SharedState,
+    approvals: &ServeApprovals,
+    cron: &CronWiring,
+    secure: bool,
+    mem_name: &Option<crate::engine::MemName>,
+) -> synsema_llm::human::ContinuationFn {
+    let (swarm, snapshot, caps_snap, shared_db, rules_snap) =
+        (swarm.clone(), snapshot.clone(), caps_snap.clone(), shared_db.clone(), rules_snap.clone());
+    let (shared_memory, on_write, shared_progress, on_write_progress) =
+        (shared_memory.clone(), on_write.clone(), shared_progress.clone(), on_write_progress.clone());
+    // La cola guarda la continuación y la continuación no guarda la cola (un ciclo de Arc la
+    // dejaría viva para siempre): los workers la ven por un Weak.
+    let approvals_weak = Arc::downgrade(approvals);
+    let default_timeout = approvals.default_timeout;
+    let (shared_state, cron, mem_name) = (shared_state.clone(), cron.clone(), mem_name.clone());
+    // La task corre dentro de la corrida del `serve` (su techo, su vida), como un request.
+    let run = synsema_core::run_scope::current();
+    Arc::new(move |s: synsema_llm::human::Settled| {
+        let run = run.clone();
+        let run_for_tasks = run.clone();
+        let (swarm, snapshot, caps_snap, shared_db, rules_snap) =
+            (swarm.clone(), snapshot.clone(), caps_snap.clone(), shared_db.clone(), rules_snap.clone());
+        let (shared_memory, on_write, shared_progress, on_write_progress) =
+            (shared_memory.clone(), on_write.clone(), shared_progress.clone(), on_write_progress.clone());
+        let (shared_state, cron, mem_name) = (shared_state.clone(), cron.clone(), mem_name.clone());
+        let approvals_weak = approvals_weak.clone();
+        let (id, task) = (s.id.clone(), s.task.clone());
+        let spawned = std::thread::Builder::new()
+            .name(format!("approval:{}", s.id))
+            .stack_size(APPROVAL_TASK_STACK)
+            .spawn(move || {
+                let _run = run.as_ref().map(|r| r.enter());
+                // La cola ya no existe: el serve terminó entre que se sacó la pendiente y acá. La
+                // pendiente vuelve al archivo y la resuelve la próxima corrida (G-4).
+                let Some(queue) = approvals_weak.upgrade().map(|a| a.queue.clone()) else {
+                    s.give_back();
+                    return;
+                };
+                let approvals: ServeApprovals = Arc::new(ApprovalsShared { queue, default_timeout });
+                let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    with_serve_interp(&swarm, &snapshot, &caps_snap, &shared_db, &rules_snap, &shared_memory, &on_write, &shared_progress, &on_write_progress, &shared_state, &approvals, &cron, secure, &mem_name, |interp, _caps| {
+                        let task = interp.global_env.borrow().bindings.get(&s.task).cloned();
+                        let Some(task @ SynValue::Task(_)) = task else {
+                            return Err(format!("\"{}\" is not a task of the program", s.task));
+                        };
+                        // Ronda 1, B3: «nadie contestó» es lo que da el gate que espera: la
+                        // primera opción de un `ask … with [...]`.
+                        let answer = if s.ty == "ask" {
+                            syn_text(s.ask_answer())
+                        } else {
+                            synsema_core::types::syn_bool(s.decision == Some(true))
+                        };
+                        match interp.call_task(task, vec![answer, syn_text(s.message.as_str()), syn_text(s.id.as_str())]) {
+                            Err(Control::Error(e)) => Err(e.message.clone()),
+                            _ => Ok(()),
+                        }
+                    })
+                }));
+                let what = if s.timed_out { "timed out" } else { "answered" };
+                match run {
+                    Ok(Ok(())) => (serve_log_sink())(&format!("approval {} {}: ran {}", s.id, what, s.task)),
+                    Ok(Err(e)) => (serve_log_sink())(&format!("approval {} {}: {} failed: {}", s.id, what, s.task, e)),
+                    Err(_) => (serve_log_sink())(&format!("approval {} {}: {} panicked", s.id, what, s.task)),
+                }
+            });
+        match spawned {
+            // Ronda 1, N2: el cierre del `serve` espera a esta task (dentro de la gracia).
+            Ok(h) => {
+                if let Some(r) = &run_for_tasks {
+                    let tasks = r.ext::<ServeApprovalQueues>();
+                    let mut g = tasks.tasks.lock().unwrap_or_else(|p| p.into_inner());
+                    g.retain(|h| !h.is_finished());
+                    g.push(h);
+                }
+            }
+            Err(e) => eprintln!("[serve] approval {}: could not start the thread for {}: {}", id, task, e),
+        }
+    })
 }
 
 /// v0.6.42 — corre una task del programa FUERA de una request (las de `domain ask` y `tls dns`),
@@ -3727,6 +3923,7 @@ fn make_serve_hook(
     shared_state: SharedState,
     cron: CronWiring,
     mem_name: Option<crate::engine::MemName>,
+    approvals_dir: Option<std::path::PathBuf>,
 ) -> ServeHook {
     Rc::new(move |interp, node, env| {
         let (
@@ -3954,6 +4151,13 @@ fn make_serve_hook(
         let approvals: ServeApprovals = {
             let store = synsema_stdlib::secrets::EnvStore::load_default();
             let mut queue = synsema_llm::human::QueueHandler::with_notice(serve_log_sink());
+            // v0.6.53 (G3): las aprobaciones con continuación sobreviven a un reinicio. Una por
+            // puerto: cada `serve` del programa tiene su cola.
+            if let Some(dir) = &approvals_dir {
+                let file = format!("approvals-{}.json", port_str);
+                note_other_approval_files(dir, &file);
+                queue = queue.with_store(dir.join(&file), then_tasks(interp, node));
+            }
             if let Some(url) = crate::llm_providers::resolve_knob("SYNSEMA_HUMAN_WEBHOOK", &store)
             {
                 let cfg = Arc::new(ApprovalWebhook {
@@ -4229,8 +4433,16 @@ fn make_serve_hook(
         let tls_dns_n = acme_n.and_then(|a| a.tls_dns.as_deref());
         if tls_auto_eff && acme_domains.is_empty() && domain_ask_n.is_none() {
             return Err(Control::Error(RuntimeError::new(
-                "tls auto (auto-HTTPS) requires a domain — pass `--domain example.com` or add `domain \"example.com\"` to the serve block".to_string(),
+                "tls auto (auto-HTTPS) requires a domain or the server's public IP — pass `--domain example.com` or add `domain \"example.com\"` (or `domain \"203.0.113.7\"`) to the serve block".to_string(),
             )));
+        }
+        // v0.6.53 (ronda 1, B8): un cliente que entra por una IP no manda SNI (RFC 6066 no lo
+        // permite), así que el servidor no sabe qué certificado dar: con dos IPs, la segunda
+        // recibiría siempre el de la primera y nunca verificaría.
+        if tls_auto_eff {
+            if let Some(err) = more_than_one_ip(&acme_domains) {
+                return Err(Control::Error(RuntimeError::new(err)));
+            }
         }
         // Bajo `--attested` sin TLS propio, un cert autofirmado emitido con la
         // clave P-256 de la identidad (la que `/.well-known/attestation` anuncia): el cliente
@@ -4399,13 +4611,22 @@ fn make_serve_hook(
         // Rutas reservadas /approvals (A1.v2): el server responde la cola de gates
         // humanos vía el gateway (GET lista sin tokens; POST con OTT responde).
         runtime.approvals = Some(Arc::new(QueueGateway(approvals.queue.clone())));
+        // v0.6.53 (G3): quién corre la task de `approve … then <task>` al llegar la respuesta.
+        if let Ok(mut qs) = interp.run_scope().ext::<ServeApprovalQueues>().queues.lock() {
+            qs.push(Arc::downgrade(&approvals.queue));
+        }
+        approvals.queue.set_continuation(serve_continuation(
+            &swarm, &snapshot, &caps_snap, &shared_db, &rules_snap, &shared_memory, &on_write, &shared_progress,
+            &on_write_progress, &shared_state, &approvals, &cron, secure, &mem_name,
+        ));
         // Registrar los vhosts (Lote 1): el dispatch elige por header `Host`.
         for vh in built_vhosts {
             runtime.add_vhost(vh.pattern, vh.routes, vh.static_mounts, vh.auth_handler);
         }
 
         // Bind síncrono: si el puerto ya acepta, la readiness está garantizada.
-        let listener = match TcpListener::bind((bind_addr.as_str(), port_num as u16)) {
+        // v0.6.53 (G1): heredado de systemd, con el puerto compartido o un bind común (`listen.rs`).
+        let listener = match synsema_stdlib::listen::bind(bind_addr.as_str(), port_num as u16) {
             Ok(l) => l,
             Err(e) => {
                 return Err(Control::Error(RuntimeError::new(format!(
@@ -4453,7 +4674,7 @@ fn make_serve_hook(
                 .unwrap_or(80);
             let store: server::ChallengeStore =
                 Arc::new(Mutex::new(std::collections::HashMap::new()));
-            let chal = match TcpListener::bind((bind_addr.as_str(), http_port)) {
+            let chal = match synsema_stdlib::listen::bind(bind_addr.as_str(), http_port) {
                 Ok(l) => l,
                 Err(e) => {
                     return Err(Control::Error(RuntimeError::new(format!(
@@ -4528,7 +4749,7 @@ fn make_serve_hook(
 
         // `redirect https`: además escucha :80 y responde 301 → https://host[:port].
         if redirect_https && tls_config.is_some() {
-            match TcpListener::bind((bind_addr.as_str(), 80u16)) {
+            match synsema_stdlib::listen::bind(bind_addr.as_str(), 80u16) {
                 Ok(rl) => {
                     let https_port = port_num as u16;
                     let life = server::ServeLife::of(&rt.run_scope);
@@ -4856,6 +5077,7 @@ fn serve_inner(source: &str, filename: &str, secure: bool, overrides: ServeOverr
         shared_state.clone(),
         cron.clone(),
         mem_name.clone(),
+        approvals_state_dir(filename),
     ));
 
     let r = interp.execute(&program);
@@ -4948,7 +5170,7 @@ fn serve_inner(source: &str, filename: &str, secure: bool, overrides: ServeOverr
     // Ronda 1, B1: al terminar, la corrida suelta lo que la servía por fuera de sus listeners: el
     // 301 de :80 y el challenge ACME cierran su puerto (se esperan acá), la renovación ACME termina
     // y cada worker del pool poda los intérpretes que cacheaba para ella.
-    close_serve_run(&server::ServeLife::of(interp.run_scope()), handles, &cron);
+    close_serve_run(interp.run_scope(), handles, &cron);
     // T10: un `serve --attested` que se cerró porque sus documentos vencieron sin renovación
     // termina con error, no con un apagado normal.
     if let Some(reason) = synsema_stdlib::attest::renewal_failure() {
@@ -4960,12 +5182,38 @@ fn serve_inner(source: &str, filename: &str, secure: bool, overrides: ServeOverr
 /// Cierra la corrida de un `serve` cuando sus listeners drenaron (ronda 1, B1): cancela el cron, la
 /// marca terminada, espera al 301 y al challenge ACME (sueltan su puerto) y le pide a cada worker del
 /// pool que suelte lo que cacheaba para ella.
-fn close_serve_run(life: &server::ServeLife, handles: Vec<JoinHandle<()>>, cron: &CronWiring) {
+fn close_serve_run(run: &Arc<synsema_core::run_scope::RunScope>, handles: Vec<JoinHandle<()>>, cron: &CronWiring) {
+    let life = server::ServeLife::of(run);
     life.wait_stopped();
     cron.sched.cancel_all();
     life.finish();
     for h in handles {
         let _ = h.join();
+    }
+    // v0.6.53 (G3): las colas de aprobaciones sueltan su continuación (ver `ServeApprovalQueues`).
+    let approvals = run.ext::<ServeApprovalQueues>();
+    if let Ok(qs) = approvals.queues.lock() {
+        for q in qs.iter().filter_map(|q| q.upgrade()) {
+            q.clear_continuation();
+        }
+    }
+    // Ronda 1, N2: las tasks de aprobaciones que ya corren terminan dentro de la gracia; la
+    // respuesta de una que no terminó no se reintenta (la pendiente ya salió del archivo).
+    let running: Vec<JoinHandle<()>> =
+        std::mem::take(&mut *approvals.tasks.lock().unwrap_or_else(|p| p.into_inner()));
+    let deadline = std::time::Instant::now() + server::shutdown_grace();
+    for h in running {
+        while !h.is_finished() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        if h.is_finished() {
+            let _ = h.join();
+        } else {
+            (serve_log_sink())(&format!(
+                "the task of {} was still running at shutdown (SYNSEMA_SHUTDOWN_GRACE); its answer is not retried",
+                h.thread().name().unwrap_or("an approval")
+            ));
+        }
     }
     server::on_every_pool_worker(prune_ended_serve_interps);
 }
@@ -4980,7 +5228,7 @@ fn end_serve_run_early(interp: &Interpreter, servers: &Servers, cron: &CronWirin
     if !handles.is_empty() {
         life.request_engine_shutdown("the preamble failed after `serve on`: stopping the server");
     }
-    close_serve_run(&life, handles, cron);
+    close_serve_run(interp.run_scope(), handles, cron);
 }
 
 /// Corre un programa que contiene `serve on PORT`. Bindea (síncrono), imprime la
@@ -5074,6 +5322,15 @@ mod tests {
 
     use super::*;
     use synsema_stdlib::secrets::EnvStore;
+
+    /// v0.6.53 (ronda 1, B8): con `tls auto`, una IP sí; dos no (un nombre más no cuenta).
+    #[test]
+    fn tls_auto_takes_one_ip_at_most() {
+        let v = |xs: &[&str]| xs.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        assert!(more_than_one_ip(&v(&["203.0.113.7", "example.com"])).is_none());
+        let e = more_than_one_ip(&v(&["203.0.113.7", "[2001:db8::1]", "example.com"])).expect("dos IPs");
+        assert!(e.contains("one IP per serve") && e.contains("203.0.113.7") && e.contains("[2001:db8::1]"), "{}", e);
+    }
 
     /// v0.6.47 (T1): una entrada de serve que entra en pánico cierra su corrida con corte (lo que
     /// escribió se deshace y la corrida no queda abierta para siempre).

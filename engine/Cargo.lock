@@ -5482,6 +5482,7 @@ dependencies = [
  "rand 0.8.6",
  "regex",
  "serde_json",
+ "sha2 0.10.9",
  "synsema-capabilities",
  "synsema-core",
 ]
@@ -5577,6 +5578,7 @@ dependencies = [
  "sha1",
  "sha2 0.10.9",
  "sha3",
+ "socket2",
  "subtle",
  "svg2pdf",
  "synsema-agents",

@@ -695,7 +695,7 @@ fn e3b_trusted_module_does_not_see_the_program_globals() {
     let (code, _, err) = trusted_run(&dir, &[("t", "export task f(xs)\n    give parallel_map((x) => x, xs)\n")], app);
     assert!(code != 0 && err.contains("parallel_map: a trusted tool cannot fan out"), "{}", err);
     let (code, _, err) = trusted_run(&dir, &[("t", "export task f(xs)\n    let n be cron_after(1, (x) => x)\n    give 1\n")], app);
-    assert!(code != 0 && err.contains("cron_after: a trusted tool cannot schedule"), "{}", err);
+    assert!(code != 0 && err.contains("cron_after: not allowed inside a trusted tool"), "{}", err);
     std::fs::write(dir.join("otro.syn"), "export task g()\n    give 1\n").unwrap();
     let (code, _, err) = trusted_run(&dir, &[("t", "use \"./otro.syn\" as o\nexport task f(xs)\n    give o.g()\n")], app);
     assert!(code != 0 && err.contains("a trusted module imports only other trusted modules") && err.contains("a file module is read from disk, where the program can write it"), "{}", err);

@@ -165,7 +165,7 @@ fn isolate_refuses_what_it_cannot_enforce_or_delegate() {
         ("{\"max_memory_mb\": 512}", "max_memory_mb is enforced only for an isolated child"),
         // Ronda 1: `..` después de una carpeta (A1) y una opción mal escrita (M3).
         ("{\"isolate\": {\"file.read\": \"./x/../data/**\"}}", "has `..` after a folder"),
-        ("{\"isolated\": true}", "unknown option \"isolated\" (valid options: cwd, stdin, max_output, env, env_clean, isolate, max_memory_mb)"),
+        ("{\"isolated\": true}", "unknown option \"isolated\" (valid options: cwd, stdin, max_output, env, env_clean, isolate, max_memory_mb, max_file_mb)"),
     ] {
         std::fs::write(dir.join("i.syn"), format!("{}run(\"nothing-runs\", [], 10, {})\n", head, opts)).unwrap();
         let (code, out, err) = synsema(&dir, &["run", "i.syn"], None);
@@ -467,6 +467,9 @@ fn two_isolated_runs_reading_the_whole_project_run_together() {
 /// contenedor, o subreaper), ni con otro proceso que los adopta y no los recoge (un lanzador que
 /// sólo espera a su hijo, como el de npm siendo PID 1). `run` vuelve enseguida y la carpeta se suelta.
 /// Siendo synsema quien los adopta, además los recoge: no le quedan zombies mientras sigue corriendo.
+///
+/// v0.6.53 (1a): también sin carpetas de escritura (`{"isolate": true}`), donde no hay préstamo que
+/// soltar: antes no se recogían nunca (`specs/v0.6.53-sondas/reap.out`).
 #[cfg(target_os = "linux")]
 #[test]
 fn isolate_lets_the_folder_go_whoever_adopts_the_orphans() {
@@ -485,16 +488,26 @@ fn isolate_lets_the_folder_go_whoever_adopts_the_orphans() {
     ]
     .join("\n");
     std::fs::write(dir.join("g.syn"), src).unwrap();
+    let bare = [
+        "require exec(\"sh\")",
+        "let r be run(\"sh\", [\"-c\", \"sleep 30 & echo hijo\"], 10, {\"isolate\": true})",
+        "print(r[\"stdout\"])",
+        "print(\"lista 0\")",
+        "sleep(2)",
+        "",
+    ]
+    .join("\n");
+    std::fs::write(dir.join("b.syn"), bare).unwrap();
     // PR_SET_CHILD_SUBREAPER (36) se conserva en `execve`: con `execv`, synsema arranca siendo
     // subreaper; con `Popen(…).wait()`, el subreaper es python, que no recoge a los que adopta.
     let wrappers = [
         ("import ctypes, os, sys; ctypes.CDLL(None).prctl(36, 1, 0, 0, 0); os.execv(sys.argv[1], sys.argv[1:])", true),
         ("import ctypes, subprocess, sys; ctypes.CDLL(None).prctl(36, 1, 0, 0, 0); sys.exit(subprocess.Popen(sys.argv[1:]).wait())", false),
     ];
-    for (w, synsema_adopts) in wrappers {
+    for ((w, synsema_adopts), file) in wrappers.into_iter().flat_map(|w| [(w, "g.syn"), (w, "b.syn")]) {
         let t0 = std::time::Instant::now();
         let mut child = std::process::Command::new("python3")
-            .args(["-c", w, env!("CARGO_BIN_EXE_synsema"), "run", "g.syn"])
+            .args(["-c", w, env!("CARGO_BIN_EXE_synsema"), "run", file])
             .current_dir(&dir)
             .env("SYNSEMA_NO_UPDATE_CHECK", "1")
             .stdout(std::process::Stdio::piped())
@@ -532,9 +545,9 @@ fn isolate_lets_the_folder_go_whoever_adopts_the_orphans() {
         if err.contains("isolate needs Landlock ABI") {
             return;
         }
-        assert!(out.contains("hijo") && out.contains("lista 0"), "{}: {}\n{}", w, out, err);
-        assert!(elapsed < std::time::Duration::from_millis(1500), "{}: tardó {:?}", w, elapsed);
-        assert!(zombies.is_empty(), "{}: synsema no recogió a los que adoptó: {:?}", w, zombies);
+        assert!(out.contains("hijo") && out.contains("lista 0"), "{} {}: {}\n{}", w, file, out, err);
+        assert!(elapsed < std::time::Duration::from_millis(1500), "{} {}: tardó {:?}", w, file, elapsed);
+        assert!(zombies.is_empty(), "{} {}: synsema no recogió a los que adoptó: {:?}", w, file, zombies);
     }
 }
 
