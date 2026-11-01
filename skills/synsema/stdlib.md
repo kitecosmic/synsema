@@ -39,6 +39,14 @@ let r be http_delete(url, {"x-api-key": secret("STORE_API_KEY")})  -- any header
 > (`{name: Alice}`) with no header — `json_encode(map)` + the header still works on every version.
 > Verified against a local `serve` echo route (engine v0.6.20).
 
+> **`localhost` reaches a server that listens on IPv4 only (v0.6.53+).** `localhost` resolves to
+> `::1` first (Windows) while `serve on 8080` listens on IPv4; the client used to try the first
+> address only and fail. Now the HTTP client, `ws_connect` and `proxy to` try every address the
+> name gives (Happy Eyeballs, RFC 8305: the next starts when the previous fails or has not
+> connected in 250 ms; the first to connect wins). Each address is still checked against the
+> program's `net` grants. Measured on Windows: `http_get("http://localhost:<port>/")` to a
+> `serve` → 200.
+
 **Timeout (optional on every HTTP builtin; a key in `fetch`'s map):** seconds as a
 positive number; absent or invalid → **30** (the historical default). Signatures: `fetch(url,
 {method, headers, body, form, timeout, tls_pin, attested})` (the form to write), `http(method, url, headers?, query?, body?, timeout?, form?)`,
@@ -638,6 +646,13 @@ Semantics (know these before reaching for cron):
   server is serving, and registering from a route works and is globally visible.
 - Under `run`, jobs share state with EACH OTHER; to exchange data with the rest of
   the program use external effects (a file, an on-disk db, or `share`/`observe`).
+- **Where scheduling is an error (v0.6.53+, breaking).** The job runs later with the program's
+  capabilities, so `cron_every`/`cron_after` are refused inside a `sandbox`, a trusted tool, a tool
+  run by `call_tool`, an agent, or a request authenticated with a capability token (under `serve`, a
+  job scheduled from a `sandbox` wrote what the block could not). The error says which:
+  ``cron_after: not allowed inside a sandbox — the task would run later with the program's
+  capabilities; schedule it outside`` (`… inside a tool run by call_tool …`, `… inside an agent …`).
+  Schedule at top level or in the route itself, outside the block.
 
 ## Serve mode (keep crons alive)
 

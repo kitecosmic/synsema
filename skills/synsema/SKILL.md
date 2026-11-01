@@ -208,14 +208,14 @@ usually version skew, not a bug.
 - [llm.md](llm.md) — LLM operations: reason, decide, analyze, generate; the embedded `local` provider (a path, an Ollama `model:tag` or a Hugging Face `org/repo`)
 - [judge.md](judge.md) — **`judge`**: calibrated judgments as values — a probability, an option with its distribution, a level on a scale — from a System One model; its own `require judge`; runs LOCAL with `SYNSEMA_JUDGE_PROVIDER=laya` (no network, no key, no cost)
 - [inference.md](inference.md) — Local inference: the two engines, and **architectures as files** a compiled binary reads at startup — add a model without recompiling
-- [human.md](human.md) — Human interaction: approve, confirm, ask, show
+- [human.md](human.md) — Human interaction: approve, confirm, ask, show; `approve … then <task>` for an approval that does not hold the request (survives restarts)
 - [observability.md](observability.md) — trace, log, measure, checkpoint, diagnostics
 - [memory.md](memory.md) — Declared agent memory (`require memory("name")` — the name IS the .db identity), per-agent namespaces (`recall(from = ...)`), owner rules, progress tracking
 - [patterns.md](patterns.md) — Common patterns and idioms
 
 **Project & deployment**
 - [structure.md](structure.md) — File map of the codebase
-- [deploy.md](deploy.md) — Daemon mode, Docker, VPS, Kubernetes, systemd, the two wasm artifacts
+- [deploy.md](deploy.md) — Daemon mode, Docker, VPS, Kubernetes, systemd (socket activation for zero-downtime restarts), the two wasm artifacts
 - [guests.md](guests.md) — Synsema **inside a host with its own wasm ABI** (Vela / Horizen's confidential coprocessor): the `.syn` contract (`deploy`/`deposit`/`process`/`deanonymize`/`trusted`, one map in, one map out, `payload_hex`/`data_hex`/subtype labels, fuel), the client in Synsema (keys, register, deploy with/without trigger, deposit ETH/ERC-20, encrypted send, reports, decrypted events, facilitator/meta-transactions), trigger contracts, the **output policy** returned by `deploy` (`reject: private`, `events_pad`/`events_min`/`state_pad`, the reserved `_vela` key and its per-transition counter), the local starter kit recipe, and how to add another host
 
 **Troubleshooting**

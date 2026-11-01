@@ -2,7 +2,9 @@
 
 Read this FIRST if something fails. Each row is a real mistake that costs hours to debug.
 
-> **Just upgraded and something that worked now fails?** Start at *Upgrading to v0.6.51* (no output
+> **Just upgraded and something that worked now fails?** Start at *Upgrading to v0.6.53* (gates in
+> `parallel_map`/agents no longer approve themselves, nothing scheduled from a `sandbox`, `ask`
+> falls back to text, a `secret()` to `run`'s child), then *v0.6.52*, then *v0.6.51* (no output
 > inside a plain `sandbox`, links in `list_dir`, tokens and `run_program` children with private
 > addresses), then *v0.6.50* (a module sees only its own names), then *v0.6.49*
 > (`require declassify` under a ceiling, `--replay` and the program, trusted modules), then *v0.6.47* (label cuts
@@ -16,6 +18,21 @@ Read this FIRST if something fails. Each row is a real mistake that costs hours 
 > Behavioral surprises · Anti-patterns · Secrets & config
 > Coming from Python? The traps that LOOK like Python but aren't are also collected in
 > [python-diff.md](python-diff.md).
+
+## Upgrading to v0.6.53 — what behaves differently
+
+| You see | What changed | What to write |
+|---|---|---|
+| an `approve`/`confirm` inside `parallel_map` or an agent gives `false` (CI, `run` without a terminal) or waits for a person (`serve`) | **breaking:** a gate there uses the program's human channel; it used to have none and **approved itself** | nothing, if a person should decide; to approve in tests use `synsema test` (auto-pass) — see human.md |
+| ``cron_after: not allowed inside a sandbox — the task would run later with the program's capabilities; schedule it outside`` (also `inside a trusted tool`, `inside a tool run by call_tool`, `inside an agent`, and in a request authenticated with a capability token) | **breaking:** `cron_every`/`cron_after` there scheduled a task that ran with the program's capabilities (under `serve`, a `sandbox` could write what it could not) | schedule outside the block: at top level or in the route before entering it |
+| `ask "n?" with [1, 2]` gives `"1"` (text) when nobody answers; `a == 1` is now `false` | **breaking:** the fallback is the first option **as text**, like a typed answer (a person's answer was always text) | compare with text (`a == "1"`) or convert (`number(a)`) |
+| ``run: env "K" is a secret — reveal() it explicitly (audited) if the child really needs the value; nothing ran`` (also `argument N`, `stdin`) | **breaking:** the child of `run` used to get the text `secret(K)` (and `stdin` dropped it) | `reveal(secret("K"))` + `require reveal("K")` if the child needs it — processes.md |
+| `serve --attested`: a literal route on `/.well-known/synsema-auth` is a load error; a `GET /*path` no longer receives that URL | it is a reserved URL like `/llms.txt` (the engine answers it when it publishes it: `auth with`, without `private`/`discovery off`) | drop the route, or `private`/`discovery off` to receive it |
+| ``approve … then t: not allowed inside …`` / ``"t" takes 2 parameter(s); it is called with three (decision, message, id)`` / ``"f" is not a task of the program …`` | new syntax `approve … then <task>` (v0.6.53) with its rules | human.md § Approvals that do not wait |
+| ``… the lock of the pending approvals ./.synsema/state/approvals-8080.json.lock can be read or written by other users (mode 777) …`` (WSL, program on `/mnt/c`) | the pending approvals of `then` need a private file, which a Windows drive mounted in WSL cannot hold | `SYNSEMA_STATE_DIR=$HOME/.myapp-state` (or move the project to the Linux filesystem) |
+| ``run: unknown option "max_file_mb" …`` on an older engine / ``run: max_file_mb is enforced only for an isolated child …`` | `max_file_mb` (v0.6.53) works only with `isolate` | `{"isolate": …, "max_file_mb": N}` |
+| `http_get("http://localhost:…")` reaches a local `serve` where it failed (Windows) | the client tries every address of the name (Happy Eyeballs) | nothing |
+| a `tls auto` certificate renews earlier than 30 days before expiry | renewal follows the certificate's own lifetime (a third of it, at most 30 days) | nothing |
 
 ## Upgrading to v0.6.52 — what behaves differently
 

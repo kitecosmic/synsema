@@ -209,6 +209,16 @@ stacks (every ceiling on the stack must cover the use). A denial inside is `Capa
 X — outside the ceiling of the enclosing sandbox under block …` (catchable), or, when the block runs
 under a verified token, the token's own message.
 
+**Nothing scheduled from a narrowed frame (v0.6.53+, breaking).** A task that runs *later* runs with
+the program's capabilities, not the block's — so `cron_every`, `cron_after` and `approve … then
+<task>` (also `confirm`/`ask … then`) are errors inside a `sandbox` (any form), a trusted tool, a
+tool run by `call_tool`, an agent, and a request authenticated with a capability token, also in a
+`parallel_map` launched from there: ``cron_after: not allowed inside a sandbox — the task would run
+later with the program's capabilities; schedule it outside`` / ``approve … then t: not allowed
+inside a tool run by call_tool — …; use the gate that waits (approve without `then`), or move the
+gate out``. Before, under `serve`, a job scheduled from a `sandbox` wrote what the block could not.
+The gate that waits still works inside them.
+
 ## Host capability ceiling (`--sandbox` / `--cap-set`) — v0.4.3+
 
 `require`/`sandbox`/`call_tool` all assume you **trust** the code. When you don't — running an

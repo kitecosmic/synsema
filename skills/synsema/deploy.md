@@ -114,7 +114,8 @@ see [secrets.md](secrets.md). Resolution: **process environment → `.env` file 
   | `SYNSEMA_WS_MAX_CONNS` | `4096` | live WebSocket handles per interpreter (`ws_connect` + incoming) |
   | `SYNSEMA_PROC_MAX` | `64` | live `proc_spawn` children per interpreter (hard ceiling 1024) |
   | `SYNSEMA_WATCH_MAX` | `64` | live `watch` handles per interpreter (hard ceiling 1024; one scanner thread each) |
-  | `SYNSEMA_STATE_DIR` | `<program dir>/.synsema/state` | where `memory("NAME")` keeps `<NAME>.db` — point it at a mounted volume and keep the code dir read-only (the `.db` is created there; nothing under the program dir) |
+  | `SYNSEMA_STATE_DIR` | `<program dir>/.synsema/state` | where `memory("NAME")` keeps `<NAME>.db` and (v0.6.53+) where the pending approvals of `approve … then` live (`approvals-<port>.json`, mode 600) — point it at a mounted volume and keep the code dir read-only (nothing is created under the program dir). Required when the program sits on a Windows drive mounted in WSL (`/mnt/c` cannot hold a private file) |
+  | `SYNSEMA_REUSE_PORT` | (off) | v0.6.53+, Linux: `1` opens the port with `SO_REUSEPORT` so a new `serve` listens while the old one drains (both need it); ignored with a notice on Windows — see § Zero-downtime restarts |
   | `SYNSEMA_LLM_BUDGET_PER_IDENTITY` | (none) | `id=N,id2=M` — per-identity LLM token ceilings under `serve` (the identity the auth task returns); one process-wide counter per identity; over the line that identity's ops degrade to `[llm budget exceeded for identity …]`, others continue (v0.6.20+; also read from `.env`) |
   | `SYNSEMA_HEALTH_PATH` | (none) | opt-in host health endpoint: `GET <path>` → `200 {ok, uptime_s, in_flight, engine}`, no auth/rate limit, absent from discovery; a declared route at that path wins (warning at start); = `serve --health` (v0.6.20+) |
   | `SYNSEMA_IDENTITY` | (none) | v0.6.28+: the operator's identity for `synsema run` (the ledger, the per-identity LLM ceiling and receipts name it); environ or `.env` |
@@ -136,7 +137,8 @@ see [secrets.md](secrets.md). Resolution: **process environment → `.env` file 
   check off, and there is no environment variable. `serve --attested` implies it (a smaller surface
   in what is attested). After `--` it is an argument of the program.
 - **Stopping:** `systemctl stop` / `docker stop` send SIGTERM → ordered shutdown (drain,
-  exit 0). Set the unit's `TimeoutStopSec` above `SYNSEMA_SHUTDOWN_GRACE`.
+  exit 0). Set the unit's `TimeoutStopSec` above `SYNSEMA_SHUTDOWN_GRACE`. A shutdown also waits,
+  within that grace, for a task an approval answer is running.
 
 ## Serve deployment flags (dev-clean `.syn` + prod flags)
 
@@ -418,6 +420,48 @@ synsema serve docs.syn --port 8791 --bind 127.0.0.1     # backend 2
 - **Independent deploys:** restart one backend without touching the others; each can even run a different
   Synsema version behind the same edge.
 
+## Zero-downtime restarts (v0.6.53+, Linux)
+
+A plain `systemctl restart` refuses the connections that arrive while the port is closed. With
+**socket activation** systemd holds the port and the new process takes it; connections wait
+instead of being refused. Two units with the same name:
+
+```ini
+# /etc/systemd/system/synsema-agent.socket
+[Socket]
+ListenStream=8080
+# One socket per port: ListenStream=8080 is one dual-stack socket. Listing 0.0.0.0:8080 and
+# [::]:8080 separately is two sockets for one port → error at start (or set BindIPv6Only=both).
+
+[Install]
+WantedBy=sockets.target
+```
+
+```ini
+# /etc/systemd/system/synsema-agent.service
+[Unit]
+Requires=synsema-agent.socket
+After=synsema-agent.socket
+
+[Service]
+ExecStart=/usr/local/bin/synsema serve /opt/agents/app.syn
+User=synsema
+StateDirectory=synsema
+```
+
+`systemctl enable --now synsema-agent.socket`, then `systemctl restart synsema-agent` as usual.
+At start the log says `[serve] port 8080: listening on the socket systemd passed in (socket
+activation)`. With `tls auto` / `redirect https`, add a `ListenStream=` for `:80` too and `serve`
+takes it for the redirect and the ACME challenge. synsema reads the standard `LISTEN_PID`/
+`LISTEN_FDS`. Measured with these two units (as user units): 60 requests across two
+`systemctl restart`s, 60 × `200`.
+
+**Without systemd (or under your own supervisor):** `SYNSEMA_REUSE_PORT=1` in the environment of
+both processes — start the new `serve`, wait until it answers, `kill -TERM` the old one; it drains
+and stops. A few connections already queued on the old process can be reset when it closes unless
+`sysctl net.ipv4.tcp_migrate_req=1`. Details and the approvals caveat (a gate that waits stays in
+the old process; use `then`): [serve.md](serve.md) § Restarting without refusing connections.
+
 ## Updating a deployed server (it does NOT auto-update)
 
 A running server does **not** update itself. To roll out a new version:
@@ -430,11 +474,14 @@ systemctl restart synsema-agent   # REQUIRED — the live process keeps the OLD 
 - `synsema update` replaces the binary **file**, but the running process keeps the old binary in
   memory. The **`systemctl restart` is what applies the new version**.
 - **Restart is safe — TLS certs persist.** `tls auto` stores certs (order: `SYNSEMA_CERT_DIR` →
-  `~/.synsema/certs` → an absolute system default) and auto-renews them in the background (30 days
-  before the 90-day expiry). A restart **reloads** the stored cert — it does **not** re-issue, so you
+  `~/.synsema/certs` → an absolute system default) and auto-renews them in the background (a third
+  of their life before expiry, at most 30 days before: a 90-day cert at 30 days). A restart **reloads** the stored cert — it does **not** re-issue, so you
   won't hit Let's Encrypt rate limits.
 - If `synsema update` targets a binary at a different path than the unit's `ExecStart`, update that
   path (or point both at the same binary), then restart.
+- To restart without refusing connections, see § Zero-downtime restarts. Pending approvals made
+  with `approve … then` survive the restart (they are in `.synsema/state`); a gate that waits does
+  not.
 
 ## Kubernetes
 
