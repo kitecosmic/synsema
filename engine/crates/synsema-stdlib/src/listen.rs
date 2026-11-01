@@ -100,6 +100,26 @@ mod unix {
         adopt_range(FIRST_FD, n)
     }
 
+    /// ¿El socket está escuchando? `SO_ACCEPTCONN`, que existe en Linux y en macOS
+    /// (`Socket::is_listener` de socket2 sólo está en Linux).
+    fn accepts_connections(s: &socket2::Socket) -> bool {
+        use std::os::fd::AsRawFd;
+        let mut v: libc::c_int = 0;
+        let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        // SAFETY: `v` y `len` son de este marco y del tamaño que `getsockopt` espera para un
+        // `int`; el descriptor lo tiene `s` mientras dura la llamada.
+        let r = unsafe {
+            libc::getsockopt(
+                s.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_ACCEPTCONN,
+                (&mut v as *mut libc::c_int).cast(),
+                &mut len,
+            )
+        };
+        r == 0 && v != 0
+    }
+
     /// Los descriptores `first..first+n` (ver `adopt`).
     pub(super) fn adopt_range(first: i32, n: i32) -> Vec<(u16, TcpListener)> {
         let mut out = Vec::new();
@@ -108,7 +128,7 @@ mod unix {
             // 3..3+LISTEN_FDS y nadie más los abrió ni los usa. Si el descriptor no resulta un
             // socket TCP escuchando, se suelta sin cerrarlo (`into_raw_fd`).
             let s = unsafe { Socket::from_raw_fd(fd) };
-            let listening = s.r#type().is_ok_and(|t| t == Type::STREAM) && s.is_listener().unwrap_or(false);
+            let listening = s.r#type().is_ok_and(|t| t == Type::STREAM) && accepts_connections(&s);
             let port = s.local_addr().ok().and_then(|a| a.as_socket()).map(|a| a.port());
             match (listening, port) {
                 (true, Some(port)) => {

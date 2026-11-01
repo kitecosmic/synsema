@@ -215,7 +215,8 @@ windows-sys = { version = "0.52", features = ["Win32_Foundation", "Win32_Securit
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 # v0.6.53 (G1): `SO_REUSEPORT` y los sockets heredados de systemd (`listen.rs`). Ya estaba en el árbol
-# (transitivo de tokio/hyper-util); `all` trae `set_reuse_port`, `is_listener` y `set_cloexec`.
+# (transitivo de tokio/hyper-util); `all` trae `set_reuse_port` y `set_cloexec`. `SO_ACCEPTCONN` va
+# por libc: socket2 sólo lo da en Linux.
 socket2 = { version = "0.6", features = ["all"] }
 
 [dev-dependencies]
