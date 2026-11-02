@@ -31,4 +31,10 @@ ignore = [
     "RUSTSEC-2026-0367",
     "RUSTSEC-2026-0368",
     "RUSTSEC-2026-0369",
+    # zip 8.6 (RUSTSEC-2026-0429, publicado 2026-10-22): `ZipArchive::extract` aborta el proceso
+    # con un symlink que declara un tamaño grande. Agregado 2026-11-02 (v0.6.54), con la misma
+    # razón que las tres de arriba: candle-core 0.11 sólo usa `ZipArchive::new` + `by_index` /
+    # `by_name` en `npy.rs` (revisado en candle-core-0.11.0), nunca `extract`; `zip_extract` de
+    # Synsema va por zip 9.0.5, que ya trae el arreglo. Quitar junto con las tres de arriba.
+    "RUSTSEC-2026-0429",
 ]
