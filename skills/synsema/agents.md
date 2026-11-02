@@ -200,6 +200,15 @@ An agent spawned from a handler or a cron tick gets **the same wiring a cron tic
 --sandbox | --cap-set <list>` (a `require` inside it never exceeds what the operator
 fixed, exactly like `run`), and an ordered shutdown (`Ctrl-C`) stops it via `agent_stop`.
 
+**Human gates in an agent (v0.6.53+, breaking).** `approve`/`confirm`/`ask` inside an agent use the
+program's channel: under `serve` the gate waits in the approvals queue like a route's; under `run`
+without a terminal it is denied (`[A_0] agent got false`). Before v0.6.53 an agent had no channel
+and its gate **approved itself**. `approve … then <task>` and `cron_every`/`cron_after` are an
+error inside an agent — the task would run later with the program's capabilities, not the
+agent's: ``Agent error [B_0]: h.syn:4:14: approve … then t: not allowed inside an agent — the task
+would run later with the program's capabilities; use the gate that waits (approve without `then`),
+or move the gate out``. Gate in the agent and act on the answer there, or schedule from the route.
+
 ## Resource locking (preventive)
 Agents declare what they're working on BEFORE touching it:
 - `exclusive` — one agent only (write)

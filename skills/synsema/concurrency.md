@@ -66,6 +66,14 @@ inside an item use the **same providers** as the caller (v0.6.45+; before, under
 gave offline placeholders / `available: false` there), and `SYNSEMA_LLM_BUDGET` holds across items.
 The same holds for `spawn`ed agents.
 
+**Human gates inside an item (v0.6.53+, breaking).** An `approve`/`confirm`/`ask` in an item uses
+the program's human channel: under `serve` it waits for a person (or, with `then`, leaves a pending
+approval); in a run without a terminal it is denied — `parallel_map(one, [1, 2])` where `one` does
+`give approve …` gives `[false, false]`. Before v0.6.53 an item had no channel and **approved
+itself** (`true`). `approve … then` and `cron_every`/`cron_after` are fine in an item, but not in an
+item launched from inside a `sandbox` or a tool run by `call_tool` (`… not allowed inside a sandbox
+…`): the task would run later with the program's capabilities. See [human.md](human.md).
+
 **Seeded generators** (v0.6.29+): a generator given as an item reaches its worker as a **copy of
 its state** — pass one child per item and the results are numpy's `g.spawn(n)` bit for bit. The
 same generator in two items is an error (each worker would draw the same numbers):

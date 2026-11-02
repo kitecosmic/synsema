@@ -20,10 +20,10 @@ run(cmd, args_list?, timeout?, opts?) -> map
 - `cmd` (text): the command. **Capability scope is checked against `cmd` as written** (before PATH resolution).
 - `args_list` (list, optional): one argument per element. Absent = no args. Non-list → error.
 - `timeout` (number, optional): seconds. **Default 120.** On expiry: kill the process and **raise**.
-- `opts` (map, optional): `{cwd, env, stdin, max_output, env_clean, isolate, max_memory_mb}`.
+- `opts` (map, optional): `{cwd, env, stdin, max_output, env_clean, isolate, max_memory_mb, max_file_mb}`.
   **An option `run` does not know is an error and nothing runs (v0.6.52+, breaking)** — a typo used
   to pass silently (`{"isolated": true}` ran the child unconfined):
-  ``run: unknown option "isolated" (valid options: cwd, stdin, max_output, env, env_clean, isolate, max_memory_mb) — nothing ran``.
+  ``run: unknown option "isolated" (valid options: cwd, stdin, max_output, env, env_clean, isolate, max_memory_mb, max_file_mb) — nothing ran``.
   Options that are not a map are an error too: ``run: options must be a map, got text — nothing ran``.
   `proc_spawn` checks its own options the same way.
 - **`..` after a folder in the program is an error (v0.6.52+)**, and in `cwd` when the program is
@@ -39,6 +39,12 @@ run(cmd, args_list?, timeout?, opts?) -> map
   `cwd`); an absolute path is unchanged. Migrate: grant exactly what the error names —
   `Capability not granted: exec("./sub/tool.bat") … add `require exec("./sub/tool.bat")`` — with the
   `./` (`exec("sub/tool.bat")` does not match).
+- **A `secret()` given to the child is an error and nothing runs (v0.6.53+, breaking)** — in `env`,
+  in the arguments and as `stdin` (before, `env` and the arguments got the text `secret(K)` and
+  `stdin` dropped it without a word). Same rule as `run_program` and `proc_spawn`:
+  ``run: env "K" is a secret — reveal() it explicitly (audited) if the child really needs the value; nothing ran``
+  (``run: argument 3 is a secret — …``, ``run: stdin is a secret — …``). If the child really needs
+  the value: `{"env": {"K": reveal(secret("K"))}}` with `require reveal("K")` — it stays in the audit.
 
 Returns `{exit_code, stdout, stderr, stdout_truncated, stderr_truncated}`:
 - `exit_code` number (`-1` if killed by signal). `stdout`/`stderr` text (lossy, up to `max_output`).
@@ -176,6 +182,11 @@ print(r["isolation"])     -- {landlock_abi: 7, network: "none", max_memory_mb: n
   system folders (a virtualenv, `~/.local/bin`) cannot start until its folder is in `file.read`:
   ``run: cannot start "mytool": Permission denied (os error 13) — an isolated child sees only the system folders and what "isolate" grants: the program has to be inside them (a venv: add its folder to "file.read")``.
   A file without the execute bit says so instead: ``… — the file is not executable (chmod +x)``.
+  **A program that is a link leading out of what the child sees** (the `python` of a venv made by
+  uv or pyenv links to a base interpreter in your home) gets a warning (v0.6.53+): the child can run
+  that file but not read the folder around it, so the interpreter fails with an error of its own.
+  The warning names the folder to add:
+  ``synsema: warning: run: "./venv/bin/python" leads to /home/me/basepy/python3.12, outside what an isolated child sees: it can run that file but not read the folder around it (a venv's python is a link to its base interpreter) — add "/home/me/basepy/**" to "file.read" in "isolate"``.
 - **Its environment is clean:** `PATH` and `LANG` of the program, its own `HOME` and `TMPDIR`, plus
   what `env` adds. Nothing else is inherited.
 - **No network:** opening a socket fails (`PermissionError: [Errno 1] Operation not permitted` in
@@ -187,8 +198,19 @@ print(r["isolation"])     -- {landlock_abi: 7, network: "none", max_memory_mb: n
 - **Memory — `"max_memory_mb"`** caps the address space of each process the child runs
   (`{"isolate": true, "max_memory_mb": 512}`; Python raises `MemoryError` past it). It works only
   with `isolate`: ``run: max_memory_mb is enforced only for an isolated child — add "isolate" (e.g. {"isolate": true, "max_memory_mb": 512})``.
-- **The result says what the kernel enforced:** `isolation: {landlock_abi, network: "none", max_memory_mb}`
-  next to `exit_code`/`stdout`/`stderr`. `timeout` works as usual (``run: "/bin/sleep" timed out after 1s``).
+- **File size — `"max_file_mb"` (v0.6.53+)** caps the size of **each file** the child writes (not
+  the disk: many small files still fill it). The process that writes past it is killed by the kernel
+  (`SIGXFSZ`) and the file stays at the cap (measured: `max_file_mb: 1` → the file is exactly
+  1048576 bytes). When that process is the child itself (`exec head -c 3000000 …`),
+  `r.killed_by` is `"max_file_mb"` and `r.exit_code` is `-1`. When it is a process the child
+  started (`sh -c "head … > f; echo rc=$?"`), only that one dies — the shell sees `rc=153` and
+  `File size limit exceeded`, and goes on. Only with `isolate`, like `max_memory_mb`:
+  ``run: max_file_mb is enforced only for an isolated child — add "isolate" (e.g. {"isolate": true, "max_file_mb": 100})``.
+- **`r.killed_by` (v0.6.53+):** `nothing` when the child exited on its own, `"max_file_mb"` as
+  above, or `"signal N"` for any other signal (`kill -9 $$` → `"signal 9"`, `exit_code` `-1`).
+- **The result says what the kernel enforced:** `isolation: {landlock_abi, network: "none", max_memory_mb, max_file_mb}`
+  (measured: `{landlock_abi: 7, network: "none", max_memory_mb: nothing, max_file_mb: 50}`)
+  next to `exit_code`/`stdout`/`stderr`/`killed_by`. `timeout` works as usual (``run: "/bin/sleep" timed out after 1s``).
 - **When `run` returns, everything the child started has been killed too** (`sh -c "sleep 37 & echo started"`
   leaves no `sleep`). A process stuck in the kernel is waited for up to 2 s.
 

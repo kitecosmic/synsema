@@ -201,6 +201,12 @@ let b be http_get("https://api.provider.com/v1/items",
 - `==` on a `secret` is already constant-time; prefer `constant_time_eq`/`verify_hmac`
   for credential checks.
 
+**A secret never reaches an OS child by accident.** `run`, `proc_spawn` and `run_program` refuse a
+`secret()` in the child's `env`, arguments or `stdin`, and nothing runs (`run` since v0.6.53 — before
+it passed the text `secret(K)` in `env`/arguments and dropped `stdin` silently):
+``run: env "K" is a secret — reveal() it explicitly (audited) if the child really needs the value; nothing ran``.
+If the child needs the value, `reveal(secret("K"))` with `require reveal("K")` — audited.
+
 ## A secret in the URL, the query or the body: bind it to a host (v0.6.46+)
 
 Some APIs take the key only in the URL (RPC providers, bot and map APIs), in the query, or in the body (OAuth `client_secret_post`). Before v0.6.46 that was an error and the only way out was `reveal()`. Now you **bind** the secret to the hosts it may go to, and then it may travel in the URL, the query, a JSON body at any depth, a form, or a header — only to those hosts:

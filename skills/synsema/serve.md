@@ -786,7 +786,9 @@ serve on 8080
 - A declared **literal** route or a static file at any of these paths **overrides** the
   generated one (so `route "GET /docs"` replaces the API page — intended). A **parametric**
   route does NOT (v0.6.20+): `GET /:lang` no longer swallows `/openapi.json` — the reserved URLs
-  are served first (a static file at the exact path still wins), and `synsema check` warns about
+  are served first (`/.well-known/synsema-auth` too since v0.6.53: before, a `GET /*path` took it;
+  under `serve --attested` a literal route on it is now a load error, like the other reserved
+  URLs) (a static file at the exact path still wins), and `synsema check` warns about
   such a route.
 - **`private` per route / per group** (v0.6.20+): the line `private` at the top of a route body or of
   an `export routes` group keeps it served but out of the five documents and of `synsema openapi`
@@ -1050,6 +1052,38 @@ serve on 8080
 
 `synsema run` is untouched (no listener). Under `serve --watch`, the supervisor restarts
 the child; Ctrl-C reaches both.
+
+### Restarting without refusing connections (v0.6.53+, Linux)
+
+A plain restart closes the port for a moment: connections that arrive then are refused. Two ways
+to avoid it:
+
+- **Socket activation (systemd).** When systemd passes the listening socket (`LISTEN_PID`/
+  `LISTEN_FDS`, a `.socket` unit with `ListenStream=`), `serve` listens on it instead of opening the
+  port, and says so: `[serve] port 8080: listening on the socket systemd passed in (socket
+  activation)`. systemd keeps the port open between the old process and the new one, so during
+  `systemctl restart` new connections **wait** instead of being refused. It takes the socket of each
+  port it serves on (the main port, the `:80` of `redirect https` and of the ACME challenge); the
+  ones it does not take are not inherited by its children. Two sockets for the same port are an
+  error at start: ``systemd passed 2 sockets for port 8080; serve listens on one, so the connections
+  of the others would never be accepted. Pass one socket per port (one ListenStream, or
+  BindIPv6Only=both)``. Unit files: [deploy.md](deploy.md) § Zero-downtime restarts. (Measured with
+  `systemd-socket-activate -l 8080 synsema serve app.syn`, which speaks the same protocol.)
+- **`SYNSEMA_REUSE_PORT=1`** (process environment) opens the port with `SO_REUSEPORT`, so a new
+  process can listen on the same port while the old one drains: start the new one with the
+  variable, wait until it answers, send `SIGTERM` to the old one (it stops accepting, finishes what
+  it has: `[serve] shutting down: draining …`, `[serve] stopped`). **Both** processes need the
+  variable. Measured: requests during the handoff → `200 200 200`. A few connections already
+  queued on the old process can be reset when it closes, unless the kernel has
+  `net.ipv4.tcp_migrate_req=1`; socket activation does not have this gap. Without the variable a
+  second `serve` on the same port is still `could not start server on 0.0.0.0:8080: Address
+  already in use (os error 98)`. On Windows it is ignored: `[serve] SYNSEMA_REUSE_PORT is ignored
+  on this system (Unix only): binding as usual` — there the handoff is the drain of
+  `SYNSEMA_SHUTDOWN_GRACE`.
+- **Approvals across the handoff:** pending approvals made with `approve … then <task>` live in a
+  file both processes share, so either answers them, once ([human.md](human.md) § Approvals that
+  do not wait). A gate that **waits** (without `then`) stays in the old process: while both listen
+  an answer can reach the new one and get 404. Approvals that must survive a restart use `then`.
 
 **A preamble that fails after `serve on` (v0.6.51+)** ends the run the same way: the server
 already listening drains and stops, then the error comes back with its exit code. stderr:
@@ -1498,7 +1532,9 @@ serve on 443
   like `mtls_identity`. The `--tls-cert`/`--tls-key` flags are the operator's and need nothing.
 - `tls auto "email"` — **automatic HTTPS** via ACME (Let's Encrypt): issues the certs,
   serves the HTTP-01 challenge on :80, stores them in `~/.synsema/certs/` (or
-  `SYNSEMA_CERT_DIR`), and a background thread renews each one by its real expiry (< 30 days).
+  `SYNSEMA_CERT_DIR`), and a background thread renews each one by its own lifetime (v0.6.53+: a
+  third of its life before it expires, at most 30 days before — a 90-day cert at 30 days, a
+  six-day one at two).
   The ACME account is stored and reused. `domain` (or `domain ask`) is **required** with `tls auto`.
 - `domain` accepts **one domain or a list**. Since v0.6.42 there is **one certificate per name**
   (it used to be one SAN cert for the whole list): adding a name issues only that one.
@@ -1511,6 +1547,20 @@ serve on 443
   ```
 
   Each name must resolve (DNS A/AAAA) to this server and be reachable on `:80`.
+- **A certificate for the server's IP, without a domain (v0.6.53+):** `domain "203.0.113.7"` (or a
+  list mixing names and one IP; IPv6 too). It is ordered with the ACME profile `shortlived` when
+  the CA offers it — Let's Encrypt issues for an IP only with that profile, and the certificate
+  lasts about six days (renewed every ~2 days, automatically). Rules:
+  - **One IP per `serve`.** A client that connects to an IP sends no SNI, so it gets the IP's
+    certificate even when a domain is listed first. Two IPs are an error at start: ``tls auto: one
+    IP per serve (2 are listed: 203.0.113.7, 203.0.113.8). A client that connects to an IP sends no
+    server name, so the server cannot tell which certificate to give; serve each IP on its own, or
+    use names`` (`synsema check` does not see it; `serve` does).
+  - An IP is validated by HTTP-01 (`:80`) or TLS-ALPN-01, **never DNS-01**, even with `tls dns`.
+  - With an IPv6 `domain`, the base URL of the sitemap, `robots.txt` and OpenAPI puts it in
+    brackets (`https://[2001:db8::1]/…`).
+  - Like a name, the server starts without the certificate when the CA cannot be reached
+    (`ACME: serving without a certificate for 203.0.113.7 (retrying in the background)`).
 - **The server starts even if the CA cannot be reached** (v0.6.42+): a name without a
   certificate is logged and retried in the background — every minute while a `domain` name is
   missing, each name backing off after a failure (1 min, doubling up to 1 h). Each issuance has
