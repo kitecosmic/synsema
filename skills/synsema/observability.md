@@ -318,6 +318,25 @@ Without `--explain`, `synsema run` prints only the short line
 (`Runtime error: <file>:<line>:<col>: <msg>`) — the stable, parseable form for scripting.
 The process exit code is unchanged either way (1 on failure, 0 on success).
 
+The JSON diagnostic is `{error_type, message, file, line, column, source_context,
+source_start_line, error_category, recoverable, retry_makes_sense, call_stack, variables,
+suggestions, active_intent, active_trace}`. v0.6.54+:
+- A **lexer or parser error** has its place in `line`/`column` (it said `line: 0`, with the place
+  only inside the message): `let x be (1 +` → `"error_type": "ParseError"`, `"message": "Expected
+  RPAREN, got NEWLINE"`, `"line": 3`, `"column": 1`, and `source_context` with the code around it.
+- Each value in `variables` is cut at **1000 characters** plus `… (N chars)`; with private data in
+  the run (`--labels`) `variables` is `null`, like `steps`.
+- **`synsema run --format json --diagnostic`** puts the same map in the run's report, as
+  `"diagnostic"` (it is how `run_program`'s `explain` gets it). It goes with `--format json` and
+  without `--explain`; otherwise it is a usage error (exit 2: `synsema run: --diagnostic goes with
+  --format json (without --explain): …`).
+
+**The `--format json` report** is `{ok, output, errors, audit, audit_dropped, exit, llm_tokens,
+steps}` (+ `diagnostic` with `--diagnostic`). v0.6.54+: `audit` keeps the **first 50 000 entries (at
+most 16 MB of them)** and `audit_dropped` counts the rest — every capability check is an entry, so a
+program that read an allowed file 100 000 times carried them all. `--audit <path>` still writes every
+entry.
+
 ## Auto-recovery
 1. Retry with backoff (IO/transient errors)
 2. Fallback to cached/default data

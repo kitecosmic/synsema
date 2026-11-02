@@ -344,6 +344,8 @@ serve on 8080
 `serve` does **not** write an access log — add a `log` in your handlers to see requests live:
 `log "GET " + (path of request)` shows as `[serve] [LOG] GET /…` in the server terminal. Both
 `log` and `print` reach it with a `[serve]` prefix. See [observability.md](observability.md#logging-under-serve-and-where-it-shows-up).
+An agent spawned from a route that fails writes `[serve] Agent error [<id>]: <file>:<line>:<col>: <message>`
+there (v0.6.54+; not with `--labels`) — see [agents.md](agents.md).
 
 ## Serving web pages (HTML, static files, CORS)
 
@@ -1555,7 +1557,9 @@ serve on 443
     certificate even when a domain is listed first. Two IPs are an error at start: ``tls auto: one
     IP per serve (2 are listed: 203.0.113.7, 203.0.113.8). A client that connects to an IP sends no
     server name, so the server cannot tell which certificate to give; serve each IP on its own, or
-    use names`` (`synsema check` does not see it; `serve` does).
+    use names`` — `synsema check` warns of it with the same text (v0.6.54+, when `domain` is a literal
+    list: `app.syn:3: warning: tls auto: one IP per serve (…) — `serve` stops with this error when it
+    starts`; exit 0), and `serve` stops with it.
   - An IP is validated by HTTP-01 (`:80`) or TLS-ALPN-01, **never DNS-01**, even with `tls dns`.
   - With an IPv6 `domain`, the base URL of the sitemap, `robots.txt` and OpenAPI puts it in
     brackets (`https://[2001:db8::1]/…`).

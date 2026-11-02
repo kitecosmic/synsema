@@ -2,7 +2,8 @@
 
 Read this FIRST if something fails. Each row is a real mistake that costs hours to debug.
 
-> **Just upgraded and something that worked now fails?** Start at *Upgrading to v0.6.53* (gates in
+> **Just upgraded and something that worked now fails?** Start at *Upgrading to v0.6.54* (an
+> unknown `run_program` option, a non-ASCII host in WebAssembly), then *Upgrading to v0.6.53* (gates in
 > `parallel_map`/agents no longer approve themselves, nothing scheduled from a `sandbox`, `ask`
 > falls back to text, a `secret()` to `run`'s child), then *v0.6.52*, then *v0.6.51* (no output
 > inside a plain `sandbox`, links in `list_dir`, tokens and `run_program` children with private
@@ -18,6 +19,22 @@ Read this FIRST if something fails. Each row is a real mistake that costs hours 
 > Behavioral surprises · Anti-patterns · Secrets & config
 > Coming from Python? The traps that LOOK like Python but aren't are also collected in
 > [python-diff.md](python-diff.md).
+
+## Upgrading to v0.6.54 — what behaves differently
+
+| You see | What changed | What to write |
+|---|---|---|
+| ``run_program: unknown option "ceilng" (valid options: ceiling, profile, env, timeout, cwd, filename, explain) — nothing ran`` | **breaking:** a key `run_program` does not know was ignored (a misspelled `ceiling` ran the child with the ceiling it inherits) | fix the key; options of your own go in `env` |
+| ``run_program: options must be a map, got text — nothing ran`` | **breaking:** options that are not a map were ignored | `run_program(code, {"ceiling": "stdout"})` |
+| WebAssembly: ``the host "…" is not plain ASCII; write an internationalized name as punycode (xn--…) …`` | **breaking:** the host maps such a name before connecting, so the engine could not tell which address it was | write the name as punycode (`xn--…`) |
+| WebAssembly: `http_get("http://169.254.169.254/")` under `net("*")` fails with ``… a private address …`` | a private IP written in the URL (every form a browser reads as one) is checked by the engine, as natively | name it: `require net("169.254.169.254")` |
+| WebAssembly: ``a browser reads the host of this URL as "…", but `net` checked "…"`` | a URL a browser reads with another host or port (`\`, tabs, escapes in the host) is refused before the hook | write the host plainly |
+| WebAssembly: `unsupported scheme 'ftp': only http and https are supported` | other schemes reached the host's hook | use `http`/`https` |
+| WebAssembly: `llm_step`/`llm_stream` with a host `llm` hook fail saying the hook answers whole texts | they returned `"[no llm provider]"` | `reason`/`generate`/… through the hook; tool calling and streaming in the native binary |
+| `run --format json`: `audit` has 50 000 entries and `audit_dropped` > 0 | the report keeps the first 50 000 (at most 16 MB) | `--audit <path>` for every entry |
+| ``run_program: the child's report is larger than 32 MB and was not read — print less (write big results to a file)`` | the child's report is read with limits (before, a 40 MB output took 200+ MB in the caller) | lend the child `file.write`, write the result there, print the path |
+| `r.output_truncated` / `r.stderr_truncated` / `r.audit_truncated` is `true` | `output` keeps 100 000 lines, `stderr` 10 MB and 100 000 lines, the audit 50 000 entries | print less, or write to a file |
+| ``oidc_verify: could not fetch the JWKS from … (<reason>). The token was NOT verified. (not retried for 30s after a failure)`` | an unreachable JWKS says why and is not asked again for 30 s; an unknown `kid` re-fetches at most once every 30 s | fix the URL or the network; nothing to change in the program |
 
 ## Upgrading to v0.6.53 — what behaves differently
 

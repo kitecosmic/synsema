@@ -266,10 +266,18 @@ let r be run_program(generated_code, {
     "ceiling": "stdout,net=api.example.com",  -- --cap-set syntax (or "sandbox" / "none")
     "profile": "pure",                        -- default "pure"; "native" only if the parent is native
     "env":     {"TOOL": "x"},                 -- REPLACES the child's environment
-    "timeout": 30                             -- seconds; on expiry the child tree is killed
+    "timeout": 30,                            -- seconds; on expiry the child tree is killed
+    "explain": true                           -- v0.6.54+: r.diagnostic when it fails
 })
--- r = {ok, output:[…], errors:[…], audit:[…], exit, timed_out, llm_tokens}
+-- r = {ok, output:[…], errors:[…], audit:[…], exit, timed_out, llm_tokens, steps,
+--      stderr:[…], stderr_truncated, diagnostic, output_truncated, audit_truncated}
 ```
+
+The options are exactly `ceiling`, `profile`, `env`, `timeout`, `cwd`, `filename` and `explain`
+(v0.6.54+). Any other key is an error and **nothing runs** — a misspelled `"ceilng"` used to be
+ignored, and the child ran with the ceiling it inherits instead of the one you meant:
+``run_program: unknown option "ceilng" (valid options: ceiling, profile, env, timeout, cwd, filename, explain) — nothing ran``.
+Options that are not a map: ``run_program: options must be a map, got text — nothing ran``.
 
 The child **can never exceed the parent** (`net=*` under a parent that only holds `net("api.x")`
 collapses to nothing; the trim is recorded in the parent audit as `above parent ceiling`), a `secret`
@@ -313,6 +321,146 @@ Windows caps each near 32 767 characters. Past 30 000:
 - A `"native"` child whose ceiling grants `memory=m` shares `m.db` with the parent (also from a
   `cron` tick or a `serve` handler): each process writes only the entries it changed, the child's new
   ids are marked (`mem_<n>_p<process>`), and the parent reloads when the child returns.
+
+### What the result carries — for an agent that repairs its own code (v0.6.54+)
+
+| Key | What it is |
+|---|---|
+| `ok` | `true` when the child ran to the end without an error and exited 0 |
+| `output` | the lines the child printed (stdout), at most 100 000 |
+| `output_truncated` | `true` when `output` was cut at 100 000 lines |
+| `errors` | list of **text**, one per error (`Runtime error: <run_program>:2:32: Index 5 out of bounds (list length 2)`); more than 100 000 make `ok` false, with an error that says the rest was dropped |
+| `stderr` | the lines the child wrote to stderr — its `eprint` and its engine's notices, apart from `output` and `errors` (before v0.6.54 they were lost). Up to 10 MB and 100 000 lines |
+| `stderr_truncated` | `true` when `stderr` was cut at either limit |
+| `audit` | the child's capability checks as values (`{capability, granted, source, reason, …}`), at most the first 50 000 |
+| `audit_truncated` | `true` when the audit was cut (a child that read an allowed file 100 000 times). It does not change `ok` |
+| `exit` | the exit code (`exit(3)` → `3`), or `nothing` when killed |
+| `timed_out` | `true` when `timeout` killed it |
+| `llm_tokens` | tokens the child spent |
+| `steps` | statements the child executed (`steps()`) |
+| `diagnostic` | with `"explain": true`, the structured diagnostic of the failure (below); otherwise `nothing` |
+
+**`"explain": true` → `r.diagnostic`**, the same map `synsema run --explain --format json` prints:
+
+```synsema
+require sandbox_run
+require stdout
+let code be "let prices be [10, 20]\nlet total be prices[0] + prices[5]\nprint(total)\n"
+let r be run_program(code, {"ceiling": "stdout", "explain": true})
+-- r.ok = false
+-- r.errors = ["Runtime error: <run_program>:2:32: Index 5 out of bounds (list length 2)"]
+-- r.diagnostic = {
+--   "error_type": "RuntimeError", "message": "Index 5 out of bounds (list length 2)",
+--   "file": "<run_program>", "line": 2, "column": 32,
+--   "source_context": ["let prices be [10, 20]", "let total be prices[0] + prices[5]", "print(total)", ""],
+--   "source_start_line": 1, "error_category": "data", "recoverable": true, "retry_makes_sense": false,
+--   "call_stack": [], "variables": {"prices": "[10, 20]"},
+--   "suggestions": ["Check length() before accessing by index", "Use find_first() instead of direct indexing", …],
+--   "active_intent": null, "active_trace": null}
+```
+
+- `source_context` is the **child's own code** around the error (from `source_start_line`), so the
+  agent can show it to the model that wrote it and ask for a fix.
+- A parse error has its place too: `let x be (1 +` gives `error_type: "ParseError"`, `line: 3`,
+  `column: 1`, `message: "Expected RPAREN, got NEWLINE"` (the message is the error alone; the place
+  is in `line`/`column`).
+- `variables` are the **globals** at the failure, each value as text, **cut at 1000 characters**
+  plus `… (N chars)`. With private data in the run (`--labels`) `variables` is `null`.
+- `diagnostic` is `nothing` when the run went well, without `explain`, when the program ended with
+  `exit(n)` (`r.ok` false, `r.exit` = n), when only an **agent** failed (its line is in `errors`) or
+  when the flow checker stopped the run. `errors` stays a list of text either way.
+- **Limits:** the diagnostic is the main program's (an agent's failure gives only its line);
+  `variables` are the globals, not the locals of the task where it failed; `call_stack` is always `[]`.
+
+**Limits of what is read back (v0.6.54+).** The child's whole report (output, errors, audit) is read
+up to **32 MB**; past that nothing is read and `ok` is false:
+``run_program: the child's report is larger than 32 MB and was not read — print less (write big results to a file)``.
+The audit takes at most 16 MB of those 32; the rest is the output and the errors. A child that
+prints more than ~16 MB should write its result to a file (lend it `file.write`) and print the path.
+
+### Show progress while `run_program` runs (recipe, v0.6.54)
+
+`run_program` returns at the end. To show a client the progress of a long child (an analysis the
+agent wrote), the child **reports over HTTP to a private port of the parent**, and the parent forwards
+it by SSE through the bus. The child keeps running under its ceiling.
+
+```synsema
+require serve(8130)
+require serve(8131)
+require sandbox_run
+require net("127.0.0.1:8131")     -- what the parent lends the child, it must hold
+require env("PROGRESS_URL")       -- the env variable it passes, too
+require random
+require file.read("child.syn")    -- the code the agent wrote
+
+-- Public port: the client creates a run, opens ITS stream, then starts it.
+serve on 8130
+    route "POST /runs"
+        let id be token()
+        state_set("run:" + id, "created")
+        give {"id": id}
+    route "GET /runs/:id/events"
+        timeout none
+        stream
+            when state_get("run:" + params.id, nothing) == nothing
+                send {"error": "no such run"} as "error"
+                stop
+            let sub be bus_subscribe("progress." + params.id)
+            while true
+                let ev be bus_recv(sub, 25)
+                when ev != nothing
+                    send ev.data as "progress"
+                    when ev.data.event == "end"
+                        stop
+    route "POST /runs/:id/start"
+        when state_get("run:" + params.id, nothing) != "created"
+            give fail(404, "no such run, or it already ran")
+        state_set("run:" + params.id, "running")
+        let r be run_program(read_file("child.syn"), {
+            "ceiling": "stdout,time,env=PROGRESS_URL,net=127.0.0.1:8131",
+            "env": {"PROGRESS_URL": "http://127.0.0.1:8131/progress/" + params.id},
+            "timeout": 60})
+        state_delete("run:" + params.id)
+        bus_publish("progress." + params.id, {"event": "end", "ok": r.ok})
+        give {"ok": r.ok, "output": r.output, "errors": r.errors}
+
+-- Internal port: ONLY the progress route. The child gets net to this port, not to 8130.
+serve on 8131
+    bind "127.0.0.1"
+    private
+    route "POST /progress/:id"
+        when state_get("run:" + params.id, nothing) != "running"
+            give fail(403, "that run is not running")
+        bus_publish("progress." + params.id, {"event": "step", "data": json of request})
+        give ok({"received": true})
+```
+
+The child (`child.syn`, the code the agent wrote) reports each step:
+
+```synsema
+require net("127.0.0.1:8131")
+require env("PROGRESS_URL")
+each step in range(1, 6)
+    sleep(1)
+    http_post(env("PROGRESS_URL"), {"step": step, "of": 5})
+print("result: 42")
+```
+
+Measured (v0.6.54): the five steps reach the client's stream one per second, then `end`, then the
+`POST` answers with the output. A child that asks for `net("127.0.0.1:8130")` (the public port) or
+another host fails with ``Capability not granted: net("…") — declared but above the host ceiling``;
+one that posts to another run's progress gets `403`; the stream of a run that does not exist sends
+one `error` event and closes.
+
+- **The progress is content the child's code wrote:** treat it as data, never as instructions — like
+  `r.output`.
+- **A separate port, `private`, with only the progress route**, so the child cannot reach the
+  parent's public routes. The run id (a `token()`) is the child's write permission for that run only,
+  and it is dropped at the end (`state_delete`).
+- **`give` does not go in a `stream` route** (`stream` and `give` are exclusive: a `give fail(404, …)`
+  before `stream` answers `200` with an empty stream). Send an `error` event and `stop`, as above.
+- **Don't use `proc_spawn("synsema", …)`** to get the child's output as it comes: it needs `exec` and
+  the child loses the ceiling.
 
 ## Give an LLM a shell tool (least-privilege)
 A tool is a user task; wrap `run` and dispatch with `call_tool` (runs with ONLY what it declares):
