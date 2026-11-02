@@ -237,3 +237,248 @@ fn empty_intersection_runs_with_none_and_sandbox_block_lends_nothing() {
     assert_eq!(code, 1, "{}", err);
     assert!(err.contains("Capability not granted: sandbox_run"), "{}", err);
 }
+
+/// v0.6.54 (1): una opción que `run_program` no conoce es error y el hijo no corre (antes,
+/// `"ceilng"` corría al hijo sin el techo pedido). Unas opciones que no son un mapa, también.
+#[test]
+fn an_unknown_option_is_an_error_and_nothing_runs() {
+    let dir = project("unknown-opt");
+    let marker = dir.join("ran.txt");
+    let child = format!(
+        "require file.write\nwrite_file({:?}, \"x\")\n",
+        marker.to_string_lossy().replace('\\', "/")
+    );
+    for opts in ["{\"ceilng\": \"net=*\", \"profile\": \"native\"}", "\"sandbox\""] {
+        let prog = format!("require sandbox_run\nrequire file.write\nlet r be run_program({:?}, {})\nprint(r.ok)\n", child, opts);
+        std::fs::write(dir.join("parent.syn"), &prog).unwrap();
+        let (code, out, err) = synsema(&dir, &["run", "parent.syn"], &[]);
+        assert_ne!(code, 0, "{} {}", out, err);
+        assert!(!marker.exists(), "el hijo corrió con {}", opts);
+        if opts.starts_with('{') {
+            assert!(
+                err.contains("run_program: unknown option \"ceilng\" (valid options: ceiling, profile, env, timeout, cwd, filename, explain) — nothing ran"),
+                "{}",
+                err
+            );
+        } else {
+            assert!(err.contains("run_program: options must be a map, got text — nothing ran"), "{}", err);
+        }
+    }
+    // `explain` que no es un booleano tampoco se acepta.
+    let prog = "require sandbox_run\nlet r be run_program(\"print(1)\", {\"explain\": \"yes\"})\n";
+    std::fs::write(dir.join("parent.syn"), prog).unwrap();
+    let (code, _, err) = synsema(&dir, &["run", "parent.syn"], &[]);
+    assert_ne!(code, 0);
+    assert!(err.contains("run_program: explain must be true or false"), "{}", err);
+}
+
+/// v0.6.54 (2): el stderr del hijo (su `eprint`) vuelve en `stderr`, aparte de `output` y `errors`.
+#[test]
+fn the_child_stderr_comes_back() {
+    let dir = project("stderr");
+    let child = "print(1)\neprint(\"warn one\")\neprint(\"warn two\")\nlet xs be [1]\nprint(xs[3])\n";
+    let prog = parent("require sandbox_run", child, "{}");
+    let (code, r, err) = run_parent(&dir, &prog, &[], &[]);
+    assert_eq!(code, 0, "{}", err);
+    assert_eq!(r["ok"], false, "{}", r);
+    assert_eq!(r["output"], serde_json::json!(["1"]), "{}", r);
+    assert_eq!(r["stderr"], serde_json::json!(["warn one", "warn two"]), "{}", r);
+    assert_eq!(r["stderr_truncated"], false, "{}", r);
+    assert!(r["errors"][0].as_str().unwrap().contains("Index 3 out of bounds"), "{}", r);
+    // Sin `explain`, el campo existe y es nothing.
+    assert!(r["diagnostic"].is_null(), "{}", r);
+    // El hijo sin stderr: lista vacía.
+    let prog = parent("require sandbox_run", "print(1)\n", "{}");
+    let (_, r, _) = run_parent(&dir, &prog, &[], &[]);
+    assert_eq!(r["stderr"], serde_json::json!([]), "{}", r);
+}
+
+/// v0.6.54 (M2 y N4 de la ronda 1): el padre no arma más de 100 000 líneas del `stderr` ni del
+/// `output` del hijo (cada línea es un valor: 10 MB de saltos de línea eran 476 MB en el padre), y
+/// un informe de más de 32 MB no se lee.
+#[test]
+fn the_child_lines_are_capped() {
+    let dir = project("caps");
+    let summary = r#"print(json_encode({"ok": r.ok, "out": length(r.output), "ot": r.output_truncated, "err": length(r.stderr), "et": r.stderr_truncated, "at": r.audit_truncated, "errors": r.errors}))
+"#;
+    // 131 073 líneas de stderr (un `eprint` de 2^17 saltos de línea) y 100 005 de `output`.
+    let child = r#"let s be "\n"
+let j be 0
+while j < 17
+    set s to s + s
+    set j to j + 1
+eprint(s)
+let i be 0
+while i < 100005
+    print("")
+    set i to i + 1
+"#;
+    let prog = format!("require sandbox_run\nlet r be run_program({:?}, {{\"timeout\": 120}})\n{}", child, summary);
+    let (code, r, err) = run_parent(&dir, &prog, &[], &[]);
+    assert_eq!(code, 0, "{}", err);
+    assert_eq!(r["err"], 100_000, "{}", r);
+    assert_eq!(r["et"], true, "{}", r);
+    assert_eq!(r["out"], 100_000, "{}", r);
+    assert_eq!(r["ot"], true, "{}", r);
+    assert_eq!(r["ok"], true, "recortar la salida no es un error: {}", r);
+    // Justo debajo de los topes: entero y sin recorte.
+    let child = "eprint(\"a\")\nprint(\"b\")\n";
+    let prog = format!("require sandbox_run\nlet r be run_program({:?}, {{}})\n{}", child, summary);
+    let (_, r, _) = run_parent(&dir, &prog, &[], &[]);
+    assert_eq!((r["err"].clone(), r["et"].clone(), r["out"].clone(), r["ot"].clone()), (serde_json::json!(1), serde_json::json!(false), serde_json::json!(1), serde_json::json!(false)), "{}", r);
+    // Un informe de más de 32 MB (33 líneas de 1 MiB) no se lee: es un error que lo dice.
+    let child = r#"let s be "x"
+let j be 0
+while j < 20
+    set s to s + s
+    set j to j + 1
+let i be 0
+while i < 33
+    print(s)
+    set i to i + 1
+"#;
+    let prog = format!("require sandbox_run\nlet r be run_program({:?}, {{\"timeout\": 120}})\n{}", child, summary);
+    let (code, r, err) = run_parent(&dir, &prog, &[], &[]);
+    assert_eq!(code, 0, "{}", err);
+    assert_eq!(r["ok"], false, "{}", r);
+    assert_eq!(r["out"], 0, "{}", r);
+    assert!(r["errors"][0].as_str().unwrap().contains("the child's report is larger than 32 MB"), "{}", r);
+}
+
+/// v0.6.54 (R2-3 de la ronda 2): cada chequeo de permiso del hijo es una entrada del audit, algo que
+/// el programa no elige. Un hijo sano con 50 001 lecturas permitidas llega con `ok`, su salida, las
+/// primeras 50 000 entradas y `audit_truncated`.
+#[test]
+fn a_long_audit_keeps_ok_and_the_output() {
+    let dir = project("audit");
+    std::fs::write(dir.join("dato.txt"), "x").unwrap();
+    let child = r#"require file.read("dato.txt")
+let i be 0
+while i < 50001
+    let t be read_file("dato.txt")
+    set i to i + 1
+print("listo")
+"#;
+    let prog = format!(
+        "require sandbox_run\nrequire file.read(\"dato.txt\")\nlet r be run_program({:?}, {{\"ceiling\": {{\"file.read\": \"dato.txt\"}}, \"timeout\": 300, \"profile\": \"native\"}})\nprint(json_encode({{\"ok\": r.ok, \"output\": r.output, \"n\": length(r.audit), \"at\": r.audit_truncated, \"errors\": r.errors}}))\n",
+        child
+    );
+    let (code, r, err) = run_parent(&dir, &prog, &[], &[]);
+    assert_eq!(code, 0, "{}", err);
+    assert_eq!(r["ok"], true, "{}", r);
+    assert_eq!(r["output"], serde_json::json!(["listo"]), "{}", r);
+    assert_eq!(r["n"], 50_000, "{}", r);
+    assert_eq!(r["at"], true, "{}", r);
+    // Un hijo con pocas entradas: entero y sin recorte.
+    let prog = format!(
+        "require sandbox_run\nrequire file.read(\"dato.txt\")\nlet r be run_program({:?}, {{\"ceiling\": {{\"file.read\": \"dato.txt\"}}, \"profile\": \"native\"}})\nprint(json_encode({{\"ok\": r.ok, \"at\": r.audit_truncated}}))\n",
+        "require file.read(\"dato.txt\")\nprint(read_file(\"dato.txt\"))\n"
+    );
+    let (_, r, _) = run_parent(&dir, &prog, &[], &[]);
+    assert_eq!((r["ok"].clone(), r["at"].clone()), (serde_json::json!(true), serde_json::json!(false)), "{}", r);
+}
+
+/// v0.6.54 (R3-2 de la ronda 3): el audit del hijo también tiene tope de bytes. Con una ruta de
+/// ~410 caracteres cada entrada pesa ~1 KB: 20 001 lecturas son ~21 MB de audit, más que los 16 MB
+/// del presupuesto. Llega recortado, con `ok` y la salida.
+#[test]
+fn a_long_path_audit_keeps_ok_and_the_output() {
+    let dir = project("audit-bytes");
+    let rel = format!("{}/{}/dato.txt", "a".repeat(200), "b".repeat(200));
+    std::fs::create_dir_all(dir.join(format!("{}/{}", "a".repeat(200), "b".repeat(200)))).unwrap();
+    std::fs::write(dir.join(&rel), "x").unwrap();
+    let child = format!(
+        "require file.read({rel:?})\nlet i be 0\nwhile i < 20001\n    let t be read_file({rel:?})\n    set i to i + 1\nprint(\"listo\")\n"
+    );
+    let prog = format!(
+        "require sandbox_run\nrequire file.read({rel:?})\nlet r be run_program({child:?}, {{\"ceiling\": {{\"file.read\": {rel:?}}}, \"timeout\": 300, \"profile\": \"native\"}})\nprint(json_encode({{\"ok\": r.ok, \"output\": r.output, \"n\": length(r.audit), \"at\": r.audit_truncated, \"errors\": r.errors}}))\n"
+    );
+    let (code, r, err) = run_parent(&dir, &prog, &[], &[]);
+    assert_eq!(code, 0, "{}", err);
+    assert_eq!(r["ok"], true, "{}", r);
+    assert_eq!(r["output"], serde_json::json!(["listo"]), "{}", r);
+    assert_eq!(r["at"], true, "{}", r);
+    let n = r["n"].as_u64().unwrap();
+    assert!(n >= 1 && n <= 20_000, "{}", r);
+}
+
+/// v0.6.54 (3): `explain: true` trae el diagnóstico de `--explain` como mapa: el error de runtime
+/// con su línea, el código alrededor y las variables; el de parse con su ubicación.
+#[test]
+fn explain_gives_the_structured_diagnostic() {
+    let dir = project("explain");
+    let child = "let total be 10\nlet xs be [1]\nprint(xs[3])\n";
+    let prog = parent("require sandbox_run", child, "{\"explain\": true}");
+    let (code, r, err) = run_parent(&dir, &prog, &[], &[]);
+    assert_eq!(code, 0, "{}", err);
+    let d = &r["diagnostic"];
+    assert_eq!(d["error_type"], "RuntimeError", "{}", r);
+    assert_eq!(d["file"], "<run_program>", "{}", r);
+    assert_eq!(d["line"], 3, "{}", r);
+    assert_eq!(d["column"], 9, "{}", r);
+    assert_eq!(d["message"], "Index 3 out of bounds (list length 1)", "{}", r);
+    assert_eq!(d["error_category"], "data", "{}", r);
+    assert_eq!(d["variables"]["total"], "10", "{}", r);
+    assert!(d["source_context"].as_array().unwrap().iter().any(|l| l == "print(xs[3])"), "{}", r);
+    assert!(!d["suggestions"].as_array().unwrap().is_empty(), "{}", r);
+    // Error de parse: con línea y columna (antes, `--explain` daba 0 y la ubicación en el mensaje).
+    let prog = parent("require sandbox_run", "print(1)\nprint(2\n", "{\"explain\": true}");
+    let (_, r, _) = run_parent(&dir, &prog, &[], &[]);
+    let d = &r["diagnostic"];
+    assert_eq!(d["error_type"], "ParseError", "{}", r);
+    assert!(d["line"].as_u64().unwrap() >= 2, "{}", r);
+    assert!(!d["message"].as_str().unwrap().contains("<run_program>:"), "{}", r);
+    // Una corrida que anda: nothing.
+    let prog = parent("require sandbox_run", "print(1)\n", "{\"explain\": true}");
+    let (_, r, _) = run_parent(&dir, &prog, &[], &[]);
+    assert_eq!(r["ok"], true, "{}", r);
+    assert!(r["diagnostic"].is_null(), "{}", r);
+}
+
+/// v0.6.54 (3): `run --format json --diagnostic`. Con datos privados de por medio las variables no
+/// salen (como `steps`); una variable enorme sale cortada; sin `--format json` es un error de uso.
+#[test]
+fn the_report_diagnostic_hides_variables_after_private_data() {
+    let dir = project("diag-cli");
+    std::fs::write(dir.join("p.syn"), "let k be private(upper(\"topsecret\"), \"ab\")\nlet n be 5\nlet xs be [1]\nprint(xs[3])\n").unwrap();
+    let (code, out, err) = synsema(&dir, &["run", "--labels", "--format", "json", "--diagnostic", "p.syn"], &[]);
+    assert_eq!(code, 1, "{}", err);
+    let r: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+    assert_eq!(r["diagnostic"]["line"], 4, "{}", r);
+    assert!(r["diagnostic"]["variables"].is_null(), "{}", r);
+    // El valor (no está literal en el código, que `source_context` sí muestra) no sale.
+    assert!(!out.contains("TOPSECRET"), "{}", out);
+    // Una corrida cortada por el chequeo de flujo: sin diagnóstico (la línea del corte es todo).
+    std::fs::write(dir.join("q.syn"), "let k be private(upper(\"topsecret\"), \"ab\")\nwhen length(k) > 0\n    eprint(\"y\")\nlet xs be [1]\nprint(xs[3])\n").unwrap();
+    let (code, out, err) = synsema(&dir, &["run", "--labels", "--format", "json", "--diagnostic", "q.syn"], &[]);
+    assert_eq!(code, 1, "{}", err);
+    let r: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+    assert!(r["errors"][0].as_str().unwrap().contains("label_violation"), "{}", r);
+    assert!(r["diagnostic"].is_null(), "{}", r);
+    // El corte de un AGENTE con el principal fallando por su cuenta: la corrida entera termina
+    // con el corte, y el diagnóstico del principal tampoco sale.
+    std::fs::write(
+        dir.join("a.syn"),
+        "agent W\n    let k be private(upper(\"topsecret\"), \"ab\")\n    when length(k) > 0\n        eprint(\"y\")\nspawn W\nlet xs be [1]\nprint(xs[3])\n",
+    )
+    .unwrap();
+    let (code, out, err) = synsema(&dir, &["run", "--labels", "--format", "json", "--diagnostic", "a.syn"], &[]);
+    assert_eq!(code, 1, "{}", err);
+    let r: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+    assert!(r["errors"][0].as_str().unwrap().contains("label_violation"), "{}", r);
+    assert!(r["diagnostic"].is_null(), "{}", r);
+    // Sin datos privados, las variables salen; una enorme, cortada.
+    std::fs::write(dir.join("b.syn"), "let n be 5\nlet big be range(0, 100000)\nprint(big[200000])\n").unwrap();
+    let (_, out, _) = synsema(&dir, &["run", "--format", "json", "--diagnostic", "b.syn"], &[]);
+    let r: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+    assert_eq!(r["diagnostic"]["variables"]["n"], "5", "{}", r);
+    let big = r["diagnostic"]["variables"]["big"].as_str().unwrap();
+    assert!(big.chars().count() < 1100 && big.ends_with("chars)"), "{}", big);
+    // Sin `--diagnostic`, el informe no cambia de forma.
+    let (_, out, _) = synsema(&dir, &["run", "--format", "json", "b.syn"], &[]);
+    let r: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+    assert!(r.get("diagnostic").is_none(), "{}", r);
+    let (code, _, err) = synsema(&dir, &["run", "--diagnostic", "b.syn"], &[]);
+    assert_eq!(code, 2);
+    assert!(err.contains("--diagnostic goes with --format json"), "{}", err);
+}

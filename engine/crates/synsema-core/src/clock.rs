@@ -43,6 +43,21 @@ fn platform_now() -> f64 {
     }
 }
 
+/// v0.6.54 — ¿hay un reloj de verdad? En un host sin sistema operativo sin [`set_clock`] el
+/// default es 0 (1970): lo que fecha un documento (un recibo) omite la hora en vez de inventarla.
+pub fn has_clock() -> bool {
+    clock_available(
+        slot().lock().map(|g| g.is_some()).unwrap_or(false),
+        cfg!(all(target_arch = "wasm32", target_os = "unknown")),
+    )
+}
+
+/// La regla de [`has_clock`], pura para poder probarla fuera de wasm: un reloj instalado, o una
+/// plataforma con sistema operativo.
+fn clock_available(installed: bool, no_os: bool) -> bool {
+    installed || !no_os
+}
+
 /// Segundos unix como float (lo que devuelve `now()`).
 pub fn now_secs_f64() -> f64 {
     if let Ok(g) = slot().lock() {
@@ -94,4 +109,15 @@ pub fn sleep_secs(secs: f64) {
     }
     #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
     std::thread::sleep(std::time::Duration::from_secs_f64(secs));
+}
+
+#[cfg(test)]
+mod v0654_has_clock {
+    #[test]
+    fn without_an_os_only_an_installed_clock_counts() {
+        assert!(super::clock_available(false, false), "nativo y wasip1: SystemTime");
+        assert!(super::clock_available(true, true), "wasm32-unknown con set_clock");
+        assert!(!super::clock_available(false, true), "wasm32-unknown sin set_clock: el 0 no es una hora");
+        assert!(super::has_clock(), "este proceso (nativo) tiene reloj");
+    }
 }

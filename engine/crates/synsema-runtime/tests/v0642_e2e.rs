@@ -43,7 +43,9 @@ fn spawn_upstream() -> u16 {
     thread::spawn(move || {
         for stream in listener.incoming().flatten() {
             thread::spawn(move || {
-                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                // Sin `try_clone()`: en Windows el clon de un socket sale heredable y un proceso que otro test
+                // lanza en ese momento se queda con la conexión (v0.6.54). `&TcpStream` lee y escribe.
+                let mut reader = BufReader::new(&stream);
                 let mut line = String::new();
                 if reader.read_line(&mut line).unwrap_or(0) == 0 {
                     return;
@@ -61,7 +63,7 @@ fn spawn_upstream() -> u16 {
                         xff = h[16..].trim().to_string();
                     }
                 }
-                let mut s = stream;
+                let mut s = &stream;
                 if method == "OPTIONS" {
                     let _ = s.write_all(b"HTTP/1.1 204 No Content\r\nX-Upstream-Preflight: yes\r\nAccess-Control-Allow-Methods: PUT\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
                     return;
@@ -248,7 +250,7 @@ fn echo_server() -> u16 {
     thread::spawn(move || {
         for stream in listener.incoming().flatten() {
             thread::spawn(move || {
-                let mut s = stream;
+                let mut s = &stream;
                 let mut buf = [0u8; 4096];
                 loop {
                     match s.read(&mut buf) {
@@ -341,7 +343,9 @@ fn spawn_counting_upstream() -> u16 {
     thread::spawn(move || {
         for stream in listener.incoming().flatten() {
             thread::spawn(move || {
-                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                // Sin `try_clone()`: en Windows el clon de un socket sale heredable y un proceso que otro test
+                // lanza en ese momento se queda con la conexión (v0.6.54). `&TcpStream` lee y escribe.
+                let mut reader = BufReader::new(&stream);
                 let mut len = 0usize;
                 let mut line = String::new();
                 let _ = reader.read_line(&mut line);
@@ -363,7 +367,7 @@ fn spawn_counting_upstream() -> u16 {
                     }
                 }
                 let body = format!("got {}", got);
-                let mut s = stream;
+                let mut s = &stream;
                 let _ = s.write_all(
                     format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).as_bytes(),
                 );
@@ -542,14 +546,16 @@ fn fixed_upstream(answer: Option<&'static str>) -> u16 {
     thread::spawn(move || {
         for stream in listener.incoming().flatten() {
             thread::spawn(move || {
-                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                // Sin `try_clone()`: en Windows el clon de un socket sale heredable y un proceso que otro test
+                // lanza en ese momento se queda con la conexión (v0.6.54). `&TcpStream` lee y escribe.
+                let mut reader = BufReader::new(&stream);
                 loop {
                     let mut h = String::new();
                     if reader.read_line(&mut h).unwrap_or(0) == 0 || h.trim().is_empty() {
                         break;
                     }
                 }
-                let mut s = stream;
+                let mut s = &stream;
                 match answer {
                     Some(a) => {
                         let _ = s.write_all(a.as_bytes());

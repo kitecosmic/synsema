@@ -1272,6 +1272,7 @@ fn run_inner(
     swarm: Option<Arc<Swarm>>,
     live_output: bool,
     ceiling: Option<Vec<Capability>>,
+    diagnostic: bool,
 ) -> RunResult {
     // T4: la medida del programa que corre, para el recibo (`receipt()`).
     synsema_stdlib::attest::note_program_sha(source, filename);
@@ -1280,12 +1281,14 @@ fn run_inner(
             success: false,
             output: Vec::new(),
             errors: vec![format!("Lexer error: {}", e)],
+            diagnostic: diagnostic.then(|| compile_diagnostic("LexerError", &e.message, &e.location, filename, source).format_agent()),
             ..Default::default()
         },
         Err(CompileError::Parse(e)) => RunResult {
             success: false,
             output: Vec::new(),
             errors: vec![format!("Parse error: {}", e)],
+            diagnostic: diagnostic.then(|| compile_diagnostic("ParseError", &e.message, &e.location, filename, source).format_agent()),
             ..Default::default()
         },
         Ok(program) => {
@@ -1374,7 +1377,26 @@ fn run_inner(
             } else {
                 interp.execute(&program)
             };
-            finish(interp, r)
+            // v0.6.54 — el diagnóstico se arma acá, en el camino de `run` (no en el de `--explain`),
+            // antes de que `finish` consuma el intérprete. Sólo para un error del programa: ni
+            // `exit(code)` ni un corte de etiquetas (la línea del corte es todo lo que sale).
+            let diag = match &r {
+                Err(Control::Error(e)) if diagnostic && e.exit_code.is_none() && !e.is_fatal_for_labels() => {
+                    Some(runtime_diagnostic(&interp, e, filename, source))
+                }
+                _ => None,
+            };
+            let mut result = finish(interp, r);
+            result.diagnostic = diag.map(|d| {
+                let mut v = d.format_agent();
+                // Las variables son valores del programa: con datos privados de por medio no
+                // salen (la misma regla que `steps`).
+                if result.touched_private {
+                    v["variables"] = serde_json::Value::Null;
+                }
+                v
+            });
+            result
         }
     }
 }
@@ -1400,7 +1422,7 @@ fn spawn_run_ceiled(source: &str, filename: &str, secure: bool, ceiling: Option<
     let fname = filename.to_string();
     std::thread::Builder::new()
         .stack_size(INTERP_STACK_SIZE)
-        .spawn(move || run_inner(&src, &fname, secure, None, false, ceiling))
+        .spawn(move || run_inner(&src, &fname, secure, None, false, ceiling, false))
         .expect("no se pudo crear el hilo del motor")
         .join()
         .unwrap_or_else(|p| RunResult {
@@ -1481,6 +1503,7 @@ fn close_swarm_run(swarm: &Swarm, result: &mut RunResult) {
         result.success = false;
         result.output = vec![synsema_core::interpreter::LABELS_WITHHELD_OUTPUT.to_string()];
         result.errors = vec![format!("Runtime error: {}", message)];
+        result.diagnostic = None;
         // El principal ya adoptó el corte (`redact_for_host`); esto cubre un corte que llegue después
         // de su `exit`, antes de que se detenga el agente.
         result.exit_code = None;
@@ -1514,13 +1537,26 @@ pub fn run_program_ceiled_opts(
     ceiling: Option<Vec<Capability>>,
     live_output: bool,
 ) -> RunResult {
+    run_program_report(source, filename, ceiling, live_output, false)
+}
+
+/// v0.6.54 — como `run_program_ceiled_opts`, y con `diagnostic` el resultado lleva el diagnóstico
+/// estructurado del error del programa principal (`RunResult::diagnostic`). Es el camino de
+/// `run --format json --diagnostic` (la opción `explain` de `run_program`).
+pub fn run_program_report(
+    source: &str,
+    filename: &str,
+    ceiling: Option<Vec<Capability>>,
+    live_output: bool,
+    diagnostic: bool,
+) -> RunResult {
     let swarm = Arc::new(run_swarm());
     let sw = swarm.clone();
     let src = source.to_string();
     let fname = filename.to_string();
     let mut result = std::thread::Builder::new()
         .stack_size(INTERP_STACK_SIZE)
-        .spawn(move || run_inner(&src, &fname, false, Some(sw), live_output, ceiling))
+        .spawn(move || run_inner(&src, &fname, false, Some(sw), live_output, ceiling, diagnostic))
         .expect("no se pudo crear el hilo del motor")
         .join()
         .unwrap_or_else(|p| {
@@ -1754,22 +1790,68 @@ pub struct DiagRun {
 /// Como `run_program` pero capturando el diagnóstico rico del error del MAIN. Si `swarm`
 /// es `Some`, los `spawn` corren en hilos aislados (DE-014): un error de agente NO se
 /// propaga al main; lo refleja el caller tras `wait_all` (en `run_with_diagnostics`).
+/// v0.6.54 — el largo máximo de cada variable en un diagnóstico: una lista global de millones de
+/// elementos no se vuelca entera en el informe.
+const DIAG_VALUE_MAX_CHARS: usize = 1000;
+
+/// v0.6.54 — el diagnóstico de un error de lexer o de parser, CON su ubicación (antes, `--explain`
+/// daba `line: 0` y la ubicación sólo dentro del mensaje).
+fn compile_diagnostic(
+    kind: &str,
+    message: &str,
+    location: &synsema_core::tokens::SourceLocation,
+    filename: &str,
+    source: &str,
+) -> crate::error_reporter::ErrorDiagnostic {
+    let mut reporter = crate::error_reporter::ErrorReporter::new();
+    reporter.load_source(filename, source);
+    reporter.build_diagnostic(kind, message, Some(location), None)
+}
+
+/// v0.6.54 — el diagnóstico de un error de runtime del programa principal: el de `--explain` y el
+/// del informe de `run --format json --diagnostic` salen de acá.
+fn runtime_diagnostic(
+    interp: &Interpreter,
+    e: &synsema_core::interpreter::RuntimeError,
+    filename: &str,
+    source: &str,
+) -> crate::error_reporter::ErrorDiagnostic {
+    let mut reporter = crate::error_reporter::ErrorReporter::new();
+    reporter.load_source(filename, source);
+    if let Some(intent) = interp.intent() {
+        reporter.set_intent(intent);
+    }
+    let vars: Vec<(String, String)> = interp
+        .global_env
+        .borrow()
+        .bindings
+        .iter()
+        .map(|(k, v)| {
+            let s = v.to_string();
+            let s = match s.char_indices().nth(DIAG_VALUE_MAX_CHARS) {
+                Some((cut, _)) => format!("{}… ({} chars)", &s[..cut], s.chars().count()),
+                None => s,
+            };
+            (k.to_string(), s)
+        })
+        .collect();
+    reporter.build_diagnostic("RuntimeError", &e.message, e.location.as_ref(), Some(&vars))
+}
+
 fn run_diag_inner(source: &str, filename: &str, swarm: Option<Arc<Swarm>>, ceiling: Option<Vec<Capability>>) -> DiagRun {
     use crate::error_reporter::ErrorReporter;
     let program = match parse_source(source, filename) {
         Ok(p) => p,
         Err(CompileError::Lex(e)) => {
-            let msg = e.to_string();
             return DiagRun {
                 result: RunResult { success: false, output: Vec::new(), errors: vec![format!("Lexer error: {}", e)], ..Default::default() },
-                diagnostics: vec![ErrorReporter::new().build_diagnostic("LexerError", &msg, None, None)],
+                diagnostics: vec![compile_diagnostic("LexerError", &e.message, &e.location, filename, source)],
             };
         }
         Err(CompileError::Parse(e)) => {
-            let msg = e.to_string();
             return DiagRun {
                 result: RunResult { success: false, output: Vec::new(), errors: vec![format!("Parse error: {}", e)], ..Default::default() },
-                diagnostics: vec![ErrorReporter::new().build_diagnostic("ParseError", &msg, None, None)],
+                diagnostics: vec![compile_diagnostic("ParseError", &e.message, &e.location, filename, source)],
             };
         }
     };
@@ -1825,19 +1907,7 @@ fn run_diag_inner(source: &str, filename: &str, swarm: Option<Arc<Swarm>>, ceili
             diagnostics: Vec::new(),
         },
         Err(Control::Error(e)) => {
-            let mut reporter = ErrorReporter::new();
-            reporter.load_source(filename, source);
-            if let Some(intent) = interp.intent() {
-                reporter.set_intent(intent);
-            }
-            let vars: Vec<(String, String)> = interp
-                .global_env
-                .borrow()
-                .bindings
-                .iter()
-                .map(|(k, v)| (k.to_string(), v.to_string()))
-                .collect();
-            let diag = reporter.build_diagnostic("RuntimeError", &e.message, e.location.as_ref(), Some(&vars));
+            let diag = runtime_diagnostic(&interp, &e, filename, source);
             DiagRun {
                 result: RunResult { success: false, output: interp.output.clone(), errors: vec![format!("Runtime error: {}", e)], ..Default::default() },
                 diagnostics: vec![diag],
@@ -2459,11 +2529,14 @@ fn spawn_agent(
                     sw.set_labels_cut(&id, message, detail);
                 }
                 Err(Control::Error(e)) => {
+                    sw.report_agent_error(&id, &e.to_string());
                     sw.set_error(&id, e.to_string());
                     sw.signal(&format!("__agent_error:{}", id), &id, None);
                 }
                 Err(_) => {
-                    sw.set_error(&id, "'give'/'stop' used outside of a task or loop".to_string());
+                    let msg = "'give'/'stop' used outside of a task or loop";
+                    sw.report_agent_error(&id, msg);
+                    sw.set_error(&id, msg.to_string());
                     sw.signal(&format!("__agent_error:{}", id), &id, None);
                 }
             }

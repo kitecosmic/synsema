@@ -90,3 +90,52 @@ fn a_plain_sandbox_denies_print_in_wasm_too() {
     let r = synsema_wasm::run("sandbox under {}\n    print(\"dentro\")\n", &synsema_wasm::RunOptions::new("s.syn"));
     assert!(r.ok && r.output == vec!["dentro".to_string()], "{:?} {:?}", r.output, r.errors);
 }
+
+/// v0.6.54 (§D de v0.6.51): el bin de wasip1 toma `--auditor`/`--receipt` como `synsema run`: el
+/// recibo sellado sale por stderr antes de la salida (o al archivo de `--receipt`) y el auditor lo
+/// abre con su privada.
+#[test]
+fn v0654_wasip1_bin_seals_a_receipt() {
+    let d = std::env::temp_dir().join(format!("synsema-wasm-bin-auditor-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    std::fs::create_dir_all(&d).unwrap();
+    std::fs::write(d.join("p.syn"), "print(\"hola\")\n").unwrap();
+    let (sk, pk) = synsema_stdlib::sealed::generate_keypair();
+    let sk = synsema_stdlib::sealed::parse_auditor_key(&sk).unwrap();
+
+    let (code, out, err) = bin(&d, &["--auditor", &pk, "p.syn"]);
+    assert_eq!((code, out.trim()), (0, "hola"), "{}", err);
+    let receipt: serde_json::Value = serde_json::from_str(err.lines().next().unwrap()).unwrap();
+    let opened = synsema_stdlib::sealed::open_receipt(&receipt, &sk).unwrap();
+    assert!(opened["header"]["program_sha"].is_string(), "{}", opened);
+    assert!(opened["header"]["started"].is_string(), "con reloj, la hora: {}", opened);
+
+    let (code, out, err) = bin(&d, &["--auditor", &pk, "--receipt", "r.json", "p.syn"]);
+    assert_eq!((code, out.trim()), (0, "hola"), "{}", err);
+    let receipt: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(d.join("r.json")).unwrap()).unwrap();
+    assert!(synsema_stdlib::sealed::open_receipt(&receipt, &sk).is_ok());
+
+    for (args, msg) in [
+        (vec!["--receipt", "r.json", "p.syn"], "--receipt needs an auditor"),
+        (vec!["--auditor", pk.as_str(), "--test", "p.syn"], "does not go with --test"),
+        (vec!["--auditor", pk.as_str(), "--receipt", "fd:3", "p.syn"], "fd:N is not available in wasip1"),
+        (vec!["--auditor", "nope", "p.syn"], "--auditor:"),
+    ] {
+        let (code, _, err) = bin(&d, &args);
+        assert_eq!(code, 2, "{:?}: {}", args, err);
+        assert!(err.contains(msg), "{:?}: {}", args, err);
+    }
+
+    // v0.6.54 (B2 de la ronda 1): un `--receipt` que no se puede escribir es un error de uso ANTES
+    // de correr: el programa no llega a hacer sus efectos.
+    std::fs::write(d.join("e.syn"), "require file_write\nwrite_file(\"efecto.txt\", \"x\")\nprint(\"hecho\")\n").unwrap();
+    let (code, out, err) = bin(&d, &["--auditor", &pk, "--receipt", "no/existe/r.json", "e.syn"]);
+    assert_eq!(code, 2, "{}", err);
+    assert!(err.contains("--receipt: cannot write no/existe/r.json"), "{}", err);
+    assert!(out.is_empty(), "{}", out);
+    assert!(!d.join("efecto.txt").exists(), "el programa corrió");
+    // Con un destino que sí se puede escribir, corre (el control del test de arriba).
+    let (code, _, err) = bin(&d, &["--auditor", &pk, "--receipt", "r2.json", "e.syn"]);
+    assert_eq!(code, 0, "{}", err);
+    assert!(d.join("efecto.txt").exists());
+}

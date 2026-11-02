@@ -78,6 +78,11 @@ pub mod http;
 #[cfg(not(feature = "native"))]
 #[path = "http_stub.rs"]
 pub mod http;
+/// Si este build de la stdlib habla la red por sí mismo (`native`) o por el host (`http_stub`). Lo
+/// leen los tests de `synsema-wasm` que miran el hook del host: con `cargo test --workspace` las
+/// features se unifican y `native` queda prendida, así que esos tests sólo valen corridos con
+/// `-p synsema-wasm` solo.
+pub const NATIVE_TRANSPORT: bool = cfg!(feature = "native");
 pub mod httpsig;
 pub mod json;
 pub mod json_exact;

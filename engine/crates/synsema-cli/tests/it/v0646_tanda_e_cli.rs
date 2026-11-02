@@ -6,7 +6,12 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
 pub(crate) fn project(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("synsema-v0646-{}-{}", tag, std::process::id()));
+    // v0.6.54: con un número por llamada. Los `v06xx_cli` comparten esta función y repetían
+    // etiquetas (`r3-b1` en v0649 y en v0650): dos tests en paralelo escribían el mismo `p.syn` y
+    // fallaba uno distinto cada vez.
+    static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("synsema-v0646-{}-{}-{}", tag, std::process::id(), n));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     dir

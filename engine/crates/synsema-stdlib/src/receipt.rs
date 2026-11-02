@@ -90,7 +90,9 @@ pub fn rfc3339_utc(secs: i64) -> String {
 /// reloj es leer el reloj). Sin `time` → `None` (se omite, no se inventa).
 fn issued_at(caps: &Rc<RefCell<CapabilitySet>>) -> Option<String> {
     let has_time = caps.borrow_mut().check_cause(&Capability::new(CapabilityType::Time, None), "receipt").is_ok();
-    if has_time {
+    // v0.6.54 (§D de v0.6.51): sin reloj (wasm sin `set_clock`) la hora se omite, como sin `time`;
+    // antes salía `1970-01-01T00:00:00Z` sin decirlo.
+    if has_time && synsema_core::clock::has_clock() {
         Some(rfc3339_utc(synsema_core::clock::now_secs()))
     } else {
         None

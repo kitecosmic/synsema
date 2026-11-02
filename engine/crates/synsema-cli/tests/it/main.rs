@@ -28,3 +28,4 @@ mod v0650_cli;
 mod v0651_cli;
 mod v0652_cli;
 mod v0653_cli;
+mod v0654_cli;

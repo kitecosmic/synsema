@@ -152,7 +152,7 @@ impl Auditor {
         log.close();
         sealed::build_receipt(
             &log,
-            &sealed::ReceiptContext { auditor: self.key, key: &self.run_key, program_sha, config_sha, trusted: trusted_shas(), started: self.started.clone() },
+            &sealed::ReceiptContext { auditor: self.key, key: &self.run_key, program_sha, config_sha, trusted: trusted_shas(), started: Some(self.started.clone()) },
         )
     }
 

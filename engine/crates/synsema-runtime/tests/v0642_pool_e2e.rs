@@ -82,8 +82,10 @@ fn slow_resp_server(gets: std::sync::Arc<std::sync::atomic::AtomicUsize>) -> u16
         for stream in listener.incoming().flatten() {
             let gets = gets.clone();
             thread::spawn(move || {
-                let mut r = std::io::BufReader::new(stream.try_clone().unwrap());
-                let mut w = stream;
+                // Sin `try_clone()`: en Windows el clon de un socket sale heredable y un proceso que otro test
+                // lanza en ese momento se queda con la conexión (v0.6.54). `&TcpStream` lee y escribe.
+                let mut r = std::io::BufReader::new(&stream);
+                let mut w = &stream;
                 loop {
                     let mut line = String::new();
                     if r.read_line(&mut line).unwrap_or(0) == 0 {

@@ -1869,6 +1869,9 @@ const SERVE_LABELS_LOG_NOTICE: &str = "labels: request and cron output is logged
 const SERVE_LABELS_LOG_CAP: usize = 10_000;
 
 fn labels_swarm(s: Swarm) -> Swarm {
+    // v0.6.54: el error de un agente sale en la consola del serve (antes no dejaba ninguna línea;
+    // en `run` sí). Con etiquetas, no (`Swarm::report_agent_error`).
+    let s = s.reporting_agent_errors(Arc::new(|line: &str| (serve_log_sink())(line)));
     if crate::host::labels() {
         s.dropping_output().journaling_runs()
     } else {
@@ -2562,7 +2565,8 @@ fn approvals_state_dir(filename: &str) -> Option<std::path::PathBuf> {
 }
 
 /// v0.6.53 (ronda 1, B8): `tls auto` con más de una IP en `domain` es un error (ver el llamador).
-fn more_than_one_ip(domains: &[String]) -> Option<String> {
+/// v0.6.54: pública para que `synsema check` lo avise con el mismo texto.
+pub fn more_than_one_ip(domains: &[String]) -> Option<String> {
     let ips: Vec<&String> = domains
         .iter()
         .filter(|d| d.trim_start_matches('[').trim_end_matches(']').parse::<std::net::IpAddr>().is_ok())

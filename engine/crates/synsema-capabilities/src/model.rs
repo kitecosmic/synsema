@@ -648,7 +648,7 @@ impl fmt::Display for Capability {
 
 /// El host y el puerto EXPLÍCITO de un URL (minúsculas, sin credenciales): `(host, puerto)`.
 /// IPv6 va sin corchetes. `None` de puerto si el URL no lo escribe.
-fn url_host_port(url: &str) -> (String, Option<String>) {
+pub fn url_host_port(url: &str) -> (String, Option<String>) {
     let rest = url.split_once("://").map(|(_, r)| r).unwrap_or(url);
     let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
     let hostport = authority.rsplit('@').next().unwrap_or("");
