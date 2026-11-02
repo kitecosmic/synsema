@@ -6,7 +6,7 @@ Each says what changed, why, and what to write instead.
 
 Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the release date.
 
-## v0.6.54 — unreleased
+## v0.6.54 — 2026-11-02
 
 **Behavior changes (read these first).**
 - **An option that `run_program` does not know is an error, and nothing runs.** A misspelled key
