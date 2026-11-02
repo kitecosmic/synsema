@@ -173,6 +173,14 @@ print(r["isolation"])     -- {landlock_abi: 7, network: "none", max_memory_mb: n
   - **The paths are the program's, not the child's.** They resolve against the program's working
     folder; `cwd` only moves where the child starts (`{"isolate": {"file.read": "./data/**"}, "cwd": "./data"}`
     lets the child read `a.txt`).
+  - **Delegating a folder delegates every file reached by name inside it — hardlinks too.** The
+    kernel (Landlock) controls by path, and so does synsema: a hardlink that already sits in
+    `./data/` to a file elsewhere is read through `./data/` (measured: `cat data/h.txt` in the
+    isolated child, and `read_file("./data/h.txt")` in the program, both give the outside file's
+    text). A **symlink** to the same file is refused in both (`cat: data/s.txt: Permission denied`;
+    ``Capability not granted: file_read("data/s.txt") — … a link (symlink or junction) on the way
+    leads outside it …``). So do not delegate a folder where someone else could have made hardlinks
+    (a shared folder): copy what the child needs into a folder you created.
   - Where it may write, the child creates files, folders and links, but not FIFOs or sockets (FIFOs
     only in its temporary folder).
   - Other keys are errors: ``run: "isolate" takes "file.read" and "file.write" (a path or a list), not "exec"``,
