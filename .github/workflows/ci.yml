@@ -196,6 +196,13 @@ jobs:
         run: cargo check --locked --manifest-path engine/Cargo.toml -p synsema-stdlib --no-default-features --target wasm32-wasip1
       - name: Build synsema-wasm
         run: cargo build --locked --manifest-path engine/Cargo.toml -p synsema-wasm --target wasm32-wasip1 --profile wasm
+      # Los tests del hook `http` del host necesitan la stdlib SIN `native`: en el job `test`
+      # (`--workspace`) las features se unifican y se saltan. Acá corren con `-p synsema-wasm` solo,
+      # y `SYNSEMA_REQUIRE_HOST_HTTP=1` hace fallar el test si igual quedara `native`.
+      - name: Host-transport tests (synsema-wasm alone)
+        env:
+          SYNSEMA_REQUIRE_HOST_HTTP: "1"
+        run: cargo test --locked --manifest-path engine/Cargo.toml -p synsema-wasm --test private_ip_literal
       # Sin action de terceros (la allowlist del repo sólo admite oficiales + los
       # pineados): release oficial de wasmtime, verificada con el attestation de
       # GitHub (firma del build de bytecodealliance; wasmtime no publica checksums

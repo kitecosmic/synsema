@@ -38,8 +38,27 @@ fn run_src(src: &str) -> (synsema_wasm::Report, Vec<String>) {
     (report, seen)
 }
 
+/// Estos tests miran el transporte del host (`http_stub`). Con `cargo test --workspace` las features
+/// se unifican, la stdlib queda con `native` y `http_get` sale por la red real: ahí se saltan, con
+/// aviso. El job `wasm` del CI los corre con `-p synsema-wasm` solo y `SYNSEMA_REQUIRE_HOST_HTTP=1`,
+/// que convierte el salto en error para que no se salten en silencio.
+fn host_transport_or_skip() -> bool {
+    if !synsema_stdlib::NATIVE_TRANSPORT {
+        return true;
+    }
+    assert!(
+        std::env::var_os("SYNSEMA_REQUIRE_HOST_HTTP").is_none(),
+        "SYNSEMA_REQUIRE_HOST_HTTP: la stdlib quedó con `native`; correr con `-p synsema-wasm` solo"
+    );
+    eprintln!("saltado: la stdlib tiene `native` (features unificadas); correr con -p synsema-wasm solo");
+    false
+}
+
 #[test]
 fn a_private_literal_ip_needs_to_be_named() {
+    if !host_transport_or_skip() {
+        return;
+    }
     // v0.6.54 (M1 de la ronda 1): también percent-encoding, ceros largos y `\` (que para un
     // navegador termina el host: `example.com` es la contraseña).
     for url in [
@@ -77,6 +96,9 @@ fn a_private_literal_ip_needs_to_be_named() {
 /// hook. En el texto del programa la barra va escrita `\\`.
 #[test]
 fn a_url_read_differently_never_reaches_the_hook() {
+    if !host_transport_or_skip() {
+        return;
+    }
     let (r, seen) = run_src(
         "require net(\"example.org\")\nlet r be http_get(\"http://evil.example\\\\@example.org/\")\nprint(r.ok)\nprint(r.error)\n",
     );
@@ -103,6 +125,9 @@ fn a_url_read_differently_never_reaches_the_hook() {
 /// otro esquema es un error antes del hook.
 #[test]
 fn a_scheme_other_than_http_never_reaches_the_hook() {
+    if !host_transport_or_skip() {
+        return;
+    }
     for url in ["ftp://example.org/", "foo:bar://example.org/", "ws://example.org/"] {
         let (r, seen) = run_src(&format!("require net(\"example.org\")\nlet r be http_get({:?})\nprint(r.ok)\nprint(r.error)\n", url));
         assert!(seen.is_empty(), "{}: llegó al hook: {:?}", url, seen);
