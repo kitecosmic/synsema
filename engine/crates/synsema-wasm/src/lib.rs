@@ -698,6 +698,8 @@ pub fn wire_pure(interp: &mut Interpreter, caps: &Rc<RefCell<CapabilitySet>>, ct
             }
         }));
         interp.set_llm_usage_callback(Rc::new(llm_tokens_total));
+        // v0.6.54 (§D de v0.6.51): el hook sólo contesta texto; `llm_step`/`llm_stream` lo dicen.
+        interp.set_llm_text_only_host(true);
     }
 
     // render real (sobrescribe el placeholder de core) — mismo snippet que engine.rs.
@@ -1267,7 +1269,8 @@ pub fn run(source: &str, opts: &RunOptions) -> Report {
     };
     // v0.6.46 (E6): el registro de la corrida, en este hilo y mientras dure la corrida (desde el
     // wiring: los grants ambientales también son entradas).
-    let started = synsema_stdlib::receipt::rfc3339_utc(synsema_core::clock::now_secs());
+    // v0.6.54 (§D de v0.6.51): sin reloj (wasm32-unknown sin `set_clock`), `null` en vez de 1970.
+    let started = synsema_core::clock::has_clock().then(|| synsema_stdlib::receipt::rfc3339_utc(synsema_core::clock::now_secs()));
     let sealed_log = opts.auditor.map(|_| synsema_stdlib::sealed::new_run_log(opts.sealed_bytes.unwrap_or(synsema_stdlib::sealed::DEFAULT_SEALED_BYTES)));
     let _sealed = sealed_log.clone().map(synsema_core::sealed::install_thread);
     let (mut interp, caps) = prepare(&program, opts);

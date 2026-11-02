@@ -916,8 +916,9 @@ fn atomic_write_by_name(path: &str, data: &[u8]) -> std::io::Result<()> {
 
 /// Lee todo el stream pero guarda como mucho `cap` bytes; si hubo más, marca truncado.
 /// Sigue drenando tras el tope (descartando) para que el hijo no se bloquee al escribir
-/// en un pipe lleno. Usado por `run()` para capturar stdout/stderr en threads.
-fn read_capped<R: Read>(mut r: R, cap: usize) -> (Vec<u8>, bool) {
+/// en un pipe lleno. Usado por `run()` para capturar stdout/stderr en threads (y desde v0.6.54 por
+/// `run_program` para el stderr del hijo).
+pub fn read_capped<R: Read>(mut r: R, cap: usize) -> (Vec<u8>, bool) {
     let mut out = Vec::new();
     let mut truncated = false;
     let mut buf = [0u8; 8192];

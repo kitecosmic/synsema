@@ -34,7 +34,7 @@ fn wait_ready(port: u16) {
 }
 
 /// Lee la request entera (request-line + headers) y devuelve (método, path, headers).
-fn read_request(reader: &mut BufReader<TcpStream>) -> Option<(String, String, Vec<(String, String)>)> {
+fn read_request(reader: &mut BufReader<&TcpStream>) -> Option<(String, String, Vec<(String, String)>)> {
     let mut line = String::new();
     if reader.read_line(&mut line).ok()? == 0 {
         return None;
@@ -66,9 +66,11 @@ fn spawn_upstream() -> u16 {
                 Err(_) => continue,
             };
             thread::spawn(move || {
-                let mut reader = BufReader::new(s.try_clone().unwrap());
+                // Sin `try_clone()`: en Windows el clon de un socket sale heredable y un proceso que otro test
+                // lanza en ese momento se queda con la conexión (v0.6.54). `&TcpStream` lee y escribe.
+                let mut reader = BufReader::new(&s);
                 let Some((method, path, headers)) = read_request(&mut reader) else { return };
-                let mut s = s;
+                let mut s = &s;
                 if path.starts_with("/sse") {
                     // SSE chunked: evento 1, pausa de 3 s, evento 2, fin.
                     let _ = s.write_all(

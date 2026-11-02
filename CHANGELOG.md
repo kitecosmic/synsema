@@ -6,6 +6,91 @@ Each says what changed, why, and what to write instead.
 
 Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the release date.
 
+## v0.6.54 — unreleased
+
+**Behavior changes (read these first).**
+- **An option that `run_program` does not know is an error, and nothing runs.** A misspelled key
+  was ignored: with `{"ceilng": "net=*"}` the child ran without the ceiling you meant (with the one
+  it inherits from the caller). The error lists the valid options (`ceiling`, `profile`, `env`,
+  `timeout`, `cwd`, `filename`, `explain`), as `run` does since v0.6.52. Options that are not a map
+  are an error too. **Breaking** for a program that passed keys of its own.
+- **WebAssembly: a URL whose host is not plain ASCII is an error.** Write an internationalized name
+  as punycode (`xn--…`). The host maps such a name (full-width digits, `。`) before connecting, and
+  the engine cannot tell which address that is. Native builds are unchanged.
+- **`synsema run --format json` keeps the first 50 000 audit entries (at most 16 MB of them)**
+  and counts the rest in `audit_dropped`; `--audit <path>` still writes them all. Every capability check is an entry, so
+  a program that read an allowed file 100 000 times carried all of them in the report.
+
+**New.**
+- **`run_program` returns the child's stderr.** `r.stderr` is the list of lines the child wrote to
+  stderr (its `eprint`, and the notices of its engine), apart from `output` and `errors`; before,
+  they were lost. It keeps up to 10 MB and 100 000 lines; past either, `r.stderr_truncated` is
+  `true`.
+- **`run_program(code, {"explain": true})` gives the structured diagnostic.** `r.diagnostic` is the
+  map `run --explain --format json` prints: `error_type`, `message`, `line`, `column`,
+  `source_context` (the child's own code around the error), `error_category`,
+  `retry_makes_sense`, `suggestions`, `variables`… — what an agent needs to fix the code it wrote.
+  It is `nothing` when the run went well, without `explain`, when the program ended with `exit`,
+  when only an agent failed (its line is in `errors`) or when the flow checker stopped the run.
+  `errors` stays a list of text.
+- **`synsema run --format json --diagnostic`** adds that `diagnostic` to the report (it is how
+  `run_program` gets it). Each variable is cut at 1000 characters (in `--explain` too), and with
+  private data in the run (`--labels`) `variables` is `null`, like `steps`.
+- **`--explain` on a lexer or parser error gives its line and column.** It gave `line: 0` and the
+  place only inside the message; now the message is the error alone and the place is in its
+  fields, with the code around it.
+- **`synsema check` warns of `tls auto` with two IPs in `domain`**, with the text `serve` stops
+  with when it starts (a client that connects to an IP sends no server name).
+- **The wasip1 binary takes `--auditor <key>` and `--receipt <path>`** (or `SYNSEMA_AUDITOR_KEY`), like
+  `synsema run`: the sealed receipt goes to stderr before the output, or to that file. A
+  `--receipt` that cannot be written is an error before the program runs. The run key is
+  ephemeral (the receipt says `"identity": "ephemeral"`): `SYNSEMA_IDENTITY_KEY` is not read.
+
+**Fixes.**
+- **An agent that fails under `serve` leaves its line in the console** (`Agent error [id]: …`, as
+  under `run`). It left nothing. With `--labels` it still leaves nothing, like the rest of the
+  agents' output in that mode.
+- **`oidc_verify` no longer asks the identity provider again for every token with an unknown
+  `kid`.** It fetches the JWKS again at most once every 30 seconds, also when many requests arrive
+  at once (they wait for the one fetch in flight), and a fetch that failed is not repeated in that
+  time (the error says so); a token with a known key is still checked against
+  the cached keys. Before, whoever sent tokens with made-up `kid`s made the engine call the provider
+  once per token. The error of an unreachable JWKS now says why (the connection, DNS, TLS or
+  timeout error) instead of `status 0`.
+- **WebAssembly: a private IP written in the URL is checked by the engine.**
+  `http_get("http://169.254.169.254/")` reached the host's `http` hook with `require net`; now a
+  private address has to be named by the program (`require net("169.254.169.254")`), as natively.
+  Every form a browser reads as an IP counts too: `http://2852039166/`, `http://0xa9fea9fe/`,
+  percent-encoded digits (`http://%31%36%39.254.169.254/`), long leading zeros and `http:` without
+  slashes. A name that resolves to a private address is still the hook's to check: the engine does
+  not resolve names there.
+- **WebAssembly: `llm_step` and `llm_stream` with a host that offers `llm` are an error that says
+  why** (the host's hook answers whole texts: tool calling and streaming are not available in that
+  embedding). They returned `"[no llm provider]"`, which looked like an answer. Without the hook,
+  the offline placeholder is unchanged.
+- **A receipt made without a real clock leaves the time out.** In `wasm32-unknown-unknown` without
+  `set_clock`, `validFrom` and the sealed receipt's `started` said `1970-01-01T00:00:00Z`; now
+  `validFrom` is left out (as without `time`) and `started` is `null`.
+- **WebAssembly: the `net` check reads the host and port as the browser does.** With
+  `require net("example.org")`, `http_get("http://evil.example\@example.org/")` passed the
+  check and the host connected to `evil.example` (a browser ends the host at `\`). Now a URL whose
+  host or port a browser reads differently from the `net` check is an error before the `http`
+  hook. With `require net("example.org:443")`, `https://example.org:8443\@example.org:443/`
+  connected to port 8443 the same way. Native builds connect to the host they check and are
+  unchanged.
+- **WebAssembly: `http_get` and the other client builtins accept only http and https**, as native
+  builds do; other schemes (`ftp://…`) reached the `http` hook.
+- **A WebSocket opened inside `sandbox under` reconnects under that block's limits**, also when
+  the block has ended. It was judged with the capabilities in force when it reconnected.
+- **`run_program` reads the child's report with limits.** It read the child's output whole: a
+  child that printed 40 MB took over 200 MB in the caller. Now `r.output` keeps the first 100 000
+  lines (past that, `r.output_truncated` is `true`); a report larger than 32 MB is not read and
+  is an error that says so; and more than 100 000 errors make `ok` false, with an error that says
+  the rest was dropped. The audit keeps its first 50 000 entries and `r.audit_truncated` says when
+  it was cut (it does not change `ok`). The audit takes at most 16 MB of the 32, and the rest is
+  the program's output and errors: a child that prints more than 16 MB should write big results
+  to a file.
+
 ## v0.6.53 — 2026-11-01
 
 **Behavior changes (read these first).**

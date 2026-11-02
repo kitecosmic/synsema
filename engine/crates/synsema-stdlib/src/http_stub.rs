@@ -39,6 +39,38 @@ fn via_host(
     timeout_secs: u64,
 ) -> HttpResult {
     let Some(p) = hostcap::provider() else { return no_transport() };
+    // v0.6.54 (R3-3 de la ronda 3): los builtins http hablan http y https, como en nativo
+    // (`connect_and_send`); `ftp://…` o `foo:bar://…` llegaban al hook, que puede hablarlos.
+    // R4-1 de la ronda 4: adelante se quita lo que quita WHATWG (C0 y el espacio), no todo el
+    // White_Space de Unicode: con `trim_start`, `"\u{3000}http://…"` llegaba al hook y el nativo
+    // lo niega.
+    let scheme = url
+        .trim_start_matches(|c: char| c <= ' ')
+        .split(':')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if scheme != "http" && scheme != "https" {
+        return err_result(format!("unsupported scheme '{}': only http and https are supported", scheme));
+    }
+    // v0.6.54 (§D de v0.6.51): una IP literal se juzga acá, con la misma regla que en nativo (una
+    // dirección privada la tiene que nombrar cada capa); antes llegaba al hook sin chequeo, y el
+    // hook no sabe si el programa la nombró. Un nombre que resuelve a una privada sigue siendo del hook.
+    match crate::http_common::literal_ip_dest(url) {
+        Ok(Some((host, port, ip))) => {
+            if let Err(e) = crate::http_common::dest_check(&host, port, ip) {
+                return err_result(e);
+            }
+        }
+        Ok(None) => {}
+        Err(e) => return err_result(e),
+    }
+    // v0.6.54 (R2-1 de la ronda 2): el host que chequeó `net` es el que va a leer el host; si un
+    // navegador lo lee distinto (`http://evil\@good/`), es un error antes del hook. Va después
+    // del chequeo de la IP literal, para que una privada diga por qué se niega.
+    if let Err(e) = crate::http_common::host_reads_alike(url) {
+        return err_result(e);
+    }
     let empty: [(String, String); 0] = [];
     let req = HostHttpRequest {
         method,

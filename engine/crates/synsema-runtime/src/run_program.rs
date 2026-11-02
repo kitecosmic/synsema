@@ -21,7 +21,7 @@
 
 use synsema_core::types::SynMap;
 use std::cell::RefCell;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
@@ -77,6 +77,24 @@ fn absolute_paths(cap: &Capability) -> Capability {
     }
 }
 pub const DEFAULT_MAX_DEPTH: u32 = 4;
+
+/// v0.6.54 — las opciones que `run_program` entiende. Una clave mal escrita (`"ceilng"`) corría al
+/// hijo sin el techo pedido; como `run` desde v0.6.52, una desconocida es error y no corre nada.
+pub const RUN_PROGRAM_OPTIONS: &[&str] = &["ceiling", "profile", "env", "timeout", "cwd", "filename", "explain"];
+
+/// v0.6.54 — cuánto stderr del hijo se guarda (el mismo default que `max_output` de `run`); lo que
+/// pasa de ahí se drena y se descarta, y `stderr_truncated` lo dice.
+pub const MAX_CHILD_STDERR_BYTES: usize = 10 * 1024 * 1024;
+/// v0.6.54 (M2 de la ronda 1) — y cuántas líneas: cada línea es un valor de la lista, y 10 MB de
+/// saltos de línea eran 10 millones de valores (476 MB en el padre). Pasado el tope también es
+/// `stderr_truncated`.
+pub const MAX_CHILD_STDERR_LINES: usize = 100_000;
+/// v0.6.54 (N4 de la ronda 1) — el informe del hijo (su `stdout`) se lee hasta este tamaño; uno
+/// más grande no se lee y es un error.
+pub const MAX_CHILD_REPORT_BYTES: usize = 32 * 1024 * 1024;
+/// v0.6.54 (N4) — cuántas líneas de `output` se guardan (lo demás se descarta y
+/// `output_truncated` lo dice), y cuántas entradas de `errors` y de `audit`.
+pub const MAX_CHILD_OUTPUT_LINES: usize = 100_000;
 pub const DEFAULT_TIMEOUT_SECS: f64 = 30.0;
 
 /// Ronda 3 (M4) — variables con las que el motor elige rutas del host.
@@ -165,6 +183,7 @@ pub(crate) fn register_run_program_builtin(
                 None => return Err(rt("run_program: missing source")),
             };
             let opts = args.get(1).cloned().unwrap_or(SynValue::Nothing);
+            synsema_capabilities::secure::check_option_keys("run_program", Some(&opts), RUN_PROGRAM_OPTIONS)?;
 
             // 2) Profundidad (protocolo por env; el knob es del host).
             let (depth, max_depth) = depth_limits();
@@ -367,9 +386,16 @@ pub(crate) fn register_run_program_builtin(
                 )));
             }
 
+            // v0.6.54: `explain: true` — el informe del hijo trae el diagnóstico de `--explain`.
+            let explain = match map_get(&opts, "explain") {
+                None | Some(SynValue::Nothing) => false,
+                Some(SynValue::Bool(b)) => b,
+                Some(_) => return Err(rt("run_program: explain must be true or false")),
+            };
+
             // 6) El hijo: el mismo binario, en modo motor, fuente por stdin, informe JSON.
             let exe = std::env::current_exe().map_err(|e| rt(format!("run_program: cannot resolve the engine binary: {}", e)))?;
-            let args = [
+            let mut args = vec![
                 "--engine",
                 "run",
                 "-",
@@ -382,6 +408,9 @@ pub(crate) fn register_run_program_builtin(
                 "--filename",
                 filename.as_str(),
             ];
+            if explain {
+                args.push("--diagnostic");
+            }
             // Ronda 2 (N2): Windows corta la línea de comandos ENTERA (el ejecutable, cada argumento
             // con sus comillas y escapes) en 32 767 caracteres. Se mide antes, en todas las
             // plataformas, y no sólo el techo: un `filename` largo también la pasaba.
@@ -451,8 +480,14 @@ pub(crate) fn register_run_program_builtin(
             }
             let out = tree.child.stdout.take();
             let err = tree.child.stderr.take();
-            let out_h = std::thread::spawn(move || read_all(out));
-            let err_h = std::thread::spawn(move || read_all(err));
+            let out_h = std::thread::spawn(move || match out {
+                Some(o) => synsema_capabilities::secure::read_capped(o, MAX_CHILD_REPORT_BYTES),
+                None => (Vec::new(), false),
+            });
+            let err_h = std::thread::spawn(move || match err {
+                Some(e) => synsema_capabilities::secure::read_capped(e, MAX_CHILD_STDERR_BYTES),
+                None => (Vec::new(), false),
+            });
 
             let deadline = Instant::now() + Duration::from_secs_f64(timeout_secs);
             let mut timed_out = false;
@@ -476,23 +511,47 @@ pub(crate) fn register_run_program_builtin(
                     Err(_) => break None,
                 }
             };
-            let stdout = out_h.join().unwrap_or_default();
-            let stderr = err_h.join().unwrap_or_default();
+            let (stdout_bytes, report_too_big) = out_h.join().unwrap_or_default();
+            let stdout = String::from_utf8_lossy(&stdout_bytes).into_owned();
+            drop(stdout_bytes);
+            let (stderr_bytes, mut stderr_truncated) = err_h.join().unwrap_or_default();
+            let stderr = String::from_utf8_lossy(&stderr_bytes).into_owned();
+            drop(stderr_bytes);
             let exit_code = status.and_then(|s| s.code());
+            // v0.6.54: el stderr del hijo (su `eprint` y los avisos de su motor), en líneas, hasta
+            // `MAX_CHILD_STDERR_LINES`.
+            let mut lines = stderr.lines();
+            let stderr_lines =
+                syn_list(lines.by_ref().take(MAX_CHILD_STDERR_LINES).map(|l| syn_text(l.to_string())).collect());
+            if lines.next().is_some() {
+                stderr_truncated = true;
+            }
 
             // 7) El informe del hijo → valor.
             let mut r: SynMap = SynMap::new();
-            let parsed: Option<serde_json::Value> = if timed_out {
+            let parsed: Option<(serde_json::Value, ReportCut)> = if timed_out || report_too_big {
                 None
             } else {
-                serde_json::from_str::<serde_json::Value>(stdout.trim()).ok().filter(|v| v.is_object())
+                parse_child_report(stdout.trim())
             };
+            drop(stdout);
+            let mut output_truncated = false;
+            let mut audit_truncated = false;
             match parsed {
-                Some(v) => {
-                    let ok = v.get("ok").and_then(|x| x.as_bool()).unwrap_or(false);
+                Some((v, cut)) => {
+                    output_truncated = cut.output;
+                    // R2-3: el hijo recorta su propio audit (`audit_dropped`); el padre, por si acaso,
+                    // también (`cut.audit`). Ninguno de los dos cambia `ok`.
+                    audit_truncated =
+                        cut.audit || v.get("audit_dropped").and_then(|x| x.as_u64()).unwrap_or(0) > 0;
+                    let (ok, errors) = mark_cut(
+                        v.get("ok").and_then(|x| x.as_bool()).unwrap_or(false),
+                        v.get("errors").cloned().unwrap_or(serde_json::Value::Array(vec![])),
+                        &cut,
+                    );
                     r.insert("ok", syn_bool(ok));
                     r.insert("output", json_to_syn(v.get("output").unwrap_or(&serde_json::Value::Array(vec![]))));
-                    r.insert("errors", json_to_syn(v.get("errors").unwrap_or(&serde_json::Value::Array(vec![]))));
+                    r.insert("errors", json_to_syn(&errors));
                     r.insert("audit", json_to_syn(v.get("audit").unwrap_or(&serde_json::Value::Array(vec![]))));
                     r.insert(
                         "exit",
@@ -508,10 +567,23 @@ pub(crate) fn register_run_program_builtin(
                     );
                     // v0.6.20 — pasos del intérprete hijo (contador determinista; ver `steps()`).
                     r.insert("steps", syn_int(v.get("steps").and_then(|x| x.as_i64()).unwrap_or(0)));
+                    r.insert(
+                        "diagnostic",
+                        match v.get("diagnostic") {
+                            Some(d) if explain && d.is_object() => json_to_syn(d),
+                            _ => SynValue::Nothing,
+                        },
+                    );
                 }
                 None => {
                     let msg = if timed_out {
                         format!("run_program: timed out after {}s", timeout_secs)
+                    } else if report_too_big {
+                        format!(
+                            "run_program: the child's report is larger than {} MB and was not read — \
+                             print less (write big results to a file)",
+                            MAX_CHILD_REPORT_BYTES / (1024 * 1024)
+                        )
                     } else {
                         let tail: String = stderr.chars().rev().take(2000).collect::<Vec<_>>().into_iter().rev().collect();
                         format!(
@@ -534,17 +606,151 @@ pub(crate) fn register_run_program_builtin(
                     r.insert("timed_out", syn_bool(timed_out));
                     r.insert("llm_tokens", syn_int(0));
                     r.insert("steps", syn_int(0));
+                    r.insert("diagnostic", SynValue::Nothing);
                 }
             }
+            r.insert("output_truncated", syn_bool(output_truncated));
+            r.insert("audit_truncated", syn_bool(audit_truncated));
+            r.insert("stderr", stderr_lines);
+            r.insert("stderr_truncated", syn_bool(stderr_truncated));
             Ok(syn_map(r))
         }),
     );
 }
 
-fn read_all<R: Read>(r: Option<R>) -> String {
-    let mut buf = Vec::new();
-    if let Some(mut r) = r {
-        let _ = r.read_to_end(&mut buf);
+/// v0.6.54 (N4) — qué listas del informe se recortaron.
+#[derive(Default, Debug, PartialEq)]
+struct ReportCut {
+    output: bool,
+    errors: bool,
+    audit: bool,
+}
+
+/// v0.6.54 (N4) — un informe con `errors` recortados no está completo: no puede decir `ok`, y un
+/// error más dice qué se descartó. Recortar `output` o `audit` no cambia `ok` (R2-3 de la ronda 2:
+/// el audit crece con cada chequeo de permiso, algo que el programa no elige; su recorte lo dice
+/// `audit_truncated`).
+fn mark_cut(ok: bool, mut errors: serde_json::Value, cut: &ReportCut) -> (bool, serde_json::Value) {
+    if !cut.errors {
+        return (ok, errors);
     }
-    String::from_utf8_lossy(&buf).into_owned()
+    if let serde_json::Value::Array(es) = &mut errors {
+        es.push(serde_json::Value::String(format!(
+            "run_program: the child's report had more than {} errors; the rest was dropped",
+            MAX_CHILD_OUTPUT_LINES
+        )));
+    }
+    (false, errors)
+}
+
+/// v0.6.54 (N4 de la ronda 1) — lee el informe del hijo sin armar más de
+/// [`MAX_CHILD_OUTPUT_LINES`] elementos de `output`, `errors` y `audit`: los que pasan se saltean
+/// sin guardarlos (cada uno sería un valor en el padre). `None` si no es un objeto JSON.
+fn parse_child_report(s: &str) -> Option<(serde_json::Value, ReportCut)> {
+    parse_report_capped(s, MAX_CHILD_OUTPUT_LINES)
+}
+
+fn parse_report_capped(s: &str, cap: usize) -> Option<(serde_json::Value, ReportCut)> {
+    use serde::de::{DeserializeSeed, Deserializer, IgnoredAny, MapAccess, SeqAccess, Visitor};
+
+    struct Capped(usize);
+    impl<'de> DeserializeSeed<'de> for Capped {
+        type Value = (Vec<serde_json::Value>, bool);
+        fn deserialize<D: Deserializer<'de>>(self, d: D) -> Result<Self::Value, D::Error> {
+            d.deserialize_seq(self)
+        }
+    }
+    impl<'de> Visitor<'de> for Capped {
+        type Value = (Vec<serde_json::Value>, bool);
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("a list")
+        }
+        fn visit_seq<A: SeqAccess<'de>>(self, mut a: A) -> Result<Self::Value, A::Error> {
+            let mut out = Vec::new();
+            while out.len() < self.0 {
+                match a.next_element::<serde_json::Value>()? {
+                    Some(v) => out.push(v),
+                    None => return Ok((out, false)),
+                }
+            }
+            let mut cut = false;
+            while a.next_element::<IgnoredAny>()?.is_some() {
+                cut = true;
+            }
+            Ok((out, cut))
+        }
+    }
+    struct Report(usize);
+    impl<'de> Visitor<'de> for Report {
+        type Value = (serde_json::Map<String, serde_json::Value>, ReportCut);
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("the child's report")
+        }
+        fn visit_map<A: MapAccess<'de>>(self, mut a: A) -> Result<Self::Value, A::Error> {
+            let mut m = serde_json::Map::new();
+            let mut cut = ReportCut::default();
+            while let Some(k) = a.next_key::<String>()? {
+                let flag = match k.as_str() {
+                    "output" => Some(&mut cut.output),
+                    "errors" => Some(&mut cut.errors),
+                    "audit" => Some(&mut cut.audit),
+                    _ => None,
+                };
+                let v = match flag {
+                    Some(flag) => {
+                        let (v, c) = a.next_value_seed(Capped(self.0))?;
+                        *flag |= c;
+                        serde_json::Value::Array(v)
+                    }
+                    None => a.next_value::<serde_json::Value>()?,
+                };
+                m.insert(k, v);
+            }
+            Ok((m, cut))
+        }
+    }
+    let mut de = serde_json::Deserializer::from_str(s);
+    let (m, cut) = de.deserialize_map(Report(cap)).ok()?;
+    de.end().ok()?;
+    Some((serde_json::Value::Object(m), cut))
+}
+
+#[cfg(test)]
+mod v0654_report_cap {
+    use super::{mark_cut, parse_report_capped, ReportCut};
+
+    #[test]
+    fn a_cut_report_is_not_ok() {
+        let none = ReportCut::default();
+        assert_eq!(mark_cut(true, serde_json::json!([]), &none), (true, serde_json::json!([])));
+        let out = ReportCut { output: true, ..Default::default() };
+        assert_eq!(mark_cut(true, serde_json::json!([]), &out), (true, serde_json::json!([])));
+        // R2-3 de la ronda 2: un audit recortado no cambia `ok` ni suma errores.
+        let audit = ReportCut { audit: true, ..Default::default() };
+        assert_eq!(mark_cut(true, serde_json::json!(["e1"]), &audit), (true, serde_json::json!(["e1"])));
+        let (ok, errors) = mark_cut(true, serde_json::json!(["e1"]), &ReportCut { errors: true, ..Default::default() });
+        assert!(!ok);
+        assert_eq!(errors[0], "e1");
+        let m = errors[1].as_str().unwrap();
+        assert!(m.contains("more than 100000 errors") && m.contains("dropped"), "{}", m);
+    }
+
+    #[test]
+    fn the_report_keeps_at_most_cap_lines() {
+        let (v, cut) = parse_report_capped(r#"{"ok":true,"output":["a","b","c"],"errors":[],"audit":[1,2]}"#, 2).unwrap();
+        assert_eq!(v["output"], serde_json::json!(["a", "b"]));
+        assert_eq!(v["ok"], serde_json::json!(true));
+        assert_eq!(cut, ReportCut { output: true, errors: false, audit: false });
+        let (_, cut) = parse_report_capped(r#"{"output":["a","b"],"errors":["x","y","z"],"audit":[1,2,3]}"#, 2).unwrap();
+        assert_eq!(cut, ReportCut { output: false, errors: true, audit: true });
+        // Justo en el tope: entero, sin recorte.
+        let (v, cut) = parse_report_capped(r#"{"output":["a","b"],"diagnostic":{"line":3}}"#, 2).unwrap();
+        assert_eq!(v["output"], serde_json::json!(["a", "b"]));
+        assert_eq!(v["diagnostic"]["line"], serde_json::json!(3));
+        assert_eq!(cut, ReportCut::default());
+        // Lo que no es un objeto JSON no es un informe.
+        for bad in ["", "[1]", "{\"ok\":true} basura", "{\"output\":3}"] {
+            assert!(parse_report_capped(bad, 2).is_none(), "{}", bad);
+        }
+    }
 }

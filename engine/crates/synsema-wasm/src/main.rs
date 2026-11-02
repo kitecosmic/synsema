@@ -47,7 +47,7 @@ fn main() {
     // `webauth::begin_call_entropy`): `random_bytes(n)` con un `n` privado ya no le dice `n`.
     synsema_stdlib::webauth::begin_call_entropy();
     let args: Vec<String> = std::env::args().collect();
-    const USAGE: &str = "usage: synsema-wasm [--test] [--labels] [--sandbox | --cap-set <list>] [--trusted name=path]... [--trusted-cap-set <list>] [--trusted-templates name=dir]... <file.syn | ->";
+    const USAGE: &str = "usage: synsema-wasm [--test] [--labels] [--sandbox | --cap-set <list>] [--trusted name=path]... [--trusted-cap-set <list>] [--trusted-templates name=dir]... [--auditor <X25519 public key> [--receipt <path>]] <file.syn | ->";
     let mut test_mode = false;
     let mut sandbox = false;
     let mut labels = false;
@@ -58,6 +58,9 @@ fn main() {
     let mut trusted_cap_set: Option<String> = None;
     // v0.6.50 (ronda 1, N6): los templates de cada tool, como `synsema run --trusted-templates`.
     let mut trusted_template_dirs: Vec<(String, String)> = Vec::new();
+    // v0.6.54 (§D de v0.6.51): el recibo sellado, como `synsema run --auditor`/`--receipt`.
+    let mut auditor_flag: Option<String> = None;
+    let mut receipt_flag: Option<String> = None;
     let mut path: Option<String> = None;
     let mut i = 1;
     while i < args.len() {
@@ -112,6 +115,22 @@ fn main() {
             p if p.starts_with("--cap-set=") => {
                 cap_set = Some(p.trim_start_matches("--cap-set=").to_string());
             }
+            flag @ ("--auditor" | "--receipt") => match args.get(i + 1) {
+                Some(v) if !v.starts_with("--") => {
+                    if flag == "--auditor" {
+                        auditor_flag = Some(v.clone());
+                    } else {
+                        receipt_flag = Some(v.clone());
+                    }
+                    i += 1;
+                }
+                _ => {
+                    eprintln!("synsema-wasm: {} requires a value\n{}", flag, USAGE);
+                    std::process::exit(2);
+                }
+            },
+            p if p.starts_with("--auditor=") => auditor_flag = Some(p["--auditor=".len()..].to_string()),
+            p if p.starts_with("--receipt=") => receipt_flag = Some(p["--receipt=".len()..].to_string()),
             "--version" | "-V" => {
                 println!("synsema-wasm {}", synsema_wasm::version());
                 return;
@@ -127,6 +146,9 @@ fn main() {
                      --trusted n=path   a trusted module the program imports with `use \"trusted:n\"`\n\
                      \x20                  (repeatable); its tasks run with their own `require`\n\
                      --trusted-cap-set <list>  the ceiling of the trusted modules\n\
+                     --auditor <key>    seal a receipt of the run for that auditor (X25519 public key,\n\
+                     \x20                  or SYNSEMA_AUDITOR_KEY); it goes to stderr before the output\n\
+                     --receipt <path>   write the receipt to that file instead\n\
                      --version          print the artifact version\n\
                      -                  read the program from stdin",
                     USAGE
@@ -152,6 +174,13 @@ fn main() {
     let Some(path) = path else {
         eprintln!("synsema-wasm: missing program\n{}", USAGE);
         std::process::exit(2);
+    };
+    let (auditor, sealed_bytes) = match auditor_from(auditor_flag, receipt_flag.as_deref(), test_mode) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("synsema-wasm: {}", e);
+            std::process::exit(2);
+        }
     };
     // Techo del host: mismo parser que `synsema run` (synsema-capabilities::build_ceiling).
     let ceiling = match build_ceiling(sandbox, cap_set.as_deref()) {
@@ -236,7 +265,7 @@ fn main() {
     // etiquetas va en el error (también en `--test`), como en `synsema run`; con techo, el programa
     // ve sólo el texto fijo.
     let owner = ceiling.is_none() && trusted.is_empty();
-    let opts = RunOptions { filename, env: None, ceiling, no_fs: false, labels, result: None, input: None, sources: Vec::new(), max_steps: None, max_memory_mb: None, trusted, trusted_templates, trusted_ceiling, auditor: None, sealed_bytes: None, labels_detail_to_program: owner };
+    let opts = RunOptions { filename, env: None, ceiling, no_fs: false, labels, result: None, input: None, sources: Vec::new(), max_steps: None, max_memory_mb: None, trusted, trusted_templates, trusted_ceiling, auditor, sealed_bytes, labels_detail_to_program: owner };
 
     if test_mode {
         let r = with_big_stack(move || synsema_wasm::test(&source, &opts));
@@ -247,6 +276,22 @@ fn main() {
         std::process::exit(if r.failed > 0 { 1 } else { 0 });
     } else {
         let r = with_big_stack(move || synsema_wasm::run(&source, &opts));
+        // El recibo, antes que la salida (como `synsema run --auditor`). Sin recibo no hay salida.
+        if let Some(receipt) = &r.receipt {
+            let line = format!("{}\n", receipt);
+            let written = match &receipt_flag {
+                Some(dest) => std::fs::write(dest, line.as_bytes()).map_err(|e| format!("--receipt: cannot write {}: {}", dest, e)),
+                None => {
+                    use std::io::Write;
+                    let mut e = std::io::stderr();
+                    e.write_all(line.as_bytes()).and_then(|_| e.flush()).map_err(|e| e.to_string())
+                }
+            };
+            if let Err(e) = written {
+                eprintln!("synsema-wasm: the sealed receipt could not be delivered: {}", e);
+                std::process::exit(1);
+            }
+        }
         for line in &r.output {
             println!("{}", line);
         }
@@ -255,6 +300,38 @@ fn main() {
         }
         std::process::exit(r.exit_code.unwrap_or(if r.ok { 0 } else { 1 }));
     }
+}
+
+/// v0.6.54 — `--auditor` (o `SYNSEMA_AUDITOR_KEY`) y `--receipt`, como en `synsema run`: un
+/// `--receipt` sin auditor es un error. `fd:N` no existe acá (WASI no hereda descriptores).
+fn auditor_from(flag: Option<String>, dest: Option<&str>, test_mode: bool) -> Result<(Option<[u8; 32]>, Option<usize>), String> {
+    let origin = if flag.is_some() { "--auditor" } else { "SYNSEMA_AUDITOR_KEY" };
+    let knob = |k: &str| std::env::var(k).ok().filter(|v| !v.trim().is_empty());
+    let Some(raw) = flag.or_else(|| knob("SYNSEMA_AUDITOR_KEY")) else {
+        if dest.is_some() {
+            return Err("--receipt needs an auditor: pass --auditor <X25519 public key> or set SYNSEMA_AUDITOR_KEY".to_string());
+        }
+        return Ok((None, None));
+    };
+    if test_mode {
+        return Err("--auditor seals a run; it does not go with --test".to_string());
+    }
+    if dest.is_some_and(|d| d.starts_with("fd:")) {
+        return Err("--receipt fd:N is not available in wasip1; use --receipt <path>".to_string());
+    }
+    let key = synsema_stdlib::sealed::parse_auditor_key(&raw).map_err(|e| format!("{}: {}", origin, e))?;
+    let size = synsema_stdlib::sealed::sealed_bytes_from(knob("SYNSEMA_RECEIPT_SEALED_BYTES").as_deref())?;
+    // v0.6.54 (B2 de la ronda 1): el destino se prueba ANTES de correr, como `synsema run` (E6-B1):
+    // si no, el error aparecía al final, con los efectos del programa ya hechos y sin recibo. Se
+    // abre para agregar (se crea si falta, sin vaciarla); al final se reemplaza con el recibo.
+    if let Some(d) = dest {
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(d)
+            .map_err(|e| format!("--receipt: cannot write {}: {}", d, e))?;
+    }
+    Ok((Some(key), Some(size)))
 }
 
 /// v0.6.50 (E-a): los avisos de un techo, como en `synsema run`.

@@ -971,6 +971,196 @@ pub fn dest_check(host: &str, port: u16, ip: std::net::IpAddr) -> Result<(), Str
     })
 }
 
+/// v0.6.54 (§D de v0.6.51) — el destino de un URL cuyo host ES una dirección IP, para chequearlo
+/// donde el motor no resuelve nombres (el transporte del host en wasm): `(host, puerto, ip)`. El
+/// host se lee como lo lee un navegador (WHATWG URL), porque el que conecta es el host:
+/// `2852039166`, `0xa9.0xfe.0xa9.0xfe`, `%31%36%39.254.169.254`, `http:169.254.169.254` (sin
+/// barras) y `http://169.254.169.254\@x/` también son `169.254.169.254`. Un nombre de dominio da
+/// `Ok(None)` (resolverlo es trabajo del hook). Un host que no es ASCII (dígitos de ancho completo,
+/// `。`, un nombre internacional sin punycode) es un error: el mapeo de IDNA que haría el host no se
+/// repite acá, así que no se puede saber a qué conecta.
+pub fn literal_ip_dest(url: &str) -> Result<Option<(String, u16, std::net::IpAddr)>, String> {
+    let Some((host, port)) = whatwg_host_port(url) else { return Ok(None) };
+    let host = percent_decode_host(&host).ok_or_else(|| non_ascii_host_error(&host))?;
+    let ip = match host.strip_prefix('[').and_then(|h| h.strip_suffix(']')) {
+        Some(v6) => match v6.parse::<std::net::Ipv6Addr>() {
+            Ok(v6) => std::net::IpAddr::V6(v6),
+            Err(_) => return Ok(None),
+        },
+        None => match whatwg_ipv4(&host) {
+            Some(v4) => std::net::IpAddr::V4(v4),
+            None => return Ok(None),
+        },
+    };
+    let host = host.trim_start_matches('[').trim_end_matches(']').to_string();
+    let port = match port.and_then(|p| p.parse::<u16>().ok()) {
+        Some(p) => p,
+        None => {
+            let scheme = url.trim_start_matches(|c: char| c <= ' ').split(':').next().unwrap_or("").to_ascii_lowercase();
+            if scheme == "https" || scheme == "wss" { 443 } else { 80 }
+        }
+    };
+    Ok(Some((host, port, ip)))
+}
+
+/// v0.6.54 (R2-4 de la ronda 2): el error de un host que no es ASCII nombra sólo el host, nunca el
+/// URL (puede llevar `user:pass@` o una clave en la query).
+fn non_ascii_host_error(host: &str) -> String {
+    format!(
+        "the host {:?} is not plain ASCII; write an internationalized name as punycode (xn--…) \
+         — in WebAssembly the host connects, and the engine cannot tell which address it is",
+        host
+    )
+}
+
+/// v0.6.54 (R2-1 de la ronda 2): ¿el host que lee un navegador (WHATWG) es el que chequeó `net`?
+/// En wasm conecta el host, y un URL que se lee distinto (`http://evil\@good/`: el navegador termina
+/// el host en la `\`) pasaba el gate de `good` y conectaba a `evil`.
+pub fn host_reads_alike(url: &str) -> Result<(), String> {
+    let gated = synsema_capabilities::secure::url_hostname(url).unwrap_or_default();
+    // v0.6.54 (R3-1 de la ronda 3): también el puerto. El gate pide el puerto escrito (lo lee
+    // `net_request_scope` con `url_host_port`), y `https://h:8443\@h:443/` pasaba un permiso de
+    // `h:443` y conectaba al 8443. Los dos lados filtran el puerto igual (no vacío, sólo dígitos).
+    let (_, gated_port) = synsema_capabilities::model::url_host_port(url);
+    let (seen, seen_port) = match whatwg_host_port(url) {
+        Some((h, p)) => (
+            percent_decode_host(&h)
+                .ok_or_else(|| non_ascii_host_error(&h))?
+                .trim_start_matches('[')
+                .trim_end_matches(']')
+                .to_string(),
+            p,
+        ),
+        // Sin host: ya lo frenó `require_net` (y lo que no es http(s) no llega acá: `via_host`).
+        None => return Ok(()),
+    };
+    if seen == gated && seen_port == gated_port {
+        return Ok(());
+    }
+    // Con comillas a mano y no `{:?}`, que duplicaba la `\` del host.
+    let show = |h: &str, p: &Option<String>| match p {
+        Some(p) if h.contains(':') => format!("\"[{}]:{}\"", h, p),
+        Some(p) => format!("\"{}:{}\"", h, p),
+        None => format!("\"{}\"", h),
+    };
+    Err(format!(
+        "a browser reads the host of this URL as {}, but `net` checked {}; write the host plainly \
+         (no `\\`, tabs or percent-escapes in it)",
+        show(&seen, &seen_port),
+        show(&gated, &gated_port)
+    ))
+}
+
+/// El host (con corchetes si es IPv6, sin decodificar) y el puerto explícito de un URL, partidos
+/// como WHATWG: se quitan los controles y espacios de los bordes y los tabs y saltos de línea de
+/// adentro; en un esquema especial (`http`, `ws`…) se saltean todas las `/` y `\` después de
+/// `scheme:`, y `\` también termina la autoridad; el host va después de la última `@`. `None` si
+/// el URL no tiene host.
+fn whatwg_host_port(url: &str) -> Option<(String, Option<String>)> {
+    let url: String = url
+        .trim_matches(|c: char| c <= ' ')
+        .chars()
+        .filter(|c| !matches!(c, '\t' | '\n' | '\r'))
+        .collect();
+    let (scheme, rest) = url.split_once(':')?;
+    let scheme = scheme.to_ascii_lowercase();
+    let special = matches!(scheme.as_str(), "http" | "https" | "ws" | "wss" | "ftp" | "file");
+    let after = if special {
+        rest.trim_start_matches(['/', '\\'])
+    } else {
+        rest.strip_prefix("//")?
+    };
+    let end = after
+        .find(|c: char| c == '/' || c == '?' || c == '#' || (special && c == '\\'))
+        .unwrap_or(after.len());
+    let authority = &after[..end];
+    let hostport = authority.rsplit('@').next().unwrap_or("");
+    let (host, port) = if hostport.starts_with('[') {
+        match hostport.find(']') {
+            Some(i) => (&hostport[..=i], hostport[i + 1..].strip_prefix(':')),
+            None => (hostport, None),
+        }
+    } else {
+        match hostport.rsplit_once(':') {
+            Some((h, p)) => (h, Some(p)),
+            None => (hostport, None),
+        }
+    };
+    let port = port.filter(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit())).map(str::to_string);
+    Some((host.to_string(), port))
+}
+
+/// El host con el percent-decoding de WHATWG, en minúsculas. `None` si el resultado no es ASCII.
+fn percent_decode_host(host: &str) -> Option<String> {
+    let b = host.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        let hex = |c: u8| (c as char).to_digit(16);
+        if b[i] == b'%' && i + 2 < b.len() {
+            if let (Some(h), Some(l)) = (hex(b[i + 1]), hex(b[i + 2])) {
+                out.push((h * 16 + l) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    if !out.is_ascii() {
+        return None;
+    }
+    Some(String::from_utf8(out).ok()?.to_ascii_lowercase())
+}
+
+/// El parser de IPv4 de WHATWG URL: de 1 a 4 partes separadas por `.` (una final vacía vale), cada
+/// una decimal, hexadecimal (`0x…`) u octal (`0…`); la última llena los bytes que faltan. `None` si
+/// el host no es una IPv4 en esa forma.
+fn whatwg_ipv4(host: &str) -> Option<std::net::Ipv4Addr> {
+    let mut parts: Vec<&str> = host.split('.').collect();
+    if parts.len() > 1 && parts.last() == Some(&"") {
+        parts.pop();
+    }
+    if parts.is_empty() || parts.len() > 4 {
+        return None;
+    }
+    let num = |p: &str| -> Option<u64> {
+        if p.is_empty() {
+            return None;
+        }
+        let (digits, radix) = if let Some(h) = p.strip_prefix("0x").or_else(|| p.strip_prefix("0X")) {
+            (h, 16)
+        } else if p.len() > 1 && p.starts_with('0') {
+            (&p[1..], 8)
+        } else {
+            (p, 10)
+        };
+        if digits.is_empty() {
+            return Some(0);
+        }
+        // Los ceros a la izquierda no cuentan (WHATWG lee números de cualquier largo); una parte de
+        // más de 20 dígitos significativos ya no entra: corta antes del desborde.
+        let digits = digits.trim_start_matches('0');
+        if digits.is_empty() {
+            return Some(0);
+        }
+        if digits.len() > 20 {
+            return None;
+        }
+        u64::from_str_radix(digits, radix).ok()
+    };
+    let nums: Vec<u64> = parts.iter().map(|p| num(p)).collect::<Option<_>>()?;
+    let (last, init) = nums.split_last()?;
+    if init.iter().any(|n| *n > 255) || *last >= 256u64.pow(5 - nums.len() as u32) {
+        return None;
+    }
+    let mut v = *last;
+    for (i, n) in init.iter().enumerate() {
+        v += n * 256u64.pow(3 - i as u32);
+    }
+    Some(std::net::Ipv4Addr::from(v as u32))
+}
+
 /// v0.6.53: por qué no conectó [`connect_each`].
 #[cfg(feature = "native")]
 #[derive(Debug)]
@@ -982,6 +1172,7 @@ pub(crate) enum ConnectFail {
 }
 
 /// v0.6.53 (RFC 8305): cuánto se espera a una dirección antes de probar también la siguiente.
+#[cfg_attr(not(feature = "native"), allow(dead_code))]
 pub(crate) const NEXT_ADDRESS_DELAY: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// v0.6.53: conecta a una de `addrs`, como Happy Eyeballs (RFC 8305): en el orden que dio el
@@ -1770,5 +1961,111 @@ mod v0653_connect_tests {
         // Todas rechazan: el error de la última.
         drop(l);
         assert!(matches!(connect_each(&[v6, v4], &ok, Duration::from_secs(5)), Err(ConnectFail::Io(_, a)) if a == v4));
+    }
+}
+
+#[cfg(test)]
+mod v0654_literal_ip {
+    use super::{host_reads_alike, literal_ip_dest};
+
+    /// R2-1 de la ronda 2: en wasm, el host que chequea `net` tiene que ser el que lee el navegador.
+    #[test]
+    fn the_net_check_reads_the_host_a_browser_reads() {
+        for u in [
+            "http://evil.example\\@example.org/",
+            "https://evil.example\\x@example.org/p",
+            "http://evil.example\\.example.org/",
+            "http://ex%61mple.org/",
+            "http://exa\tmple.org/",
+            // R3-1 de la ronda 3: el puerto también.
+            "https://example.org:8443\\@example.org:443/",
+            "https://[2606:4700:4700::1111]:22\\@[2606:4700:4700::1111]:443/",
+        ] {
+            let e = host_reads_alike(u).unwrap_err();
+            assert!(e.contains("a browser reads the host"), "{}: {}", u, e);
+        }
+        for u in [
+            "http://example.org/",
+            "HTTP://Example.ORG:8080/a\\b",
+            "http://u:p@example.org/",
+            "http://[::1]:80/",
+            " http://example.org/",
+            "https://api.example.org/v1?q=a\\b#x",
+            "http://example.org:0080/",
+            "http://example.org:/",
+            "https://example.org:443/",
+            "https://[2606:4700:4700::1111]:443/",
+        ] {
+            assert_eq!(host_reads_alike(u), Ok(()), "{}", u);
+        }
+        // El error muestra host y puerto, sin duplicar la `\`.
+        let e = host_reads_alike("https://example.org:8443\\@example.org:443/").unwrap_err();
+        assert!(e.contains("as \"example.org:8443\", but `net` checked \"example.org:443\""), "{}", e);
+    }
+
+    #[test]
+    fn literal_ips_are_read_like_a_browser() {
+        let ip = |u: &str| literal_ip_dest(u).unwrap().map(|(_, port, ip)| (ip.to_string(), port));
+        let meta = Some(("169.254.169.254".to_string(), 80));
+        for u in [
+            "http://169.254.169.254/latest",
+            "http://2852039166/",
+            "http://0xa9.0xfe.0xa9.0xfe/",
+            "http://0251.0376.0251.0376/",
+            "http://169.254.43518/",
+            "http://169.16689662/",
+            "http://169.254.169.254./",
+            "http://user:pw@169.254.169.254/",
+            // v0.6.54 (M1 de la ronda 1): lo que el navegador hace antes de leer los números.
+            "http://%31%36%39.254.169.254/",
+            "http://169.254.169.254%2e/",
+            "http://%30x%61%39%66%65%61%39%66%65/",
+            "http://0x000000000000000000000000000000a9.254.169.254/",
+            "http://00000000000000000000000000000251.0376.0251.0376/",
+            "HTTP://169.254.169.254/",
+            "http:169.254.169.254/",
+            "http:/169.254.169.254/",
+            "http:\\169.254.169.254/",
+            "http://169.254.169.254\\@example.com/",
+            "http://169.254.169.254:80@example.com@169.254.169.254/",
+            " http://169.254.169.254/ ",
+            "http://169.25\t4.169.254/",
+            "http://169.254.\n169.254/",
+        ] {
+            assert_eq!(ip(u), meta, "{}", u);
+        }
+        assert_eq!(ip("http://0000000000000000000000000000177.0.0.1/"), Some(("127.0.0.1".to_string(), 80)));
+        // Un host que no es ASCII es un error (el mapeo de IDNA del host no se repite acá).
+        for u in [
+            "http://\u{ff11}\u{ff16}\u{ff19}\u{ff0e}254.169.254/",
+            "http://169\u{3002}254\u{3002}169\u{3002}254/",
+            "http://\u{1d7cf}\u{1d7d4}\u{1d7d7}.254.169.254/",
+            "http://%EF%BC%91%EF%BC%96%EF%BC%99.254.169.254/",
+            "https://b\u{fc}cher.example/",
+        ] {
+            let e = literal_ip_dest(u).unwrap_err();
+            assert!(e.contains("not plain ASCII") && e.contains("punycode"), "{}: {}", u, e);
+        }
+        // R2-4 de la ronda 2: el error nombra el host, no el URL (credenciales, query).
+        let e = literal_ip_dest("https://user:clave@\u{FF45}\u{FF58}.com/v1?api_key=abc").unwrap_err();
+        assert!(e.contains("not plain ASCII"), "{}", e);
+        assert!(!e.contains("clave") && !e.contains("api_key"), "{}", e);
+        assert_eq!(ip("https://127.0.0.1:8443/x"), Some(("127.0.0.1".to_string(), 8443)));
+        assert_eq!(ip("https://[::1]/x"), Some(("::1".to_string(), 443)));
+        assert_eq!(ip("https://[::ffff:10.0.0.1]/"), Some(("::ffff:10.0.0.1".to_string(), 443)));
+        // Nombres: no son IPs.
+        for u in [
+            "https://example.com/",
+            "http://1.2.3.4.5/",
+            "http://0x.example/",
+            "http://256.1.1.1/",
+            "http://4294967296/",
+            "https://xn--bcher-kva.example/",
+            "http://ex%61mple.com/",
+            "http://169.254.169.254.example.com/",
+            "mailto:169.254.169.254",
+        ] {
+            assert_eq!(ip(u), None, "{}", u);
+        }
     }
 }

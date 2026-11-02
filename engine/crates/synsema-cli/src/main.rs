@@ -16,7 +16,7 @@ use std::process::ExitCode;
 use synsema_capabilities::model::build_ceiling;
 use synsema_runtime::daemon;
 use synsema_runtime::engine::{
-    repl, run_program_ceiled, run_program_ceiled_opts, run_source_ceiled, run_swarm_dump_ceiled,
+    repl, run_program_ceiled, run_program_ceiled_opts, run_program_report, run_source_ceiled, run_swarm_dump_ceiled,
     run_tests_ceiled, run_with_diagnostics_ceiled, TestReport,
 };
 use synsema_runtime::host::{self, Profile};
@@ -40,7 +40,7 @@ mod update;
 mod code;
 mod sealed_receipt;
 
-const USAGE: &str = "uso: synsema <conform [--swarm] [--flat] | serve [--secure] [--watch] [--port N] [--domain d1,d2] [--tls-auto <email> | --tls-cert <p> --tls-key <p>] [--bind addr] [--trust-proxy ip,cidr] [--health <path>] [--attested] [--auditor <X25519 public key> [--receipt <ruta|fd:N>]] | run [--flat] [--explain] [--format human|json] [--provider <name>] [--attest] [--auditor <X25519 public key> [--receipt <ruta|fd:N>] | --replay <recibo abierto> [--replay-any-program]] <archivo.syn | -> [-- args...] | receipt <open <recibo> --key <privada> | verify <recibo> | keygen> | test [-v] [--auditor <X25519 public key> [--receipt <ruta|fd:N>]] <archivo|dir> | build <main.syn> -o <salida> [--include <p>]... [--engine-binary <ruta>] [--serve [--bind addr] ...] [--no-console] [--icon <svg|png|ico>] [--bundle [--name <n>] [--id <id>]] | check [--templates <dir>] | code <outline|symbol|refs|routes|caps|check|search|deps> [--json] | code --mcp | openapi [--out f] [--base-url URL] | tokens | ast | repl | daemon | init [dir] [--synfide | --pwa | --desktop] | llm status [--json] | version | update> [--sandbox | --cap-set <list> | --deterministic] [--trusted <nombre=ruta>]... [--trusted-cap-set <list>] [--trusted-templates <nombre=dir>]... [--labels] [--jitless] [--profile native|pure] [--audit json|<ruta>|fd:N|unix:<ruta>] [--env-file <path> | --no-env-file] <archivo.syn>";
+const USAGE: &str = "uso: synsema <conform [--swarm] [--flat] | serve [--secure] [--watch] [--port N] [--domain d1,d2] [--tls-auto <email> | --tls-cert <p> --tls-key <p>] [--bind addr] [--trust-proxy ip,cidr] [--health <path>] [--attested] [--auditor <X25519 public key> [--receipt <ruta|fd:N>]] | run [--flat] [--explain] [--format human|json [--diagnostic]] [--provider <name>] [--attest] [--auditor <X25519 public key> [--receipt <ruta|fd:N>] | --replay <recibo abierto> [--replay-any-program]] <archivo.syn | -> [-- args...] | receipt <open <recibo> --key <privada> | verify <recibo> | keygen> | test [-v] [--auditor <X25519 public key> [--receipt <ruta|fd:N>]] <archivo|dir> | build <main.syn> -o <salida> [--include <p>]... [--engine-binary <ruta>] [--serve [--bind addr] ...] [--no-console] [--icon <svg|png|ico>] [--bundle [--name <n>] [--id <id>]] | check [--templates <dir>] | code <outline|symbol|refs|routes|caps|check|search|deps> [--json] | code --mcp | openapi [--out f] [--base-url URL] | tokens | ast | repl | daemon | init [dir] [--synfide | --pwa | --desktop] | llm status [--json] | version | update> [--sandbox | --cap-set <list> | --deterministic] [--trusted <nombre=ruta>]... [--trusted-cap-set <list>] [--trusted-templates <nombre=dir>]... [--labels] [--jitless] [--profile native|pure] [--audit json|<ruta>|fd:N|unix:<ruta>] [--env-file <path> | --no-env-file] <archivo.syn>";
 
 // `build_ceiling` (--sandbox/--cap-set → techo) vive en synsema-capabilities: lo comparten
 // este binario y `synsema-wasm` (mismas flags, misma semántica en los dos front-ends).
@@ -347,7 +347,22 @@ mod audit {
         collect: Option<Mutex<Vec<serde_json::Value>>>,
         granted: AtomicUsize,
         denied: AtomicUsize,
+        /// v0.6.54 (R2-3 de la ronda 2): las entradas que no entraron en la copia del informe.
+        dropped: AtomicUsize,
+        /// v0.6.54 (R3-2 de la ronda 3): los bytes de las entradas que sí entraron.
+        collected_bytes: AtomicUsize,
     }
+
+    /// v0.6.54 (R2-3 de la ronda 2): cuántas entradas del audit van en el informe de
+    /// `run --format json` (unos 11 MB). Cada chequeo de permiso es una entrada, así que un programa
+    /// sano que lee 100 000 veces un archivo permitido las juntaba todas en memoria y en el JSON. Lo
+    /// demás se cuenta en `audit_dropped`; `--audit <ruta>` sigue escribiéndolas todas.
+    pub const REPORT_AUDIT_MAX: usize = 50_000;
+
+    /// v0.6.54 (R3-2 de la ronda 3): y cuántos bytes (la mitad de los 32 MB que lee `run_program`).
+    /// Una entrada lleva su scope dos veces, y con una ruta larga pesa más de 1 KB: 50 000 eran
+    /// 52 MB y el informe entero se perdía. Así sólo lo que el programa imprime puede llenarlo.
+    pub const REPORT_AUDIT_MAX_BYTES: usize = 16 * 1024 * 1024;
 
     static SINK: OnceLock<Arc<Sink>> = OnceLock::new();
 
@@ -415,6 +430,8 @@ mod audit {
             collect: if collect { Some(Mutex::new(Vec::new())) } else { None },
             granted: AtomicUsize::new(0),
             denied: AtomicUsize::new(0),
+            dropped: AtomicUsize::new(0),
+            collected_bytes: AtomicUsize::new(0),
         });
         if SINK.set(sink.clone()).is_err() {
             return Err("--audit: the audit sink is already installed".to_string());
@@ -435,7 +452,15 @@ mod audit {
             }
             if let Some(c) = &s.collect {
                 if let Ok(mut c) = c.lock() {
-                    c.push(v);
+                    // Bajo el lock del `Vec`: el contador de bytes no necesita más.
+                    let n = v.to_string().len();
+                    let used = s.collected_bytes.load(Ordering::Relaxed);
+                    if c.len() < REPORT_AUDIT_MAX && used + n <= REPORT_AUDIT_MAX_BYTES {
+                        s.collected_bytes.store(used + n, Ordering::Relaxed);
+                        c.push(v);
+                    } else {
+                        s.dropped.fetch_add(1, Ordering::Relaxed);
+                    }
                 }
             }
         }));
@@ -460,6 +485,11 @@ mod audit {
                 }
             }
         }
+    }
+
+    /// v0.6.54 (R2-3): las entradas que no entraron en el informe.
+    pub fn dropped() -> usize {
+        SINK.get().map(|s| s.dropped.load(Ordering::Relaxed)).unwrap_or(0)
     }
 
     /// Las entradas colectadas (para `run --format json`).
@@ -1673,6 +1703,8 @@ fn cmd_run(args: &[String]) -> ExitCode {
     };
     let mut flat = false;
     let mut explain = false;
+    // v0.6.54: `--diagnostic` — con `--format json`, el informe lleva `diagnostic` (el de `--explain`).
+    let mut diagnostic = false;
     let mut attest = false; // --attest: modo job atestado (fuerza --deterministic)
     let mut fmt_json = false; // --format json: con --explain, diagnóstico JSON; sin él, el INFORME
     let mut path: Option<String> = None;
@@ -1706,6 +1738,7 @@ fn cmd_run(args: &[String]) -> ExitCode {
             p if p.starts_with("--auditor=") => auditor_flag = Some(p["--auditor=".len()..].to_string()),
             p if p.starts_with("--receipt=") => receipt_flag = Some(p["--receipt=".len()..].to_string()),
             "--explain" => explain = true,
+            "--diagnostic" => diagnostic = true,
             // Corre bajo --deterministic y cierra con una línea JSON
             // `{output_sha, steps, state_root, program_sha, input_sha, attestation}` cuyo
             // documento ata sha256(program_sha ‖ input_sha ‖ output_sha).
@@ -1767,7 +1800,7 @@ fn cmd_run(args: &[String]) -> ExitCode {
     let path = match path {
         Some(p) => p,
         None => {
-            eprintln!("uso: synsema run [--flat] [--explain] [--format human|json] [--provider <name>] [--attest] [--auditor <X25519 public key> [--receipt <ruta|fd:N>] | --replay <recibo abierto> [--replay-any-program]] [--sandbox | --cap-set <list> | --deterministic] [--trusted <nombre=ruta>]... [--trusted-cap-set <list>] [--trusted-templates <nombre=dir>]... [--labels] [--profile native|pure] [--audit json|<ruta>|fd:N] <archivo.syn | -> [-- args...]");
+            eprintln!("uso: synsema run [--flat] [--explain] [--format human|json [--diagnostic]] [--provider <name>] [--attest] [--auditor <X25519 public key> [--receipt <ruta|fd:N>] | --replay <recibo abierto> [--replay-any-program]] [--sandbox | --cap-set <list> | --deterministic] [--trusted <nombre=ruta>]... [--trusted-cap-set <list>] [--trusted-templates <nombre=dir>]... [--labels] [--profile native|pure] [--audit json|<ruta>|fd:N] <archivo.syn | -> [-- args...]");
             return ExitCode::from(2);
         }
     };
@@ -1787,6 +1820,10 @@ fn cmd_run(args: &[String]) -> ExitCode {
         host.deterministic = true;
     }
     let report_mode = fmt_json && !explain;
+    if diagnostic && !report_mode {
+        eprintln!("synsema run: --diagnostic goes with --format json (without --explain): it adds the --explain diagnostic to the report");
+        return ExitCode::from(2);
+    }
     let auditor = match sealed_receipt::from_flags("run", auditor_flag, receipt_flag) {
         Ok(a) => a,
         Err(code) => return code,
@@ -1926,13 +1963,15 @@ fn cmd_run(args: &[String]) -> ExitCode {
     // La salida del programa se colecta (no va en vivo). Es el transporte de
     // `run_program` y una API para cualquier runner.
     if report_mode {
-        let result = run_program_ceiled_opts(&source, &filename, ceiling, false);
+        let result = run_program_report(&source, &filename, ceiling, false, diagnostic);
         let exit = run_exit_code(&result) as i32;
         let mut report = serde_json::json!({
             "ok": result.success,
             "output": result.output,
             "errors": result.errors,
             "audit": audit::collected(),
+            // v0.6.54 (R2-3): las entradas del audit que no entraron (ver `REPORT_AUDIT_MAX`).
+            "audit_dropped": audit::dropped(),
             "exit": exit,
             "llm_tokens": synsema_runtime::llm_providers::llm_tokens_total(),
             // v0.6.20 — pasos del intérprete (contador determinista; ver `steps()`).
@@ -1942,6 +1981,9 @@ fn cmd_run(args: &[String]) -> ExitCode {
             // pidiera nada.
             "steps": steps_field(&result),
         });
+        if diagnostic {
+            report["diagnostic"] = result.diagnostic.clone().unwrap_or(serde_json::Value::Null);
+        }
         // `--attest --format json`: la attestation va DENTRO del informe (sólo si el run
         // fue bien; no se atesta una salida fallida).
         if let (Some(input), true) = (&attest_input, result.success) {
@@ -2795,6 +2837,34 @@ pub(crate) fn cli_lints(program: &synsema_core::ast::Program, path: &str) -> Vec
     out.extend(deprecated_fetch_warnings(program, path));
     out.extend(positional_beyond_two_warnings(program, path));
     out.extend(unbound_secret_warnings(program, path));
+    out.extend(tls_auto_ip_warnings(program, path));
+    out
+}
+
+/// v0.6.54 (pendiente de v0.6.53): `tls auto` con dos IPs en `domain` es un error al arrancar el
+/// `serve`; `check` lo avisa antes, con el mismo texto, cuando `domain` es un literal.
+fn tls_auto_ip_warnings(program: &synsema_core::ast::Program, path: &str) -> Vec<String> {
+    use synsema_core::ast::NodeKind as NK;
+    let mut out = Vec::new();
+    for stmt in &program.statements {
+        synsema_core::ast_api::walk(stmt, &mut |n| {
+            let NK::ServeBlock { acme: Some(acme), .. } = &n.kind else { return };
+            let (true, Some(domain)) = (acme.tls_auto, acme.domain.as_deref()) else { return };
+            let texts: Vec<String> = match &domain.kind {
+                NK::ListLiteral { elements } => elements
+                    .iter()
+                    .filter_map(|e| match &e.kind {
+                        NK::TextLiteral { value } => Some(value.to_string()),
+                        _ => None,
+                    })
+                    .collect(),
+                _ => Vec::new(),
+            };
+            if let Some(msg) = synsema_runtime::serve::more_than_one_ip(&texts) {
+                out.push(format!("{}:{}: warning: {} — `serve` stops with this error when it starts", path, domain.location.line, msg));
+            }
+        });
+    }
     out
 }
 

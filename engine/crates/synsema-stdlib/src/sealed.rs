@@ -289,7 +289,8 @@ pub struct ReceiptContext<'a> {
     /// v0.6.49 (ronda 1, M3): el sha256 de cada módulo `--trusted` (`{nombre: sha}`), o `None` si
     /// la corrida no tuvo. `--replay` lo compara como a `program_sha`.
     pub trusted: Option<serde_json::Value>,
-    pub started: String,
+    /// v0.6.54: `None` (sale `null`) sin un reloj de verdad, en vez de 1970.
+    pub started: Option<String>,
 }
 
 /// Todas las entradas en el orden de la corrida: cada sellada lleva `after`, cuántas públicas la
@@ -685,7 +686,7 @@ pub fn request_finish() -> Result<(), String> {
                 program_sha: r.program_sha.clone(),
                 config_sha: r.config_sha.clone(),
                 trusted: None,
-                started: req.started.clone(),
+                started: Some(req.started.clone()),
             },
         )?
     };
@@ -818,7 +819,7 @@ mod tests {
         let l = log.lock().unwrap();
         build_receipt(
             &l,
-            &ReceiptContext { auditor, key, program_sha: Some("ab".repeat(32)), config_sha: None, trusted: None, started: "2026-10-21T00:00:00Z".into() },
+            &ReceiptContext { auditor, key, program_sha: Some("ab".repeat(32)), config_sha: None, trusted: None, started: Some("2026-10-21T00:00:00Z".into()) },
         )
         .unwrap()
     }
@@ -858,7 +859,7 @@ mod tests {
         }
         let t0 = std::time::Instant::now();
         let l = log.lock().unwrap();
-        let ctx = ReceiptContext { auditor: pk, key: &key, program_sha: None, config_sha: None, trusted: None, started: "2026-10-21T00:00:00Z".into() };
+        let ctx = ReceiptContext { auditor: pk, key: &key, program_sha: None, config_sha: None, trusted: None, started: Some("2026-10-21T00:00:00Z".into()) };
         let r = build_receipt(&l, &ctx).unwrap();
         assert!(t0.elapsed() < std::time::Duration::from_secs(20), "{:?}", t0.elapsed());
         let o = open_receipt(&r, &sk).unwrap();
@@ -914,7 +915,7 @@ mod tests {
         let mut l = RunLog::new(16 * 1024);
         l.seed = Some("00".repeat(32));
         l.push_sealed(json!({"kind": "op", "line": "x"}).to_string());
-        let ctx = ReceiptContext { auditor: pk, key: &key, program_sha: None, config_sha: None, trusted: None, started: "s".into() };
+        let ctx = ReceiptContext { auditor: pk, key: &key, program_sha: None, config_sha: None, trusted: None, started: Some("s".into()) };
         let good = build_receipt(&l, &ctx).unwrap();
         let mut forged = good.clone();
         forged["root"] = json!(hex_encode(&[7u8; 32]));

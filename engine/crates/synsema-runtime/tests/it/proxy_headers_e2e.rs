@@ -29,7 +29,9 @@ fn spawn_upstream() -> u16 {
                 Ok(s) => s,
                 Err(_) => continue,
             };
-            let mut reader = BufReader::new(s.try_clone().unwrap());
+            // Sin `try_clone()`: en Windows el clon de un socket sale heredable y un proceso que otro test
+            // lanza en ese momento se queda con la conexión (v0.6.54). `&TcpStream` lee y escribe.
+            let mut reader = BufReader::new(&s);
             let mut line = String::new();
             let _ = reader.read_line(&mut line);
             // Drenar el resto de los headers de la request.

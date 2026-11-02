@@ -46,6 +46,11 @@ fn err(msg: impl Into<String>) -> Control {
 /// fuerza un re-fetch inmediato igual (ver `jwks_for`).
 const JWKS_TTL_SECS: u64 = 600;
 
+/// v0.6.54 — enfriamiento por URL (el default de `jose`). Un `kid` desconocido vuelve a pedir el
+/// JWKS como mucho una vez cada 30 s, y un pedido que falló no se repite antes: si no, quien manda
+/// tokens con un `kid` inventado hace que el motor le pegue al IdP una vez por token.
+const JWKS_COOLDOWN_SECS: u64 = 30;
+
 /// Tope del cuerpo del JWKS que se acepta (un IdP real está muy por debajo; esto
 /// acota un endpoint hostil o mal configurado).
 #[cfg_attr(not(feature = "native"), allow(dead_code))]
@@ -60,14 +65,108 @@ fn unix_now() -> i64 {
 // cache de JWKS (por URL, con TTL)
 // =========================================================
 
+#[derive(Default)]
 struct CachedJwks {
+    /// El último JWKS bueno y cuándo llegó.
     fetched_at: u64,
-    body: String,
+    body: Option<String>,
+    /// v0.6.54: el último pedido que falló (cuándo y por qué), para no repetirlo en el enfriamiento.
+    failed: Option<(u64, String)>,
+    /// v0.6.54: hay un pedido en curso; los que llegan mientras tanto esperan su resultado en vez
+    /// de salir también a la red (como la promesa compartida de `jose`).
+    in_flight: bool,
 }
+
+/// v0.6.54: como mucho tantas URLs en el cache; al llenarse sale la que se usó hace más tiempo.
+/// `jwks_url` la pone el programa, y ahora también entra una URL que falla.
+const JWKS_CACHE_MAX_URLS: usize = 256;
 
 fn jwks_cache() -> &'static Mutex<HashMap<String, CachedJwks>> {
     static C: OnceLock<Mutex<HashMap<String, CachedJwks>>> = OnceLock::new();
     C.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Avisa a los que esperan un pedido en curso (va con el mutex de [`jwks_cache`]).
+#[cfg(feature = "native")]
+fn jwks_done() -> &'static std::sync::Condvar {
+    static C: OnceLock<std::sync::Condvar> = OnceLock::new();
+    C.get_or_init(std::sync::Condvar::new)
+}
+
+/// La entrada de `url`, creándola si hace falta sin pasar de [`JWKS_CACHE_MAX_URLS`]: sale la de
+/// uso más viejo que no tiene un pedido en curso.
+#[cfg_attr(not(feature = "native"), allow(dead_code))]
+fn jwks_entry<'a>(cache: &'a mut HashMap<String, CachedJwks>, url: &str) -> &'a mut CachedJwks {
+    if !cache.contains_key(url) && cache.len() >= JWKS_CACHE_MAX_URLS {
+        let oldest = cache
+            .iter()
+            .filter(|(_, e)| !e.in_flight)
+            .min_by_key(|(_, e)| e.fetched_at.max(e.failed.as_ref().map(|f| f.0).unwrap_or(0)))
+            .map(|(k, _)| k.clone());
+        if let Some(k) = oldest {
+            cache.remove(&k);
+        }
+    }
+    cache.entry(url.to_string()).or_default()
+}
+
+/// Qué hacer con un pedido del JWKS, según lo que hay en el cache.
+#[derive(Debug, PartialEq)]
+enum JwksStep {
+    Cached(String),
+    /// Falló hace menos del enfriamiento: el mismo error, sin red.
+    StillFailing(String),
+    /// v0.6.54: otro pedido a la misma URL está en curso: esperar su resultado.
+    Wait,
+    Fetch,
+}
+
+/// v0.6.54 — la decisión, pura (sin red ni reloj) para poder probarla.
+fn jwks_step(entry: Option<&CachedJwks>, now: u64, force: bool) -> JwksStep {
+    let Some(e) = entry else { return JwksStep::Fetch };
+    let age = now.saturating_sub(e.fetched_at);
+    let fresh = e.body.as_ref().filter(|_| age < JWKS_TTL_SECS);
+    // Sin `force`, un JWKS dentro del TTL gana siempre, también sobre una falla reciente: un
+    // re-fetch forzado que falló (un `kid` inventado justo cuando el IdP tropieza) no puede
+    // dejar sin verificar los tokens buenos.
+    if let (false, Some(body)) = (force, fresh) {
+        return JwksStep::Cached(body.clone());
+    }
+    if let Some((at, msg)) = &e.failed {
+        if now.saturating_sub(*at) < JWKS_COOLDOWN_SECS {
+            return match fresh {
+                Some(body) => JwksStep::Cached(body.clone()),
+                None => JwksStep::StillFailing(msg.clone()),
+            };
+        }
+    }
+    // Con `force` (un `kid` desconocido): como mucho un pedido por enfriamiento.
+    if let (true, Some(body)) = (force, e.body.as_ref()) {
+        if age < JWKS_COOLDOWN_SECS {
+            return JwksStep::Cached(body.clone());
+        }
+    }
+    if e.in_flight {
+        return JwksStep::Wait;
+    }
+    JwksStep::Fetch
+}
+
+/// v0.6.54: el pedido en curso de una URL. Al soltarse (también si algo falla antes de salir a la
+/// red, o en un pánico) la marca se saca y se despierta a los que esperan.
+#[cfg(feature = "native")]
+struct JwksInFlight<'a>(&'a str);
+
+#[cfg(feature = "native")]
+impl Drop for JwksInFlight<'_> {
+    fn drop(&mut self) {
+        let mut cache = jwks_cache().lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(e) = cache.get_mut(self.0) {
+            e.in_flight = false;
+        }
+        drop(cache);
+        jwks_done().notify_all();
+    }
 }
 
 fn monotonic_secs() -> u64 {
@@ -81,14 +180,45 @@ fn fetch_jwks(
     url: &str,
     force: bool,
 ) -> Result<String, Control> {
-    if !force {
-        if let Ok(cache) = jwks_cache().lock() {
-            if let Some(c) = cache.get(url) {
-                if monotonic_secs().saturating_sub(c.fetched_at) < JWKS_TTL_SECS {
-                    return Ok(c.body.clone());
+    #[cfg(not(feature = "native"))]
+    let step = jwks_cache()
+        .lock()
+        .map(|c| jwks_step(c.get(url), monotonic_secs(), force))
+        .unwrap_or(JwksStep::Fetch);
+    // v0.6.54: la decisión y la marca de «en curso» van bajo el mismo lock; si otro pedido a esta
+    // URL está en curso, se espera su resultado (hasta el plazo del pedido y un margen; pasado
+    // eso, se sale a la red).
+    #[cfg(feature = "native")]
+    let (step, _in_flight) = {
+        // v0.6.54 (R2-2 de la ronda 2): el que espera el pedido en vuelo suelta su permiso de CPU,
+        // como toda espera bajo `serve`; si no, N tokens con un `kid` inventado frenaban todas las
+        // rutas mientras durara el pedido. La sección se abre sólo al esperar, y se declara ANTES
+        // que el lock: se cierra después de soltarlo.
+        let mut _waiting: Option<synsema_core::waiting::Waiting> = None;
+        let wait_until = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        let mut cache = jwks_cache().lock().unwrap_or_else(|p| p.into_inner());
+        loop {
+            let late = std::time::Instant::now() >= wait_until;
+            match jwks_step(cache.get(url), monotonic_secs(), force) {
+                JwksStep::Wait if !late => {
+                    if _waiting.is_none() {
+                        _waiting = Some(synsema_core::waiting::waiting());
+                    }
+                    cache = jwks_done()
+                        .wait_timeout(cache, std::time::Duration::from_millis(500))
+                        .unwrap_or_else(|p| p.into_inner())
+                        .0;
                 }
+                JwksStep::Fetch | JwksStep::Wait => {
+                    jwks_entry(&mut cache, url).in_flight = true;
+                    break (JwksStep::Fetch, Some(JwksInFlight(url)));
+                }
+                other => break (other, None),
             }
         }
+    };
+    if let JwksStep::Cached(body) = step {
+        return Ok(body);
     }
     // Sin `native` (perfil wasm) no hay sockets: el fetch por URL no existe, pero el
     // camino puro (JWKS inline vía `jwks`) sigue completo. Error claro, no un builtin
@@ -107,6 +237,9 @@ fn fetch_jwks(
         // Red = capability `net`, con el MISMO scope de host que `http_get` (el error
         // ya sugiere el `require net("host")` exacto).
         crate::http::require_net(caps, url, "oidc_verify() fetching the JWKS")?;
+        if let JwksStep::StillFailing(msg) = step {
+            return Err(err(format!("{} (not retried for {}s after a failure)", msg, JWKS_COOLDOWN_SECS)));
+        }
         if !url.starts_with("https://") {
             return Err(err(format!(
                 "oidc_verify: the JWKS URL must be https:// (got {:?}) — the signing keys of an \
@@ -119,25 +252,37 @@ fn fetch_jwks(
             let _net = crate::http_common::program_request(caps, "oidc_verify()", Vec::new());
             crate::http::http_request("GET", url, None, None, None, 10)
         };
-        if !res.ok {
-            return Err(err(format!(
-                "oidc_verify: could not fetch the JWKS from {} (status {}). The token was NOT verified.",
-                url, res.status
-            )));
-        }
-        if res.body.len() > JWKS_MAX_BYTES {
-            return Err(err(format!(
+        let failure = if !res.ok {
+            // v0.6.54: el motivo real (DNS, conexión, TLS, timeout), no sólo `status 0`.
+            let why = match (&res.error, res.status) {
+                (Some(e), 0) => e.clone(),
+                (Some(e), s) => format!("status {}: {}", s, e),
+                (None, s) => format!("status {}", s),
+            };
+            Some(format!("oidc_verify: could not fetch the JWKS from {} ({}). The token was NOT verified.", url, why))
+        } else if res.body.len() > JWKS_MAX_BYTES {
+            Some(format!(
                 "oidc_verify: the JWKS from {} is larger than {} bytes; refusing to parse it",
                 url, JWKS_MAX_BYTES
-            )));
-        }
+            ))
+        } else {
+            None
+        };
         if let Ok(mut cache) = jwks_cache().lock() {
-            cache.insert(
-                url.to_string(),
-                CachedJwks { fetched_at: monotonic_secs(), body: res.body.clone() },
-            );
+            let e = jwks_entry(&mut cache, url);
+            match &failure {
+                Some(msg) => e.failed = Some((monotonic_secs(), msg.clone())),
+                None => {
+                    e.failed = None;
+                    e.fetched_at = monotonic_secs();
+                    e.body = Some(res.body.clone());
+                }
+            }
         }
-        Ok(res.body)
+        match failure {
+            Some(msg) => Err(err(msg)),
+            None => Ok(res.body),
+        }
     }
 }
 
@@ -1025,6 +1170,47 @@ mod tests {
         }
     }
 
+    /// v0.6.54: un JWKS inalcanzable da el motivo real (no sólo `status 0`), y el pedido siguiente
+    /// dentro del enfriamiento no vuelve a salir a la red.
+    #[cfg(feature = "native")]
+    #[test]
+    fn v0654_unreachable_jwks_says_why_and_is_not_retried() {
+        // Un puerto local cerrado: la conexión se rechaza al instante.
+        let port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let url = format!("https://127.0.0.1:{}/jwks.json", port);
+        let cs = caps();
+        cs.borrow_mut().grant(synsema_capabilities::model::Capability::new(
+            synsema_capabilities::model::CapabilityType::Net,
+            Some(format!("127.0.0.1:{}", port)),
+        ));
+        let idp = FakeIdp::new();
+        let token = idp.token("k1", &base_claims(""));
+        let o = map(vec![
+            ("iss", text("https://idp.example.com")),
+            ("aud", text("my-client-id")),
+            ("jwks_url", text(&url)),
+        ]);
+        let first = match b_oidc_verify(&[text(&token), o.clone()], &cs) {
+            Err(Control::Error(e)) => e.to_string(),
+            Ok(v) => panic!("tenía que fallar: {}", v),
+            Err(_) => panic!("tenía que fallar con un error"),
+        };
+        assert!(first.contains("could not fetch the JWKS"), "{}", first);
+        assert!(!first.contains("(status 0)"), "sin el motivo: {}", first);
+        assert!(!first.contains("not retried"), "{}", first);
+        let t0 = std::time::Instant::now();
+        let second = match b_oidc_verify(&[text(&token), o], &cs) {
+            Err(Control::Error(e)) => e.to_string(),
+            Ok(v) => panic!("tenía que fallar: {}", v),
+            Err(_) => panic!("tenía que fallar con un error"),
+        };
+        assert!(second.contains("not retried for 30s after a failure"), "{}", second);
+        assert!(t0.elapsed() < std::time::Duration::from_millis(500));
+    }
+
     /// RS256 de punta a punta: clave RSA generada, JWKS publicado, token firmado y
     /// verificado — más el rechazo de una clave por debajo del mínimo de 2048 bits.
     #[test]
@@ -1096,6 +1282,184 @@ mod tests {
             b64url_encode(&weak_pk.e().to_bytes_be())
         );
         assert!(matches!(verify(&weak_token, opts, &padded_jwks), SynValue::Nothing));
+    }
+
+    #[test]
+    fn v0654_jwks_cooldown() {
+        let ok = |at| CachedJwks { fetched_at: at, body: Some("B".into()), failed: None, in_flight: false };
+        // Sin cache: se pide.
+        assert_eq!(jwks_step(None, 100, false), JwksStep::Fetch);
+        // Dentro del TTL: el cache.
+        assert_eq!(jwks_step(Some(&ok(100)), 100 + JWKS_TTL_SECS - 1, false), JwksStep::Cached("B".into()));
+        assert_eq!(jwks_step(Some(&ok(100)), 100 + JWKS_TTL_SECS, false), JwksStep::Fetch);
+        // `kid` desconocido (force): no se vuelve a pedir dentro del enfriamiento.
+        assert_eq!(jwks_step(Some(&ok(100)), 100 + JWKS_COOLDOWN_SECS - 1, true), JwksStep::Cached("B".into()));
+        assert_eq!(jwks_step(Some(&ok(100)), 100 + JWKS_COOLDOWN_SECS, true), JwksStep::Fetch);
+        // Un pedido que falló no se repite dentro del enfriamiento, con o sin force.
+        let failed_empty = CachedJwks { fetched_at: 0, body: None, failed: Some((100, "boom".into())), in_flight: false };
+        for force in [false, true] {
+            assert_eq!(jwks_step(Some(&failed_empty), 100 + JWKS_COOLDOWN_SECS - 1, force), JwksStep::StillFailing("boom".into()));
+            assert_eq!(jwks_step(Some(&failed_empty), 100 + JWKS_COOLDOWN_SECS, force), JwksStep::Fetch);
+        }
+        // Un re-fetch forzado que falló no deja sin verificar los tokens buenos: con un JWKS dentro
+        // del TTL, se usa (con o sin force).
+        let failed_fresh = CachedJwks { fetched_at: 90, body: Some("B".into()), failed: Some((100, "boom".into())), in_flight: false };
+        for force in [false, true] {
+            assert_eq!(jwks_step(Some(&failed_fresh), 101, force), JwksStep::Cached("B".into()));
+        }
+        // Con el JWKS vencido y una falla reciente: el error, sin red.
+        let failed_stale = CachedJwks { fetched_at: 0, body: Some("B".into()), failed: Some((JWKS_TTL_SECS + 10, "boom".into())), in_flight: false };
+        assert_eq!(jwks_step(Some(&failed_stale), JWKS_TTL_SECS + 11, false), JwksStep::StillFailing("boom".into()));
+        // v0.6.54 (B1 de la ronda 1): con un pedido en curso, se espera su resultado en vez de
+        // salir también a la red; un JWKS que sirve o una falla reciente siguen ganando.
+        let flying = CachedJwks { fetched_at: 0, body: None, failed: None, in_flight: true };
+        for force in [false, true] {
+            assert_eq!(jwks_step(Some(&flying), 100, force), JwksStep::Wait);
+        }
+        let flying_fresh = CachedJwks { fetched_at: 90, body: Some("B".into()), failed: None, in_flight: true };
+        assert_eq!(jwks_step(Some(&flying_fresh), 100, false), JwksStep::Cached("B".into()));
+        let flying_stale = CachedJwks { fetched_at: 0, body: Some("B".into()), failed: None, in_flight: true };
+        assert_eq!(jwks_step(Some(&flying_stale), JWKS_TTL_SECS + 1, false), JwksStep::Wait);
+        let flying_failed = CachedJwks { fetched_at: 0, body: None, failed: Some((100, "boom".into())), in_flight: true };
+        assert_eq!(jwks_step(Some(&flying_failed), 101, true), JwksStep::StillFailing("boom".into()));
+    }
+
+    /// v0.6.54 (B1 de la ronda 1): muchos pedidos a la vez con el cache frío salen a la red una
+    /// sola vez; los demás esperan ese pedido y dan su error.
+    #[cfg(feature = "native")]
+    #[test]
+    fn v0654_concurrent_jwks_fetches_once() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        // Un IdP que acepta, se queda 1 s sin responder y cierra.
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        let conns = Arc::new(AtomicUsize::new(0));
+        {
+            let conns = conns.clone();
+            std::thread::spawn(move || {
+                for s in l.incoming().flatten() {
+                    conns.fetch_add(1, Ordering::SeqCst);
+                    std::thread::spawn(move || {
+                        std::thread::sleep(std::time::Duration::from_secs(1));
+                        drop(s);
+                    });
+                }
+            });
+        }
+        let url = format!("https://127.0.0.1:{}/jwks.json", port);
+        let n = 8;
+        let start = Arc::new(std::sync::Barrier::new(n));
+        let hs: Vec<_> = (0..n)
+            .map(|_| {
+                let (url, start) = (url.clone(), start.clone());
+                std::thread::spawn(move || {
+                    let cs = caps();
+                    cs.borrow_mut().grant(synsema_capabilities::model::Capability::new(
+                        synsema_capabilities::model::CapabilityType::Net,
+                        Some(format!("127.0.0.1:{}", port)),
+                    ));
+                    let idp = FakeIdp::new();
+                    let token = idp.token("k1", &base_claims(""));
+                    let o = map(vec![
+                        ("iss", text("https://idp.example.com")),
+                        ("aud", text("my-client-id")),
+                        ("jwks_url", text(&url)),
+                    ]);
+                    start.wait();
+                    match b_oidc_verify(&[text(&token), o], &cs) {
+                        Err(Control::Error(e)) => e.to_string(),
+                        _ => panic!("tenía que fallar con un error"),
+                    }
+                })
+            })
+            .collect();
+        for h in hs {
+            let m = h.join().unwrap();
+            assert!(m.contains("could not fetch the JWKS"), "{}", m);
+        }
+        assert_eq!(conns.load(Ordering::SeqCst), 1, "un solo pedido al IdP");
+    }
+
+    /// v0.6.54 (R2-2 de la ronda 2): el que espera el pedido en vuelo abre una sección de espera
+    /// (bajo `serve`, suelta su permiso de CPU), y sigue habiendo un solo pedido al IdP.
+    #[cfg(feature = "native")]
+    #[test]
+    fn v0654_a_jwks_waiter_releases_its_permit() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        thread_local! {
+            static EVENTS: std::cell::RefCell<Vec<bool>> = const { std::cell::RefCell::new(Vec::new()) };
+        }
+        fn record(on: bool) {
+            EVENTS.with(|e| e.borrow_mut().push(on));
+        }
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        let conns = Arc::new(AtomicUsize::new(0));
+        {
+            let conns = conns.clone();
+            std::thread::spawn(move || {
+                for s in l.incoming().flatten() {
+                    conns.fetch_add(1, Ordering::SeqCst);
+                    std::thread::spawn(move || {
+                        std::thread::sleep(std::time::Duration::from_secs(1));
+                        drop(s);
+                    });
+                }
+            });
+        }
+        let url = format!("https://127.0.0.1:{}/jwks.json", port);
+        let call = move |url: String, hook: bool| {
+            std::thread::spawn(move || {
+                if hook {
+                    synsema_core::waiting::set_thread_hook(Some(record));
+                }
+                let cs = caps();
+                cs.borrow_mut().grant(synsema_capabilities::model::Capability::new(
+                    synsema_capabilities::model::CapabilityType::Net,
+                    Some(format!("127.0.0.1:{}", port)),
+                ));
+                let idp = FakeIdp::new();
+                let token = idp.token("k1", &base_claims(""));
+                let o = map(vec![
+                    ("iss", text("https://idp.example.com")),
+                    ("aud", text("my-client-id")),
+                    ("jwks_url", text(&url)),
+                ]);
+                let m = match b_oidc_verify(&[text(&token), o], &cs) {
+                    Err(Control::Error(e)) => e.to_string(),
+                    _ => panic!("tenía que fallar con un error"),
+                };
+                synsema_core::waiting::set_thread_hook(None);
+                (m, EVENTS.with(|e| e.borrow().clone()))
+            })
+        };
+        let a = call(url.clone(), false);
+        // B llega cuando A ya está en vuelo.
+        let t0 = std::time::Instant::now();
+        while conns.load(Ordering::SeqCst) == 0 && t0.elapsed() < std::time::Duration::from_secs(5) {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let b = call(url, true);
+        let (ma, _) = a.join().unwrap();
+        let (mb, events) = b.join().unwrap();
+        assert!(ma.contains("could not fetch the JWKS") && mb.contains("could not fetch the JWKS"), "{} / {}", ma, mb);
+        assert_eq!(events, vec![true, false], "B esperó sin soltar su permiso");
+        assert_eq!(conns.load(Ordering::SeqCst), 1, "un solo pedido al IdP");
+    }
+
+    /// v0.6.54 (N2 de la ronda 1): el cache no pasa de `JWKS_CACHE_MAX_URLS` URLs.
+    #[test]
+    fn v0654_jwks_cache_is_capped() {
+        let mut c: HashMap<String, CachedJwks> = HashMap::new();
+        for i in 0..(JWKS_CACHE_MAX_URLS + 10) {
+            jwks_entry(&mut c, &format!("https://idp{}.example/jwks", i)).failed = Some((i as u64, "x".into()));
+        }
+        assert_eq!(c.len(), JWKS_CACHE_MAX_URLS);
+        // Salieron las más viejas; la última quedó.
+        assert!(!c.contains_key("https://idp0.example/jwks"));
+        assert!(c.contains_key(&format!("https://idp{}.example/jwks", JWKS_CACHE_MAX_URLS + 9)));
     }
 
     #[test]

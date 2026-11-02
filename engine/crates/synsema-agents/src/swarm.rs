@@ -99,6 +99,9 @@ pub struct Swarm {
     drop_output: bool,
     /// v0.6.47 (T1): lleva el diario por corrida del blackboard (serve con etiquetas).
     journal_runs: bool,
+    /// v0.6.54: dónde se informa, en el momento, el error de un agente (`serve`: su consola). Bajo
+    /// `run` no hace falta: los errores se juntan al final y salen como `Agent error [id]: …`.
+    on_agent_error: Option<std::sync::Arc<dyn Fn(&str) + Send + Sync>>,
 }
 
 impl Default for Swarm {
@@ -130,6 +133,25 @@ impl Swarm {
             held_err: None,
             drop_output: false,
             journal_runs: false,
+            on_agent_error: None,
+        }
+    }
+
+    /// v0.6.54: un swarm que informa el error de cada agente al terminar (bajo `serve`, que no tiene
+    /// un fin de corrida donde juntarlos: antes el error no dejaba ninguna línea).
+    pub fn reporting_agent_errors(mut self, sink: std::sync::Arc<dyn Fn(&str) + Send + Sync>) -> Self {
+        self.on_agent_error = Some(sink);
+        self
+    }
+
+    /// v0.6.54: informa el error de un agente, si este swarm lo hace. Con la salida descartada
+    /// (`serve` con etiquetas) no: qué agente falló puede depender de un dato privado.
+    pub fn report_agent_error(&self, id: &str, msg: &str) {
+        if self.drop_output {
+            return;
+        }
+        if let Some(f) = &self.on_agent_error {
+            f(&format!("Agent error [{}]: {}", id, msg));
         }
     }
 

@@ -1728,6 +1728,10 @@ pub struct Interpreter {
     /// `provider.call_stream`. Sin él: `llm_stream` devuelve el placeholder
     /// `"[no llm provider]"` sin invocar `on_chunk`.
     llm_stream_callback: Option<LlmStreamCallback>,
+    /// v0.6.54 — el modelo lo da un host que sólo contesta texto (el hook `llm` de wasm): ahí
+    /// `llm_step`/`llm_stream` sin callback son un error que lo dice, no el placeholder
+    /// `"[no llm provider]"`, que parecería una respuesta (el host sí ofrece un modelo).
+    llm_text_only_host: bool,
     /// Callback de `llm_usage()` (FRAMEWORK F1): devuelve los tokens LLM acumulados
     /// del proceso. Introspección sin gate (como `llm_available`). Sin él (offline /
     /// sin provider): el builtin devuelve 0.
@@ -2221,6 +2225,7 @@ impl Interpreter {
             llm_decide_callback: None,
             llm_step_callback: None,
             llm_stream_callback: None,
+            llm_text_only_host: false,
             llm_usage_callback: None,
             llm_cap_hook: None,
             judge_callback: None,
@@ -3887,6 +3892,23 @@ impl Interpreter {
     /// Cablea el callback LLM de streaming (`llm_stream`, F2).
     pub fn set_llm_stream_callback(&mut self, cb: LlmStreamCallback) {
         self.llm_stream_callback = Some(cb);
+    }
+
+    /// v0.6.54 — el modelo viene de un host que sólo contesta texto (ver `llm_text_only_host`).
+    pub fn set_llm_text_only_host(&mut self, on: bool) {
+        self.llm_text_only_host = on;
+    }
+
+    /// v0.6.54 — el error de `llm_step`/`llm_stream` con un host que sólo contesta texto.
+    fn llm_text_only_error(&self, builtin: &str, loc: &SourceLocation) -> Control {
+        Control::Error(RuntimeError::at(
+            format!(
+                "{}: the host gives the model through its `llm` hook, which answers whole texts (reason/decide/analyze/generate); {} is not available in this embedding",
+                builtin,
+                if builtin == "llm_step" { "tool calling" } else { "streaming" }
+            ),
+            loc.clone(),
+        ))
     }
 
     /// Cablea el callback de `llm_usage()` (tokens LLM acumulados del proceso,
@@ -10797,6 +10819,9 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
             Some(SynValue::Nothing) | None => String::new(),
             Some(v) => v.to_string(),
         };
+        if self.llm_step_callback.is_none() && self.llm_text_only_host {
+            return Err(self.llm_text_only_error("llm_step", loc));
+        }
         let result = match &self.llm_step_callback {
             Some(cb) => {
                 let r = cb(&prompt, &catalog, &context);
@@ -10854,6 +10879,7 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
         let on_chunk = nth(args, 2)?.clone();
         let cb = match &self.llm_stream_callback {
             Some(cb) => cb.clone(),
+            None if self.llm_text_only_host => return Err(self.llm_text_only_error("llm_stream", loc)),
             None => {
                 note_llm_offline();
                 return Ok(Self::llm_out(&lab, syn_text("[no llm provider]")));
@@ -13076,6 +13102,11 @@ pub struct RunResult {
     /// ¿La corrida tocó datos privados? Si sí, el host no publica `steps` (después de una rama
     /// privada el contador es el dato con aritmética encima).
     pub touched_private: bool,
+    /// v0.6.54 — el diagnóstico estructurado del error del programa principal (la forma de
+    /// `run --explain --format json`), sólo si el host lo pidió (`run --format json --diagnostic`,
+    /// la opción `explain` de `run_program`). `None` si no se pidió, si la corrida anduvo, si
+    /// terminó con `exit`, si falló sólo un agente o si la cortó el chequeo de etiquetas.
+    pub diagnostic: Option<serde_json::Value>,
 }
 
 /// Resultado de un bloque `test` (Batch 3). `assertion` distingue una falla de aserción

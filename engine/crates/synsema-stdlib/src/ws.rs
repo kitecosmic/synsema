@@ -315,6 +315,10 @@ struct DialParams {
     dialed_at: Instant,
     /// v0.6.46 (E7): las ataduras de los secrets de la URL y los headers (ver `dest_check_with`).
     bindings: Vec<String>,
+    /// v0.6.54 (§D de v0.6.51): los techos delegados vigentes al abrir (un `sandbox under`, el
+    /// token de la request). Cada reconexión se juzga también con ellos: un `ws` abierto dentro de
+    /// un bloque que reconecta cuando el bloque ya terminó no llega más lejos que al abrirse.
+    opened_under: Vec<synsema_capabilities::model::Delegation>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -622,6 +626,41 @@ pub(crate) const PEER_GONE_REASON: &str = "connection reset by peer";
 // =========================================================
 // Establecer la conexión (handshake bloqueante → promoción a mio)
 // =========================================================
+
+/// v0.6.54 — una reconexión: con los techos delegados de la apertura apilados mientras se decide
+/// (y se sacan después, pase lo que pase). Los vigentes también cuentan: la intersección.
+fn establish_again(
+    dial: &DialParams,
+    caps: &Rc<RefCell<CapabilitySet>>,
+) -> Result<(WebSocket<WsStream>, Option<String>, Option<crate::attested_client::AttestedInfo>), Control> {
+    with_layers(caps, &dial.opened_under, || establish(dial, caps))
+}
+
+/// Corre `f` con `layers` apiladas sobre los techos vigentes. Las saca una guarda, así que salen
+/// también si `f` entra en pánico (N1 de la ronda 1 de v0.6.54).
+fn with_layers<T>(
+    caps: &Rc<RefCell<CapabilitySet>>,
+    layers: &[synsema_capabilities::model::Delegation],
+    f: impl FnOnce() -> T,
+) -> T {
+    struct Pop<'a>(&'a Rc<RefCell<CapabilitySet>>, usize);
+    impl Drop for Pop<'_> {
+        fn drop(&mut self) {
+            // `try_borrow_mut`: en un pánico con el set prestado, otro pánico abortaría el proceso.
+            if let Ok(mut c) = self.0.try_borrow_mut() {
+                for _ in 0..self.1 {
+                    c.pop_delegation();
+                }
+            }
+        }
+    }
+    let mut pop = Pop(caps, 0);
+    for d in layers {
+        caps.borrow_mut().push_delegation(d.clone());
+        pop.1 += 1;
+    }
+    f()
+}
 
 /// Conecta, hace el handshake TLS+WS en modo BLOQUEANTE (acotado por timeout) y
 /// promueve el socket a mio. Re-chequea `net(host)` (G21) — lo llama tanto el
@@ -1025,7 +1064,7 @@ impl WsRegistry {
         for handle in due {
             let dial = self.conns.get(&handle).map(|c| c.dial.clone());
             let Some(dial) = dial else { continue };
-            match establish(&dial, &self.caps) {
+            match establish_again(&dial, &self.caps) {
                 Ok((ws, sub, attested)) => {
                     let task = {
                         let Some(c) = self.conns.get_mut(&handle) else { continue };
@@ -1624,6 +1663,7 @@ fn ws_connect(args: &[SynValue], reg: &Registry) -> Result<SynValue, Control> {
         tls_check: opts.tls_check,
         dialed_at: Instant::now(),
         bindings: out.bindings().to_vec(),
+        opened_under: reg.borrow().caps.borrow().delegations(),
     };
     match (&dial.tls_check, dial.tls) {
         (Some(crate::http_common::TlsCheck::Pin(_)), false) => {
@@ -2141,6 +2181,7 @@ pub fn adopt_server_socket(interp: &Interpreter, link: ServerSocketLink) -> Resu
             tls_check: None,
             dialed_at: Instant::now(),
             bindings: Vec::new(),
+            opened_under: Vec::new(),
         },
         negotiated_subprotocol: subprotocol,
         attested: None,
@@ -3512,4 +3553,61 @@ pub fn register_ws_builtins(interp: &Interpreter, caps: Rc<RefCell<CapabilitySet
     reg_fn_interp!("bus_recv", -1, bus_recv);
     reg_fn!("bus_unsubscribe", 1, bus_unsubscribe);
     reg_fn!("bus_topics", 0, bus_topics);
+}
+
+#[cfg(test)]
+mod v0654_reconnect_layers {
+    use super::*;
+    use synsema_capabilities::model::Delegation;
+
+    fn dial(url: &str, opened_under: Vec<Delegation>) -> DialParams {
+        DialParams {
+            url: url.to_string(),
+            host: "127.0.0.1".to_string(),
+            port: 1,
+            tls: false,
+            headers: Vec::new(),
+            subprotocols: Vec::new(),
+            max_msg: 1024,
+            connect_timeout: Duration::from_millis(200),
+            tls_check: None,
+            dialed_at: Instant::now(),
+            bindings: Vec::new(),
+            opened_under,
+        }
+    }
+
+    /// v0.6.54 (§D de v0.6.51): un `ws` abierto dentro de `sandbox under` reconecta con la capa de
+    /// la apertura apilada: lo que el bloque no dejaba, la reconexión tampoco, aunque afuera sí.
+    #[test]
+    fn a_reconnect_is_judged_with_the_layers_it_was_opened_under() {
+        let mut cs = CapabilitySet::new("test");
+        cs.grant(Capability::new(CapabilityType::Net, Some("127.0.0.1".to_string())));
+        let caps = Rc::new(RefCell::new(cs));
+        let narrow = Delegation::block(vec![Capability::new(CapabilityType::Net, Some("api.example.com".to_string()))]);
+        let d = dial("ws://127.0.0.1:1/", vec![narrow]);
+        let Err(Control::Error(e)) = establish_again(&d, &caps) else { panic!("la capa de la apertura no cubre 127.0.0.1") };
+        assert!(e.to_string().contains("net"), "{}", e);
+        assert!(caps.borrow().delegations().is_empty(), "la capa se saca después");
+        // Sin capas de apertura, la decisión es la del set vigente: pasa el gate y falla al conectar
+        // (puerto 1 cerrado), no por permiso.
+        let d = dial("ws://127.0.0.1:1/", Vec::new());
+        let Err(Control::Error(e)) = establish_again(&d, &caps) else { panic!("el puerto 1 está cerrado") };
+        assert!(e.to_string().contains("cannot connect"), "{}", e);
+    }
+
+    /// v0.6.54 (N1 de la ronda 1): las capas salen también si lo de adentro entra en pánico.
+    #[test]
+    fn the_layers_come_off_after_a_panic() {
+        let caps = Rc::new(RefCell::new(CapabilitySet::new("test")));
+        let narrow = Delegation::block(vec![Capability::new(CapabilityType::Net, Some("api.example.com".to_string()))]);
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            with_layers(&caps, &[narrow.clone(), narrow.clone()], || {
+                assert_eq!(caps.borrow().delegations().len(), 2);
+                panic!("adentro");
+            })
+        }));
+        assert!(r.is_err());
+        assert!(caps.borrow().delegations().is_empty(), "las capas quedaron puestas");
+    }
 }

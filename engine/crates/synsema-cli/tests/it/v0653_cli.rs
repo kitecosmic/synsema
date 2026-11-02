@@ -174,13 +174,15 @@ fn http_get_to_localhost_reaches_an_ipv4_only_server() {
     let port = l.local_addr().unwrap().port();
     std::thread::spawn(move || {
         for s in l.incoming().flatten() {
-            let mut r = std::io::BufReader::new(s.try_clone().unwrap());
+            // Sin `try_clone()`: en Windows el clon de un socket sale heredable, y un proceso que otro
+            // test lanza en ese momento se queda con la conexión hasta terminar (el cliente ve
+            // `10054` unos segundos después). `&TcpStream` lee y escribe sin clonar.
+            let mut r = std::io::BufReader::new(&s);
             let mut line = String::new();
             while r.read_line(&mut line).unwrap_or(0) > 2 {
                 line.clear();
             }
-            let mut s = s;
-            let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\nhola");
+            let _ = (&s).write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\nhola");
         }
     });
     let dir = project("http-localhost");
@@ -217,7 +219,7 @@ fn wait_body(port: u16) -> Option<String> {
     None
 }
 
-fn free_port() -> u16 {
+pub(crate) fn free_port() -> u16 {
     std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
 }
 
@@ -368,20 +370,25 @@ fn http(port: u16, method: &str, path: &str, body: &str) -> Option<(u16, String)
 }
 
 /// Un `serve` con la salida (stdout) en un buffer que se puede mirar mientras corre.
-struct Served {
+pub(crate) struct Served {
     child: std::process::Child,
     out: std::sync::Arc<std::sync::Mutex<String>>,
 }
 
 impl Served {
-    fn start(dir: &std::path::Path, file: &str) -> Served {
+    pub(crate) fn start(dir: &std::path::Path, file: &str) -> Served {
         Served::start_with(dir, file, &[])
     }
 
     fn start_with(dir: &std::path::Path, file: &str, env: &[(&str, &str)]) -> Served {
+        Served::start_args(dir, &["serve", file], env)
+    }
+
+    /// v0.6.54: con los argumentos de `synsema` enteros (p. ej. `serve --labels a.syn`).
+    pub(crate) fn start_args(dir: &std::path::Path, args: &[&str], env: &[(&str, &str)]) -> Served {
         use std::io::Read;
         let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_synsema"))
-            .args(["serve", file])
+            .args(args)
             .current_dir(dir)
             .env("SYNSEMA_NO_UPDATE_CHECK", "1")
             .envs(env.iter().copied())
@@ -405,7 +412,7 @@ impl Served {
         Served { child, out }
     }
 
-    fn wait_for(&self, what: &str) -> String {
+    pub(crate) fn wait_for(&self, what: &str) -> String {
         for _ in 0..200 {
             if self.out.lock().unwrap().contains(what) {
                 return self.out.lock().unwrap().clone();
@@ -423,7 +430,7 @@ impl Drop for Served {
     }
 }
 
-fn wait_http(port: u16, method: &str, path: &str, body: &str) -> (u16, String) {
+pub(crate) fn wait_http(port: u16, method: &str, path: &str, body: &str) -> (u16, String) {
     for _ in 0..200 {
         if let Some(r) = http(port, method, path, body) {
             return r;
