@@ -80,7 +80,10 @@ its output. When the main program finishes, `synsema run` **joins** the spawned 
 them) before exiting, so the process does not return while agents are still working. **Exit code:**
 `synsema run` exits non-zero if the main program fails **or** if any agent ended in `ERROR` (each
 such failure is reported on stderr as `Agent error [<id>]: <message>`); a clean run with all agents
-`DONE` exits 0. (For the post-run state dump — blackboard + per-agent states as JSON — use
+`DONE` exits 0. **Under `serve` (v0.6.54+)** an agent spawned from a route that fails leaves the same
+line in the server console, `[serve] Agent error [<id>]: <file>:<line>:<col>: <message>` (e.g.
+`[serve] Agent error [Worker_0]: app.syn:4:13: Index 5 out of bounds (list length 1)`) (the request already answered; before, it left nothing). With `serve --labels` it still
+leaves nothing, like the rest of the agents' output in that mode. (For the post-run state dump — blackboard + per-agent states as JSON — use
 `conform --swarm`.)
 
 ## Blackboard (shared state)

@@ -554,11 +554,28 @@ wasmtime run --env ETH_KEY=... synsema-wasm.wasm -  < program.syn
 wasmtime run --dir . synsema-wasm.wasm --sandbox program.syn                 # ceiling = [stdout, time]
 wasmtime run --dir . synsema-wasm.wasm --cap-set stdout,secret=ETH_* program.syn
 wasmtime run synsema-wasm.wasm --version      # the artifact's version (release tag, or v<crate>-dev)
+wasmtime run --dir . synsema-wasm.wasm --auditor <X25519 public key> program.syn               # v0.6.54+: sealed receipt to stderr
+wasmtime run --dir . synsema-wasm.wasm --auditor <X25519 public key> --receipt r.json program.syn
+wasmtime run --dir . --env SYNSEMA_AUDITOR_KEY=<key> synsema-wasm.wasm program.syn
 ```
 
-`synsema-wasm [--test] [--sandbox | --cap-set <list>] [--version] <file.syn | ->`. An unknown
-`--flag` is an error (exit 2), never silently taken as the program path. Exit codes: 0 ok,
-1 runtime/test failure, 2 usage/read error.
+`synsema-wasm [--test] [--labels] [--sandbox | --cap-set <list>] [--trusted name=path]...
+[--trusted-cap-set <list>] [--trusted-templates name=dir]... [--auditor <X25519 public key>
+[--receipt <path>]] [--version] <file.syn | ->`. An unknown `--flag` is an error (exit 2), never
+silently taken as the program path. Exit codes: 0 ok, 1 runtime/test failure, 2 usage/read error.
+
+**Sealed receipts in wasip1 (v0.6.54+)**, like `synsema run` ([observability.md](observability.md)
+§ Sealed receipts): `--auditor <key>` (or `SYNSEMA_AUDITOR_KEY`) seals a receipt of the run; it goes
+to stderr before the output, or to the file of `--receipt <path>` (inside a `--dir` you gave
+wasmtime). The native `synsema receipt open`/`verify` read it. Differences from native:
+- The run key is **ephemeral**: the receipt says `"identity": "ephemeral"`, and
+  `SYNSEMA_IDENTITY_KEY` is not read.
+- A `--receipt` that cannot be written is an error **before** the program runs (exit 2:
+  `synsema-wasm: --receipt: cannot write no/such/r.json: No such file or directory (os error 44)`).
+- Usage errors (exit 2): `--receipt` without an auditor (`--receipt needs an auditor: pass --auditor
+  <X25519 public key> or set SYNSEMA_AUDITOR_KEY`), `--auditor` with `--test` (`--auditor seals a
+  run; it does not go with --test`), `--receipt fd:N` (`not available in wasip1; use --receipt
+  <path>`), a key that is not 32 bytes.
 
 ```js
 // embed (Node/Bun/browser) — @synsema/wasm
@@ -657,11 +674,11 @@ tried to read STRIPE_KEY" = `origin == "program" && !granted`; no need to re-par
    empty answer with `ok: true`.
 3. **`http` gets `redirect: "error"`** when the request carries a secret (URL, query, body or a
    header): pass it to `fetch` (the browser option of the same name) or a redirect carries the secret
-   to a host the program never named. **The engine checks the host NAME only:** blocking private
-   addresses for a wildcard grant (loopback, RFC 1918, CGNAT, ULA, link-local and the metadata
-   endpoint `169.254.169.254`, multicast, documentation ranges, IPv4 mapped or translated in IPv6)
-   is the hook's job — resolve the name, check the address, connect to that one. The hook does not
-   know whether the program named the host.
+   to a host the program never named. **A NAME is the hook's to check:** blocking private addresses
+   for a wildcard grant (loopback, RFC 1918, CGNAT, ULA, link-local and the metadata endpoint
+   `169.254.169.254`, multicast, documentation ranges, IPv4 mapped or translated in IPv6) when a name
+   resolves to one is the hook's job — resolve the name, check the address, connect to that one. A
+   **literal IP** in the URL is checked by the engine since v0.6.54 (below).
 4. **Ceilings with `labels`:** `declassify=<principal>` (globs) bounds `declassify` — breaking for
    labelled code under a ceiling that declassifies; since v0.6.49 the code also declares it,
    `require declassify("<principal>")` (a trusted task in its own body, within `trustedCeiling`); `llm=<p>@embedder` / `judge=<p>@embedder` let
@@ -687,6 +704,35 @@ tried to read STRIPE_KEY" = `origin == "program" && !granted`; no need to re-par
   fail saying so. Without a host `kv` the state belongs to the instance and is atomic.
 - Each call asks the host for 32 bytes of entropy once (they seed the run's generator); with
   `labels`, `now()` is the clock read at the start and at each host interaction.
+
+**What the engine checks before the `http` hook (v0.6.54+)** — `fetch`/`http_*`/RPC read-side, in
+this order; each is an error of the builtin (`r.ok` false, `r.error` with the text) and the hook is
+never called:
+1. **Only `http` and `https`**, as native builds: `ftp://…` → `unsupported scheme 'ftp': only http
+   and https are supported` (other schemes reached the hook, which might speak them). The scheme is
+   read as a browser reads it: leading C0 controls and spaces are dropped, a Unicode space is not
+   (`"\u{3000}http://…"` is refused, as natively).
+2. **A private address written as an IP has to be named by the program**, as natively:
+   `http_get("http://169.254.169.254/")` with `require net("*")` (or any wildcard) is refused with the
+   native message (`` `169.254.169.254` resolved to 169.254.169.254, a private address … ``);
+   `require net("169.254.169.254")` allows it. Every form a browser reads as an IP counts:
+   `http://2852039166/`, `http://0xa9fea9fe/`, `http://0XA9.0XFE.0XA9.0XFE/`, percent-encoded digits
+   (`http://%31%36%39.254.169.254/`), long leading zeros, a trailing dot, `[::ffff:169.254.169.254]`
+   and `http:` without slashes. `localhost` and other names still go to the hook.
+3. **The host and port the `net` check saw are the ones a browser connects to.** A URL a browser
+   reads differently is an error: `http://evil.example\@example.org/` (a browser ends the host at
+   `\`) or `https://example.org:8443\@example.org:443/` → ``a browser reads the host of this URL as
+   "example.org:8443", but `net` checked "example.org:443"; write the host plainly (no `\`, tabs or
+   percent-escapes in it)``. Native builds connect to the host they check and are unchanged.
+4. **A host that is not plain ASCII is an error** (breaking): write an internationalized name as
+   punycode (`xn--…`). Full-width digits (`１６９．２５４．１６９．２５４`) or `。` as a dot →
+   ``the host "…" is not plain ASCII; write an internationalized name as punycode (xn--…) — in
+   WebAssembly the host connects, and the engine cannot tell which address it is``.
+
+**`llm_step` and `llm_stream` with a host that offers `llm` are an error (v0.6.54+)** that says the
+host's hook answers whole texts: tool calling and streaming are not available in that embedding
+(they returned `"[no llm provider]"`, which looked like an answer). `reason`/`decide`/`analyze`/
+`generate` work through the hook. Without an `llm` hook, the offline placeholder is unchanged.
 
 Value in wasm: `sign`/`spend`/`wallet`/`reveal` are fail-loud (no audit line → no operation). A wasm
 host has no filesystem, so the audit line goes to the host `kv` under namespace `audit` (key
