@@ -4262,7 +4262,14 @@ impl Interpreter {
             if done {
                 v
             } else {
-                set_leaf_index(&obj, &i, v, &chunk.locs[d.target_loc as usize], &chunk.locs[chunk.loc[at] as usize])?
+                set_leaf_index(
+                    &obj,
+                    &i,
+                    v,
+                    &chunk.nodes[d.node as usize],
+                    &chunk.locs[d.target_loc as usize],
+                    &chunk.locs[chunk.loc[at] as usize],
+                )?
             }
         };
         self.put(base, d.dst, out);

@@ -706,3 +706,121 @@ fn random_with_a_shape_errors() {
     assert_eq!(both("print(random_normal(rng(1), \"x\"))"), "ERR: random_normal: shape must be an int or a list of ints, got text");
     assert_eq!(both("print(random_uniform(rng(1), [-1]))"), "ERR: random_uniform: dimensions must be non-negative");
 }
+
+// =========================================================
+// Ítems 2 y 3 — indexar con posiciones y escribir (diseño §3.3, R5)
+// Valores de `specs/v0.6.55-numpy/item23.py`.
+// =========================================================
+
+const M: &str = "let M be array([[1, 2], [3, 4]])\n";
+
+#[test]
+fn an_index_list_takes_rows_in_order() {
+    let t = |rest: &str| with_a(&format!("{}{}", M, rest));
+    assert_eq!(t("print(M[[1, 0]])\nprint(a[[0, 0, 3]])\nprint(a[array([0, 3])])"), "[[3, 4], [1, 2]]\n[1, 1, 8]\n[1, 8]");
+    assert_eq!(t("print(a[[-1]])\nprint(m[[1, 3]])\nprint(shape(M[[]]))"), "[8]\n[true, true]\n[0, 2]");
+    assert_eq!(t("print(a[[0, 9]])"), "ERR: Index 9 out of bounds (array axis 0 has length 4)");
+    assert_eq!(t("print(a[m])"), "ERR: an array is indexed by positions — for the elements where a mask is true: where(a, m)");
+    assert_eq!(t("print(a[array([1.5])])"), "ERR: an array index must hold whole numbers, got 1.5 — round first");
+    assert_eq!(t("print(a[[\"x\"]])"), "ERR: an index must be an integer, got text");
+    assert_eq!(t("print(a[[0.5]])"), "ERR: index must be an integer, got 0.5 — use floor(x), round(x) or trunc(x) on purpose");
+    // Un número sigue como siempre.
+    assert_eq!(t("print(M[1])\nprint(a[-1])"), "[3, 4]\n8.0");
+}
+
+#[test]
+fn set_writes_into_an_array() {
+    let t = |rest: &str| with_a(&format!("{}{}", M, rest));
+    assert_eq!(t("set a[1] to 9\nprint(a)"), "[1, 9, 2, 8]");
+    assert_eq!(t("set a[-1] to 0\nprint(a)"), "[1, 5, 2, 0]");
+    assert_eq!(t("set M[0] to array([7, 7])\nprint(M)"), "[[7, 7], [3, 4]]");
+    assert_eq!(t("set M[0] to 0\nprint(M)"), "[[0, 0], [3, 4]]");
+    assert_eq!(t("set M[0][1] to 9\nprint(M)"), "[[1, 9], [3, 4]]");
+    assert_eq!(t("set M[-1][-2] to 9\nprint(M)"), "[[1, 2], [9, 4]]");
+    assert_eq!(t("set a[[0, 2]] to array([4, 4])\nprint(a)"), "[4, 5, 4, 8]");
+    assert_eq!(t("set a[[0, 2]] to 4\nprint(a)"), "[4, 5, 4, 8]");
+    // Un índice repetido: gana el último (numpy).
+    assert_eq!(t("set a[[0, 0]] to array([1, 2])\nprint(a)"), "[2, 5, 2, 8]");
+    assert_eq!(t("set M[[1, 0]] to array([[5, 6], [7, 8]])\nprint(M)"), "[[7, 8], [5, 6]]");
+    assert_eq!(t("set m[0] to true\nprint(m)"), "[true, true, false, true]");
+    assert_eq!(
+        both("let T be reshape(arange(0, 24), [2, 3, 4])\nset T[1][2][3] to -1\nprint(T[1])\nprint(T[0][0])"),
+        "[[12, 13, 14, 15], [16, 17, 18, 19], [20, 21, 22, -1]]\n[0, 1, 2, 3]"
+    );
+    // En un bucle, con el índice de una variable.
+    assert_eq!(both("let z be zeros(5)\nlet i be 0\nwhile i < 5\n    set z[i] to i * i\n    set i to i + 1\nprint(z)"), "[0, 1, 4, 9, 16]");
+    // El valor de un `set` dentro de una lista o un mapa.
+    assert_eq!(both("let xs be [array([1, 2]), array([3, 4])]\nset xs[1][0] to 9\nprint(xs)"), "[[1, 2], [9, 4]]");
+    assert_eq!(both("let p be {\"w\": array([[1, 2], [3, 4]])}\nset p[\"w\"][1][1] to 0\nset p.w[0] to 5\nprint(p.w)"), "[[5, 5], [3, 0]]");
+}
+
+#[test]
+fn set_errors_name_the_rule() {
+    let t = |rest: &str| with_a(&format!("{}{}", M, rest));
+    assert_eq!(t("set M[0] to array([1, 2, 3])"), "ERR: set M[0]: the row has shape [2], got [3]");
+    assert_eq!(t("set a[0] to array([1, 2])"), "ERR: set a[0]: the element is a number, got [2]");
+    assert_eq!(t("set a[[0, 1]] to array([1, 2, 3])"), "ERR: set a[[0, 1]]: the positions have shape [2], got [3]");
+    assert_eq!(t("set m[0] to 1"), "ERR: a mask holds true or false, got 1");
+    assert_eq!(t("set m[0] to array([1, 2])"), "ERR: a mask holds true or false, got an f64 array");
+    assert_eq!(t("set a[0] to true"), "ERR: an f64 array holds numbers, got bool — use 1.0");
+    assert_eq!(t("set M[0] to array([1, 0]) > 0"), "ERR: an f64 array holds numbers, got a mask — use m * 1.0");
+    assert_eq!(t("set a[0] to \"x\""), "ERR: an f64 array holds numbers, got text");
+    assert_eq!(t("set a[m] to 0"), "ERR: set takes positions, not a mask — if_else(m, 0, a) builds the new array");
+    assert_eq!(t("set a[9] to 1"), "ERR: Index 9 out of bounds (array axis 0 has length 4)");
+    assert_eq!(t("set M[0] to [1, 2]"), "ERR: set: make the list an array first: array(xs)");
+    assert_eq!(
+        t("set M[[0, 1]][0] to 1"),
+        "ERR: set: a list of positions only goes in the last index — set M[[0, 2]] to rows, or M[i][j] one by one"
+    );
+    assert_eq!(t("set a[0][0] to 1"), "ERR: Cannot set index on number");
+    // Un error no deja nada escrito ni afecta al siguiente `set`.
+    assert_eq!(t("let r be 0\nset M[0][\"x\"] to 1\nprint(M)"), "ERR: an index must be an integer, got text");
+}
+
+/// R5: escribir en un array no cambia a nadie más (un alias, el argumento de una task, el array
+/// que recorre un `each`).
+#[test]
+fn set_has_value_semantics() {
+    assert_eq!(with_a("let b be a\nset a[0] to 9\nprint(a)\nprint(b)"), "[9, 5, 2, 8]\n[1, 5, 2, 8]");
+    assert_eq!(with_a("let b be a\nset b[0] to 9\nprint(a)\nprint(b)"), "[1, 5, 2, 8]\n[9, 5, 2, 8]");
+    assert_eq!(
+        with_a("task zero(c)\n    set c[0] to 0\n    give c\nlet z be zero(a)\nprint(a)\nprint(z)"),
+        "[1, 5, 2, 8]\n[0, 5, 2, 8]"
+    );
+    assert_eq!(both(&format!("{}let R be M[0]\nset M[0][0] to 9\nprint(R)\nprint(M)", M)), "[1, 2]\n[[9, 2], [3, 4]]");
+    assert_eq!(both(&format!("{}let R be M\nset M[0][0] to 9\nprint(R)", M)), "[[1, 2], [3, 4]]");
+    assert_eq!(
+        with_a("let seen be []\neach x in a\n    set a[0] to 100\n    set seen to append(seen, x)\nprint(seen)\nprint(a)"),
+        "[1.0, 5.0, 2.0, 8.0]\n[100, 5, 2, 8]"
+    );
+    assert_eq!(
+        both("let xs be [array([1, 2])]\nlet ys be xs\nset xs[0][0] to 9\nprint(xs)\nprint(ys)"),
+        "[[9, 2]]\n[[1, 2]]"
+    );
+}
+
+/// R5 y §5: sin otro dueño, `set a[i]` escribe en el mismo array (no lo copia en cada vuelta).
+#[test]
+fn set_writes_in_place_when_nobody_shares() {
+    use synsema_core::interpreter::{env_get, Interpreter};
+    for labels in [false, true] {
+        let mut interp = Interpreter::new();
+        interp.set_labels(labels);
+        let run = |interp: &mut Interpreter, src: &str| {
+            let program = synsema_core::parser::parse_source(src, "<v0655>").unwrap();
+            if let Err(Control::Error(e)) = interp.execute(&program) {
+                panic!("{}", e);
+            }
+        };
+        let ptr = |interp: &Interpreter| match env_get(&interp.global_env, "z") {
+            Some(synsema_core::types::SynValue::Array(o)) => synsema_core::types::Obj::as_ptr(&o) as usize,
+            other => panic!("{:?}", other.map(|v| v.to_string())),
+        };
+        run(&mut interp, "let z be zeros([300, 4])\n");
+        let before = ptr(&interp);
+        run(&mut interp, "let i be 0\nwhile i < 300\n    set z[i] to i\n    set z[i][1] to -1\n    set i to i + 1\n");
+        assert_eq!(ptr(&interp), before, "labels = {}", labels);
+        run(&mut interp, "let w be z\nset z[0][0] to 7\n");
+        assert_ne!(ptr(&interp), before, "con un alias se copia (labels = {})", labels);
+    }
+}

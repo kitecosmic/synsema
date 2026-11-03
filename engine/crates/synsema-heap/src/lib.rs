@@ -926,6 +926,24 @@ impl<T> Obj<T> {
         }
     }
 
+    /// `&mut` con exactamente `owners` dueños conocidos y sin débiles, nunca si es inmortal (como
+    /// `get_mut` con una cuenta mayor). Es la escritura en el lugar de `set a[i]` (v0.6.55): el
+    /// camino del `set` dejó el valor único en su lugar (`make_unique`) y lo recorre con una copia
+    /// de la referencia, así que los dueños son el lugar y esa copia.
+    ///
+    /// # Safety
+    /// Los otros `owners - 1` dueños no pueden leer el valor ni tener un `&T` vivo mientras dure el
+    /// `&mut`; ven la escritura después (como la lista de un lugar, que se escribe por su `RefCell`).
+    pub unsafe fn get_mut_with_owners(this: &Self, owners: usize) -> Option<&mut T> {
+        let h = this.header();
+        if owners >= 1 && h.strong.get() as usize == owners && h.strong.get() != IMMORTAL && h.weak.get() == 0 {
+            // SAFETY: lo garantiza quien llama (ver arriba); inmortal no: lo leen otros hilos.
+            Some(unsafe { &mut *this.ptr.as_ref().value.get() })
+        } else {
+            None
+        }
+    }
+
     /// `&mut` copiando antes si no es el único dueño (como `Rc::make_mut`).
     pub fn make_mut(this: &mut Self) -> &mut T
     where

@@ -30,6 +30,8 @@ pub const BUILTIN_KWARGS: &[(&str, &[&str])] = &[
     ("random_normal", &["mean", "std"]),
     ("array_from_bytes", &["shape"]),
     ("random_uniform", &["low", "high"]),
+    ("take", &["axis"]),
+    ("index_add", &["axis"]),
     ("int", &["base", "fallback"]),
     ("json_decode", &["allow_nan"]),
     ("jsonl_decode", &["allow_nan"]),

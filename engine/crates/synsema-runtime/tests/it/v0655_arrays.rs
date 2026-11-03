@@ -226,3 +226,84 @@ fn arrays_to_bytes_and_back() {
     err_has("print(array_from_bytes(\"abc\", \"f64\"))", "array_from_bytes expects bytes, got text");
     err_has("print(array_to_bytes([1, 2]))", "array_to_bytes expects an array, got list");
 }
+
+// Ítems 2 y 3: `take` e `index_add` (stdlib), y `set a[i]` con etiquetas.
+// Valores: `specs/v0.6.55-numpy/item23.py`.
+
+#[test]
+fn take_picks_positions_along_an_axis() {
+    assert_eq!(with_a("print(take(M, [1, 0], axis = 1))\nprint(take(M, [1, 0], axis = -1))"), "[[2, 1], [4, 3]]\n[[2, 1], [4, 3]]");
+    assert_eq!(with_a("print(take(M, [1, 1], axis = 0))\nprint(take(a, [3, 0]))"), "[[3, 4], [3, 4]]\n[8, 1]");
+    assert_eq!(with_a("print(dtype(take(m, [0, 1])))"), "bool");
+    err_has("print(take(M, [0], axis = 2))", "take: axis 2 out of range for a 2-D array");
+    err_has(
+        "print(take(M, [0]))",
+        "take: say which axis of the 2-D array — axis = 0 for rows, axis = 1 for columns (numpy's take without an axis flattens: take(flatten(a), …))",
+    );
+    err_has("print(take(M, [0, 2], axis = 1))", "take: Index 2 out of bounds (array axis 1 has length 2)");
+    err_has("print(take(a, m))", "take takes positions, not a mask — for the elements where a mask is true: where(a, m)");
+    err_has("print(take([1, 2], [0]))", "take expects an array, got list");
+}
+
+#[test]
+fn index_add_accumulates_repeated_positions() {
+    assert_eq!(with_a("print(index_add(a, [0, 0, 2], array([1, 1, 1])))\nprint(a)"), "[3, 5, 3, 8]\n[1, 5, 2, 8]");
+    assert_eq!(with_a("print(index_add(a, [0, 0, 2], 1))"), "[3, 5, 3, 8]");
+    // El gradiente de un embedding: filas sumadas en sus posiciones.
+    assert_eq!(
+        with_a("print(index_add(zeros([4, 2]), [0, 2, 0], array([[1, 1], [2, 2], [3, 3]])))"),
+        "[[4, 4], [0, 0], [2, 2], [0, 0]]"
+    );
+    assert_eq!(
+        with_a("print(index_add(zeros([2, 3]), [2, 2], array([[1, 2], [3, 4]]), axis = 1))"),
+        "[[0, 0, 3], [0, 0, 7]]"
+    );
+    err_has("print(index_add(a, [0, 1], array([1, 2, 3])))", "index_add: the values have shape [3] and the selection [2]");
+    err_has("print(index_add(a, [0, 1], [1, 2]))", "index_add: make the list an array first: array(xs)");
+    err_has("print(index_add(a, [9], 1))", "index_add: Index 9 out of bounds (array axis 0 has length 4)");
+}
+
+/// R6 con `set`: un array privado recibe valores tan privados como él; uno público no guarda un
+/// elemento privado, y una rama privada no escribe en él.
+#[test]
+fn set_into_an_array_respects_labels() {
+    use synsema_core::interpreter::{env_get, Control, Interpreter};
+    use synsema_core::labels::{label_deep, label_display_raw, strip_deep};
+    let run = |src: &str| {
+        let program = synsema_core::parser::parse_source(src, "<v0655>").unwrap();
+        let mut interp = Interpreter::new();
+        synsema_stdlib::ndarray_ops::register_ndarray_builtins(&interp);
+        interp.set_labels(true);
+        interp.set_labels_detail_to_program(true);
+        let r = interp.execute(&program);
+        (interp, r)
+    };
+    let (interp, r) = run("let p be private(array([1, 5, 2, 8]), \"x\")\nset p[0] to p[1] * 2\nset p[[2, 3]] to 0\n");
+    assert!(r.is_ok(), "{:?}", r.err().map(|c| match c { Control::Error(e) => e.message.clone(), _ => String::new() }));
+    let v = env_get(&interp.global_env, "p").unwrap();
+    assert_eq!((label_display_raw(&label_deep(&v)), strip_deep(&v).to_string()), ("x".to_string(), "[10, 5, 0, 0]".to_string()));
+    // R5 con un array privado: el alias no cambia.
+    let (interp, r) = run("let p be private(array([1, 2]), \"x\")\nlet q be p\nset p[0] to 9\n");
+    assert!(r.is_ok());
+    let q = env_get(&interp.global_env, "q").unwrap();
+    let p = env_get(&interp.global_env, "p").unwrap();
+    assert_eq!((strip_deep(&q).to_string(), strip_deep(&p).to_string()), ("[1, 2]".to_string(), "[9, 2]".to_string()));
+    let err_of = |src: &str| match run(src).1 {
+        Err(Control::Error(e)) => e.message.clone(),
+        other => panic!("se esperaba un error: {:?}", other.is_ok()),
+    };
+    let e = err_of("let a be array([1, 5])\nlet s be private(3, \"x\")\nset a[0] to s\n");
+    assert!(e.contains("into the array 'a' (public): an array is private as a whole"), "{}", e);
+    let e = err_of("let a be array([1, 5])\nlet s be private(3, \"x\")\nwhen s > 2\n    set a[0] to 1\n");
+    assert!(e.contains("a position of the array 'a'"), "{}", e);
+}
+
+/// Diseño §3.3: un array congelado (el global que leen los workers de `parallel_map`) siempre se
+/// copia al escribir; el de los demás workers y el del programa no cambian.
+#[test]
+fn set_on_a_frozen_array_copies() {
+    let src = "let G be array([1, 2, 3])\n\
+        task f(i)\n    let c be G\n    set c[0] to i\n    give sum(c)\n\
+        print(parallel_map(f, [10, 20, 30]))\nprint(G)";
+    assert_eq!(with_a(src), "[15.0, 25.0, 35.0]\n[1, 2, 3]");
+}

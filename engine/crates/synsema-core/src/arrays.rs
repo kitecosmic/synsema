@@ -1451,3 +1451,280 @@ pub fn polyval(args: &[SynValue]) -> Result<SynValue, Control> {
         }
     }
 }
+
+// =========================================================
+// v0.6.55, ítems 2 y 3: indexar con posiciones y escribir (R5)
+// =========================================================
+
+/// Para qué se piden las posiciones: cambia sólo el texto del error de una máscara.
+#[derive(Clone, Copy)]
+pub enum PosFor<'a> {
+    /// `a[[0, 3]]`.
+    Read,
+    /// `set a[[0, 3]] to …`.
+    Set,
+    /// Un builtin (`take`, `index_add`): su nombre va adelante.
+    Builtin(&'a str),
+}
+
+/// Las posiciones de `idx` sobre un eje de largo `len`: un número (una), una lista o un array de
+/// enteros (en ese orden, repetir vale). Negativos desde el final; fuera de rango, el error de
+/// `a[i]`. Una máscara no es una lista de posiciones.
+#[inline(never)]
+pub fn positions(idx: &SynValue, len: usize, axis: usize, why: PosFor) -> Result<Vec<usize>, Control> {
+    let pre = match why {
+        PosFor::Builtin(n) => format!("{}: ", n),
+        _ => String::new(),
+    };
+    let one = |x: f64, shown: &dyn std::fmt::Display| -> Result<usize, Control> {
+        let k = x as i64;
+        let j = if k < 0 { k + len as i64 } else { k };
+        if j < 0 || j >= len as i64 {
+            return Err(err(format!("{}Index {} out of bounds (array axis {} has length {})", pre, shown, axis, len)));
+        }
+        Ok(j as usize)
+    };
+    let number = |n: &Number| -> Result<usize, Control> {
+        let x = n.to_f64();
+        if !(x.is_finite() && x.fract() == 0.0) {
+            return Err(err(format!(
+                "{}index must be an integer, got {} — use floor(x), round(x) or trunc(x) on purpose",
+                pre, n
+            )));
+        }
+        one(x, n)
+    };
+    match idx {
+        SynValue::Number(n) => Ok(vec![number(n)?]),
+        SynValue::List(l) => list_values(l)
+            .iter()
+            .map(|v| match v {
+                SynValue::Number(n) => number(n),
+                other => Err(err(format!("{}an index must be an integer, got {}", pre, other.type_name()))),
+            })
+            .collect(),
+        SynValue::Array(a) => match &**a {
+            NdArray::Bool(_) => Err(err(match why {
+                PosFor::Read => "an array is indexed by positions — for the elements where a mask is true: where(a, m)".to_string(),
+                PosFor::Set => "set takes positions, not a mask — if_else(m, 0, a) builds the new array".to_string(),
+                PosFor::Builtin(n) => {
+                    format!("{} takes positions, not a mask — for the elements where a mask is true: where(a, m)", n)
+                }
+            })),
+            NdArray::F64(x) => {
+                if x.ndim() != 1 {
+                    return Err(err(format!("{}an array index must be 1-D, got shape {:?}", pre, x.shape())));
+                }
+                x.iter()
+                    .map(|&v| {
+                        if !(v.is_finite() && v.fract() == 0.0) {
+                            return Err(err(format!("{}an array index must hold whole numbers, got {} — round first", pre, v)));
+                        }
+                        one(v, &v)
+                    })
+                    .collect()
+            }
+        },
+        other => Err(err(format!("{}an index must be an integer, got {}", pre, other.type_name()))),
+    }
+}
+
+/// `a[[1, 0]]`, `a[array([0, 3])]`: las filas en esas posiciones (como `take(a, …, axis = 0)`).
+/// Un índice que no es número llega acá; el número sigue por `index_row`.
+#[inline(never)]
+pub fn index_by(a: &NdArray, idx: &SynValue) -> Result<SynValue, Control> {
+    if a.ndim() == 0 {
+        return Err(err("cannot index a 0-dimensional array"));
+    }
+    let pos = positions(idx, a.shape()[0], 0, PosFor::Read)?;
+    Ok(take_axis(a, &pos, 0))
+}
+
+/// Las posiciones `pos` del eje `axis`, en orden, con el tipo de elemento.
+pub fn take_axis(a: &NdArray, pos: &[usize], axis: usize) -> SynValue {
+    nd_value_of(nd_map!(a, |x| x.select(Axis(axis), pos)))
+}
+
+/// Una fila del camino de un `set` (`set M[i][j]`): la fila es una copia y se recuerda de qué array
+/// salió y en qué posición, para que la hoja la vuelva a escribir ahí (`set_index`). Guarda la
+/// copia viva, así que su dirección no se reusa: una entrada que quedó de un `set` que falló no se
+/// confunde con otra fila.
+struct RowPlace {
+    row: crate::types::Obj<NdArray>,
+    parent: crate::types::Obj<NdArray>,
+    at: usize,
+}
+
+thread_local! {
+    static ROW_PLACES: std::cell::RefCell<Vec<RowPlace>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Un paso `[i]` del camino de un `set` sobre un array (`place_index_step`): la fila `i`, recordada.
+#[inline(never)]
+pub fn place_row(parent: &SynValue, idx: &SynValue) -> Result<SynValue, Control> {
+    let SynValue::Array(p) = parent else {
+        return Err(err(format!("Cannot index into {}", parent.type_name())));
+    };
+    if p.ndim() == 0 {
+        return Err(err("cannot index a 0-dimensional array"));
+    }
+    if !matches!(idx, SynValue::Number(_)) {
+        return Err(err(
+            "set: a list of positions only goes in the last index — set M[[0, 2]] to rows, or M[i][j] one by one",
+        ));
+    }
+    let at = positions(idx, p.shape()[0], 0, PosFor::Set)?[0];
+    let row = index_row(p, at as i64)?;
+    if let SynValue::Array(r) = &row {
+        ROW_PLACES.with(|v| {
+            let mut v = v.borrow_mut();
+            if v.len() >= 64 {
+                v.clear();
+            }
+            v.push(RowPlace { row: r.clone(), parent: p.clone(), at });
+        });
+    }
+    Ok(row)
+}
+
+/// Lo que se escribe, ya convertido al tipo del array.
+enum Payload {
+    F64(f64),
+    Bool(bool),
+    F64s(ArrayD<f64>),
+    Bools(ArrayD<bool>),
+}
+
+impl Payload {
+    fn of(value: &SynValue, mask: bool) -> Result<Payload, Control> {
+        let value = crate::labels::unwrap(value);
+        let shown = |v: &SynValue| match v {
+            SynValue::Number(n) => n.to_string(),
+            SynValue::Bool(b) => b.to_string(),
+            SynValue::Array(a) if a.dtype() == "bool" => "a mask".to_string(),
+            SynValue::Array(_) => "an f64 array".to_string(),
+            o => o.type_name().to_string(),
+        };
+        Ok(match (mask, value) {
+            (_, SynValue::List(_)) => return Err(err("set: make the list an array first: array(xs)")),
+            (false, SynValue::Number(n)) => Payload::F64(n.to_f64()),
+            (false, SynValue::Array(a)) if a.dtype() == "f64" => Payload::F64s(a.to_f64().into_owned()),
+            (false, SynValue::Bool(_)) => return Err(err("an f64 array holds numbers, got bool — use 1.0")),
+            (false, SynValue::Array(_)) => return Err(err("an f64 array holds numbers, got a mask — use m * 1.0")),
+            (false, o) => return Err(err(format!("an f64 array holds numbers, got {}", shown(o)))),
+            (true, SynValue::Bool(b)) => Payload::Bool(*b),
+            (true, SynValue::Array(a)) => match &**a {
+                NdArray::Bool(m) => Payload::Bools(m.clone()),
+                NdArray::F64(_) => return Err(err("a mask holds true or false, got an f64 array")),
+            },
+            (true, o) => return Err(err(format!("a mask holds true or false, got {}", shown(o)))),
+        })
+    }
+
+    fn shape(&self) -> Option<&[usize]> {
+        match self {
+            Payload::F64s(a) => Some(a.shape()),
+            Payload::Bools(a) => Some(a.shape()),
+            _ => None,
+        }
+    }
+}
+
+/// Escribe `p` en las posiciones `pos` del primer eje de `x` (la región es `[k] ++ shape[1..]`, o
+/// `shape[1..]` con un índice solo). Las formas ya están verificadas.
+fn write_region<T: Copy>(x: &mut ArrayD<T>, pos: &[usize], single: bool, scalar: Option<T>, arr: Option<&ArrayD<T>>) {
+    let region: Vec<usize> = if single {
+        x.shape()[1..].to_vec()
+    } else {
+        std::iter::once(pos.len()).chain(x.shape()[1..].iter().copied()).collect()
+    };
+    let src = arr.map(|a| a.broadcast(IxDyn(&region)).expect("forma verificada"));
+    for (n, &p) in pos.iter().enumerate() {
+        let mut dst = x.index_axis_mut(Axis(0), p);
+        match (&scalar, &src) {
+            (Some(v), _) => dst.fill(*v),
+            (None, Some(s)) if single => dst.assign(s),
+            (None, Some(s)) => dst.assign(&s.index_axis(Axis(0), n)),
+            (None, None) => {}
+        }
+    }
+}
+
+/// `set a[idx] to value` (la hoja; `set_leaf_index`): escribe en el lugar el array que el camino
+/// dejó único. Si `a` es una fila del camino (`set M[i][j]`), la fila escrita vuelve a su array,
+/// hasta el de la variable. `root`: el nombre de la variable, para el error de forma.
+#[inline(never)]
+pub fn set_index(obj: &SynValue, idx: &SynValue, value: SynValue, root: Option<&str>) -> Result<SynValue, Control> {
+    let SynValue::Array(a) = obj else {
+        return Err(err(format!("Cannot set index on {}", obj.type_name())));
+    };
+    // La cadena de filas (de adentro hacia afuera); todo lo demás que quedó es de un `set` que
+    // falló y se descarta.
+    let mut chain: Vec<(crate::types::Obj<NdArray>, usize)> = Vec::new();
+    ROW_PLACES.with(|v| {
+        let mut v = v.borrow_mut();
+        let mut cur = a.clone();
+        while let Some(k) = v.iter().position(|e| crate::types::Obj::ptr_eq(&e.row, &cur)) {
+            let e = v.swap_remove(k);
+            cur = e.parent.clone();
+            chain.push((e.parent, e.at));
+        }
+        v.clear();
+    });
+    if a.ndim() == 0 {
+        return Err(err("cannot index a 0-dimensional array"));
+    }
+    let single = matches!(idx, SynValue::Number(_));
+    let pos = positions(idx, a.shape()[0], 0, PosFor::Set)?;
+    let payload = Payload::of(&value, a.dtype() == "bool")?;
+    let sub = &a.shape()[1..];
+    let region: Vec<usize> =
+        if single { sub.to_vec() } else { std::iter::once(pos.len()).chain(sub.iter().copied()).collect() };
+    if let Some(vs) = payload.shape() {
+        if broadcast_shape(vs, &region).as_deref() != Some(region.as_slice()) {
+            let what = if single { if sub.is_empty() { "the element is a number" } else { "the row has shape" } } else { "the positions have shape" };
+            let shape = if single && sub.is_empty() { String::new() } else { format!(" {:?}", region) };
+            return Err(err(format!(
+                "set {}[{}]: {}{}, got {:?}",
+                root.unwrap_or("a"),
+                crate::labels::unwrap(idx),
+                what,
+                shape,
+                vs
+            )));
+        }
+    }
+    // Los dueños: una fila del camino es sólo de esta escritura; el array de la variable, además,
+    // de su lugar.
+    let owners = if chain.is_empty() { 2 } else { 1 };
+    // SAFETY: el camino del `set` dejó el array único en su lugar (`make_unique`) y nadie lo lee
+    // mientras se escribe; si la cuenta no es la esperada, no se escribe.
+    let target = unsafe { crate::types::Obj::get_mut_with_owners(a, owners) }.ok_or_else(in_use)?;
+    match (target, payload) {
+        (NdArray::F64(x), Payload::F64(v)) => write_region(x, &pos, single, Some(v), None),
+        (NdArray::F64(x), Payload::F64s(s)) => write_region(x, &pos, single, None, Some(&s)),
+        (NdArray::Bool(x), Payload::Bool(v)) => write_region(x, &pos, single, Some(v), None),
+        (NdArray::Bool(x), Payload::Bools(s)) => write_region(x, &pos, single, None, Some(&s)),
+        _ => unreachable!("Payload::of sigue el tipo del array"),
+    }
+    // Cada fila vuelve a su array: la de adentro al de arriba, hasta el de la variable.
+    let mut child = a.clone();
+    let n = chain.len();
+    for (i, (parent, at)) in chain.into_iter().enumerate() {
+        let owners = if i + 1 == n { 2 } else { 1 };
+        // SAFETY: como arriba; las filas de la cadena son copias que sólo tiene esta escritura.
+        let p = unsafe { crate::types::Obj::get_mut_with_owners(&parent, owners) }.ok_or_else(in_use)?;
+        match (p, &*child) {
+            (NdArray::F64(x), NdArray::F64(r)) => x.index_axis_mut(Axis(0), at).assign(r),
+            (NdArray::Bool(x), NdArray::Bool(r)) => x.index_axis_mut(Axis(0), at).assign(r),
+            _ => unreachable!("una fila tiene el tipo de su array"),
+        }
+        child = parent;
+    }
+    Ok(value)
+}
+
+#[cold]
+fn in_use() -> Control {
+    err("set: the array is in use elsewhere in this statement and cannot be written in place — compute the index or the value into a variable first")
+}

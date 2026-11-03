@@ -13,7 +13,7 @@
 use std::rc::Rc;
 
 use ndarray::{ArrayD, Dimension, IxDyn, Zip};
-use synsema_core::arrays::{broadcast_shape, elem_operand, zip_broadcast};
+use synsema_core::arrays::{broadcast_shape, elem_operand, positions, take_axis, zip_broadcast, PosFor};
 use synsema_core::interpreter::{Control, Interpreter, RuntimeError};
 use synsema_core::types::{syn_array, syn_bool, syn_float, syn_mask, syn_text, NdArray, SynValue};
 
@@ -45,6 +45,8 @@ pub fn register_ndarray_builtins(interp: &Interpreter) {
     interp.register_builtin("matmul", 2, Rc::new(|_i, a, _l| matmul(a)));
     interp.register_builtin("array_to_bytes", -1, Rc::new(|_i, a, _l| array_to_bytes(a)));
     interp.register_builtin("array_from_bytes", 2, Rc::new(|i, a, _l| array_from_bytes(i, a)));
+    interp.register_builtin("take", 2, Rc::new(|i, a, _l| take(i, a)));
+    interp.register_builtin("index_add", 3, Rc::new(|i, a, _l| index_add(i, a)));
 }
 
 /// `dtype(a)`: `"f64"` o `"bool"` (R1).
@@ -398,6 +400,96 @@ pub fn array_from_bytes(interp: &mut Interpreter, args: &[SynValue]) -> Result<S
             .expect("forma verificada"),
         ),
     })
+}
+
+// =========================================================
+// Ítems 2 y 3: `take` e `index_add`
+// =========================================================
+
+/// El eje de `take`/`index_add` (`axis = k`, negativo desde el final), o el de siempre.
+fn axis_kw(interp: &mut Interpreter, name: &str, ndim: usize, default: Option<usize>) -> Result<Option<usize>, Control> {
+    match interp.kwarg("axis") {
+        None | Some(SynValue::Nothing) => Ok(default),
+        Some(SynValue::Number(n)) if n.is_integer() => {
+            let k = n.to_i64_trunc().unwrap_or(i64::MAX);
+            let j = if k < 0 { k + ndim as i64 } else { k };
+            if j < 0 || j >= ndim as i64 {
+                return Err(err(format!("{}: axis {} out of range for a {}-D array", name, k, ndim)));
+            }
+            Ok(Some(j as usize))
+        }
+        Some(other) => Err(err(format!("{}: axis must be an integer, got {}", name, other))),
+    }
+}
+
+/// `take(a, [1, 0], axis = 1)`: las posiciones de ese eje, en orden (np.take). Sobre un 1-D el eje
+/// es el único; con más ejes hay que decirlo (el `take` de numpy sin eje aplana: eso es
+/// `take(flatten(a), …)`).
+pub fn take(interp: &mut Interpreter, args: &[SynValue]) -> Result<SynValue, Control> {
+    let a = match args.first() {
+        Some(SynValue::Array(a)) => a,
+        Some(other) => {
+            let _ = interp.kwarg("axis");
+            return Err(err(format!("take expects an array, got {}", other.type_name())));
+        }
+        None => return Err(err("take expects 2 argument(s), got 0")),
+    };
+    let nd = a.ndim();
+    let axis = axis_kw(interp, "take", nd, if nd == 1 { Some(0) } else { None })?;
+    arity(args, 2, "take")?;
+    if nd == 0 {
+        return Err(err("take: a 0-dimensional array has no axis"));
+    }
+    let Some(axis) = axis else {
+        return Err(err(format!(
+            "take: say which axis of the {}-D array — axis = 0 for rows, axis = 1 for columns (numpy's take without an axis flattens: take(flatten(a), …))",
+            nd
+        )));
+    };
+    let pos = positions(&args[1], a.shape()[axis], axis, PosFor::Builtin("take"))?;
+    Ok(take_axis(a, &pos, axis))
+}
+
+/// `index_add(a, [0, 0, 2], values, axis = 0)`: un array nuevo con `values` sumados en esas
+/// posiciones del eje; las repetidas acumulan, en el orden de las posiciones. Con `axis = 0` sobre
+/// una matriz suma filas (el gradiente de un embedding). `values` tiene la forma de la selección
+/// (o se le hace broadcasting); una máscara cuenta como 0/1 (R2).
+pub fn index_add(interp: &mut Interpreter, args: &[SynValue]) -> Result<SynValue, Control> {
+    let a = match args.first() {
+        Some(SynValue::Array(a)) => a,
+        Some(other) => {
+            let _ = interp.kwarg("axis");
+            return Err(err(format!("index_add expects an array, got {}", other.type_name())));
+        }
+        None => return Err(err("index_add expects 3 argument(s), got 0")),
+    };
+    let nd = a.ndim();
+    let axis = axis_kw(interp, "index_add", nd, Some(0))?.unwrap_or(0);
+    arity(args, 3, "index_add")?;
+    if nd == 0 {
+        return Err(err("index_add: a 0-dimensional array has no axis"));
+    }
+    let pos = positions(&args[1], a.shape()[axis], axis, PosFor::Builtin("index_add"))?;
+    let values = elem_operand(&args[2]).ok_or_else(|| match &args[2] {
+        SynValue::List(_) => err("index_add: make the list an array first: array(xs)"),
+        o => err(format!("index_add expects an array or a number for the values, got {}", o.type_name())),
+    })?;
+    let mut region = a.shape().to_vec();
+    region[axis] = pos.len();
+    let Some(vb) = values.broadcast(IxDyn(&region)) else {
+        return Err(err(format!(
+            "index_add: the values have shape {:?} and the selection {:?}",
+            values.shape(),
+            region
+        )));
+    };
+    let mut out = a.to_f64().into_owned();
+    for (n, &p) in pos.iter().enumerate() {
+        let src = vb.index_axis(ndarray::Axis(axis), n);
+        let mut dst = out.index_axis_mut(ndarray::Axis(axis), p);
+        dst += &src;
+    }
+    Ok(syn_array(out))
 }
 
 #[cfg(test)]

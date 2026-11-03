@@ -1107,6 +1107,7 @@ pub(crate) fn set_leaf_index(
     obj: &SynValue,
     idx: &SynValue,
     value: SynValue,
+    target: &Node,
     target_loc: &SourceLocation,
     loc: &SourceLocation,
 ) -> Result<SynValue, Control> {
@@ -1140,6 +1141,9 @@ pub(crate) fn set_leaf_index(
             m.borrow_mut().set_value_key(idx, value.clone());
             Ok(value)
         }
+        // v0.6.55 (ítem 3, R5): en el lugar; el error de un índice, donde está el destino.
+        SynValue::Array(_) => crate::arrays::set_index(obj, idx, value, set_root_identifier(target))
+            .map_err(|e| crate::arrays::located(e, target_loc)),
         _ => Err(cannot_set(obj, "index", loc)),
     }
 }
@@ -8281,7 +8285,14 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                     } else {
                         (obj, idx, value)
                     };
-                set_leaf_index(&obj, &idx, value, &target.location, loc)
+                // Un array no guarda un elemento privado: el valor tiene que ser a lo sumo tan
+                // privado como la variable (R6: la etiqueta es del array entero).
+                let value = if self.labels && matches!(obj, SynValue::Array(_)) && labels::has_label_deep(&value) {
+                    self.array_set_value(target, value, env, loc)?
+                } else {
+                    value
+                };
+                set_leaf_index(&obj, &idx, value, target, &target.location, loc)
             }
             _ => Err(err_at("Invalid set target", loc)),
         }
@@ -8325,6 +8336,7 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
             return Ok((labels::unwrap(&obj).clone(), value));
         }
         let what = match root {
+            Some(name) if matches!(labels::unwrap(&obj), SynValue::Array(_)) => format!("a position of the array '{}'", name),
             Some(name) => format!("a position of '{}'", name),
             None => "a position of a container that is not a variable".to_string(),
         };
@@ -8334,6 +8346,33 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                 what,
                 if have.is_empty() { "public".to_string() } else { format!("private to {}", self.safe_label(&have)) },
                 self.safe_label(&needed)
+            ),
+            loc,
+        ))
+    }
+
+    /// `set a[i] to v` con `v` privado (v0.6.55, R6): un array no tiene elementos privados, así que
+    /// `v` tiene que ser a lo sumo tan privado como la variable raíz, y se escribe sin la etiqueta.
+    #[inline(never)]
+    fn array_set_value(
+        &mut self,
+        target: &Node,
+        value: SynValue,
+        env: &Rc<RefCell<Environment>>,
+        loc: &SourceLocation,
+    ) -> Result<SynValue, Control> {
+        let root = set_root_identifier(target);
+        let have = root.and_then(|n| env_get(env, n)).map(|v| labels::label(&v)).unwrap_or_else(labels::empty);
+        let got = labels::label_deep(&value);
+        if labels::subset(&got, &have) {
+            return Ok(labels::strip_deep(&value));
+        }
+        Err(err_labels(
+            format!(
+                "label_violation: cannot write a value private to {} into the array '{}' ({}): an array is private as a whole, not element by element — bind it as private(…, \"<principal>\") first, or declassify the value",
+                self.safe_label(&got),
+                root.unwrap_or("?"),
+                if have.is_empty() { "public".to_string() } else { format!("private to {}", self.safe_label(&have)) }
             ),
             loc,
         ))
@@ -8467,7 +8506,11 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                 }
             }
             // `a[i]` → fila (nD) o escalar (1D). Negativo/fuera de rango → error.
-            SynValue::Array(a) => crate::arrays::index_row(a, num_to_i64(&idx)?),
+            SynValue::Array(a) => match &idx {
+                SynValue::Number(_) => crate::arrays::index_row(a, num_to_i64(&idx)?),
+                // v0.6.55 (ítem 2): `a[[1, 0]]`, `a[array([0, 3])]`; una máscara da el error de `where`.
+                _ => crate::arrays::index_by(a, &idx),
+            },
             _ => Err(err_at(format!("Cannot index into {}", obj.type_name()), loc)),
         };
         match plabel {
@@ -8536,6 +8579,10 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                 if let Some(slot) = m.borrow_mut().get_mut(&key) {
                     make_unique(slot);
                 }
+            }
+            // v0.6.55 (R5): `set M[i][j]`: la fila es una copia que la hoja vuelve a escribir en `M`.
+            SynValue::Array(_) => {
+                return crate::arrays::place_row(labels::unwrap(&parent), labels::unwrap(&idx)).map_err(|e| crate::arrays::located(e, loc));
             }
             _ => {}
         }
@@ -11796,7 +11843,7 @@ fn is_scalar_literal(node: &Node) -> bool {
 
 /// La variable raíz de un destino de `set` (`m` en `set m["a"][k].f to v`), si el camino
 /// nace de un identificador; `None` si nace de otra expresión (una llamada, un literal…).
-fn set_root_identifier(target: &Node) -> Option<&str> {
+pub(crate) fn set_root_identifier(target: &Node) -> Option<&str> {
     match &target.kind {
         NodeKind::Identifier { name } => Some(name.as_str()),
         NodeKind::IndexAccess { object, .. } | NodeKind::PropertyAccess { object, .. } => {
@@ -12500,18 +12547,28 @@ fn make_unique_n(slot: &mut SynValue, extra: usize) {
             }
             *slot = SynValue::Map(copy);
         }
+        // v0.6.55 (R5): `set a[i]` escribe el array en el lugar; si otro lo comparte (o está
+        // congelado: su cuenta es `usize::MAX`), se copia antes, como una lista.
+        SynValue::Array(o) if crate::types::Obj::strong_count(o) > owners => {
+            *slot = SynValue::Array(crate::types::Obj::new((**o).clone()));
+        }
         SynValue::Private(p) => {
             let shared_inner = match &p.value {
                 SynValue::List(rc) => crate::types::ListRef::strong_count(rc) > 1,
                 SynValue::Map(rc) => crate::types::MapRef::strong_count(rc) > 1,
+                SynValue::Array(o) => crate::types::Obj::strong_count(o) > 1,
                 _ => false,
             };
-            if shared_inner || (crate::types::Obj::strong_count(p) > owners && matches!(p.value, SynValue::List(_) | SynValue::Map(_))) {
+            if shared_inner
+                || (crate::types::Obj::strong_count(p) > owners
+                    && matches!(p.value, SynValue::List(_) | SynValue::Map(_) | SynValue::Array(_)))
+            {
                 // Copia del contenedor interno aunque su cuenta sea 1 cuando el envoltorio
                 // está compartido: el alias ve el mismo Rc interno.
                 let inner = match &p.value {
                     SynValue::List(rc) => SynValue::List(crate::types::ListRef::new(rc.borrow().clone())),
                     SynValue::Map(rc) => SynValue::Map(rc.borrow().to_ref()),
+                    SynValue::Array(o) => SynValue::Array(crate::types::Obj::new((**o).clone())),
                     other => other.clone(),
                 };
                 *slot = labels::labelled(inner, p.label.clone());
