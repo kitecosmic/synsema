@@ -76,7 +76,7 @@ macro_rules! nd_map {
 }
 
 /// `shape` desde un arg: un entero `n` → `[n]` (1D); una lista de enteros `[2,3]` → nD.
-fn shape_from(v: &SynValue, name: &str) -> Result<Vec<usize>, Control> {
+pub fn shape_from(v: &SynValue, name: &str) -> Result<Vec<usize>, Control> {
     let dim = |n: &Number| -> Result<usize, Control> {
         let i = n.to_i64_trunc().ok_or_else(|| err(format!("{}: dimension too large", name)))?;
         if i < 0 {

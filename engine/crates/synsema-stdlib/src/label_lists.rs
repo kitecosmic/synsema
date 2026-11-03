@@ -172,6 +172,7 @@ pub const LABEL_PURE_BUILTINS: &[&str] = &[
     "bit_and", "bit_or", "bit_xor", "bit_not", "shl", "shr", "xor_bytes",
     // v0.6.55: arrays elemento a elemento (máscaras).
     "dtype", "equal", "not_equal", "logical_and", "logical_or", "logical_not", "if_else", "maximum", "minimum",
+    "array_to_bytes", "array_from_bytes",
     // v0.6.45 (B1, B2): gzip y percent-encoding (puros, en los tres hosts).
     "gzip", "gunzip", "url_encode", "url_decode",
     // v0.6.45 (B3): leer un header sin distinguir mayúsculas.
