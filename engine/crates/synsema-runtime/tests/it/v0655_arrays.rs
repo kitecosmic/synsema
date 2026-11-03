@@ -307,3 +307,13 @@ fn set_on_a_frozen_array_copies() {
         print(parallel_map(f, [10, 20, 30]))\nprint(G)";
     assert_eq!(with_a(src), "[15.0, 25.0, 35.0]\n[1, 2, 3]");
 }
+
+/// `set z[i]` en un bucle caliente por el motor entero (el que compila a nativo): el mismo
+/// resultado, sin el error de un array tomado por otro.
+#[test]
+fn set_in_a_hot_loop_through_the_engine() {
+    let src = "let n be 20000\nlet z be zeros(n)\nlet Q be zeros([200, 3])\nlet i be 0\n\
+        while i < n\n    set z[i] to i % 7\n    set Q[i % 200][i % 3] to Q[i % 200][i % 3] + 1\n    set i to i + 1\n\
+        print(sum(z))\nprint(sum(Q))\nprint(Q[0])";
+    assert_eq!(with_a(src), "59997.0\n20000.0\n[34, 33, 33]");
+}

@@ -27,6 +27,35 @@ Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the rele
   `some(m)`, `every(m)`, `count_where(m)`, and `some`/`every`/`count_where` with a predicate over an
   array; `apply` that returns bools gives a mask. `any`, `all`, `clip` and `scatter_add` are not
   defined and say what to write instead.
+- **Index with positions and write into an array.** `M[[1, 0]]` and `a[array([0, 3])]` give those
+  rows in that order (a position may repeat); `take(M, [1, 0], axis = 1)` does it on any axis (with
+  more than one axis the axis is required: numpy's `take` without one flattens). `set a[1] to 9`,
+  `set M[0] to array([7, 7])` (a number fills the row), `set M[0][1] to 9` and
+  `set a[[0, 2]] to array([4, 4])` (a repeated position keeps the last value) write the array.
+  Writing has value semantics, like lists: an alias, a task's argument or the array an `each`
+  walks do not change, and an array nobody else holds is written in place, without a copy per
+  write. A mask holds `true`/`false` and an `f64` array numbers (`set a[0] to true` → `… use 1.0`);
+  a mask as a position is an error that names `where(a, m)` / `if_else(m, 0, a)`. With `--labels`
+  an array is private as a whole: it takes values at most as private as the variable.
+- **`index_add(a, positions, values, axis = 0)`** returns a new array with the values added at those
+  positions; repeated positions accumulate in order (the gradient of an embedding).
+- **`each` walks an array** along its first axis: the elements of a 1-D array (numbers, or
+  booleans for a mask) and the rows of a matrix; `{ each }` in templates too. A 0-d array is an
+  error.
+- **Numeric functions work elementwise:** `sign`, `gamma`, `lgamma`, `erf`, `erfc`, `factorial`
+  (as `f64`), `real`, `imag`, `conj`, `arg`; `is_nan`, `is_finite`, `is_infinite` give masks;
+  `pow`, `atan2`, `hypot`, `log_base`, `beta`, `gcd` and `lcm` broadcast; `round_to(a, 2)`. A test
+  walks every numeric builtin with an array so none is left out; `complex` on an array says that
+  arrays hold `f64` or `bool`.
+- **`transpose(a, axes)`** reorders the axes (`np.transpose`; a negative axis counts from the end).
+  **`matmul` takes batches** (3-D or more, the batch axes broadcast like numpy's; 2-D with 3-D too).
+- **Arrays to bytes and back:** `array_to_bytes(a, "f64" | "f32" | "bool")` and
+  `array_from_bytes(b, "f32", shape = [2, 3])`, little-endian in C order; `f32` rounds to nearest
+  and reads back as `f64`.
+- **Seeded random arrays:** `random_normal(g, [2, 3], mean = 0, std = 1)` and
+  `random_uniform(g, [2, 2], low = 0, high = 1)` give the same numbers as numpy's
+  `default_rng(seed).normal(…, size)` / `.uniform(…, size)`, bit for bit; without a shape they give
+  one number (`random_uniform(g)` is `g()`).
 - **Fixed:** with `--labels`, `apply` over a private array (or with a captured private value) stopped
   the run with `private(x)`; it now gives a private array.
 
@@ -40,6 +69,8 @@ Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the rele
   and a predicate that returns an array are errors that suggest `some(m)` / `every(m)`,
   `length(a) > 0` or `logical_and`. Before, a non-empty array counted as true.
 - `arrays do not support ordering comparisons` is gone (comparisons work now).
+- `each x in a` over an array walks it instead of failing with `Cannot iterate over array`, and
+  `Cannot set index on array` is gone (`set a[i]` works).
 
 ## v0.6.54 — 2026-11-02
 
