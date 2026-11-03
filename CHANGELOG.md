@@ -41,7 +41,8 @@ Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the rele
   the variable held before. With `--labels` an array is private as a whole: it takes values at most
   as private as the variable; writing into an array inside a list or map takes indices that run no
   code (`let i be f()` first), and when the statement touched private data the errors of the write
-  reach the operator as a diagnostic (the program sees the fixed cut text).
+  reach the operator as a diagnostic (the program sees the fixed cut text). An alias taken inside the
+  index is `in_use` with and without `--labels`.
 - **`index_add(a, positions, values, axis = 0)`** returns a new array with the values added at those
   positions; repeated positions accumulate in order (the gradient of an embedding).
 - **`each` walks an array** along its first axis: the elements of a 1-D array (numbers, or
@@ -68,6 +69,13 @@ Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the rele
   (`file.syn:3:6: an array is not true or false — …`).
 - **Fixed:** with `--labels`, `apply` over a private array (or with a captured private value) stopped
   the run with `private(x)`; it now gives a private array.
+- **Fixed (since before this version, for lists):** with `--labels`, an error of `set` that depends on
+  private data — an out-of-range private index (`set xs[secret]`), the length of a private list or
+  array walked with a public index, the shape or the type of a private value — could be caught with
+  `try/recover` and showed the data in its text. It now stops the run like the same error in a read
+  (`xs[secret]`): it is not caught and the run stops with `private(x)` and the place.
+- A `set` that fails halfway through its path and is caught no longer keeps a copy of the array alive
+  until much later (each caught failure on a large matrix held a full copy).
 
 **Breaking.**
 - **`==`/`!=` with an array no longer answer `false` in silence.** Two arrays are still compared as

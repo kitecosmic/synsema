@@ -1117,9 +1117,13 @@ fn with_labels_an_index_that_runs_code_cannot_write_through_a_list() {
         set L[0][f()] to 1\nprint(keep)";
     assert_eq!(labelled_out(elem), format!("ERR: <v0655>:7:9: {}", THROUGH_A_LIST));
     // Un índice del medio que corre código, y una llamada adentro de una cuenta (`f() + 0`).
+    // Con datos públicos es un error común (M22 de la ronda 4): `e.message` sin ubicación.
     let mid = "let L be [array([1, 2]), array([3, 4])]\ntask f()\n    give 1\n";
-    assert_eq!(labelled_out(&format!("{}set L[f()][0] to 9\nprint(L)", mid)), format!("ERR: <v0655>:4:11: {}", THROUGH_A_LIST));
-    assert_eq!(labelled_out(&format!("{}set L[0][f() + 0] to 9\nprint(L)", mid)), format!("ERR: <v0655>:4:9: {}", THROUGH_A_LIST));
+    assert_eq!(labelled_out(&format!("{}set L[f()][0] to 9\nprint(L)", mid)), format!("ERR: {}", THROUGH_A_LIST));
+    assert_eq!(labelled_out(&format!("{}set L[0][f() + 0] to 9\nprint(L)", mid)), format!("ERR: {}", THROUGH_A_LIST));
+    // Un índice anidado y un unario que corren código (las sondas `g_nested` y `g_unary`).
+    assert_eq!(labelled_out(&format!("{}let xs be [0, 1]\nset L[0][xs[f()]] to 9", mid)), format!("ERR: {}", THROUGH_A_LIST));
+    assert_eq!(labelled_out(&format!("{}set L[0][-f()] to 9", mid)), format!("ERR: {}", THROUGH_A_LIST));
     // Sin etiquetas, lo mismo escribe; con etiquetas, sin código en los índices, también.
     assert_eq!(plain_out(&format!("{}set L[f()][0] to 9\nset L[0][f() + 0] to 8\nprint(L)", mid)), "[[1, 8], [9, 4]]");
     assert_eq!(labelled_out(&format!("{}let i be f()\nset L[i][0] to 9\nset L[0][i + 0] to 8\nprint(L)", mid)), "[[1, 8], [9, 4]]");
@@ -1243,4 +1247,142 @@ fn run_result(interp: &mut synsema_core::interpreter::Interpreter, file: &str, s
         Err(Control::Error(e)) => format!("ERR: {}", e.operator_detail.clone().unwrap_or_else(|| e.message.clone())),
         Err(_) => "otro control".to_string(),
     }
+}
+
+// =========================================================
+// Auditoría v0.6.55, ronda 4
+// =========================================================
+
+/// Lo único que queda en la salida cuando el verificador corta la corrida: la salida de antes se retiene.
+const WITHHELD: &str = "private(labels): the run was stopped by the flow checker; its output is withheld because the NUMBER of lines before the stop depends on private data";
+
+/// Corre con etiquetas un programa en `file`: (lo impreso, el mensaje que ve el programa, el
+/// diagnóstico del operador). Sin error, los dos últimos vacíos.
+fn labelled_run(source: &str, file: &str) -> (String, String, String) {
+    use synsema_core::interpreter::Interpreter;
+    let program = synsema_core::parser::parse_source(source, file).unwrap();
+    let mut interp = Interpreter::new();
+    interp.set_labels(true);
+    let r = interp.execute(&program);
+    let out = interp.output.join("\n");
+    match r {
+        Ok(_) => (out, String::new(), String::new()),
+        Err(Control::Error(e)) => (out, e.message.clone(), e.operator_detail.clone().unwrap_or_default()),
+        Err(_) => (out, "otro control".to_string(), String::new()),
+    }
+}
+
+/// B4: con `--labels`, el error de un `set` que depende de un dato privado (el índice, el largo del
+/// array, la forma o el valor) no se atrapa ni muestra el dato: el `recover` no corre, el programa ve
+/// el texto fijo y el operador `private(x)`, como en la lectura `a[i]`. Las sondas `b4_*` de la ronda 4;
+/// las listas tenían el mismo agujero desde antes de v0.6.55 (`oob_list_try`, `b4_len_list`).
+#[test]
+fn with_labels_a_set_error_on_private_data_is_not_caught() {
+    let cases = [
+        ("idx", "let a be private(zeros(3), \"x\")\nlet secret be private(42, \"x\")\ntry\n    set a[secret] to 1\nrecover e\n    print(e)"),
+        ("row", "let a be private(zeros([2, 3]), \"x\")\nlet secret be private(42, \"x\")\ntry\n    set a[secret][0] to 1\nrecover e\n    print(e)"),
+        ("positions", "let a be private(zeros(3), \"x\")\nlet pos be private([0, 42], \"x\")\ntry\n    set a[pos] to 1\nrecover e\n    print(e)"),
+        ("len", "let a be private(zeros(7), \"x\")\nlet i be 0\nwhile i < 100\n    try\n        set a[i] to 1\n    recover e\n        print(\"largo: \" + text(i))\n        set i to 100\n    set i to i + 1"),
+        ("shape", "let a be private(zeros([2, 2]), \"x\")\nlet v be private(zeros(5), \"x\")\ntry\n    set a[0] to v\nrecover e\n    print(e)"),
+        ("mask", "let mk be private(array([1, 2, 3]) > 5, \"x\")\nlet secret be private(42, \"x\")\ntry\n    set mk[0] to secret\nrecover e\n    print(e)"),
+        ("list", "let a be private([0, 0, 0], \"x\")\nlet i be private(9, \"x\")\ntry\n    set a[i] to 1\nrecover e\n    print(\"caught: \" + e)"),
+        ("list-len", "let a be private([0, 0, 0, 0, 0, 0, 0], \"x\")\ntry\n    set a[50] to 1\nrecover e\n    print(e)"),
+        ("field", "let r be private({\"x\": 1}, \"x\")\nlet secret be private(42, \"x\")\ntry\n    set r.x.y to secret\nrecover e\n    print(e)"),
+        // Un campo directo sobre una raíz privada que no es un mapa: el error diría su tipo.
+        ("field-type", "let r be private(42, \"x\")\ntry\n    set r.y to 1\nrecover e\n    print(e)"),
+    ];
+    for (name, src) in cases {
+        let (out, msg, detail) = labelled_run(src, "<v0655>");
+        assert_eq!(out, WITHHELD, "{}: el recover no corre", name);
+        assert!(!msg.is_empty(), "{}: la corrida se corta", name);
+        for leak in ["42", "[5]", "7", "length", "bounds", "number"] {
+            assert!(!msg.contains(leak), "{}: el programa ve {:?}: {}", name, leak, msg);
+        }
+        assert!(detail.ends_with("private(x)"), "{}: {}", name, detail);
+    }
+    // Un array público con un índice público sigue dando su error, y se atrapa.
+    let (out, msg, _) = labelled_run("let a be zeros(3)\ntry\n    set a[9] to 1\nrecover e\n    print(\"caught: \" + e)", "<v0655>");
+    assert_eq!((out.as_str(), msg.as_str()), ("caught: Index 9 out of bounds (array axis 0 has length 3)", ""));
+}
+
+/// N6: un `set` que falla a mitad de camino y se atrapa no deja su entrada: el próximo `set` escribe
+/// en el mismo array, sin copiarlo (antes, cada falla retenía una copia entera). Por `try/recover` y por
+/// `assert_error`, en la VM y en el árbol.
+#[test]
+fn a_caught_failure_in_the_path_does_not_keep_a_copy() {
+    use synsema_core::interpreter::{env_get, Interpreter};
+    let ptr = |interp: &Interpreter| match env_get(&interp.global_env, "A") {
+        Some(SynValue::Array(o)) => synsema_core::types::Obj::as_ptr(&o) as usize,
+        other => panic!("{:?}", other.map(|v| v.type_name())),
+    };
+    let fails = [
+        "let k be 0\nwhile k < 70\n    try\n        set A[0][nope] to 1\n    recover e\n        set k to k + 1",
+        "task pick(c)\n    raise \"unknown category \" + c\nlet k be 0\nwhile k < 70\n    try\n        set A[0][pick(\"z\")] to 1\n    recover e\n        set k to k + 1",
+        "task bad()\n    set A[1][nope] to 1\nlet k be 0\nwhile k < 70\n    assert_error(bad)\n    set k to k + 1",
+    ];
+    for labels in [false, true] {
+        for f in fails {
+            let mut interp = Interpreter::new();
+            interp.set_labels(labels);
+            let run = |interp: &mut Interpreter, src: &str| {
+                let program = synsema_core::parser::parse_source(src, "<v0655>").unwrap();
+                if let Err(Control::Error(e)) = interp.execute(&program) {
+                    panic!("labels = {}: {}", labels, e);
+                }
+            };
+            run(&mut interp, "let A be zeros([2, 3])");
+            let before = ptr(&interp);
+            run(&mut interp, f);
+            run(&mut interp, "set A[0][1] to 5");
+            assert_eq!(ptr(&interp), before, "labels = {}: el set después de las fallas copió el array\n{}", labels, f);
+        }
+    }
+}
+
+/// M21: con `--labels`, un alias tomado en el índice comparte el envoltorio `Private` (no el array):
+/// es `in_use`, como sin etiquetas, y el alias no recibe la escritura. Las sondas `priv_alias_*`.
+#[test]
+fn with_labels_an_alias_taken_in_the_index_is_in_use() {
+    let pre = |a: &str| format!("let a be private({}, \"x\")\nlet keep be 0\ntask f()\n    set keep to a\n    give 0\n", a);
+    for (a, set) in [("zeros(3)", "set a[f()] to 1"), ("zeros([2, 2])", "set a[1][f()] to 1")] {
+        let (out, _, detail) = labelled_run(&format!("{}{}\nprint(declassify(keep, \"x\"))", pre(a), set), "<v0655>");
+        assert_eq!(out, WITHHELD, "{}", set);
+        assert!(detail.contains("set: the array is in use elsewhere in this statement"), "{}: {}", set, detail);
+    }
+    // Sin etiquetas, lo mismo (antes ya era así).
+    assert!(plain_out("let a be zeros(3)\nlet keep be 0\ntask f()\n    set keep to a\n    give 0\nset a[f()] to 1")
+        .starts_with("ERR: set: the array is in use elsewhere"));
+    // Un alias tomado ANTES de la sentencia se separa: no es `in_use`.
+    let (out, msg, _) = labelled_run("let a be private(zeros(3), \"x\")\nlet keep be a\nset a[abs(0)] to 1\nprint(declassify(a, \"x\"))\nprint(declassify(keep, \"x\"))", "<v0655>");
+    assert_eq!((out.as_str(), msg.as_str()), ("[1, 0, 0]\n[0, 0, 0]", ""));
+}
+
+/// M22: la guarda de B3 en un programa sin datos privados es un error común: no retiene la salida y se
+/// puede atrapar (la regla no depende de datos, atraparla no dice nada).
+#[test]
+fn the_list_guard_without_private_data_is_a_plain_error() {
+    let src = "print(\"antes\")\nlet L be [zeros(3)]\ntask f()\n    give 1\ntry\n    set L[0][f()] to 1\nrecover e\n    print(\"caught: \" + e)";
+    let (out, msg, _) = labelled_run(src, "<v0655>");
+    assert_eq!(msg, "");
+    assert_eq!(out, format!("antes\ncaught: {}", THROUGH_A_LIST));
+}
+
+/// M23: el `in_use` por la cuenta del array con etiquetas va al operador con su motivo, y la ubicación
+/// de un diagnóstico lleva el nombre del archivo sin directorios.
+///
+/// (La cláusula del PC de `touched` se sacó: bajo un PC privado un índice que no es literal sale con el
+/// PC, así que el contenedor tiene que cubrirlo, y entonces es privado y ya está en `seen` por B4; con un
+/// índice literal no corre código y no hay `rebound`.)
+#[test]
+fn write_diagnostics_name_the_reason_and_only_the_file() {
+    // El alias es el array de adentro (lo da `declassify`), no el envoltorio: lo ve la cuenta del array.
+    let src = "let a be private(zeros(3), \"x\")\nlet keep be nothing\ntask f()\n    set keep to declassify(a, \"x\")\n    give 0\nset a[f()] to 1\nprint(keep)";
+    let (out, msg, detail) = labelled_run(src, "<v0655>");
+    assert_eq!(out, WITHHELD);
+    assert!(msg.starts_with("label_violation: the flow checker stopped the run"), "{}", msg);
+    assert!(detail.contains("set: the array is in use elsewhere in this statement"), "{}", detail);
+    // La ubicación del diagnóstico lleva el nombre del archivo, sin sus directorios.
+    let leak = "let a be private(array([1, 2, 3]), \"x\")\nlet keep be nothing\ntask f()\n    set keep to declassify(a, \"x\")\n    set a to private(zeros(3), \"x\")\n    give 0\nset a[f()] to 1";
+    let (_, _, detail) = labelled_run(leak, "C:/tmp/una/carpeta/prog.syn");
+    assert_eq!(detail, format!("prog.syn:7:6: {}", &REBOUND_A[5..]));
 }

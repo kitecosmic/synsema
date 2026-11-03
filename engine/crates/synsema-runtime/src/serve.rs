@@ -2315,6 +2315,9 @@ fn with_serve_interp<R>(
     // abierta para siempre, con lo que escribió a la vista y sin confirmar ni deshacer.
     let mut owner = RunOwner { swarm, scope };
     let out = f(&mut base.interp, &base.caps);
+    // v0.6.55 (N6 de la ronda 4): el hilo del worker sigue vivo; un `set` sobre un array que falló a
+    // mitad de camino en esta entrada no le deja a la próxima una copia del array retenida.
+    synsema_core::arrays::drop_dead_places();
     let stopped = base.interp.take_label_stop();
     finish_state_journal(shared_state, stopped);
     if let Some(s) = owner.scope.take() {

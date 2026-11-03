@@ -1611,6 +1611,22 @@ fn prune(s: &mut Places) {
     s.limit = PLACES_CAP.max(2 * s.rows.len().max(s.views.len()));
 }
 
+/// Después de un error que el programa atrapa (`recover`, `assert_error`) o que termina una unidad de
+/// trabajo de un hilo que sigue vivo (`serve`): las entradas de los `set` que fallaron a mitad de camino
+/// ya están muertas (sus fichas cayeron al propagarse el error) y cada una retiene una copia entera
+/// del array como dueña (N6 de la ronda 4). Las de las sentencias en curso de más afuera siguen vivas
+/// y quedan. De paso el tope vuelve a bajar (M24). Frío: sólo corre después de un error.
+#[cold]
+#[inline(never)]
+pub fn drop_dead_places() {
+    PLACES.with(|s| {
+        let mut s = s.borrow_mut();
+        if !s.rows.is_empty() || !s.views.is_empty() || s.limit != PLACES_CAP {
+            prune(&mut s);
+        }
+    });
+}
+
 /// La raíz y las posiciones de una ficha (de afuera hacia adentro); `None` si `a` no es una ficha.
 fn row_chain(rows: &[RowPlace], a: &crate::types::Obj<NdArray>) -> Option<(crate::types::Obj<NdArray>, Vec<usize>)> {
     let mut cur = a;
@@ -1764,6 +1780,9 @@ pub struct Rooted {
     /// programa ve el texto fijo de corte, el operador el motivo; M16 de la ronda 3). Su texto sólo
     /// nombra la variable.
     pub labels: bool,
+    /// La variable tiene el array dentro de un envoltorio `Private` que alguien más comparte (un
+    /// alias tomado a mitad de la sentencia, M21 de la ronda 4): `in_use`, como sin etiquetas.
+    pub shared: bool,
 }
 
 /// Cuántas filas recorrió el camino hasta la ficha `obj` (0 si no es una ficha).
@@ -1823,6 +1842,11 @@ pub fn set_index(
     let direct = rooted.depth == Some(prefix.len() + 1);
     if direct && rooted.now != Some(crate::types::Obj::as_ptr(target) as usize) {
         return Err(sys(rebound(root), rooted.labels));
+    }
+    // Con `--labels` la variable tiene un envoltorio `Private`, y un alias tomado en el índice comparte
+    // el envoltorio, no el array: la cuenta del array no lo ve.
+    if direct && rooted.shared {
+        return Err(sys(in_use(), rooted.labels));
     }
 
     // Los dueños del array de la variable: su lugar y la referencia de esta escritura (la del camino,

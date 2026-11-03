@@ -1110,10 +1110,11 @@ pub(crate) fn set_leaf_prop(obj: &SynValue, property_name: &str, value: SynValue
 /// La hoja de `set <camino>[idx] to v` (ver `set_leaf_prop`). `target_loc`: la del destino (el
 /// error de fuera de rango, como la lectura `xs[i]`); `loc`: la de la sentencia.
 ///
-/// `root_now`: el array que tiene AHORA la variable raíz (sólo se pide si la hoja es un array; B2 de
-/// la ronda 2). `labels`: corre con `--labels` (la guarda por lista o mapa; B3 de la ronda 3).
-/// `touched`: además, la sentencia tocó algo privado (o corre bajo un PC privado): los errores de la
-/// escritura salen como diagnóstico del sistema, en vez de redactados (M16 de la ronda 3).
+/// `root_now`: el array que tiene AHORA la variable raíz y si su envoltorio `Private` está compartido
+/// (sólo se pide si la hoja es un array; B2 de la ronda 2, M21 de la ronda 4). `labels`: corre con
+/// `--labels` (la guarda por lista o mapa; B3 de la ronda 3). `touched`: además, la sentencia tocó algo
+/// privado o corre bajo un PC privado: los errores de la escritura salen como diagnóstico del sistema
+/// (M16 de la ronda 3); sin nada privado son errores comunes (M22 de la ronda 4).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn set_leaf_index(
     obj: &SynValue,
@@ -1122,7 +1123,7 @@ pub(crate) fn set_leaf_index(
     target: &Node,
     target_loc: &SourceLocation,
     loc: &SourceLocation,
-    root_now: &dyn Fn() -> Option<usize>,
+    root_now: &dyn Fn() -> Option<(usize, bool)>,
     labels: bool,
     touched: bool,
 ) -> Result<SynValue, Control> {
@@ -1164,13 +1165,18 @@ pub(crate) fn set_leaf_index(
             // pública, y entonces el valor —o la posición, si el índice es privado (B3 de la ronda 3)—
             // caería en ese alias. Con `--labels` es un error por la FORMA del camino, sin mirar ningún
             // dato: el error mismo no dice nada de un valor privado.
+            // Sin nada privado en la sentencia es un error común (M22 de la ronda 4): la regla no depende
+            // de datos, así que atraparlo no dice nada, y un diagnóstico del sistema retendría la salida
+            // diciendo que depende de datos privados.
             if labels && depth != Some(crate::arrays::chain_len(obj) + 1) && path_runs_code(target) {
-                return Err(err_labels(
-                    "label_violation: an index that runs code writes into an array inside a list or map — compute the index into a variable first",
-                    target_loc,
-                ));
+                const MSG: &str = "label_violation: an index that runs code writes into an array inside a list or map — compute the index into a variable first";
+                return Err(if touched { err_labels(MSG, target_loc) } else { err_at(MSG, target_loc) });
             }
-            let rooted = crate::arrays::Rooted { depth, now: if depth.is_some() { root_now() } else { None }, labels: touched };
+            let (now, shared) = match depth {
+                Some(_) => root_now().map_or((None, false), |(p, s)| (Some(p), s)),
+                None => (None, false),
+            };
+            let rooted = crate::arrays::Rooted { depth, now, labels: touched, shared };
             crate::arrays::set_index(obj, idx, value, set_root_identifier(target), rooted).map_err(|e| {
                 let mut e = crate::arrays::located(e, target_loc);
                 // Un diagnóstico de etiquetas viaja con el nombre del archivo, como `err_labels`.
@@ -1242,6 +1248,17 @@ pub(crate) fn array_ptr_of(v: &SynValue) -> Option<usize> {
         SynValue::Array(a) => Some(crate::types::Obj::as_ptr(a) as usize),
         _ => None,
     }
+}
+
+/// La raíz de un `set` en el árbol (M21 de la ronda 4): el array de `v` y si su envoltorio `Private`
+/// tiene otro dueño además de la variable y de esta copia (`v`, la que dio `env_get`).
+fn array_root_of(v: &SynValue) -> Option<(usize, bool)> {
+    let p = array_ptr_of(v)?;
+    let shared = match v {
+        SynValue::Private(w) => crate::types::Obj::strong_count(w) > 2,
+        _ => false,
+    };
+    Some((p, shared))
 }
 
 /// Si `parent` es el mapa de un módulo y `name` una de sus exportaciones: acceso único a la
@@ -7745,6 +7762,8 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
             // que se recuperan.
             Err(Control::Error(e)) if e.is_halt() => Err(Control::Error(e)),
             Err(Control::Error(e)) => {
+                // N6 (ronda 4): los `set` que fallaron adentro del `try` no dejan sus entradas.
+                crate::arrays::drop_dead_places();
                 let msg = strip_loc_prefix(&e.to_string());
                 let recover_env = Environment::child_scope(env, "recover");
                 let mut ev = syn_text(msg);
@@ -8369,6 +8388,9 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                 // Escritura a través de un contenedor privado o bajo PC (ver
                 // `set_through_labels`): la etiqueta vive en la variable raíz del camino.
                 let (obj, value) = if self.labels && (obj.is_private() || !self.pc_is_empty()) {
+                    // B4 (ronda 4): lo que se desenvuelve queda anotado, como en una lectura: un error
+                    // de la escritura que depende de él sale marcado y no se atrapa.
+                    self.note_seen(&labels::label(&obj));
                     self.set_through_labels(target, obj, labels::empty(), value, env, loc, escape_pc)?
                 } else {
                     (obj, value)
@@ -8386,6 +8408,10 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                         // Una clave LITERAL sólo puede llevar el PC (B5): es texto del programa,
                         // No una clave privada (el PC se suma aparte, salvo `escape_pc`).
                         let key_label = if is_scalar_literal(index) { labels::empty() } else { labels::label_deep(&idx) };
+                        // B4 (ronda 4): el contenedor y el índice que se desenvuelven quedan anotados,
+                        // como en `index_read`: un error de la escritura (fuera de rango, forma, tipo)
+                        // depende de ellos, así que sale marcado, redactado y sin atraparse.
+                        self.note_seen(&labels::union(&labels::label(&obj), &labels::label_deep(&idx)));
                         let (obj, value) =
                             self.set_through_labels(target, obj, key_label, value, env, loc, escape_pc)?;
                         (obj, labels::unwrap(&idx).clone(), value)
@@ -8399,8 +8425,13 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                 } else {
                     value
                 };
-                let root_now = || set_root_identifier(target).and_then(|n| env_get(env, n)).and_then(|v| array_ptr_of(&v));
-                let touched = self.labels && (!self.seen.is_empty() || !self.pc_is_empty() || labels::has_label_deep(&value));
+                let root_now = || set_root_identifier(target).and_then(|n| env_get(env, n)).and_then(|v| array_root_of(&v));
+                // `seen` ya tiene todo lo privado que la sentencia desenvolvió (el camino, el índice, el
+                // valor: B4). Ni el valor ni el PC hace falta mirarlos aparte (M23 de la ronda 4): el valor
+                // de un array ya llega sin etiqueta (anotada en `array_set_value`), y bajo un PC privado un
+                // índice que no es literal lleva el PC, así que el contenedor tiene que cubrirlo y ya está
+                // en `seen`. Si algo se escapara de esta cuenta, el error saldría redactado: seguro.
+                let touched = self.labels && !self.seen.is_empty();
                 set_leaf_index(&obj, &idx, value, target, &target.location, loc, &root_now, self.labels, touched)
             }
             _ => Err(err_at("Invalid set target", loc)),
@@ -8473,6 +8504,8 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
         let root = set_root_identifier(target);
         let have = root.and_then(|n| env_get(env, n)).map(|v| labels::label(&v)).unwrap_or_else(labels::empty);
         let got = labels::label_deep(&value);
+        // B4 (ronda 4): no hace falta anotar `got` en `seen`: sólo pasa si está contenida en la de la
+        // raíz, y la raíz ya quedó anotada (en la hoja si el camino es directo, en el primer paso si no).
         if labels::subset(&got, &have) {
             return Ok(labels::strip_deep(&value));
         }
@@ -8692,6 +8725,11 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
             }
             // v0.6.55 (R5): `set M[i][j]`: la ficha de la fila; la hoja escribe directo en `M`.
             SynValue::Array(_) => {
+                // B4 (ronda 4): el padre y el índice que se desenvuelven quedan anotados, como en
+                // `index_read` (las listas y los mapas pasan por ahí).
+                if self.labels && (parent.is_private() || labels::has_label_deep(&idx)) {
+                    self.note_seen(&labels::union(&labels::label(&parent), &labels::label_deep(&idx)));
+                }
                 return crate::arrays::place_row(labels::unwrap(&parent), labels::unwrap(&idx)).map_err(|e| crate::arrays::located(e, loc));
             }
             _ => {}
@@ -9969,8 +10007,11 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                 Err(Control::Error(e))
             }
             Err(Control::Error(e)) if e.is_halt() => Err(Control::Error(e)),
-            // Lanzó un error → la aserción pasa.
-            Err(Control::Error(_)) => Ok(SynValue::Nothing),
+            // Lanzó un error → la aserción pasa (N6 de la ronda 4: sin dejar entradas de un `set`).
+            Err(Control::Error(_)) => {
+                crate::arrays::drop_dead_places();
+                Ok(SynValue::Nothing)
+            }
             // Retornó normal (incl. un `give`, que `call_value` materializa como Ok) → falla.
             Ok(_) => Err(err_assertion("expected an error, but none was raised")),
             // `give`/`stop` fuera de un task se propagan como hoy (no son "el error esperado").

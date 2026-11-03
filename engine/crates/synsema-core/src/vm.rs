@@ -4259,7 +4259,8 @@ impl Interpreter {
             if done {
                 v
             } else {
-                let root_now = || self.vm_root_ptr(chunk, env, base, d.root);
+                // La VM no corre con etiquetas: no hay envoltorio `Private` que mirar (M21).
+                let root_now = || self.vm_root_ptr(chunk, env, base, d.root).map(|p| (p, false));
                 set_leaf_index(
                     &obj,
                     &i,
