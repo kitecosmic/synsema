@@ -271,6 +271,9 @@ fn extreme(args: &[SynValue], name: &str, want: Ordering) -> Result<SynValue, Co
 }
 
 pub fn clamp(args: &[SynValue]) -> Result<SynValue, Control> {
+    if args.iter().any(|a| matches!(a, SynValue::Array(_))) {
+        return crate::arrays::clamp_array(args);
+    }
     arity(args, 3, "clamp")?;
     let x = num(args, 0, "clamp")?;
     let lo = num(args, 1, "clamp")?;

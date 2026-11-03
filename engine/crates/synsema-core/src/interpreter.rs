@@ -264,6 +264,55 @@ fn err_validation(msg: impl Into<String>, field: Option<String>) -> Control {
 fn err_at(msg: impl Into<String>, loc: &SourceLocation) -> Control {
     Control::Error(RuntimeError::at(msg, loc.clone()))
 }
+
+/// v0.6.55 (R4): dónde se pidió la verdad de un valor, para el texto del error de un array.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum TruthAt {
+    /// `when`, `while`, una guarda, `assert`, `invariant`, una plantilla.
+    Cond,
+    And,
+    Or,
+    Not,
+}
+
+const ARRAY_NOT_A_CONDITION: &str =
+    "an array is not true or false — some(m) / every(m) for a mask, length(a) > 0 for \"not empty\"";
+
+/// v0.6.55 (R4): la verdad de un valor en una condición; un array no es verdadero ni falso.
+#[inline]
+pub(crate) fn truth(v: &SynValue, at: TruthAt) -> Result<bool, Control> {
+    match v.truth() {
+        Some(b) => Ok(b),
+        None => Err(array_truth_error(v, at)),
+    }
+}
+
+/// La verdad de lo que devolvió el predicado de un builtin (`where`, `some`, …): el error del
+/// `when`, con el nombre de la función.
+#[inline]
+pub(crate) fn pred_truth(v: &SynValue, who: &str) -> Result<bool, Control> {
+    match v.truth() {
+        Some(b) => Ok(b),
+        None => Err(pred_truth_error(who)),
+    }
+}
+
+#[inline(never)]
+fn pred_truth_error(who: &str) -> Control {
+    err(format!("{}: the function returned an array — {}", who, ARRAY_NOT_A_CONDITION))
+}
+
+#[inline(never)]
+pub(crate) fn array_truth_error(v: &SynValue, at: TruthAt) -> Control {
+    let mask = matches!(crate::labels::unwrap(v), SynValue::Array(a) if a.as_f64().is_none());
+    let got = if mask { "a mask" } else { "an array" };
+    match at {
+        TruthAt::Cond => err(ARRAY_NOT_A_CONDITION),
+        TruthAt::And => err(format!("and needs true or false, got {} — combine masks with logical_and(m1, m2)", got)),
+        TruthAt::Or => err(format!("or needs true or false, got {} — combine masks with logical_or(m1, m2)", got)),
+        TruthAt::Not => err(format!("not needs true or false, got {} — negate a mask with logical_not(m)", got)),
+    }
+}
 /// v0.6.46 (C6): un argumento con nombre que la task o el builtin no tiene. Dice los que tiene (la
 /// firma es dato: es lo que ve un modelo que arma la llamada) y el más cercano si hay uno. Frío:
 /// está en el camino de llamada y sólo corre al fallar.
@@ -4989,7 +5038,7 @@ impl Interpreter {
         // llm_stream(prompt, context, on_chunk) — genera invocando la task/lambda
         // `on_chunk` con cada fragmento (F2); devuelve el texto completo. Mismo gate `llm`.
         self.register("llm_stream", 3, Rc::new(|i, a, l| i.b_llm_stream(a, l)));
-        self.register("where", 2, Rc::new(|i, a, l| i.b_where(a, l)));
+        self.register("where", -1, Rc::new(|i, a, l| i.b_where(a, l)));
         self.register("collect", 2, Rc::new(|i, a, l| i.b_collect(a, l)));
         self.register("transform", -1, Rc::new(|i, a, l| i.b_transform(a, l)));
         self.register("reduce", -1, Rc::new(|i, a, l| i.b_reduce(a, l)));
@@ -5000,9 +5049,9 @@ impl Interpreter {
         // v0.6.29 (DATOS-3): `[{key, items}]` en orden de aparición, la clave con su tipo.
         self.register("group_by", 2, Rc::new(|i, a, _l| crate::tabular::group_by(i, a)));
         self.register("find_first", 2, Rc::new(|i, a, l| i.b_find_first(a, l)));
-        self.register("every", 2, Rc::new(|i, a, l| i.b_every(a, l)));
-        self.register("some", 2, Rc::new(|i, a, l| i.b_some(a, l)));
-        self.register("count_where", 2, Rc::new(|i, a, l| i.b_count_where(a, l)));
+        self.register("every", -1, Rc::new(|i, a, l| i.b_every(a, l)));
+        self.register("some", -1, Rc::new(|i, a, l| i.b_some(a, l)));
+        self.register("count_where", -1, Rc::new(|i, a, l| i.b_count_where(a, l)));
         self.register("flatten", 1, Rc::new(|i, a, l| i.b_flatten(a, l)));
         self.register("zip_with", 3, Rc::new(|i, a, l| i.b_zip_with(a, l)));
         // Mini-stdlib (batch DX). Nacen con UN orden canónico (lista primero, el de la
@@ -5896,21 +5945,21 @@ impl Interpreter {
                 // Python): `x or default` NO es un idioma de Synsema.
                 // El booleano sale con la unión de las etiquetas de lo evaluado.
                 if *operator == BinOp::And {
-                    if !l.is_truthy() {
+                    if !truth(&l, TruthAt::And)? {
                         let res = syn_bool(false);
                         return if self.labels { self.join_operands(res, &l, None, loc) } else { Ok(res) };
                     }
                     let r = if self.labels { self.exec_right_under(&l, right, env)? } else { self.exec(right, env)? };
-                    let res = syn_bool(r.is_truthy());
+                    let res = syn_bool(truth(&r, TruthAt::And)?);
                     return if self.labels { self.join_operands(res, &l, Some(&r), loc) } else { Ok(res) };
                 }
                 if *operator == BinOp::Or {
-                    if l.is_truthy() {
+                    if truth(&l, TruthAt::Or)? {
                         let res = syn_bool(true);
                         return if self.labels { self.join_operands(res, &l, None, loc) } else { Ok(res) };
                     }
                     let r = if self.labels { self.exec_right_under(&l, right, env)? } else { self.exec(right, env)? };
-                    let res = syn_bool(r.is_truthy());
+                    let res = syn_bool(truth(&r, TruthAt::Or)?);
                     return if self.labels { self.join_operands(res, &l, Some(&r), loc) } else { Ok(res) };
                 }
                 // `x // nota`: un comentario al estilo C se lee como división entera por la
@@ -5958,11 +6007,11 @@ impl Interpreter {
                     let c = self.exec_binary(prev, *op, cur.clone(), loc)?;
                     let joined = match acc {
                         Some(a) if self.labels => {
-                            self.join_operands(syn_bool(c.is_truthy()), &a, Some(&c), loc)?
+                            self.join_operands(syn_bool(truth(&c, TruthAt::And)?), &a, Some(&c), loc)?
                         }
                         _ => c,
                     };
-                    if !joined.is_truthy() {
+                    if !truth(&joined, TruthAt::And)? {
                         return if self.labels {
                             self.join_operands(syn_bool(false), &joined, None, loc)
                         } else {
@@ -6032,6 +6081,8 @@ impl Interpreter {
             // -- Control de flujo --
             NodeKind::WhenStatement { condition, body, otherwise, otherwise_when } => {
                 let cond = self.exec(condition, env)?;
+                // v0.6.55 (R4): antes de tomar el PC, que un error no lo deje puesto.
+                let yes = truth(&cond, TruthAt::Cond)?;
                 // Condición privada (a cualquier profundidad, B3) → toda la cadena
                 // when/otherwise corre bajo su etiqueta de PC (flujo implícito); se saca al
                 // salir, también en error. El valor IMPLÍCITO de la cadena sale con el PC (B2).
@@ -6046,14 +6097,14 @@ impl Interpreter {
                         }
                         self.pc_push(&l);
                     }
-                    let r = self.exec_when_branches(cond.is_truthy(), body, otherwise_when, otherwise, env);
+                    let r = self.exec_when_branches(yes, body, otherwise_when, otherwise, env);
                     let r = r.and_then(|v| self.pc_mark(v, loc));
                     if !l.is_empty() {
                         self.pc_pop();
                     }
                     return r;
                 }
-                self.exec_when_branches(cond.is_truthy(), body, otherwise_when, otherwise, env)
+                self.exec_when_branches(yes, body, otherwise_when, otherwise, env)
             }
             NodeKind::EachStatement { variable, collection, body } => {
                 // `each i in range(…)` sin armar la lista (atajo, F1.11; ver `each_over_range`).
@@ -6160,8 +6211,13 @@ impl Interpreter {
                             break;
                         }
                     };
-                    if !cond.is_truthy() {
-                        break;
+                    match truth(&cond, TruthAt::Cond) {
+                        Ok(true) => {}
+                        Ok(false) => break,
+                        Err(e) => {
+                            outcome = Err(e);
+                            break;
+                        }
                     }
                     // Condición con etiquetas (profundo, B3) → el cuerpo de ESTA
                     // iteración y su valor implícito (B2) van bajo PC.
@@ -6807,7 +6863,7 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                 self.note_seen(&l);
             }
         }
-        if !result.is_truthy() {
+        if !truth(&result, TruthAt::Cond)? {
             let desc = description.clone().unwrap_or_else(|| "unnamed invariant".to_string());
             return Err(err_at(format!("Invariant violation: {}", desc), loc));
         }
@@ -7763,7 +7819,7 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                     if self.labels {
                         extra = labels::union(&extra, &labels::label_deep(gv));
                     }
-                    if !gv.is_truthy() {
+                    if !truth(gv, TruthAt::Cond)? {
                         continue; // guard falso → próximo arm
                     }
                 }
@@ -7841,7 +7897,7 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                 SynValue::Array(a) => Ok(crate::arrays::negate(a)),
                 _ => Err(err_at(format!("Cannot negate {}", v.type_name()), loc)),
             },
-            UnOp::Not => Ok(syn_bool(!v.is_truthy())),
+            UnOp::Not => Ok(syn_bool(!truth(&v, TruthAt::Not)?)),
         }
     }
 
@@ -7894,10 +7950,10 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
         // Lógicos: el cortocircuito vive en `exec` (BinaryOp); acá sólo llega un
         // `and`/`or` ya evaluado por ambos lados (callers internos).
         if op == BinOp::And {
-            return Ok(syn_bool(left.is_truthy() && right.is_truthy()));
+            return Ok(syn_bool(truth(&left, TruthAt::And)? && truth(&right, TruthAt::And)?));
         }
         if op == BinOp::Or {
-            return Ok(syn_bool(left.is_truthy() || right.is_truthy()));
+            return Ok(syn_bool(truth(&left, TruthAt::Or)? || truth(&right, TruthAt::Or)?));
         }
         // `x in xs` / `x not in xs` (v0.6.29): pertenencia en lista, clave de mapa,
         // subtexto o subsecuencia de bytes — la misma igualdad que `contains`.
@@ -8117,6 +8173,10 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
         // (`group_by`, `unique`, …) siguen usando la igualdad total de `probe_key`.
         if matches!(op, BinOp::Eq | BinOp::Ne) {
             let eq = crate::tabular::strict_equals(&left, &right).map_err(|_| err_at(MIX_DECIMAL_FLOAT, loc))?;
+            // v0.6.55 (R3): un array contra lo que no es su igual da error, salvo `nothing`.
+            if !eq && (matches!(left, SynValue::Array(_)) || matches!(right, SynValue::Array(_))) {
+                crate::arrays::array_eq_mismatch(&left, &right, op.as_str())?;
+            }
             return Ok(syn_bool(if op == BinOp::Eq { eq } else { !eq }));
         }
         // Orden
@@ -8125,12 +8185,9 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
             if matches!(left, SynValue::Complex(_)) || matches!(right, SynValue::Complex(_)) {
                 return Err(err_at("complex numbers are not ordered", loc));
             }
-            // Comparación elementwise de arrays = futuro (§12). Por ahora, error claro (G3).
+            // v0.6.55 (R1): con un array de un lado, una máscara (función fría).
             if matches!(left, SynValue::Array(_)) || matches!(right, SynValue::Array(_)) {
-                return Err(err_at(
-                    "arrays do not support ordering comparisons (use elementwise functions)",
-                    loc,
-                ));
+                return crate::arrays::array_compare(&left, &right, op.as_str());
             }
             if let (SynValue::Number(a), SynValue::Number(b)) = (&left, &right) {
                 if Number::mixes_decimal_float(a, b) {
@@ -9697,7 +9754,7 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
     /// `assert(cond, msg?)` → `nothing` si `cond` es truthy; si no, error de aserción con
     /// `msg` (o `"assertion failed"`).
     fn b_assert(&mut self, args: &[SynValue], _loc: &SourceLocation) -> Result<SynValue, Control> {
-        if nth(args, 0)?.is_truthy() {
+        if truth(nth(args, 0)?, TruthAt::Cond)? {
             return Ok(SynValue::Nothing);
         }
         let msg = match args.get(1) {
@@ -10682,6 +10739,8 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
     fn apply_array(&mut self, func: SynValue, a: &crate::types::NdArray, loc: &SourceLocation) -> Result<SynValue, Control> {
         let a = a.to_f64();
         let mut out = Vec::with_capacity(a.len());
+        // v0.6.55: si todos los resultados son bool, el resultado es una máscara.
+        let mut bools: Vec<bool> = Vec::new();
         for x in a.iter() {
             let r = self.call_value(func.clone(), vec![syn_float(*x)], loc)?;
             // v0.6.55 (1b, R6): con etiquetas, la lambda devuelve `Private` (el PC del despacho
@@ -10696,7 +10755,8 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                 other => other,
             };
             match r {
-                SynValue::Number(n) => out.push(n.to_f64()),
+                SynValue::Number(n) if bools.is_empty() => out.push(n.to_f64()),
+                SynValue::Bool(b) if out.is_empty() => bools.push(b),
                 other => {
                     return Err(err(format!(
                         "apply over an array needs numbers back, got {} — use to_list(a) for other results",
@@ -10704,6 +10764,11 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                     )))
                 }
             }
+        }
+        if !bools.is_empty() {
+            return Ok(crate::types::syn_mask(
+                ndarray::ArrayD::from_shape_vec(a.raw_dim(), bools).map_err(|e| err(e.to_string()))?,
+            ));
         }
         Ok(crate::types::syn_array(
             ndarray::ArrayD::from_shape_vec(a.raw_dim(), out).map_err(|e| err(e.to_string()))?,
@@ -10717,7 +10782,7 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
         let a = a.to_f64();
         let mut out = Vec::new();
         for x in a.iter() {
-            if self.call_value(pred.clone(), vec![syn_float(*x)], loc)?.is_truthy() {
+            if pred_truth(&self.call_value(pred.clone(), vec![syn_float(*x)], loc)?, "where")? {
                 out.push(*x);
             }
         }
@@ -10725,6 +10790,65 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
         Ok(crate::types::syn_array(
             ndarray::ArrayD::from_shape_vec(ndarray::IxDyn(&[n]), out).map_err(|e| err(e.to_string()))?,
         ))
+    }
+
+    /// `some`/`every`/`count_where` sobre un array (v0.6.55): con una máscara sola, sus verdaderos;
+    /// con un predicado, recorre todos los elementos (una máscara los da como bool). Fuera de línea,
+    /// como `apply_array`.
+    #[inline(never)]
+    fn quantify_array(&mut self, args: &[SynValue], who: &str, loc: &SourceLocation) -> Result<SynValue, Control> {
+        use crate::types::NdArray;
+        let (yes, total) = if args.len() == 1 {
+            match &args[0] {
+                SynValue::Array(a) => match &**a {
+                    NdArray::Bool(m) => (m.iter().filter(|b| **b).count(), m.len()),
+                    NdArray::F64(_) => {
+                        return Err(err(format!(
+                            "{} expects a mask (bool array) or a predicate, got a f64 array — compare first: a > 0",
+                            who
+                        )))
+                    }
+                },
+                other => {
+                    return Err(err(format!(
+                        "{} with one argument takes a mask (bool array), got {} — with a list: {}(xs, (x) => …)",
+                        who,
+                        other.type_name(),
+                        who
+                    )))
+                }
+            }
+        } else {
+            let Some((pred, a)) = fn_and_array(args) else {
+                return Err(err(format!("{} expects a list or array and a predicate ((x) => …)", who)));
+            };
+            let elems: Vec<SynValue> = match &*a {
+                NdArray::F64(x) => x.iter().map(|v| syn_float(*v)).collect(),
+                NdArray::Bool(x) => x.iter().map(|v| syn_bool(*v)).collect(),
+            };
+            let total = elems.len();
+            let mut yes = 0usize;
+            for x in elems {
+                let r = self.call_value(pred.clone(), vec![x], loc)?;
+                if let SynValue::Private(p) = &r {
+                    self.note_seen(&p.label);
+                }
+                if pred_truth(&r, who)? {
+                    yes += 1;
+                    if who == "some" {
+                        break;
+                    }
+                } else if who == "every" {
+                    break;
+                }
+            }
+            (yes, total)
+        };
+        Ok(match who {
+            "some" => syn_bool(yes > 0),
+            "every" => syn_bool(yes == total),
+            _ => syn_int(yes as i64),
+        })
     }
 
     fn b_apply(&mut self, args: &[SynValue], loc: &SourceLocation) -> Result<SynValue, Control> {
@@ -10956,12 +11080,21 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
         if let Some((pred, a)) = fn_and_array(args) {
             return self.where_array(pred, &a, loc);
         }
+        // v0.6.55: `where(a, m)` con una máscara; el `np.where` de tres argumentos es `if_else`.
+        if args.len() == 3 {
+            return Err(err(
+                "where takes a list or array and a predicate or mask; numpy's where(cond, x, y) is if_else(cond, x, y)",
+            ));
+        }
+        if let Some(SynValue::Array(a)) = args.first() {
+            return crate::arrays::where_mask(a, nth(args, 1)?);
+        }
         let (pred, l) = self.dual_fn_rc(args, "where")?;
         self.with_lambda(&pred, |it, lc| {
             let mut out = SynList::new();
             for i in 0..l.borrow().len() {
                 let (item, r) = lc.item_keep(it, &l, i, loc)?;
-                if r.is_truthy() {
+                if pred_truth(&r, "where")? {
                     out.push(item);
                 }
             }
@@ -10994,7 +11127,7 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
         for i in 0..n {
             let item = list_values(&l)[i].clone();
             let should = match &pred {
-                Some(p) => self.call_fast(p, &mut [item.clone()], loc)?.is_truthy(),
+                Some(p) => pred_truth(&self.call_fast(p, &mut [item.clone()], loc)?, "transform")?,
                 None => true,
             };
             if should {
@@ -11081,7 +11214,7 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
         self.with_lambda(&pred, |it, lc| {
             for i in 0..l.borrow().len() {
                 let (item, r) = lc.item_keep(it, &l, i, loc)?;
-                if r.is_truthy() {
+                if pred_truth(&r, "find_first")? {
                     return Ok(item);
                 }
             }
@@ -11090,10 +11223,13 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
     }
 
     fn b_every(&mut self, args: &[SynValue], loc: &SourceLocation) -> Result<SynValue, Control> {
+        if args.len() == 1 || args.iter().any(|a| matches!(a, SynValue::Array(_))) {
+            return self.quantify_array(args, "every", loc);
+        }
         let (pred, l) = self.dual_fn_rc(args, "every")?;
         self.with_lambda(&pred, |it, lc| {
             for i in 0..l.borrow().len() {
-                if !lc.item(it, &l, i, loc)?.is_truthy() {
+                if !pred_truth(&lc.item(it, &l, i, loc)?, "every")? {
                     return Ok(syn_bool(false));
                 }
             }
@@ -11102,10 +11238,13 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
     }
 
     fn b_some(&mut self, args: &[SynValue], loc: &SourceLocation) -> Result<SynValue, Control> {
+        if args.len() == 1 || args.iter().any(|a| matches!(a, SynValue::Array(_))) {
+            return self.quantify_array(args, "some", loc);
+        }
         let (pred, l) = self.dual_fn_rc(args, "some")?;
         self.with_lambda(&pred, |it, lc| {
             for i in 0..l.borrow().len() {
-                if lc.item(it, &l, i, loc)?.is_truthy() {
+                if pred_truth(&lc.item(it, &l, i, loc)?, "some")? {
                     return Ok(syn_bool(true));
                 }
             }
@@ -11114,11 +11253,14 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
     }
 
     fn b_count_where(&mut self, args: &[SynValue], loc: &SourceLocation) -> Result<SynValue, Control> {
+        if args.len() == 1 || args.iter().any(|a| matches!(a, SynValue::Array(_))) {
+            return self.quantify_array(args, "count_where", loc);
+        }
         let (pred, l) = self.dual_fn_rc(args, "count_where")?;
         self.with_lambda(&pred, |it, lc| {
             let mut count: i64 = 0;
             for i in 0..l.borrow().len() {
-                if lc.item(it, &l, i, loc)?.is_truthy() {
+                if pred_truth(&lc.item(it, &l, i, loc)?, "count_where")? {
                     count += 1;
                 }
             }
@@ -11221,7 +11363,7 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                     Some(x) => x.clone(),
                     None => break,
                 };
-                if self.call_value(needle.clone(), vec![item], loc)?.is_truthy() {
+                if pred_truth(&self.call_value(needle.clone(), vec![item], loc)?, "index_of")? {
                     return Ok(syn_int(i as i64));
                 }
                 i += 1;

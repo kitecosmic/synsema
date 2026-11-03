@@ -369,12 +369,12 @@ fn view_ins(c: &Chunk, pc: usize, env: &Rc<RefCell<Environment>>, me: Option<usi
             },
             a: nopnd(c, a)?,
         },
-        Ins::ToBool { dst, src } => NIns::ToBool { dst, src: nopnd(c, src)? },
+        Ins::ToBool { dst, src, .. } => NIns::ToBool { dst, src: nopnd(c, src)? },
         Ins::IntCmpJump { op, a, b: y, .. } => {
             let Some(Ins::JumpIfFalsy { to, .. }) = c.code.get(pc + 1).map(Cell::get) else { return None };
             NIns::IntCmpJump { op: ncmp(op)?, a: nopnd(c, a)?, b: nopnd(c, y)?, to }
         }
-        Ins::JumpIfFalsy { src, to } => NIns::JumpIfFalsy { src: nopnd(c, src)?, to },
+        Ins::JumpIfFalsy { src, to, .. } => NIns::JumpIfFalsy { src: nopnd(c, src)?, to },
         Ins::Jump { to } | Ins::LoopBack { to, n: 0, .. } => NIns::Jump { to },
         // `each` sobre `range` (F4.2b): el iterador perezoso en el código nativo.
         Ins::LoopBack { to, first, n, .. } | Ins::EachStepV { head: to, first, n } => NIns::EachStep { head: to, first, n },

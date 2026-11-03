@@ -47,6 +47,11 @@ pub fn kwargs_of(name: &str) -> &'static [&'static str] {
 }
 
 pub const BUILTIN_ARITY: &[(&str, usize, Option<usize>)] = &[
+    // v0.6.55: `some(m)` con una máscara sola; `where(m, x, y)` llega para dar el error de `if_else`.
+    ("some", 1, Some(2)),
+    ("every", 1, Some(2)),
+    ("count_where", 1, Some(2)),
+    ("where", 2, Some(3)),
     ("random", 0, Some(1)),
     ("random_int", 2, Some(3)),
     ("parquet_write", 1, Some(2)),

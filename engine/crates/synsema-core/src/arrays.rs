@@ -409,7 +409,7 @@ pub fn index_row(a: &NdArray, i: i64) -> Result<SynValue, Control> {
 
 /// Shape de broadcast estilo NumPy (alinea desde la derecha; cada dim igual o uno = 1).
 /// `None` si no son broadcasteables.
-fn broadcast_shape(a: &[usize], b: &[usize]) -> Option<Vec<usize>> {
+pub fn broadcast_shape(a: &[usize], b: &[usize]) -> Option<Vec<usize>> {
     let n = a.len().max(b.len());
     let mut out = vec![0usize; n];
     for i in 0..n {
@@ -495,6 +495,138 @@ pub fn array_binop(left: &SynValue, right: &SynValue, op: &str) -> Option<Result
         }
     };
     Some(res)
+}
+
+// =========================================================
+// Elemento a elemento con broadcasting (v0.6.55): comparaciones, `==`, `maximum`, …
+// =========================================================
+
+/// Un operando elemento a elemento como `f64`: un array (una máscara da 0/1, R2) o un número
+/// (un array 0-d, que el broadcasting estira). `None` si no es ninguno de los dos.
+pub fn elem_operand(v: &SynValue) -> Option<Cow<'_, ArrayD<f64>>> {
+    match v {
+        SynValue::Array(a) => Some(a.to_f64()),
+        SynValue::Number(n) => Some(Cow::Owned(ArrayD::from_elem(IxDyn(&[]), n.to_f64()))),
+        _ => None,
+    }
+}
+
+/// `f(a, b)` elemento a elemento con el broadcasting de numpy, sin copiar los operandos.
+pub fn zip_broadcast<A: Copy, B: Copy, T>(a: &ArrayD<A>, b: &ArrayD<B>, f: impl Fn(A, B) -> T) -> Result<ArrayD<T>, Control> {
+    let shape = broadcast_shape(a.shape(), b.shape())
+        .ok_or_else(|| err(format!("arrays of shape {:?} and {:?} are not broadcastable", a.shape(), b.shape())))?;
+    let (va, vb) = (a.broadcast(IxDyn(&shape)).unwrap(), b.broadcast(IxDyn(&shape)).unwrap());
+    Ok(ndarray::Zip::from(va).and(vb).map_collect(|&x, &y| f(x, y)))
+}
+
+fn is_mask(v: &SynValue) -> bool {
+    matches!(v, SynValue::Array(a) if a.as_f64().is_none())
+}
+
+/// `<`, `>`, `<=`, `>=` con un array de un lado (R1): una máscara de la forma del broadcast. Un
+/// `NaN` da `false` (numpy). Una máscara no tiene orden (R2) y una lista no se convierte sola.
+/// Fría: `exec_binary` llega acá sólo si un operando es un array.
+#[inline(never)]
+pub fn array_compare(left: &SynValue, right: &SynValue, op: &str) -> Result<SynValue, Control> {
+    if is_mask(left) || is_mask(right) {
+        return Err(err("masks are not ordered — compare the numbers they came from"));
+    }
+    let (a, b) = match (elem_operand(left), elem_operand(right)) {
+        (Some(a), Some(b)) => (a, b),
+        _ => {
+            let other = if matches!(left, SynValue::Array(_)) { right } else { left };
+            return Err(match other {
+                SynValue::List(_) => err("cannot compare an array with a list — make it an array first: array(xs)"),
+                o => err(format!("cannot compare an array with {}", o.type_name())),
+            });
+        }
+    };
+    let f: fn(f64, f64) -> bool = match op {
+        "<" => |x, y| x < y,
+        ">" => |x, y| x > y,
+        "<=" => |x, y| x <= y,
+        _ => |x, y| x >= y,
+    };
+    Ok(crate::types::syn_mask(zip_broadcast(&a, &b, f)?))
+}
+
+/// `==`/`!=` con un array de un lado, cuando la igualdad del valor entero dio `false` (R3): si
+/// eso es la respuesta (otra forma, otros valores, `nothing`) devuelve `Ok`; si `false` en
+/// silencio sería un error (un número, una lista, otro tipo, una máscara contra un `f64`), el
+/// error nombra la forma Synsema.
+#[inline(never)]
+pub fn array_eq_mismatch(left: &SynValue, right: &SynValue, op: &str) -> Result<(), Control> {
+    let (arr, other) = if matches!(left, SynValue::Array(_)) { (left, right) } else { (right, left) };
+    match (arr, other) {
+        (SynValue::Array(a), SynValue::Array(b)) => {
+            if a.dtype() == b.dtype() {
+                Ok(())
+            } else {
+                Err(err("a mask and a f64 array are never equal — compare like with like (m * 1.0 gives 0/1 floats)"))
+            }
+        }
+        (_, SynValue::Nothing) => Ok(()),
+        (_, SynValue::Number(n)) => {
+            let f = if op == "==" { "equal" } else { "not_equal" };
+            Err(err(format!("{} compares whole values; for elementwise: {}(a, {})", op, f, n)))
+        }
+        (_, SynValue::List(_)) => Err(err(if op == "==" {
+            "== between an array and a list is never true — compare array(xs), or to_list(a) == xs"
+        } else {
+            "!= between an array and a list is always true — compare array(xs), or to_list(a) != xs"
+        })),
+        (_, o) => Err(err(format!(
+            "{} between an array and {} is {}",
+            op,
+            o.type_name(),
+            if op == "==" { "never true" } else { "always true" }
+        ))),
+    }
+}
+
+/// `where(a, m)` (v0.6.55): los elementos de `a` donde la máscara es verdadera, aplanados en 1-D,
+/// como `a[m]` de numpy. La máscara tiene la forma de `a`. Una máscara de máscara da una máscara.
+#[inline(never)]
+pub fn where_mask(a: &NdArray, m: &SynValue) -> Result<SynValue, Control> {
+    let m = match m {
+        SynValue::Array(x) => match &**x {
+            NdArray::Bool(m) => m,
+            NdArray::F64(_) => {
+                return Err(err("where expects a mask (a > 0) or a predicate ((x) => …), got a f64 array"))
+            }
+        },
+        other => {
+            return Err(err(format!(
+                "where expects a mask (a > 0) or a predicate ((x) => …), got {}",
+                other.type_name()
+            )))
+        }
+    };
+    if m.shape() != a.shape() {
+        return Err(err(format!("where: the mask has shape {:?} and the array {:?}", m.shape(), a.shape())));
+    }
+    fn pick<T: Copy>(x: &ArrayD<T>, m: &ArrayD<bool>) -> ArrayD<T> {
+        let v: Vec<T> = x.iter().zip(m.iter()).filter(|(_, k)| **k).map(|(v, _)| *v).collect();
+        let n = v.len();
+        ArrayD::from_shape_vec(IxDyn(&[n]), v).expect("1-D")
+    }
+    Ok(nd_value_of(nd_map!(a, |x| pick(x, m))))
+}
+
+/// `clamp(a, lo, hi)` con un array en alguno de los tres (v0.6.55): `min(max(x, lo), hi)` elemento a
+/// elemento, con broadcasting; un `NaN` se propaga (el `np.clip` de numpy).
+#[inline(never)]
+pub fn clamp_array(args: &[SynValue]) -> Result<SynValue, Control> {
+    arity(args, 3, "clamp")?;
+    let one = |i: usize| -> Result<Cow<'_, ArrayD<f64>>, Control> {
+        elem_operand(&args[i]).ok_or_else(|| match &args[i] {
+            SynValue::List(_) => err("clamp: make the list an array first: array(xs)"),
+            o => err(format!("clamp expects arrays or numbers, got {}", o.type_name())),
+        })
+    };
+    let (x, lo, hi) = (one(0)?, one(1)?, one(2)?);
+    let up = zip_broadcast(&x, &lo, |v, l| if v.is_nan() || l.is_nan() { f64::NAN } else { v.max(l) })?;
+    Ok(syn_array(zip_broadcast(&up, &hi, |v, h| if v.is_nan() || h.is_nan() { f64::NAN } else { v.min(h) })?))
 }
 
 /// Unario `-` sobre un array (elementwise).

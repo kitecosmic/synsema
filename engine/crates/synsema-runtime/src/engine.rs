@@ -639,6 +639,7 @@ pub(crate) fn wire_common_with_state(
     synsema_stdlib::hashing::register_hash_builtins(interp);
     // Bits sobre enteros de 64 bits y `xor_bytes` (puro, v0.6.44).
     synsema_stdlib::bits::register_bit_builtins(interp);
+    synsema_stdlib::ndarray_ops::register_ndarray_builtins(interp);
     synsema_stdlib::encoding::register_encoding_builtins(interp);
     synsema_stdlib::headers::register_header_builtins(interp);
     synsema_stdlib::qr::register_qr_builtins(interp);

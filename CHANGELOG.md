@@ -16,6 +16,30 @@ Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the rele
   `parallel_map` and the snapshots of `serve`, and the charts and database parameters reject it
   (`chart_svg: a mask (bool array) is not a series — m * 1.0 gives 0/1 floats`; for a parameter,
   `sql: a mask (bool array) is not a vector — …`).
+- **Comparisons give masks.** `a > 2`, `2 < a`, `a >= b` (numpy broadcasting) return a mask; `NaN`
+  compares `false`. `dtype(a)` is `"f64"` or `"bool"`. A mask in arithmetic is 0/1 (`m * 1.0`),
+  `sum(m)` is the count of trues (an integer), `mean(m)` the fraction. Masks are not ordered
+  (`m > m` is an error) and a list is never turned into an array behind your back
+  (`a > [1, 2]` → `… make it an array first: array(xs)`).
+- **Elementwise builtins:** `equal`, `not_equal`, `logical_and`, `logical_or`, `logical_not`,
+  `if_else(m, x, y)` (numpy's three-argument `where`), `maximum`, `minimum` (NaN propagates), and
+  `clamp` on arrays. `where(a, m)` keeps the elements where the mask is true (`a[m]` in numpy);
+  `some(m)`, `every(m)`, `count_where(m)`, and `some`/`every`/`count_where` with a predicate over an
+  array; `apply` that returns bools gives a mask. `any`, `all`, `clip` and `scatter_add` are not
+  defined and say what to write instead.
+- **Fixed:** with `--labels`, `apply` over a private array (or with a captured private value) stopped
+  the run with `private(x)`; it now gives a private array.
+
+**Breaking.**
+- **`==`/`!=` with an array no longer answer `false` in silence.** Two arrays are still compared as
+  whole values (same type, shape and values). Against a number, a list or another type it is an
+  error that names the elementwise form (`== compares whole values; for elementwise: equal(a, 3)`);
+  a mask against a `f64` array is an error too. `x == nothing` still answers `false`. `in`, `match`
+  and `contains` do not change.
+- **An array is never true or false.** `when a`, `while m`, `assert(m)`, a guard, `and`/`or`/`not`
+  and a predicate that returns an array are errors that suggest `some(m)` / `every(m)`,
+  `length(a) > 0` or `logical_and`. Before, a non-empty array counted as true.
+- `arrays do not support ordering comparisons` is gone (comparisons work now).
 
 ## v0.6.54 — 2026-11-02
 

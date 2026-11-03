@@ -878,7 +878,7 @@ fn render_nodes(
                         interp.note_seen(&l);
                     }
                 }
-                let branch = if c.is_truthy() { then } else { els };
+                let branch = if crate::interpreter::truth(&c, crate::interpreter::TruthAt::Cond)? { then } else { els };
                 render_nodes(branch, interp, env, out, filename, slots, depth)?;
             }
             // El HTML ya renderizado de la página hija, inyectado raw en un layout.

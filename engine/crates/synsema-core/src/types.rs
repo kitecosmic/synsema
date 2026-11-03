@@ -263,6 +263,18 @@ impl SynValue {
         }
     }
 
+    /// v0.6.55 (R4): la verdad de un valor en una condición. Como `is_truthy`, pero un array
+    /// (que no es verdadero ni falso) da `None`; el que pregunta arma el error.
+    #[inline]
+    pub fn truth(&self) -> Option<bool> {
+        match self {
+            SynValue::Bool(b) => Some(*b),
+            SynValue::Array(_) => None,
+            SynValue::Private(p) => p.value.truth(),
+            other => Some(other.is_truthy()),
+        }
+    }
+
     /// Igualdad por valor (operador `==`/`!=`, `match`, `contains`).
     pub fn syn_equals(&self, other: &SynValue) -> bool {
         match (self, other) {
