@@ -633,16 +633,31 @@ pub fn clamp_array(args: &[SynValue]) -> Result<SynValue, Control> {
 /// array 1-D da sus elementos (números, o bool si es una máscara); uno de más ejes, sus filas.
 #[inline(never)]
 pub fn each_items(a: &NdArray) -> Result<Vec<SynValue>, Control> {
+    each_check(a)?;
+    Ok((0..a.shape()[0]).filter_map(|i| each_item(a, i)).collect())
+}
+
+/// `each` sobre un array 0-d es un error (no tiene filas).
+pub fn each_check(a: &NdArray) -> Result<(), Control> {
     if a.ndim() == 0 {
         return Err(err("each over a 0-d array: it is a scalar and has no rows — use the value itself"));
     }
+    Ok(())
+}
+
+/// El elemento (1-D) o la fila `i` de `each`, recién cuando le toca la vuelta; `None` al terminar.
+#[inline(never)]
+pub fn each_item(a: &NdArray, i: usize) -> Option<SynValue> {
+    if i >= a.shape()[0] {
+        return None;
+    }
     if a.ndim() == 1 {
-        return Ok(match a {
-            NdArray::F64(x) => x.iter().map(|v| syn_float(*v)).collect(),
-            NdArray::Bool(x) => x.iter().map(|v| syn_bool(*v)).collect(),
+        return Some(match a {
+            NdArray::F64(x) => syn_float(x[[i]]),
+            NdArray::Bool(x) => syn_bool(x[[i]]),
         });
     }
-    (0..a.shape()[0]).map(|i| index_row(a, i as i64)).collect()
+    index_row(a, i as i64).ok()
 }
 
 /// Un error sin ubicación con la de `loc` (la de la sentencia que lo pidió).
@@ -880,10 +895,17 @@ pub fn dot(args: &[SynValue]) -> Result<SynValue, Control> {
     }
     // v0.6.29 (DATOS-10): un nombre por concepto — `dot` es el producto interno de VECTORES;
     // el producto de matrices es `matmul` (en numpy `dot` hace las dos cosas y confunde).
+    // Una matriz con un vector (`np.dot(M, v)`): la forma Synsema, con el largo del vector.
+    let hint = match (a.ndim(), b.ndim()) {
+        (2, 1) => format!("for a matrix times a vector: matmul(M, reshape(v, [{}, 1]))", b.len()),
+        (1, 2) => format!("for a vector times a matrix: matmul(reshape(v, [1, {}]), M)", a.len()),
+        _ => "for matrices use matmul(a, b)".to_string(),
+    };
     Err(err(format!(
-        "dot is the inner product of two 1-D vectors (got {}-D and {}-D) — for matrices use matmul(a, b)",
+        "dot is the inner product of two 1-D vectors (got {}-D and {}-D) — {}",
         a.ndim(),
-        b.ndim()
+        b.ndim(),
+        hint
     )))
 }
 
@@ -1545,27 +1567,89 @@ pub fn take_axis(a: &NdArray, pos: &[usize], axis: usize) -> SynValue {
     nd_value_of(nd_map!(a, |x| x.select(Axis(axis), pos)))
 }
 
-/// Una fila del camino de un `set` (`set M[i][j]`): la fila es una copia y se recuerda de qué array
-/// salió y en qué posición, para que la hoja la vuelva a escribir ahí (`set_index`). Guarda la
-/// copia viva, así que su dirección no se reusa: una entrada que quedó de un `set` que falló no se
-/// confunde con otra fila.
+/// Un paso de fila del camino de un `set` (`set M[i][j]`, R5): por el camino no viaja la fila (una
+/// copia por escritura) sino una FICHA, un array vacío propio que la hoja reconoce; la entrada dice
+/// de qué array (o de qué ficha de más arriba) y en qué posición. La hoja escribe el elemento
+/// directo en el array de la variable. La entrada guarda la ficha viva, así que su dirección no se
+/// reusa: una que quedó de un `set` que falló no se confunde con otra.
 struct RowPlace {
-    row: crate::types::Obj<NdArray>,
+    token: crate::types::Obj<NdArray>,
     parent: crate::types::Obj<NdArray>,
     at: usize,
 }
 
-thread_local! {
-    static ROW_PLACES: std::cell::RefCell<Vec<RowPlace>> = const { std::cell::RefCell::new(Vec::new()) };
+/// Lo que el camino de un `set` sobre arrays deja para la hoja: las fichas de las filas y los arrays
+/// exportados por un módulo, cuya vista en el mapa del módulo es un dueño más que el lugar (B1 de la
+/// auditoría de v0.6.55). Cada entrada guarda una referencia, que la hoja descuenta al sacarla.
+struct Places {
+    rows: Vec<RowPlace>,
+    views: Vec<crate::types::Obj<NdArray>>,
 }
 
-/// Un paso `[i]` del camino de un `set` sobre un array (`place_index_step`): la fila `i`, recordada.
+thread_local! {
+    static PLACES: std::cell::RefCell<Places> =
+        const { std::cell::RefCell::new(Places { rows: Vec::new(), views: Vec::new() }) };
+}
+
+/// Lo que quedó de `set` que fallaron a mitad de camino se descarta de a tandas (una entrada vieja
+/// sólo cuesta una copia del array en el próximo `set`, porque suma un dueño).
+const PLACES_CAP: usize = 64;
+
+/// La raíz y las posiciones de una ficha (de afuera hacia adentro); `None` si `a` no es una ficha.
+fn row_chain(rows: &[RowPlace], a: &crate::types::Obj<NdArray>) -> Option<(crate::types::Obj<NdArray>, Vec<usize>)> {
+    let mut cur = a;
+    let mut prefix = Vec::new();
+    while let Some(e) = rows.iter().find(|e| crate::types::Obj::ptr_eq(&e.token, cur)) {
+        prefix.push(e.at);
+        cur = &e.parent;
+    }
+    if prefix.is_empty() {
+        return None;
+    }
+    prefix.reverse();
+    Some((cur.clone(), prefix))
+}
+
+/// La sub-vista en `prefix` (una posición por eje, desde el primero).
+fn sub_view<'a, T>(x: &'a ArrayD<T>, prefix: &[usize]) -> ndarray::ArrayViewD<'a, T> {
+    let mut v = x.view();
+    for &i in prefix {
+        v = v.index_axis_move(Axis(0), i);
+    }
+    v
+}
+
+fn sub_view_mut<'a, T>(x: &'a mut ArrayD<T>, prefix: &[usize]) -> ndarray::ArrayViewMutD<'a, T> {
+    let mut v = x.view_mut();
+    for &i in prefix {
+        v = v.index_axis_move(Axis(0), i);
+    }
+    v
+}
+
+/// `with_unique_binding` (intérprete): el array de una exportación de un módulo, al que la vista del
+/// mapa también apunta. La hoja cuenta esa vista como dueña (B1).
+#[inline(never)]
+pub fn note_module_view(a: &crate::types::Obj<NdArray>) {
+    PLACES.with(|s| {
+        let mut s = s.borrow_mut();
+        if s.views.len() >= PLACES_CAP {
+            s.views.clear();
+        }
+        s.views.push(a.clone());
+    });
+}
+
+/// Un paso `[i]` del camino de un `set` sobre un array (`place_index_step`): la ficha de la fila
+/// `i`, o el elemento si la fila es un número (la hoja dará entonces el error de siempre).
 #[inline(never)]
 pub fn place_row(parent: &SynValue, idx: &SynValue) -> Result<SynValue, Control> {
     let SynValue::Array(p) = parent else {
         return Err(err(format!("Cannot index into {}", parent.type_name())));
     };
-    if p.ndim() == 0 {
+    let (root, prefix) = PLACES.with(|s| row_chain(&s.borrow().rows, p)).unwrap_or_else(|| (p.clone(), Vec::new()));
+    let shape = &root.shape()[prefix.len()..];
+    if shape.is_empty() {
         return Err(err("cannot index a 0-dimensional array"));
     }
     if !matches!(idx, SynValue::Number(_)) {
@@ -1573,18 +1657,22 @@ pub fn place_row(parent: &SynValue, idx: &SynValue) -> Result<SynValue, Control>
             "set: a list of positions only goes in the last index — set M[[0, 2]] to rows, or M[i][j] one by one",
         ));
     }
-    let at = positions(idx, p.shape()[0], 0, PosFor::Set)?[0];
-    let row = index_row(p, at as i64)?;
-    if let SynValue::Array(r) = &row {
-        ROW_PLACES.with(|v| {
-            let mut v = v.borrow_mut();
-            if v.len() >= 64 {
-                v.clear();
-            }
-            v.push(RowPlace { row: r.clone(), parent: p.clone(), at });
+    let at = positions(idx, shape[0], 0, PosFor::Set)?[0];
+    if shape.len() == 1 {
+        return Ok(match &*root {
+            NdArray::F64(x) => syn_float(sub_view(x, &prefix)[[at]]),
+            NdArray::Bool(x) => syn_bool(sub_view(x, &prefix)[[at]]),
         });
     }
-    Ok(row)
+    let token = crate::types::Obj::new(NdArray::F64(ArrayD::zeros(IxDyn(&[0]))));
+    PLACES.with(|s| {
+        let mut s = s.borrow_mut();
+        if s.rows.len() >= PLACES_CAP {
+            s.rows.clear();
+        }
+        s.rows.push(RowPlace { token: token.clone(), parent: p.clone(), at });
+    });
+    Ok(SynValue::Array(token))
 }
 
 /// Lo que se escribe, ya convertido al tipo del array.
@@ -1632,7 +1720,7 @@ impl Payload {
 
 /// Escribe `p` en las posiciones `pos` del primer eje de `x` (la región es `[k] ++ shape[1..]`, o
 /// `shape[1..]` con un índice solo). Las formas ya están verificadas.
-fn write_region<T: Copy>(x: &mut ArrayD<T>, pos: &[usize], single: bool, scalar: Option<T>, arr: Option<&ArrayD<T>>) {
+fn write_region<T: Copy>(mut x: ndarray::ArrayViewMutD<T>, pos: &[usize], single: bool, scalar: Option<T>, arr: Option<&ArrayD<T>>) {
     let region: Vec<usize> = if single {
         x.shape()[1..].to_vec()
     } else {
@@ -1651,33 +1739,58 @@ fn write_region<T: Copy>(x: &mut ArrayD<T>, pos: &[usize], single: bool, scalar:
 }
 
 /// `set a[idx] to value` (la hoja; `set_leaf_index`): escribe en el lugar el array que el camino
-/// dejó único. Si `a` es una fila del camino (`set M[i][j]`), la fila escrita vuelve a su array,
-/// hasta el de la variable. `root`: el nombre de la variable, para el error de forma.
+/// dejó único. Si `a` es la ficha de una fila (`set M[i][j]`), escribe en el array de la variable,
+/// en esa fila. `root`: el nombre de la variable, para el error de forma.
 #[inline(never)]
 pub fn set_index(obj: &SynValue, idx: &SynValue, value: SynValue, root: Option<&str>) -> Result<SynValue, Control> {
     let SynValue::Array(a) = obj else {
         return Err(err(format!("Cannot set index on {}", obj.type_name())));
     };
-    // La cadena de filas (de adentro hacia afuera); todo lo demás que quedó es de un `set` que
-    // falló y se descarta.
-    let mut chain: Vec<(crate::types::Obj<NdArray>, usize)> = Vec::new();
-    ROW_PLACES.with(|v| {
-        let mut v = v.borrow_mut();
-        let mut cur = a.clone();
-        while let Some(k) = v.iter().position(|e| crate::types::Obj::ptr_eq(&e.row, &cur)) {
-            let e = v.swap_remove(k);
-            cur = e.parent.clone();
-            chain.push((e.parent, e.at));
+    // Las entradas de ESTA escritura salen (y sus referencias con ellas); las de otra, no: un `set`
+    // dentro de un índice (`set M[0][f()]` con `f` que escribe otro array) no le borra el camino.
+    let (chain, view) = PLACES.with(|s| {
+        let mut s = s.borrow_mut();
+        let chain = row_chain(&s.rows, a);
+        if let Some((r, _)) = &chain {
+            // Las fichas de esta cadena: de `a` hacia arriba hasta la raíz.
+            let mut cur = a.clone();
+            while let Some(k) = s.rows.iter().position(|e| crate::types::Obj::ptr_eq(&e.token, &cur)) {
+                let e = s.rows.swap_remove(k);
+                if crate::types::Obj::ptr_eq(&e.parent, r) {
+                    break;
+                }
+                cur = e.parent;
+            }
         }
-        v.clear();
+        let target = chain.as_ref().map_or(a, |(r, _)| r);
+        let view = match s.views.iter().position(|v| crate::types::Obj::ptr_eq(v, target)) {
+            Some(k) => {
+                s.views.swap_remove(k);
+                true
+            }
+            None => false,
+        };
+        (chain, view)
     });
-    if a.ndim() == 0 {
+    let (target, prefix): (&crate::types::Obj<NdArray>, &[usize]) = match &chain {
+        Some((r, p)) => (r, p),
+        None => (a, &[]),
+    };
+    // Los dueños del array de la variable: su lugar y la referencia de esta escritura (la del camino,
+    // o la raíz de la cadena), más la vista del módulo si es una exportación. Si hay otro (un alias
+    // tomado a mitad de la sentencia, la reentrada), no se escribe.
+    let owners = if view { 3 } else { 2 };
+    if crate::types::Obj::strong_count(target) != owners {
+        return Err(in_use());
+    }
+    let shape = &target.shape()[prefix.len()..];
+    if shape.is_empty() {
         return Err(err("cannot index a 0-dimensional array"));
     }
     let single = matches!(idx, SynValue::Number(_));
-    let pos = positions(idx, a.shape()[0], 0, PosFor::Set)?;
-    let payload = Payload::of(&value, a.dtype() == "bool")?;
-    let sub = &a.shape()[1..];
+    let pos = positions(idx, shape[0], 0, PosFor::Set)?;
+    let payload = Payload::of(&value, target.dtype() == "bool")?;
+    let sub = &shape[1..];
     let region: Vec<usize> =
         if single { sub.to_vec() } else { std::iter::once(pos.len()).chain(sub.iter().copied()).collect() };
     if let Some(vs) = payload.shape() {
@@ -1694,37 +1807,23 @@ pub fn set_index(obj: &SynValue, idx: &SynValue, value: SynValue, root: Option<&
             )));
         }
     }
-    // Los dueños: una fila del camino es sólo de esta escritura; el array de la variable, además,
-    // de su lugar.
-    let owners = if chain.is_empty() { 2 } else { 1 };
-    // SAFETY: el camino del `set` dejó el array único en su lugar (`make_unique`) y nadie lo lee
-    // mientras se escribe; si la cuenta no es la esperada, no se escribe.
-    let target = unsafe { crate::types::Obj::get_mut_with_owners(a, owners) }.ok_or_else(in_use)?;
-    match (target, payload) {
-        (NdArray::F64(x), Payload::F64(v)) => write_region(x, &pos, single, Some(v), None),
-        (NdArray::F64(x), Payload::F64s(s)) => write_region(x, &pos, single, None, Some(&s)),
-        (NdArray::Bool(x), Payload::Bool(v)) => write_region(x, &pos, single, Some(v), None),
-        (NdArray::Bool(x), Payload::Bools(s)) => write_region(x, &pos, single, None, Some(&s)),
+    // SAFETY: la cuenta es exacta (arriba) y ninguna de esas referencias se lee mientras se escribe:
+    // el lugar está quieto hasta que termine la sentencia, el valor ya se copió a `payload` y las
+    // posiciones ya están calculadas. Lo que la cuenta NO dice es que el otro dueño sea el lugar: un
+    // índice que religa la variable y guarda el array viejo en otra (`set a[f()]`) hace que se
+    // escriba en ese array, como con una lista (faltantes: evaluar los índices antes del camino).
+    let t = unsafe { crate::types::Obj::get_mut_with_owners(target, owners) }.ok_or_else(in_use)?;
+    match (t, payload) {
+        (NdArray::F64(x), Payload::F64(v)) => write_region(sub_view_mut(x, prefix), &pos, single, Some(v), None),
+        (NdArray::F64(x), Payload::F64s(s)) => write_region(sub_view_mut(x, prefix), &pos, single, None, Some(&s)),
+        (NdArray::Bool(x), Payload::Bool(v)) => write_region(sub_view_mut(x, prefix), &pos, single, Some(v), None),
+        (NdArray::Bool(x), Payload::Bools(s)) => write_region(sub_view_mut(x, prefix), &pos, single, None, Some(&s)),
         _ => unreachable!("Payload::of sigue el tipo del array"),
-    }
-    // Cada fila vuelve a su array: la de adentro al de arriba, hasta el de la variable.
-    let mut child = a.clone();
-    let n = chain.len();
-    for (i, (parent, at)) in chain.into_iter().enumerate() {
-        let owners = if i + 1 == n { 2 } else { 1 };
-        // SAFETY: como arriba; las filas de la cadena son copias que sólo tiene esta escritura.
-        let p = unsafe { crate::types::Obj::get_mut_with_owners(&parent, owners) }.ok_or_else(in_use)?;
-        match (p, &*child) {
-            (NdArray::F64(x), NdArray::F64(r)) => x.index_axis_mut(Axis(0), at).assign(r),
-            (NdArray::Bool(x), NdArray::Bool(r)) => x.index_axis_mut(Axis(0), at).assign(r),
-            _ => unreachable!("una fila tiene el tipo de su array"),
-        }
-        child = parent;
     }
     Ok(value)
 }
 
 #[cold]
 fn in_use() -> Control {
-    err("set: the array is in use elsewhere in this statement and cannot be written in place — compute the index or the value into a variable first")
+    err("set: the array is in use elsewhere in this statement and cannot be written in place — an index or value that reads or writes the same array: compute it into a variable first")
 }

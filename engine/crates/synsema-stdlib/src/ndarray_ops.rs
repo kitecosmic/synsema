@@ -59,11 +59,14 @@ pub fn dtype(args: &[SynValue]) -> Result<SynValue, Control> {
 }
 
 /// Los dos operandos como `f64` (array o número; una máscara es 0/1). Al menos uno tiene que ser
-/// array, salvo en `equal`/`maximum` de dos números, que da un escalar.
+/// array (dos números los resuelven `equal`/`extreme` con los números del lenguaje).
 fn operands<'a>(
     args: &'a [SynValue],
     name: &str,
 ) -> Result<(std::borrow::Cow<'a, ArrayD<f64>>, std::borrow::Cow<'a, ArrayD<f64>>), Control> {
+    if !matches!(args[0], SynValue::Array(_)) && !matches!(args[1], SynValue::Array(_)) {
+        return Err(two_scalars(&args[0], &args[1], name));
+    }
     let one = |v: &'a SynValue| match elem_operand(v) {
         Some(a) => Ok(a),
         None => Err(match v {
@@ -74,30 +77,61 @@ fn operands<'a>(
     Ok((one(&args[0])?, one(&args[1])?))
 }
 
-fn both_numbers(args: &[SynValue]) -> bool {
-    matches!((&args[0], &args[1]), (SynValue::Number(_), SynValue::Number(_)))
+/// Dos números (M4 de la auditoría de v0.6.55): su orden con los números del lenguaje, no por `f64`
+/// (`equal(2**53 + 1, 2**53)` es `false`, como `==`; `maximum(2, 3)` es el entero `3`, como `max`).
+/// `None` adentro: un `NaN`. `Ok(None)`: no son dos números.
+fn two_numbers(args: &[SynValue], name: &str) -> Result<Option<Option<std::cmp::Ordering>>, Control> {
+    let (SynValue::Number(a), SynValue::Number(b)) = (&args[0], &args[1]) else { return Ok(None) };
+    if synsema_core::number::Number::mixes_decimal_float(a, b) {
+        return Err(err(format!("{}: cannot mix a decimal and a float — convert one first", name)));
+    }
+    Ok(Some(a.partial_cmp_num(b)))
+}
+
+#[cold]
+#[inline(never)]
+fn two_scalars(a: &SynValue, b: &SynValue, name: &str) -> Control {
+    let instead = match name {
+        "equal" => "for two values use a == b",
+        "not_equal" => "for two values use a != b",
+        "maximum" => "for two numbers use max(a, b)",
+        _ => "for two numbers use min(a, b)",
+    };
+    match (a, b) {
+        (SynValue::List(_), _) | (_, SynValue::List(_)) => err(format!("{}: make the list an array first: array(xs)", name)),
+        _ => err(format!("{} works on arrays (got {} and {}) — {}", name, a.type_name(), b.type_name(), instead)),
+    }
 }
 
 /// `equal`/`not_equal`: la máscara de la igualdad elemento a elemento (un `NaN` nunca es igual).
 fn equal(args: &[SynValue], name: &str, f: fn(f64, f64) -> bool) -> Result<SynValue, Control> {
     arity(args, 2, name)?;
+    if let Some(o) = two_numbers(args, name)? {
+        // `equal(nan, nan)` es `false` (diseño §3.1), como `f(nan, nan)`.
+        let eq = o == Some(std::cmp::Ordering::Equal);
+        return Ok(syn_bool(if name == "equal" { eq } else { !eq }));
+    }
     let (a, b) = operands(args, name)?;
     let m = zip_broadcast(&a, &b, f).map_err(|e| prefixed(e, name))?;
-    if both_numbers(args) {
-        return Ok(syn_bool(m.iter().next().copied().unwrap_or(false)));
-    }
     Ok(syn_mask(m))
 }
 
 /// `maximum`/`minimum`: elemento a elemento; un `NaN` se propaga (numpy).
 fn extreme(args: &[SynValue], name: &str, f: fn(f64, f64) -> f64) -> Result<SynValue, Control> {
     arity(args, 2, name)?;
+    if let Some(o) = two_numbers(args, name)? {
+        let (x, y) = (&args[0], &args[1]);
+        return Ok(match o {
+            None => syn_float(f64::NAN),
+            Some(o) => {
+                let first = if name == "maximum" { o != std::cmp::Ordering::Less } else { o != std::cmp::Ordering::Greater };
+                if first { x.clone() } else { y.clone() }
+            }
+        });
+    }
     let (a, b) = operands(args, name)?;
     let r = zip_broadcast(&a, &b, |x, y| if x.is_nan() || y.is_nan() { f64::NAN } else { f(x, y) })
         .map_err(|e| prefixed(e, name))?;
-    if both_numbers(args) {
-        return Ok(syn_float(r.iter().next().copied().unwrap_or(f64::NAN)));
-    }
     Ok(syn_array(r))
 }
 
@@ -241,11 +275,33 @@ pub fn matmul(args: &[SynValue]) -> Result<SynValue, Control> {
     let (SynValue::Array(a), SynValue::Array(b)) = (&args[0], &args[1]) else {
         return synsema_core::arrays::matmul(args);
     };
+    if a.ndim() == 1 || b.ndim() == 1 {
+        return Err(matmul_vector_error(a.shape(), b.shape()));
+    }
     if a.ndim() < 2 || b.ndim() < 2 || (a.ndim() == 2 && b.ndim() == 2) {
         return synsema_core::arrays::matmul(args);
     }
     let (a, b) = (a.to_f64(), b.to_f64());
     batched_matmul(&a, &b)
+}
+
+/// `matmul` con un vector (N3 de la auditoría de v0.6.55): numpy lo acepta y quita el eje; acá la
+/// forma es explícita, y el error dice cuál (`M @ v` es la línea más común de una red).
+#[cold]
+#[inline(never)]
+fn matmul_vector_error(a: &[usize], b: &[usize]) -> Control {
+    let hint = match (a.len(), b.len()) {
+        (1, 1) => "for two vectors: dot(a, b)".to_string(),
+        (_, 1) => format!(
+            "for a matrix times a vector: matmul(M, reshape(v, [{}, 1])); for two vectors: dot(a, b)",
+            b[0]
+        ),
+        _ => format!(
+            "for a vector times a matrix: matmul(reshape(v, [1, {}]), M); for two vectors: dot(a, b)",
+            a[0]
+        ),
+    };
+    err(format!("matmul: expected a 2D array (matrix), got 1-D — {}", hint))
 }
 
 #[inline(never)]

@@ -272,13 +272,21 @@ impl TestGenerator {
             if let Some(cond) = &case.expected {
                 let genv = interp.global_env.clone();
                 match interp.eval(cond, &genv) {
-                    Ok(v) => {
-                        case.passed = Some(v.is_truthy());
-                        if !v.is_truthy() {
-                            case.error = Some("Invariant violation".to_string());
+                    // v0.6.55 (R4, M2 de la auditoría): un array no es verdadero ni falso; el
+                    // invariante falla con el error del `when`, no pasa por no estar vacío.
+                    Ok(v) => match crate::interpreter::truth(&v, crate::interpreter::TruthAt::Cond, &cond.location) {
+                        Ok(t) => {
+                            case.passed = Some(t);
+                            if !t {
+                                case.error = Some("Invariant violation".to_string());
+                            }
+                            case.result = Some(v);
                         }
-                        case.result = Some(v);
-                    }
+                        Err(e) => {
+                            case.passed = Some(false);
+                            case.error = Some(control_msg(&e));
+                        }
+                    },
                     Err(e) => {
                         case.passed = Some(false);
                         case.error = Some(control_msg(&e));
@@ -383,5 +391,20 @@ mod tests {
         assert!(stats.total > 0);
         let report = gen.format_report(&cases, &stats);
         assert!(report.contains("Test Generation Report"));
+    }
+
+    /// v0.6.55 (R4): un invariante sobre un array no pasa por no estar vacío; falla con el error
+    /// del `when` (como `synsema run`).
+    #[test]
+    fn v0655_an_array_invariant_fails_with_the_condition_error() {
+        let mut gen = TestGenerator::new();
+        gen.load_program("let a be array([1, 2])
+invariant \"positive\": a > 0
+");
+        let mut cases = gen.generate_all();
+        gen.run_all(&mut cases);
+        let inv = cases.iter().find(|c| c.check == "invariant").expect("el caso del invariante");
+        assert_eq!(inv.passed, Some(false));
+        assert!(inv.error.as_deref().unwrap_or("").contains("an array is not true or false"), "{:?}", inv.error);
     }
 }

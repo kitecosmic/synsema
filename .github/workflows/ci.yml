@@ -254,7 +254,7 @@ jobs:
         run: |
           set -euo pipefail
           W="wasmtime run --dir . --env ETH_KEY=$ETH_KEY engine/target/wasm32-wasip1/wasm/synsema-wasm.wasm"
-          for f in wasm_pure wasm_agents wasm_respond wasm_sandbox wasm_math; do
+          for f in wasm_pure wasm_agents wasm_respond wasm_sandbox wasm_math wasm_arrays; do
             echo "== $f"
             engine/target/debug/synsema run tests/$f.probe.syn | grep -v '^fetch_error=' > native.out
             $W tests/$f.probe.syn | grep -v '^fetch_error=' > wasm.out

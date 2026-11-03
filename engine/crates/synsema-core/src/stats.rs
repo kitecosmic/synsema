@@ -221,6 +221,14 @@ pub fn builtin(interp: &mut Interpreter, args: &[SynValue], kind: Kind) -> Resul
             if let (Kind::Sum, None, crate::types::NdArray::Bool(m)) = (kind, axis, &**a) {
                 return Ok(crate::types::syn_int(m.iter().filter(|b| **b).count() as i64));
             }
+            // Por eje, también cuentas (M5 de la auditoría): lo que queda en 0-d es un entero; un
+            // array sigue siendo `f64`, con valores enteros (numpy da `int64`).
+            if let (Kind::Sum, Some(_), crate::types::NdArray::Bool(_)) = (kind, axis, &**a) {
+                return Ok(match reduce_array(a, kind, axis, lvl, ddof)? {
+                    SynValue::Number(n) => crate::types::syn_int(n.to_f64() as i64),
+                    other => other,
+                });
+            }
             reduce_array(a, kind, axis, lvl, ddof)
         }
         _ => {

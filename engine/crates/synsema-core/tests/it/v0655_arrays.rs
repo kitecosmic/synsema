@@ -824,3 +824,195 @@ fn set_writes_in_place_when_nobody_shares() {
         assert_ne!(ptr(&interp), before, "con un alias se copia (labels = {})", labels);
     }
 }
+
+// =========================================================
+// Auditoría v0.6.55, ronda 1
+// =========================================================
+
+/// N2: `set T[i][j][k]` escribe el elemento en `T`, sin copiar la fila (antes, una losa de 8 MB por
+/// escritura: 3000 escrituras tardaban decenas de segundos en debug).
+#[test]
+fn set_of_an_element_does_not_copy_its_row() {
+    let src = "let T be zeros([2, 1000, 1000])\nlet i be 0\nwhile i < 3000\n    set T[i % 2][i % 1000][7] to i\n    set i to i + 1\nprint(T[1][999][7])\nprint(sum(T))";
+    let t0 = std::time::Instant::now();
+    assert_eq!(both(src), "2999.0\n2499500.0");
+    let took = t0.elapsed();
+    assert!(took < std::time::Duration::from_secs(10), "tardó {:?}: ¿se copia la fila?", took);
+}
+
+/// N4 (p6_stale): un `set` de fila que falló a mitad de camino no afecta a los siguientes, ni a un
+/// alias tomado después; un `set` de otro array dentro de un índice no le borra el camino al de
+/// afuera, y uno del mismo array sí lo corta.
+#[test]
+fn a_failed_row_set_leaves_the_next_ones_alone() {
+    let src = format!(
+        "{}try\n    set M[0][nope] to 1\nrecover e\n    print(\"err\")\nset M[1][1] to 40\nlet K be M\nset M[0][0] to 5\nprint(M)\nprint(K)",
+        M
+    );
+    assert_eq!(both(&src), "err\n[[5, 2], [3, 40]]\n[[1, 2], [3, 40]]");
+    let other = "let M be zeros([2, 2])\nlet z be zeros(3)\ntask f()\n    set z[1] to 7\n    give 1\nset M[0][f()] to 9\nprint(M)\nprint(z)";
+    assert_eq!(both(other), "[[0, 9], [0, 0]]\n[0, 7, 0]");
+    let same = "let M be zeros([2, 2])\ntask f()\n    set M[1][0] to 7\n    give 1\nset M[0][f()] to 9";
+    let got = both(same);
+    assert!(got.starts_with("ERR: set: the array is in use elsewhere in this statement"), "{}", got);
+}
+
+/// §3.2: `match` compara el valor entero, como `in` (sin cambio).
+#[test]
+fn match_compares_whole_arrays() {
+    assert_eq!(
+        both("let a be array([1, 2])\nlet b be array([1, 2])\nmatch a\n    is b\n        print(\"same\")\n    otherwise\n        print(\"other\")"),
+        "same"
+    );
+    assert_eq!(
+        both("let a be array([1, 2])\nlet b be array([1, 3])\nmatch a\n    is b\n        print(\"same\")\n    otherwise\n        print(\"other\")"),
+        "other"
+    );
+}
+
+/// Corre con etiquetas y devuelve cada variable sin etiquetas.
+fn labelled_vars(source: &str, names: &[&str]) -> Vec<String> {
+    use synsema_core::interpreter::{env_get, Interpreter};
+    let program = synsema_core::parser::parse_source(source, "<v0655>").unwrap();
+    let mut interp = Interpreter::new();
+    interp.set_labels(true);
+    if let Err(Control::Error(e)) = interp.execute(&program) {
+        panic!("el programa falló: {}\nfuente:\n{}", e, source);
+    }
+    names
+        .iter()
+        .map(|n| synsema_core::labels::strip_deep(&env_get(&interp.global_env, n).expect("sin la variable")).to_string())
+        .collect()
+}
+
+/// N4 (A-private-inner): un valor privado que comparte su array con otro lo copia antes de escribir.
+#[test]
+fn writing_a_private_copy_leaves_the_original() {
+    // `private(b)` envuelve el mismo array de `b` (`let k` en el medio: el valor de la sentencia
+    // anterior vive hasta que termina la siguiente, y sin él la cuenta del envoltorio ya obliga a
+    // copiar, así que no se probaría el array de adentro).
+    assert_eq!(
+        labelled_vars("let b be array([1, 2])\nlet p be private(b, \"x\")\nlet k be 0\nset p[0] to 9\n", &["b", "p"]),
+        ["[1, 2]", "[9, 2]"]
+    );
+    assert_eq!(
+        labelled_vars("let B be array([[1, 2], [3, 4]])\nlet P be private(B, \"x\")\nlet k be 0\nset P[1][0] to 9\n", &["B", "P"]),
+        ["[[1, 2], [3, 4]]", "[[1, 2], [9, 4]]"]
+    );
+    // Lo que se lee de un contenedor privado, `L[0]`, también es otro envoltorio sobre el mismo array.
+    assert_eq!(
+        labelled_vars("let L be private([array([1, 2])], \"x\")\nlet p be L[0]\nlet k be 0\nset p[0] to 9\nlet r be L[0]\n", &["p", "r"]),
+        ["[9, 2]", "[1, 2]"]
+    );
+}
+
+/// Corre en la VM y en el árbol y devuelve `línea: mensaje` del error (los dos iguales).
+fn both_at(source: &str) -> String {
+    fn one(source: &str, labels: bool) -> String {
+        use synsema_core::interpreter::Interpreter;
+        let program = synsema_core::parser::parse_source(source, "<v0655>").unwrap();
+        let mut interp = Interpreter::new();
+        interp.set_labels(labels);
+        match interp.execute(&program) {
+            Err(Control::Error(e)) => match &e.location {
+                Some(l) => format!("{}: {}", l.line, e.message),
+                None => format!("sin ubicación: {}", e.message),
+            },
+            _ => "sin error".to_string(),
+        }
+    }
+    let (vm, tree) = (one(source, false), one(source, true));
+    assert_eq!(vm, tree, "la VM y el árbol no coinciden en:\n{}", source);
+    vm
+}
+
+/// N1: los errores de R1, R3, R4 y R5 dicen la línea (el de orden de v0.6.54 la decía).
+#[test]
+fn array_errors_say_the_line() {
+    let at = |rest: &str| both_at(&format!("{}let n be 0\n{}", A, rest));
+    let starts = |rest: &str, want: &str| {
+        let got = at(rest);
+        assert!(got.starts_with(want), "{}\n  dio: {}\n  esperaba: {}…", rest, got, want);
+    };
+    assert_eq!(at("when a\n    print(1)"), format!("4: {}", NOT_A_CONDITION));
+    assert_eq!(at("print(when m then 1 otherwise 0)"), format!("4: {}", NOT_A_CONDITION));
+    assert_eq!(at("while m\n    stop"), format!("4: {}", NOT_A_CONDITION));
+    starts("print(a == 3)", "4: == compares whole values");
+    starts("print(m > m)", "4: ");
+    starts("print(a > [1, 2, 3, 4])", "4: cannot compare an array with a list");
+    starts("print(not m)", "4: not needs true or false");
+    starts("print(m and true)", "4: and needs true or false");
+    starts("print(1 < a < 9)", "4: and needs true or false");
+    starts("print(where([1, 2], (x) => a))", "4: where: the function returned an array");
+    starts("assert(m)", "4: an array is not true or false");
+    starts("set a[0] to true", "4: an f64 array holds numbers");
+    starts("print(a + array([1, 2]))", "4: arrays of shape [4] and [2] are not broadcastable");
+    starts("print(a[[0, 9]])", "4: Index 9 out of bounds");
+}
+
+fn module_dir(tag: &str, lib: &str) -> std::path::PathBuf {
+    let d = std::env::temp_dir().join(format!("synsema-v0655-{}-{}", tag, std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    std::fs::create_dir_all(&d).unwrap();
+    std::fs::write(d.join("lib.syn"), lib).unwrap();
+    d
+}
+
+/// B1: un array exportado por un módulo se escribe desde sus tasks y desde afuera, en el lugar (la
+/// vista del mapa del módulo no cuenta como otro dueño), y una foto tomada antes no cambia.
+#[test]
+fn an_exported_array_is_written_in_place() {
+    use synsema_core::interpreter::{env_get, Interpreter};
+    let lib = "export let STATE be zeros(3000)\nexport let G be zeros([3, 3])\n\
+        export task bump(n)\n    let i be 0\n    while i < n\n        set STATE[i] to STATE[i] + i\n        set i to i + 1\n    give STATE[n - 1]\n\
+        export task show()\n    give STATE[1]\n\
+        export task put(i, j, v)\n    set G[i][j] to v\n    give G\n";
+    for labels in [false, true] {
+        let d = module_dir(&format!("export-{}", labels), lib);
+        let main = d.join("main.syn").to_string_lossy().to_string();
+        let mut interp = Interpreter::new();
+        interp.set_labels(labels);
+        let run = |interp: &mut Interpreter, src: &str| {
+            let program = synsema_core::parser::parse_source(src, &main).unwrap();
+            interp.output.clear();
+            if let Err(Control::Error(e)) = interp.execute(&program) {
+                panic!("labels = {}: {}", labels, e);
+            }
+            interp.output.join("\n")
+        };
+        let ptr = |interp: &Interpreter| match env_get(&interp.global_env, "m") {
+            Some(SynValue::Map(m)) => match m.borrow().get("STATE") {
+                Some(SynValue::Array(o)) => synsema_core::types::Obj::as_ptr(&o) as usize,
+                other => panic!("{:?}", other.map(|v| v.type_name())),
+            },
+            other => panic!("{:?}", other.map(|v| v.type_name())),
+        };
+        assert_eq!(run(&mut interp, "use \"./lib.syn\" as m\nprint(m.bump(3000))"), "2999.0");
+        let before = ptr(&interp);
+        assert_eq!(run(&mut interp, "print(m.bump(3000))"), "5998.0");
+        assert_eq!(ptr(&interp), before, "una task que escribe su array exportado no lo copia (labels = {})", labels);
+        assert_eq!(run(&mut interp, "set m.STATE[1] to 70\nprint(m.show())"), "70.0");
+        assert_eq!(ptr(&interp), before, "desde afuera, tampoco (labels = {})", labels);
+        assert_eq!(
+            run(&mut interp, "let snap be m.STATE\nset m.STATE[1] to 71\nprint(snap[1])\nprint(m.show())\nprint(m.STATE[1])"),
+            "70.0\n71.0\n71.0"
+        );
+        assert_eq!(
+            run(&mut interp, "print(m.put(1, 2, 5))\nset m.G[0][0] to 4\nprint(m.G)"),
+            "[[0, 0, 0], [0, 0, 5], [0, 0, 0]]\n[[4, 0, 0], [0, 0, 5], [0, 0, 0]]"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
+/// M7: `each` sobre un array toma una foto del array, no de sus elementos: la vuelta lee el que le
+/// toca, y un `set` del cuerpo no lo cambia.
+#[test]
+fn each_over_an_array_reads_as_it_goes() {
+    assert_eq!(
+        both("let M be array([[1, 2], [3, 4]])\neach r in M\n    set M[1][0] to 9\n    print(r)\nprint(M)"),
+        "[1, 2]\n[3, 4]\n[[1, 2], [9, 4]]"
+    );
+    assert_eq!(both("let n be 0\neach x in zeros(100000) > -1\n    when x\n        set n to n + 1\nprint(n)"), "100000");
+    assert_eq!(both("each x in array([])\n    print(x)\nprint(\"done\")"), "done");
+}

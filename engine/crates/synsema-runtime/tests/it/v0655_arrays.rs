@@ -317,3 +317,58 @@ fn set_in_a_hot_loop_through_the_engine() {
         print(sum(z))\nprint(sum(Q))\nprint(Q[0])";
     assert_eq!(with_a(src), "59997.0\n20000.0\n[34, 33, 33]");
 }
+
+// =========================================================
+// Auditoría v0.6.55, ronda 1
+// =========================================================
+
+/// N3: `matmul` y `dot` con una matriz y un vector dicen la forma Synsema (antes se mandaban uno al
+/// otro), con el largo del vector; y la forma que dicen anda.
+#[test]
+fn matmul_and_dot_with_a_vector_name_the_shape() {
+    let v = "let v be array([1, 1])\n";
+    let t = |rest: &str| with_a(&format!("{}{}", v, rest));
+    assert_eq!(
+        t("print(matmul(M, v))"),
+        "ERR: Runtime error: matmul: expected a 2D array (matrix), got 1-D — for a matrix times a vector: matmul(M, reshape(v, [2, 1])); for two vectors: dot(a, b)"
+    );
+    assert_eq!(
+        t("print(matmul(v, M))"),
+        "ERR: Runtime error: matmul: expected a 2D array (matrix), got 1-D — for a vector times a matrix: matmul(reshape(v, [1, 2]), M); for two vectors: dot(a, b)"
+    );
+    assert_eq!(t("print(matmul(v, v))"), "ERR: Runtime error: matmul: expected a 2D array (matrix), got 1-D — for two vectors: dot(a, b)");
+    assert_eq!(
+        t("print(dot(M, v))"),
+        "ERR: Runtime error: dot is the inner product of two 1-D vectors (got 2-D and 1-D) — for a matrix times a vector: matmul(M, reshape(v, [2, 1]))"
+    );
+    assert_eq!(
+        t("print(dot(v, M))"),
+        "ERR: Runtime error: dot is the inner product of two 1-D vectors (got 1-D and 2-D) — for a vector times a matrix: matmul(reshape(v, [1, 2]), M)"
+    );
+    assert_eq!(
+        t("print(dot(M, M))"),
+        "ERR: Runtime error: dot is the inner product of two 1-D vectors (got 2-D and 2-D) — for matrices use matmul(a, b)"
+    );
+    // Lo que el mensaje propone (numpy: M @ v = [3, 7], v @ M = [4, 6]).
+    assert_eq!(t("print(matmul(M, reshape(v, [2, 1])))\nprint(matmul(reshape(v, [1, 2]), M))"), "[[3], [7]]\n[[4, 6]]");
+}
+
+/// M4: con dos números, `equal`/`maximum` siguen los números del lenguaje (como `==` y `max`).
+#[test]
+fn elementwise_builtins_on_two_numbers_follow_the_language() {
+    assert_eq!(with_a("print(maximum(2, 3))\nprint(minimum(2.5, 3))\nprint(maximum(2.0, 3.0))"), "3\n2.5\n3.0");
+    assert_eq!(
+        with_a("print(equal(9007199254740993, 9007199254740992))\nprint(9007199254740993 == 9007199254740992)"),
+        "false\nfalse"
+    );
+    assert_eq!(with_a("print(not_equal(2, 2.0))\nprint(equal(nan, nan))\nprint(maximum(nan, 1))"), "false\nfalse\nnan");
+    err_has("print(equal(\"a\", \"a\"))", "equal works on arrays (got text and text) — for two values use a == b");
+    err_has("print(maximum(true, 1))", "maximum works on arrays (got bool and number) — for two numbers use max(a, b)");
+}
+
+/// M5: `sum` de una máscara cuenta también por eje: 0-d es un entero (numpy: `int64`).
+#[test]
+fn sum_of_a_mask_by_axis_counts() {
+    assert_eq!(with_a("print(sum(array([1, 0]) > 0, axis = 0))\nprint(sum(m, axis = 0) + 0.5)"), "1\n2.5");
+    assert_eq!(with_a("print(sum(M > 1, axis = 0))\nprint(sum(M > 1, axis = 1))"), "[1, 2]\n[1, 2]");
+}

@@ -9,21 +9,20 @@ Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the rele
 ## v0.6.55 — unreleased
 
 **Engine.**
-- **An array carries its element type.** Inside the engine an `array` is now `f64` or `bool` (the
-  mask that comparisons will return), behind the same pointer, so a value is still 24 bytes. No
-  program changes yet: every array a program can build is still `f64`. A mask prints as
-  `[false, true]`, `to_list` gives booleans, `json` gives `true`/`false`, it keeps its type across
+- **An array carries its element type:** `f64` or `bool` (the mask that comparisons return),
+  behind the same pointer, so a value is still 24 bytes. A mask prints as `[false, true]`, `to_list` gives booleans, `json` gives `true`/`false`, it keeps its type across
   `parallel_map` and the snapshots of `serve`, and the charts and database parameters reject it
   (`chart_svg: a mask (bool array) is not a series — m * 1.0 gives 0/1 floats`; for a parameter,
   `sql: a mask (bool array) is not a vector — …`).
 - **Comparisons give masks.** `a > 2`, `2 < a`, `a >= b` (numpy broadcasting) return a mask; `NaN`
   compares `false`. `dtype(a)` is `"f64"` or `"bool"`. A mask in arithmetic is 0/1 (`m * 1.0`),
-  `sum(m)` is the count of trues (an integer), `mean(m)` the fraction. Masks are not ordered
+  `sum(m)` is the count of trues (an integer; by axis, the counts), `mean(m)` the fraction. Masks are not ordered
   (`m > m` is an error) and a list is never turned into an array behind your back
   (`a > [1, 2]` → `… make it an array first: array(xs)`).
 - **Elementwise builtins:** `equal`, `not_equal`, `logical_and`, `logical_or`, `logical_not`,
   `if_else(m, x, y)` (numpy's three-argument `where`), `maximum`, `minimum` (NaN propagates), and
-  `clamp` on arrays. `where(a, m)` keeps the elements where the mask is true (`a[m]` in numpy);
+  `clamp` on arrays (with two numbers they follow the language: `maximum(2, 3)` is `3`, like
+  `max`, and `equal` compares big integers exactly, like `==`). `where(a, m)` keeps the elements where the mask is true (`a[m]` in numpy);
   `some(m)`, `every(m)`, `count_where(m)`, and `some`/`every`/`count_where` with a predicate over an
   array; `apply` that returns bools gives a mask. `any`, `all`, `clip` and `scatter_add` are not
   defined and say what to write instead.
@@ -34,14 +33,15 @@ Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the rele
   `set a[[0, 2]] to array([4, 4])` (a repeated position keeps the last value) write the array.
   Writing has value semantics, like lists: an alias, a task's argument or the array an `each`
   walks do not change, and an array nobody else holds is written in place, without a copy per
-  write. A mask holds `true`/`false` and an `f64` array numbers (`set a[0] to true` → `… use 1.0`);
+  write — `set T[i][j][k]` writes the element into `T` without copying its row, and the array a
+  module exports is written in place by its tasks and from outside (`set m.STATE[1] to 70`). A mask holds `true`/`false` and an `f64` array numbers (`set a[0] to true` → `… use 1.0`);
   a mask as a position is an error that names `where(a, m)` / `if_else(m, 0, a)`. With `--labels`
   an array is private as a whole: it takes values at most as private as the variable.
 - **`index_add(a, positions, values, axis = 0)`** returns a new array with the values added at those
   positions; repeated positions accumulate in order (the gradient of an embedding).
 - **`each` walks an array** along its first axis: the elements of a 1-D array (numbers, or
-  booleans for a mask) and the rows of a matrix; `{ each }` in templates too. A 0-d array is an
-  error.
+  booleans for a mask) and the rows of a matrix, reading each one when its turn comes (it does not
+  build them all first); `{ each }` in templates too. A 0-d array is an error.
 - **Numeric functions work elementwise:** `sign`, `gamma`, `lgamma`, `erf`, `erfc`, `factorial`
   (as `f64`), `real`, `imag`, `conj`, `arg`; `is_nan`, `is_finite`, `is_infinite` give masks;
   `pow`, `atan2`, `hypot`, `log_base`, `beta`, `gcd` and `lcm` broadcast; `round_to(a, 2)`. A test
@@ -49,6 +49,9 @@ Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the rele
   arrays hold `f64` or `bool`.
 - **`transpose(a, axes)`** reorders the axes (`np.transpose`; a negative axis counts from the end).
   **`matmul` takes batches** (3-D or more, the batch axes broadcast like numpy's; 2-D with 3-D too).
+  `matmul` and `dot` with a matrix and a vector name the Synsema form, with the vector's length
+  (`… for a matrix times a vector: matmul(M, reshape(v, [3, 1]))`); before, each pointed to the
+  other.
 - **Arrays to bytes and back:** `array_to_bytes(a, "f64" | "f32" | "bool")` and
   `array_from_bytes(b, "f32", shape = [2, 3])`, little-endian in C order; `f32` rounds to nearest
   and reads back as `f64`.
@@ -56,6 +59,8 @@ Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the rele
   `random_uniform(g, [2, 2], low = 0, high = 1)` give the same numbers as numpy's
   `default_rng(seed).normal(…, size)` / `.uniform(…, size)`, bit for bit; without a shape they give
   one number (`random_uniform(g)` is `g()`).
+- The errors of comparisons, `==`, conditions, broadcasting and array indexing say the line
+  (`file.syn:3:6: an array is not true or false — …`).
 - **Fixed:** with `--labels`, `apply` over a private array (or with a captured private value) stopped
   the run with `private(x)`; it now gives a private array.
 

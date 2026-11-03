@@ -3052,7 +3052,10 @@ impl Interpreter {
                     Ok(())
                 })(),
                 Ins::ToBool { dst, src, why } => self.opnd(&chunk, &env, base, src, at).and_then(|v| {
-                    let t = truth(&v, why)?;
+                    let t = match v.truth() {
+                        Some(t) => t,
+                        None => return Err(array_truth_error_at(&v, why, &chunk.locs[chunk.loc[at] as usize])),
+                    };
                     self.put(base, dst, syn_bool(t));
                     Ok(())
                 }),
@@ -3101,7 +3104,11 @@ impl Interpreter {
                     r
                 }
                 Ins::JumpIfFalsy { src, to, why } => self.opnd(&chunk, &env, base, src, at).and_then(|v| {
-                    if !truth(&v, why)? {
+                    let t = match v.truth() {
+                        Some(t) => t,
+                        None => return Err(array_truth_error_at(&v, why, &chunk.locs[chunk.loc[at] as usize])),
+                    };
+                    if !t {
                         pc = to as usize;
                     }
                     Ok(())
