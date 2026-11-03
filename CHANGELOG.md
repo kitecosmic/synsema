@@ -39,8 +39,9 @@ Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the rele
   rebinds the variable it writes (`set a[f()]` where `f` does `set a to …`) is an error
   (`set: the index changed 'a' while it was being written …`): the write never lands in the array
   the variable held before. With `--labels` an array is private as a whole: it takes values at most
-  as private as the variable, and a private value written into an array inside a list or map needs
-  an index that runs no code (`let i be f()` first).
+  as private as the variable; writing into an array inside a list or map takes indices that run no
+  code (`let i be f()` first), and when the statement touched private data the errors of the write
+  reach the operator as a diagnostic (the program sees the fixed cut text).
 - **`index_add(a, positions, values, axis = 0)`** returns a new array with the values added at those
   positions; repeated positions accumulate in order (the gradient of an embedding).
 - **`each` walks an array** along its first axis: the elements of a 1-D array (numbers, or
@@ -79,7 +80,7 @@ Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the rele
   `length(a) > 0` or `logical_and`. Before, a non-empty array counted as true.
 - `arrays do not support ordering comparisons` is gone (comparisons work now).
 - **`-m` on a mask is an error**, like `-true` (numpy rejects it too): `logical_not(m)` flips it,
-  `-(m * 1.0)` gives the 0/-1 floats. Negating a `f64` array works.
+  `0 - m` gives the 0/-1 floats. Negating a `f64` array works.
 - `each x in a` over an array walks it instead of failing with `Cannot iterate over array`, and
   `Cannot set index on array` is gone (`set a[i]` works).
 

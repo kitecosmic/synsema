@@ -970,7 +970,8 @@ fn an_exported_array_is_written_in_place() {
     let lib = "export let STATE be zeros(3000)\nexport let G be zeros([3, 3])\n\
         export task bump(n)\n    let i be 0\n    while i < n\n        set STATE[i] to STATE[i] + i\n        set i to i + 1\n    give STATE[n - 1]\n\
         export task show()\n    give STATE[1]\n\
-        export task put(i, j, v)\n    set G[i][j] to v\n    give G\n";
+        export task put(i, j, v)\n    set G[i][j] to v\n    give G\n\
+        export task fail(n)\n    let Q be zeros([2, 2])\n    let k be 0\n    while k < n\n        try\n            set Q[0][nope] to 1\n        recover e\n            set k to k + 1\n    give 1\n";
     for labels in [false, true] {
         let d = module_dir(&format!("export-{}", labels), lib);
         let main = d.join("main.syn").to_string_lossy().to_string();
@@ -1005,6 +1006,14 @@ fn an_exported_array_is_written_in_place() {
             run(&mut interp, "print(m.put(1, 2, 5))\nset m.G[0][0] to 4\nprint(m.G)"),
             "[[0, 0, 0], [0, 0, 5], [0, 0, 0]]\n[[4, 0, 0], [0, 0, 5], [0, 0, 0]]"
         );
+        // La vista del módulo sigue viva aunque el índice llene el tope de entradas (M17 de la ronda 3).
+        // Con `--labels`, un índice que corre código por el mapa del módulo es un error (B3).
+        let deep = run_result(&mut interp, &main, "set m.G[2][m.fail(70)] to 6\nprint(m.G[2])");
+        if labels {
+            assert!(deep.contains("an index that runs code writes into an array inside a list or map"), "{}", deep);
+        } else {
+            assert_eq!(deep, "[0, 6, 0]");
+        }
         let _ = std::fs::remove_dir_all(&d);
     }
 }
@@ -1050,9 +1059,10 @@ fn an_index_that_rebinds_the_array_stops_the_write() {
     let leak = "let a be private(array([1, 2, 3]), \"x\")\nlet secret be private(42, \"x\")\nlet keep be nothing\n\
         task f()\n    set keep to declassify(a, \"x\")\n    set a to private(zeros(3), \"x\")\n    give 0\n\
         try\n    set a[f()] to secret\nrecover e\n    print(e)\nprint(keep)\nprint(label_of(keep))";
-    // El error lo causa un dato privado: no se atrapa y sale redactado (la corrida se corta en el
-    // `set`, 9:10, sin que el secreto llegue a `keep`). El texto propio se ve sin etiquetas, abajo.
-    assert_eq!(labelled_out(leak), "ERR: <v0655>:9:10: private(x)");
+    // Con etiquetas es un diagnóstico del sistema (M16 de la ronda 3): no se atrapa, el programa ve el
+    // texto fijo de corte y el operador el motivo, que sólo nombra la variable. La corrida se corta en
+    // el `set`, sin que el secreto llegue a `keep`.
+    assert_eq!(labelled_out(leak), format!("ERR: <v0655>:9:10: {}", &REBOUND_A[5..]));
     let plain = "let a be array([1, 2, 3])\nlet keep be nothing\ntask f()\n    set keep to a\n    set a to zeros(3)\n    give 0\n";
     assert_eq!(both(&format!("{}set a[f()] to 42", plain)), REBOUND_A);
     assert_eq!(both(&format!("{}try\n    set a[f()] to 42\nrecover e\n    print(\"err\")\nprint(keep)\nprint(a)", plain)), "err\n[1, 2, 3]\n[0, 0, 0]");
@@ -1068,17 +1078,53 @@ fn an_index_that_rebinds_the_array_stops_the_write() {
     assert_eq!(both("let a be array([1, 2, 3])\nlet n be 0\ntask f()\n    set n to n + 1\n    give n\nset a[f()] to 9\nprint(a)"), "[1, 9, 3]");
 }
 
-/// B2, a través de una lista: la identidad del array no se puede verificar, así que con `--labels` un
-/// valor privado por un índice que corre código es un error; con índices que no corren código, o sin
-/// valor privado, se escribe.
+const THROUGH_A_LIST: &str = "label_violation: an index that runs code writes into an array inside a list or map — compute the index into a variable first";
+
+/// Sin etiquetas, sólo la VM: lo impreso, o `ERR: <mensaje>`.
+fn plain_out(source: &str) -> String {
+    use synsema_core::interpreter::Interpreter;
+    let program = synsema_core::parser::parse_source(source, "<v0655>").unwrap();
+    let mut interp = Interpreter::new();
+    match interp.execute(&program) {
+        Ok(_) => interp.output.join("\n"),
+        Err(Control::Error(e)) => format!("ERR: {}", e.message),
+        Err(_) => "otro control".to_string(),
+    }
+}
+
+/// B2 y B3, a través de una lista o un mapa: la identidad del array no se puede verificar, así que con
+/// `--labels` un índice que corre código es un error por la forma del camino, sea privado el valor
+/// (B2), el índice (B3: elegiría la posición en el alias público) o un índice del medio. Con índices
+/// que no corren código se escribe; sin etiquetas, también.
 #[test]
-fn a_private_value_into_an_array_in_a_list_needs_a_plain_index() {
+fn with_labels_an_index_that_runs_code_cannot_write_through_a_list() {
     let pre = "let L be private([array([1, 2, 3])], \"x\")\nlet secret be private(42, \"x\")\nlet keep be nothing\n\
         task f()\n    set keep to declassify(L, \"x\")\n    set L to private([zeros(3)], \"x\")\n    give 0\n";
-    let got = labelled_out(&format!("{}set L[0][f()] to secret\nprint(keep)", pre));
-    assert!(got.starts_with("ERR: <v0655>:8:1: label_violation: a private value is written into an array inside a list or map through an index that runs code"), "{}", got);
+    assert_eq!(labelled_out(&format!("{}set L[0][f()] to secret\nprint(keep)", pre)), format!("ERR: <v0655>:8:9: {}", THROUGH_A_LIST));
     assert_eq!(labelled_out(&format!("{}let i be 1\nset L[0][i] to secret\nprint(declassify(L, \"x\"))", pre)), "[[1, 42, 3]]");
-    assert_eq!(labelled_out("let L be [array([1, 2, 3])]\ntask f()\n    give 2\nset L[0][f()] to 7\nprint(L)"), "[[1, 2, 7]]");
+    // B3: el valor es público y el índice, privado (la sonda `lp_idx_try` de la ronda 3).
+    let idx = "let secret be private(1, \"x\")\nlet L be private([array([0, 0, 0])], \"x\")\nlet keep be nothing\n\
+        task f()\n    set keep to declassify(L, \"x\")[0]\n    set L to private([zeros(3)], \"x\")\n    give secret\n\
+        set L[0][f()] to 1\nprint(keep)";
+    assert_eq!(labelled_out(idx), format!("ERR: <v0655>:8:9: {}", THROUGH_A_LIST));
+    // Por un mapa (`lp_map_idx`) y religando el elemento (`lp_elem_idx`).
+    let map = "let m be private({\"x\": array([0, 0, 0])}, \"x\")\nlet keep be nothing\n\
+        task f()\n    set keep to declassify(m, \"x\").x\n    set m to private({\"x\": zeros(3)}, \"x\")\n    give private(2, \"x\")\n\
+        set m.x[f()] to 1\nprint(keep)";
+    assert_eq!(labelled_out(map), format!("ERR: <v0655>:7:8: {}", THROUGH_A_LIST));
+    let elem = "let L be private([array([0, 0, 0])], \"x\")\nlet keep be nothing\n\
+        task f()\n    set keep to declassify(L[0], \"x\")\n    set L[0] to zeros(3)\n    give private(2, \"x\")\n\
+        set L[0][f()] to 1\nprint(keep)";
+    assert_eq!(labelled_out(elem), format!("ERR: <v0655>:7:9: {}", THROUGH_A_LIST));
+    // Un índice del medio que corre código, y una llamada adentro de una cuenta (`f() + 0`).
+    let mid = "let L be [array([1, 2]), array([3, 4])]\ntask f()\n    give 1\n";
+    assert_eq!(labelled_out(&format!("{}set L[f()][0] to 9\nprint(L)", mid)), format!("ERR: <v0655>:4:11: {}", THROUGH_A_LIST));
+    assert_eq!(labelled_out(&format!("{}set L[0][f() + 0] to 9\nprint(L)", mid)), format!("ERR: <v0655>:4:9: {}", THROUGH_A_LIST));
+    // Sin etiquetas, lo mismo escribe; con etiquetas, sin código en los índices, también.
+    assert_eq!(plain_out(&format!("{}set L[f()][0] to 9\nset L[0][f() + 0] to 8\nprint(L)", mid)), "[[1, 8], [9, 4]]");
+    assert_eq!(labelled_out(&format!("{}let i be f()\nset L[i][0] to 9\nset L[0][i + 0] to 8\nprint(L)", mid)), "[[1, 8], [9, 4]]");
+    // Un array directo (sin lista en el medio) no pasa por esta guarda: ahí decide `rebound`.
+    assert_eq!(labelled_out("let a be zeros(3)\ntask f()\n    give 1\nset a[f()] to 5\nprint(a)"), "[0, 5, 0]");
 }
 
 /// M11: el tope de las entradas descarta sólo las muertas; la de la sentencia en curso sigue.
@@ -1109,11 +1155,92 @@ fn a_shape_error_names_the_whole_path() {
         both("let T be zeros([2, 2, 2])\nset T[1][-1][0] to array([1, 2])"),
         "ERR: set T[1][1][0]: the element is a number, got [2]"
     );
+    // La hoja también resuelta (M18 de la ronda 3), con una lista de posiciones.
+    assert_eq!(
+        both("let T be zeros([2, 2, 3])\nset T[-1][0][[0, -1]] to array([1, 2, 3])"),
+        "ERR: set T[1][0][[0, 2]]: the positions have shape [2], got [3]"
+    );
+    assert_eq!(
+        both("let T be zeros([2, 2])\nset T[1][-1] to array([1, 2])"),
+        "ERR: set T[1][1]: the element is a number, got [2]"
+    );
 }
 
 /// M13: `-m` es un error, como `-true` (numpy también lo rechaza); un array `f64` se niega.
 #[test]
 fn negating_a_mask_is_an_error() {
-    assert_eq!(with_a("print(-m)"), "ERR: Cannot negate a mask — logical_not(m) flips it; -(m * 1.0) gives the 0/-1 floats");
-    assert_eq!(with_a("print(-(m * 1.0))\nprint(-a)"), "[-0, -1, -0, -1]\n[-1, -5, -2, -8]");
+    assert_eq!(with_a("print(-m)"), "ERR: Cannot negate a mask — logical_not(m) flips it; 0 - m gives the 0/-1 floats");
+    // La pista da los floats sin `-0` (M19 de la ronda 3).
+    assert_eq!(with_a("print(0 - m)\nprint(-a)"), "[0, -1, 0, -1]\n[-1, -5, -2, -8]");
+}
+
+
+// =========================================================
+// Auditoría v0.6.55, ronda 3
+// =========================================================
+
+/// N5: las cuatro raíces de la VM (un parámetro, una variable local de una task, un local que captura
+/// un cierre y el nivel de arriba) escriben con un índice que corre código, igual que el árbol (las
+/// sondas `roots` y `roots2` de la ronda 3).
+#[test]
+fn every_vm_root_writes_through_an_index_that_runs_code() {
+    let roots = r#"let top be zeros(3)
+set top[abs(1)] to 1
+print(top)
+task t()
+    let loc be zeros([2, 2])
+    set loc[1][abs(0)] to 2
+    let i be 0
+    while i < 2
+        let inner be zeros(2)
+        set inner[abs(i)] to 3
+        set loc[0][i] to 4
+        set i to i + 1
+    each j in [0, 1]
+        let e be zeros(2)
+        set e[abs(j)] to 5
+        set loc[j][j] to 6
+    give loc
+print(t())
+task p(c)
+    set c[abs(0)] to 7
+    give c
+print(p(zeros(2)))"#;
+    assert_eq!(both(roots), "[0, 1, 0]\n[[6, 4], [2, 6]]\n[7, 0]");
+    let captured = r#"task t()
+    let a be zeros(3)
+    let g be () => a
+    set a[abs(1)] to 1
+    give [a, g()]
+print(t())
+task u()
+    let M be zeros([2, 2])
+    task h()
+        give M
+    set M[1][abs(1)] to 2
+    give h()
+print(u())"#;
+    assert_eq!(both(captured), "[[0, 1, 0], [0, 1, 0]]\n[[0, 0], [0, 2]]");
+}
+
+/// M17: con muchas sentencias en curso a la vez (la llamada en el índice, recursiva) el tope no
+/// descarta las vivas: crece (la sonda `m11_deep` de la ronda 3).
+#[test]
+fn deep_recursion_in_the_index_keeps_every_row_alive() {
+    let src = "task g(n)\n    when n == 0\n        give 0\n    let A be zeros([2, 2])\n    set A[0][g(n - 1)] to n\n    give 1\n\
+        print(g(30))\nprint(g(70))\nprint(g(150))";
+    // La recursión de 150 niveles pide más pila que la del hilo de test en debug.
+    let got = std::thread::Builder::new().stack_size(64 << 20).spawn(move || both(src)).unwrap().join().unwrap();
+    assert_eq!(got, "1\n1\n1");
+}
+
+/// Corre en un intérprete ya armado y devuelve lo impreso, o `ERR: <diagnóstico del operador o mensaje>`.
+fn run_result(interp: &mut synsema_core::interpreter::Interpreter, file: &str, src: &str) -> String {
+    let program = synsema_core::parser::parse_source(src, file).unwrap();
+    interp.output.clear();
+    match interp.execute(&program) {
+        Ok(_) => interp.output.join("\n"),
+        Err(Control::Error(e)) => format!("ERR: {}", e.operator_detail.clone().unwrap_or_else(|| e.message.clone())),
+        Err(_) => "otro control".to_string(),
+    }
 }

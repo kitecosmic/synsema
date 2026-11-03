@@ -1111,8 +1111,9 @@ pub(crate) fn set_leaf_prop(obj: &SynValue, property_name: &str, value: SynValue
 /// error de fuera de rango, como la lectura `xs[i]`); `loc`: la de la sentencia.
 ///
 /// `root_now`: el array que tiene AHORA la variable raíz (sólo se pide si la hoja es un array; B2 de
-/// la ronda 2). `guarded`: con `--labels`, el valor llevaba etiqueta y algún índice corre código; la
-/// escritura sólo sigue si se puede verificar que cae en el array de la variable.
+/// la ronda 2). `labels`: corre con `--labels` (la guarda por lista o mapa; B3 de la ronda 3).
+/// `touched`: además, la sentencia tocó algo privado (o corre bajo un PC privado): los errores de la
+/// escritura salen como diagnóstico del sistema, en vez de redactados (M16 de la ronda 3).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn set_leaf_index(
     obj: &SynValue,
@@ -1122,7 +1123,8 @@ pub(crate) fn set_leaf_index(
     target_loc: &SourceLocation,
     loc: &SourceLocation,
     root_now: &dyn Fn() -> Option<usize>,
-    guarded: bool,
+    labels: bool,
+    touched: bool,
 ) -> Result<SynValue, Control> {
     match obj {
         SynValue::List(l) => {
@@ -1157,18 +1159,30 @@ pub(crate) fn set_leaf_index(
         // v0.6.55 (ítem 3, R5): en el lugar; el error de un índice, donde está el destino.
         SynValue::Array(_) => {
             let depth = index_depth(target);
-            // A través de una lista o un mapa la identidad no se puede verificar: con `--labels`, un
-            // valor privado por un índice que corre código no se escribe (ese código podría religar la
-            // raíz y dejar el array en otra variable, pública).
-            if guarded && depth != Some(crate::arrays::chain_len(obj) + 1) {
+            // A través de una lista o un mapa la identidad no se puede verificar (B2 de la ronda 2): un
+            // índice que corre código podría religar la raíz y dejar el array viejo en otra variable,
+            // pública, y entonces el valor —o la posición, si el índice es privado (B3 de la ronda 3)—
+            // caería en ese alias. Con `--labels` es un error por la FORMA del camino, sin mirar ningún
+            // dato: el error mismo no dice nada de un valor privado.
+            if labels && depth != Some(crate::arrays::chain_len(obj) + 1) && path_runs_code(target) {
                 return Err(err_labels(
-                    "label_violation: a private value is written into an array inside a list or map through an index that runs code — compute the index into a variable first",
-                    loc,
+                    "label_violation: an index that runs code writes into an array inside a list or map — compute the index into a variable first",
+                    target_loc,
                 ));
             }
-            let rooted = crate::arrays::Rooted { depth, now: if depth.is_some() { root_now() } else { None } };
-            crate::arrays::set_index(obj, idx, value, set_root_identifier(target), rooted)
-                .map_err(|e| crate::arrays::located(e, target_loc))
+            let rooted = crate::arrays::Rooted { depth, now: if depth.is_some() { root_now() } else { None }, labels: touched };
+            crate::arrays::set_index(obj, idx, value, set_root_identifier(target), rooted).map_err(|e| {
+                let mut e = crate::arrays::located(e, target_loc);
+                // Un diagnóstico de etiquetas viaja con el nombre del archivo, como `err_labels`.
+                if let Control::Error(r) = &mut e {
+                    if r.from_labels {
+                        if let Some(l) = r.location.as_mut() {
+                            l.file = basename_of(&l.file).into();
+                        }
+                    }
+                }
+                e
+            })
         }
         _ => Err(cannot_set(obj, "index", loc)),
     }
@@ -7989,7 +8003,7 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                 SynValue::Complex(z) => Ok(SynValue::Complex(-z)),
                 // M13 (ronda 2): una máscara no es un número, como `-true`.
                 SynValue::Array(a) if a.dtype() == "bool" => Err(err_at(
-                    "Cannot negate a mask — logical_not(m) flips it; -(m * 1.0) gives the 0/-1 floats",
+                    "Cannot negate a mask — logical_not(m) flips it; 0 - m gives the 0/-1 floats",
                     loc,
                 )),
                 SynValue::Array(a) => Ok(crate::arrays::negate(a)),
@@ -8380,15 +8394,14 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                     };
                 // Un array no guarda un elemento privado: el valor tiene que ser a lo sumo tan
                 // privado como la variable (R6: la etiqueta es del array entero).
-                let mut guarded = false;
                 let value = if self.labels && matches!(obj, SynValue::Array(_)) && labels::has_label_deep(&value) {
-                    guarded = path_runs_code(target);
                     self.array_set_value(target, value, env, loc)?
                 } else {
                     value
                 };
                 let root_now = || set_root_identifier(target).and_then(|n| env_get(env, n)).and_then(|v| array_ptr_of(&v));
-                set_leaf_index(&obj, &idx, value, target, &target.location, loc, &root_now, guarded)
+                let touched = self.labels && (!self.seen.is_empty() || !self.pc_is_empty() || labels::has_label_deep(&value));
+                set_leaf_index(&obj, &idx, value, target, &target.location, loc, &root_now, self.labels, touched)
             }
             _ => Err(err_at("Invalid set target", loc)),
         }

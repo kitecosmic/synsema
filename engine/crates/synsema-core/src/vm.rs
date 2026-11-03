@@ -4269,6 +4269,7 @@ impl Interpreter {
                     &chunk.locs[chunk.loc[at] as usize],
                     &root_now,
                     false,
+                    false,
                 )?
             }
         };

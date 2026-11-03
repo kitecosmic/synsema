@@ -1584,32 +1584,31 @@ struct RowPlace {
 struct Places {
     rows: Vec<RowPlace>,
     views: Vec<crate::types::Obj<NdArray>>,
+    /// Cuántas entradas disparan la limpieza (`prune`): `PLACES_CAP`, o el doble de las vivas.
+    limit: usize,
 }
 
 thread_local! {
     static PLACES: std::cell::RefCell<Places> =
-        const { std::cell::RefCell::new(Places { rows: Vec::new(), views: Vec::new() }) };
+        const { std::cell::RefCell::new(Places { rows: Vec::new(), views: Vec::new(), limit: PLACES_CAP }) };
 }
 
 /// Al llegar a este tope se descartan las entradas muertas: las de `set` que fallaron a mitad de
 /// camino (una entrada vieja sólo cuesta una copia del array en el próximo `set`, porque suma un
-/// dueño). Las de una sentencia en curso no se tocan (M11 de la ronda 2).
+/// dueño). Las de una sentencia en curso no se tocan nunca (M11 de la ronda 2, M17 de la ronda 3):
+/// están acotadas por la profundidad de las sentencias en curso, y el tope sólo dispara la limpieza.
 const PLACES_CAP: usize = 64;
 
 /// Una ficha viva tiene otro dueño además de la entrada (el valor que recorre el camino); una muerta,
-/// no. Una vista muerta es la de un array que ya no tiene nadie más. Si con eso no baja del tope, se
-/// descarta la mitad más vieja.
+/// no. Una vista muerta es la de un array que ya no tiene nadie más. Las vivas quedan; si son muchas
+/// (una recursión con la llamada en el índice), el próximo disparo espera al doble, para que limpiar
+/// no cueste en cada `set`.
 #[cold]
 #[inline(never)]
 fn prune(s: &mut Places) {
     s.rows.retain(|e| crate::types::Obj::strong_count(&e.token) > 1);
     s.views.retain(|v| crate::types::Obj::strong_count(v) > 1);
-    if s.rows.len() >= PLACES_CAP {
-        s.rows.drain(..PLACES_CAP / 2);
-    }
-    if s.views.len() >= PLACES_CAP {
-        s.views.drain(..PLACES_CAP / 2);
-    }
+    s.limit = PLACES_CAP.max(2 * s.rows.len().max(s.views.len()));
 }
 
 /// La raíz y las posiciones de una ficha (de afuera hacia adentro); `None` si `a` no es una ficha.
@@ -1650,7 +1649,7 @@ fn sub_view_mut<'a, T>(x: &'a mut ArrayD<T>, prefix: &[usize]) -> ndarray::Array
 pub fn note_module_view(a: &crate::types::Obj<NdArray>) {
     PLACES.with(|s| {
         let mut s = s.borrow_mut();
-        if s.views.len() >= PLACES_CAP {
+        if s.views.len() >= s.limit {
             prune(&mut s);
         }
         s.views.push(a.clone());
@@ -1684,7 +1683,7 @@ pub fn place_row(parent: &SynValue, idx: &SynValue) -> Result<SynValue, Control>
     let token = crate::types::Obj::new(NdArray::F64(ArrayD::zeros(IxDyn(&[0]))));
     PLACES.with(|s| {
         let mut s = s.borrow_mut();
-        if s.rows.len() >= PLACES_CAP {
+        if s.rows.len() >= s.limit {
             prune(&mut s);
         }
         s.rows.push(RowPlace { token: token.clone(), parent: p.clone(), at });
@@ -1761,6 +1760,10 @@ pub struct Rooted {
     pub depth: Option<usize>,
     /// El array que tiene ahora la variable (su dirección), si tiene uno.
     pub now: Option<usize>,
+    /// Con `--labels`: `rebound` e `in_use` salen como diagnóstico del sistema de etiquetas (el
+    /// programa ve el texto fijo de corte, el operador el motivo; M16 de la ronda 3). Su texto sólo
+    /// nombra la variable.
+    pub labels: bool,
 }
 
 /// Cuántas filas recorrió el camino hasta la ficha `obj` (0 si no es una ficha).
@@ -1819,7 +1822,7 @@ pub fn set_index(
     // haría caer la escritura en ese alias, y con `--labels` un valor privado en un array público.
     let direct = rooted.depth == Some(prefix.len() + 1);
     if direct && rooted.now != Some(crate::types::Obj::as_ptr(target) as usize) {
-        return Err(rebound(root));
+        return Err(sys(rebound(root), rooted.labels));
     }
 
     // Los dueños del array de la variable: su lugar y la referencia de esta escritura (la del camino,
@@ -1827,7 +1830,7 @@ pub fn set_index(
     // tomado a mitad de la sentencia, la reentrada), no se escribe.
     let owners = if view { 3 } else { 2 };
     if crate::types::Obj::strong_count(target) != owners {
-        return Err(in_use());
+        return Err(sys(in_use(), rooted.labels));
     }
     let shape = &target.shape()[prefix.len()..];
     if shape.is_empty() {
@@ -1843,12 +1846,14 @@ pub fn set_index(
         if broadcast_shape(vs, &region).as_deref() != Some(region.as_slice()) {
             let what = if single { if sub.is_empty() { "the element is a number" } else { "the row has shape" } } else { "the positions have shape" };
             let shape = if single && sub.is_empty() { String::new() } else { format!(" {:?}", region) };
+            // Las posiciones resueltas, todas (M18 de la ronda 3): `T[-1][0]` sale `T[1][0]`.
             let path: String = prefix.iter().map(|i| format!("[{}]", i)).collect();
+            let leaf = if single { pos[0].to_string() } else { format!("{:?}", pos) };
             return Err(err(format!(
                 "set {}{}[{}]: {}{}, got {:?}",
                 root.unwrap_or("a"),
                 path,
-                crate::labels::unwrap(idx),
+                leaf,
                 what,
                 shape,
                 vs
@@ -1862,7 +1867,7 @@ pub fn set_index(
     // (`set L[0][f()]`) la cuenta no lo distingue, como con listas (faltantes: evaluar los índices
     // antes del camino); con `--labels`, ahí un valor privado sólo pasa con índices que no corren
     // código (`set_leaf_index`).
-    let t = unsafe { crate::types::Obj::get_mut_with_owners(target, owners) }.ok_or_else(in_use)?;
+    let t = unsafe { crate::types::Obj::get_mut_with_owners(target, owners) }.ok_or_else(|| sys(in_use(), rooted.labels))?;
     match (t, payload) {
         (NdArray::F64(x), Payload::F64(v)) => write_region(sub_view_mut(x, prefix), &pos, single, Some(v), None),
         (NdArray::F64(x), Payload::F64s(s)) => write_region(sub_view_mut(x, prefix), &pos, single, None, Some(&s)),
@@ -1879,6 +1884,19 @@ fn rebound(root: Option<&str>) -> Control {
         "set: the index changed '{}' while it was being written (it now holds another value) — compute the index into a variable first",
         root.unwrap_or("a")
     ))
+}
+
+/// Con `--labels`, un error de la escritura que es un diagnóstico del sistema (`from_labels`): no se
+/// redacta ni se atrapa, y su texto va al operador.
+#[cold]
+fn sys(e: Control, labels: bool) -> Control {
+    match e {
+        Control::Error(mut r) if labels => {
+            r.from_labels = true;
+            Control::Error(r)
+        }
+        other => other,
+    }
 }
 
 #[cold]
