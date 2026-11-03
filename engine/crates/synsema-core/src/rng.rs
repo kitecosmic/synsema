@@ -614,11 +614,95 @@ fn list_items(v: &SynValue, who: &str) -> Result<Vec<SynValue>, Control> {
 }
 
 fn num_kw(v: Option<SynValue>, default: f64, what: &str) -> Result<f64, Control> {
+    num_kw_of(v, default, what, "random_normal")
+}
+
+fn num_kw_of(v: Option<SynValue>, default: f64, what: &str, who: &str) -> Result<f64, Control> {
     match v {
         None | Some(SynValue::Nothing) => Ok(default),
         Some(SynValue::Number(n)) => Ok(n.to_f64()),
-        Some(other) => Err(err(format!("random_normal: {} must be a number, got {}", what, other.type_name()))),
+        Some(other) => Err(err(format!("{}: {} must be a number, got {}", who, what, other.type_name()))),
     }
+}
+
+/// La distribución de `samples`.
+#[derive(Clone, Copy)]
+enum Dist {
+    /// `mean + std * z` (numpy `random_normal`).
+    Normal { mean: f64, std: f64 },
+    /// `low + (high - low) * u` (numpy `random_uniform`).
+    Uniform { low: f64, high: f64 },
+}
+
+/// `n` muestras de `g` en orden (v0.6.55, ítem 6). Con un generador de `rng()`, las mismas que
+/// numpy con `size` (orden C) y un solo préstamo del estado; con otra función, una llamada por
+/// muestra (Box–Muller para la normal), en el mismo orden.
+#[inline(never)]
+fn samples(
+    interp: &mut crate::interpreter::Interpreter,
+    g: &SynValue,
+    n: usize,
+    dist: Dist,
+    loc: &crate::tokens::SourceLocation,
+) -> Result<Vec<f64>, Control> {
+    if let Some(cell) = generator_of(g) {
+        let mut gen = cell.borrow_mut();
+        return Ok((0..n)
+            .map(|_| match dist {
+                Dist::Normal { mean, std } => mean + std * gen.standard_normal(),
+                Dist::Uniform { low, high } => low + (high - low) * gen.next_f64(),
+            })
+            .collect());
+    }
+    let mut out = Vec::with_capacity(n);
+    for _ in 0..n {
+        out.push(match dist {
+            Dist::Normal { mean, std } => normal(interp, g, mean, std, loc)?,
+            Dist::Uniform { low, high } => low + (high - low) * uniform(interp, g, "random_uniform", loc)?,
+        });
+    }
+    Ok(out)
+}
+
+/// Un número sin forma; con forma (`[2, 3]` o un entero), un array de esas muestras.
+fn draw(
+    interp: &mut crate::interpreter::Interpreter,
+    args: &[SynValue],
+    dist: Dist,
+    who: &str,
+    loc: &crate::tokens::SourceLocation,
+) -> Result<SynValue, Control> {
+    let g = &args[0];
+    let Some(shape) = args.get(1) else {
+        return Ok(syn_float(samples(interp, g, 1, dist, loc)?[0]));
+    };
+    let shape = crate::arrays::shape_from(shape, who)?;
+    let n = shape
+        .iter()
+        .try_fold(1usize, |acc, &d| acc.checked_mul(d))
+        .ok_or_else(|| err(format!("{}: shape {:?} is too large", who, shape)))?;
+    let xs = samples(interp, g, n, dist, loc)?;
+    Ok(crate::types::syn_array(
+        ndarray::ArrayD::from_shape_vec(ndarray::IxDyn(&shape), xs).expect("n es el producto de la forma"),
+    ))
+}
+
+/// `random_uniform(g)`, `random_uniform(g, [2, 2], low = 0, high = 1)`: numpy
+/// `default_rng(seed).uniform(low, high, size)`. Sin forma es un número (con 0 y 1, igual que `g()`).
+pub fn b_uniform(
+    interp: &mut crate::interpreter::Interpreter,
+    args: &[SynValue],
+    loc: &crate::tokens::SourceLocation,
+) -> Result<SynValue, Control> {
+    let low = num_kw_of(interp.kwarg("low"), 0.0, "low", "random_uniform")?;
+    let high = num_kw_of(interp.kwarg("high"), 1.0, "high", "random_uniform")?;
+    if args.is_empty() {
+        return Err(err("random_uniform(g, shape, low = 0, high = 1): pass a generator from rng(seed)"));
+    }
+    if !(high - low).is_finite() {
+        return Err(err(format!("random_uniform: high - low must be finite, got low = {} and high = {}", low, high)));
+    }
+    draw(interp, args, Dist::Uniform { low, high }, "random_uniform", loc)
 }
 
 /// `random_normal(g, mean = 0, std = 1)` → un valor normal con el generador `g`.
@@ -632,8 +716,11 @@ pub fn b_normal(
     if std < 0.0 {
         return Err(err(format!("random_normal: std must be ≥ 0, got {}", std)));
     }
-    let g = args.first().ok_or_else(|| err("random_normal(g, mean = 0, std = 1): pass a generator from rng(seed)"))?;
-    Ok(syn_float(normal(interp, g, mean, std, loc)?))
+    if args.is_empty() {
+        return Err(err("random_normal(g, mean = 0, std = 1): pass a generator from rng(seed)"));
+    }
+    // v0.6.55 (ítem 6): `random_normal(g, [2, 2])` da un array (numpy `normal(mean, std, size)`).
+    draw(interp, args, Dist::Normal { mean, std }, "random_normal", loc)
 }
 
 /// `shuffle(g, xs)` → una lista nueva, mezclada con `g`.

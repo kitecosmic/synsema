@@ -657,3 +657,52 @@ fn no_numeric_builtin_rejects_an_array() {
     }
     assert!(bad.is_empty(), "no aceptan arrays:\n{}", bad.join("\n"));
 }
+
+// =========================================================
+// Ítem 6 — `random_normal`/`random_uniform` con forma (diseño §3.5)
+// Valores de `specs/v0.6.55-numpy/item6.py` (numpy 2.2.1, `default_rng`). `==` compara bit a bit.
+// =========================================================
+
+#[test]
+fn random_with_a_shape_repeats_numpy() {
+    let src = "let g be rng(42)\n\
+        let n be random_normal(g, [2, 3], mean = 1, std = 2)\n\
+        let u be random_uniform(g, [2, 2], low = -1, high = 3)\n\
+        print(shape(n))\n\
+        print(n == array([[1.6094341595088628, -1.079968212480991, 2.5009023916129145], [2.8811294327824277, -2.902070377307673, -1.6043590137246362]]))\n\
+        print(u == array([[2.044558807961412, 2.1442572211078152], [-0.4875454692978165, 0.8015437515822685]]))\n\
+        print(g() == 0.37079802423258124)\n";
+    assert_eq!(both(src), "[2, 3]\ntrue\ntrue\ntrue");
+    let src = "let g be rng(7)\n\
+        print(random_normal(g, 4) == array([0.0012301533574825742, 0.2987455375084699, -0.2741378553622176, -0.8905918387572742]))\n\
+        print(random_uniform(g) == 0.30016628491122543)\n";
+    assert_eq!(both(src), "true\ntrue");
+    // Sin forma, el número de siempre; `random_uniform(g)` es `g()`.
+    assert_eq!(both("print(random_uniform(rng(1)) == rng(1)())\nprint(is_array(random_normal(rng(1))))"), "true\nfalse");
+    assert_eq!(both("print(shape(random_uniform(rng(1), [0, 3])))"), "[0, 3]");
+}
+
+/// Un generador que no es de `rng()` (Box–Muller): con forma, las mismas muestras y en el mismo
+/// orden que llamada por llamada.
+#[test]
+fn random_with_a_shape_from_any_generator() {
+    let src = "let g1 be rng(3)\nlet g2 be rng(3)\n\
+        let h1 be () => g1()\nlet h2 be () => g2()\n\
+        let a be random_normal(h1, [3], std = 2)\n\
+        let b be [random_normal(h2, std = 2), random_normal(h2, std = 2), random_normal(h2, std = 2)]\n\
+        print(a == array(b))\n\
+        print(random_uniform(h1, [2], low = 5, high = 6) == array([5 + g2(), 5 + g2()]))\n";
+    assert_eq!(both(src), "true\ntrue");
+}
+
+#[test]
+fn random_with_a_shape_errors() {
+    assert_eq!(both("print(random_normal(rng(1), [2], std = -1))"), "ERR: random_normal: std must be ≥ 0, got -1");
+    assert_eq!(both("print(random_uniform(rng(1), [2], low = \"a\"))"), "ERR: random_uniform: low must be a number, got text");
+    assert_eq!(
+        both("print(random_uniform(rng(1), [2], low = 0, high = inf))"),
+        "ERR: random_uniform: high - low must be finite, got low = 0 and high = inf"
+    );
+    assert_eq!(both("print(random_normal(rng(1), \"x\"))"), "ERR: random_normal: shape must be an int or a list of ints, got text");
+    assert_eq!(both("print(random_uniform(rng(1), [-1]))"), "ERR: random_uniform: dimensions must be non-negative");
+}

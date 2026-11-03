@@ -299,13 +299,10 @@ fn elem_size(name: &str, t: &SynValue) -> Result<(&'static str, usize), Control>
             "f64" => Ok(("f64", 8)),
             "f32" => Ok(("f32", 4)),
             "bool" => Ok(("bool", 1)),
-            other => Err(err(format!(
-                "{}: unknown element type \"{}\" — \"f64\", \"f32\" or \"bool\"",
-                name, other
-            ))),
+            other => Err(err(format!("{}: dtype must be \"f64\", \"f32\" or \"bool\", got \"{}\"", name, other))),
         },
         other => Err(err(format!(
-            "{}: the element type is a text (\"f64\", \"f32\" or \"bool\"), got {}",
+            "{}: dtype must be \"f64\", \"f32\" or \"bool\", got {}",
             name,
             other.type_name()
         ))),

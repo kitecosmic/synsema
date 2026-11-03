@@ -5278,7 +5278,8 @@ impl Interpreter {
         // DATOS-12: generadores con semilla (puros).
         self.register("rng", 1, Rc::new(|_i, a, _l| crate::rng::make_rng(a)));
         self.register("rng_spawn", 2, Rc::new(|_i, a, _l| crate::rng::b_spawn(a)));
-        self.register("random_normal", 1, Rc::new(|i, a, l| crate::rng::b_normal(i, a, l)));
+        self.register("random_normal", -1, Rc::new(|i, a, l| crate::rng::b_normal(i, a, l)));
+        self.register("random_uniform", -1, Rc::new(|i, a, l| crate::rng::b_uniform(i, a, l)));
         self.register("shuffle", 2, Rc::new(|i, a, l| crate::rng::b_shuffle(i, a, l)));
         self.register("sample", 3, Rc::new(|i, a, l| crate::rng::b_sample(i, a, l)));
         self.register("choice", 2, Rc::new(|i, a, l| crate::rng::b_choice(i, a, l)));

@@ -29,6 +29,7 @@ pub const BUILTIN_KWARGS: &[(&str, &[&str])] = &[
     ("cov", &["ddof"]),
     ("random_normal", &["mean", "std"]),
     ("array_from_bytes", &["shape"]),
+    ("random_uniform", &["low", "high"]),
     ("int", &["base", "fallback"]),
     ("json_decode", &["allow_nan"]),
     ("jsonl_decode", &["allow_nan"]),
@@ -56,6 +57,9 @@ pub const BUILTIN_ARITY: &[(&str, usize, Option<usize>)] = &[
     // v0.6.55 (ítems 4 y 8, en synsema-stdlib/src/ndarray_ops.rs).
     ("transpose", 1, Some(2)),
     ("array_to_bytes", 1, Some(2)),
+    // v0.6.55 (ítem 6): con forma.
+    ("random_normal", 1, Some(2)),
+    ("random_uniform", 1, Some(2)),
     ("random", 0, Some(1)),
     ("random_int", 2, Some(3)),
     ("parquet_write", 1, Some(2)),

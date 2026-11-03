@@ -220,7 +220,8 @@ fn arrays_to_bytes_and_back() {
         "array_from_bytes: shape [2, 3] needs 24 bytes, got 16",
     );
     err_has("print(array_from_bytes(bytes(\"a\"), \"bool\"))", "array_from_bytes: byte 97 at position 0 is not a bool (0 or 1)");
-    err_has("print(array_to_bytes(a, \"i8\"))", "array_to_bytes: unknown element type \"i8\" — \"f64\", \"f32\" or \"bool\"");
+    err_has("print(array_to_bytes(a, \"f16\"))", "array_to_bytes: dtype must be \"f64\", \"f32\" or \"bool\", got \"f16\"");
+    err_has("print(array_from_bytes(bytes(\"\"), 4))", "array_from_bytes: dtype must be \"f64\", \"f32\" or \"bool\", got number");
     err_has("print(array_to_bytes(a, \"bool\"))", "array_to_bytes: \"bool\" is for masks and this array is f64 — compare first: a != 0");
     err_has("print(array_from_bytes(\"abc\", \"f64\"))", "array_from_bytes expects bytes, got text");
     err_has("print(array_to_bytes([1, 2]))", "array_to_bytes expects an array, got list");

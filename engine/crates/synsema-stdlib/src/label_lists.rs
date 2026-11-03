@@ -190,7 +190,7 @@ pub const LABEL_PURE_BUILTINS: &[&str] = &[
     "summarize", "count_by", "pivot", "count", "count_missing", "sum_of", "mean_of", "min_of", "max_of", "median_of",
     "first_of", "n_unique_of", "quantile_of", "is_missing", "fill_missing", "drop_missing", "fill_nan",
     "quantile", "concat", "stack", "argmin", "argmax", "cumsum", "diff", "cov", "corr", "lstsq",
-    "polyfit", "polyval", "mode", "rng", "rng_spawn", "random_normal", "shuffle", "sample", "choice", "date",
+    "polyfit", "polyval", "mode", "rng", "rng_spawn", "random_normal", "random_uniform", "shuffle", "sample", "choice", "date",
     "datetime", "duration", "parse_date", "parse_datetime", "truncate", "add_months", "date_range",
     "timestamp", "to_timezone", "in_units", "add_days", "jsonl_encode", "jsonl_decode", "lineage", "parquet_read", "parquet_write",
     // v0.6.45 (B4): el esquema y los row groups de un Parquet, sin leer los datos.
