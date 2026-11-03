@@ -10683,7 +10683,19 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
         let a = a.to_f64();
         let mut out = Vec::with_capacity(a.len());
         for x in a.iter() {
-            match self.call_value(func.clone(), vec![syn_float(*x)], loc)? {
+            let r = self.call_value(func.clone(), vec![syn_float(*x)], loc)?;
+            // v0.6.55 (1b, R6): con etiquetas, la lambda devuelve `Private` (el PC del despacho
+            // etiquetado, o un privado capturado). Un array no guarda elementos etiquetados: se
+            // desenvuelve, la etiqueta pasa a `seen` y `call_builtin_labelled` envuelve el array
+            // entero una vez. Antes caía al error y el error llevaba el valor privado.
+            let r = match r {
+                SynValue::Private(p) => {
+                    self.note_seen(&p.label);
+                    p.value.clone()
+                }
+                other => other,
+            };
+            match r {
                 SynValue::Number(n) => out.push(n.to_f64()),
                 other => {
                     return Err(err(format!(

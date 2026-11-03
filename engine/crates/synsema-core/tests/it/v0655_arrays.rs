@@ -159,3 +159,49 @@ fn fill_nan_leaves_a_mask_alone() {
     let r = ok(synsema_core::tabular::fill_nan(&[f64s(&[2], &[f64::NAN, 1.0]), syn_int(7)]));
     assert_eq!((dtype(&r), r.to_string().as_str()), ("f64", "[7, 1]"));
 }
+
+// =========================================================
+// 1b — `apply` sobre un array con etiquetas (diseño §4, R6)
+// =========================================================
+
+/// Corre con etiquetas encendidas y devuelve (etiqueta profunda, valor sin etiquetas) de `r`.
+fn labelled_r(source: &str) -> (String, String) {
+    use synsema_core::interpreter::{env_get, Interpreter};
+    use synsema_core::labels::{label_deep, label_display_raw, strip_deep};
+    let program = synsema_core::parser::parse_source(source, "<v0655>").unwrap();
+    let mut interp = Interpreter::new();
+    interp.set_labels(true);
+    interp.set_labels_detail_to_program(true);
+    if let Err(Control::Error(e)) = interp.execute(&program) {
+        panic!("el programa falló: {}\nfuente:\n{}", e, source);
+    }
+    let v = env_get(&interp.global_env, "r").expect("sin r");
+    let stripped = strip_deep(&v);
+    assert_eq!(stripped.type_name(), "array", "fuente:\n{}", source);
+    (label_display_raw(&label_deep(&v)), stripped.to_string())
+}
+
+/// v0.6.54: `apply(private(a), f)` cortaba con `Runtime error: private(x)`: la lambda devuelve un
+/// `Private` (el PC del despacho etiquetado) y `apply` sobre arrays sólo aceptaba números.
+#[test]
+fn apply_over_a_private_array_gives_a_private_array() {
+    let (l, v) = labelled_r("let r be apply(private(array([1, 5, 2, 8]), \"x\"), (x) => x * 2)\n");
+    assert_eq!((l.as_str(), v.as_str()), ("x", "[2, 10, 4, 16]"));
+}
+
+#[test]
+fn apply_with_a_captured_private_labels_the_whole_array() {
+    let (l, v) = labelled_r("let k be private(3, \"x\")\nlet r be apply(array([1, 5]), (x) => x * k)\n");
+    assert_eq!((l.as_str(), v.as_str()), ("x", "[3, 15]"));
+    let (l, v) = labelled_r("let r be apply(array([1, 5]), (x) => x * 3)\n");
+    assert_eq!((l.as_str(), v.as_str()), ("", "[3, 15]"));
+}
+
+/// Lo que ya andaba sigue igual: `where` con predicado, aritmética y `sum` sobre el array privado.
+#[test]
+fn where_and_arithmetic_over_a_private_array_still_work() {
+    let (l, v) = labelled_r("let p be private(array([1, 5, 2, 8]), \"x\")\nlet r be where(p, (x) => x > 2)\n");
+    assert_eq!((l.as_str(), v.as_str()), ("x", "[5, 8]"));
+    let (l, v) = labelled_r("let p be private(array([1, 5]), \"x\")\nlet r be p * 2 + apply(p, (x) => x)\n");
+    assert_eq!((l.as_str(), v.as_str()), ("x", "[3, 15]"));
+}
