@@ -1591,9 +1591,26 @@ thread_local! {
         const { std::cell::RefCell::new(Places { rows: Vec::new(), views: Vec::new() }) };
 }
 
-/// Lo que quedó de `set` que fallaron a mitad de camino se descarta de a tandas (una entrada vieja
-/// sólo cuesta una copia del array en el próximo `set`, porque suma un dueño).
+/// Al llegar a este tope se descartan las entradas muertas: las de `set` que fallaron a mitad de
+/// camino (una entrada vieja sólo cuesta una copia del array en el próximo `set`, porque suma un
+/// dueño). Las de una sentencia en curso no se tocan (M11 de la ronda 2).
 const PLACES_CAP: usize = 64;
+
+/// Una ficha viva tiene otro dueño además de la entrada (el valor que recorre el camino); una muerta,
+/// no. Una vista muerta es la de un array que ya no tiene nadie más. Si con eso no baja del tope, se
+/// descarta la mitad más vieja.
+#[cold]
+#[inline(never)]
+fn prune(s: &mut Places) {
+    s.rows.retain(|e| crate::types::Obj::strong_count(&e.token) > 1);
+    s.views.retain(|v| crate::types::Obj::strong_count(v) > 1);
+    if s.rows.len() >= PLACES_CAP {
+        s.rows.drain(..PLACES_CAP / 2);
+    }
+    if s.views.len() >= PLACES_CAP {
+        s.views.drain(..PLACES_CAP / 2);
+    }
+}
 
 /// La raíz y las posiciones de una ficha (de afuera hacia adentro); `None` si `a` no es una ficha.
 fn row_chain(rows: &[RowPlace], a: &crate::types::Obj<NdArray>) -> Option<(crate::types::Obj<NdArray>, Vec<usize>)> {
@@ -1634,7 +1651,7 @@ pub fn note_module_view(a: &crate::types::Obj<NdArray>) {
     PLACES.with(|s| {
         let mut s = s.borrow_mut();
         if s.views.len() >= PLACES_CAP {
-            s.views.clear();
+            prune(&mut s);
         }
         s.views.push(a.clone());
     });
@@ -1668,7 +1685,7 @@ pub fn place_row(parent: &SynValue, idx: &SynValue) -> Result<SynValue, Control>
     PLACES.with(|s| {
         let mut s = s.borrow_mut();
         if s.rows.len() >= PLACES_CAP {
-            s.rows.clear();
+            prune(&mut s);
         }
         s.rows.push(RowPlace { token: token.clone(), parent: p.clone(), at });
     });
@@ -1738,11 +1755,32 @@ fn write_region<T: Copy>(mut x: ndarray::ArrayViewMutD<T>, pos: &[usize], single
     }
 }
 
+/// Lo que la hoja sabe de la variable raíz (ver `set_index`).
+pub struct Rooted {
+    /// Cuántos índices van de la variable a la hoja; `None` si el camino pasa por un campo.
+    pub depth: Option<usize>,
+    /// El array que tiene ahora la variable (su dirección), si tiene uno.
+    pub now: Option<usize>,
+}
+
+/// Cuántas filas recorrió el camino hasta la ficha `obj` (0 si no es una ficha).
+pub fn chain_len(obj: &SynValue) -> usize {
+    let SynValue::Array(a) = obj else { return 0 };
+    PLACES.with(|s| row_chain(&s.borrow().rows, a).map_or(0, |(_, p)| p.len()))
+}
+
 /// `set a[idx] to value` (la hoja; `set_leaf_index`): escribe en el lugar el array que el camino
 /// dejó único. Si `a` es la ficha de una fila (`set M[i][j]`), escribe en el array de la variable,
-/// en esa fila. `root`: el nombre de la variable, para el error de forma.
+/// en esa fila. `root`: el nombre de la variable, para los errores. `rooted`: lo que se sabe de la
+/// variable raíz ahora (B2 de la ronda 2).
 #[inline(never)]
-pub fn set_index(obj: &SynValue, idx: &SynValue, value: SynValue, root: Option<&str>) -> Result<SynValue, Control> {
+pub fn set_index(
+    obj: &SynValue,
+    idx: &SynValue,
+    value: SynValue,
+    root: Option<&str>,
+    rooted: Rooted,
+) -> Result<SynValue, Control> {
     let SynValue::Array(a) = obj else {
         return Err(err(format!("Cannot set index on {}", obj.type_name())));
     };
@@ -1776,6 +1814,14 @@ pub fn set_index(obj: &SynValue, idx: &SynValue, value: SynValue, root: Option<&
         Some((r, p)) => (r, p),
         None => (a, &[]),
     };
+    // B2 (ronda 2): si la raíz de la cadena es el array de la variable al empezar el camino, la
+    // variable tiene que seguir teniéndolo. Un índice que la religó (y guardó el array viejo en otra)
+    // haría caer la escritura en ese alias, y con `--labels` un valor privado en un array público.
+    let direct = rooted.depth == Some(prefix.len() + 1);
+    if direct && rooted.now != Some(crate::types::Obj::as_ptr(target) as usize) {
+        return Err(rebound(root));
+    }
+
     // Los dueños del array de la variable: su lugar y la referencia de esta escritura (la del camino,
     // o la raíz de la cadena), más la vista del módulo si es una exportación. Si hay otro (un alias
     // tomado a mitad de la sentencia, la reentrada), no se escribe.
@@ -1797,9 +1843,11 @@ pub fn set_index(obj: &SynValue, idx: &SynValue, value: SynValue, root: Option<&
         if broadcast_shape(vs, &region).as_deref() != Some(region.as_slice()) {
             let what = if single { if sub.is_empty() { "the element is a number" } else { "the row has shape" } } else { "the positions have shape" };
             let shape = if single && sub.is_empty() { String::new() } else { format!(" {:?}", region) };
+            let path: String = prefix.iter().map(|i| format!("[{}]", i)).collect();
             return Err(err(format!(
-                "set {}[{}]: {}{}, got {:?}",
+                "set {}{}[{}]: {}{}, got {:?}",
                 root.unwrap_or("a"),
+                path,
                 crate::labels::unwrap(idx),
                 what,
                 shape,
@@ -1809,9 +1857,11 @@ pub fn set_index(obj: &SynValue, idx: &SynValue, value: SynValue, root: Option<&
     }
     // SAFETY: la cuenta es exacta (arriba) y ninguna de esas referencias se lee mientras se escribe:
     // el lugar está quieto hasta que termine la sentencia, el valor ya se copió a `payload` y las
-    // posiciones ya están calculadas. Lo que la cuenta NO dice es que el otro dueño sea el lugar: un
-    // índice que religa la variable y guarda el array viejo en otra (`set a[f()]`) hace que se
-    // escriba en ese array, como con una lista (faltantes: evaluar los índices antes del camino).
+    // posiciones ya están calculadas. Que el otro dueño sea el lugar lo dice `rooted` (arriba) cuando
+    // el camino va de la variable al array sólo por índices; a través de una lista o un mapa
+    // (`set L[0][f()]`) la cuenta no lo distingue, como con listas (faltantes: evaluar los índices
+    // antes del camino); con `--labels`, ahí un valor privado sólo pasa con índices que no corren
+    // código (`set_leaf_index`).
     let t = unsafe { crate::types::Obj::get_mut_with_owners(target, owners) }.ok_or_else(in_use)?;
     match (t, payload) {
         (NdArray::F64(x), Payload::F64(v)) => write_region(sub_view_mut(x, prefix), &pos, single, Some(v), None),
@@ -1821,6 +1871,14 @@ pub fn set_index(obj: &SynValue, idx: &SynValue, value: SynValue, root: Option<&
         _ => unreachable!("Payload::of sigue el tipo del array"),
     }
     Ok(value)
+}
+
+#[cold]
+fn rebound(root: Option<&str>) -> Control {
+    err(format!(
+        "set: the index changed '{}' while it was being written (it now holds another value) — compute the index into a variable first",
+        root.unwrap_or("a")
+    ))
 }
 
 #[cold]

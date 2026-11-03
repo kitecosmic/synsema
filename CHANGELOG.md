@@ -35,8 +35,12 @@ Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the rele
   walks do not change, and an array nobody else holds is written in place, without a copy per
   write — `set T[i][j][k]` writes the element into `T` without copying its row, and the array a
   module exports is written in place by its tasks and from outside (`set m.STATE[1] to 70`). A mask holds `true`/`false` and an `f64` array numbers (`set a[0] to true` → `… use 1.0`);
-  a mask as a position is an error that names `where(a, m)` / `if_else(m, 0, a)`. With `--labels`
-  an array is private as a whole: it takes values at most as private as the variable.
+  a mask as a position is an error that names `where(a, m)` / `if_else(m, 0, a)`. An index that
+  rebinds the variable it writes (`set a[f()]` where `f` does `set a to …`) is an error
+  (`set: the index changed 'a' while it was being written …`): the write never lands in the array
+  the variable held before. With `--labels` an array is private as a whole: it takes values at most
+  as private as the variable, and a private value written into an array inside a list or map needs
+  an index that runs no code (`let i be f()` first).
 - **`index_add(a, positions, values, axis = 0)`** returns a new array with the values added at those
   positions; repeated positions accumulate in order (the gradient of an embedding).
 - **`each` walks an array** along its first axis: the elements of a 1-D array (numbers, or
@@ -74,6 +78,8 @@ Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the rele
   and a predicate that returns an array are errors that suggest `some(m)` / `every(m)`,
   `length(a) > 0` or `logical_and`. Before, a non-empty array counted as true.
 - `arrays do not support ordering comparisons` is gone (comparisons work now).
+- **`-m` on a mask is an error**, like `-true` (numpy rejects it too): `logical_not(m)` flips it,
+  `-(m * 1.0)` gives the 0/-1 floats. Negating a `f64` array works.
 - `each x in a` over an array walks it instead of failing with `Cannot iterate over array`, and
   `Cannot set index on array` is gone (`set a[i]` works).
 

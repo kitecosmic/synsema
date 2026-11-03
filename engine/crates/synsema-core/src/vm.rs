@@ -4259,6 +4259,7 @@ impl Interpreter {
             if done {
                 v
             } else {
+                let root_now = || self.vm_root_ptr(chunk, env, base, d.root);
                 set_leaf_index(
                     &obj,
                     &i,
@@ -4266,11 +4267,26 @@ impl Interpreter {
                     &chunk.nodes[d.node as usize],
                     &chunk.locs[d.target_loc as usize],
                     &chunk.locs[chunk.loc[at] as usize],
+                    &root_now,
+                    false,
                 )?
             }
         };
         self.put(base, d.dst, out);
         Ok(())
+    }
+
+    /// El array que tiene ahora la variable raíz de un camino (B2 de la ronda 2): sólo lo pide la hoja
+    /// de un `set` sobre un array.
+    #[inline(never)]
+    fn vm_root_ptr(&self, chunk: &Chunk, env: &Rc<RefCell<Environment>>, base: usize, root: Root) -> Option<usize> {
+        match root {
+            Root::Param(r) => array_ptr_of(&self.vm_regs[base + r as usize]),
+            Root::Win(k) => self.vm_locals[self.vm_lbase + k as usize].as_ref().and_then(array_ptr_of),
+            Root::Local(k) => env.borrow_mut().bindings.slot_mut(k as usize).and_then(|v| array_ptr_of(v)),
+            Root::Free { name, .. } => env_get(env, &chunk.names[name as usize]).and_then(|v| array_ptr_of(&v)),
+            Root::Slow => None,
+        }
     }
 
     #[inline(never)]

@@ -1109,6 +1109,11 @@ pub(crate) fn set_leaf_prop(obj: &SynValue, property_name: &str, value: SynValue
 
 /// La hoja de `set <camino>[idx] to v` (ver `set_leaf_prop`). `target_loc`: la del destino (el
 /// error de fuera de rango, como la lectura `xs[i]`); `loc`: la de la sentencia.
+///
+/// `root_now`: el array que tiene AHORA la variable raíz (sólo se pide si la hoja es un array; B2 de
+/// la ronda 2). `guarded`: con `--labels`, el valor llevaba etiqueta y algún índice corre código; la
+/// escritura sólo sigue si se puede verificar que cae en el array de la variable.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn set_leaf_index(
     obj: &SynValue,
     idx: &SynValue,
@@ -1116,6 +1121,8 @@ pub(crate) fn set_leaf_index(
     target: &Node,
     target_loc: &SourceLocation,
     loc: &SourceLocation,
+    root_now: &dyn Fn() -> Option<usize>,
+    guarded: bool,
 ) -> Result<SynValue, Control> {
     match obj {
         SynValue::List(l) => {
@@ -1148,9 +1155,78 @@ pub(crate) fn set_leaf_index(
             Ok(value)
         }
         // v0.6.55 (ítem 3, R5): en el lugar; el error de un índice, donde está el destino.
-        SynValue::Array(_) => crate::arrays::set_index(obj, idx, value, set_root_identifier(target))
-            .map_err(|e| crate::arrays::located(e, target_loc)),
+        SynValue::Array(_) => {
+            let depth = index_depth(target);
+            // A través de una lista o un mapa la identidad no se puede verificar: con `--labels`, un
+            // valor privado por un índice que corre código no se escribe (ese código podría religar la
+            // raíz y dejar el array en otra variable, pública).
+            if guarded && depth != Some(crate::arrays::chain_len(obj) + 1) {
+                return Err(err_labels(
+                    "label_violation: a private value is written into an array inside a list or map through an index that runs code — compute the index into a variable first",
+                    loc,
+                ));
+            }
+            let rooted = crate::arrays::Rooted { depth, now: if depth.is_some() { root_now() } else { None } };
+            crate::arrays::set_index(obj, idx, value, set_root_identifier(target), rooted)
+                .map_err(|e| crate::arrays::located(e, target_loc))
+        }
         _ => Err(cannot_set(obj, "index", loc)),
+    }
+}
+
+/// Cuántos índices van de la variable a la hoja de un `set` (`a[i]` → 1, `M[i][j]` → 2); `None` si el
+/// camino pasa por un campo.
+fn index_depth(target: &Node) -> Option<usize> {
+    let mut n = target;
+    let mut d = 0;
+    loop {
+        match &n.kind {
+            NodeKind::IndexAccess { object, .. } => {
+                d += 1;
+                n = object;
+            }
+            NodeKind::Identifier { .. } => return Some(d),
+            _ => return None,
+        }
+    }
+}
+
+/// ¿Algún índice del camino de un `set` puede correr código (una llamada)? Conservador: lo que no es
+/// una variable, un literal o una cuenta entre ellos cuenta como que sí.
+fn path_runs_code(target: &Node) -> bool {
+    fn runs(n: &Node) -> bool {
+        match &n.kind {
+            NodeKind::Identifier { .. }
+            | NodeKind::NumberLiteral { .. }
+            | NodeKind::TextLiteral { .. }
+            | NodeKind::BoolLiteral { .. } => false,
+            NodeKind::BinaryOp { left, right, .. } => runs(left) || runs(right),
+            NodeKind::UnaryOp { operand, .. } => runs(operand),
+            NodeKind::PropertyAccess { object, .. } => runs(object),
+            NodeKind::IndexAccess { object, index } => runs(object) || runs(index),
+            _ => true,
+        }
+    }
+    let mut n = target;
+    loop {
+        match &n.kind {
+            NodeKind::IndexAccess { object, index } => {
+                if runs(index) {
+                    return true;
+                }
+                n = object;
+            }
+            NodeKind::PropertyAccess { object, .. } => n = object,
+            _ => return false,
+        }
+    }
+}
+
+/// La dirección del array de `v` (adentro de un valor privado también), para comparar identidades.
+pub(crate) fn array_ptr_of(v: &SynValue) -> Option<usize> {
+    match labels::unwrap(v) {
+        SynValue::Array(a) => Some(crate::types::Obj::as_ptr(a) as usize),
+        _ => None,
     }
 }
 
@@ -7911,6 +7987,11 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
             UnOp::Neg => match &v {
                 SynValue::Number(n) => Ok(syn_number(n.neg())),
                 SynValue::Complex(z) => Ok(SynValue::Complex(-z)),
+                // M13 (ronda 2): una máscara no es un número, como `-true`.
+                SynValue::Array(a) if a.dtype() == "bool" => Err(err_at(
+                    "Cannot negate a mask — logical_not(m) flips it; -(m * 1.0) gives the 0/-1 floats",
+                    loc,
+                )),
                 SynValue::Array(a) => Ok(crate::arrays::negate(a)),
                 _ => Err(err_at(format!("Cannot negate {}", v.type_name()), loc)),
             },
@@ -8299,12 +8380,15 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                     };
                 // Un array no guarda un elemento privado: el valor tiene que ser a lo sumo tan
                 // privado como la variable (R6: la etiqueta es del array entero).
+                let mut guarded = false;
                 let value = if self.labels && matches!(obj, SynValue::Array(_)) && labels::has_label_deep(&value) {
+                    guarded = path_runs_code(target);
                     self.array_set_value(target, value, env, loc)?
                 } else {
                     value
                 };
-                set_leaf_index(&obj, &idx, value, target, &target.location, loc)
+                let root_now = || set_root_identifier(target).and_then(|n| env_get(env, n)).and_then(|v| array_ptr_of(&v));
+                set_leaf_index(&obj, &idx, value, target, &target.location, loc, &root_now, guarded)
             }
             _ => Err(err_at("Invalid set target", loc)),
         }
