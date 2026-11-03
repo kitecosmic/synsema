@@ -130,4 +130,8 @@ fn a_template_when_on_an_array_is_an_error() {
     assert_eq!(run_with("some(array([1, 5]) > 2)"), "yes");
     let out = run_with("array([1, 5]) > 2");
     assert!(out.contains("an array is not true or false"), "{}", out);
+    // Ítem 9: `{ each }` recorre un array como `each`.
+    std::fs::write(dir.join("t.html"), "{ each x in m }[{ x }]{ end }").unwrap();
+    assert_eq!(run_with("array([1, 5]) > 2"), "[false][true]");
+    assert_eq!(run_with("array([[1, 2], [3, 4]])"), "[[1, 2]][[3, 4]]");
 }

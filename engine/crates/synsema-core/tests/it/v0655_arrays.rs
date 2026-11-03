@@ -482,3 +482,178 @@ fn a_private_mask_is_not_a_condition_either() {
         Err(_) => panic!("otro control"),
     }
 }
+
+// =========================================================
+// Ítem 9 — `each` sobre un array (diseño §3.2)
+// =========================================================
+
+#[test]
+fn each_walks_the_first_axis_of_an_array() {
+    assert_eq!(with_a("each x in a\n    print(x)"), "1.0\n5.0\n2.0\n8.0");
+    assert_eq!(with_a("each b in m\n    print(b)"), "false\ntrue\nfalse\ntrue");
+    assert_eq!(both("each r in array([[1, 2], [3, 4]])\n    print(r)"), "[1, 2]\n[3, 4]");
+    // Lo mismo que `enumerate(a)` da como `item`.
+    assert_eq!(
+        both("let M be array([[1, 2], [3, 4]])\nlet n be 0\neach e in enumerate(M)\n    each r in M\n        when r == e.item\n            set n to n + 1\nprint(n)"),
+        "2"
+    );
+    assert_eq!(both("each x in array([])\n    print(x)\nprint(\"fin\")"), "fin");
+    assert_eq!(
+        both("each x in array(5)\n    print(x)"),
+        "ERR: each over a 0-d array: it is a scalar and has no rows — use the value itself"
+    );
+}
+
+/// Un array privado se recorre como una lista privada (R6): cada elemento sale con la etiqueta y
+/// una rama sobre él corta igual.
+#[test]
+fn each_over_a_private_array_behaves_like_a_private_list() {
+    fn outcome(coll: &str, body: &str) -> String {
+        use synsema_core::interpreter::{env_get, Interpreter};
+        use synsema_core::labels::{label_deep, label_display_raw, strip_deep};
+        let src = format!("let p be private({}, \"x\")\nlet n be 0\nlet out be []\neach x in p\n{}\n", coll, body);
+        let program = synsema_core::parser::parse_source(&src, "<v0655>").unwrap();
+        let mut interp = Interpreter::new();
+        interp.set_labels(true);
+        interp.set_labels_detail_to_program(true);
+        match interp.execute(&program) {
+            Ok(_) => {
+                let v = env_get(&interp.global_env, "out").expect("sin out");
+                format!("ok {} {}", label_display_raw(&label_deep(&v)), strip_deep(&v))
+            }
+            Err(Control::Error(e)) => e.message.clone(),
+            Err(_) => "otro control".to_string(),
+        }
+    }
+    for body in [
+        "    when x > 2\n        set n to n + 1",
+        "    set out to append(out, x * 2)",
+    ] {
+        let list = outcome("[1.0, 5.0, 2.0, 8.0]", body);
+        assert_eq!(outcome("array([1, 5, 2, 8])", body), list, "{}", body);
+    }
+}
+
+// =========================================================
+// Ítem 5 — funciones numéricas sobre arrays (diseño §3.4)
+// Valores de `specs/v0.6.55-numpy/item5.py` (numpy 2.2.1 y `math` de Python).
+// =========================================================
+
+/// `true` si `expr` (un array) está a menos de 1e-12 de `want` en cada elemento.
+fn close(expr: &str, want: &str) -> String {
+    both(&format!("let got be {}\nprint(shape(got) == shape(array({w})) and every(abs(got - array({w})) < 1e-12))", expr, w = want))
+}
+
+#[test]
+fn unary_numeric_functions_work_elementwise() {
+    assert_eq!(both("print(sign(array([-2, 0, 3, nan])))"), "[-1, 0, 1, nan]");
+    let g = "array([0.5, 1, 4.5])";
+    assert_eq!(close(&format!("gamma({})", g), "[1.7724538509055159, 1.0, 11.631728396567446]"), "true");
+    assert_eq!(close(&format!("lgamma({})", g), "[0.5723649429247004, 0.0, 2.453736570842443]"), "true");
+    assert_eq!(close(&format!("erf({})", g), "[0.5204998778130465, 0.8427007929497149, 0.9999999998033839]"), "true");
+    assert_eq!(close(&format!("erfc({})", g), "[0.4795001221869534, 0.1572992070502851, 1.9661604415428876e-10]"), "true");
+    // Una máscara entra como 0/1 (R2).
+    assert_eq!(with_a("print(gamma(m + 2.0))"), "[1, 2, 1, 2]");
+}
+
+#[test]
+fn predicates_over_an_array_give_masks() {
+    let v = "array([1, nan, exp(1000)])";
+    assert_eq!(both(&format!("print(is_nan({v}))\nprint(is_finite({v}))")), "[false, true, false]\n[true, false, false]");
+    assert_eq!(both("print(is_infinite(array([1, nan, -exp(1000)])))"), "[false, false, true]");
+}
+
+#[test]
+fn binary_numeric_functions_broadcast() {
+    assert_eq!(with_a("print(pow(a, 2))\nprint(pow(2, a))"), "[1, 25, 4, 64]\n[2, 32, 4, 256]");
+    let b = "array([3, 3, 9, 1])";
+    assert_eq!(
+        close(&format!("atan2(array([1, 5, 2, 8]), {b})"), "[0.3217505543966422, 1.0303768265243125, 0.21866894587394195, 1.446441332248135]"),
+        "true"
+    );
+    assert_eq!(
+        close(&format!("hypot(array([1, 5, 2, 8]), {b})"), "[3.1622776601683795, 5.830951894845301, 9.219544457292887, 8.06225774829855]"),
+        "true"
+    );
+    assert_eq!(close("log_base(array([1, 5, 2, 8]), 2)", "[0.0, 2.321928094887362, 1.0, 3.0]"), "true");
+    assert_eq!(close("beta(array([1, 0.5]), array([2, 0.5]))", "[0.5000000000000002, 3.1415926535897953]"), "true");
+    assert_eq!(both("print(pow(array([[1], [2]]), array([1, 2])))"), "[[1, 1], [2, 4]]");
+    assert_eq!(with_a("print(pow(a, [1, 2]))"), "ERR: pow: make the list an array first: array(xs)");
+    assert_eq!(with_a("print(hypot(a, array([1, 2])))"), "ERR: hypot: arrays of shape [4] and [2] are not broadcastable");
+}
+
+#[test]
+fn round_to_over_an_array() {
+    assert_eq!(both("print(round_to(array([2.675, 1.005, -0.125, 3.14159]), 2))"), "[2.67, 1, -0.12, 3.14]");
+    assert_eq!(
+        with_a("print(round_to(a, array([1])))"),
+        "ERR: round_to expects a number, got array"
+    );
+    assert_eq!(
+        with_a("print(round_to(a, -1))"),
+        "ERR: round_to expects a non-negative integer number of decimals"
+    );
+}
+
+/// Los que cerraron la lista del test de abajo: enteros y complejos sobre arrays.
+#[test]
+fn integer_and_complex_functions_over_arrays() {
+    let (x, y) = ("array([12, 18, 0, -4])", "array([8, 27, 5, 6])");
+    assert_eq!(both(&format!("print(gcd({x}, {y}))
+print(lcm({x}, {y}))")), "[4, 9, 5, 2]
+[24, 54, 0, 12]");
+    assert_eq!(both(&format!("print(gcd({x}, 6))")), "[6, 6, 6, 2]");
+    // numpy: `lcm(0, 0)` = 0 (no 0/0).
+    assert_eq!(both("print(lcm(array([0, 3]), 0))"), "[0, 0]");
+    assert_eq!(both("print(gcd(array([2.5]), 5))"), "ERR: gcd expects whole numbers, the array has 2.5");
+    assert_eq!(both("print(lcm(array([1, nan]), 5))"), "ERR: lcm expects whole numbers, the array has NaN");
+    assert_eq!(both("print(factorial(array([0, 1, 5, 20, 171])))"), "[1, 1, 120, 2.43290200817664e+18, inf]");
+    assert_eq!(both("print(factorial(array([3, -1])))"), "ERR: factorial expects a non-negative integer");
+    let z = "array([-1, 0, 2, nan])";
+    assert_eq!(
+        both(&format!("print(real({z}))
+print(imag({z}))
+print(conj({z}))")),
+        "[-1, 0, 2, nan]
+[0, 0, 0, 0]
+[-1, 0, 2, nan]"
+    );
+    assert_eq!(close(&format!("arg(array([-1, 0, 2]))"), "[3.141592653589793, 0.0, 0.0]"), "true");
+    assert_eq!(both(&format!("print(is_nan(arg({z})))")), "[false, false, false, true]");
+    assert_eq!(
+        both("print(complex(array([1]), 2))"),
+        "ERR: complex: arrays hold f64 or bool, not complex numbers — keep the real and imaginary parts as two arrays"
+    );
+}
+
+/// El cierre de la lista (diseño §3.4): ningún builtin numérico de `math.rs` responde
+/// `expects a number` a un array. Recorre los builtins registrados que llaman a `crate::math::`.
+#[test]
+fn no_numeric_builtin_rejects_an_array() {
+    let src = include_str!("../../src/interpreter.rs");
+    let mut names: Vec<(String, usize)> = Vec::new();
+    for line in src.lines() {
+        let line = line.trim();
+        if !line.starts_with("self.register(\"") || !line.contains("crate::math::") {
+            continue;
+        }
+        let name = line["self.register(\"".len()..].split('"').next().unwrap().to_string();
+        let arity: i64 = line.split(", ").nth(1).and_then(|n| n.trim().parse().ok()).unwrap_or(1);
+        names.push((name, arity.max(1) as usize));
+    }
+    assert!(names.len() > 40, "se esperaban los builtins de math.rs, hubo {}", names.len());
+    let mut bad = Vec::new();
+    for (name, n) in &names {
+        // `round_to`: los decimales son un número, no un array (diseño §3.4).
+        let args = if name == "round_to" {
+            "array([0.5, 2]), 1".to_string()
+        } else {
+            vec!["array([0.5, 2])"; *n].join(", ")
+        };
+        let out = both(&format!("print({}({}))", name, args));
+        if out.contains("expects a number") {
+            bad.push(format!("{}: {}", name, out));
+        }
+    }
+    assert!(bad.is_empty(), "no aceptan arrays:\n{}", bad.join("\n"));
+}

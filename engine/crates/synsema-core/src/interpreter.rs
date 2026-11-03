@@ -11461,6 +11461,8 @@ impl Interpreter {
             SynValue::Bytes(b) => {
                 EachItems::Owned(b.iter().map(|x| syn_int(*x as i64)).collect::<Vec<_>>().into_iter())
             }
+            // v0.6.55 (ítem 9): un array por su primer eje, como `enumerate(a)` y `a[i]`.
+            SynValue::Array(a) => EachItems::Owned(crate::arrays::each_items(a).map_err(|e| crate::arrays::located(e, loc))?.into_iter()),
             _ => {
                 return Err(err_at(
                     format!(

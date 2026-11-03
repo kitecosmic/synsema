@@ -629,6 +629,93 @@ pub fn clamp_array(args: &[SynValue]) -> Result<SynValue, Control> {
     Ok(syn_array(zip_broadcast(&up, &hi, |v, h| if v.is_nan() || h.is_nan() { f64::NAN } else { v.min(h) })?))
 }
 
+/// Lo que recorre `each x in a` (v0.6.55, ítem 9): el primer eje, como `enumerate(a)` y `a[i]`. Un
+/// array 1-D da sus elementos (números, o bool si es una máscara); uno de más ejes, sus filas.
+#[inline(never)]
+pub fn each_items(a: &NdArray) -> Result<Vec<SynValue>, Control> {
+    if a.ndim() == 0 {
+        return Err(err("each over a 0-d array: it is a scalar and has no rows — use the value itself"));
+    }
+    if a.ndim() == 1 {
+        return Ok(match a {
+            NdArray::F64(x) => x.iter().map(|v| syn_float(*v)).collect(),
+            NdArray::Bool(x) => x.iter().map(|v| syn_bool(*v)).collect(),
+        });
+    }
+    (0..a.shape()[0]).map(|i| index_row(a, i as i64)).collect()
+}
+
+/// Un error sin ubicación con la de `loc` (la de la sentencia que lo pidió).
+pub fn located(e: Control, loc: &crate::tokens::SourceLocation) -> Control {
+    match e {
+        Control::Error(mut r) if r.location.is_none() => {
+            r.location = Some(loc.clone());
+            Control::Error(r)
+        }
+        other => other,
+    }
+}
+
+/// Una función numérica de un argumento sobre un array (v0.6.55, ítem 5): elemento a elemento, `f64`
+/// (una máscara entra como 0/1, R2).
+#[inline(never)]
+pub fn map_f64(a: &NdArray, f: impl Fn(f64) -> f64) -> SynValue {
+    syn_array(a.to_f64().mapv(f))
+}
+
+/// Un predicado numérico sobre un array (`is_nan`, `is_finite`, …): una máscara.
+#[inline(never)]
+pub fn map_pred(a: &NdArray, f: fn(f64) -> bool) -> SynValue {
+    crate::types::syn_mask(a.to_f64().mapv(f))
+}
+
+/// Una función numérica de dos argumentos con un array en alguno (`pow`, `atan2`, `hypot`,
+/// `log_base`, `beta`): elemento a elemento con broadcasting, `f64`.
+#[inline(never)]
+pub fn binary_elem(args: &[SynValue], name: &str, f: impl Fn(f64, f64) -> f64) -> Result<SynValue, Control> {
+    arity(args, 2, name)?;
+    let one = |i: usize| -> Result<Cow<'_, ArrayD<f64>>, Control> {
+        elem_operand(&args[i]).ok_or_else(|| match &args[i] {
+            SynValue::List(_) => err(format!("{}: make the list an array first: array(xs)", name)),
+            o => err(format!("{} expects arrays or numbers, got {}", name, o.type_name())),
+        })
+    };
+    let (a, b) = (one(0)?, one(1)?);
+    let r = zip_broadcast(&a, &b, f).map_err(|e| match e {
+        Control::Error(mut r) => {
+            r.message = format!("{}: {}", name, r.message);
+            Control::Error(r)
+        }
+        other => other,
+    })?;
+    Ok(syn_array(r))
+}
+
+/// `Err` si algún elemento de un array de `args` no es un entero (`gcd`, `lcm`, `factorial`
+/// sobre arrays: el array es `f64`, los enteros van como floats exactos hasta 2^53).
+#[inline(never)]
+pub fn require_whole(args: &[SynValue], name: &str) -> Result<(), Control> {
+    for v in args {
+        if let SynValue::Array(a) = v {
+            if let Some(x) = a.to_f64().iter().find(|x| !(x.is_finite() && x.fract() == 0.0)) {
+                return Err(err(format!("{} expects whole numbers, the array has {}", name, x)));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `gcd` de dos floats enteros (Euclides; exacto mientras quepan en 2^53).
+pub fn gcd_f64(a: f64, b: f64) -> f64 {
+    let (mut a, mut b) = (a.abs(), b.abs());
+    while b != 0.0 {
+        let r = a % b;
+        a = b;
+        b = r;
+    }
+    a
+}
+
 /// Unario `-` sobre un array (elementwise).
 pub fn negate(a: &NdArray) -> SynValue {
     syn_array(a.to_f64().mapv(|x| -x))

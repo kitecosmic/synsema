@@ -3052,7 +3052,10 @@ impl Interpreter {
                     Ok(())
                 })(),
                 Ins::ToBool { dst, src, why } => self.opnd(&chunk, &env, base, src, at).and_then(|v| {
-                    let t = truth(&v, why)?;
+                    let t = match v {
+                        SynValue::Bool(b) => b,
+                        ref o => vm_truth(o, why)?,
+                    };
                     self.put(base, dst, syn_bool(t));
                     Ok(())
                 }),
@@ -3101,7 +3104,14 @@ impl Interpreter {
                     r
                 }
                 Ins::JumpIfFalsy { src, to, why } => self.opnd(&chunk, &env, base, src, at).and_then(|v| {
-                    if !truth(&v, why)? {
+                    // v0.6.55 (perf-guard): en línea sólo el `Bool`; lo demás (y el error de un array, R4)
+                    // fuera del bucle de la VM, que con la verdad completa adentro crecía 4 instrucciones
+                    // por vuelta en programas que ni tocan arrays (d_idx4 +0,42 %).
+                    let t = match v {
+                        SynValue::Bool(b) => b,
+                        ref o => vm_truth(o, why)?,
+                    };
+                    if !t {
                         pc = to as usize;
                     }
                     Ok(())
@@ -4989,4 +4999,10 @@ pub mod profile {
         }
         out
     }
+}
+
+/// v0.6.55 (R4): la verdad de lo que no es un `Bool` en `JumpIfFalsy`/`ToBool`, fuera del bucle de la VM.
+#[inline(never)]
+fn vm_truth(v: &SynValue, why: TruthAt) -> Result<bool, Control> {
+    truth(v, why)
 }
