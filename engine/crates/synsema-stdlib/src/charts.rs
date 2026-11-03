@@ -40,6 +40,11 @@ fn err(msg: impl Into<String>) -> Control {
     Control::Error(RuntimeError::new(msg))
 }
 
+/// Los números de un array para graficar; una máscara no es una serie (v0.6.55).
+fn chart_nums<'a>(a: &'a synsema_core::types::NdArray, name: &str) -> Result<&'a ndarray::ArrayD<f64>, Control> {
+    a.as_f64().ok_or_else(|| err(format!("{}: a mask (bool array) is not a series — m * 1.0 gives 0/1 floats", name)))
+}
+
 // =========================================================
 // Defaults de diseño (paleta validada CVD-safe, orden FIJO)
 // =========================================================
@@ -981,6 +986,7 @@ fn normalize_xy(
         }
         // Forma 5: array 1-D (2-D multi-serie = futuro).
         SynValue::Array(a) => {
+            let a = chart_nums(a, name)?;
             if a.ndim() != 1 {
                 return Err(err(format!(
                     "{}: only 1-D arrays can be plotted directly (got a {}-D array); convert with to_list() or pass rows",
@@ -1272,6 +1278,7 @@ fn normalize_heatmap(
                 cells
             }
             SynValue::Array(a) => {
+                let a = chart_nums(a, name)?;
                 if a.ndim() != 2 {
                     return Err(err(format!(
                         "{}: heatmap takes a 2-D array (rows × columns) or a list of rows, got a {}-D array",
@@ -1493,6 +1500,7 @@ fn normalize_histogram(
             raw()
         }
         SynValue::Array(a) => {
+            let a = chart_nums(a, name)?;
             if a.ndim() != 1 {
                 return Err(err(format!(
                     "{}: only 1-D arrays can be plotted directly (got a {}-D array); convert with to_list() or pass rows",
@@ -1767,6 +1775,7 @@ fn normalize_boxplot(
                         vals
                     }
                     SynValue::Array(a) if a.ndim() == 1 => {
+                        let a = chart_nums(a, name)?;
                         let vals: Vec<f64> = a.iter().copied().collect();
                         if vals.iter().any(|v| !v.is_finite()) {
                             return Err(err(format!(
@@ -1790,6 +1799,7 @@ fn normalize_boxplot(
             Ok(out)
         }
         SynValue::Array(a) => {
+            let a = chart_nums(a, name)?;
             if a.ndim() != 1 {
                 return Err(err(format!(
                     "{}: only 1-D arrays can be plotted directly (got a {}-D array); convert with to_list() or pass rows",
@@ -3479,6 +3489,30 @@ mod tests {
             Ok(v) => v,
             Err(Control::Error(e)) => panic!("error inesperado: {}", e.message),
             Err(_) => panic!("control inesperado"),
+        }
+    }
+
+    /// v0.6.55: una máscara no es una serie; el error dice cómo pasarla a 0/1.
+    #[test]
+    fn v0655_a_mask_is_not_a_series() {
+        let m = synsema_core::types::syn_mask(ndarray::ArrayD::from_shape_vec(ndarray::IxDyn(&[4]), vec![false, true, false, true]).unwrap());
+        let h = synsema_core::types::syn_mask(ndarray::ArrayD::from_shape_vec(ndarray::IxDyn(&[2, 2]), vec![false, true, false, true]).unwrap());
+        for (kind, data) in [("bar", m.clone()), ("line", m.clone()), ("histogram", m.clone()), ("boxplot", m.clone()), ("heatmap", h)] {
+            match chart_svg(&[syn_text(kind), data]) {
+                Err(Control::Error(e)) => assert_eq!(
+                    e.message,
+                    "chart_svg: a mask (bool array) is not a series — m * 1.0 gives 0/1 floats",
+                    "{}", kind
+                ),
+                Ok(_) => panic!("{}: graficó una máscara", kind),
+                Err(_) => panic!("control inesperado"),
+            }
+        }
+        let mut g = SynMap::new();
+        g.insert("a", m);
+        match chart_svg(&[syn_text("boxplot"), syn_map(g)]) {
+            Err(Control::Error(e)) => assert!(e.message.contains("a mask (bool array) is not a series"), "{}", e.message),
+            _ => panic!("boxplot por grupos graficó una máscara"),
         }
     }
 

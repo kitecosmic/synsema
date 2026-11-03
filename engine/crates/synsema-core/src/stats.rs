@@ -230,8 +230,9 @@ pub fn builtin(interp: &mut Interpreter, args: &[SynValue], kind: Kind) -> Resul
     }
 }
 
-fn reduce_array(a: &crate::types::Obj<ArrayD<f64>>, kind: Kind, axis: Option<i64>, lvl: f64, ddof: f64) -> Result<SynValue, Control> {
+fn reduce_array(a: &crate::types::NdArray, kind: Kind, axis: Option<i64>, lvl: f64, ddof: f64) -> Result<SynValue, Control> {
     let who = kind.name();
+    let a: &ArrayD<f64> = &a.to_f64();
     if a.is_empty() && !matches!(kind, Kind::Sum | Kind::Product) {
         return Err(err(format!("{} of an empty array", who)));
     }

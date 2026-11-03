@@ -589,6 +589,11 @@ impl DatabaseManager {
 fn reject_sealed(v: &SynValue, who: &str) -> Result<(), String> {
     match v {
         SynValue::Secret(s) => s.expose_bytes_checked(who).map(|_| ()),
+        // v0.6.55: una máscara no es un vector de números (pgvector, columnas): que lo diga.
+        SynValue::Array(a) if a.as_f64().is_none() => Err(format!(
+            "{}: a mask (bool array) is not a vector — m * 1.0 gives 0/1 floats",
+            who
+        )),
         SynValue::List(l) => list_values(l).iter().try_for_each(|x| reject_sealed(x, who)),
         SynValue::Map(m) => m.borrow().iter().try_for_each(|(_, x)| reject_sealed(x, who)),
         _ => Ok(()),
@@ -909,7 +914,8 @@ fn list_to_vector_text(items: &[SynValue]) -> String {
     format!("[{}]", parts.join(","))
 }
 
-fn array_to_vector_text(a: &ndarray::ArrayD<f64>) -> String {
+fn array_to_vector_text(a: &synsema_core::types::NdArray) -> String {
+    let a = a.to_f64();
     let parts: Vec<String> = a.iter().map(|f| f.to_string()).collect();
     format!("[{}]", parts.join(","))
 }
@@ -2462,6 +2468,17 @@ mod tests {
 
     /// v0.6.46 (backlog §10): el `ATTACH` a un archivo (y `VACUUM INTO`) que rechaza el authorizer
     /// salía como `not authorized`, sin decir por qué ni qué hacer.
+    #[test]
+    fn v0655_a_mask_is_not_a_db_parameter() {
+        let mut m = DatabaseManager::new();
+        m.open(":memory:", "memory").unwrap();
+        let mask = synsema_core::types::syn_mask(ndarray::ArrayD::from_shape_vec(ndarray::IxDyn(&[4]), vec![false, true, false, true]).unwrap());
+        for p in [mask.clone(), synsema_core::types::syn_list(vec![mask])] {
+            let e = m.query("SELECT ?", &[p]).unwrap_err();
+            assert_eq!(e, "sql: a mask (bool array) is not a vector — m * 1.0 gives 0/1 floats");
+        }
+    }
+
     #[test]
     fn a_refused_attach_says_why() {
         let mut m = DatabaseManager::new();

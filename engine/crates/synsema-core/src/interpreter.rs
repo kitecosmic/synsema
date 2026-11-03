@@ -9247,7 +9247,7 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
             }
             SynValue::Number(n) => Ok(SynValue::Number(n.clone())), // Int/Big ya son enteros
             // v0.6.29: sobre un array, elemento a elemento (sigue siendo un array de floats).
-            SynValue::Array(a) => Ok(crate::types::syn_array(a.mapv(op))),
+            SynValue::Array(a) => Ok(crate::types::syn_array(a.to_f64().mapv(op))),
             _ => Err(err(format!("{} expects a number, got {}", name, v.type_name()))),
         }
     }
@@ -10300,9 +10300,7 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                     return Err(err("Cannot slice a 0-dimensional array"));
                 }
                 let (s, e) = py_slice_range(a.shape()[0], start, end);
-                Ok(crate::types::syn_array(
-                    a.slice_axis(ndarray::Axis(0), ndarray::Slice::from(s..e)).to_owned(),
-                ))
+                Ok(crate::arrays::slice_rows(a, s, e))
             }
             _ => Err(err(format!("Cannot slice {}", coll.type_name()))),
         }
@@ -10677,24 +10675,50 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
         Ok((a2.clone(), a, b))
     }
 
+    /// `apply` sobre un array, fuera de línea (v0.6.55, perf-guard): con el `Cow` de `to_f64` adentro
+    /// de `b_apply`/`b_where`, el bucle de LISTAS de esos builtins pagaba 2 instrucciones más por
+    /// elemento (`s_each_list` +0,29 %). Sin `#[cold]` (donde-nace-cada-cosa §C: sólo con PGO).
+    #[inline(never)]
+    fn apply_array(&mut self, func: SynValue, a: &crate::types::NdArray, loc: &SourceLocation) -> Result<SynValue, Control> {
+        let a = a.to_f64();
+        let mut out = Vec::with_capacity(a.len());
+        for x in a.iter() {
+            match self.call_value(func.clone(), vec![syn_float(*x)], loc)? {
+                SynValue::Number(n) => out.push(n.to_f64()),
+                other => {
+                    return Err(err(format!(
+                        "apply over an array needs numbers back, got {} — use to_list(a) for other results",
+                        other.type_name()
+                    )))
+                }
+            }
+        }
+        Ok(crate::types::syn_array(
+            ndarray::ArrayD::from_shape_vec(a.raw_dim(), out).map_err(|e| err(e.to_string()))?,
+        ))
+    }
+
+    /// `where(a, pred)` sobre un array: los elementos que cumplen, como array 1-D. Fuera de línea,
+    /// como `apply_array`.
+    #[inline(never)]
+    fn where_array(&mut self, pred: SynValue, a: &crate::types::NdArray, loc: &SourceLocation) -> Result<SynValue, Control> {
+        let a = a.to_f64();
+        let mut out = Vec::new();
+        for x in a.iter() {
+            if self.call_value(pred.clone(), vec![syn_float(*x)], loc)?.is_truthy() {
+                out.push(*x);
+            }
+        }
+        let n = out.len();
+        Ok(crate::types::syn_array(
+            ndarray::ArrayD::from_shape_vec(ndarray::IxDyn(&[n]), out).map_err(|e| err(e.to_string()))?,
+        ))
+    }
+
     fn b_apply(&mut self, args: &[SynValue], loc: &SourceLocation) -> Result<SynValue, Control> {
         // v0.6.29 (DATOS-11): sobre un array, elemento a elemento → array de la misma forma.
         if let Some((func, a)) = fn_and_array(args) {
-            let mut out = Vec::with_capacity(a.len());
-            for x in a.iter() {
-                match self.call_value(func.clone(), vec![syn_float(*x)], loc)? {
-                    SynValue::Number(n) => out.push(n.to_f64()),
-                    other => {
-                        return Err(err(format!(
-                            "apply over an array needs numbers back, got {} — use to_list(a) for other results",
-                            other.type_name()
-                        )))
-                    }
-                }
-            }
-            return Ok(crate::types::syn_array(
-                ndarray::ArrayD::from_shape_vec(a.raw_dim(), out).map_err(|e| err(e.to_string()))?,
-            ));
+            return self.apply_array(func, &a, loc);
         }
         let (func, l) = self.dual_fn_rc(args, "apply")?;
         let n = l.borrow().len();
@@ -10918,16 +10942,7 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
     fn b_where(&mut self, args: &[SynValue], loc: &SourceLocation) -> Result<SynValue, Control> {
         // v0.6.29 (DATOS-11): la máscara con nombre — los elementos que cumplen, como array 1-D.
         if let Some((pred, a)) = fn_and_array(args) {
-            let mut out = Vec::new();
-            for x in a.iter() {
-                if self.call_value(pred.clone(), vec![syn_float(*x)], loc)?.is_truthy() {
-                    out.push(*x);
-                }
-            }
-            let n = out.len();
-            return Ok(crate::types::syn_array(
-                ndarray::ArrayD::from_shape_vec(ndarray::IxDyn(&[n]), out).map_err(|e| err(e.to_string()))?,
-            ));
+            return self.where_array(pred, &a, loc);
         }
         let (pred, l) = self.dual_fn_rc(args, "where")?;
         self.with_lambda(&pred, |it, lc| {
@@ -11694,7 +11709,7 @@ fn principals_arg(
 /// ¿El valor es invocable? (task de usuario, lambda o builtin). La base de la regla
 /// de detección del dual-order (batch DX) y del 2º arg de `index_of`.
 /// `(función, array)` en cualquier orden, si la llamada es sobre un array.
-fn fn_and_array(args: &[SynValue]) -> Option<(SynValue, crate::types::Obj<ndarray::ArrayD<f64>>)> {
+fn fn_and_array(args: &[SynValue]) -> Option<(SynValue, crate::types::Obj<crate::types::NdArray>)> {
     match (args.first(), args.get(1)) {
         (Some(SynValue::Array(a)), Some(f)) if is_callable(f) => Some((f.clone(), a.clone())),
         (Some(f), Some(SynValue::Array(a))) if is_callable(f) => Some((f.clone(), a.clone())),

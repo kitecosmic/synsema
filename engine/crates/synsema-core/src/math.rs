@@ -70,7 +70,7 @@ fn unary_float(args: &[SynValue], name: &str, f: impl Fn(f64) -> f64) -> Result<
     arity(args, 1, name)?;
     // v0.6.29 (DATOS-10/11): sobre un array, elemento a elemento.
     if let SynValue::Array(a) = arg(args, 0)? {
-        return Ok(crate::types::syn_array(a.mapv(f)));
+        return Ok(crate::types::syn_array(a.to_f64().mapv(f)));
     }
     Ok(syn_float(f(num(args, 0, name)?.to_f64())))
 }
@@ -102,7 +102,7 @@ fn unary_poly(
     arity(args, 1, name)?;
     match arg(args, 0)? {
         SynValue::Number(n) => Ok(syn_float(real(n.to_f64()))),
-        SynValue::Array(a) => Ok(crate::types::syn_array(a.mapv(real))),
+        SynValue::Array(a) => Ok(crate::types::syn_array(a.to_f64().mapv(real))),
         SynValue::Complex(z) => Ok(SynValue::Complex(cplx(*z))),
         other => Err(err(format!("{} expects a number, got {}", name, other.type_name()))),
     }
@@ -155,7 +155,7 @@ pub fn abs(args: &[SynValue]) -> Result<SynValue, Control> {
         return Ok(syn_float(z.norm()));
     }
     if let SynValue::Array(a) = arg(args, 0)? {
-        return Ok(crate::types::syn_array(a.mapv(f64::abs)));
+        return Ok(crate::types::syn_array(a.to_f64().mapv(f64::abs)));
     }
     let n = num(args, 0, "abs")?;
     Ok(syn_number(match n {
@@ -571,7 +571,7 @@ fn data_f64(args: &[SynValue], name: &str) -> Result<Vec<f64>, Control> {
             }
             out
         }
-        SynValue::Array(a) => a.iter().copied().collect(),
+        SynValue::Array(a) => a.to_f64().iter().copied().collect(),
         other => {
             return Err(err(format!(
                 "{} expects a list of numbers or an array, got {}",

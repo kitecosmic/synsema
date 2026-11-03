@@ -1,6 +1,6 @@
 //! Arrays numéricos n-dimensionales + álgebra lineal (Batch 5).
 //!
-//! Tipo `SynValue::Array(Obj<ArrayD<f64>>)` (dtype f64, inmutable). `ndarray` da el modelo
+//! Tipo `SynValue::Array(Obj<NdArray>)` (dtype `f64` o `bool`, inmutable; ver `types::NdArray`). `ndarray` da el modelo
 //! n-dimensional + vectorización/broadcasting/reducciones; `faer` (puro-Rust, SIMD) el
 //! álgebra lineal densa 2D (matmul/solve/det/inv/eig/svd). **`*` es ELEMENTWISE**; el
 //! producto matricial es `matmul`/`dot`.
@@ -20,8 +20,9 @@ use faer::{Accum, Mat, Par};
 use crate::interpreter::{Control, RuntimeError};
 use crate::number::Number;
 use crate::types::{
-    syn_array, syn_bool, syn_complex, syn_float, syn_int, syn_list, syn_map, syn_number, SynValue,
+    syn_array, syn_bool, syn_complex, syn_float, syn_int, syn_list, syn_map, syn_number, NdArray, SynValue,
 };
+use std::borrow::Cow;
 
 // =========================================================
 // Helpers básicos
@@ -50,12 +51,28 @@ fn num_f64(args: &[SynValue], i: usize, name: &str) -> Result<f64, Control> {
     }
 }
 
-/// El i-ésimo argumento como `array`; error si no lo es.
-fn array_arg<'a>(args: &'a [SynValue], i: usize, name: &str) -> Result<&'a ArrayD<f64>, Control> {
+/// El i-ésimo argumento como `array`, con su tipo de elemento; error si no lo es.
+fn nd_arg<'a>(args: &'a [SynValue], i: usize, name: &str) -> Result<&'a NdArray, Control> {
     match arg(args, i)? {
         SynValue::Array(a) => Ok(a),
         other => Err(err(format!("{} expects an array, got {}", name, other.type_name()))),
     }
+}
+
+/// El i-ésimo argumento como números `f64`: prestado si el array es `f64`, convertido a 0/1 si
+/// es una máscara (R2). Es el único punto de conversión de las operaciones que no miran el tipo.
+fn array_arg<'a>(args: &'a [SynValue], i: usize, name: &str) -> Result<Cow<'a, ArrayD<f64>>, Control> {
+    nd_arg(args, i, name).map(NdArray::to_f64)
+}
+
+/// Aplica una transformación que no depende del tipo de elemento (forma, orden) a cada variante.
+macro_rules! nd_map {
+    ($a:expr, |$x:ident| $body:expr) => {
+        match $a {
+            NdArray::F64($x) => NdArray::F64($body),
+            NdArray::Bool($x) => NdArray::Bool($body),
+        }
+    };
 }
 
 /// `shape` desde un arg: un entero `n` → `[n]` (1D); una lista de enteros `[2,3]` → nD.
@@ -244,18 +261,18 @@ pub fn eye(args: &[SynValue]) -> Result<SynValue, Control> {
 
 pub fn shape(args: &[SynValue]) -> Result<SynValue, Control> {
     arity(args, 1, "shape")?;
-    let a = array_arg(args, 0, "shape")?;
+    let a = nd_arg(args, 0, "shape")?;
     Ok(syn_list(a.shape().iter().map(|&d| syn_int(d as i64)).collect()))
 }
 
 pub fn ndim(args: &[SynValue]) -> Result<SynValue, Control> {
     arity(args, 1, "ndim")?;
-    Ok(syn_int(array_arg(args, 0, "ndim")?.ndim() as i64))
+    Ok(syn_int(nd_arg(args, 0, "ndim")?.ndim() as i64))
 }
 
 pub fn size(args: &[SynValue]) -> Result<SynValue, Control> {
     arity(args, 1, "size")?;
-    Ok(syn_int(array_arg(args, 0, "size")?.len() as i64))
+    Ok(syn_int(nd_arg(args, 0, "size")?.len() as i64))
 }
 
 pub fn is_array(args: &[SynValue]) -> Result<SynValue, Control> {
@@ -263,23 +280,31 @@ pub fn is_array(args: &[SynValue]) -> Result<SynValue, Control> {
     Ok(syn_bool(matches!(arg(args, 0)?, SynValue::Array(_))))
 }
 
-/// `array` → lista anidada Synsema (vuelve a valores `number`).
-fn view_to_value(a: &ndarray::ArrayViewD<f64>) -> SynValue {
+/// `array` → lista anidada Synsema (vuelve a valores `number`, o `bool` si es una máscara).
+fn view_to_value<T: Copy>(a: &ndarray::ArrayViewD<T>, elem: fn(T) -> SynValue) -> SynValue {
     if a.ndim() == 0 {
-        syn_float(*a.first().unwrap())
+        elem(*a.first().unwrap())
     } else {
-        syn_list(a.outer_iter().map(|s| view_to_value(&s)).collect())
+        syn_list(a.outer_iter().map(|s| view_to_value(&s, elem)).collect())
+    }
+}
+
+/// Un elemento suelto del array como valor del lenguaje: número o `bool`.
+pub fn nd_to_list(a: &NdArray) -> SynValue {
+    match a {
+        NdArray::F64(x) => view_to_value(&x.view(), syn_float),
+        NdArray::Bool(x) => view_to_value(&x.view(), syn_bool),
     }
 }
 
 pub fn to_list(args: &[SynValue]) -> Result<SynValue, Control> {
     arity(args, 1, "to_list")?;
-    Ok(view_to_value(&array_arg(args, 0, "to_list")?.view()))
+    Ok(nd_to_list(nd_arg(args, 0, "to_list")?))
 }
 
 pub fn reshape(args: &[SynValue]) -> Result<SynValue, Control> {
     arity(args, 2, "reshape")?;
-    let a = array_arg(args, 0, "reshape")?;
+    let a = nd_arg(args, 0, "reshape")?;
     let shape = shape_from(arg(args, 1)?, "reshape")?;
     let total: usize = shape.iter().product();
     if total != a.len() {
@@ -290,30 +315,38 @@ pub fn reshape(args: &[SynValue]) -> Result<SynValue, Control> {
         )));
     }
     // row-major (C order), consistente con `flatten` y `array`.
-    let flat: Vec<f64> = a.iter().copied().collect();
-    Ok(syn_array(ArrayD::from_shape_vec(IxDyn(&shape), flat).unwrap()))
+    Ok(nd_value_of(nd_map!(a, |x| ArrayD::from_shape_vec(IxDyn(&shape), x.iter().copied().collect()).unwrap())))
+}
+
+/// `slice(a, i, j)`: las filas `s..e` del primer eje (ya normalizadas), con el mismo tipo.
+pub fn slice_rows(a: &NdArray, s: usize, e: usize) -> SynValue {
+    nd_value_of(nd_map!(a, |x| x.slice_axis(Axis(0), ndarray::Slice::from(s..e)).to_owned()))
+}
+
+/// Envuelve un `NdArray` como valor `array`.
+fn nd_value_of(a: NdArray) -> SynValue {
+    SynValue::Array(crate::types::Obj::new(a))
 }
 
 pub fn transpose(args: &[SynValue]) -> Result<SynValue, Control> {
     arity(args, 1, "transpose")?;
-    let a = array_arg(args, 0, "transpose")?;
+    let a = nd_arg(args, 0, "transpose")?;
     // reverso de ejes (2D = la transpuesta usual). `.t()` invierte los ejes.
-    Ok(syn_array(a.t().to_owned()))
+    Ok(nd_value_of(nd_map!(a, |x| x.t().to_owned())))
 }
 
 pub fn flatten(args: &[SynValue]) -> Result<SynValue, Control> {
     arity(args, 1, "flatten")?;
-    let a = array_arg(args, 0, "flatten")?;
-    let flat: Vec<f64> = a.iter().copied().collect();
-    let n = flat.len();
-    Ok(syn_array(ArrayD::from_shape_vec(IxDyn(&[n]), flat).unwrap()))
+    let a = nd_arg(args, 0, "flatten")?;
+    let n = a.len();
+    Ok(nd_value_of(nd_map!(a, |x| ArrayD::from_shape_vec(IxDyn(&[n]), x.iter().copied().collect()).unwrap())))
 }
 
 /// `at(a, [i, j, …])` → el escalar en el multi-índice. Nº de índices ≠ ndim → error; fuera
 /// de rango → error.
 pub fn at(args: &[SynValue]) -> Result<SynValue, Control> {
     arity(args, 2, "at")?;
-    let a = array_arg(args, 0, "at")?;
+    let a = nd_arg(args, 0, "at")?;
     let idx_list = match arg(args, 1)? {
         SynValue::List(l) => l.borrow().to_vec(),
         other => return Err(err(format!("at expects a list of indices, got {}", other.type_name()))),
@@ -338,7 +371,10 @@ pub fn at(args: &[SynValue]) -> Result<SynValue, Control> {
         }
         idx.push(i as usize);
     }
-    Ok(syn_float(a[IxDyn(&idx)]))
+    Ok(match a {
+        NdArray::F64(x) => syn_float(x[IxDyn(&idx)]),
+        NdArray::Bool(x) => syn_bool(x[IxDyn(&idx)]),
+    })
 }
 
 // =========================================================
@@ -347,7 +383,7 @@ pub fn at(args: &[SynValue]) -> Result<SynValue, Control> {
 
 /// `a[i]`: 1D → escalar (Number); nD → la fila `i` (sub-array de un eje menos). Índice
 /// negativo o fuera de rango → error.
-pub fn index_row(a: &ArrayD<f64>, i: i64) -> Result<SynValue, Control> {
+pub fn index_row(a: &NdArray, i: i64) -> Result<SynValue, Control> {
     if a.ndim() == 0 {
         return Err(err("cannot index a 0-dimensional array"));
     }
@@ -357,12 +393,14 @@ pub fn index_row(a: &ArrayD<f64>, i: i64) -> Result<SynValue, Control> {
     if j < 0 || j >= len0 {
         return Err(err(format!("Index {} out of bounds (array axis 0 has length {})", i, len0)));
     }
-    let sub = a.index_axis(Axis(0), j as usize);
-    if sub.ndim() == 0 {
-        Ok(syn_float(*sub.first().unwrap()))
-    } else {
-        Ok(syn_array(sub.to_owned()))
+    let j = j as usize;
+    if a.ndim() == 1 {
+        return Ok(match a {
+            NdArray::F64(x) => syn_float(x[[j]]),
+            NdArray::Bool(x) => syn_bool(x[[j]]),
+        });
     }
+    Ok(nd_value_of(nd_map!(a, |x| x.index_axis(Axis(0), j).to_owned())))
 }
 
 // =========================================================
@@ -418,6 +456,7 @@ pub fn array_binop(left: &SynValue, right: &SynValue, op: &str) -> Option<Result
     }
     let res = match (left, right) {
         (SynValue::Array(a), SynValue::Array(b)) => {
+            let (a, b) = (a.to_f64(), b.to_f64());
             match broadcast_shape(a.shape(), b.shape()) {
                 None => Err(err(format!(
                     "arrays of shape {:?} and {:?} are not broadcastable",
@@ -444,11 +483,11 @@ pub fn array_binop(left: &SynValue, right: &SynValue, op: &str) -> Option<Result
         }
         (SynValue::Array(a), SynValue::Number(n)) => {
             let s = n.to_f64();
-            Ok(syn_array(a.mapv(|x| scalar_op(x, s, op))))
+            Ok(syn_array(a.to_f64().mapv(|x| scalar_op(x, s, op))))
         }
         (SynValue::Number(n), SynValue::Array(b)) => {
             let s = n.to_f64();
-            Ok(syn_array(b.mapv(|x| scalar_op(s, x, op))))
+            Ok(syn_array(b.to_f64().mapv(|x| scalar_op(s, x, op))))
         }
         _ => {
             let other = if la { right } else { left };
@@ -459,8 +498,8 @@ pub fn array_binop(left: &SynValue, right: &SynValue, op: &str) -> Option<Result
 }
 
 /// Unario `-` sobre un array (elementwise).
-pub fn negate(a: &ArrayD<f64>) -> SynValue {
-    syn_array(a.mapv(|x| -x))
+pub fn negate(a: &NdArray) -> SynValue {
+    syn_array(a.to_f64().mapv(|x| -x))
 }
 
 // =========================================================
@@ -504,9 +543,9 @@ pub fn reduce(args: &[SynValue], kind: &str) -> Result<SynValue, Control> {
         ("product", Some(k)) => a.map_axis(Axis(k), |v| v.iter().product()),
         ("mean", None) => return Ok(syn_float(a.mean().unwrap())),
         ("mean", Some(k)) => a.mean_axis(Axis(k)).unwrap(),
-        ("min", None) => return Ok(syn_float(min_all(a))),
+        ("min", None) => return Ok(syn_float(min_all(&a))),
         ("min", Some(k)) => a.map_axis(Axis(k), |v| v.iter().copied().fold(f64::INFINITY, f64::min)),
-        ("max", None) => return Ok(syn_float(max_all(a))),
+        ("max", None) => return Ok(syn_float(max_all(&a))),
         ("max", Some(k)) => a.map_axis(Axis(k), |v| v.iter().copied().fold(f64::NEG_INFINITY, f64::max)),
         ("var", None) => return Ok(syn_float(variance(a.iter().copied()))),
         ("var", Some(k)) => a.map_axis(Axis(k), |v| variance(v.iter().copied())),
@@ -592,8 +631,8 @@ pub fn matmul(args: &[SynValue]) -> Result<SynValue, Control> {
     arity(args, 2, "matmul")?;
     let a = array_arg(args, 0, "matmul")?;
     let b = array_arg(args, 1, "matmul")?;
-    let fa = nd_to_faer(a, "matmul")?;
-    let fb = nd_to_faer(b, "matmul")?;
+    let fa = nd_to_faer(&a, "matmul")?;
+    let fb = nd_to_faer(&b, "matmul")?;
     if fa.ncols() != fb.nrows() {
         return Err(err(format!(
             "matmul: incompatible shapes {:?} and {:?} (cols of A must equal rows of B)",
@@ -633,7 +672,7 @@ pub fn dot(args: &[SynValue]) -> Result<SynValue, Control> {
 pub fn solve(args: &[SynValue]) -> Result<SynValue, Control> {
     arity(args, 2, "solve")?;
     let a = array_arg(args, 0, "solve")?;
-    let fa = nd_to_faer(a, "solve")?;
+    let fa = nd_to_faer(&a, "solve")?;
     if fa.nrows() != fa.ncols() {
         return Err(err("solve: A must be a square matrix"));
     }
@@ -672,7 +711,7 @@ pub fn solve(args: &[SynValue]) -> Result<SynValue, Control> {
 pub fn det(args: &[SynValue]) -> Result<SynValue, Control> {
     arity(args, 1, "det")?;
     let a = array_arg(args, 0, "det")?;
-    let fa = nd_to_faer(a, "det")?;
+    let fa = nd_to_faer(&a, "det")?;
     if fa.nrows() != fa.ncols() {
         return Err(err("det: matrix must be square"));
     }
@@ -683,7 +722,7 @@ pub fn det(args: &[SynValue]) -> Result<SynValue, Control> {
 pub fn inv(args: &[SynValue]) -> Result<SynValue, Control> {
     arity(args, 1, "inv")?;
     let a = array_arg(args, 0, "inv")?;
-    let fa = nd_to_faer(a, "inv")?;
+    let fa = nd_to_faer(&a, "inv")?;
     if fa.nrows() != fa.ncols() {
         return Err(err("inv: matrix must be square"));
     }
@@ -739,7 +778,7 @@ pub fn trace(args: &[SynValue]) -> Result<SynValue, Control> {
 pub fn eig(args: &[SynValue]) -> Result<SynValue, Control> {
     arity(args, 1, "eig")?;
     let a = array_arg(args, 0, "eig")?;
-    let fa = nd_to_faer(a, "eig")?;
+    let fa = nd_to_faer(&a, "eig")?;
     if fa.nrows() != fa.ncols() {
         return Err(err("eig: matrix must be square"));
     }
@@ -778,7 +817,7 @@ pub fn eig(args: &[SynValue]) -> Result<SynValue, Control> {
 pub fn svd(args: &[SynValue]) -> Result<SynValue, Control> {
     arity(args, 1, "svd")?;
     let a = array_arg(args, 0, "svd")?;
-    let fa = nd_to_faer(a, "svd")?;
+    let fa = nd_to_faer(&a, "svd")?;
     let decomp = fa.as_ref().svd().map_err(|_| err("svd: decomposition failed"))?;
     let u = faer_to_nd(&decomp.U().to_owned());
     // V → Vt (transpuesta; para real V^H = V^T).
@@ -827,7 +866,7 @@ fn vector_with_gaps(v: &SynValue, name: &str) -> Result<Vec<f64>, Control> {
             if a.ndim() != 1 {
                 return Err(err(format!("{}: expected a 1-D array or a list, got a {}-D array", name, a.ndim())));
             }
-            Ok(a.iter().copied().collect())
+            Ok(a.to_f64().iter().copied().collect())
         }
         SynValue::List(l) => list_values(&l)
             .iter()
@@ -871,7 +910,7 @@ pub fn concat_or_stack(args: &[SynValue], axis: Option<SynValue>, stack: bool) -
     let mut arrs: Vec<ArrayD<f64>> = Vec::with_capacity(items.len());
     for (i, it) in items.iter().enumerate() {
         match it {
-            SynValue::Array(a) => arrs.push((**a).clone()),
+            SynValue::Array(a) => arrs.push(a.to_f64().into_owned()),
             other => return Err(err(format!("{}: item {} is {}, not an array", name, i, other.type_name()))),
         }
     }
@@ -904,6 +943,7 @@ pub fn arg_extreme(args: &[SynValue], axis: Option<SynValue>, max: bool) -> Resu
     };
     match (arg(args, 0)?, axis) {
         (SynValue::Array(a), Some(k)) if !matches!(k, SynValue::Nothing) => {
+            let a = a.to_f64();
             let ax = axis_norm(int_value(&k, "axis", name)?, a.ndim(), name)?;
             let out = a.map_axis(Axis(ax), |l| lane(&l.iter().copied().collect::<Vec<_>>()));
             Ok(nd_result(out))
@@ -935,7 +975,7 @@ pub fn arg_extreme(args: &[SynValue], axis: Option<SynValue>, max: bool) -> Resu
         }
         (v, _) => {
             let data = match v {
-                SynValue::Array(a) => a.iter().copied().collect(),
+                SynValue::Array(a) => a.to_f64().iter().copied().collect(),
                 other => vector(other, name)?,
             };
             if data.is_empty() {
@@ -965,8 +1005,8 @@ pub fn cumsum(args: &[SynValue], axis: Option<SynValue>) -> Result<SynValue, Con
             }
             Ok(crate::types::syn_list(out))
         }
-        SynValue::Array(a) => match axis {
-            None | Some(SynValue::Nothing) => {
+        SynValue::Array(a) => match (a.to_f64(), axis) {
+            (a, None | Some(SynValue::Nothing)) => {
                 let mut acc = 0.0;
                 let flat: Vec<f64> = a.iter().map(|x| {
                     acc += x;
@@ -974,9 +1014,9 @@ pub fn cumsum(args: &[SynValue], axis: Option<SynValue>) -> Result<SynValue, Con
                 }).collect();
                 Ok(syn_array(ArrayD::from_shape_vec(IxDyn(&[flat.len()]), flat).unwrap()))
             }
-            Some(k) => {
+            (a, Some(k)) => {
                 let ax = axis_norm(int_value(&k, "axis", "cumsum")?, a.ndim(), "cumsum")?;
-                let mut out = (**a).clone();
+                let mut out = a.into_owned();
                 out.accumulate_axis_inplace(Axis(ax), |&prev, cur| *cur += prev);
                 Ok(syn_array(out))
             }
@@ -1002,6 +1042,7 @@ pub fn diff(args: &[SynValue], axis: Option<SynValue>) -> Result<SynValue, Contr
             Ok(crate::types::syn_list(out))
         }
         SynValue::Array(a) => {
+            let a = a.to_f64();
             let k = match axis {
                 None | Some(SynValue::Nothing) => -1,
                 Some(v) => int_value(&v, "axis", "diff")?,
@@ -1009,7 +1050,7 @@ pub fn diff(args: &[SynValue], axis: Option<SynValue>) -> Result<SynValue, Contr
             let ax = Axis(axis_norm(k, a.ndim(), "diff")?);
             let n = a.len_of(ax);
             if n == 0 {
-                return Ok(syn_array((**a).clone()));
+                return Ok(syn_array(a.into_owned()));
             }
             let hi = a.slice_axis(ax, ndarray::Slice::from(1..));
             let lo = a.slice_axis(ax, ndarray::Slice::from(..n - 1));
@@ -1110,10 +1151,13 @@ fn least_squares(a: &Mat<f64>, b: &Mat<f64>, name: &str) -> Result<(Mat<f64>, us
 /// `lstsq(A, b)`: la solución de mínimos cuadrados (1-D si `b` es 1-D).
 pub fn lstsq(args: &[SynValue]) -> Result<SynValue, Control> {
     let a = array_arg(args, 0, "lstsq")?;
-    let fa = nd_to_faer(a, "lstsq")?;
+    let fa = nd_to_faer(&a, "lstsq")?;
     let (fb, one_d) = match arg(args, 1)? {
-        SynValue::Array(b) if b.ndim() == 1 => (Mat::from_fn(b.len(), 1, |i, _| b[[i]]), true),
-        SynValue::Array(b) => (nd_to_faer(b, "lstsq")?, false),
+        SynValue::Array(b) if b.ndim() == 1 => {
+            let b = b.to_f64();
+            (Mat::from_fn(b.len(), 1, |i, _| b[[i]]), true)
+        }
+        SynValue::Array(b) => (nd_to_faer(&b.to_f64(), "lstsq")?, false),
         other => {
             let v = vector(other, "lstsq")?;
             (Mat::from_fn(v.len(), 1, |i, _| v[i]), true)
@@ -1177,7 +1221,7 @@ pub fn polyval(args: &[SynValue]) -> Result<SynValue, Control> {
     let eval = |x: f64| coefs.iter().fold(0.0, |acc, c| acc * x + c);
     match arg(args, 1)? {
         SynValue::Number(n) => Ok(syn_float(eval(n.to_f64()))),
-        SynValue::Array(a) => Ok(syn_array(a.mapv(eval))),
+        SynValue::Array(a) => Ok(syn_array(a.to_f64().mapv(eval))),
         SynValue::Nothing => Ok(SynValue::Nothing),
         other => {
             let xs = vector_with_gaps(other, "polyval")?;

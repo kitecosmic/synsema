@@ -33,4 +33,5 @@ mod v0642_conformance;
 mod v0646_tanda_c;
 mod v0646_f1;
 mod v0650_modules;
+mod v0655_arrays;
 mod vm;

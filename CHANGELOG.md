@@ -6,6 +6,17 @@ Each says what changed, why, and what to write instead.
 
 Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the release date.
 
+## v0.6.55 — unreleased
+
+**Engine.**
+- **An array carries its element type.** Inside the engine an `array` is now `f64` or `bool` (the
+  mask that comparisons will return), behind the same pointer, so a value is still 24 bytes. No
+  program changes yet: every array a program can build is still `f64`. A mask prints as
+  `[false, true]`, `to_list` gives booleans, `json` gives `true`/`false`, it keeps its type across
+  `parallel_map` and the snapshots of `serve`, and the charts and database parameters reject it
+  (`chart_svg: a mask (bool array) is not a series — m * 1.0 gives 0/1 floats`; for a parameter,
+  `sql: a mask (bool array) is not a vector — …`).
+
 ## v0.6.54 — 2026-11-02
 
 **Behavior changes (read these first).**
