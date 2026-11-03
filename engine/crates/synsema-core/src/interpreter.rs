@@ -1251,14 +1251,41 @@ pub(crate) fn array_ptr_of(v: &SynValue) -> Option<usize> {
 }
 
 /// La raíz de un `set` en el árbol (M21 de la ronda 4): el array de `v` y si su envoltorio `Private`
-/// tiene otro dueño además de la variable y de esta copia (`v`, la que dio `env_get`).
-fn array_root_of(v: &SynValue) -> Option<(usize, bool)> {
+/// tiene otro dueño además de la variable y de esta copia (`v`, la que dio `env_get`). La entrada del
+/// mapa de exportaciones de un módulo es la otra vista del mismo nombre, no un alias (N7 de la ronda 5):
+/// `exported` dice si la variable es una exportación que tiene ese mismo envoltorio, y sólo se pregunta
+/// cuando la cuenta pasa de 2.
+fn array_root_of(v: &SynValue, exported: impl FnOnce() -> bool) -> Option<(usize, bool)> {
     let p = array_ptr_of(v)?;
     let shared = match v {
-        SynValue::Private(w) => crate::types::Obj::strong_count(w) > 2,
+        SynValue::Private(w) => match crate::types::Obj::strong_count(w) {
+            n if n <= 2 => false,
+            3 => !exported(),
+            _ => true,
+        },
         _ => false,
     };
     Some((p, shared))
+}
+
+/// ¿El binding `name` (el del scope más cercano que lo tiene) es una exportación de su módulo y el mapa
+/// de exportaciones tiene ese mismo contenedor `v`? (N7 de la ronda 5.)
+#[cold]
+fn module_view_holds(env: &Rc<RefCell<Environment>>, name: &str, v: &SynValue) -> bool {
+    let mut cur = env.clone();
+    loop {
+        let (here, module, next) = {
+            let e = cur.borrow();
+            (e.bindings.contains_key(name), e.name.starts_with("module:"), e.parent.clone())
+        };
+        if here {
+            return module && module_map_of_env(&cur).is_some_and(|m| m.borrow().get(name).is_some_and(|x| same_container(&x, v)));
+        }
+        match next {
+            Some(p) => cur = p,
+            None => return false,
+        }
+    }
 }
 
 /// Si `parent` es el mapa de un módulo y `name` una de sus exportaciones: acceso único a la
@@ -2851,6 +2878,10 @@ impl Interpreter {
     /// v0.6.47 (T1, A1): el agente adopta el corte de la corrida que lo lanzó.
     pub fn set_run_cut(&mut self, cut: std::sync::Arc<RunCut>) {
         self.run_cut = cut;
+        // v0.6.55 (M27 de la ronda 5): una corrida nueva en este hilo (cada entrada de un worker de
+        // `serve`, del handler del guest, de un agente) no hereda las entradas muertas de un `set` que
+        // falló en la anterior: cada una retenía una copia entera del array. Las vivas no se tocan.
+        crate::arrays::drop_dead_places();
     }
 
     /// v0.6.47 (T1, A1): `Some` si un agente de la corrida se cortó por etiquetas. El error ya sale
@@ -5823,6 +5854,11 @@ impl Interpreter {
                 // No puede llegarle al siguiente (ni al setup).
                 let saved_taint = self.take_taint();
                 let result = self.exec_block(body, &test_env);
+                // v0.6.55 (M25 de la ronda 5): el runner atrapa el error del bloque y sigue con el
+                // próximo: un `set` que falló a mitad de camino no le deja una copia del array retenida.
+                if result.is_err() {
+                    crate::arrays::drop_dead_places();
+                }
                 // Ronda 1 (M3): un bloque que llamó `exit` le pide al host que detenga sus agentes.
                 let exited = matches!(&result, Err(Control::Error(e)) if e.exit_code.is_some());
                 let mut outcome = match result {
@@ -8425,7 +8461,11 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                 } else {
                     value
                 };
-                let root_now = || set_root_identifier(target).and_then(|n| env_get(env, n)).and_then(|v| array_root_of(&v));
+                let root_now = || {
+                    let n = set_root_identifier(target)?;
+                    let v = env_get(env, n)?;
+                    array_root_of(&v, || module_view_holds(env, n, &v))
+                };
                 // `seen` ya tiene todo lo privado que la sentencia desenvolvió (el camino, el índice, el
                 // valor: B4). Ni el valor ni el PC hace falta mirarlos aparte (M23 de la ronda 4): el valor
                 // de un array ya llega sin etiqueta (anotada en `array_set_value`), y bajo un PC privado un

@@ -1386,3 +1386,90 @@ fn write_diagnostics_name_the_reason_and_only_the_file() {
     let (_, _, detail) = labelled_run(leak, "C:/tmp/una/carpeta/prog.syn");
     assert_eq!(detail, format!("prog.syn:7:6: {}", &REBOUND_A[5..]));
 }
+
+// =========================================================
+// Auditoría v0.6.55, ronda 5
+// =========================================================
+
+/// N7: con `--labels`, un módulo escribe su propio array privado exportado (el mapa de exportaciones
+/// comparte el envoltorio: es la otra vista del nombre, no un alias), directo y con un índice que corre
+/// código; un alias tomado en el índice dentro del módulo sigue siendo `in_use`.
+#[test]
+fn with_labels_a_module_writes_its_private_exported_array() {
+    use synsema_core::interpreter::Interpreter;
+    let lib = "export let S be private(zeros(3), \"x\")\nlet keep be nothing\n\
+        export task bump()\n    set S[0] to 1\n    set S[abs(1)] to 2\n    give declassify(S, \"x\")\n\
+        task grab()\n    set keep to S\n    give 2\n\
+        export task aliased()\n    set S[grab()] to 3\n    give 0\n";
+    let d = module_dir("private-export", lib);
+    let main = d.join("main.syn").to_string_lossy().to_string();
+    let run = |src: &str| {
+        let program = synsema_core::parser::parse_source(src, &main).unwrap();
+        let mut interp = Interpreter::new();
+        interp.set_labels(true);
+        let r = interp.execute(&program);
+        let out = interp.output.join("\n");
+        match r {
+            Ok(_) => out,
+            Err(Control::Error(e)) => format!("ERR: {}", e.operator_detail.clone().unwrap_or_else(|| e.message.clone())),
+            Err(_) => "otro control".to_string(),
+        }
+    };
+    assert_eq!(run("use \"./lib.syn\" as m\nprint(m.bump())\nprint(m.bump())"), "[1, 2, 0]\n[1, 2, 0]");
+    let got = run("use \"./lib.syn\" as m\nprint(m.aliased())");
+    assert!(got.contains("set: the array is in use elsewhere in this statement"), "{}", got);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// M25: el runner de `synsema test` atrapa el error de cada bloque y sigue: los `set` que fallaron a
+/// mitad de camino no le dejan al próximo una copia del array retenida.
+#[test]
+fn the_test_runner_does_not_keep_copies_of_failed_sets() {
+    use synsema_core::interpreter::{env_get, Interpreter};
+    // El bloque que escribe va primero y los que fallan al final: el último deja (sin la limpieza) una
+    // entrada muerta sobre el `A` de ese momento, y el `set` de abajo lo copiaría.
+    let mut src = String::from("let A be zeros([2, 3])\ntest \"escribe\"\n    set A[0][1] to 5\n    assert(A[0][1] == 5)\n");
+    for k in 0..70 {
+        src.push_str(&format!("test \"falla {}\"\n    set A[0][nope] to 1\n", k));
+    }
+    for labels in [false, true] {
+        let program = synsema_core::parser::parse_source(&src, "<v0655>").unwrap();
+        let mut interp = Interpreter::new();
+        interp.set_labels(labels);
+        let outcomes = interp.run_test_blocks(&program);
+        assert_eq!(outcomes.iter().filter(|o| !o.passed).count(), 70, "labels = {}", labels);
+        assert!(outcomes[0].passed, "labels = {}: {:?}", labels, outcomes[0].message);
+        // Lo que dejó el runner: ninguna entrada muerta retiene `A` (si no, el `set` de abajo lo copia).
+        let ptr = |interp: &Interpreter| match env_get(&interp.global_env, "A") {
+            Some(SynValue::Array(o)) => synsema_core::types::Obj::as_ptr(&o) as usize,
+            other => panic!("{:?}", other.map(|v| v.type_name())),
+        };
+        let before = ptr(&interp);
+        let program = synsema_core::parser::parse_source("set A[1][1] to 6", "<v0655>").unwrap();
+        assert!(interp.execute(&program).is_ok());
+        assert_eq!(ptr(&interp), before, "labels = {}", labels);
+    }
+}
+
+/// M27: una corrida nueva en el hilo (`set_run_cut`: cada entrada de un worker de `serve`, del handler
+/// del guest, de un agente) no hereda las entradas muertas de un `set` que falló en la anterior.
+#[test]
+fn a_new_run_on_the_thread_drops_the_dead_entries() {
+    use synsema_core::interpreter::{env_get, Interpreter, RunCut};
+    let ptr = |interp: &Interpreter| match env_get(&interp.global_env, "A") {
+        Some(SynValue::Array(o)) => synsema_core::types::Obj::as_ptr(&o) as usize,
+        other => panic!("{:?}", other.map(|v| v.type_name())),
+    };
+    let mut interp = Interpreter::new();
+    let exec = |interp: &mut Interpreter, src: &str| {
+        let program = synsema_core::parser::parse_source(src, "<v0655>").unwrap();
+        interp.execute(&program).is_ok()
+    };
+    assert!(exec(&mut interp, "let A be zeros([2, 3])"));
+    let before = ptr(&interp);
+    // La entrada falla sin `try`: nadie limpia en el camino del error.
+    assert!(!exec(&mut interp, "set A[0][nope] to 1"));
+    interp.set_run_cut(std::sync::Arc::new(RunCut::default()));
+    assert!(exec(&mut interp, "set A[0][1] to 5"));
+    assert_eq!(ptr(&interp), before);
+}

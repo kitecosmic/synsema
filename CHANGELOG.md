@@ -87,6 +87,10 @@ Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the rele
   and a predicate that returns an array are errors that suggest `some(m)` / `every(m)`,
   `length(a) > 0` or `logical_and`. Before, a non-empty array counted as true.
 - `arrays do not support ordering comparisons` is gone (comparisons work now).
+- **With `--labels`, a `try` whose body wrote into a private list, map or array runs its `recover`
+  under that private context**, as if it had read it (the write now counts as touching the private
+  data; a read already did this). A `recover` that then assigns a public variable stops the run. To
+  count failures in public, move the write out of the `try` or make the counter private.
 - **`-m` on a mask is an error**, like `-true` (numpy rejects it too): `logical_not(m)` flips it,
   `0 - m` gives the 0/-1 floats. Negating a `f64` array works.
 - `each x in a` over an array walks it instead of failing with `Cannot iterate over array`, and

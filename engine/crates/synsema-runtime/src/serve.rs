@@ -2305,6 +2305,7 @@ fn with_serve_interp<R>(
     // v0.6.47 (T1): cada entrada (request, tick del cron, handler de socket) es su propia corrida,
     // con su propio corte y sus propios agentes: el intérprete del worker no arrastra los de la
     // anterior.
+    // (v0.6.55: también suelta las entradas muertas de un `set` que falló en la entrada anterior.)
     base.interp.set_run_cut(Arc::new(synsema_core::interpreter::RunCut::default()));
     let held = if crate::host::labels() { Some(hold_serve_log(&mut base.interp)) } else { None };
     // v0.6.47 (T1): lo que esta entrada escribe en el blackboard va al diario de su corrida, como
@@ -2315,9 +2316,6 @@ fn with_serve_interp<R>(
     // abierta para siempre, con lo que escribió a la vista y sin confirmar ni deshacer.
     let mut owner = RunOwner { swarm, scope };
     let out = f(&mut base.interp, &base.caps);
-    // v0.6.55 (N6 de la ronda 4): el hilo del worker sigue vivo; un `set` sobre un array que falló a
-    // mitad de camino en esta entrada no le deja a la próxima una copia del array retenida.
-    synsema_core::arrays::drop_dead_places();
     let stopped = base.interp.take_label_stop();
     finish_state_journal(shared_state, stopped);
     if let Some(s) = owner.scope.take() {
