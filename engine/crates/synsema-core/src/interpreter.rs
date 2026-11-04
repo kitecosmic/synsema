@@ -1434,15 +1434,9 @@ fn with_unique_binding<R>(
                 let out = f(slot);
                 if exported {
                     if let Some(m) = view {
-                        // La entrada ya existe: se reescribe en su lugar, sin armar una clave nueva en
-                        // cada escritura (M29 de la ronda 6). `insert` haría lo mismo, con la reserva.
-                        let mut m = m.borrow_mut();
-                        match m.get_mut(name) {
-                            Some(x) => *x = slot.clone(),
-                            None => {
-                                m.insert(name.to_string(), slot.clone());
-                            }
-                        }
+                        // `set` reescribe la entrada que ya existe, sin armar una clave nueva en cada
+                        // escritura (M29 de la ronda 6); `insert` hacía lo mismo, con la reserva.
+                        m.borrow_mut().set(name, slot.clone());
                     }
                     // v0.6.55 (B1 de la auditoría): un array se escribe en el lugar sólo con la
                     // cuenta exacta de dueños; la vista del mapa es uno más, y la hoja lo sabe por acá.
@@ -8510,7 +8504,10 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                 // Un array no guarda un elemento privado: el valor tiene que ser a lo sumo tan
                 // privado como la variable (R6: la etiqueta es del array entero).
                 let value = if self.labels && matches!(obj, SynValue::Array(_)) && labels::has_label_deep(&value) {
-                    self.array_set_value(target, value, env, loc)?
+                    // M31 (ronda 7): el array es la variable si el camino va de ella al array sólo por índices
+                    // sobre arrays, como lo decide la guarda de `set_leaf_index` (no por la sintaxis).
+                    let direct = index_depth(target) == Some(crate::arrays::chain_len(&obj) + 1);
+                    self.array_set_value(target, value, direct, env, loc)?
                 } else {
                     value
                 };
@@ -8591,6 +8588,7 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
         &mut self,
         target: &Node,
         value: SynValue,
+        direct: bool,
         env: &Rc<RefCell<Environment>>,
         loc: &SourceLocation,
     ) -> Result<SynValue, Control> {
@@ -8604,10 +8602,9 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
         }
         let have_text = if have.is_empty() { "public".to_string() } else { format!("private to {}", self.safe_label(&have)) };
         let root = root.unwrap_or("?");
-        // M30 (ronda 6): si el array no es la variable (`set m.a[0]`), el texto no le dice «array» a `m`
-        // ni «public» a un array que puede ser privado: nombra la variable por la que se llega, que es
-        // contra la que se compara.
-        let direct = matches!(&target.kind, NodeKind::IndexAccess { object, .. } if matches!(object.kind, NodeKind::Identifier { .. }));
+        // M30 (ronda 6): si el array no es la variable (`set m.a[0]`, `set L[0][1]`), el texto no le dice
+        // «array» a `m` ni «public» a un array que puede ser privado: nombra la variable por la que se
+        // llega, que es contra la que se compara. `direct` lo decide el llamador (M31 de la ronda 7).
         let msg = if direct {
             format!(
                 "label_violation: cannot write a value private to {} into the array '{}' ({}): an array is private as a whole, not element by element — bind it as private(…, \"<principal>\") first, or declassify the value",

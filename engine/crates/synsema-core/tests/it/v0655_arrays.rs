@@ -1496,4 +1496,36 @@ fn a_write_through_a_container_names_the_variable_it_is_checked_against() {
     assert!(!detail.contains("the array 'm'"), "{}", detail);
     let (_, _, detail) = labelled_run("let a be zeros(3)\nlet v be private(5, \"x\")\nset a[0] to v", "<v0655>");
     assert!(detail.contains("into the array 'a' (public): an array is private as a whole"), "{}", detail);
+    // M31 (ronda 7): la decisión es la de la guarda (sólo índices sobre arrays), no la sintaxis: un 2-D
+    // directo es la variable; una fila que vive en una lista, no.
+    let (_, _, detail) = labelled_run("let A be zeros([2, 3])\nlet v be private(5, \"x\")\nset A[0][1] to v", "<v0655>");
+    assert!(detail.contains("into the array 'A' (public): an array is private as a whole"), "{}", detail);
+    let (_, _, detail) = labelled_run("let L be [zeros(3)]\nlet v be private(5, \"x\")\nset L[0][1] to v", "<v0655>");
+    assert!(detail.contains("into an array reached through 'L' (the variable is public)"), "{}", detail);
+}
+
+/// M32 (ronda 7): la caché de `module_view_holds` guarda la posición de una exportación; otro array del
+/// mismo módulo, sin exportar, no hereda esa respuesta. `bump` deja en la caché la de `S`; después
+/// `set T[grab()]`, con un alias de `T` tomado en el índice, tiene que dar `in_use` (si la caché se
+/// creyera sin mirar la clave, el alias `k` recibiría la escritura).
+#[test]
+fn the_module_view_answer_is_only_for_its_own_export() {
+    use synsema_core::interpreter::Interpreter;
+    let lib = "export let S be private(zeros(3), \"x\")\nlet T be private(zeros(3), \"x\")\nlet k be private(0, \"x\")\n\
+        task grab()\n    set k to T\n    give 1\n\
+        export task bump()\n    set S[0] to 1\n    give 0\n\
+        export task alias_t()\n    set S[0] to 2\n    set T[grab()] to 5\n    give [declassify(T, \"x\"), declassify(k, \"x\")]\n";
+    let d = module_dir("view-cache-key", lib);
+    let main = d.join("main.syn").to_string_lossy().to_string();
+    let program = synsema_core::parser::parse_source("use \"./lib.syn\" as m\nprint(m.bump())\nprint(m.alias_t())", &main).unwrap();
+    let mut interp = Interpreter::new();
+    interp.set_labels(true);
+    let r = interp.execute(&program);
+    let got = match r {
+        Ok(_) => interp.output.join("\n"),
+        Err(Control::Error(e)) => format!("ERR: {}", e.operator_detail.clone().unwrap_or_else(|| e.message.clone())),
+        Err(_) => "otro control".to_string(),
+    };
+    assert!(got.contains("set: the array is in use elsewhere in this statement"), "{}", got);
+    let _ = std::fs::remove_dir_all(&d);
 }
