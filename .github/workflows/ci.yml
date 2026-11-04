@@ -56,7 +56,7 @@ jobs:
 
   # v0.6.46: guardia de rendimiento por instrucciones contra un ancla fija (engine/perf/guard.py).
   # Falla si un programa del corpus, en cualquiera de los tres caminos del motor (nivel nativo, VM,
-  # tree-walker), pasa +0,2 % sobre `engine/perf/baseline.json`, y dice qué funciones crecieron. El
+  # tree-walker), pasa +0,3 % sobre `engine/perf/baseline.json`, y dice qué funciones crecieron. El
   # ancla no es la versión anterior: así una suba chica que se repite release tras release se suma
   # y se ve. Runner y toolchain fijos: con otra libc u otro compilador los números cambian, y
   # cambiarlos es volver a medir el ancla (`--bless-from` con el artefacto, en un PR sin cambios

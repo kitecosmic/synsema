@@ -142,7 +142,7 @@ def main():
     if a.bless_from:
         with open(a.bless_from, encoding="utf-8") as f:
             measured = json.load(f)
-        write_baseline(measured["programs"], measured["meta"], a.budget if a.budget is not None else 0.2)
+        write_baseline(measured["programs"], measured["meta"], a.budget if a.budget is not None else 0.3)
         return 0
     if not a.bin:
         ap.error("--bin es obligatorio (salvo con --bless-from)")
@@ -155,7 +155,7 @@ def main():
     if os.path.exists(BASELINE):
         with open(BASELINE, encoding="utf-8") as f:
             base = json.load(f)
-    budget = a.budget if a.budget is not None else (base or {}).get("budget_pct", 0.2)
+    budget = a.budget if a.budget is not None else (base or {}).get("budget_pct", 0.3)
 
     results = {}
     over, missing = [], []

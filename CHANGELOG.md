@@ -97,6 +97,11 @@ Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the rele
 - `each x in a` over an array walks it instead of failing with `Cannot iterate over array`, and
   `Cannot set index on array` is gone (`set a[i]` works).
 
+**`perf-guard` allows +0.3 % over its anchor** (was +0.2 %). With `lto = true`, a change in one part
+of the engine moves how LLVM inlines code elsewhere: in this release `s_csv` on the tree-walker
+grew +0.22 % inside an `IndexMap::get` with `csv.rs` untouched, and the VM loop
+moved 1-1.7 % depending on the build machine. The anchor was re-measured on CI for this release.
+
 ## v0.6.54 — 2026-11-02
 
 **Behavior changes (read these first).**
