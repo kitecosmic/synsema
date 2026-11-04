@@ -1764,14 +1764,8 @@ pub fn repl() {
         if trimmed.trim().is_empty() {
             continue;
         }
-        match parse_source(trimmed, "<repl>") {
-            Ok(prog) => match interp.execute(&prog) {
-                Ok(_) => {}
-                Err(Control::Error(e)) => println!("Runtime error: {}", e),
-                Err(_) => println!("Runtime error: 'give'/'stop' used outside of a task or loop"),
-            },
-            Err(CompileError::Lex(e)) => println!("Lexer error: {}", e),
-            Err(CompileError::Parse(e)) => println!("Parse error: {}", e),
+        if let Some(e) = repl_eval(&mut interp, trimmed) {
+            println!("{}", e);
         }
         while printed < interp.output.len() {
             println!("{}", interp.output[printed]);
@@ -1779,6 +1773,23 @@ pub fn repl() {
         }
     }
     println!();
+}
+
+/// Una línea del REPL: `None` si corrió bien, o el texto del error. El REPL atrapa el error de cada
+/// línea y sigue en el mismo hilo, sin `set_run_cut` ni `recover`: un `set` que falló a mitad de
+/// camino no le deja a la línea siguiente una entrada muerta que retenga el array (M28 de v0.6.55).
+pub fn repl_eval(interp: &mut Interpreter, line: &str) -> Option<String> {
+    let err = match parse_source(line, "<repl>") {
+        Ok(prog) => match interp.execute(&prog) {
+            Ok(_) => return None,
+            Err(Control::Error(e)) => format!("Runtime error: {}", e),
+            Err(_) => "Runtime error: 'give'/'stop' used outside of a task or loop".to_string(),
+        },
+        Err(CompileError::Lex(e)) => return Some(format!("Lexer error: {}", e)),
+        Err(CompileError::Parse(e)) => return Some(format!("Parse error: {}", e)),
+    };
+    synsema_core::arrays::drop_dead_places();
+    Some(err)
 }
 
 /// Resultado con diagnósticos ricos (capa 9: error_reporter). Espeja

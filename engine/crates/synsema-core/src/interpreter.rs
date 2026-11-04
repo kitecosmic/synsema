@@ -908,6 +908,12 @@ struct ModuleRegistry {
     by_map: HashMap<usize, (synsema_heap::WeakTail<MapObj>, std::rc::Weak<RefCell<Environment>>)>,
     by_env: HashMap<usize, (synsema_heap::WeakTail<MapObj>, std::rc::Weak<RefCell<Environment>>)>,
     prune_at: usize,
+    /// Sube con cada registro: una respuesta guardada de `module_view_holds` (M29) vale sólo mientras
+    /// ningún entorno haya cambiado de mapa.
+    generation: u64,
+    /// La última respuesta positiva de `module_view_holds`: (entorno, mapa, generación, posición de la
+    /// exportación en el mapa). Los `Weak` no retienen nada (el registro ya guarda los mismos).
+    view_hit: Option<(std::rc::Weak<RefCell<Environment>>, synsema_heap::WeakTail<MapObj>, u64, usize)>,
 }
 
 thread_local! {
@@ -926,6 +932,7 @@ pub fn register_module(map: &crate::types::MapRef, env: &Rc<RefCell<Environment>
         }
         r.by_map.insert(crate::types::MapRef::as_ptr(map).cast::<()>() as usize, (crate::types::MapRef::downgrade(map), Rc::downgrade(env)));
         r.by_env.insert(Rc::as_ptr(env) as usize, (crate::types::MapRef::downgrade(map), Rc::downgrade(env)));
+        r.generation += 1;
     });
 }
 
@@ -1268,22 +1275,58 @@ fn array_root_of(v: &SynValue, exported: impl FnOnce() -> bool) -> Option<(usize
     Some((p, shared))
 }
 
-/// ¿El binding `name` (el del scope más cercano que lo tiene) es una exportación de su módulo y el mapa
-/// de exportaciones tiene ese mismo contenedor `v`? (N7 de la ronda 5.)
-#[cold]
-fn module_view_holds(env: &Rc<RefCell<Environment>>, name: &str, v: &SynValue) -> bool {
+/// ¿El binding `name` de `scope` (su entorno, de `binding_scope`) es una exportación de su módulo y el
+/// mapa de exportaciones tiene ese mismo contenedor `v`? (N7 de la ronda 5.) En un bucle de `set` sobre
+/// un array privado exportado se pregunta en cada vuelta (M29 de la ronda 6).
+fn module_view_holds(scope: &Rc<RefCell<Environment>>, name: &str, v: &SynValue) -> bool {
+    if !scope.borrow().name.starts_with("module:") {
+        return false;
+    }
+    // La última respuesta positiva, si sigue valiendo: el mismo entorno, ningún registro desde
+    // entonces (así que el mismo mapa) y, en la posición guardada, la clave `name` con este mismo
+    // contenedor. Es el predicado entero; sólo se ahorra buscar la posición (M29 de la ronda 6).
+    let (hit, generation) = MODULES.with(|r| {
+        let r = r.borrow();
+        let hit = r.view_hit.as_ref().and_then(|(env, map, g, i)| {
+            if *g != r.generation || !env.upgrade().is_some_and(|e| Rc::ptr_eq(&e, scope)) {
+                return None;
+            }
+            let m = map.upgrade()?;
+            let m = m.borrow();
+            let (k, x) = m.get_index(*i)?;
+            Some(k.as_str() == name && same_container(x, v))
+        });
+        (hit, r.generation)
+    });
+    if hit == Some(true) {
+        return true;
+    }
+    let Some(m) = module_map_of_env(scope) else { return false };
+    let found = m.borrow().get_full(name).filter(|(_, _, x)| same_container(x, v)).map(|(i, _, _)| i);
+    match found {
+        Some(i) => {
+            MODULES.with(|r| r.borrow_mut().view_hit = Some((Rc::downgrade(scope), crate::types::MapRef::downgrade(&m), generation, i)));
+            true
+        }
+        None => false,
+    }
+}
+
+/// El entorno donde está el binding `name` (el del scope más cercano que lo tiene).
+fn binding_scope(env: &Rc<RefCell<Environment>>, name: &str) -> Option<Rc<RefCell<Environment>>> {
     let mut cur = env.clone();
     loop {
-        let (here, module, next) = {
+        let next = {
             let e = cur.borrow();
-            (e.bindings.contains_key(name), e.name.starts_with("module:"), e.parent.clone())
+            if e.bindings.contains_key(name) {
+                drop(e);
+                return Some(cur);
+            }
+            e.parent.clone()
         };
-        if here {
-            return module && module_map_of_env(&cur).is_some_and(|m| m.borrow().get(name).is_some_and(|x| same_container(&x, v)));
-        }
         match next {
             Some(p) => cur = p,
-            None => return false,
+            None => return None,
         }
     }
 }
@@ -1382,14 +1425,24 @@ fn with_unique_binding<R>(
             let is_module = e.name.starts_with("module:");
             if let Some(slot) = e.bindings.get_mut(name) {
                 let view = if is_module { module_map_of_env(&cur) } else { None };
-                let exported = view.as_ref().is_some_and(|m| m.borrow().contains_key(name));
-                let shared_with_view = exported
-                    && view.as_ref().is_some_and(|m| m.borrow().get(name).is_some_and(|v| same_container(v, slot)));
+                // Una sola consulta al mapa: si es una exportación y si tiene este mismo contenedor.
+                let (exported, shared_with_view) = match view.as_ref().map(|m| m.borrow().get(name).map(|v| same_container(v, slot))) {
+                    Some(Some(same)) => (true, same),
+                    _ => (false, false),
+                };
                 make_unique_n(slot, if shared_with_view { 1 } else { 0 });
                 let out = f(slot);
                 if exported {
                     if let Some(m) = view {
-                        m.borrow_mut().insert(name.to_string(), slot.clone());
+                        // La entrada ya existe: se reescribe en su lugar, sin armar una clave nueva en
+                        // cada escritura (M29 de la ronda 6). `insert` haría lo mismo, con la reserva.
+                        let mut m = m.borrow_mut();
+                        match m.get_mut(name) {
+                            Some(x) => *x = slot.clone(),
+                            None => {
+                                m.insert(name.to_string(), slot.clone());
+                            }
+                        }
                     }
                     // v0.6.55 (B1 de la auditoría): un array se escribe en el lugar sólo con la
                     // cuenta exacta de dueños; la vista del mapa es uno más, y la hoja lo sabe por acá.
@@ -8464,7 +8517,7 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                 let root_now = || {
                     let n = set_root_identifier(target)?;
                     let v = env_get(env, n)?;
-                    array_root_of(&v, || module_view_holds(env, n, &v))
+                    array_root_of(&v, || binding_scope(env, n).is_some_and(|scope| module_view_holds(&scope, n, &v)))
                 };
                 // `seen` ya tiene todo lo privado que la sentencia desenvolvió (el camino, el índice, el
                 // valor: B4). Ni el valor ni el PC hace falta mirarlos aparte (M23 de la ronda 4): el valor
@@ -8549,15 +8602,29 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
         if labels::subset(&got, &have) {
             return Ok(labels::strip_deep(&value));
         }
-        Err(err_labels(
+        let have_text = if have.is_empty() { "public".to_string() } else { format!("private to {}", self.safe_label(&have)) };
+        let root = root.unwrap_or("?");
+        // M30 (ronda 6): si el array no es la variable (`set m.a[0]`), el texto no le dice «array» a `m`
+        // ni «public» a un array que puede ser privado: nombra la variable por la que se llega, que es
+        // contra la que se compara.
+        let direct = matches!(&target.kind, NodeKind::IndexAccess { object, .. } if matches!(object.kind, NodeKind::Identifier { .. }));
+        let msg = if direct {
             format!(
                 "label_violation: cannot write a value private to {} into the array '{}' ({}): an array is private as a whole, not element by element — bind it as private(…, \"<principal>\") first, or declassify the value",
                 self.safe_label(&got),
-                root.unwrap_or("?"),
-                if have.is_empty() { "public".to_string() } else { format!("private to {}", self.safe_label(&have)) }
-            ),
-            loc,
-        ))
+                root,
+                have_text
+            )
+        } else {
+            format!(
+                "label_violation: cannot write a value private to {} into an array reached through '{}' (the variable is {}): a write into an array is checked against the variable it is reached from, not the containers in between — bind '{}' as private(…, \"<principal>\"), or declassify the value",
+                self.safe_label(&got),
+                root,
+                have_text,
+                root
+            )
+        };
+        Err(err_labels(msg, loc))
     }
 
     /// Lectura de un campo (`m.k`, `k of m`): la misma para una expresión y para el

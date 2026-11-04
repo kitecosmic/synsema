@@ -1473,3 +1473,27 @@ fn a_new_run_on_the_thread_drops_the_dead_entries() {
     assert!(exec(&mut interp, "set A[0][1] to 5"));
     assert_eq!(ptr(&interp), before);
 }
+
+// =========================================================
+// Auditoría v0.6.55, ronda 6
+// =========================================================
+
+/// M30: con `--labels`, un valor privado escrito en un array al que se llega por un mapa público se
+/// compara contra la variable (`m`), y el motivo lo dice así: no llama «array» al mapa ni «public» a un
+/// array que es privado. Con la variable misma (`set a[0]`) el texto sigue igual.
+#[test]
+fn a_write_through_a_container_names_the_variable_it_is_checked_against() {
+    let (out, _, detail) = labelled_run(
+        "let m be {\"a\": private(zeros(3), \"x\")}\nlet v be private(5, \"x\")\nset m.a[0] to v",
+        "<v0655>",
+    );
+    assert_eq!(out, WITHHELD);
+    assert!(
+        detail.contains("into an array reached through 'm' (the variable is public): a write into an array is checked against the variable it is reached from"),
+        "{}",
+        detail
+    );
+    assert!(!detail.contains("the array 'm'"), "{}", detail);
+    let (_, _, detail) = labelled_run("let a be zeros(3)\nlet v be private(5, \"x\")\nset a[0] to v", "<v0655>");
+    assert!(detail.contains("into the array 'a' (public): an array is private as a whole"), "{}", detail);
+}

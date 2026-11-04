@@ -1970,4 +1970,47 @@ mod tests {
         drop(inner);
         assert_eq!(drops.get(), 150);
     }
+
+    /// `get_mut_with_owners` (v0.6.55, la escritura en el lugar de `set a[i]`): da `&mut` sólo con la
+    /// cuenta exacta, sin débiles y nunca a un inmortal; lo escrito lo ve el otro dueño. Corre con Miri.
+    #[test]
+    fn obj_get_mut_with_owners_needs_the_exact_count() {
+        let a = Obj::new(vec![1, 2, 3]);
+        let b = a.clone();
+        // SAFETY (del test): `b` no se lee mientras dura el `&mut`.
+        unsafe {
+            assert!(Obj::get_mut_with_owners(&a, 0).is_none());
+            assert!(Obj::get_mut_with_owners(&a, 1).is_none());
+            assert!(Obj::get_mut_with_owners(&a, 3).is_none());
+            Obj::get_mut_with_owners(&a, 2).expect("dos dueños")[1] = 20;
+        }
+        assert_eq!(*b, vec![1, 20, 3]);
+        drop(b);
+        // SAFETY (del test): `a` es el único dueño.
+        unsafe { Obj::get_mut_with_owners(&a, 1).expect("uno")[0] = 10 };
+        assert_eq!(*a, vec![10, 20, 3]);
+
+        // Con un débil vivo, no: el débil puede subir a fuerte y leer.
+        let w = Obj::downgrade(&a);
+        // SAFETY (del test): sin otros dueños fuertes.
+        unsafe { assert!(Obj::get_mut_with_owners(&a, 1).is_none()) };
+        drop(w);
+        // SAFETY (del test): igual que arriba.
+        unsafe { assert!(Obj::get_mut_with_owners(&a, 1).is_some()) };
+
+        // Un inmortal lo leen otros hilos: nunca.
+        let v = Obj::new(7);
+        Obj::make_immortal(&v);
+        let vptr = v.ptr;
+        // SAFETY (del test): no hay otros dueños.
+        unsafe {
+            assert!(Obj::get_mut_with_owners(&v, 1).is_none());
+            // La cuenta de un inmortal es `u32::MAX`: pedir justo esa cantidad tampoco lo abre.
+            assert!(Obj::get_mut_with_owners(&v, u32::MAX as usize).is_none());
+            assert!(Obj::get_mut_with_owners(&v, usize::MAX).is_none());
+        }
+        drop(v);
+        // SAFETY (del test): la reserva del inmortal sigue viva y nadie más la usa.
+        unsafe { alloc::dealloc(vptr.as_ptr().cast(), Layout::new::<Inner<i32>>()) };
+    }
 }

@@ -1927,3 +1927,48 @@ fn sys(e: Control, labels: bool) -> Control {
 fn in_use() -> Control {
     err("set: the array is in use elsewhere in this statement and cannot be written in place — an index or value that reads or writes the same array: compute it into a variable first")
 }
+
+#[cfg(test)]
+mod tests {
+    /// El único `unsafe` de este archivo (`get_mut_with_owners` en `set_index`) con los casos que lo
+    /// cuidan: escritura en el lugar, un alias que tiene que copiarse, el alias tomado en el índice
+    /// (`in_use`), una fila y la religadura en el índice; con y sin `--labels`. Pensado para Miri
+    /// (`cargo +nightly miri test -p synsema-core --lib arrays::tests`): ningún acceso inválido.
+    #[test]
+    fn writing_in_place_with_the_shared_reference() {
+        let src = "let A be zeros([2, 3])
+set A[0][1] to 5
+let B be A
+set A[1][2] to 7
+print(B[1][2])
+print(A[1][2])
+let keep be nothing
+task grab()
+    set keep to A
+    give 0
+try
+    set A[grab()][0] to 1
+recover e
+    print(\"in use\")
+task rebind()
+    set A to zeros([2, 3])
+    give 1
+try
+    set A[rebind()][1] to 9
+recover e
+    print(\"rebound\")
+set A[1][1] to 9
+print(A)
+set A[0] to array([1, 2, 3])
+print(A[0])";
+        let want = ["0.0", "7.0", "in use", "rebound", "[[0, 0, 0], [0, 9, 0]]", "[1, 2, 3]"];
+        let r = crate::interpreter::run_source(src, "<arrays>");
+        assert!(r.success, "{:?}", r.errors);
+        assert_eq!(r.output, want);
+        let program = crate::parser::parse_source(src, "<arrays>").unwrap();
+        let mut interp = crate::interpreter::Interpreter::new();
+        interp.set_labels(true);
+        assert!(interp.execute(&program).is_ok());
+        assert_eq!(interp.output, want);
+    }
+}

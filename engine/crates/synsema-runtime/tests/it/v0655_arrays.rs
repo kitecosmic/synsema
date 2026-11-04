@@ -372,3 +372,27 @@ fn sum_of_a_mask_by_axis_counts() {
     assert_eq!(with_a("print(sum(array([1, 0]) > 0, axis = 0))\nprint(sum(m, axis = 0) + 0.5)"), "1\n2.5");
     assert_eq!(with_a("print(sum(M > 1, axis = 0))\nprint(sum(M > 1, axis = 1))"), "[1, 2]\n[1, 2]");
 }
+
+/// M28 (ronda 6): el REPL atrapa el error de cada línea y sigue en el mismo hilo; un `set` que falló a
+/// mitad de camino no le deja a la línea siguiente una copia del array retenida.
+#[test]
+fn the_repl_does_not_keep_copies_of_failed_sets() {
+    use synsema_core::interpreter::{env_get, Interpreter};
+    use synsema_core::types::SynValue;
+    use synsema_runtime::engine::repl_eval;
+    let ptr = |interp: &Interpreter| match env_get(&interp.global_env, "A") {
+        Some(SynValue::Array(o)) => synsema_core::types::Obj::as_ptr(&o) as usize,
+        other => panic!("{:?}", other.map(|v| v.type_name())),
+    };
+    let mut interp = Interpreter::new();
+    assert_eq!(repl_eval(&mut interp, "let A be zeros([2, 3])"), None);
+    let before = ptr(&interp);
+    for _ in 0..3 {
+        let e = repl_eval(&mut interp, "set A[0][nope] to 1").expect("la línea falla");
+        assert!(e.starts_with("Runtime error:"), "{}", e);
+    }
+    assert_eq!(repl_eval(&mut interp, "set A[0][1] to 5"), None);
+    assert_eq!(ptr(&interp), before);
+    assert_eq!(repl_eval(&mut interp, "print(A[0][1])"), None);
+    assert_eq!(interp.output.last().map(String::as_str), Some("5.0"));
+}

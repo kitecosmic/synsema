@@ -39,7 +39,7 @@ Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the rele
   rebinds the variable it writes (`set a[f()]` where `f` does `set a to …`) is an error
   (`set: the index changed 'a' while it was being written …`): the write never lands in the array
   the variable held before. With `--labels` an array is private as a whole: it takes values at most
-  as private as the variable; writing into an array inside a list or map takes indices that run no
+  as private as the variable it is reached from (`set m.a[0]` is checked against `m`); writing into an array inside a list or map takes indices that run no
   code (`let i be f()` first), and when the statement touched private data the errors of the write
   reach the operator as a diagnostic (the program sees the fixed cut text). An alias taken inside the
   index is `in_use` with and without `--labels`.
@@ -75,7 +75,8 @@ Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the rele
   `try/recover` and showed the data in its text. It now stops the run like the same error in a read
   (`xs[secret]`): it is not caught and the run stops with `private(x)` and the place.
 - A `set` that fails halfway through its path and is caught no longer keeps a copy of the array alive
-  until much later (each caught failure on a large matrix held a full copy).
+  until much later (each caught failure on a large matrix held a full copy). The same holds for a
+  failed block of `synsema test`, a failed line of the REPL and the next entry of a `serve` worker.
 
 **Breaking.**
 - **`==`/`!=` with an array no longer answer `false` in silence.** Two arrays are still compared as
