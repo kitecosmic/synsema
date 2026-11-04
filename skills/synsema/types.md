@@ -37,7 +37,7 @@ Three distinct types (the java.time / JS Temporal / polars model), `type_of` →
 ## Collection types
 - `list` — `[1, 2, 3]`, `["a", "b"]`, mixed types allowed. `xs[-1]` is the last element. `is_list(x)`.
 - `map` — `{"key": value, "key2": value2}` (preserves insertion order). `each k in m` walks the keys in insertion order (v0.6.29+); `get(m, k, default)`, `items(m)`, `merge`, `remove`. `is_map(x)`.
-- `array` — n-dimensional **numeric** array (f64): `array([[1,2],[3,4]])`, `zeros`/`ones`/`arange`/`linspace`/`identity`. Vectorized math + broadcasting (`*` is **elementwise**, not matrix product); `matmul`/`solve`/`det`/`inv`/`eig`/`svd`. See [builtins.md](builtins.md). NumPy-equivalent core.
+- `array` — n-dimensional array of `f64` numbers (`array([[1,2],[3,4]])`, `zeros`/`ones`/`arange`/`linspace`/`identity`), or of `bool`: a **mask**, what comparisons return (`a > 2`; `dtype(a)` → `"f64"`/`"bool"`, v0.6.55+). Vectorized math + broadcasting (`*` is **elementwise**, not matrix product); `matmul`/`solve`/`det`/`inv`/`eig`/`svd`. **Value semantics** like lists (`set a[i] to v` never changes an alias). `==` compares whole arrays; an array is never true or false (`when a` is an error: `some(m)`/`every(m)`/`length(a) > 0`). See [builtins.md](builtins.md) § Numeric arrays. NumPy-equivalent core.
 - **Display:** inside a list or map, text is shown quoted (v0.6.29+): `print(["1", 1, {"a": "b"}])` → `["1", 1, {a: "b"}]` (map keys stay bare); `text(xs)` is the same form. A top-level `print("x")` prints `x`.
 
 ## Values — lists and maps are values (copy-on-write, v0.6.29+)
