@@ -8504,10 +8504,7 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                 // Un array no guarda un elemento privado: el valor tiene que ser a lo sumo tan
                 // privado como la variable (R6: la etiqueta es del array entero).
                 let value = if self.labels && matches!(obj, SynValue::Array(_)) && labels::has_label_deep(&value) {
-                    // M31 (ronda 7): el array es la variable si el camino va de ella al array sólo por índices
-                    // sobre arrays, como lo decide la guarda de `set_leaf_index` (no por la sintaxis).
-                    let direct = index_depth(target) == Some(crate::arrays::chain_len(&obj) + 1);
-                    self.array_set_value(target, value, direct, env, loc)?
+                    self.array_set_value(target, &obj, value, env, loc)?
                 } else {
                     value
                 };
@@ -8587,8 +8584,8 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
     fn array_set_value(
         &mut self,
         target: &Node,
+        obj: &SynValue,
         value: SynValue,
-        direct: bool,
         env: &Rc<RefCell<Environment>>,
         loc: &SourceLocation,
     ) -> Result<SynValue, Control> {
@@ -8604,7 +8601,10 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
         let root = root.unwrap_or("?");
         // M30 (ronda 6): si el array no es la variable (`set m.a[0]`, `set L[0][1]`), el texto no le dice
         // «array» a `m` ni «public» a un array que puede ser privado: nombra la variable por la que se
-        // llega, que es contra la que se compara. `direct` lo decide el llamador (M31 de la ronda 7).
+        // llega, que es contra la que se compara. El array es la variable si el camino va de ella al array
+        // sólo por índices sobre arrays, como lo decide la guarda de `set_leaf_index`, no la sintaxis (M31
+        // de la ronda 7). Se calcula acá, fuera de `exec_set`, que es caliente.
+        let direct = index_depth(target) == Some(crate::arrays::chain_len(obj) + 1);
         let msg = if direct {
             format!(
                 "label_violation: cannot write a value private to {} into the array '{}' ({}): an array is private as a whole, not element by element — bind it as private(…, \"<principal>\") first, or declassify the value",
