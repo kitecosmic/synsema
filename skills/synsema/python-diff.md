@@ -118,6 +118,20 @@ rows. Full pipeline: [dataviz.md](dataviz.md) § Data analysis; contracts: [buil
 | `np.percentile(xs, 90)` / `np.quantile(xs, 0.9)` | `percentile(xs, 90)` / `quantile(xs, 0.9)` | same interpolation (linear) |
 | `np.dot(A, B)` (matrices) / `A @ B` | `matmul(A, B)` | `dot` is 1-D vectors only |
 | `np.eye(n)` | `identity(n)` | `eye` is a deprecated alias |
+| `a > 2` (a bool array) / `a[a > 2]` | `a > 2` (a mask, v0.6.55+) / `where(a, a > 2)` | `a[m]` is an error that names `where(a, m)` |
+| `np.where(c, x, y)` | `if_else(c, x, y)` | `where(a, m)` is the filter, `if_else` the three-argument form |
+| `np.any(m)` / `np.all(m)` / `np.count_nonzero(m)` | `some(m)` / `every(m)` / `count_where(m)` | `any`/`all` are not defined (the error names `some`/`every`) |
+| `a == b` / `a != 3` elementwise | `equal(a, b)` / `not_equal(a, 3)` | `==` compares whole arrays → one bool; against a number or a list it is an error |
+| `m1 & m2` / `m1 \| m2` / `~m` (`np.logical_*`) | `logical_and(m1, m2)` / `logical_or(m1, m2)` / `logical_not(m)` | `and`/`or`/`not`/`-m` on a mask are errors |
+| `np.maximum(a, b)` / `np.minimum(a, b)` / `np.clip(a, lo, hi)` | `maximum(a, b)` / `minimum(a, b)` / `clamp(a, lo, hi)` | NaN propagates in both |
+| `a.sum()` of a bool array / `m.mean()` | `sum(m)` (an integer) / `mean(m)` | a mask in arithmetic is 0/1: `m * 1.0` |
+| `a[[1, 0]]` / `np.take(a, idx, axis=1)` | `a[[1, 0]]` / `take(a, idx, axis = 1)` | with more than one axis `take` needs the axis (numpy flattens) |
+| `a[i] = v` / `a[[0, 2]] = v` / `M[0] = 7` | `set a[i] to v` / `set a[[0, 2]] to v` / `set M[0] to 7` | value semantics: an alias does not change (numpy views do) |
+| `np.add.at(a, idx, v)` | `let b be index_add(a, idx, v)` | returns a NEW array; repeated positions accumulate |
+| `for x in arr:` / `for row in M:` | `each x in a` / `each row in M` | first axis, like numpy |
+| `a.astype(np.float32).tobytes()` / `np.frombuffer(b, np.float32).reshape(2, 3)` | `array_to_bytes(a, "f32")` / `array_from_bytes(b, "f32", shape = [2, 3])` | little-endian, C order; `f32` reads back as `f64` |
+| `np.transpose(a, (2, 0, 1))` / batched `A @ B` | `transpose(a, [2, 0, 1])` / `matmul(A, B)` | `matmul` broadcasts the batch axes like numpy |
+| `rng.normal(0, 1, size=(2, 3))` / `rng.uniform(0, 1, size=4)` | `random_normal(g, [2, 3], mean = 0, std = 1)` / `random_uniform(g, [4], low = 0, high = 1)` | bit for bit numpy's |
 | `np.concatenate` / `np.stack` / `np.argmax` / `np.cumsum` / `np.diff` | `concat([a, b], axis = 0)` / `stack([a, b])` / `argmax(x, axis = k)` / `cumsum(x)` / `diff(x)` | `axis` is named |
 | `np.corrcoef(x, y)[0, 1]` / `np.cov(x, y)[0, 1]` / `np.linalg.lstsq(A, b)` / `np.polyfit(x, y, 1)` | `corr(x, y)` / `cov(x, y)` / `lstsq(A, b)` / `polyfit(x, y, 1)` + `polyval(c, x)` | `cov` is sample by default, like numpy's `cov`; `lstsq` is numpy's (SVD, minimum-norm on rank-deficient data); an undetermined `polyfit` is an error, not a `RankWarning` |
 | `len(arr)` / `arr.size` / `arr[-1]` / `arr[1:3]` | `length(a)` / `size(a)` / `a[-1]` / `slice(a, 1, 3)` | — |
@@ -140,6 +154,7 @@ rows. Full pipeline: [dataviz.md](dataviz.md) § Data analysis; contracts: [buil
 | Two names for one list/dict see each other's changes | **Value semantics** (v0.6.29+): `let ys be xs` + `set ys[0] to 9` leaves `xs` alone; a task that `set`s inside a map it received does NOT change the caller's — `give` it back. Shared state is explicit (blackboard, memory, bus) |
 | `d["missing"]` → KeyError you catch by type | `Map has no key 'missing'` — catchable only as `try/recover` (message text). For an optional key use `get(m, "missing", default)` |
 | `"a" + 1` → TypeError | **It concatenates**: `"a" + 1` → `"a1"` (text + number/bool coerces). But text + `nothing`/list/map/bytes IS an error (v0.6.29+: `Cannot add text and nothing — convert it on purpose`), and so are `"ab" * 2` and `1 + true` — no repetition, no bool arithmetic |
+| `if arr:` is true when the array is non-empty | **Error** (v0.6.55+): `an array is not true or false — some(m) / every(m) for a mask, length(a) > 0 for "not empty"` |
 | `except:` keeps the program dying | `recover` **swallows the error entirely** (task ends normally). To fail upward, `raise(err)` inside `recover` |
 
 More traps (databases, serve, blockchain, secrets, charts): [pitfalls.md](pitfalls.md).

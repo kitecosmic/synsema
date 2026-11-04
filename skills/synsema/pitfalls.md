@@ -20,6 +20,20 @@ Read this FIRST if something fails. Each row is a real mistake that costs hours 
 > Coming from Python? The traps that LOOK like Python but aren't are also collected in
 > [python-diff.md](python-diff.md).
 
+## Upgrading to v0.6.55 — what behaves differently
+
+| You see | What changed | What to write |
+|---|---|---|
+| `a == 3` → ``== compares whole values; for elementwise: equal(a, 3)`` (`!=` → `not_equal`) | **breaking:** `==`/`!=` between an array and a number answered `false` in silence | `equal(a, 3)` for the mask; `==` between two arrays still compares whole values |
+| `a == [1, 2]` → ``== between an array and a list is never true — compare array(xs), or to_list(a) == xs`` | **breaking:** it answered `false` | `a == array(xs)` or `to_list(a) == xs` |
+| `when a` / `while m` / `assert(m)` → ``an array is not true or false — some(m) / every(m) for a mask, length(a) > 0 for "not empty"`` | **breaking:** a non-empty array counted as true | `some(m)`, `every(m)` or `length(a) > 0` |
+| `not m` / `m and x` → ``not needs true or false, got a mask — negate a mask with logical_not(m)`` | **breaking:** same rule for `and`/`or`/`not` and for a predicate that returns an array | `logical_not(m)`, `logical_and(m1, m2)`, `logical_or(m1, m2)` |
+| `-m` → ``Cannot negate a mask — logical_not(m) flips it; 0 - m gives the 0/-1 floats`` | **breaking:** a mask is not a number (numpy rejects it too) | `logical_not(m)` or `0 - m`; negating an `f64` array works |
+| `a > 2` gives `[false, true, …]` where it used to be an error | comparisons on arrays give a **mask** (`dtype` `"bool"`) | `where(a, m)`, `sum(m)`, `some(m)`, `if_else(m, x, y)` — builtins.md § Numeric arrays |
+| with `--labels`, a `recover` that assigns a public variable stops the run with ``cannot assign to 'fails' (public) under private control flow`` | **breaking:** a `try` whose body wrote into a private list, map or array runs its `recover` under that private context, as a read already did | move the write out of the `try`, or make the counter private (`let fails be private(0, "x")`) |
+| with `--labels`, `set xs[secret] to …` out of range is no longer caught by `try`: the run stops with `private(x)` and the place | an error of `set` that depends on private data (a private index, the length of a private list or array, the shape or type of a private value) stops the run like the same error in a read — its text showed the data | a `try` cannot catch it: keep a private index in range before the `set` |
+| `Cannot iterate over array` / `Cannot set index on array` are gone | `each x in a` walks the first axis; `set a[i] to v` writes the array | — |
+
 ## Upgrading to v0.6.54 — what behaves differently
 
 | You see | What changed | What to write |
@@ -150,7 +164,7 @@ Read this FIRST if something fails. Each row is a real mistake that costs hours 
 | `unknown parameter 'limt' — did you mean 'limit'?; the parameters are: limit, offset` | a named argument a task or builtin does not have; before, a misspelled name said the right one was missing | use a listed name (found when the call runs, not by `check`) |
 | `log(x)` → `Undefined variable: 'log' — in Synsema: ln(x) …` | `log` is the statement `log "message"` | `ln(x)`, `log10(x)`, `log2(x)`, `log_base(x, b)` |
 | `in_units(90, "minutes")` → `in_units() takes a duration, got number …` | a number is not a duration | `in_units(duration(seconds = 90), "minutes")` |
-| `each x in a` over an array → `Cannot iterate over array` | `each` walks lists | `each e in enumerate(a)` (v0.6.46+, first axis) or `to_list(a)` |
+| `each x in a` over an array → `Cannot iterate over array` | an engine before v0.6.55 (`each` walked lists only) | since v0.6.55 `each x in a` walks the first axis (elements of a 1-D array, rows of a matrix); on an older engine `each e in enumerate(a)` or `to_list(a)` |
 | `parquet_read(read_file_bytes(big))` to read a few columns | the whole file goes into memory | `parquet_scan(path, {"columns": […]})` reads only those pages |
 | in `@synsema/wasm`: `state_get: host kv.get failed: … must return a string or null, got a number` / `kv.list must return a list of strings, got …` | a host `kv` that fails or answers something else is an error, not an absent key (the next write used to replace what was stored) | return the stored text; `list` → an array of key names (map Cloudflare's `{keys:[{name}]}`) — see [deploy.md](deploy.md) § WebAssembly |
 | a labelled wasm/guest run under a `ceiling` fails at `declassify`; a Vela request returns `runtime_error` with `declassify is not granted …` in the log | the ceiling bounds `declassify`; the Vela guest runs under `stdout,declassify=app` | add `declassify=<principal>` to the ceiling; a Vela app publishes only `app` data |
@@ -604,7 +618,13 @@ byte-strings (text/bytes/number); structured data goes via `json_encode`/`json_d
 | `array * array` is the matrix product | It's **elementwise** (Hadamard) | Use `matmul(a, b)` for the matrix product (`dot` is 1-D vectors only since v0.6.29). `*` is elementwise. |
 | `inv`/`solve` of a singular matrix returns NaN | It **errors** (no silent NaN) | Check `det(A)` first, or `try/recover` |
 | Linear algebra works on n-D arrays | LA (`solve`/`det`/`eig`/`svd`) is **2D only** | Reshape to 2D; n-D is for storage/vectorized math (like `numpy.linalg`) |
-| An array holds ints/strings | Arrays are **f64** only (this version) | Use a `list` for mixed/other types; `to_list(a)` converts back |
+| An array holds ints/strings | An array holds **`f64`** numbers, or **`bool`** for the masks comparisons return (v0.6.55+); `array([true, false])` → `array expects numbers or nested lists of numbers, got bool` | Use a `list` for mixed/other types (`to_list(a)` converts back); a mask comes from a comparison (`a > 2`) |
+| `a[a > 2]` filters like numpy | ``an array is indexed by positions — for the elements where a mask is true: where(a, m)`` | `where(a, a > 2)`; the numpy three-argument `np.where(c, x, y)` is `if_else(c, x, y)` |
+| `set a[a > 2] to 0` | ``set takes positions, not a mask — if_else(m, 0, a) builds the new array`` | `set a to if_else(a > 2, 0, a)` |
+| `set a[0] to true` on a numeric array | ``an f64 array holds numbers, got bool — use 1.0`` | write `1.0` / `0.0` (a mask holds `true`/`false`) |
+| `take(M, [0, 2])` on a matrix flattens like numpy | ``take: say which axis of the 2-D array — axis = 0 for rows, axis = 1 for columns …`` | `take(M, [0, 2], axis = 1)`; for numpy's flat take, `take(flatten(M), …)` |
+| `set a[next_index()] to v` where the task also does `set a to …` | ``set: the index changed 'a' while it was being written … — compute the index into a variable first`` | `let i be next_index()` then `set a[i] to v` |
+| `let b be a` then `set b[0] to 9` changes `a` (numpy views) | value semantics: `a` stays as it was; an array nobody else holds is written in place, without a copy | nothing to do; to share one array, keep one name (or a module's exported array) |
 | `match x is {}` matches an empty map | Matches **any** map (`{}` is a map pattern) | To match an empty map use a guard: `is m when length(m) == 0` |
 | `match x is myvar` binds `myvar` | Top-level `is myvar` **compares** against the value of `myvar` (does NOT bind) | Binders live only inside `[...]`/`{...}`/variant patterns and `_`. To always match, use `is _`. |
 | `match x is {status}` works on a serve response value | Map patterns match plain `map` values, not server response values | Match the underlying map, or check fields with `of` |

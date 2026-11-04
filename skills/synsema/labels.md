@@ -375,6 +375,60 @@ the *caller's* loop, and whether a call does that is a question the engine canno
 the loop has already run. Write the `stop` in the loop it belongs to, and `give` a value to decide
 with.
 
+## Arrays (v0.6.55+)
+
+**Masks keep the label and never branch.** A comparison over a private array gives a private mask,
+and `sum(m)`, `where(a, m)`, `some(m)`, `if_else(m, x, y)` and `apply` give private results — no
+cut, because nothing ran under a private condition. This is why the mask is the native path for
+private data: `where(p, (v) => v > 2)` gives the same answer, but `when` on a private value inside
+your own loop is a private branch.
+
+```synsema
+require declassify("x")
+let p be private(array([1, 5, 2, 8]), "x")
+let m be p > 2
+print(declassify(sum(m), "x"))         -- 2
+print(declassify(where(p, m), "x"))    -- [5, 8]
+```
+
+**An array is private as a whole, not element by element.** Writing a private value into a public
+array stops the run:
+
+```
+label_violation: cannot write a value private to x into the array 'pub' (public): an array is
+private as a whole, not element by element — bind it as private(…, "<principal>") first, or
+declassify the value
+```
+
+Bind the array private (`let q be private(zeros(3), "x")`) and write into it. The check is against
+**the variable the array is reached from**, not the containers in between: `set m.a[0] to v` is
+checked against `m` (`… into an array reached through 'm' (the variable is public) …`). A private
+index into a public array is a violation too (`cannot write a position of the array 'xs' (public)
+with a key/context private to x …`).
+
+**Writing into an array inside a list or map takes indices that run no code**:
+`set L[0][f()] to 2` → `label_violation: an index that runs code writes into an array inside a list
+or map — compute the index into a variable first`. Write `let i be f()` and `set L[0][i] to 2`.
+
+**An error of `set` that depends on private data is not catchable** — a private index out of range
+(`set xs[secret]`), the length of a private list or array walked with a public index, the shape or
+type of a private value. It stops the run with `private(x)` and the place, like the same error in a
+read (`xs[secret]`). Before v0.6.55 a `try` caught it and its text showed the data.
+
+**A `try` whose body wrote into a private list, map or array runs its `recover` under that private
+context**, as if it had read it. A `recover` that then assigns a public variable stops the run:
+
+```
+label_violation: cannot assign to 'fails' (public) under private control flow (pc = [x]); declare
+it private first (let fails be private(<its initial value>, "x")) …
+```
+
+To count failures in public, move the write out of the `try`, or make the counter private
+(`let fails be private(0, "x")`).
+
+When the statement touched private data, the errors of the write reach the operator as a diagnostic
+and the program sees the fixed cut text (§ What a cut shows, and to whom).
+
 ## Errors
 
 An error that was **born under a private branch, or caused by private data**, is not catchable:

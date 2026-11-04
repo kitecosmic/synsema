@@ -51,6 +51,7 @@ parse there, but the fields are still named `kind` and `none` (`v.x.type` → no
 
 ## Operators
 Arithmetic: `+`, `-`, `*`, `/`, `//`, `%`, `**` (on `array`, these are **elementwise** with broadcasting — matrix product is `matmul`)
+- On arrays, `<` `<=` `>` `>=` are elementwise too and give a **mask** (a `bool` array, v0.6.55+); `==`/`!=` compare whole arrays, and against a number or a list they are an error that names `equal(a, x)` / `not_equal(a, x)`. An array is never a condition (`when a`, `not m`, `m and x` are errors naming `some`/`every`/`logical_*`). builtins.md § Numeric arrays.
 - `/` always returns float (like Python 3). `//` (v0.6.29+) is **floor division**: exact for integers of any size, integer result (`(10**30) // 3` → `333…333`, `-7 // 2` → `-4`); with floats it floors like Python (`7.5 // 2` → `3.0`), and float `//` / `%` give exactly CPython's (and numpy's) results (`7 // 0.1` → `69.0`, `7 % 0.1` → `0.09999999999999962`, because `0.1` is stored as slightly more than 0.1); decimal → decimal; `x // 0` → `Division by zero`. Invariant with `%`: `a == b * (a // b) + a % b`. Same precedence as `*` `/` `%`.
 - `**` binds tighter than unary minus and is right-associative (v0.6.29+): `-2 ** 2` → `-4`, `(-2) ** 2` → `4`, `2 ** -1` → `0.5`, `2 ** 3 ** 2` → `512`.
 
