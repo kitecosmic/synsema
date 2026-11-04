@@ -481,9 +481,10 @@ fn peek_elem(items: &crate::synlist::SynList, j: usize) -> NPeek {
     }
 }
 
-/// Si `v` es verdadero (`is_truthy`).
-pub fn truthy(v: &SynValue) -> bool {
-    v.is_truthy()
+/// Si `v` es verdadero (`is_truthy`); `None` si es un array, que no es verdadero ni falso (R4): el
+/// código nativo sale y la VM da el error.
+pub fn truthy(v: &SynValue) -> Option<bool> {
+    v.truth()
 }
 
 /// F4.7c: `length(v)` como el builtin (texto en caracteres, lista, mapa, bytes); `None` con lo demás

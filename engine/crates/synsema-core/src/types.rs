@@ -73,7 +73,9 @@ pub enum SynValue {
     /// devuelven arrays nuevos). La aritmética vectorizada (elementwise + broadcasting) se
     /// resuelve en `exec_binary`; el álgebra lineal (faer) opera sobre el caso 2D.
     /// `*` es ELEMENTWISE (Hadamard); el producto matricial es `matmul`/`dot`.
-    Array(Obj<ArrayD<f64>>),
+    /// v0.6.55: el contenido lleva su tipo de elemento (`NdArray`: `f64` o `bool`, la máscara),
+    /// detrás del mismo `Obj` para que `SynValue` no cambie de tamaño.
+    Array(Obj<NdArray>),
     /// Valor etiquetado con un conjunto de principales (`private`/`declassify`).
     /// Variante **aislada** (como `secret`): se computa normalmente (el intérprete
     /// desenvuelve, opera y re-envuelve con la unión de etiquetas) pero se redacta en
@@ -261,6 +263,18 @@ impl SynValue {
         }
     }
 
+    /// v0.6.55 (R4): la verdad de un valor en una condición. Como `is_truthy`, pero un array
+    /// (que no es verdadero ni falso) da `None`; el que pregunta arma el error.
+    #[inline]
+    pub fn truth(&self) -> Option<bool> {
+        match self {
+            SynValue::Bool(b) => Some(*b),
+            SynValue::Array(_) => None,
+            SynValue::Private(p) => p.value.truth(),
+            other => Some(other.is_truthy()),
+        }
+    }
+
     /// Igualdad por valor (operador `==`/`!=`, `match`, `contains`).
     pub fn syn_equals(&self, other: &SynValue) -> bool {
         match (self, other) {
@@ -427,7 +441,7 @@ impl fmt::Display for SynValue {
             SynValue::Complex(z) => write!(f, "{}", complex_display(z.re, z.im)),
             SynValue::Time(t) => write!(f, "{}", t),
             // Repr anidado estilo NumPy; ACOTADO a un resumen si size > 100.
-            SynValue::Array(a) => write!(f, "{}", array_display(a)),
+            SynValue::Array(a) => write!(f, "{}", nd_display(a)),
             // Redacción: nunca el valor (como `secret(NAME)`). Sella print/show/log/coerción-a-
             // texto fuera del despacho etiquetado. T5 (ronda 7): el texto NO lleva la etiqueta de
             // ESTE valor —variaba con cuál se había seleccionado y publicaba el dato— sino el
@@ -442,19 +456,31 @@ impl fmt::Display for SynValue {
 /// recorte de `.0` de los floats (enteros sin decimal). **Acotado**: si hay más de 100
 /// elementos, muestra un resumen `array(shape=[..], N elements)` (no vuelca millones).
 pub fn array_display(a: &ArrayD<f64>) -> String {
+    display_with(a, |x| trim_float(*x))
+}
+
+/// El repr de un `array` de cualquier tipo de elemento: una máscara se ve `[false, true]`.
+pub fn nd_display(a: &NdArray) -> String {
+    match a {
+        NdArray::F64(a) => array_display(a),
+        NdArray::Bool(a) => display_with(a, |b| if *b { "true".to_string() } else { "false".to_string() }),
+    }
+}
+
+fn display_with<T>(a: &ArrayD<T>, elem: impl Fn(&T) -> String + Copy) -> String {
     if a.len() > 100 {
         let shape: Vec<String> = a.shape().iter().map(|d| d.to_string()).collect();
         return format!("array(shape=[{}], {} elements)", shape.join(", "), a.len());
     }
-    fn rec(a: &ndarray::ArrayViewD<f64>) -> String {
+    fn rec<T>(a: &ndarray::ArrayViewD<T>, elem: impl Fn(&T) -> String + Copy) -> String {
         if a.ndim() == 0 {
-            trim_float(*a.first().unwrap())
+            elem(a.first().unwrap())
         } else {
-            let parts: Vec<String> = a.outer_iter().map(|s| rec(&s)).collect();
+            let parts: Vec<String> = a.outer_iter().map(|s| rec(&s, elem)).collect();
             format!("[{}]", parts.join(", "))
         }
     }
-    rec(&a.view())
+    rec(&a.view(), elem)
 }
 
 /// Float al estilo del lenguaje pero recortando un `.0` final (como el repr de Python
@@ -534,9 +560,137 @@ pub fn syn_bytes(b: impl Into<BytesRef>) -> SynValue {
 pub fn syn_complex(re: f64, im: f64) -> SynValue {
     SynValue::Complex(Complex64::new(re, im))
 }
-/// Construye un `array` (envuelve el `ArrayD<f64>` en `Rc`, inmutable compartido).
+/// Construye un `array` `f64` (envuelve el `ArrayD<f64>` en un `Obj`, inmutable compartido).
 pub fn syn_array(a: ArrayD<f64>) -> SynValue {
-    SynValue::Array(crate::types::Obj::new(a))
+    SynValue::Array(crate::types::Obj::new(NdArray::F64(a)))
+}
+/// Construye una máscara (array `bool`).
+pub fn syn_mask(a: ArrayD<bool>) -> SynValue {
+    SynValue::Array(crate::types::Obj::new(NdArray::Bool(a)))
+}
+
+// =========================================================
+// NdArray — el contenido de un `array` con su tipo de elemento (v0.6.55)
+// =========================================================
+//
+// specs/v0.6.55-diseno.md §2. Los nombres de `dtype` son fijos: `f64`, `bool` y (0.6.56) `f32`.
+// Las operaciones que no miran el tipo piden `to_f64()`: prestado si es `F64`, convertido a 0/1
+// si es `Bool` (R2). Sólo las que dependen del tipo (comparaciones, `sum`, máscaras, escritura,
+// salida y snapshots) hacen `match`. Agregar `F32` es un brazo más acá y en esos pocos sitios.
+
+/// El contenido de un `array`: un bloque n-dimensional de un solo tipo de elemento.
+#[derive(Clone, Debug)]
+pub enum NdArray {
+    F64(ArrayD<f64>),
+    /// Una máscara: lo que da una comparación.
+    Bool(ArrayD<bool>),
+}
+
+impl NdArray {
+    /// El nombre del tipo de elemento, como lo devuelve `dtype(a)`.
+    pub fn dtype(&self) -> &'static str {
+        match self {
+            NdArray::F64(_) => "f64",
+            NdArray::Bool(_) => "bool",
+        }
+    }
+    pub fn shape(&self) -> &[usize] {
+        match self {
+            NdArray::F64(a) => a.shape(),
+            NdArray::Bool(a) => a.shape(),
+        }
+    }
+    pub fn ndim(&self) -> usize {
+        self.shape().len()
+    }
+    /// La cantidad total de elementos (como `ArrayD::len`).
+    pub fn len(&self) -> usize {
+        match self {
+            NdArray::F64(a) => a.len(),
+            NdArray::Bool(a) => a.len(),
+        }
+    }
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+    /// Los números del array: prestados si es `f64`; una máscara se convierte a 0/1 (R2).
+    #[inline]
+    pub fn to_f64(&self) -> std::borrow::Cow<'_, ArrayD<f64>> {
+        match self {
+            NdArray::F64(a) => std::borrow::Cow::Borrowed(a),
+            NdArray::Bool(a) => std::borrow::Cow::Owned(a.mapv(|b| if b { 1.0 } else { 0.0 })),
+        }
+    }
+    /// El bloque `f64` si el array es `f64` (sin convertir).
+    #[inline]
+    pub fn as_f64(&self) -> Option<&ArrayD<f64>> {
+        match self {
+            NdArray::F64(a) => Some(a),
+            _ => None,
+        }
+    }
+}
+
+/// Igualdad del valor entero (R3): mismo tipo de elemento, misma forma y mismos valores; un
+/// `NaN` nunca es igual a otro (como `array_equal` de numpy).
+impl PartialEq for NdArray {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (NdArray::F64(a), NdArray::F64(b)) => a == b,
+            (NdArray::Bool(a), NdArray::Bool(b)) => a == b,
+            _ => false,
+        }
+    }
+}
+
+impl From<ArrayD<f64>> for NdArray {
+    fn from(a: ArrayD<f64>) -> Self {
+        NdArray::F64(a)
+    }
+}
+impl From<ArrayD<bool>> for NdArray {
+    fn from(a: ArrayD<bool>) -> Self {
+        NdArray::Bool(a)
+    }
+}
+
+/// Los datos de un array en un snapshot (`SendValue::Array`), con su tipo de elemento.
+#[derive(Clone, Debug, PartialEq)]
+pub enum SendArray {
+    F64(Vec<f64>),
+    Bool(Vec<bool>),
+}
+
+impl SendArray {
+    /// Cantidad de elementos.
+    pub fn len(&self) -> usize {
+        match self {
+            SendArray::F64(d) => d.len(),
+            SendArray::Bool(d) => d.len(),
+        }
+    }
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+    /// Bytes que ocupan los datos (para los topes de tamaño de los sumideros).
+    pub fn byte_len(&self) -> usize {
+        match self {
+            SendArray::F64(d) => d.len() * 8,
+            SendArray::Bool(d) => d.len(),
+        }
+    }
+    /// Reconstruye el bloque con esa forma. Si no cuadra (no debería: el snapshot es
+    /// consistente), cae a 1-D con los datos.
+    pub fn to_nd(&self, shape: &[usize]) -> NdArray {
+        fn build<T: Clone>(shape: &[usize], d: &[T]) -> ArrayD<T> {
+            ArrayD::from_shape_vec(ndarray::IxDyn(shape), d.to_vec())
+                .unwrap_or_else(|_| ArrayD::from_shape_vec(ndarray::IxDyn(&[d.len()]), d.to_vec()).unwrap())
+        }
+        match self {
+            SendArray::F64(d) => NdArray::F64(build(shape, d)),
+            SendArray::Bool(d) => NdArray::Bool(build(shape, d)),
+        }
+    }
 }
 
 // =========================================================
@@ -563,8 +717,9 @@ pub enum SendValue {
     Bytes(Vec<u8>),
     /// Snapshot de un complejo (re, im): cruza el blackboard como copia owned (G7).
     Complex(f64, f64),
-    /// Snapshot de un array (shape, datos row-major): cruza el blackboard como copia (G7).
-    Array(Vec<usize>, Vec<f64>),
+    /// Snapshot de un array (shape, datos row-major con su tipo): cruza el blackboard como copia
+    /// (G7).
+    Array(Vec<usize>, SendArray),
     /// T5 (auditoría ronda 3, bloqueante 3) — valor con ETIQUETA de flujo: los principales como
     /// texto owned (el `Label` del intérprete es `Rc<[Rc<str>]>` y no es `Send`) más el valor
     /// envuelto. Es la ÚNICA forma en que un privado cruza un snapshot —globales de `serve`,
@@ -639,7 +794,13 @@ pub fn to_send(v: &SynValue) -> SendValue {
         // Snapshot del complejo (re, im): copia owned (G7).
         SynValue::Complex(z) => SendValue::Complex(z.re, z.im),
         // Snapshot del array (shape + datos row-major): copia owned (G7).
-        SynValue::Array(a) => SendValue::Array(a.shape().to_vec(), a.iter().copied().collect()),
+        SynValue::Array(a) => SendValue::Array(
+            a.shape().to_vec(),
+            match &**a {
+                NdArray::F64(x) => SendArray::F64(x.iter().copied().collect()),
+                NdArray::Bool(x) => SendArray::Bool(x.iter().copied().collect()),
+            },
+        ),
         SynValue::Time(t) => SendValue::Time((**t).clone()),
         // T5: la etiqueta VIAJA con el valor (ronda 3, bloqueante 3). Los sumideros del host
         // (`share`/`signal`/`bus_publish`/`parallel_map`…) siguen rechazando un privado ANTES de
@@ -670,14 +831,8 @@ pub fn from_send(v: &SendValue) -> SynValue {
         }
         SendValue::Bytes(v) => syn_bytes(v.clone()),
         SendValue::Complex(re, im) => syn_complex(*re, *im),
-        // Reconstruye el array desde shape + datos. Si la shape no cuadra con los datos
-        // (no debería: el snapshot es consistente), cae a un array 1D con los datos.
-        SendValue::Array(shape, data) => {
-            match ArrayD::from_shape_vec(ndarray::IxDyn(shape), data.clone()) {
-                Ok(a) => syn_array(a),
-                Err(_) => syn_array(ArrayD::from_shape_vec(ndarray::IxDyn(&[data.len()]), data.clone()).unwrap()),
-            }
-        }
+        // Reconstruye el array desde shape + datos, con su tipo de elemento.
+        SendValue::Array(shape, data) => SynValue::Array(crate::types::Obj::new(data.to_nd(shape))),
         // T5 — restaura la etiqueta al otro lado del snapshot. `label_from` normaliza (ordena,
         // dedupea, descarta vacíos) y `mark` respeta los invariantes de la variante (nunca
         // privado de privado, nunca etiqueta vacía, nunca privado de secret).
@@ -715,12 +870,7 @@ impl fmt::Display for SendValue {
             // Mismo formato `re±imi` que `SynValue::Complex`.
             SendValue::Complex(re, im) => write!(f, "{}", complex_display(*re, *im)),
             // Reconstruye el array y reusa el repr NumPy-like.
-            SendValue::Array(shape, data) => {
-                match ArrayD::from_shape_vec(ndarray::IxDyn(shape), data.clone()) {
-                    Ok(a) => write!(f, "{}", array_display(&a)),
-                    Err(_) => write!(f, "array(shape=[{}])", shape.iter().map(|d| d.to_string()).collect::<Vec<_>>().join(", ")),
-                }
-            }
+            SendValue::Array(shape, data) => write!(f, "{}", nd_display(&data.to_nd(shape))),
         }
     }
 }

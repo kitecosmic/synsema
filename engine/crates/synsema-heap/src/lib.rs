@@ -926,6 +926,24 @@ impl<T> Obj<T> {
         }
     }
 
+    /// `&mut` con exactamente `owners` dueños conocidos y sin débiles, nunca si es inmortal (como
+    /// `get_mut` con una cuenta mayor). Es la escritura en el lugar de `set a[i]` (v0.6.55): el
+    /// camino del `set` dejó el valor único en su lugar (`make_unique`) y lo recorre con una copia
+    /// de la referencia, así que los dueños son el lugar y esa copia.
+    ///
+    /// # Safety
+    /// Los otros `owners - 1` dueños no pueden leer el valor ni tener un `&T` vivo mientras dure el
+    /// `&mut`; ven la escritura después (como la lista de un lugar, que se escribe por su `RefCell`).
+    pub unsafe fn get_mut_with_owners(this: &Self, owners: usize) -> Option<&mut T> {
+        let h = this.header();
+        if owners >= 1 && h.strong.get() as usize == owners && h.strong.get() != IMMORTAL && h.weak.get() == 0 {
+            // SAFETY: lo garantiza quien llama (ver arriba); inmortal no: lo leen otros hilos.
+            Some(unsafe { &mut *this.ptr.as_ref().value.get() })
+        } else {
+            None
+        }
+    }
+
     /// `&mut` copiando antes si no es el único dueño (como `Rc::make_mut`).
     pub fn make_mut(this: &mut Self) -> &mut T
     where
@@ -1951,5 +1969,48 @@ mod tests {
         assert_eq!(drops.get(), 149);
         drop(inner);
         assert_eq!(drops.get(), 150);
+    }
+
+    /// `get_mut_with_owners` (v0.6.55, la escritura en el lugar de `set a[i]`): da `&mut` sólo con la
+    /// cuenta exacta, sin débiles y nunca a un inmortal; lo escrito lo ve el otro dueño. Corre con Miri.
+    #[test]
+    fn obj_get_mut_with_owners_needs_the_exact_count() {
+        let a = Obj::new(vec![1, 2, 3]);
+        let b = a.clone();
+        // SAFETY (del test): `b` no se lee mientras dura el `&mut`.
+        unsafe {
+            assert!(Obj::get_mut_with_owners(&a, 0).is_none());
+            assert!(Obj::get_mut_with_owners(&a, 1).is_none());
+            assert!(Obj::get_mut_with_owners(&a, 3).is_none());
+            Obj::get_mut_with_owners(&a, 2).expect("dos dueños")[1] = 20;
+        }
+        assert_eq!(*b, vec![1, 20, 3]);
+        drop(b);
+        // SAFETY (del test): `a` es el único dueño.
+        unsafe { Obj::get_mut_with_owners(&a, 1).expect("uno")[0] = 10 };
+        assert_eq!(*a, vec![10, 20, 3]);
+
+        // Con un débil vivo, no: el débil puede subir a fuerte y leer.
+        let w = Obj::downgrade(&a);
+        // SAFETY (del test): sin otros dueños fuertes.
+        unsafe { assert!(Obj::get_mut_with_owners(&a, 1).is_none()) };
+        drop(w);
+        // SAFETY (del test): igual que arriba.
+        unsafe { assert!(Obj::get_mut_with_owners(&a, 1).is_some()) };
+
+        // Un inmortal lo leen otros hilos: nunca.
+        let v = Obj::new(7);
+        Obj::make_immortal(&v);
+        let vptr = v.ptr;
+        // SAFETY (del test): no hay otros dueños.
+        unsafe {
+            assert!(Obj::get_mut_with_owners(&v, 1).is_none());
+            // La cuenta de un inmortal es `u32::MAX`: pedir justo esa cantidad tampoco lo abre.
+            assert!(Obj::get_mut_with_owners(&v, u32::MAX as usize).is_none());
+            assert!(Obj::get_mut_with_owners(&v, usize::MAX).is_none());
+        }
+        drop(v);
+        // SAFETY (del test): la reserva del inmortal sigue viva y nadie más la usa.
+        unsafe { alloc::dealloc(vptr.as_ptr().cast(), Layout::new::<Inner<i32>>()) };
     }
 }

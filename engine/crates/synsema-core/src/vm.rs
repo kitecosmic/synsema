@@ -111,7 +111,8 @@ pub(crate) enum Ins {
     /// `partial_cmp_num`/`num_eq` de la referencia (`2**53 + 1` no es igual a `9007199254740992.0`).
     NumCmp { dst: Reg, op: BinOp, a: Opnd, b: Opnd, fb: u16 },
     Unary { dst: Reg, op: UnOp, a: Opnd },
-    ToBool { dst: Reg, src: Opnd },
+    /// v0.6.55: `why` nombra el `and`/`or` en el error de un array (R4).
+    ToBool { dst: Reg, src: Opnd, why: TruthAt },
     Jump { to: u32 },
     /// F4.2: el salto hacia atrás de un `while` cuando hay nivel nativo. Cuenta vueltas (la cuenta
     /// regresiva de `chunk.loops[lp]`) y, caliente, entra al bucle compilado a mitad de camino
@@ -120,7 +121,8 @@ pub(crate) enum Ins {
     /// `first..first + n` se sueltan antes); `n = 0` en un `while`.
     #[cfg(feature = "native-tier")]
     LoopBack { to: u32, lp: u16, first: u16, n: u16 },
-    JumpIfFalsy { src: Opnd, to: u32 },
+    /// v0.6.55: `why` nombra la condición en el error de un array (R4).
+    JumpIfFalsy { src: Opnd, to: u32, why: TruthAt },
     LetLocal { src: Opnd, slot: u16, dst: Reg },
     /// F3.3b: lo mismo sobre la ventana de locales (el compilador sabe el modo: el despacho de
     /// las demás instrucciones no pregunta por él).
@@ -1202,7 +1204,7 @@ impl<'r, 's> Compiler<'r, 's> {
                 }
                 let c = self.expr(condition);
                 self.at(&n.location);
-                self.emit(Ins::JumpIfFalsy { src: c, to: exit });
+                self.emit(Ins::JumpIfFalsy { src: c, to: exit, why: TruthAt::Cond });
                 if let Some(d) = want {
                     let k = self.konst(SynValue::Nothing);
                     self.emit(Ins::Const { dst: d, k });
@@ -1273,7 +1275,7 @@ impl<'r, 's> Compiler<'r, 's> {
                         let c = self.expr(g);
                         let l = self.label();
                         self.at(&arm.location);
-                        self.emit(Ins::JumpIfFalsy { src: c, to: l });
+                        self.emit(Ins::JumpIfFalsy { src: c, to: l, why: TruthAt::Cond });
                         l
                     });
                     self.block(body, want, true);
@@ -1597,7 +1599,7 @@ impl<'r, 's> Compiler<'r, 's> {
         self.at(&n.location);
         let other = self.label();
         let end = self.label();
-        self.emit(Ins::JumpIfFalsy { src: c, to: other });
+        self.emit(Ins::JumpIfFalsy { src: c, to: other, why: TruthAt::Cond });
         self.block(body, want, true);
         self.emit(Ins::Jump { to: end });
         self.bind(other);
@@ -1826,24 +1828,24 @@ impl<'r, 's> Compiler<'r, 's> {
                 let short = self.label();
                 let end = self.label();
                 if *operator == BinOp::And {
-                    self.emit(Ins::JumpIfFalsy { src: l, to: short });
+                    self.emit(Ins::JumpIfFalsy { src: l, to: short, why: TruthAt::And });
                 } else {
                     // `or`: si el lado izquierdo es verdadero, `true` sin evaluar el derecho.
-                    self.emit(Ins::ToBool { dst, src: l });
-                    self.emit(Ins::JumpIfFalsy { src: Opnd::Copy(dst), to: short });
+                    self.emit(Ins::ToBool { dst, src: l, why: TruthAt::Or });
+                    self.emit(Ins::JumpIfFalsy { src: Opnd::Copy(dst), to: short, why: TruthAt::Or });
                     let k = self.konst(syn_bool(true));
                     self.emit(Ins::Const { dst, k });
                     self.emit(Ins::Jump { to: end });
                     self.bind(short);
                     let r = self.expr(right);
                     self.at(&n.location);
-                    self.emit(Ins::ToBool { dst, src: r });
+                    self.emit(Ins::ToBool { dst, src: r, why: TruthAt::Or });
                     self.bind(end);
                     return Opnd::Reg(dst);
                 }
                 let r = self.expr(right);
                 self.at(&n.location);
-                self.emit(Ins::ToBool { dst, src: r });
+                self.emit(Ins::ToBool { dst, src: r, why: TruthAt::And });
                 self.emit(Ins::Jump { to: end });
                 self.bind(short);
                 let k = self.konst(syn_bool(false));
@@ -1888,7 +1890,7 @@ impl<'r, 's> Compiler<'r, 's> {
                     let fb = self.feedback;
                     self.feedback = self.feedback.saturating_add(1);
                     self.emit(Ins::Binary { dst, op: *op, a: prev, b: Opnd::Copy(cur), fb });
-                    self.emit(Ins::JumpIfFalsy { src: Opnd::Copy(dst), to: fail });
+                    self.emit(Ins::JumpIfFalsy { src: Opnd::Copy(dst), to: fail, why: TruthAt::And });
                     if i + 1 == operators.len() {
                         self.emit(Ins::Drop { r: cur });
                     }
@@ -3049,7 +3051,14 @@ impl Interpreter {
                     self.put(base, dst, v);
                     Ok(())
                 })(),
-                Ins::ToBool { dst, src } => self.opnd(&chunk, &env, base, src, at).map(|v| self.put(base, dst, syn_bool(v.is_truthy()))),
+                Ins::ToBool { dst, src, why } => self.opnd(&chunk, &env, base, src, at).and_then(|v| {
+                    let t = match v.truth() {
+                        Some(t) => t,
+                        None => return Err(array_truth_error_at(&v, why, &chunk.locs[chunk.loc[at] as usize])),
+                    };
+                    self.put(base, dst, syn_bool(t));
+                    Ok(())
+                }),
                 Ins::Jump { to } => {
                     pc = to as usize;
                     Ok(())
@@ -3094,10 +3103,15 @@ impl Interpreter {
                     }
                     r
                 }
-                Ins::JumpIfFalsy { src, to } => self.opnd(&chunk, &env, base, src, at).map(|v| {
-                    if !v.is_truthy() {
+                Ins::JumpIfFalsy { src, to, why } => self.opnd(&chunk, &env, base, src, at).and_then(|v| {
+                    let t = match v.truth() {
+                        Some(t) => t,
+                        None => return Err(array_truth_error_at(&v, why, &chunk.locs[chunk.loc[at] as usize])),
+                    };
+                    if !t {
                         pc = to as usize;
                     }
+                    Ok(())
                 }),
                 Ins::LetRLocal { src, slot, dst } => self.opnd(&chunk, &env, base, src, at).map(|v| {
                     let k = self.vm_lbase + slot as usize;
@@ -4245,11 +4259,36 @@ impl Interpreter {
             if done {
                 v
             } else {
-                set_leaf_index(&obj, &i, v, &chunk.locs[d.target_loc as usize], &chunk.locs[chunk.loc[at] as usize])?
+                // La VM no corre con etiquetas: no hay envoltorio `Private` que mirar (M21).
+                let root_now = || self.vm_root_ptr(chunk, env, base, d.root).map(|p| (p, false));
+                set_leaf_index(
+                    &obj,
+                    &i,
+                    v,
+                    &chunk.nodes[d.node as usize],
+                    &chunk.locs[d.target_loc as usize],
+                    &chunk.locs[chunk.loc[at] as usize],
+                    &root_now,
+                    false,
+                    false,
+                )?
             }
         };
         self.put(base, d.dst, out);
         Ok(())
+    }
+
+    /// El array que tiene ahora la variable raíz de un camino (B2 de la ronda 2): sólo lo pide la hoja
+    /// de un `set` sobre un array.
+    #[inline(never)]
+    fn vm_root_ptr(&self, chunk: &Chunk, env: &Rc<RefCell<Environment>>, base: usize, root: Root) -> Option<usize> {
+        match root {
+            Root::Param(r) => array_ptr_of(&self.vm_regs[base + r as usize]),
+            Root::Win(k) => self.vm_locals[self.vm_lbase + k as usize].as_ref().and_then(array_ptr_of),
+            Root::Local(k) => env.borrow_mut().bindings.slot_mut(k as usize).and_then(|v| array_ptr_of(v)),
+            Root::Free { name, .. } => env_get(env, &chunk.names[name as usize]).and_then(|v| array_ptr_of(&v)),
+            Root::Slow => None,
+        }
     }
 
     #[inline(never)]

@@ -264,6 +264,61 @@ fn err_validation(msg: impl Into<String>, field: Option<String>) -> Control {
 fn err_at(msg: impl Into<String>, loc: &SourceLocation) -> Control {
     Control::Error(RuntimeError::at(msg, loc.clone()))
 }
+
+/// v0.6.55 (R4): dónde se pidió la verdad de un valor, para el texto del error de un array.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum TruthAt {
+    /// `when`, `while`, una guarda, `assert`, `invariant`, una plantilla.
+    Cond,
+    And,
+    Or,
+    Not,
+}
+
+const ARRAY_NOT_A_CONDITION: &str =
+    "an array is not true or false — some(m) / every(m) for a mask, length(a) > 0 for \"not empty\"";
+
+/// v0.6.55 (R4): la verdad de un valor en una condición; un array no es verdadero ni falso.
+#[inline]
+pub(crate) fn truth(v: &SynValue, at: TruthAt, loc: &SourceLocation) -> Result<bool, Control> {
+    match v.truth() {
+        Some(b) => Ok(b),
+        None => Err(array_truth_error_at(v, at, loc)),
+    }
+}
+
+/// El error de R4 con la ubicación de la condición (N1 de la auditoría de v0.6.55).
+#[inline(never)]
+pub(crate) fn array_truth_error_at(v: &SynValue, at: TruthAt, loc: &SourceLocation) -> Control {
+    crate::arrays::located(array_truth_error(v, at), loc)
+}
+
+/// La verdad de lo que devolvió el predicado de un builtin (`where`, `some`, …): el error del
+/// `when`, con el nombre de la función.
+#[inline]
+pub(crate) fn pred_truth(v: &SynValue, who: &str, loc: &SourceLocation) -> Result<bool, Control> {
+    match v.truth() {
+        Some(b) => Ok(b),
+        None => Err(pred_truth_error(who, loc)),
+    }
+}
+
+#[inline(never)]
+fn pred_truth_error(who: &str, loc: &SourceLocation) -> Control {
+    err_at(format!("{}: the function returned an array — {}", who, ARRAY_NOT_A_CONDITION), loc)
+}
+
+#[inline(never)]
+pub(crate) fn array_truth_error(v: &SynValue, at: TruthAt) -> Control {
+    let mask = matches!(crate::labels::unwrap(v), SynValue::Array(a) if a.as_f64().is_none());
+    let got = if mask { "a mask" } else { "an array" };
+    match at {
+        TruthAt::Cond => err(ARRAY_NOT_A_CONDITION),
+        TruthAt::And => err(format!("and needs true or false, got {} — combine masks with logical_and(m1, m2)", got)),
+        TruthAt::Or => err(format!("or needs true or false, got {} — combine masks with logical_or(m1, m2)", got)),
+        TruthAt::Not => err(format!("not needs true or false, got {} — negate a mask with logical_not(m)", got)),
+    }
+}
 /// v0.6.46 (C6): un argumento con nombre que la task o el builtin no tiene. Dice los que tiene (la
 /// firma es dato: es lo que ve un modelo que arma la llamada) y el más cercano si hay uno. Frío:
 /// está en el camino de llamada y sólo corre al fallar.
@@ -853,6 +908,12 @@ struct ModuleRegistry {
     by_map: HashMap<usize, (synsema_heap::WeakTail<MapObj>, std::rc::Weak<RefCell<Environment>>)>,
     by_env: HashMap<usize, (synsema_heap::WeakTail<MapObj>, std::rc::Weak<RefCell<Environment>>)>,
     prune_at: usize,
+    /// Sube con cada registro: una respuesta guardada de `module_view_holds` (M29) vale sólo mientras
+    /// ningún entorno haya cambiado de mapa.
+    generation: u64,
+    /// La última respuesta positiva de `module_view_holds`: (entorno, mapa, generación, posición de la
+    /// exportación en el mapa). Los `Weak` no retienen nada (el registro ya guarda los mismos).
+    view_hit: Option<(std::rc::Weak<RefCell<Environment>>, synsema_heap::WeakTail<MapObj>, u64, usize)>,
 }
 
 thread_local! {
@@ -871,6 +932,7 @@ pub fn register_module(map: &crate::types::MapRef, env: &Rc<RefCell<Environment>
         }
         r.by_map.insert(crate::types::MapRef::as_ptr(map).cast::<()>() as usize, (crate::types::MapRef::downgrade(map), Rc::downgrade(env)));
         r.by_env.insert(Rc::as_ptr(env) as usize, (crate::types::MapRef::downgrade(map), Rc::downgrade(env)));
+        r.generation += 1;
     });
 }
 
@@ -1054,12 +1116,23 @@ pub(crate) fn set_leaf_prop(obj: &SynValue, property_name: &str, value: SynValue
 
 /// La hoja de `set <camino>[idx] to v` (ver `set_leaf_prop`). `target_loc`: la del destino (el
 /// error de fuera de rango, como la lectura `xs[i]`); `loc`: la de la sentencia.
+///
+/// `root_now`: el array que tiene AHORA la variable raíz y si su envoltorio `Private` está compartido
+/// (sólo se pide si la hoja es un array; B2 de la ronda 2, M21 de la ronda 4). `labels`: corre con
+/// `--labels` (la guarda por lista o mapa; B3 de la ronda 3). `touched`: además, la sentencia tocó algo
+/// privado o corre bajo un PC privado: los errores de la escritura salen como diagnóstico del sistema
+/// (M16 de la ronda 3); sin nada privado son errores comunes (M22 de la ronda 4).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn set_leaf_index(
     obj: &SynValue,
     idx: &SynValue,
     value: SynValue,
+    target: &Node,
     target_loc: &SourceLocation,
     loc: &SourceLocation,
+    root_now: &dyn Fn() -> Option<(usize, bool)>,
+    labels: bool,
+    touched: bool,
 ) -> Result<SynValue, Control> {
     match obj {
         SynValue::List(l) => {
@@ -1091,7 +1164,170 @@ pub(crate) fn set_leaf_index(
             m.borrow_mut().set_value_key(idx, value.clone());
             Ok(value)
         }
+        // v0.6.55 (ítem 3, R5): en el lugar; el error de un índice, donde está el destino.
+        SynValue::Array(_) => {
+            let depth = index_depth(target);
+            // A través de una lista o un mapa la identidad no se puede verificar (B2 de la ronda 2): un
+            // índice que corre código podría religar la raíz y dejar el array viejo en otra variable,
+            // pública, y entonces el valor —o la posición, si el índice es privado (B3 de la ronda 3)—
+            // caería en ese alias. Con `--labels` es un error por la FORMA del camino, sin mirar ningún
+            // dato: el error mismo no dice nada de un valor privado.
+            // Sin nada privado en la sentencia es un error común (M22 de la ronda 4): la regla no depende
+            // de datos, así que atraparlo no dice nada, y un diagnóstico del sistema retendría la salida
+            // diciendo que depende de datos privados.
+            if labels && depth != Some(crate::arrays::chain_len(obj) + 1) && path_runs_code(target) {
+                const MSG: &str = "label_violation: an index that runs code writes into an array inside a list or map — compute the index into a variable first";
+                return Err(if touched { err_labels(MSG, target_loc) } else { err_at(MSG, target_loc) });
+            }
+            let (now, shared) = match depth {
+                Some(_) => root_now().map_or((None, false), |(p, s)| (Some(p), s)),
+                None => (None, false),
+            };
+            let rooted = crate::arrays::Rooted { depth, now, labels: touched, shared };
+            crate::arrays::set_index(obj, idx, value, set_root_identifier(target), rooted).map_err(|e| {
+                let mut e = crate::arrays::located(e, target_loc);
+                // Un diagnóstico de etiquetas viaja con el nombre del archivo, como `err_labels`.
+                if let Control::Error(r) = &mut e {
+                    if r.from_labels {
+                        if let Some(l) = r.location.as_mut() {
+                            l.file = basename_of(&l.file).into();
+                        }
+                    }
+                }
+                e
+            })
+        }
         _ => Err(cannot_set(obj, "index", loc)),
+    }
+}
+
+/// Cuántos índices van de la variable a la hoja de un `set` (`a[i]` → 1, `M[i][j]` → 2); `None` si el
+/// camino pasa por un campo.
+fn index_depth(target: &Node) -> Option<usize> {
+    let mut n = target;
+    let mut d = 0;
+    loop {
+        match &n.kind {
+            NodeKind::IndexAccess { object, .. } => {
+                d += 1;
+                n = object;
+            }
+            NodeKind::Identifier { .. } => return Some(d),
+            _ => return None,
+        }
+    }
+}
+
+/// ¿Algún índice del camino de un `set` puede correr código (una llamada)? Conservador: lo que no es
+/// una variable, un literal o una cuenta entre ellos cuenta como que sí.
+fn path_runs_code(target: &Node) -> bool {
+    fn runs(n: &Node) -> bool {
+        match &n.kind {
+            NodeKind::Identifier { .. }
+            | NodeKind::NumberLiteral { .. }
+            | NodeKind::TextLiteral { .. }
+            | NodeKind::BoolLiteral { .. } => false,
+            NodeKind::BinaryOp { left, right, .. } => runs(left) || runs(right),
+            NodeKind::UnaryOp { operand, .. } => runs(operand),
+            NodeKind::PropertyAccess { object, .. } => runs(object),
+            NodeKind::IndexAccess { object, index } => runs(object) || runs(index),
+            _ => true,
+        }
+    }
+    let mut n = target;
+    loop {
+        match &n.kind {
+            NodeKind::IndexAccess { object, index } => {
+                if runs(index) {
+                    return true;
+                }
+                n = object;
+            }
+            NodeKind::PropertyAccess { object, .. } => n = object,
+            _ => return false,
+        }
+    }
+}
+
+/// La dirección del array de `v` (adentro de un valor privado también), para comparar identidades.
+pub(crate) fn array_ptr_of(v: &SynValue) -> Option<usize> {
+    match labels::unwrap(v) {
+        SynValue::Array(a) => Some(crate::types::Obj::as_ptr(a) as usize),
+        _ => None,
+    }
+}
+
+/// La raíz de un `set` en el árbol (M21 de la ronda 4): el array de `v` y si su envoltorio `Private`
+/// tiene otro dueño además de la variable y de esta copia (`v`, la que dio `env_get`). La entrada del
+/// mapa de exportaciones de un módulo es la otra vista del mismo nombre, no un alias (N7 de la ronda 5):
+/// `exported` dice si la variable es una exportación que tiene ese mismo envoltorio, y sólo se pregunta
+/// cuando la cuenta pasa de 2.
+fn array_root_of(v: &SynValue, exported: impl FnOnce() -> bool) -> Option<(usize, bool)> {
+    let p = array_ptr_of(v)?;
+    let shared = match v {
+        SynValue::Private(w) => match crate::types::Obj::strong_count(w) {
+            n if n <= 2 => false,
+            3 => !exported(),
+            _ => true,
+        },
+        _ => false,
+    };
+    Some((p, shared))
+}
+
+/// ¿El binding `name` de `scope` (su entorno, de `binding_scope`) es una exportación de su módulo y el
+/// mapa de exportaciones tiene ese mismo contenedor `v`? (N7 de la ronda 5.) En un bucle de `set` sobre
+/// un array privado exportado se pregunta en cada vuelta (M29 de la ronda 6).
+fn module_view_holds(scope: &Rc<RefCell<Environment>>, name: &str, v: &SynValue) -> bool {
+    if !scope.borrow().name.starts_with("module:") {
+        return false;
+    }
+    // La última respuesta positiva, si sigue valiendo: el mismo entorno, ningún registro desde
+    // entonces (así que el mismo mapa) y, en la posición guardada, la clave `name` con este mismo
+    // contenedor. Es el predicado entero; sólo se ahorra buscar la posición (M29 de la ronda 6).
+    let (hit, generation) = MODULES.with(|r| {
+        let r = r.borrow();
+        let hit = r.view_hit.as_ref().and_then(|(env, map, g, i)| {
+            if *g != r.generation || !env.upgrade().is_some_and(|e| Rc::ptr_eq(&e, scope)) {
+                return None;
+            }
+            let m = map.upgrade()?;
+            let m = m.borrow();
+            let (k, x) = m.get_index(*i)?;
+            Some(k.as_str() == name && same_container(x, v))
+        });
+        (hit, r.generation)
+    });
+    if hit == Some(true) {
+        return true;
+    }
+    let Some(m) = module_map_of_env(scope) else { return false };
+    let found = m.borrow().get_full(name).filter(|(_, _, x)| same_container(x, v)).map(|(i, _, _)| i);
+    match found {
+        Some(i) => {
+            MODULES.with(|r| r.borrow_mut().view_hit = Some((Rc::downgrade(scope), crate::types::MapRef::downgrade(&m), generation, i)));
+            true
+        }
+        None => false,
+    }
+}
+
+/// El entorno donde está el binding `name` (el del scope más cercano que lo tiene).
+fn binding_scope(env: &Rc<RefCell<Environment>>, name: &str) -> Option<Rc<RefCell<Environment>>> {
+    let mut cur = env.clone();
+    loop {
+        let next = {
+            let e = cur.borrow();
+            if e.bindings.contains_key(name) {
+                drop(e);
+                return Some(cur);
+            }
+            e.parent.clone()
+        };
+        match next {
+            Some(p) => cur = p,
+            None => return None,
+        }
     }
 }
 
@@ -1166,6 +1402,7 @@ fn same_container(a: &SynValue, b: &SynValue) -> bool {
         (SynValue::List(x), SynValue::List(y)) => crate::types::ListRef::ptr_eq(x, y),
         (SynValue::Map(x), SynValue::Map(y)) => crate::types::MapRef::ptr_eq(x, y),
         (SynValue::Private(x), SynValue::Private(y)) => crate::types::Obj::ptr_eq(x, y),
+        (SynValue::Array(x), SynValue::Array(y)) => crate::types::Obj::ptr_eq(x, y),
         _ => false,
     }
 }
@@ -1188,14 +1425,23 @@ fn with_unique_binding<R>(
             let is_module = e.name.starts_with("module:");
             if let Some(slot) = e.bindings.get_mut(name) {
                 let view = if is_module { module_map_of_env(&cur) } else { None };
-                let exported = view.as_ref().is_some_and(|m| m.borrow().contains_key(name));
-                let shared_with_view = exported
-                    && view.as_ref().is_some_and(|m| m.borrow().get(name).is_some_and(|v| same_container(v, slot)));
+                // Una sola consulta al mapa: si es una exportación y si tiene este mismo contenedor.
+                let (exported, shared_with_view) = match view.as_ref().map(|m| m.borrow().get(name).map(|v| same_container(v, slot))) {
+                    Some(Some(same)) => (true, same),
+                    _ => (false, false),
+                };
                 make_unique_n(slot, if shared_with_view { 1 } else { 0 });
                 let out = f(slot);
                 if exported {
                     if let Some(m) = view {
-                        m.borrow_mut().insert(name.to_string(), slot.clone());
+                        // `set` reescribe la entrada que ya existe, sin armar una clave nueva en cada
+                        // escritura (M29 de la ronda 6); `insert` hacía lo mismo, con la reserva.
+                        m.borrow_mut().set(name, slot.clone());
+                    }
+                    // v0.6.55 (B1 de la auditoría): un array se escribe en el lugar sólo con la
+                    // cuenta exacta de dueños; la vista del mapa es uno más, y la hoja lo sabe por acá.
+                    if let SynValue::Array(a) = slot {
+                        crate::arrays::note_module_view(a);
                     }
                 }
                 return Some(out);
@@ -2679,6 +2925,10 @@ impl Interpreter {
     /// v0.6.47 (T1, A1): el agente adopta el corte de la corrida que lo lanzó.
     pub fn set_run_cut(&mut self, cut: std::sync::Arc<RunCut>) {
         self.run_cut = cut;
+        // v0.6.55 (M27 de la ronda 5): una corrida nueva en este hilo (cada entrada de un worker de
+        // `serve`, del handler del guest, de un agente) no hereda las entradas muertas de un `set` que
+        // falló en la anterior: cada una retenía una copia entera del array. Las vivas no se tocan.
+        crate::arrays::drop_dead_places();
     }
 
     /// v0.6.47 (T1, A1): `Some` si un agente de la corrida se cortó por etiquetas. El error ya sale
@@ -4989,7 +5239,7 @@ impl Interpreter {
         // llm_stream(prompt, context, on_chunk) — genera invocando la task/lambda
         // `on_chunk` con cada fragmento (F2); devuelve el texto completo. Mismo gate `llm`.
         self.register("llm_stream", 3, Rc::new(|i, a, l| i.b_llm_stream(a, l)));
-        self.register("where", 2, Rc::new(|i, a, l| i.b_where(a, l)));
+        self.register("where", -1, Rc::new(|i, a, l| i.b_where(a, l)));
         self.register("collect", 2, Rc::new(|i, a, l| i.b_collect(a, l)));
         self.register("transform", -1, Rc::new(|i, a, l| i.b_transform(a, l)));
         self.register("reduce", -1, Rc::new(|i, a, l| i.b_reduce(a, l)));
@@ -5000,9 +5250,9 @@ impl Interpreter {
         // v0.6.29 (DATOS-3): `[{key, items}]` en orden de aparición, la clave con su tipo.
         self.register("group_by", 2, Rc::new(|i, a, _l| crate::tabular::group_by(i, a)));
         self.register("find_first", 2, Rc::new(|i, a, l| i.b_find_first(a, l)));
-        self.register("every", 2, Rc::new(|i, a, l| i.b_every(a, l)));
-        self.register("some", 2, Rc::new(|i, a, l| i.b_some(a, l)));
-        self.register("count_where", 2, Rc::new(|i, a, l| i.b_count_where(a, l)));
+        self.register("every", -1, Rc::new(|i, a, l| i.b_every(a, l)));
+        self.register("some", -1, Rc::new(|i, a, l| i.b_some(a, l)));
+        self.register("count_where", -1, Rc::new(|i, a, l| i.b_count_where(a, l)));
         self.register("flatten", 1, Rc::new(|i, a, l| i.b_flatten(a, l)));
         self.register("zip_with", 3, Rc::new(|i, a, l| i.b_zip_with(a, l)));
         // Mini-stdlib (batch DX). Nacen con UN orden canónico (lista primero, el de la
@@ -5229,7 +5479,8 @@ impl Interpreter {
         // DATOS-12: generadores con semilla (puros).
         self.register("rng", 1, Rc::new(|_i, a, _l| crate::rng::make_rng(a)));
         self.register("rng_spawn", 2, Rc::new(|_i, a, _l| crate::rng::b_spawn(a)));
-        self.register("random_normal", 1, Rc::new(|i, a, l| crate::rng::b_normal(i, a, l)));
+        self.register("random_normal", -1, Rc::new(|i, a, l| crate::rng::b_normal(i, a, l)));
+        self.register("random_uniform", -1, Rc::new(|i, a, l| crate::rng::b_uniform(i, a, l)));
         self.register("shuffle", 2, Rc::new(|i, a, l| crate::rng::b_shuffle(i, a, l)));
         self.register("sample", 3, Rc::new(|i, a, l| crate::rng::b_sample(i, a, l)));
         self.register("choice", 2, Rc::new(|i, a, l| crate::rng::b_choice(i, a, l)));
@@ -5650,6 +5901,11 @@ impl Interpreter {
                 // No puede llegarle al siguiente (ni al setup).
                 let saved_taint = self.take_taint();
                 let result = self.exec_block(body, &test_env);
+                // v0.6.55 (M25 de la ronda 5): el runner atrapa el error del bloque y sigue con el
+                // próximo: un `set` que falló a mitad de camino no le deja una copia del array retenida.
+                if result.is_err() {
+                    crate::arrays::drop_dead_places();
+                }
                 // Ronda 1 (M3): un bloque que llamó `exit` le pide al host que detenga sus agentes.
                 let exited = matches!(&result, Err(Control::Error(e)) if e.exit_code.is_some());
                 let mut outcome = match result {
@@ -5896,21 +6152,21 @@ impl Interpreter {
                 // Python): `x or default` NO es un idioma de Synsema.
                 // El booleano sale con la unión de las etiquetas de lo evaluado.
                 if *operator == BinOp::And {
-                    if !l.is_truthy() {
+                    if !truth(&l, TruthAt::And, loc)? {
                         let res = syn_bool(false);
                         return if self.labels { self.join_operands(res, &l, None, loc) } else { Ok(res) };
                     }
                     let r = if self.labels { self.exec_right_under(&l, right, env)? } else { self.exec(right, env)? };
-                    let res = syn_bool(r.is_truthy());
+                    let res = syn_bool(truth(&r, TruthAt::And, loc)?);
                     return if self.labels { self.join_operands(res, &l, Some(&r), loc) } else { Ok(res) };
                 }
                 if *operator == BinOp::Or {
-                    if l.is_truthy() {
+                    if truth(&l, TruthAt::Or, loc)? {
                         let res = syn_bool(true);
                         return if self.labels { self.join_operands(res, &l, None, loc) } else { Ok(res) };
                     }
                     let r = if self.labels { self.exec_right_under(&l, right, env)? } else { self.exec(right, env)? };
-                    let res = syn_bool(r.is_truthy());
+                    let res = syn_bool(truth(&r, TruthAt::Or, loc)?);
                     return if self.labels { self.join_operands(res, &l, Some(&r), loc) } else { Ok(res) };
                 }
                 // `x // nota`: un comentario al estilo C se lee como división entera por la
@@ -5958,11 +6214,11 @@ impl Interpreter {
                     let c = self.exec_binary(prev, *op, cur.clone(), loc)?;
                     let joined = match acc {
                         Some(a) if self.labels => {
-                            self.join_operands(syn_bool(c.is_truthy()), &a, Some(&c), loc)?
+                            self.join_operands(syn_bool(truth(&c, TruthAt::And, loc)?), &a, Some(&c), loc)?
                         }
                         _ => c,
                     };
-                    if !joined.is_truthy() {
+                    if !truth(&joined, TruthAt::And, loc)? {
                         return if self.labels {
                             self.join_operands(syn_bool(false), &joined, None, loc)
                         } else {
@@ -6032,6 +6288,8 @@ impl Interpreter {
             // -- Control de flujo --
             NodeKind::WhenStatement { condition, body, otherwise, otherwise_when } => {
                 let cond = self.exec(condition, env)?;
+                // v0.6.55 (R4): antes de tomar el PC, que un error no lo deje puesto.
+                let yes = truth(&cond, TruthAt::Cond, loc)?;
                 // Condición privada (a cualquier profundidad, B3) → toda la cadena
                 // when/otherwise corre bajo su etiqueta de PC (flujo implícito); se saca al
                 // salir, también en error. El valor IMPLÍCITO de la cadena sale con el PC (B2).
@@ -6046,14 +6304,14 @@ impl Interpreter {
                         }
                         self.pc_push(&l);
                     }
-                    let r = self.exec_when_branches(cond.is_truthy(), body, otherwise_when, otherwise, env);
+                    let r = self.exec_when_branches(yes, body, otherwise_when, otherwise, env);
                     let r = r.and_then(|v| self.pc_mark(v, loc));
                     if !l.is_empty() {
                         self.pc_pop();
                     }
                     return r;
                 }
-                self.exec_when_branches(cond.is_truthy(), body, otherwise_when, otherwise, env)
+                self.exec_when_branches(yes, body, otherwise_when, otherwise, env)
             }
             NodeKind::EachStatement { variable, collection, body } => {
                 // `each i in range(…)` sin armar la lista (atajo, F1.11; ver `each_over_range`).
@@ -6160,8 +6418,13 @@ impl Interpreter {
                             break;
                         }
                     };
-                    if !cond.is_truthy() {
-                        break;
+                    match truth(&cond, TruthAt::Cond, loc) {
+                        Ok(true) => {}
+                        Ok(false) => break,
+                        Err(e) => {
+                            outcome = Err(e);
+                            break;
+                        }
                     }
                     // Condición con etiquetas (profundo, B3) → el cuerpo de ESTA
                     // iteración y su valor implícito (B2) van bajo PC.
@@ -6807,7 +7070,7 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                 self.note_seen(&l);
             }
         }
-        if !result.is_truthy() {
+        if !truth(&result, TruthAt::Cond, loc)? {
             let desc = description.clone().unwrap_or_else(|| "unnamed invariant".to_string());
             return Err(err_at(format!("Invariant violation: {}", desc), loc));
         }
@@ -7582,6 +7845,8 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
             // que se recuperan.
             Err(Control::Error(e)) if e.is_halt() => Err(Control::Error(e)),
             Err(Control::Error(e)) => {
+                // N6 (ronda 4): los `set` que fallaron adentro del `try` no dejan sus entradas.
+                crate::arrays::drop_dead_places();
                 let msg = strip_loc_prefix(&e.to_string());
                 let recover_env = Environment::child_scope(env, "recover");
                 let mut ev = syn_text(msg);
@@ -7763,7 +8028,7 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                     if self.labels {
                         extra = labels::union(&extra, &labels::label_deep(gv));
                     }
-                    if !gv.is_truthy() {
+                    if !truth(gv, TruthAt::Cond, loc)? {
                         continue; // guard falso → próximo arm
                     }
                 }
@@ -7838,10 +8103,15 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
             UnOp::Neg => match &v {
                 SynValue::Number(n) => Ok(syn_number(n.neg())),
                 SynValue::Complex(z) => Ok(SynValue::Complex(-z)),
+                // M13 (ronda 2): una máscara no es un número, como `-true`.
+                SynValue::Array(a) if a.dtype() == "bool" => Err(err_at(
+                    "Cannot negate a mask — logical_not(m) flips it; 0 - m gives the 0/-1 floats",
+                    loc,
+                )),
                 SynValue::Array(a) => Ok(crate::arrays::negate(a)),
                 _ => Err(err_at(format!("Cannot negate {}", v.type_name()), loc)),
             },
-            UnOp::Not => Ok(syn_bool(!v.is_truthy())),
+            UnOp::Not => Ok(syn_bool(!truth(&v, TruthAt::Not, loc)?)),
         }
     }
 
@@ -7894,10 +8164,10 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
         // Lógicos: el cortocircuito vive en `exec` (BinaryOp); acá sólo llega un
         // `and`/`or` ya evaluado por ambos lados (callers internos).
         if op == BinOp::And {
-            return Ok(syn_bool(left.is_truthy() && right.is_truthy()));
+            return Ok(syn_bool(truth(&left, TruthAt::And, loc)? && truth(&right, TruthAt::And, loc)?));
         }
         if op == BinOp::Or {
-            return Ok(syn_bool(left.is_truthy() || right.is_truthy()));
+            return Ok(syn_bool(truth(&left, TruthAt::Or, loc)? || truth(&right, TruthAt::Or, loc)?));
         }
         // `x in xs` / `x not in xs` (v0.6.29): pertenencia en lista, clave de mapa,
         // subtexto o subsecuencia de bytes — la misma igualdad que `contains`.
@@ -8062,7 +8332,7 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
             && (matches!(left, SynValue::Array(_)) || matches!(right, SynValue::Array(_)))
         {
             if let Some(res) = crate::arrays::array_binop(&left, &right, op.as_str()) {
-                return res;
+                return res.map_err(|e| crate::arrays::located(e, loc));
             }
         }
         // Fechas, instantes y duraciones (v0.6.29).
@@ -8117,6 +8387,10 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
         // (`group_by`, `unique`, …) siguen usando la igualdad total de `probe_key`.
         if matches!(op, BinOp::Eq | BinOp::Ne) {
             let eq = crate::tabular::strict_equals(&left, &right).map_err(|_| err_at(MIX_DECIMAL_FLOAT, loc))?;
+            // v0.6.55 (R3): un array contra lo que no es su igual da error, salvo `nothing`.
+            if !eq && (matches!(left, SynValue::Array(_)) || matches!(right, SynValue::Array(_))) {
+                crate::arrays::array_eq_mismatch(&left, &right, op.as_str()).map_err(|e| crate::arrays::located(e, loc))?;
+            }
             return Ok(syn_bool(if op == BinOp::Eq { eq } else { !eq }));
         }
         // Orden
@@ -8125,12 +8399,9 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
             if matches!(left, SynValue::Complex(_)) || matches!(right, SynValue::Complex(_)) {
                 return Err(err_at("complex numbers are not ordered", loc));
             }
-            // Comparación elementwise de arrays = futuro (§12). Por ahora, error claro (G3).
+            // v0.6.55 (R1): con un array de un lado, una máscara (función fría).
             if matches!(left, SynValue::Array(_)) || matches!(right, SynValue::Array(_)) {
-                return Err(err_at(
-                    "arrays do not support ordering comparisons (use elementwise functions)",
-                    loc,
-                ));
+                return crate::arrays::array_compare(&left, &right, op.as_str()).map_err(|e| crate::arrays::located(e, loc));
             }
             if let (SynValue::Number(a), SynValue::Number(b)) = (&left, &right) {
                 if Number::mixes_decimal_float(a, b) {
@@ -8200,6 +8471,9 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                 // Escritura a través de un contenedor privado o bajo PC (ver
                 // `set_through_labels`): la etiqueta vive en la variable raíz del camino.
                 let (obj, value) = if self.labels && (obj.is_private() || !self.pc_is_empty()) {
+                    // B4 (ronda 4): lo que se desenvuelve queda anotado, como en una lectura: un error
+                    // de la escritura que depende de él sale marcado y no se atrapa.
+                    self.note_seen(&labels::label(&obj));
                     self.set_through_labels(target, obj, labels::empty(), value, env, loc, escape_pc)?
                 } else {
                     (obj, value)
@@ -8217,13 +8491,35 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                         // Una clave LITERAL sólo puede llevar el PC (B5): es texto del programa,
                         // No una clave privada (el PC se suma aparte, salvo `escape_pc`).
                         let key_label = if is_scalar_literal(index) { labels::empty() } else { labels::label_deep(&idx) };
+                        // B4 (ronda 4): el contenedor y el índice que se desenvuelven quedan anotados,
+                        // como en `index_read`: un error de la escritura (fuera de rango, forma, tipo)
+                        // depende de ellos, así que sale marcado, redactado y sin atraparse.
+                        self.note_seen(&labels::union(&labels::label(&obj), &labels::label_deep(&idx)));
                         let (obj, value) =
                             self.set_through_labels(target, obj, key_label, value, env, loc, escape_pc)?;
                         (obj, labels::unwrap(&idx).clone(), value)
                     } else {
                         (obj, idx, value)
                     };
-                set_leaf_index(&obj, &idx, value, &target.location, loc)
+                // Un array no guarda un elemento privado: el valor tiene que ser a lo sumo tan
+                // privado como la variable (R6: la etiqueta es del array entero).
+                let value = if self.labels && matches!(obj, SynValue::Array(_)) && labels::has_label_deep(&value) {
+                    self.array_set_value(target, &obj, value, env, loc)?
+                } else {
+                    value
+                };
+                let root_now = || {
+                    let n = set_root_identifier(target)?;
+                    let v = env_get(env, n)?;
+                    array_root_of(&v, || binding_scope(env, n).is_some_and(|scope| module_view_holds(&scope, n, &v)))
+                };
+                // `seen` ya tiene todo lo privado que la sentencia desenvolvió (el camino, el índice, el
+                // valor: B4). Ni el valor ni el PC hace falta mirarlos aparte (M23 de la ronda 4): el valor
+                // de un array ya llega sin etiqueta (anotada en `array_set_value`), y bajo un PC privado un
+                // índice que no es literal lleva el PC, así que el contenedor tiene que cubrirlo y ya está
+                // en `seen`. Si algo se escapara de esta cuenta, el error saldría redactado: seguro.
+                let touched = self.labels && !self.seen.is_empty();
+                set_leaf_index(&obj, &idx, value, target, &target.location, loc, &root_now, self.labels, touched)
             }
             _ => Err(err_at("Invalid set target", loc)),
         }
@@ -8267,6 +8563,7 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
             return Ok((labels::unwrap(&obj).clone(), value));
         }
         let what = match root {
+            Some(name) if matches!(labels::unwrap(&obj), SynValue::Array(_)) => format!("a position of the array '{}'", name),
             Some(name) => format!("a position of '{}'", name),
             None => "a position of a container that is not a variable".to_string(),
         };
@@ -8279,6 +8576,52 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
             ),
             loc,
         ))
+    }
+
+    /// `set a[i] to v` con `v` privado (v0.6.55, R6): un array no tiene elementos privados, así que
+    /// `v` tiene que ser a lo sumo tan privado como la variable raíz, y se escribe sin la etiqueta.
+    #[inline(never)]
+    fn array_set_value(
+        &mut self,
+        target: &Node,
+        obj: &SynValue,
+        value: SynValue,
+        env: &Rc<RefCell<Environment>>,
+        loc: &SourceLocation,
+    ) -> Result<SynValue, Control> {
+        let root = set_root_identifier(target);
+        let have = root.and_then(|n| env_get(env, n)).map(|v| labels::label(&v)).unwrap_or_else(labels::empty);
+        let got = labels::label_deep(&value);
+        // B4 (ronda 4): no hace falta anotar `got` en `seen`: sólo pasa si está contenida en la de la
+        // raíz, y la raíz ya quedó anotada (en la hoja si el camino es directo, en el primer paso si no).
+        if labels::subset(&got, &have) {
+            return Ok(labels::strip_deep(&value));
+        }
+        let have_text = if have.is_empty() { "public".to_string() } else { format!("private to {}", self.safe_label(&have)) };
+        let root = root.unwrap_or("?");
+        // M30 (ronda 6): si el array no es la variable (`set m.a[0]`, `set L[0][1]`), el texto no le dice
+        // «array» a `m` ni «public» a un array que puede ser privado: nombra la variable por la que se
+        // llega, que es contra la que se compara. El array es la variable si el camino va de ella al array
+        // sólo por índices sobre arrays, como lo decide la guarda de `set_leaf_index`, no la sintaxis (M31
+        // de la ronda 7). Se calcula acá, fuera de `exec_set`, que es caliente.
+        let direct = index_depth(target) == Some(crate::arrays::chain_len(obj) + 1);
+        let msg = if direct {
+            format!(
+                "label_violation: cannot write a value private to {} into the array '{}' ({}): an array is private as a whole, not element by element — bind it as private(…, \"<principal>\") first, or declassify the value",
+                self.safe_label(&got),
+                root,
+                have_text
+            )
+        } else {
+            format!(
+                "label_violation: cannot write a value private to {} into an array reached through '{}' (the variable is {}): a write into an array is checked against the variable it is reached from, not the containers in between — bind '{}' as private(…, \"<principal>\"), or declassify the value",
+                self.safe_label(&got),
+                root,
+                have_text,
+                root
+            )
+        };
+        Err(err_labels(msg, loc))
     }
 
     /// Lectura de un campo (`m.k`, `k of m`): la misma para una expresión y para el
@@ -8409,7 +8752,12 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                 }
             }
             // `a[i]` → fila (nD) o escalar (1D). Negativo/fuera de rango → error.
-            SynValue::Array(a) => crate::arrays::index_row(a, num_to_i64(&idx)?),
+            SynValue::Array(a) => match &idx {
+                SynValue::Number(_) => crate::arrays::index_row(a, num_to_i64(&idx)?),
+                // v0.6.55 (ítem 2): `a[[1, 0]]`, `a[array([0, 3])]`; una máscara da el error de `where`.
+                _ => crate::arrays::index_by(a, &idx),
+            }
+            .map_err(|e| crate::arrays::located(e, loc)),
             _ => Err(err_at(format!("Cannot index into {}", obj.type_name()), loc)),
         };
         match plabel {
@@ -8478,6 +8826,15 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                 if let Some(slot) = m.borrow_mut().get_mut(&key) {
                     make_unique(slot);
                 }
+            }
+            // v0.6.55 (R5): `set M[i][j]`: la ficha de la fila; la hoja escribe directo en `M`.
+            SynValue::Array(_) => {
+                // B4 (ronda 4): el padre y el índice que se desenvuelven quedan anotados, como en
+                // `index_read` (las listas y los mapas pasan por ahí).
+                if self.labels && (parent.is_private() || labels::has_label_deep(&idx)) {
+                    self.note_seen(&labels::union(&labels::label(&parent), &labels::label_deep(&idx)));
+                }
+                return crate::arrays::place_row(labels::unwrap(&parent), labels::unwrap(&idx)).map_err(|e| crate::arrays::located(e, loc));
             }
             _ => {}
         }
@@ -9247,7 +9604,7 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
             }
             SynValue::Number(n) => Ok(SynValue::Number(n.clone())), // Int/Big ya son enteros
             // v0.6.29: sobre un array, elemento a elemento (sigue siendo un array de floats).
-            SynValue::Array(a) => Ok(crate::types::syn_array(a.mapv(op))),
+            SynValue::Array(a) => Ok(crate::types::syn_array(a.to_f64().mapv(op))),
             _ => Err(err(format!("{} expects a number, got {}", name, v.type_name()))),
         }
     }
@@ -9696,8 +10053,8 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
 
     /// `assert(cond, msg?)` → `nothing` si `cond` es truthy; si no, error de aserción con
     /// `msg` (o `"assertion failed"`).
-    fn b_assert(&mut self, args: &[SynValue], _loc: &SourceLocation) -> Result<SynValue, Control> {
-        if nth(args, 0)?.is_truthy() {
+    fn b_assert(&mut self, args: &[SynValue], loc: &SourceLocation) -> Result<SynValue, Control> {
+        if truth(nth(args, 0)?, TruthAt::Cond, loc)? {
             return Ok(SynValue::Nothing);
         }
         let msg = match args.get(1) {
@@ -9754,8 +10111,11 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                 Err(Control::Error(e))
             }
             Err(Control::Error(e)) if e.is_halt() => Err(Control::Error(e)),
-            // Lanzó un error → la aserción pasa.
-            Err(Control::Error(_)) => Ok(SynValue::Nothing),
+            // Lanzó un error → la aserción pasa (N6 de la ronda 4: sin dejar entradas de un `set`).
+            Err(Control::Error(_)) => {
+                crate::arrays::drop_dead_places();
+                Ok(SynValue::Nothing)
+            }
             // Retornó normal (incl. un `give`, que `call_value` materializa como Ok) → falla.
             Ok(_) => Err(err_assertion("expected an error, but none was raised")),
             // `give`/`stop` fuera de un task se propagan como hoy (no son "el error esperado").
@@ -10300,9 +10660,7 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                     return Err(err("Cannot slice a 0-dimensional array"));
                 }
                 let (s, e) = py_slice_range(a.shape()[0], start, end);
-                Ok(crate::types::syn_array(
-                    a.slice_axis(ndarray::Axis(0), ndarray::Slice::from(s..e)).to_owned(),
-                ))
+                Ok(crate::arrays::slice_rows(a, s, e))
             }
             _ => Err(err(format!("Cannot slice {}", coll.type_name()))),
         }
@@ -10677,24 +11035,129 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
         Ok((a2.clone(), a, b))
     }
 
+    /// `apply` sobre un array, fuera de línea (v0.6.55, perf-guard): con el `Cow` de `to_f64` adentro
+    /// de `b_apply`/`b_where`, el bucle de LISTAS de esos builtins pagaba 2 instrucciones más por
+    /// elemento (`s_each_list` +0,29 %). Sin `#[cold]` (donde-nace-cada-cosa §C: sólo con PGO).
+    #[inline(never)]
+    fn apply_array(&mut self, func: SynValue, a: &crate::types::NdArray, loc: &SourceLocation) -> Result<SynValue, Control> {
+        let a = a.to_f64();
+        let mut out = Vec::with_capacity(a.len());
+        // v0.6.55: si todos los resultados son bool, el resultado es una máscara.
+        let mut bools: Vec<bool> = Vec::new();
+        for x in a.iter() {
+            let r = self.call_value(func.clone(), vec![syn_float(*x)], loc)?;
+            // v0.6.55 (1b, R6): con etiquetas, la lambda devuelve `Private` (el PC del despacho
+            // etiquetado, o un privado capturado). Un array no guarda elementos etiquetados: se
+            // desenvuelve, la etiqueta pasa a `seen` y `call_builtin_labelled` envuelve el array
+            // entero una vez. Antes caía al error y el error llevaba el valor privado.
+            let r = match r {
+                SynValue::Private(p) => {
+                    self.note_seen(&p.label);
+                    p.value.clone()
+                }
+                other => other,
+            };
+            match r {
+                SynValue::Number(n) if bools.is_empty() => out.push(n.to_f64()),
+                SynValue::Bool(b) if out.is_empty() => bools.push(b),
+                other => {
+                    return Err(err(format!(
+                        "apply over an array needs numbers back, got {} — use to_list(a) for other results",
+                        other.type_name()
+                    )))
+                }
+            }
+        }
+        if !bools.is_empty() {
+            return Ok(crate::types::syn_mask(
+                ndarray::ArrayD::from_shape_vec(a.raw_dim(), bools).map_err(|e| err(e.to_string()))?,
+            ));
+        }
+        Ok(crate::types::syn_array(
+            ndarray::ArrayD::from_shape_vec(a.raw_dim(), out).map_err(|e| err(e.to_string()))?,
+        ))
+    }
+
+    /// `where(a, pred)` sobre un array: los elementos que cumplen, como array 1-D. Fuera de línea,
+    /// como `apply_array`.
+    #[inline(never)]
+    fn where_array(&mut self, pred: SynValue, a: &crate::types::NdArray, loc: &SourceLocation) -> Result<SynValue, Control> {
+        let a = a.to_f64();
+        let mut out = Vec::new();
+        for x in a.iter() {
+            if pred_truth(&self.call_value(pred.clone(), vec![syn_float(*x)], loc)?, "where", loc)? {
+                out.push(*x);
+            }
+        }
+        let n = out.len();
+        Ok(crate::types::syn_array(
+            ndarray::ArrayD::from_shape_vec(ndarray::IxDyn(&[n]), out).map_err(|e| err(e.to_string()))?,
+        ))
+    }
+
+    /// `some`/`every`/`count_where` sobre un array (v0.6.55): con una máscara sola, sus verdaderos;
+    /// con un predicado, recorre todos los elementos (una máscara los da como bool). Fuera de línea,
+    /// como `apply_array`.
+    #[inline(never)]
+    fn quantify_array(&mut self, args: &[SynValue], who: &str, loc: &SourceLocation) -> Result<SynValue, Control> {
+        use crate::types::NdArray;
+        let (yes, total) = if args.len() == 1 {
+            match &args[0] {
+                SynValue::Array(a) => match &**a {
+                    NdArray::Bool(m) => (m.iter().filter(|b| **b).count(), m.len()),
+                    NdArray::F64(_) => {
+                        return Err(err(format!(
+                            "{} expects a mask (bool array) or a predicate, got a f64 array — compare first: a > 0",
+                            who
+                        )))
+                    }
+                },
+                other => {
+                    return Err(err(format!(
+                        "{} with one argument takes a mask (bool array), got {} — with a list: {}(xs, (x) => …)",
+                        who,
+                        other.type_name(),
+                        who
+                    )))
+                }
+            }
+        } else {
+            let Some((pred, a)) = fn_and_array(args) else {
+                return Err(err(format!("{} expects a list or array and a predicate ((x) => …)", who)));
+            };
+            let elems: Vec<SynValue> = match &*a {
+                NdArray::F64(x) => x.iter().map(|v| syn_float(*v)).collect(),
+                NdArray::Bool(x) => x.iter().map(|v| syn_bool(*v)).collect(),
+            };
+            let total = elems.len();
+            let mut yes = 0usize;
+            for x in elems {
+                let r = self.call_value(pred.clone(), vec![x], loc)?;
+                if let SynValue::Private(p) = &r {
+                    self.note_seen(&p.label);
+                }
+                if pred_truth(&r, who, loc)? {
+                    yes += 1;
+                    if who == "some" {
+                        break;
+                    }
+                } else if who == "every" {
+                    break;
+                }
+            }
+            (yes, total)
+        };
+        Ok(match who {
+            "some" => syn_bool(yes > 0),
+            "every" => syn_bool(yes == total),
+            _ => syn_int(yes as i64),
+        })
+    }
+
     fn b_apply(&mut self, args: &[SynValue], loc: &SourceLocation) -> Result<SynValue, Control> {
         // v0.6.29 (DATOS-11): sobre un array, elemento a elemento → array de la misma forma.
         if let Some((func, a)) = fn_and_array(args) {
-            let mut out = Vec::with_capacity(a.len());
-            for x in a.iter() {
-                match self.call_value(func.clone(), vec![syn_float(*x)], loc)? {
-                    SynValue::Number(n) => out.push(n.to_f64()),
-                    other => {
-                        return Err(err(format!(
-                            "apply over an array needs numbers back, got {} — use to_list(a) for other results",
-                            other.type_name()
-                        )))
-                    }
-                }
-            }
-            return Ok(crate::types::syn_array(
-                ndarray::ArrayD::from_shape_vec(a.raw_dim(), out).map_err(|e| err(e.to_string()))?,
-            ));
+            return self.apply_array(func, &a, loc);
         }
         let (func, l) = self.dual_fn_rc(args, "apply")?;
         let n = l.borrow().len();
@@ -10918,23 +11381,23 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
     fn b_where(&mut self, args: &[SynValue], loc: &SourceLocation) -> Result<SynValue, Control> {
         // v0.6.29 (DATOS-11): la máscara con nombre — los elementos que cumplen, como array 1-D.
         if let Some((pred, a)) = fn_and_array(args) {
-            let mut out = Vec::new();
-            for x in a.iter() {
-                if self.call_value(pred.clone(), vec![syn_float(*x)], loc)?.is_truthy() {
-                    out.push(*x);
-                }
-            }
-            let n = out.len();
-            return Ok(crate::types::syn_array(
-                ndarray::ArrayD::from_shape_vec(ndarray::IxDyn(&[n]), out).map_err(|e| err(e.to_string()))?,
+            return self.where_array(pred, &a, loc);
+        }
+        // v0.6.55: `where(a, m)` con una máscara; el `np.where` de tres argumentos es `if_else`.
+        if args.len() == 3 {
+            return Err(err(
+                "where takes a list or array and a predicate or mask; numpy's where(cond, x, y) is if_else(cond, x, y)",
             ));
+        }
+        if let Some(SynValue::Array(a)) = args.first() {
+            return crate::arrays::where_mask(a, nth(args, 1)?);
         }
         let (pred, l) = self.dual_fn_rc(args, "where")?;
         self.with_lambda(&pred, |it, lc| {
             let mut out = SynList::new();
             for i in 0..l.borrow().len() {
                 let (item, r) = lc.item_keep(it, &l, i, loc)?;
-                if r.is_truthy() {
+                if pred_truth(&r, "where", loc)? {
                     out.push(item);
                 }
             }
@@ -10967,7 +11430,7 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
         for i in 0..n {
             let item = list_values(&l)[i].clone();
             let should = match &pred {
-                Some(p) => self.call_fast(p, &mut [item.clone()], loc)?.is_truthy(),
+                Some(p) => pred_truth(&self.call_fast(p, &mut [item.clone()], loc)?, "transform", loc)?,
                 None => true,
             };
             if should {
@@ -11054,7 +11517,7 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
         self.with_lambda(&pred, |it, lc| {
             for i in 0..l.borrow().len() {
                 let (item, r) = lc.item_keep(it, &l, i, loc)?;
-                if r.is_truthy() {
+                if pred_truth(&r, "find_first", loc)? {
                     return Ok(item);
                 }
             }
@@ -11063,10 +11526,13 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
     }
 
     fn b_every(&mut self, args: &[SynValue], loc: &SourceLocation) -> Result<SynValue, Control> {
+        if args.len() == 1 || args.iter().any(|a| matches!(a, SynValue::Array(_))) {
+            return self.quantify_array(args, "every", loc);
+        }
         let (pred, l) = self.dual_fn_rc(args, "every")?;
         self.with_lambda(&pred, |it, lc| {
             for i in 0..l.borrow().len() {
-                if !lc.item(it, &l, i, loc)?.is_truthy() {
+                if !pred_truth(&lc.item(it, &l, i, loc)?, "every", loc)? {
                     return Ok(syn_bool(false));
                 }
             }
@@ -11075,10 +11541,13 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
     }
 
     fn b_some(&mut self, args: &[SynValue], loc: &SourceLocation) -> Result<SynValue, Control> {
+        if args.len() == 1 || args.iter().any(|a| matches!(a, SynValue::Array(_))) {
+            return self.quantify_array(args, "some", loc);
+        }
         let (pred, l) = self.dual_fn_rc(args, "some")?;
         self.with_lambda(&pred, |it, lc| {
             for i in 0..l.borrow().len() {
-                if lc.item(it, &l, i, loc)?.is_truthy() {
+                if pred_truth(&lc.item(it, &l, i, loc)?, "some", loc)? {
                     return Ok(syn_bool(true));
                 }
             }
@@ -11087,11 +11556,14 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
     }
 
     fn b_count_where(&mut self, args: &[SynValue], loc: &SourceLocation) -> Result<SynValue, Control> {
+        if args.len() == 1 || args.iter().any(|a| matches!(a, SynValue::Array(_))) {
+            return self.quantify_array(args, "count_where", loc);
+        }
         let (pred, l) = self.dual_fn_rc(args, "count_where")?;
         self.with_lambda(&pred, |it, lc| {
             let mut count: i64 = 0;
             for i in 0..l.borrow().len() {
-                if lc.item(it, &l, i, loc)?.is_truthy() {
+                if pred_truth(&lc.item(it, &l, i, loc)?, "count_where", loc)? {
                     count += 1;
                 }
             }
@@ -11194,7 +11666,7 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                     Some(x) => x.clone(),
                     None => break,
                 };
-                if self.call_value(needle.clone(), vec![item], loc)?.is_truthy() {
+                if pred_truth(&self.call_value(needle.clone(), vec![item], loc)?, "index_of", loc)? {
                     return Ok(syn_int(i as i64));
                 }
                 i += 1;
@@ -11270,6 +11742,9 @@ enum EachItems {
     List(ListRef, usize),
     /// `range(…)` sin armar la lista (F1.11).
     Range(RangeIter),
+    /// v0.6.55 (M7 de la auditoría): un array por su primer eje, de a un elemento o fila. Guarda el
+    /// array (la foto: un `set` del cuerpo lo copia una vez, como a una lista).
+    Array(crate::types::Obj<crate::types::NdArray>, usize),
 }
 
 impl Interpreter {
@@ -11291,6 +11766,11 @@ impl Interpreter {
             }
             SynValue::Bytes(b) => {
                 EachItems::Owned(b.iter().map(|x| syn_int(*x as i64)).collect::<Vec<_>>().into_iter())
+            }
+            // v0.6.55 (ítem 9): un array por su primer eje, como `enumerate(a)` y `a[i]`.
+            SynValue::Array(a) => {
+                crate::arrays::each_check(a).map_err(|e| crate::arrays::located(e, loc))?;
+                EachItems::Array(a.clone(), 0)
             }
             _ => {
                 return Err(err_at(
@@ -11315,6 +11795,11 @@ impl EachItems {
                 item
             }
             EachItems::Range(r) => r.next().map(syn_int),
+            EachItems::Array(a, i) => {
+                let item = crate::arrays::each_item(a, *i);
+                *i += 1;
+                item
+            }
         }
     }
 }
@@ -11624,7 +12109,7 @@ fn is_scalar_literal(node: &Node) -> bool {
 
 /// La variable raíz de un destino de `set` (`m` en `set m["a"][k].f to v`), si el camino
 /// nace de un identificador; `None` si nace de otra expresión (una llamada, un literal…).
-fn set_root_identifier(target: &Node) -> Option<&str> {
+pub(crate) fn set_root_identifier(target: &Node) -> Option<&str> {
     match &target.kind {
         NodeKind::Identifier { name } => Some(name.as_str()),
         NodeKind::IndexAccess { object, .. } | NodeKind::PropertyAccess { object, .. } => {
@@ -11694,7 +12179,7 @@ fn principals_arg(
 /// ¿El valor es invocable? (task de usuario, lambda o builtin). La base de la regla
 /// de detección del dual-order (batch DX) y del 2º arg de `index_of`.
 /// `(función, array)` en cualquier orden, si la llamada es sobre un array.
-fn fn_and_array(args: &[SynValue]) -> Option<(SynValue, crate::types::Obj<ndarray::ArrayD<f64>>)> {
+fn fn_and_array(args: &[SynValue]) -> Option<(SynValue, crate::types::Obj<crate::types::NdArray>)> {
     match (args.first(), args.get(1)) {
         (Some(SynValue::Array(a)), Some(f)) if is_callable(f) => Some((f.clone(), a.clone())),
         (Some(f), Some(SynValue::Array(a))) if is_callable(f) => Some((f.clone(), a.clone())),
@@ -12328,18 +12813,28 @@ fn make_unique_n(slot: &mut SynValue, extra: usize) {
             }
             *slot = SynValue::Map(copy);
         }
+        // v0.6.55 (R5): `set a[i]` escribe el array en el lugar; si otro lo comparte (o está
+        // congelado: su cuenta es `usize::MAX`), se copia antes, como una lista.
+        SynValue::Array(o) if crate::types::Obj::strong_count(o) > owners => {
+            *slot = SynValue::Array(crate::types::Obj::new((**o).clone()));
+        }
         SynValue::Private(p) => {
             let shared_inner = match &p.value {
                 SynValue::List(rc) => crate::types::ListRef::strong_count(rc) > 1,
                 SynValue::Map(rc) => crate::types::MapRef::strong_count(rc) > 1,
+                SynValue::Array(o) => crate::types::Obj::strong_count(o) > 1,
                 _ => false,
             };
-            if shared_inner || (crate::types::Obj::strong_count(p) > owners && matches!(p.value, SynValue::List(_) | SynValue::Map(_))) {
+            if shared_inner
+                || (crate::types::Obj::strong_count(p) > owners
+                    && matches!(p.value, SynValue::List(_) | SynValue::Map(_) | SynValue::Array(_)))
+            {
                 // Copia del contenedor interno aunque su cuenta sea 1 cuando el envoltorio
                 // está compartido: el alias ve el mismo Rc interno.
                 let inner = match &p.value {
                     SynValue::List(rc) => SynValue::List(crate::types::ListRef::new(rc.borrow().clone())),
                     SynValue::Map(rc) => SynValue::Map(rc.borrow().to_ref()),
+                    SynValue::Array(o) => SynValue::Array(crate::types::Obj::new((**o).clone())),
                     other => other.clone(),
                 };
                 *slot = labels::labelled(inner, p.label.clone());

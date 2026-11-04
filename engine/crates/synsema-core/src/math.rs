@@ -70,7 +70,7 @@ fn unary_float(args: &[SynValue], name: &str, f: impl Fn(f64) -> f64) -> Result<
     arity(args, 1, name)?;
     // v0.6.29 (DATOS-10/11): sobre un array, elemento a elemento.
     if let SynValue::Array(a) = arg(args, 0)? {
-        return Ok(crate::types::syn_array(a.mapv(f)));
+        return Ok(crate::types::syn_array(a.to_f64().mapv(f)));
     }
     Ok(syn_float(f(num(args, 0, name)?.to_f64())))
 }
@@ -82,6 +82,10 @@ fn binary_float(
     f: impl Fn(f64, f64) -> f64,
 ) -> Result<SynValue, Control> {
     arity(args, 2, name)?;
+    // v0.6.55 (ítem 5): con un array en alguno, elemento a elemento con broadcasting.
+    if args.iter().any(|a| matches!(a, SynValue::Array(_))) {
+        return crate::arrays::binary_elem(args, name, f);
+    }
     let a = num(args, 0, name)?.to_f64();
     let b = num(args, 1, name)?.to_f64();
     Ok(syn_float(f(a, b)))
@@ -102,7 +106,7 @@ fn unary_poly(
     arity(args, 1, name)?;
     match arg(args, 0)? {
         SynValue::Number(n) => Ok(syn_float(real(n.to_f64()))),
-        SynValue::Array(a) => Ok(crate::types::syn_array(a.mapv(real))),
+        SynValue::Array(a) => Ok(crate::types::syn_array(a.to_f64().mapv(real))),
         SynValue::Complex(z) => Ok(SynValue::Complex(cplx(*z))),
         other => Err(err(format!("{} expects a number, got {}", name, other.type_name()))),
     }
@@ -155,7 +159,7 @@ pub fn abs(args: &[SynValue]) -> Result<SynValue, Control> {
         return Ok(syn_float(z.norm()));
     }
     if let SynValue::Array(a) = arg(args, 0)? {
-        return Ok(crate::types::syn_array(a.mapv(f64::abs)));
+        return Ok(crate::types::syn_array(a.to_f64().mapv(f64::abs)));
     }
     let n = num(args, 0, "abs")?;
     Ok(syn_number(match n {
@@ -167,6 +171,10 @@ pub fn abs(args: &[SynValue]) -> Result<SynValue, Control> {
 
 pub fn sign(args: &[SynValue]) -> Result<SynValue, Control> {
     arity(args, 1, "sign")?;
+    // v0.6.55 (ítem 5): sobre un array, el `np.sign` de numpy (`f64`; un NaN queda NaN).
+    if let SynValue::Array(a) = arg(args, 0)? {
+        return Ok(crate::arrays::map_f64(a, |x| if x.is_nan() || x == 0.0 { x } else { x.signum() }));
+    }
     let n = num(args, 0, "sign")?;
     if let Number::Float(x) = n {
         if x.is_nan() {
@@ -271,6 +279,9 @@ fn extreme(args: &[SynValue], name: &str, want: Ordering) -> Result<SynValue, Co
 }
 
 pub fn clamp(args: &[SynValue]) -> Result<SynValue, Control> {
+    if args.iter().any(|a| matches!(a, SynValue::Array(_))) {
+        return crate::arrays::clamp_array(args);
+    }
     arity(args, 3, "clamp")?;
     let x = num(args, 0, "clamp")?;
     let lo = num(args, 1, "clamp")?;
@@ -313,6 +324,9 @@ pub fn pow(args: &[SynValue]) -> Result<SynValue, Control> {
         let a = complex_arg(args, 0, "pow")?;
         let b = complex_arg(args, 1, "pow")?;
         return Ok(SynValue::Complex(complex_pow(a, arg(args, 1)?, b)));
+    }
+    if args.iter().any(|a| matches!(a, SynValue::Array(_))) {
+        return crate::arrays::binary_elem(args, "pow", f64::powf);
     }
     let base = num(args, 0, "pow")?;
     let exp = num(args, 1, "pow")?;
@@ -377,6 +391,11 @@ pub fn degrees(args: &[SynValue]) -> Result<SynValue, Control> {
 
 pub fn gcd(args: &[SynValue]) -> Result<SynValue, Control> {
     arity(args, 2, "gcd")?;
+    // v0.6.55 (ítem 5): sobre arrays, elemento a elemento (`np.gcd`), con elementos enteros.
+    if args.iter().any(|a| matches!(a, SynValue::Array(_))) {
+        crate::arrays::require_whole(args, "gcd")?;
+        return crate::arrays::binary_elem(args, "gcd", crate::arrays::gcd_f64);
+    }
     let a = int_arg(args, 0, "gcd")?;
     let b = int_arg(args, 1, "gcd")?;
     Ok(syn_number(Number::from_bigint(a.gcd(&b))))
@@ -384,6 +403,14 @@ pub fn gcd(args: &[SynValue]) -> Result<SynValue, Control> {
 
 pub fn lcm(args: &[SynValue]) -> Result<SynValue, Control> {
     arity(args, 2, "lcm")?;
+    // v0.6.55 (ítem 5): sobre arrays, `np.lcm` (`lcm(0, x)` = 0).
+    if args.iter().any(|a| matches!(a, SynValue::Array(_))) {
+        crate::arrays::require_whole(args, "lcm")?;
+        return crate::arrays::binary_elem(args, "lcm", |a, b| {
+            let g = crate::arrays::gcd_f64(a, b);
+            if g == 0.0 { 0.0 } else { (a / g * b).abs() }
+        });
+    }
     let a = int_arg(args, 0, "lcm")?;
     let b = int_arg(args, 1, "lcm")?;
     Ok(syn_number(Number::from_bigint(a.lcm(&b))))
@@ -392,6 +419,23 @@ pub fn lcm(args: &[SynValue]) -> Result<SynValue, Control> {
 /// `factorial(n)` exacto (usa `Big`). `n` debe ser un entero no-negativo.
 pub fn factorial(args: &[SynValue]) -> Result<SynValue, Control> {
     arity(args, 1, "factorial")?;
+    // v0.6.55 (ítem 5): sobre un array, `f64` (`gamma(n + 1)`, `inf` desde 171); los
+    // elementos son enteros no negativos, como el escalar.
+    if let SynValue::Array(a) = arg(args, 0)? {
+        crate::arrays::require_whole(args, "factorial")?;
+        if a.to_f64().iter().any(|x| *x < 0.0) {
+            return Err(err("factorial expects a non-negative integer"));
+        }
+        return Ok(crate::arrays::map_f64(a, |n| {
+            let mut acc: f64 = 1.0;
+            let mut k = 2.0;
+            while k <= n && acc.is_finite() {
+                acc *= k;
+                k += 1.0;
+            }
+            acc
+        }));
+    }
     let bi = int_arg(args, 0, "factorial")?;
     if bi.sign() == Sign::Minus {
         return Err(err("factorial expects a non-negative integer"));
@@ -419,6 +463,10 @@ fn float_pred(
     int_default: bool,
 ) -> Result<SynValue, Control> {
     arity(args, 1, name)?;
+    // v0.6.55 (ítem 5): sobre un array, una máscara.
+    if let SynValue::Array(a) = arg(args, 0)? {
+        return Ok(crate::arrays::map_pred(a, f));
+    }
     let b = match num(args, 0, name)? {
         Number::Float(x) => f(*x),
         _ => int_default, // los enteros son siempre finitos
@@ -441,9 +489,24 @@ pub fn is_finite(args: &[SynValue]) -> Result<SynValue, Control> {
 /// el futuro tipo `Decimal`).
 pub fn round_to(args: &[SynValue]) -> Result<SynValue, Control> {
     arity(args, 2, "round_to")?;
+    let d = num(args, 1, "round_to")?;
+    // v0.6.55 (ítem 5): sobre un array, cada elemento como un float; `ndigits` es un número.
+    if let SynValue::Array(a) = arg(args, 0)? {
+        let k = d.to_i64_trunc().filter(|k| d.is_integer() && *k >= 0);
+        let Some(k) = k else {
+            return Err(err("round_to expects a non-negative integer number of decimals"));
+        };
+        let k = k.min(340) as usize;
+        return Ok(crate::arrays::map_f64(a, move |x| {
+            if x.is_finite() {
+                format!("{:.*}", k, x).parse::<f64>().unwrap_or(x)
+            } else {
+                x
+            }
+        }));
+    }
     let value = num(args, 0, "round_to")?.clone();
     let x = value.to_f64();
-    let d = num(args, 1, "round_to")?;
     if !d.is_integer() {
         return Err(err("round_to expects an integer number of decimals"));
     }
@@ -571,7 +634,7 @@ fn data_f64(args: &[SynValue], name: &str) -> Result<Vec<f64>, Control> {
             }
             out
         }
-        SynValue::Array(a) => a.iter().copied().collect(),
+        SynValue::Array(a) => a.to_f64().iter().copied().collect(),
         other => {
             return Err(err(format!(
                 "{} expects a list of numbers or an array, got {}",
@@ -771,35 +834,54 @@ pub fn atanh(args: &[SynValue]) -> Result<SynValue, Control> {
 /// `gamma(x)` = Γ(x) (= `(x-1)!` para enteros). `gamma(5)`=24, `gamma(0.5)`=√π.
 pub fn gamma(args: &[SynValue]) -> Result<SynValue, Control> {
     arity(args, 1, "gamma")?;
+    if let SynValue::Array(a) = arg(args, 0)? {
+        return Ok(crate::arrays::map_f64(a, libm::tgamma));
+    }
     Ok(syn_float(libm::tgamma(real_only(args, 0, "gamma")?)))
 }
 /// `lgamma(x)` = ln|Γ(x)| (estable para argumentos grandes).
 pub fn lgamma(args: &[SynValue]) -> Result<SynValue, Control> {
     arity(args, 1, "lgamma")?;
+    if let SynValue::Array(a) = arg(args, 0)? {
+        return Ok(crate::arrays::map_f64(a, libm::lgamma));
+    }
     Ok(syn_float(libm::lgamma(real_only(args, 0, "lgamma")?)))
 }
 /// `erf(x)` = función error.
 pub fn erf(args: &[SynValue]) -> Result<SynValue, Control> {
     arity(args, 1, "erf")?;
+    if let SynValue::Array(a) = arg(args, 0)? {
+        return Ok(crate::arrays::map_f64(a, libm::erf));
+    }
     Ok(syn_float(libm::erf(real_only(args, 0, "erf")?)))
 }
 /// `erfc(x)` = error complementaria (`1 - erf(x)`, estable en la cola).
 pub fn erfc(args: &[SynValue]) -> Result<SynValue, Control> {
     arity(args, 1, "erfc")?;
+    if let SynValue::Array(a) = arg(args, 0)? {
+        return Ok(crate::arrays::map_f64(a, libm::erfc));
+    }
     Ok(syn_float(libm::erfc(real_only(args, 0, "erfc")?)))
 }
 /// `beta(a, b)` = B(a,b) = Γ(a)Γ(b)/Γ(a+b). Forma numéricamente estable vía lgamma con
 /// signo (`lgamma_r`): `signo · exp(lgΓ(a)+lgΓ(b)−lgΓ(a+b))`. Para `a,b>0` es positivo.
 pub fn beta(args: &[SynValue]) -> Result<SynValue, Control> {
     arity(args, 2, "beta")?;
+    if args.iter().any(|a| matches!(a, SynValue::Array(_))) {
+        return crate::arrays::binary_elem(args, "beta", beta_f64);
+    }
     let a = real_only(args, 0, "beta")?;
     let b = real_only(args, 1, "beta")?;
+    Ok(syn_float(beta_f64(a, b)))
+}
+
+fn beta_f64(a: f64, b: f64) -> f64 {
     let (la, sa) = libm::lgamma_r(a);
     let (lb, sb) = libm::lgamma_r(b);
     let (lab, sab) = libm::lgamma_r(a + b);
     // signo(Γ(a))·signo(Γ(b))/signo(Γ(a+b)); como sab=±1, dividir = multiplicar.
     let sign = (sa * sb * sab) as f64;
-    Ok(syn_float(sign * (la + lb - lab).exp()))
+    sign * (la + lb - lab).exp()
 }
 
 // =========================================================
@@ -809,6 +891,11 @@ pub fn beta(args: &[SynValue]) -> Result<SynValue, Control> {
 /// `complex(re, im)` → número complejo (re/im numéricos reales).
 pub fn complex(args: &[SynValue]) -> Result<SynValue, Control> {
     arity(args, 2, "complex")?;
+    if args.iter().any(|a| matches!(a, SynValue::Array(_))) {
+        return Err(err(
+            "complex: arrays hold f64 or bool, not complex numbers — keep the real and imaginary parts as two arrays",
+        ));
+    }
     let re = num(args, 0, "complex")?.to_f64();
     let im = num(args, 1, "complex")?.to_f64();
     Ok(syn_complex(re, im))
@@ -820,6 +907,8 @@ pub fn real(args: &[SynValue]) -> Result<SynValue, Control> {
     match arg(args, 0)? {
         SynValue::Complex(z) => Ok(syn_float(z.re)),
         SynValue::Number(n) => Ok(syn_float(n.to_f64())),
+        // v0.6.55 (ítem 5): un array es real: `np.real(a)` es `a` (como `f64`).
+        SynValue::Array(a) => Ok(crate::arrays::map_f64(a, |x| x)),
         other => Err(err(format!("real expects a number or complex, got {}", other.type_name()))),
     }
 }
@@ -830,6 +919,7 @@ pub fn imag(args: &[SynValue]) -> Result<SynValue, Control> {
     match arg(args, 0)? {
         SynValue::Complex(z) => Ok(syn_float(z.im)),
         SynValue::Number(_) => Ok(syn_float(0.0)),
+        SynValue::Array(a) => Ok(crate::arrays::map_f64(a, |_| 0.0)),
         other => Err(err(format!("imag expects a number or complex, got {}", other.type_name()))),
     }
 }
@@ -840,6 +930,7 @@ pub fn conj(args: &[SynValue]) -> Result<SynValue, Control> {
     match arg(args, 0)? {
         SynValue::Complex(z) => Ok(SynValue::Complex(z.conj())),
         SynValue::Number(n) => Ok(syn_number(n.clone())),
+        SynValue::Array(a) => Ok(crate::arrays::map_f64(a, |x| x)),
         other => Err(err(format!("conj expects a number or complex, got {}", other.type_name()))),
     }
 }
@@ -852,6 +943,8 @@ pub fn arg_phase(args: &[SynValue]) -> Result<SynValue, Control> {
     match arg(args, 0)? {
         SynValue::Complex(z) => Ok(syn_float(z.arg())),
         SynValue::Number(n) => Ok(syn_float(Complex64::new(n.to_f64(), 0.0).arg())),
+        // `np.angle`: 0 para x ≥ 0 (también -0.0 → π como atan2), π para negativos, NaN queda NaN.
+        SynValue::Array(a) => Ok(crate::arrays::map_f64(a, |x| Complex64::new(x, 0.0).arg())),
         other => Err(err(format!("arg expects a number or complex, got {}", other.type_name()))),
     }
 }

@@ -37,6 +37,7 @@ mod engine_security;
 mod frozen_reads;
 mod gaps_conformance;
 mod hmac_bytes;
+mod v0655_arrays;
 mod llm_stream_e2e;
 mod llm_text_prompt;
 mod memory_declared;

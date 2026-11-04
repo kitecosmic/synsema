@@ -853,6 +853,8 @@ fn render_nodes(
                     SynValue::List(l) => l.borrow().to_vec(),
                     // v0.6.29: como `each` del lenguaje — un mapa se recorre por sus claves.
                     SynValue::Map(m) => m.borrow().keys().map(|k| crate::types::syn_text(k.as_str())).collect(),
+                    // v0.6.55 (ítem 9): como `each` del lenguaje.
+                    SynValue::Array(a) => crate::arrays::each_items(a)?,
                     other => {
                         return Err(terr(filename, *line,
                             &format!("Cannot iterate over {} in '{{ each }}'", other.type_name())));
@@ -878,7 +880,7 @@ fn render_nodes(
                         interp.note_seen(&l);
                     }
                 }
-                let branch = if c.is_truthy() { then } else { els };
+                let branch = if crate::interpreter::truth(&c, crate::interpreter::TruthAt::Cond, &cond.location)? { then } else { els };
                 render_nodes(branch, interp, env, out, filename, slots, depth)?;
             }
             // El HTML ya renderizado de la página hija, inyectado raw en un layout.

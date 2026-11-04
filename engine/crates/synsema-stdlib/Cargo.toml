@@ -31,6 +31,8 @@ redis = { workspace = true, optional = true }
 rand.workspace = true
 # Arrays (Batch 5): serializar `SynValue::Array` a JSON anidado en las respuestas serve.
 ndarray.workspace = true
+# v0.6.55 (ítem 7): `matmul` por lotes en ndarray_ops.rs (el 2-D sigue en synsema-core).
+faer.workspace = true
 # Export PNG/PDF (Batch 9): svg_to_png/svg_to_pdf en raster.rs. Puro-Rust, sin C (ver workspace).
 resvg.workspace = true
 usvg.workspace = true

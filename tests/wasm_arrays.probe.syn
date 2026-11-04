@@ -1,0 +1,31 @@
+-- Sonda del perfil wasm, parte 7: arrays sin bucles por elemento (v0.6.55). Los builtins de
+-- synsema-stdlib/src/ndarray_ops.rs y la escritura en el lugar existen en wasm igual que en
+-- nativo. Salida byte a byte idéntica nativo/wasm.
+let a be array([1, 5, 2, 8])
+let m be a > 2
+print("dtype=" + dtype(m))
+print("equal=" + text(equal(a, 5)))
+print("if_else=" + text(if_else(m, a, 0)))
+print("logical=" + text(logical_and(m, a < 8)) + " " + text(logical_not(m)))
+print("maximum=" + text(maximum(a, 3)) + " " + text(maximum(2, 3)))
+print("where=" + text(where(a, m)) + " count=" + text(count_where(a, (x) => x > 2)))
+print("sum_mask=" + text(sum(m)) + " " + text(sum(m, axis = 0)))
+print("take=" + text(take(array([[1, 2], [3, 4]]), [1, 0], axis = 1)))
+print("index=" + text(a[[3, 0]]))
+print("index_add=" + text(index_add(a, [0, 0], 1)))
+print("transpose=" + text(transpose(reshape(arange(0, 8), [2, 2, 2]), [0, 2, 1])))
+print("matmul=" + text(matmul(ones([2, 2, 3]), ones([3, 2]))))
+print("bytes=" + hex(array_to_bytes(m)) + " " + text(array_from_bytes(array_to_bytes(a, "f32"), "f32")))
+print("uniform=" + text(random_uniform(rng(1), [2])))
+print("normal=" + text(random_normal(rng(1), [2])))
+print("gcd=" + text(gcd(array([12, 18]), 8)) + " factorial=" + text(factorial(array([3, 5]))))
+let z be zeros(3)
+set z[1] to 4
+let T be zeros([2, 2, 2])
+set T[1][0][1] to 7
+set T[0] to 1
+print("set=" + text(z) + " " + text(T))
+let seen be []
+each r in array([[1, 2], [3, 4]])
+    set seen to append(seen, sum(r))
+print("each=" + text(seen))

@@ -457,14 +457,24 @@ fn canon_key(v: &SynValue, out: &mut String) {
             }
         },
         // Un array: su forma y cada valor (el Display de uno grande se abrevia).
-        SynValue::Array(a) => {
-            let _ = write!(out, "A{:?}:", a.shape());
-            for x in a.iter() {
-                // -0.0 == 0.0 (como en `==`): una sola clave.
-                let x = if *x == 0.0 { 0.0 } else { *x };
-                let _ = write!(out, "{};", crate::number::py_float_str(x));
+        SynValue::Array(a) => match &**a {
+            crate::types::NdArray::F64(a) => {
+                let _ = write!(out, "A{:?}:", a.shape());
+                for x in a.iter() {
+                    // -0.0 == 0.0 (como en `==`): una sola clave.
+                    let x = if *x == 0.0 { 0.0 } else { *x };
+                    let _ = write!(out, "{};", crate::number::py_float_str(x));
+                }
             }
-        }
+            // Una máscara nunca es igual a un array `f64` (R3): otra clave.
+            crate::types::NdArray::Bool(a) => {
+                let _ = write!(out, "M{:?}:", a.shape());
+                for b in a.iter() {
+                    out.push(if *b { '1' } else { '0' });
+                }
+                out.push(';');
+            }
+        },
         // Un secret se compara por contenido (en `==`, en tiempo constante): acá va su hash,
         // nunca el texto.
         SynValue::Secret(sec) => {
@@ -1230,10 +1240,14 @@ pub fn fill_nan(args: &[SynValue]) -> Result<SynValue, Control> {
                 })
                 .collect(),
         )),
-        Some(SynValue::Array(a)) => {
-            let f = fill.to_f64();
-            Ok(SynValue::Array(crate::types::Obj::new(a.mapv(|x| if x.is_nan() { f } else { x }))))
-        }
+        Some(SynValue::Array(a)) => match a.as_f64() {
+            Some(a) => {
+                let f = fill.to_f64();
+                Ok(crate::types::syn_array(a.mapv(|x| if x.is_nan() { f } else { x })))
+            }
+            // Una máscara no tiene NaN: queda igual.
+            None => Ok(SynValue::Array(a.clone())),
+        },
         Some(other) => Err(err(format!("fill_nan: expected a list or an array, got {}", other.type_name()))),
         None => Err(err("fill_nan(values, number)")),
     }
@@ -1272,6 +1286,19 @@ pub fn mode(args: &[SynValue]) -> Result<SynValue, Control> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// v0.6.55 (R3): `unique` y `groups` usan esta clave; una máscara y un array `f64` con los
+    /// mismos 0/1 son valores distintos, y dos máscaras iguales, el mismo.
+    #[test]
+    fn v0655_a_mask_and_its_floats_have_different_keys() {
+        use ndarray::{ArrayD, IxDyn};
+        let m = crate::types::syn_mask(ArrayD::from_shape_vec(IxDyn(&[2]), vec![false, true]).unwrap());
+        let f = crate::types::syn_array(ArrayD::from_shape_vec(IxDyn(&[2]), vec![0.0, 1.0]).unwrap());
+        assert_ne!(probe_key(&m), probe_key(&f));
+        assert_eq!(probe_key(&m), probe_key(&m.clone()));
+        let m2 = crate::types::syn_mask(ArrayD::from_shape_vec(IxDyn(&[1, 2]), vec![false, true]).unwrap());
+        assert_ne!(probe_key(&m), probe_key(&m2), "otra forma, otra clave");
+    }
 
     /// Los bytes que una clave le da al hasher.
     fn hashed_bytes(k: &JoinKey) -> Vec<u8> {

@@ -1979,8 +1979,14 @@ impl Vars<'_> {
         }
     }
 
-    /// Si es verdadero (`is_truthy`), como un `I8`.
-    fn truthy(&self, b: &mut FunctionBuilder, st: &[Kind], o: NOpnd) -> Value {
+    /// Si `truthy` puede llamar a la VM con un valor con caja (que puede ser un array, R4).
+    fn may_be_array(&self, st: &[Kind], o: NOpnd) -> bool {
+        matches!(self.f.opnd_kind(st, o), Kind::Any(_)) && self.h.reads.is_some()
+    }
+
+    /// Si es verdadero (`is_truthy`), como un `I8`. Un valor con caja que es un array no es
+    /// verdadero ni falso (R4, v0.6.55): sale a `ex` y la VM da el error (`ex` lo da `may_be_array`).
+    fn truthy(&self, b: &mut FunctionBuilder, st: &[Kind], o: NOpnd, ex: Option<Block>) -> Value {
         match self.f.opnd_kind(st, o) {
             Kind::Int | Kind::Bool => {
                 let x = self.bits(b, o);
@@ -2015,6 +2021,10 @@ impl Vars<'_> {
                 b.switch_to_block(call);
                 let r = b.ins().call(reads.truthy, &[self.ctx, q]);
                 let r = b.inst_results(r)[0];
+                if let Some(ex) = ex {
+                    let bad = b.ins().icmp_imm_s(IntCC::SignedLessThan, r, 0);
+                    exit_if(b, bad, ex);
+                }
                 let t = b.ins().icmp_imm_s(IntCC::NotEqual, r, 0);
                 b.ins().jump(join, &[BlockArg::Value(t)]);
                 b.seal_block(join);
@@ -2703,7 +2713,8 @@ pub(crate) fn build(
                         }
                     }
                     NUnary::Not => {
-                        let t = vs.truthy(&mut b, &st, a);
+                        let ex = if vs.may_be_array(&st, a) { Some(exit_before!(pc)) } else { None };
+                        let t = vs.truthy(&mut b, &st, a, ex);
                         let r = b.ins().bxor_imm_u(t, 1);
                         let r = b.ins().uextend(I64, r);
                         vs.consume(&mut b, a);
@@ -2714,7 +2725,8 @@ pub(crate) fn build(
                 }
             }
             NIns::ToBool { dst, src } => {
-                let t = vs.truthy(&mut b, &st, src);
+                let ex = if vs.may_be_array(&st, src) { Some(exit_before!(pc)) } else { None };
+                let t = vs.truthy(&mut b, &st, src, ex);
                 let r = b.ins().uextend(I64, t);
                 vs.consume(&mut b, src);
                 if dst != DISCARD {
@@ -2722,7 +2734,8 @@ pub(crate) fn build(
                 }
             }
             NIns::JumpIfFalsy { src, to } => {
-                let t = vs.truthy(&mut b, &st, src);
+                let ex = if vs.may_be_array(&st, src) { Some(exit_before!(pc)) } else { None };
+                let t = vs.truthy(&mut b, &st, src, ex);
                 vs.consume(&mut b, src);
                 let (yes, no) = (*blocks.get(&(pc + 1))?, *blocks.get(&(to as usize))?);
                 b.ins().brif(t, yes, &[], no, &[]);

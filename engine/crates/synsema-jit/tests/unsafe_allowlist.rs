@@ -1,6 +1,6 @@
 //! Dónde hay `unsafe` en el motor (spec §F4.2): el nivel nativo lo tiene sólo en
 //! `synsema-jit/src/abi.rs`, el texto sólo en `synsema-text/src/lib.rs` (F4.6b), core sólo en
-//! `frozen.rs` (R2), y cualquier `unsafe` nuevo en otro archivo rompe este test (para agregarlo hay que sumarlo
+//! `frozen.rs` (R2) y la escritura en el lugar de `arrays.rs` (v0.6.55), y cualquier `unsafe` nuevo en otro archivo rompe este test (para agregarlo hay que sumarlo
 //! acá, a la vista del que revisa).
 
 use std::path::{Path, PathBuf};
@@ -16,6 +16,13 @@ const ALLOWED: &[&str] = &[
     // La región compartida (R2): el `unsafe impl Send/Sync` de `FrozenValue`, que sólo arma el
     // recorrido que congela todo lo alcanzable (la invariante depende de la forma de `SynValue`).
     "engine/crates/synsema-core/src/frozen.rs",
+    // La escritura en el lugar de `set a[i]` (v0.6.55, aprobado por Joel el 2026-11-03): UNA llamada a
+    // `Obj::get_mut_with_owners` con los dos dueños conocidos (el lugar y la copia de la referencia que
+    // lleva el camino); sin ella cada `set` copia el array entero. La cuenta la verifica el heap; el
+    // resto lo cuidan las guardas de `set_index` (religadura, envoltorio compartido, alias en el índice).
+    // Miri limpio en x86_64, i686 y s390x: `arrays::tests` y el test del heap
+    // (specs/compute-bench/v0655_miri_core.sh y v0655_miri_heap.sh).
+    "engine/crates/synsema-core/src/arrays.rs",
     // El nivel nativo: el contexto, la salida a la VM y la llamada al código generado.
     "engine/crates/synsema-jit/src/abi.rs",
     // Handles del sistema (descriptores heredados, consola de Windows, Job Objects, ioctl de Nitro).
@@ -71,17 +78,30 @@ fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
 }
 
 /// `unsafe` como palabra en código (no en comentarios ni en el nombre del lint `unsafe_code`).
-fn has_unsafe(src: &str) -> bool {
-    src.lines().any(|l| {
-        let code = l.split("//").next().unwrap_or("");
-        code.match_indices("unsafe").any(|(i, _)| {
-            let before = code[..i].chars().next_back();
-            let after = code[i + 6..].chars().next();
-            let word = |c: Option<char>| c.is_some_and(|c| c.is_alphanumeric() || c == '_');
-            !word(before) && !word(after)
+/// Cuántas veces aparece la palabra `unsafe` en código (fuera de comentarios de línea).
+fn unsafe_count(src: &str) -> usize {
+    src.lines()
+        .map(|l| {
+            let code = l.split("//").next().unwrap_or("");
+            code.match_indices("unsafe")
+                .filter(|(i, _)| {
+                    let before = code[..*i].chars().next_back();
+                    let after = code[i + 6..].chars().next();
+                    let word = |c: Option<char>| c.is_some_and(|c| c.is_alphanumeric() || c == '_');
+                    !word(before) && !word(after)
+                })
+                .count()
         })
-    })
+        .sum()
 }
+
+fn has_unsafe(src: &str) -> bool {
+    unsafe_count(src) > 0
+}
+
+/// Archivos grandes con un `unsafe` puntual: la cuenta exacta, para que uno nuevo en el mismo archivo
+/// no pase escondido detrás del permiso.
+const EXACT: &[(&str, usize)] = &[("engine/crates/synsema-core/src/arrays.rs", 1)];
 
 #[test]
 fn unsafe_only_where_allowed() {
@@ -100,9 +120,15 @@ fn unsafe_only_where_allowed() {
     assert!(extra.is_empty(), "`unsafe` fuera de la lista permitida: {:?}", extra);
     assert!(found.iter().any(|f| f.ends_with("synsema-jit/src/abi.rs")), "el test no ve abi.rs: ¿cambió la ruta?");
     // Core no tiene `unsafe` salvo la región compartida (R2, aprobado por Joel el 2026-10-02):
-    // `frozen.rs`, el `Send/Sync` de los valores congelados junto al recorrido que los congela.
+    // `frozen.rs`, el `Send/Sync` de los valores congelados junto al recorrido que los congela; y la
+    // escritura en el lugar de `arrays.rs` (v0.6.55, aprobado por Joel el 2026-11-03).
+    const CORE: &[&str] = &["synsema-core/src/frozen.rs", "synsema-core/src/arrays.rs"];
     assert!(
-        !found.iter().any(|f| f.contains("synsema-core/src/") && !f.ends_with("synsema-core/src/frozen.rs")),
-        "core tiene `unsafe` fuera de frozen.rs"
+        !found.iter().any(|f| f.contains("synsema-core/src/") && !CORE.iter().any(|c| f.ends_with(c))),
+        "core tiene `unsafe` fuera de frozen.rs y arrays.rs"
     );
+    for (f, n) in EXACT {
+        let src = std::fs::read_to_string(root.join(f)).expect("el archivo con cuenta exacta existe");
+        assert_eq!(unsafe_count(&src), *n, "{}: la cantidad de `unsafe` cambió (revisar y actualizar EXACT)", f);
+    }
 }

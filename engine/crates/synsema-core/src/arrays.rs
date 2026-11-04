@@ -1,6 +1,6 @@
 //! Arrays numéricos n-dimensionales + álgebra lineal (Batch 5).
 //!
-//! Tipo `SynValue::Array(Obj<ArrayD<f64>>)` (dtype f64, inmutable). `ndarray` da el modelo
+//! Tipo `SynValue::Array(Obj<NdArray>)` (dtype `f64` o `bool`, inmutable; ver `types::NdArray`). `ndarray` da el modelo
 //! n-dimensional + vectorización/broadcasting/reducciones; `faer` (puro-Rust, SIMD) el
 //! álgebra lineal densa 2D (matmul/solve/det/inv/eig/svd). **`*` es ELEMENTWISE**; el
 //! producto matricial es `matmul`/`dot`.
@@ -20,8 +20,9 @@ use faer::{Accum, Mat, Par};
 use crate::interpreter::{Control, RuntimeError};
 use crate::number::Number;
 use crate::types::{
-    syn_array, syn_bool, syn_complex, syn_float, syn_int, syn_list, syn_map, syn_number, SynValue,
+    syn_array, syn_bool, syn_complex, syn_float, syn_int, syn_list, syn_map, syn_number, NdArray, SynValue,
 };
+use std::borrow::Cow;
 
 // =========================================================
 // Helpers básicos
@@ -50,16 +51,32 @@ fn num_f64(args: &[SynValue], i: usize, name: &str) -> Result<f64, Control> {
     }
 }
 
-/// El i-ésimo argumento como `array`; error si no lo es.
-fn array_arg<'a>(args: &'a [SynValue], i: usize, name: &str) -> Result<&'a ArrayD<f64>, Control> {
+/// El i-ésimo argumento como `array`, con su tipo de elemento; error si no lo es.
+fn nd_arg<'a>(args: &'a [SynValue], i: usize, name: &str) -> Result<&'a NdArray, Control> {
     match arg(args, i)? {
         SynValue::Array(a) => Ok(a),
         other => Err(err(format!("{} expects an array, got {}", name, other.type_name()))),
     }
 }
 
+/// El i-ésimo argumento como números `f64`: prestado si el array es `f64`, convertido a 0/1 si
+/// es una máscara (R2). Es el único punto de conversión de las operaciones que no miran el tipo.
+fn array_arg<'a>(args: &'a [SynValue], i: usize, name: &str) -> Result<Cow<'a, ArrayD<f64>>, Control> {
+    nd_arg(args, i, name).map(NdArray::to_f64)
+}
+
+/// Aplica una transformación que no depende del tipo de elemento (forma, orden) a cada variante.
+macro_rules! nd_map {
+    ($a:expr, |$x:ident| $body:expr) => {
+        match $a {
+            NdArray::F64($x) => NdArray::F64($body),
+            NdArray::Bool($x) => NdArray::Bool($body),
+        }
+    };
+}
+
 /// `shape` desde un arg: un entero `n` → `[n]` (1D); una lista de enteros `[2,3]` → nD.
-fn shape_from(v: &SynValue, name: &str) -> Result<Vec<usize>, Control> {
+pub fn shape_from(v: &SynValue, name: &str) -> Result<Vec<usize>, Control> {
     let dim = |n: &Number| -> Result<usize, Control> {
         let i = n.to_i64_trunc().ok_or_else(|| err(format!("{}: dimension too large", name)))?;
         if i < 0 {
@@ -244,18 +261,18 @@ pub fn eye(args: &[SynValue]) -> Result<SynValue, Control> {
 
 pub fn shape(args: &[SynValue]) -> Result<SynValue, Control> {
     arity(args, 1, "shape")?;
-    let a = array_arg(args, 0, "shape")?;
+    let a = nd_arg(args, 0, "shape")?;
     Ok(syn_list(a.shape().iter().map(|&d| syn_int(d as i64)).collect()))
 }
 
 pub fn ndim(args: &[SynValue]) -> Result<SynValue, Control> {
     arity(args, 1, "ndim")?;
-    Ok(syn_int(array_arg(args, 0, "ndim")?.ndim() as i64))
+    Ok(syn_int(nd_arg(args, 0, "ndim")?.ndim() as i64))
 }
 
 pub fn size(args: &[SynValue]) -> Result<SynValue, Control> {
     arity(args, 1, "size")?;
-    Ok(syn_int(array_arg(args, 0, "size")?.len() as i64))
+    Ok(syn_int(nd_arg(args, 0, "size")?.len() as i64))
 }
 
 pub fn is_array(args: &[SynValue]) -> Result<SynValue, Control> {
@@ -263,23 +280,31 @@ pub fn is_array(args: &[SynValue]) -> Result<SynValue, Control> {
     Ok(syn_bool(matches!(arg(args, 0)?, SynValue::Array(_))))
 }
 
-/// `array` → lista anidada Synsema (vuelve a valores `number`).
-fn view_to_value(a: &ndarray::ArrayViewD<f64>) -> SynValue {
+/// `array` → lista anidada Synsema (vuelve a valores `number`, o `bool` si es una máscara).
+fn view_to_value<T: Copy>(a: &ndarray::ArrayViewD<T>, elem: fn(T) -> SynValue) -> SynValue {
     if a.ndim() == 0 {
-        syn_float(*a.first().unwrap())
+        elem(*a.first().unwrap())
     } else {
-        syn_list(a.outer_iter().map(|s| view_to_value(&s)).collect())
+        syn_list(a.outer_iter().map(|s| view_to_value(&s, elem)).collect())
+    }
+}
+
+/// Un elemento suelto del array como valor del lenguaje: número o `bool`.
+pub fn nd_to_list(a: &NdArray) -> SynValue {
+    match a {
+        NdArray::F64(x) => view_to_value(&x.view(), syn_float),
+        NdArray::Bool(x) => view_to_value(&x.view(), syn_bool),
     }
 }
 
 pub fn to_list(args: &[SynValue]) -> Result<SynValue, Control> {
     arity(args, 1, "to_list")?;
-    Ok(view_to_value(&array_arg(args, 0, "to_list")?.view()))
+    Ok(nd_to_list(nd_arg(args, 0, "to_list")?))
 }
 
 pub fn reshape(args: &[SynValue]) -> Result<SynValue, Control> {
     arity(args, 2, "reshape")?;
-    let a = array_arg(args, 0, "reshape")?;
+    let a = nd_arg(args, 0, "reshape")?;
     let shape = shape_from(arg(args, 1)?, "reshape")?;
     let total: usize = shape.iter().product();
     if total != a.len() {
@@ -290,30 +315,38 @@ pub fn reshape(args: &[SynValue]) -> Result<SynValue, Control> {
         )));
     }
     // row-major (C order), consistente con `flatten` y `array`.
-    let flat: Vec<f64> = a.iter().copied().collect();
-    Ok(syn_array(ArrayD::from_shape_vec(IxDyn(&shape), flat).unwrap()))
+    Ok(nd_value_of(nd_map!(a, |x| ArrayD::from_shape_vec(IxDyn(&shape), x.iter().copied().collect()).unwrap())))
+}
+
+/// `slice(a, i, j)`: las filas `s..e` del primer eje (ya normalizadas), con el mismo tipo.
+pub fn slice_rows(a: &NdArray, s: usize, e: usize) -> SynValue {
+    nd_value_of(nd_map!(a, |x| x.slice_axis(Axis(0), ndarray::Slice::from(s..e)).to_owned()))
+}
+
+/// Envuelve un `NdArray` como valor `array`.
+fn nd_value_of(a: NdArray) -> SynValue {
+    SynValue::Array(crate::types::Obj::new(a))
 }
 
 pub fn transpose(args: &[SynValue]) -> Result<SynValue, Control> {
     arity(args, 1, "transpose")?;
-    let a = array_arg(args, 0, "transpose")?;
+    let a = nd_arg(args, 0, "transpose")?;
     // reverso de ejes (2D = la transpuesta usual). `.t()` invierte los ejes.
-    Ok(syn_array(a.t().to_owned()))
+    Ok(nd_value_of(nd_map!(a, |x| x.t().to_owned())))
 }
 
 pub fn flatten(args: &[SynValue]) -> Result<SynValue, Control> {
     arity(args, 1, "flatten")?;
-    let a = array_arg(args, 0, "flatten")?;
-    let flat: Vec<f64> = a.iter().copied().collect();
-    let n = flat.len();
-    Ok(syn_array(ArrayD::from_shape_vec(IxDyn(&[n]), flat).unwrap()))
+    let a = nd_arg(args, 0, "flatten")?;
+    let n = a.len();
+    Ok(nd_value_of(nd_map!(a, |x| ArrayD::from_shape_vec(IxDyn(&[n]), x.iter().copied().collect()).unwrap())))
 }
 
 /// `at(a, [i, j, …])` → el escalar en el multi-índice. Nº de índices ≠ ndim → error; fuera
 /// de rango → error.
 pub fn at(args: &[SynValue]) -> Result<SynValue, Control> {
     arity(args, 2, "at")?;
-    let a = array_arg(args, 0, "at")?;
+    let a = nd_arg(args, 0, "at")?;
     let idx_list = match arg(args, 1)? {
         SynValue::List(l) => l.borrow().to_vec(),
         other => return Err(err(format!("at expects a list of indices, got {}", other.type_name()))),
@@ -338,7 +371,10 @@ pub fn at(args: &[SynValue]) -> Result<SynValue, Control> {
         }
         idx.push(i as usize);
     }
-    Ok(syn_float(a[IxDyn(&idx)]))
+    Ok(match a {
+        NdArray::F64(x) => syn_float(x[IxDyn(&idx)]),
+        NdArray::Bool(x) => syn_bool(x[IxDyn(&idx)]),
+    })
 }
 
 // =========================================================
@@ -347,7 +383,7 @@ pub fn at(args: &[SynValue]) -> Result<SynValue, Control> {
 
 /// `a[i]`: 1D → escalar (Number); nD → la fila `i` (sub-array de un eje menos). Índice
 /// negativo o fuera de rango → error.
-pub fn index_row(a: &ArrayD<f64>, i: i64) -> Result<SynValue, Control> {
+pub fn index_row(a: &NdArray, i: i64) -> Result<SynValue, Control> {
     if a.ndim() == 0 {
         return Err(err("cannot index a 0-dimensional array"));
     }
@@ -357,12 +393,14 @@ pub fn index_row(a: &ArrayD<f64>, i: i64) -> Result<SynValue, Control> {
     if j < 0 || j >= len0 {
         return Err(err(format!("Index {} out of bounds (array axis 0 has length {})", i, len0)));
     }
-    let sub = a.index_axis(Axis(0), j as usize);
-    if sub.ndim() == 0 {
-        Ok(syn_float(*sub.first().unwrap()))
-    } else {
-        Ok(syn_array(sub.to_owned()))
+    let j = j as usize;
+    if a.ndim() == 1 {
+        return Ok(match a {
+            NdArray::F64(x) => syn_float(x[[j]]),
+            NdArray::Bool(x) => syn_bool(x[[j]]),
+        });
     }
+    Ok(nd_value_of(nd_map!(a, |x| x.index_axis(Axis(0), j).to_owned())))
 }
 
 // =========================================================
@@ -371,7 +409,7 @@ pub fn index_row(a: &ArrayD<f64>, i: i64) -> Result<SynValue, Control> {
 
 /// Shape de broadcast estilo NumPy (alinea desde la derecha; cada dim igual o uno = 1).
 /// `None` si no son broadcasteables.
-fn broadcast_shape(a: &[usize], b: &[usize]) -> Option<Vec<usize>> {
+pub fn broadcast_shape(a: &[usize], b: &[usize]) -> Option<Vec<usize>> {
     let n = a.len().max(b.len());
     let mut out = vec![0usize; n];
     for i in 0..n {
@@ -418,6 +456,7 @@ pub fn array_binop(left: &SynValue, right: &SynValue, op: &str) -> Option<Result
     }
     let res = match (left, right) {
         (SynValue::Array(a), SynValue::Array(b)) => {
+            let (a, b) = (a.to_f64(), b.to_f64());
             match broadcast_shape(a.shape(), b.shape()) {
                 None => Err(err(format!(
                     "arrays of shape {:?} and {:?} are not broadcastable",
@@ -444,11 +483,11 @@ pub fn array_binop(left: &SynValue, right: &SynValue, op: &str) -> Option<Result
         }
         (SynValue::Array(a), SynValue::Number(n)) => {
             let s = n.to_f64();
-            Ok(syn_array(a.mapv(|x| scalar_op(x, s, op))))
+            Ok(syn_array(a.to_f64().mapv(|x| scalar_op(x, s, op))))
         }
         (SynValue::Number(n), SynValue::Array(b)) => {
             let s = n.to_f64();
-            Ok(syn_array(b.mapv(|x| scalar_op(s, x, op))))
+            Ok(syn_array(b.to_f64().mapv(|x| scalar_op(s, x, op))))
         }
         _ => {
             let other = if la { right } else { left };
@@ -458,9 +497,243 @@ pub fn array_binop(left: &SynValue, right: &SynValue, op: &str) -> Option<Result
     Some(res)
 }
 
+// =========================================================
+// Elemento a elemento con broadcasting (v0.6.55): comparaciones, `==`, `maximum`, …
+// =========================================================
+
+/// Un operando elemento a elemento como `f64`: un array (una máscara da 0/1, R2) o un número
+/// (un array 0-d, que el broadcasting estira). `None` si no es ninguno de los dos.
+pub fn elem_operand(v: &SynValue) -> Option<Cow<'_, ArrayD<f64>>> {
+    match v {
+        SynValue::Array(a) => Some(a.to_f64()),
+        SynValue::Number(n) => Some(Cow::Owned(ArrayD::from_elem(IxDyn(&[]), n.to_f64()))),
+        _ => None,
+    }
+}
+
+/// `f(a, b)` elemento a elemento con el broadcasting de numpy, sin copiar los operandos.
+pub fn zip_broadcast<A: Copy, B: Copy, T>(a: &ArrayD<A>, b: &ArrayD<B>, f: impl Fn(A, B) -> T) -> Result<ArrayD<T>, Control> {
+    let shape = broadcast_shape(a.shape(), b.shape())
+        .ok_or_else(|| err(format!("arrays of shape {:?} and {:?} are not broadcastable", a.shape(), b.shape())))?;
+    let (va, vb) = (a.broadcast(IxDyn(&shape)).unwrap(), b.broadcast(IxDyn(&shape)).unwrap());
+    Ok(ndarray::Zip::from(va).and(vb).map_collect(|&x, &y| f(x, y)))
+}
+
+fn is_mask(v: &SynValue) -> bool {
+    matches!(v, SynValue::Array(a) if a.as_f64().is_none())
+}
+
+/// `<`, `>`, `<=`, `>=` con un array de un lado (R1): una máscara de la forma del broadcast. Un
+/// `NaN` da `false` (numpy). Una máscara no tiene orden (R2) y una lista no se convierte sola.
+/// Fría: `exec_binary` llega acá sólo si un operando es un array.
+#[inline(never)]
+pub fn array_compare(left: &SynValue, right: &SynValue, op: &str) -> Result<SynValue, Control> {
+    if is_mask(left) || is_mask(right) {
+        return Err(err("masks are not ordered — compare the numbers they came from"));
+    }
+    let (a, b) = match (elem_operand(left), elem_operand(right)) {
+        (Some(a), Some(b)) => (a, b),
+        _ => {
+            let other = if matches!(left, SynValue::Array(_)) { right } else { left };
+            return Err(match other {
+                SynValue::List(_) => err("cannot compare an array with a list — make it an array first: array(xs)"),
+                o => err(format!("cannot compare an array with {}", o.type_name())),
+            });
+        }
+    };
+    let f: fn(f64, f64) -> bool = match op {
+        "<" => |x, y| x < y,
+        ">" => |x, y| x > y,
+        "<=" => |x, y| x <= y,
+        _ => |x, y| x >= y,
+    };
+    Ok(crate::types::syn_mask(zip_broadcast(&a, &b, f)?))
+}
+
+/// `==`/`!=` con un array de un lado, cuando la igualdad del valor entero dio `false` (R3): si
+/// eso es la respuesta (otra forma, otros valores, `nothing`) devuelve `Ok`; si `false` en
+/// silencio sería un error (un número, una lista, otro tipo, una máscara contra un `f64`), el
+/// error nombra la forma Synsema.
+#[inline(never)]
+pub fn array_eq_mismatch(left: &SynValue, right: &SynValue, op: &str) -> Result<(), Control> {
+    let (arr, other) = if matches!(left, SynValue::Array(_)) { (left, right) } else { (right, left) };
+    match (arr, other) {
+        (SynValue::Array(a), SynValue::Array(b)) => {
+            if a.dtype() == b.dtype() {
+                Ok(())
+            } else {
+                Err(err("a mask and a f64 array are never equal — compare like with like (m * 1.0 gives 0/1 floats)"))
+            }
+        }
+        (_, SynValue::Nothing) => Ok(()),
+        (_, SynValue::Number(n)) => {
+            let f = if op == "==" { "equal" } else { "not_equal" };
+            Err(err(format!("{} compares whole values; for elementwise: {}(a, {})", op, f, n)))
+        }
+        (_, SynValue::List(_)) => Err(err(if op == "==" {
+            "== between an array and a list is never true — compare array(xs), or to_list(a) == xs"
+        } else {
+            "!= between an array and a list is always true — compare array(xs), or to_list(a) != xs"
+        })),
+        (_, o) => Err(err(format!(
+            "{} between an array and {} is {}",
+            op,
+            o.type_name(),
+            if op == "==" { "never true" } else { "always true" }
+        ))),
+    }
+}
+
+/// `where(a, m)` (v0.6.55): los elementos de `a` donde la máscara es verdadera, aplanados en 1-D,
+/// como `a[m]` de numpy. La máscara tiene la forma de `a`. Una máscara de máscara da una máscara.
+#[inline(never)]
+pub fn where_mask(a: &NdArray, m: &SynValue) -> Result<SynValue, Control> {
+    let m = match m {
+        SynValue::Array(x) => match &**x {
+            NdArray::Bool(m) => m,
+            NdArray::F64(_) => {
+                return Err(err("where expects a mask (a > 0) or a predicate ((x) => …), got a f64 array"))
+            }
+        },
+        other => {
+            return Err(err(format!(
+                "where expects a mask (a > 0) or a predicate ((x) => …), got {}",
+                other.type_name()
+            )))
+        }
+    };
+    if m.shape() != a.shape() {
+        return Err(err(format!("where: the mask has shape {:?} and the array {:?}", m.shape(), a.shape())));
+    }
+    fn pick<T: Copy>(x: &ArrayD<T>, m: &ArrayD<bool>) -> ArrayD<T> {
+        let v: Vec<T> = x.iter().zip(m.iter()).filter(|(_, k)| **k).map(|(v, _)| *v).collect();
+        let n = v.len();
+        ArrayD::from_shape_vec(IxDyn(&[n]), v).expect("1-D")
+    }
+    Ok(nd_value_of(nd_map!(a, |x| pick(x, m))))
+}
+
+/// `clamp(a, lo, hi)` con un array en alguno de los tres (v0.6.55): `min(max(x, lo), hi)` elemento a
+/// elemento, con broadcasting; un `NaN` se propaga (el `np.clip` de numpy).
+#[inline(never)]
+pub fn clamp_array(args: &[SynValue]) -> Result<SynValue, Control> {
+    arity(args, 3, "clamp")?;
+    let one = |i: usize| -> Result<Cow<'_, ArrayD<f64>>, Control> {
+        elem_operand(&args[i]).ok_or_else(|| match &args[i] {
+            SynValue::List(_) => err("clamp: make the list an array first: array(xs)"),
+            o => err(format!("clamp expects arrays or numbers, got {}", o.type_name())),
+        })
+    };
+    let (x, lo, hi) = (one(0)?, one(1)?, one(2)?);
+    let up = zip_broadcast(&x, &lo, |v, l| if v.is_nan() || l.is_nan() { f64::NAN } else { v.max(l) })?;
+    Ok(syn_array(zip_broadcast(&up, &hi, |v, h| if v.is_nan() || h.is_nan() { f64::NAN } else { v.min(h) })?))
+}
+
+/// Lo que recorre `each x in a` (v0.6.55, ítem 9): el primer eje, como `enumerate(a)` y `a[i]`. Un
+/// array 1-D da sus elementos (números, o bool si es una máscara); uno de más ejes, sus filas.
+#[inline(never)]
+pub fn each_items(a: &NdArray) -> Result<Vec<SynValue>, Control> {
+    each_check(a)?;
+    Ok((0..a.shape()[0]).filter_map(|i| each_item(a, i)).collect())
+}
+
+/// `each` sobre un array 0-d es un error (no tiene filas).
+pub fn each_check(a: &NdArray) -> Result<(), Control> {
+    if a.ndim() == 0 {
+        return Err(err("each over a 0-d array: it is a scalar and has no rows — use the value itself"));
+    }
+    Ok(())
+}
+
+/// El elemento (1-D) o la fila `i` de `each`, recién cuando le toca la vuelta; `None` al terminar.
+#[inline(never)]
+pub fn each_item(a: &NdArray, i: usize) -> Option<SynValue> {
+    if i >= a.shape()[0] {
+        return None;
+    }
+    if a.ndim() == 1 {
+        return Some(match a {
+            NdArray::F64(x) => syn_float(x[[i]]),
+            NdArray::Bool(x) => syn_bool(x[[i]]),
+        });
+    }
+    index_row(a, i as i64).ok()
+}
+
+/// Un error sin ubicación con la de `loc` (la de la sentencia que lo pidió).
+pub fn located(e: Control, loc: &crate::tokens::SourceLocation) -> Control {
+    match e {
+        Control::Error(mut r) if r.location.is_none() => {
+            r.location = Some(loc.clone());
+            Control::Error(r)
+        }
+        other => other,
+    }
+}
+
+/// Una función numérica de un argumento sobre un array (v0.6.55, ítem 5): elemento a elemento, `f64`
+/// (una máscara entra como 0/1, R2).
+#[inline(never)]
+pub fn map_f64(a: &NdArray, f: impl Fn(f64) -> f64) -> SynValue {
+    syn_array(a.to_f64().mapv(f))
+}
+
+/// Un predicado numérico sobre un array (`is_nan`, `is_finite`, …): una máscara.
+#[inline(never)]
+pub fn map_pred(a: &NdArray, f: fn(f64) -> bool) -> SynValue {
+    crate::types::syn_mask(a.to_f64().mapv(f))
+}
+
+/// Una función numérica de dos argumentos con un array en alguno (`pow`, `atan2`, `hypot`,
+/// `log_base`, `beta`): elemento a elemento con broadcasting, `f64`.
+#[inline(never)]
+pub fn binary_elem(args: &[SynValue], name: &str, f: impl Fn(f64, f64) -> f64) -> Result<SynValue, Control> {
+    arity(args, 2, name)?;
+    let one = |i: usize| -> Result<Cow<'_, ArrayD<f64>>, Control> {
+        elem_operand(&args[i]).ok_or_else(|| match &args[i] {
+            SynValue::List(_) => err(format!("{}: make the list an array first: array(xs)", name)),
+            o => err(format!("{} expects arrays or numbers, got {}", name, o.type_name())),
+        })
+    };
+    let (a, b) = (one(0)?, one(1)?);
+    let r = zip_broadcast(&a, &b, f).map_err(|e| match e {
+        Control::Error(mut r) => {
+            r.message = format!("{}: {}", name, r.message);
+            Control::Error(r)
+        }
+        other => other,
+    })?;
+    Ok(syn_array(r))
+}
+
+/// `Err` si algún elemento de un array de `args` no es un entero (`gcd`, `lcm`, `factorial`
+/// sobre arrays: el array es `f64`, los enteros van como floats exactos hasta 2^53).
+#[inline(never)]
+pub fn require_whole(args: &[SynValue], name: &str) -> Result<(), Control> {
+    for v in args {
+        if let SynValue::Array(a) = v {
+            if let Some(x) = a.to_f64().iter().find(|x| !(x.is_finite() && x.fract() == 0.0)) {
+                return Err(err(format!("{} expects whole numbers, the array has {}", name, x)));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `gcd` de dos floats enteros (Euclides; exacto mientras quepan en 2^53).
+pub fn gcd_f64(a: f64, b: f64) -> f64 {
+    let (mut a, mut b) = (a.abs(), b.abs());
+    while b != 0.0 {
+        let r = a % b;
+        a = b;
+        b = r;
+    }
+    a
+}
+
 /// Unario `-` sobre un array (elementwise).
-pub fn negate(a: &ArrayD<f64>) -> SynValue {
-    syn_array(a.mapv(|x| -x))
+pub fn negate(a: &NdArray) -> SynValue {
+    syn_array(a.to_f64().mapv(|x| -x))
 }
 
 // =========================================================
@@ -504,9 +777,9 @@ pub fn reduce(args: &[SynValue], kind: &str) -> Result<SynValue, Control> {
         ("product", Some(k)) => a.map_axis(Axis(k), |v| v.iter().product()),
         ("mean", None) => return Ok(syn_float(a.mean().unwrap())),
         ("mean", Some(k)) => a.mean_axis(Axis(k)).unwrap(),
-        ("min", None) => return Ok(syn_float(min_all(a))),
+        ("min", None) => return Ok(syn_float(min_all(&a))),
         ("min", Some(k)) => a.map_axis(Axis(k), |v| v.iter().copied().fold(f64::INFINITY, f64::min)),
-        ("max", None) => return Ok(syn_float(max_all(a))),
+        ("max", None) => return Ok(syn_float(max_all(&a))),
         ("max", Some(k)) => a.map_axis(Axis(k), |v| v.iter().copied().fold(f64::NEG_INFINITY, f64::max)),
         ("var", None) => return Ok(syn_float(variance(a.iter().copied()))),
         ("var", Some(k)) => a.map_axis(Axis(k), |v| variance(v.iter().copied())),
@@ -592,8 +865,8 @@ pub fn matmul(args: &[SynValue]) -> Result<SynValue, Control> {
     arity(args, 2, "matmul")?;
     let a = array_arg(args, 0, "matmul")?;
     let b = array_arg(args, 1, "matmul")?;
-    let fa = nd_to_faer(a, "matmul")?;
-    let fb = nd_to_faer(b, "matmul")?;
+    let fa = nd_to_faer(&a, "matmul")?;
+    let fb = nd_to_faer(&b, "matmul")?;
     if fa.ncols() != fb.nrows() {
         return Err(err(format!(
             "matmul: incompatible shapes {:?} and {:?} (cols of A must equal rows of B)",
@@ -622,10 +895,17 @@ pub fn dot(args: &[SynValue]) -> Result<SynValue, Control> {
     }
     // v0.6.29 (DATOS-10): un nombre por concepto — `dot` es el producto interno de VECTORES;
     // el producto de matrices es `matmul` (en numpy `dot` hace las dos cosas y confunde).
+    // Una matriz con un vector (`np.dot(M, v)`): la forma Synsema, con el largo del vector.
+    let hint = match (a.ndim(), b.ndim()) {
+        (2, 1) => format!("for a matrix times a vector: matmul(M, reshape(v, [{}, 1]))", b.len()),
+        (1, 2) => format!("for a vector times a matrix: matmul(reshape(v, [1, {}]), M)", a.len()),
+        _ => "for matrices use matmul(a, b)".to_string(),
+    };
     Err(err(format!(
-        "dot is the inner product of two 1-D vectors (got {}-D and {}-D) — for matrices use matmul(a, b)",
+        "dot is the inner product of two 1-D vectors (got {}-D and {}-D) — {}",
         a.ndim(),
-        b.ndim()
+        b.ndim(),
+        hint
     )))
 }
 
@@ -633,7 +913,7 @@ pub fn dot(args: &[SynValue]) -> Result<SynValue, Control> {
 pub fn solve(args: &[SynValue]) -> Result<SynValue, Control> {
     arity(args, 2, "solve")?;
     let a = array_arg(args, 0, "solve")?;
-    let fa = nd_to_faer(a, "solve")?;
+    let fa = nd_to_faer(&a, "solve")?;
     if fa.nrows() != fa.ncols() {
         return Err(err("solve: A must be a square matrix"));
     }
@@ -672,7 +952,7 @@ pub fn solve(args: &[SynValue]) -> Result<SynValue, Control> {
 pub fn det(args: &[SynValue]) -> Result<SynValue, Control> {
     arity(args, 1, "det")?;
     let a = array_arg(args, 0, "det")?;
-    let fa = nd_to_faer(a, "det")?;
+    let fa = nd_to_faer(&a, "det")?;
     if fa.nrows() != fa.ncols() {
         return Err(err("det: matrix must be square"));
     }
@@ -683,7 +963,7 @@ pub fn det(args: &[SynValue]) -> Result<SynValue, Control> {
 pub fn inv(args: &[SynValue]) -> Result<SynValue, Control> {
     arity(args, 1, "inv")?;
     let a = array_arg(args, 0, "inv")?;
-    let fa = nd_to_faer(a, "inv")?;
+    let fa = nd_to_faer(&a, "inv")?;
     if fa.nrows() != fa.ncols() {
         return Err(err("inv: matrix must be square"));
     }
@@ -739,7 +1019,7 @@ pub fn trace(args: &[SynValue]) -> Result<SynValue, Control> {
 pub fn eig(args: &[SynValue]) -> Result<SynValue, Control> {
     arity(args, 1, "eig")?;
     let a = array_arg(args, 0, "eig")?;
-    let fa = nd_to_faer(a, "eig")?;
+    let fa = nd_to_faer(&a, "eig")?;
     if fa.nrows() != fa.ncols() {
         return Err(err("eig: matrix must be square"));
     }
@@ -778,7 +1058,7 @@ pub fn eig(args: &[SynValue]) -> Result<SynValue, Control> {
 pub fn svd(args: &[SynValue]) -> Result<SynValue, Control> {
     arity(args, 1, "svd")?;
     let a = array_arg(args, 0, "svd")?;
-    let fa = nd_to_faer(a, "svd")?;
+    let fa = nd_to_faer(&a, "svd")?;
     let decomp = fa.as_ref().svd().map_err(|_| err("svd: decomposition failed"))?;
     let u = faer_to_nd(&decomp.U().to_owned());
     // V → Vt (transpuesta; para real V^H = V^T).
@@ -827,7 +1107,7 @@ fn vector_with_gaps(v: &SynValue, name: &str) -> Result<Vec<f64>, Control> {
             if a.ndim() != 1 {
                 return Err(err(format!("{}: expected a 1-D array or a list, got a {}-D array", name, a.ndim())));
             }
-            Ok(a.iter().copied().collect())
+            Ok(a.to_f64().iter().copied().collect())
         }
         SynValue::List(l) => list_values(&l)
             .iter()
@@ -871,7 +1151,7 @@ pub fn concat_or_stack(args: &[SynValue], axis: Option<SynValue>, stack: bool) -
     let mut arrs: Vec<ArrayD<f64>> = Vec::with_capacity(items.len());
     for (i, it) in items.iter().enumerate() {
         match it {
-            SynValue::Array(a) => arrs.push((**a).clone()),
+            SynValue::Array(a) => arrs.push(a.to_f64().into_owned()),
             other => return Err(err(format!("{}: item {} is {}, not an array", name, i, other.type_name()))),
         }
     }
@@ -904,6 +1184,7 @@ pub fn arg_extreme(args: &[SynValue], axis: Option<SynValue>, max: bool) -> Resu
     };
     match (arg(args, 0)?, axis) {
         (SynValue::Array(a), Some(k)) if !matches!(k, SynValue::Nothing) => {
+            let a = a.to_f64();
             let ax = axis_norm(int_value(&k, "axis", name)?, a.ndim(), name)?;
             let out = a.map_axis(Axis(ax), |l| lane(&l.iter().copied().collect::<Vec<_>>()));
             Ok(nd_result(out))
@@ -935,7 +1216,7 @@ pub fn arg_extreme(args: &[SynValue], axis: Option<SynValue>, max: bool) -> Resu
         }
         (v, _) => {
             let data = match v {
-                SynValue::Array(a) => a.iter().copied().collect(),
+                SynValue::Array(a) => a.to_f64().iter().copied().collect(),
                 other => vector(other, name)?,
             };
             if data.is_empty() {
@@ -965,8 +1246,8 @@ pub fn cumsum(args: &[SynValue], axis: Option<SynValue>) -> Result<SynValue, Con
             }
             Ok(crate::types::syn_list(out))
         }
-        SynValue::Array(a) => match axis {
-            None | Some(SynValue::Nothing) => {
+        SynValue::Array(a) => match (a.to_f64(), axis) {
+            (a, None | Some(SynValue::Nothing)) => {
                 let mut acc = 0.0;
                 let flat: Vec<f64> = a.iter().map(|x| {
                     acc += x;
@@ -974,9 +1255,9 @@ pub fn cumsum(args: &[SynValue], axis: Option<SynValue>) -> Result<SynValue, Con
                 }).collect();
                 Ok(syn_array(ArrayD::from_shape_vec(IxDyn(&[flat.len()]), flat).unwrap()))
             }
-            Some(k) => {
+            (a, Some(k)) => {
                 let ax = axis_norm(int_value(&k, "axis", "cumsum")?, a.ndim(), "cumsum")?;
-                let mut out = (**a).clone();
+                let mut out = a.into_owned();
                 out.accumulate_axis_inplace(Axis(ax), |&prev, cur| *cur += prev);
                 Ok(syn_array(out))
             }
@@ -1002,6 +1283,7 @@ pub fn diff(args: &[SynValue], axis: Option<SynValue>) -> Result<SynValue, Contr
             Ok(crate::types::syn_list(out))
         }
         SynValue::Array(a) => {
+            let a = a.to_f64();
             let k = match axis {
                 None | Some(SynValue::Nothing) => -1,
                 Some(v) => int_value(&v, "axis", "diff")?,
@@ -1009,7 +1291,7 @@ pub fn diff(args: &[SynValue], axis: Option<SynValue>) -> Result<SynValue, Contr
             let ax = Axis(axis_norm(k, a.ndim(), "diff")?);
             let n = a.len_of(ax);
             if n == 0 {
-                return Ok(syn_array((**a).clone()));
+                return Ok(syn_array(a.into_owned()));
             }
             let hi = a.slice_axis(ax, ndarray::Slice::from(1..));
             let lo = a.slice_axis(ax, ndarray::Slice::from(..n - 1));
@@ -1110,10 +1392,13 @@ fn least_squares(a: &Mat<f64>, b: &Mat<f64>, name: &str) -> Result<(Mat<f64>, us
 /// `lstsq(A, b)`: la solución de mínimos cuadrados (1-D si `b` es 1-D).
 pub fn lstsq(args: &[SynValue]) -> Result<SynValue, Control> {
     let a = array_arg(args, 0, "lstsq")?;
-    let fa = nd_to_faer(a, "lstsq")?;
+    let fa = nd_to_faer(&a, "lstsq")?;
     let (fb, one_d) = match arg(args, 1)? {
-        SynValue::Array(b) if b.ndim() == 1 => (Mat::from_fn(b.len(), 1, |i, _| b[[i]]), true),
-        SynValue::Array(b) => (nd_to_faer(b, "lstsq")?, false),
+        SynValue::Array(b) if b.ndim() == 1 => {
+            let b = b.to_f64();
+            (Mat::from_fn(b.len(), 1, |i, _| b[[i]]), true)
+        }
+        SynValue::Array(b) => (nd_to_faer(&b.to_f64(), "lstsq")?, false),
         other => {
             let v = vector(other, "lstsq")?;
             (Mat::from_fn(v.len(), 1, |i, _| v[i]), true)
@@ -1177,7 +1462,7 @@ pub fn polyval(args: &[SynValue]) -> Result<SynValue, Control> {
     let eval = |x: f64| coefs.iter().fold(0.0, |acc, c| acc * x + c);
     match arg(args, 1)? {
         SynValue::Number(n) => Ok(syn_float(eval(n.to_f64()))),
-        SynValue::Array(a) => Ok(syn_array(a.mapv(eval))),
+        SynValue::Array(a) => Ok(syn_array(a.to_f64().mapv(eval))),
         SynValue::Nothing => Ok(SynValue::Nothing),
         other => {
             let xs = vector_with_gaps(other, "polyval")?;
@@ -1186,5 +1471,504 @@ pub fn polyval(args: &[SynValue]) -> Result<SynValue, Control> {
                 xs.into_iter().enumerate().map(|(i, x)| if gap(i) { SynValue::Nothing } else { syn_float(eval(x)) }).collect(),
             ))
         }
+    }
+}
+
+// =========================================================
+// v0.6.55, ítems 2 y 3: indexar con posiciones y escribir (R5)
+// =========================================================
+
+/// Para qué se piden las posiciones: cambia sólo el texto del error de una máscara.
+#[derive(Clone, Copy)]
+pub enum PosFor<'a> {
+    /// `a[[0, 3]]`.
+    Read,
+    /// `set a[[0, 3]] to …`.
+    Set,
+    /// Un builtin (`take`, `index_add`): su nombre va adelante.
+    Builtin(&'a str),
+}
+
+/// Las posiciones de `idx` sobre un eje de largo `len`: un número (una), una lista o un array de
+/// enteros (en ese orden, repetir vale). Negativos desde el final; fuera de rango, el error de
+/// `a[i]`. Una máscara no es una lista de posiciones.
+#[inline(never)]
+pub fn positions(idx: &SynValue, len: usize, axis: usize, why: PosFor) -> Result<Vec<usize>, Control> {
+    let pre = match why {
+        PosFor::Builtin(n) => format!("{}: ", n),
+        _ => String::new(),
+    };
+    let one = |x: f64, shown: &dyn std::fmt::Display| -> Result<usize, Control> {
+        let k = x as i64;
+        let j = if k < 0 { k + len as i64 } else { k };
+        if j < 0 || j >= len as i64 {
+            return Err(err(format!("{}Index {} out of bounds (array axis {} has length {})", pre, shown, axis, len)));
+        }
+        Ok(j as usize)
+    };
+    let number = |n: &Number| -> Result<usize, Control> {
+        let x = n.to_f64();
+        if !(x.is_finite() && x.fract() == 0.0) {
+            return Err(err(format!(
+                "{}index must be an integer, got {} — use floor(x), round(x) or trunc(x) on purpose",
+                pre, n
+            )));
+        }
+        one(x, n)
+    };
+    match idx {
+        SynValue::Number(n) => Ok(vec![number(n)?]),
+        SynValue::List(l) => list_values(l)
+            .iter()
+            .map(|v| match v {
+                SynValue::Number(n) => number(n),
+                other => Err(err(format!("{}an index must be an integer, got {}", pre, other.type_name()))),
+            })
+            .collect(),
+        SynValue::Array(a) => match &**a {
+            NdArray::Bool(_) => Err(err(match why {
+                PosFor::Read => "an array is indexed by positions — for the elements where a mask is true: where(a, m)".to_string(),
+                PosFor::Set => "set takes positions, not a mask — if_else(m, 0, a) builds the new array".to_string(),
+                PosFor::Builtin(n) => {
+                    format!("{} takes positions, not a mask — for the elements where a mask is true: where(a, m)", n)
+                }
+            })),
+            NdArray::F64(x) => {
+                if x.ndim() != 1 {
+                    return Err(err(format!("{}an array index must be 1-D, got shape {:?}", pre, x.shape())));
+                }
+                x.iter()
+                    .map(|&v| {
+                        if !(v.is_finite() && v.fract() == 0.0) {
+                            return Err(err(format!("{}an array index must hold whole numbers, got {} — round first", pre, v)));
+                        }
+                        one(v, &v)
+                    })
+                    .collect()
+            }
+        },
+        other => Err(err(format!("{}an index must be an integer, got {}", pre, other.type_name()))),
+    }
+}
+
+/// `a[[1, 0]]`, `a[array([0, 3])]`: las filas en esas posiciones (como `take(a, …, axis = 0)`).
+/// Un índice que no es número llega acá; el número sigue por `index_row`.
+#[inline(never)]
+pub fn index_by(a: &NdArray, idx: &SynValue) -> Result<SynValue, Control> {
+    if a.ndim() == 0 {
+        return Err(err("cannot index a 0-dimensional array"));
+    }
+    let pos = positions(idx, a.shape()[0], 0, PosFor::Read)?;
+    Ok(take_axis(a, &pos, 0))
+}
+
+/// Las posiciones `pos` del eje `axis`, en orden, con el tipo de elemento.
+pub fn take_axis(a: &NdArray, pos: &[usize], axis: usize) -> SynValue {
+    nd_value_of(nd_map!(a, |x| x.select(Axis(axis), pos)))
+}
+
+/// Un paso de fila del camino de un `set` (`set M[i][j]`, R5): por el camino no viaja la fila (una
+/// copia por escritura) sino una FICHA, un array vacío propio que la hoja reconoce; la entrada dice
+/// de qué array (o de qué ficha de más arriba) y en qué posición. La hoja escribe el elemento
+/// directo en el array de la variable. La entrada guarda la ficha viva, así que su dirección no se
+/// reusa: una que quedó de un `set` que falló no se confunde con otra.
+struct RowPlace {
+    token: crate::types::Obj<NdArray>,
+    parent: crate::types::Obj<NdArray>,
+    at: usize,
+}
+
+/// Lo que el camino de un `set` sobre arrays deja para la hoja: las fichas de las filas y los arrays
+/// exportados por un módulo, cuya vista en el mapa del módulo es un dueño más que el lugar (B1 de la
+/// auditoría de v0.6.55). Cada entrada guarda una referencia, que la hoja descuenta al sacarla.
+struct Places {
+    rows: Vec<RowPlace>,
+    views: Vec<crate::types::Obj<NdArray>>,
+    /// Cuántas entradas disparan la limpieza (`prune`): `PLACES_CAP`, o el doble de las vivas.
+    limit: usize,
+}
+
+thread_local! {
+    static PLACES: std::cell::RefCell<Places> =
+        const { std::cell::RefCell::new(Places { rows: Vec::new(), views: Vec::new(), limit: PLACES_CAP }) };
+}
+
+/// Al llegar a este tope se descartan las entradas muertas: las de `set` que fallaron a mitad de
+/// camino (una entrada vieja sólo cuesta una copia del array en el próximo `set`, porque suma un
+/// dueño). Las de una sentencia en curso no se tocan nunca (M11 de la ronda 2, M17 de la ronda 3):
+/// están acotadas por la profundidad de las sentencias en curso, y el tope sólo dispara la limpieza.
+const PLACES_CAP: usize = 64;
+
+/// Una ficha viva tiene otro dueño además de la entrada (el valor que recorre el camino); una muerta,
+/// no. Una vista muerta es la de un array que ya no tiene nadie más. Las vivas quedan; si son muchas
+/// (una recursión con la llamada en el índice), el próximo disparo espera al doble, para que limpiar
+/// no cueste en cada `set`.
+#[cold]
+#[inline(never)]
+fn prune(s: &mut Places) {
+    s.rows.retain(|e| crate::types::Obj::strong_count(&e.token) > 1);
+    s.views.retain(|v| crate::types::Obj::strong_count(v) > 1);
+    s.limit = PLACES_CAP.max(2 * s.rows.len().max(s.views.len()));
+}
+
+/// Después de un error que el programa atrapa (`recover`, `assert_error`) o que termina una unidad de
+/// trabajo de un hilo que sigue vivo (`serve`): las entradas de los `set` que fallaron a mitad de camino
+/// ya están muertas (sus fichas cayeron al propagarse el error) y cada una retiene una copia entera
+/// del array como dueña (N6 de la ronda 4). Las de las sentencias en curso de más afuera siguen vivas
+/// y quedan. De paso el tope vuelve a bajar (M24). Frío: sólo corre después de un error.
+#[cold]
+#[inline(never)]
+pub fn drop_dead_places() {
+    PLACES.with(|s| {
+        let mut s = s.borrow_mut();
+        if !s.rows.is_empty() || !s.views.is_empty() || s.limit != PLACES_CAP {
+            prune(&mut s);
+        }
+    });
+}
+
+/// La raíz y las posiciones de una ficha (de afuera hacia adentro); `None` si `a` no es una ficha.
+fn row_chain(rows: &[RowPlace], a: &crate::types::Obj<NdArray>) -> Option<(crate::types::Obj<NdArray>, Vec<usize>)> {
+    let mut cur = a;
+    let mut prefix = Vec::new();
+    while let Some(e) = rows.iter().find(|e| crate::types::Obj::ptr_eq(&e.token, cur)) {
+        prefix.push(e.at);
+        cur = &e.parent;
+    }
+    if prefix.is_empty() {
+        return None;
+    }
+    prefix.reverse();
+    Some((cur.clone(), prefix))
+}
+
+/// La sub-vista en `prefix` (una posición por eje, desde el primero).
+fn sub_view<'a, T>(x: &'a ArrayD<T>, prefix: &[usize]) -> ndarray::ArrayViewD<'a, T> {
+    let mut v = x.view();
+    for &i in prefix {
+        v = v.index_axis_move(Axis(0), i);
+    }
+    v
+}
+
+fn sub_view_mut<'a, T>(x: &'a mut ArrayD<T>, prefix: &[usize]) -> ndarray::ArrayViewMutD<'a, T> {
+    let mut v = x.view_mut();
+    for &i in prefix {
+        v = v.index_axis_move(Axis(0), i);
+    }
+    v
+}
+
+/// `with_unique_binding` (intérprete): el array de una exportación de un módulo, al que la vista del
+/// mapa también apunta. La hoja cuenta esa vista como dueña (B1).
+#[inline(never)]
+pub fn note_module_view(a: &crate::types::Obj<NdArray>) {
+    PLACES.with(|s| {
+        let mut s = s.borrow_mut();
+        if s.views.len() >= s.limit {
+            prune(&mut s);
+        }
+        s.views.push(a.clone());
+    });
+}
+
+/// Un paso `[i]` del camino de un `set` sobre un array (`place_index_step`): la ficha de la fila
+/// `i`, o el elemento si la fila es un número (la hoja dará entonces el error de siempre).
+#[inline(never)]
+pub fn place_row(parent: &SynValue, idx: &SynValue) -> Result<SynValue, Control> {
+    let SynValue::Array(p) = parent else {
+        return Err(err(format!("Cannot index into {}", parent.type_name())));
+    };
+    let (root, prefix) = PLACES.with(|s| row_chain(&s.borrow().rows, p)).unwrap_or_else(|| (p.clone(), Vec::new()));
+    let shape = &root.shape()[prefix.len()..];
+    if shape.is_empty() {
+        return Err(err("cannot index a 0-dimensional array"));
+    }
+    if !matches!(idx, SynValue::Number(_)) {
+        return Err(err(
+            "set: a list of positions only goes in the last index — set M[[0, 2]] to rows, or M[i][j] one by one",
+        ));
+    }
+    let at = positions(idx, shape[0], 0, PosFor::Set)?[0];
+    if shape.len() == 1 {
+        return Ok(match &*root {
+            NdArray::F64(x) => syn_float(sub_view(x, &prefix)[[at]]),
+            NdArray::Bool(x) => syn_bool(sub_view(x, &prefix)[[at]]),
+        });
+    }
+    let token = crate::types::Obj::new(NdArray::F64(ArrayD::zeros(IxDyn(&[0]))));
+    PLACES.with(|s| {
+        let mut s = s.borrow_mut();
+        if s.rows.len() >= s.limit {
+            prune(&mut s);
+        }
+        s.rows.push(RowPlace { token: token.clone(), parent: p.clone(), at });
+    });
+    Ok(SynValue::Array(token))
+}
+
+/// Lo que se escribe, ya convertido al tipo del array.
+enum Payload {
+    F64(f64),
+    Bool(bool),
+    F64s(ArrayD<f64>),
+    Bools(ArrayD<bool>),
+}
+
+impl Payload {
+    fn of(value: &SynValue, mask: bool) -> Result<Payload, Control> {
+        let value = crate::labels::unwrap(value);
+        let shown = |v: &SynValue| match v {
+            SynValue::Number(n) => n.to_string(),
+            SynValue::Bool(b) => b.to_string(),
+            SynValue::Array(a) if a.dtype() == "bool" => "a mask".to_string(),
+            SynValue::Array(_) => "an f64 array".to_string(),
+            o => o.type_name().to_string(),
+        };
+        Ok(match (mask, value) {
+            (_, SynValue::List(_)) => return Err(err("set: make the list an array first: array(xs)")),
+            (false, SynValue::Number(n)) => Payload::F64(n.to_f64()),
+            (false, SynValue::Array(a)) if a.dtype() == "f64" => Payload::F64s(a.to_f64().into_owned()),
+            (false, SynValue::Bool(_)) => return Err(err("an f64 array holds numbers, got bool — use 1.0")),
+            (false, SynValue::Array(_)) => return Err(err("an f64 array holds numbers, got a mask — use m * 1.0")),
+            (false, o) => return Err(err(format!("an f64 array holds numbers, got {}", shown(o)))),
+            (true, SynValue::Bool(b)) => Payload::Bool(*b),
+            (true, SynValue::Array(a)) => match &**a {
+                NdArray::Bool(m) => Payload::Bools(m.clone()),
+                NdArray::F64(_) => return Err(err("a mask holds true or false, got an f64 array")),
+            },
+            (true, o) => return Err(err(format!("a mask holds true or false, got {}", shown(o)))),
+        })
+    }
+
+    fn shape(&self) -> Option<&[usize]> {
+        match self {
+            Payload::F64s(a) => Some(a.shape()),
+            Payload::Bools(a) => Some(a.shape()),
+            _ => None,
+        }
+    }
+}
+
+/// Escribe `p` en las posiciones `pos` del primer eje de `x` (la región es `[k] ++ shape[1..]`, o
+/// `shape[1..]` con un índice solo). Las formas ya están verificadas.
+fn write_region<T: Copy>(mut x: ndarray::ArrayViewMutD<T>, pos: &[usize], single: bool, scalar: Option<T>, arr: Option<&ArrayD<T>>) {
+    let region: Vec<usize> = if single {
+        x.shape()[1..].to_vec()
+    } else {
+        std::iter::once(pos.len()).chain(x.shape()[1..].iter().copied()).collect()
+    };
+    let src = arr.map(|a| a.broadcast(IxDyn(&region)).expect("forma verificada"));
+    for (n, &p) in pos.iter().enumerate() {
+        let mut dst = x.index_axis_mut(Axis(0), p);
+        match (&scalar, &src) {
+            (Some(v), _) => dst.fill(*v),
+            (None, Some(s)) if single => dst.assign(s),
+            (None, Some(s)) => dst.assign(&s.index_axis(Axis(0), n)),
+            (None, None) => {}
+        }
+    }
+}
+
+/// Lo que la hoja sabe de la variable raíz (ver `set_index`).
+pub struct Rooted {
+    /// Cuántos índices van de la variable a la hoja; `None` si el camino pasa por un campo.
+    pub depth: Option<usize>,
+    /// El array que tiene ahora la variable (su dirección), si tiene uno.
+    pub now: Option<usize>,
+    /// Con `--labels`: `rebound` e `in_use` salen como diagnóstico del sistema de etiquetas (el
+    /// programa ve el texto fijo de corte, el operador el motivo; M16 de la ronda 3). Su texto sólo
+    /// nombra la variable.
+    pub labels: bool,
+    /// La variable tiene el array dentro de un envoltorio `Private` que alguien más comparte (un
+    /// alias tomado a mitad de la sentencia, M21 de la ronda 4): `in_use`, como sin etiquetas.
+    pub shared: bool,
+}
+
+/// Cuántas filas recorrió el camino hasta la ficha `obj` (0 si no es una ficha).
+pub fn chain_len(obj: &SynValue) -> usize {
+    let SynValue::Array(a) = obj else { return 0 };
+    PLACES.with(|s| row_chain(&s.borrow().rows, a).map_or(0, |(_, p)| p.len()))
+}
+
+/// `set a[idx] to value` (la hoja; `set_leaf_index`): escribe en el lugar el array que el camino
+/// dejó único. Si `a` es la ficha de una fila (`set M[i][j]`), escribe en el array de la variable,
+/// en esa fila. `root`: el nombre de la variable, para los errores. `rooted`: lo que se sabe de la
+/// variable raíz ahora (B2 de la ronda 2).
+#[inline(never)]
+pub fn set_index(
+    obj: &SynValue,
+    idx: &SynValue,
+    value: SynValue,
+    root: Option<&str>,
+    rooted: Rooted,
+) -> Result<SynValue, Control> {
+    let SynValue::Array(a) = obj else {
+        return Err(err(format!("Cannot set index on {}", obj.type_name())));
+    };
+    // Las entradas de ESTA escritura salen (y sus referencias con ellas); las de otra, no: un `set`
+    // dentro de un índice (`set M[0][f()]` con `f` que escribe otro array) no le borra el camino.
+    let (chain, view) = PLACES.with(|s| {
+        let mut s = s.borrow_mut();
+        let chain = row_chain(&s.rows, a);
+        if let Some((r, _)) = &chain {
+            // Las fichas de esta cadena: de `a` hacia arriba hasta la raíz.
+            let mut cur = a.clone();
+            while let Some(k) = s.rows.iter().position(|e| crate::types::Obj::ptr_eq(&e.token, &cur)) {
+                let e = s.rows.swap_remove(k);
+                if crate::types::Obj::ptr_eq(&e.parent, r) {
+                    break;
+                }
+                cur = e.parent;
+            }
+        }
+        let target = chain.as_ref().map_or(a, |(r, _)| r);
+        let view = match s.views.iter().position(|v| crate::types::Obj::ptr_eq(v, target)) {
+            Some(k) => {
+                s.views.swap_remove(k);
+                true
+            }
+            None => false,
+        };
+        (chain, view)
+    });
+    let (target, prefix): (&crate::types::Obj<NdArray>, &[usize]) = match &chain {
+        Some((r, p)) => (r, p),
+        None => (a, &[]),
+    };
+    // B2 (ronda 2): si la raíz de la cadena es el array de la variable al empezar el camino, la
+    // variable tiene que seguir teniéndolo. Un índice que la religó (y guardó el array viejo en otra)
+    // haría caer la escritura en ese alias, y con `--labels` un valor privado en un array público.
+    let direct = rooted.depth == Some(prefix.len() + 1);
+    if direct && rooted.now != Some(crate::types::Obj::as_ptr(target) as usize) {
+        return Err(sys(rebound(root), rooted.labels));
+    }
+    // Con `--labels` la variable tiene un envoltorio `Private`, y un alias tomado en el índice comparte
+    // el envoltorio, no el array: la cuenta del array no lo ve.
+    if direct && rooted.shared {
+        return Err(sys(in_use(), rooted.labels));
+    }
+
+    // Los dueños del array de la variable: su lugar y la referencia de esta escritura (la del camino,
+    // o la raíz de la cadena), más la vista del módulo si es una exportación. Si hay otro (un alias
+    // tomado a mitad de la sentencia, la reentrada), no se escribe.
+    let owners = if view { 3 } else { 2 };
+    if crate::types::Obj::strong_count(target) != owners {
+        return Err(sys(in_use(), rooted.labels));
+    }
+    let shape = &target.shape()[prefix.len()..];
+    if shape.is_empty() {
+        return Err(err("cannot index a 0-dimensional array"));
+    }
+    let single = matches!(idx, SynValue::Number(_));
+    let pos = positions(idx, shape[0], 0, PosFor::Set)?;
+    let payload = Payload::of(&value, target.dtype() == "bool")?;
+    let sub = &shape[1..];
+    let region: Vec<usize> =
+        if single { sub.to_vec() } else { std::iter::once(pos.len()).chain(sub.iter().copied()).collect() };
+    if let Some(vs) = payload.shape() {
+        if broadcast_shape(vs, &region).as_deref() != Some(region.as_slice()) {
+            let what = if single { if sub.is_empty() { "the element is a number" } else { "the row has shape" } } else { "the positions have shape" };
+            let shape = if single && sub.is_empty() { String::new() } else { format!(" {:?}", region) };
+            // Las posiciones resueltas, todas (M18 de la ronda 3): `T[-1][0]` sale `T[1][0]`.
+            let path: String = prefix.iter().map(|i| format!("[{}]", i)).collect();
+            let leaf = if single { pos[0].to_string() } else { format!("{:?}", pos) };
+            return Err(err(format!(
+                "set {}{}[{}]: {}{}, got {:?}",
+                root.unwrap_or("a"),
+                path,
+                leaf,
+                what,
+                shape,
+                vs
+            )));
+        }
+    }
+    // SAFETY: la cuenta es exacta (arriba) y ninguna de esas referencias se lee mientras se escribe:
+    // el lugar está quieto hasta que termine la sentencia, el valor ya se copió a `payload` y las
+    // posiciones ya están calculadas. Que el otro dueño sea el lugar lo dice `rooted` (arriba) cuando
+    // el camino va de la variable al array sólo por índices; a través de una lista o un mapa
+    // (`set L[0][f()]`) la cuenta no lo distingue, como con listas (faltantes: evaluar los índices
+    // antes del camino); con `--labels`, ahí un valor privado sólo pasa con índices que no corren
+    // código (`set_leaf_index`).
+    let t = unsafe { crate::types::Obj::get_mut_with_owners(target, owners) }.ok_or_else(|| sys(in_use(), rooted.labels))?;
+    match (t, payload) {
+        (NdArray::F64(x), Payload::F64(v)) => write_region(sub_view_mut(x, prefix), &pos, single, Some(v), None),
+        (NdArray::F64(x), Payload::F64s(s)) => write_region(sub_view_mut(x, prefix), &pos, single, None, Some(&s)),
+        (NdArray::Bool(x), Payload::Bool(v)) => write_region(sub_view_mut(x, prefix), &pos, single, Some(v), None),
+        (NdArray::Bool(x), Payload::Bools(s)) => write_region(sub_view_mut(x, prefix), &pos, single, None, Some(&s)),
+        _ => unreachable!("Payload::of sigue el tipo del array"),
+    }
+    Ok(value)
+}
+
+#[cold]
+fn rebound(root: Option<&str>) -> Control {
+    err(format!(
+        "set: the index changed '{}' while it was being written (it now holds another value) — compute the index into a variable first",
+        root.unwrap_or("a")
+    ))
+}
+
+/// Con `--labels`, un error de la escritura que es un diagnóstico del sistema (`from_labels`): no se
+/// redacta ni se atrapa, y su texto va al operador.
+#[cold]
+fn sys(e: Control, labels: bool) -> Control {
+    match e {
+        Control::Error(mut r) if labels => {
+            r.from_labels = true;
+            Control::Error(r)
+        }
+        other => other,
+    }
+}
+
+#[cold]
+fn in_use() -> Control {
+    err("set: the array is in use elsewhere in this statement and cannot be written in place — an index or value that reads or writes the same array: compute it into a variable first")
+}
+
+#[cfg(test)]
+mod tests {
+    /// El único `unsafe` de este archivo (`get_mut_with_owners` en `set_index`) con los casos que lo
+    /// cuidan: escritura en el lugar, un alias que tiene que copiarse, el alias tomado en el índice
+    /// (`in_use`), una fila y la religadura en el índice; con y sin `--labels`. Pensado para Miri
+    /// (`cargo +nightly miri test -p synsema-core --lib arrays::tests`): ningún acceso inválido.
+    #[test]
+    fn writing_in_place_with_the_shared_reference() {
+        let src = "let A be zeros([2, 3])
+set A[0][1] to 5
+let B be A
+set A[1][2] to 7
+print(B[1][2])
+print(A[1][2])
+let keep be nothing
+task grab()
+    set keep to A
+    give 0
+try
+    set A[grab()][0] to 1
+recover e
+    print(\"in use\")
+task rebind()
+    set A to zeros([2, 3])
+    give 1
+try
+    set A[rebind()][1] to 9
+recover e
+    print(\"rebound\")
+set A[1][1] to 9
+print(A)
+set A[0] to array([1, 2, 3])
+print(A[0])";
+        let want = ["0.0", "7.0", "in use", "rebound", "[[0, 0, 0], [0, 9, 0]]", "[1, 2, 3]"];
+        let r = crate::interpreter::run_source(src, "<arrays>");
+        assert!(r.success, "{:?}", r.errors);
+        assert_eq!(r.output, want);
+        let program = crate::parser::parse_source(src, "<arrays>").unwrap();
+        let mut interp = crate::interpreter::Interpreter::new();
+        interp.set_labels(true);
+        assert!(interp.execute(&program).is_ok());
+        assert_eq!(interp.output, want);
     }
 }

@@ -184,13 +184,17 @@ pub(crate) extern "C" fn synsema_jit_list_elem(ctx: *mut Ctx, body: *const ListR
     })
 }
 
-/// Si un valor con caja es verdadero (`is_truthy`): 1 o 0.
+/// Si un valor con caja es verdadero (`is_truthy`): 1 o 0; -1 si es un array (R4, v0.6.55): el código
+/// sale y la VM da el error.
 pub(crate) extern "C" fn synsema_jit_truthy(ctx: *mut Ctx, v: *const SynValue) -> i64 {
     let mut t = 0i64;
     read(ctx, |_| {
         // SAFETY: como en `synsema_jit_index`.
         if let Some(v) = unsafe { v.as_ref() } {
-            t = i64::from(native_tier::truthy(v));
+            t = match native_tier::truthy(v) {
+                Some(b) => i64::from(b),
+                None => -1,
+            };
         }
         NPeek { tag: TAG_OTHER, bits: 0, ptr: std::ptr::null() }
     });

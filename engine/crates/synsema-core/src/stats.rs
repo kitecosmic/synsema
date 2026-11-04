@@ -58,6 +58,23 @@ impl Kind {
     }
 }
 
+/// v0.6.55: `max(a, b)` con dos arrays es el `np.maximum` de numpy: el error del eje lo dice.
+#[inline(never)]
+fn elementwise_hint(e: Control, kind: Kind, v: &SynValue) -> Control {
+    let hint = match (kind, v) {
+        (Kind::Max, SynValue::Array(_)) => " — for the elementwise max of two arrays: maximum(a, b)",
+        (Kind::Min, SynValue::Array(_)) => " — for the elementwise min of two arrays: minimum(a, b)",
+        _ => return e,
+    };
+    match e {
+        Control::Error(mut r) => {
+            r.message.push_str(hint);
+            Control::Error(r)
+        }
+        other => other,
+    }
+}
+
 fn int_kw(v: SynValue, what: &str, who: &str) -> Result<i64, Control> {
     match &v {
         SynValue::Number(n) if n.is_integer() => n.to_i64_trunc().ok_or_else(|| err(format!("{}: {} out of range", who, what))),
@@ -197,9 +214,21 @@ pub fn builtin(interp: &mut Interpreter, args: &[SynValue], kind: Kind) -> Resul
             let axis = match (kw_axis, pos_axis) {
                 (Some(_), Some(_)) => return Err(err(format!("{}: pass the axis once (axis = k)", who))),
                 (Some(v), None) => Some(int_kw(v, "axis", who)?),
-                (None, Some(v)) => Some(int_kw(v.clone(), "axis", who)?),
+                (None, Some(v)) => Some(int_kw(v.clone(), "axis", who).map_err(|e| elementwise_hint(e, kind, v))?),
                 (None, None) => None,
             };
+            // v0.6.55 (R2): `sum(m)` de una máscara es un entero, la cantidad de verdaderos.
+            if let (Kind::Sum, None, crate::types::NdArray::Bool(m)) = (kind, axis, &**a) {
+                return Ok(crate::types::syn_int(m.iter().filter(|b| **b).count() as i64));
+            }
+            // Por eje, también cuentas (M5 de la auditoría): lo que queda en 0-d es un entero; un
+            // array sigue siendo `f64`, con valores enteros (numpy da `int64`).
+            if let (Kind::Sum, Some(_), crate::types::NdArray::Bool(_)) = (kind, axis, &**a) {
+                return Ok(match reduce_array(a, kind, axis, lvl, ddof)? {
+                    SynValue::Number(n) => crate::types::syn_int(n.to_f64() as i64),
+                    other => other,
+                });
+            }
             reduce_array(a, kind, axis, lvl, ddof)
         }
         _ => {
@@ -230,8 +259,9 @@ pub fn builtin(interp: &mut Interpreter, args: &[SynValue], kind: Kind) -> Resul
     }
 }
 
-fn reduce_array(a: &crate::types::Obj<ArrayD<f64>>, kind: Kind, axis: Option<i64>, lvl: f64, ddof: f64) -> Result<SynValue, Control> {
+fn reduce_array(a: &crate::types::NdArray, kind: Kind, axis: Option<i64>, lvl: f64, ddof: f64) -> Result<SynValue, Control> {
     let who = kind.name();
+    let a: &ArrayD<f64> = &a.to_f64();
     if a.is_empty() && !matches!(kind, Kind::Sum | Kind::Product) {
         return Err(err(format!("{} of an empty array", who)));
     }

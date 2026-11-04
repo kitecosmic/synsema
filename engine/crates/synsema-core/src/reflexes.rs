@@ -66,6 +66,11 @@ pub const NAME_REFLEXES: &[(&str, &str)] = &[
     ("value_counts", "count_by(rows, key)"),
     ("read_csv", "csv_parse(read_file(path), {\"types\": {…}})"),
     ("to_csv", "csv_encode(rows)"),
+    // numpy (v0.6.55, R7): el nombre propio de Synsema.
+    ("any", "some(m) / every(m)"),
+    ("all", "some(m) / every(m)"),
+    ("clip", "clamp(a, lo, hi)"),
+    ("scatter_add", "index_add(a, indices, values)"),
 ];
 
 /// Métodos de otros lenguajes (`xs.append(y)`) → la función.

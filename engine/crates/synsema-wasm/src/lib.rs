@@ -492,6 +492,7 @@ pub fn wire_pure(interp: &mut Interpreter, caps: &Rc<RefCell<CapabilitySet>>, ct
     register_secret_builtins(interp, caps.clone(), ctx.env.clone());
     synsema_stdlib::hashing::register_hash_builtins(interp);
     synsema_stdlib::bits::register_bit_builtins(interp);
+    synsema_stdlib::ndarray_ops::register_ndarray_builtins(interp);
     synsema_stdlib::encoding::register_encoding_builtins(interp);
     synsema_stdlib::headers::register_header_builtins(interp);
     synsema_stdlib::qr::register_qr_builtins(interp);

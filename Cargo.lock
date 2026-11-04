@@ -3122,6 +3122,7 @@ dependencies = [
  "curve25519-dalek",
  "ed25519-dalek",
  "ego-tree",
+ "faer",
  "flate2",
  "fontdb",
  "hkdf 0.12.4",

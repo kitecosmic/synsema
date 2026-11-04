@@ -201,3 +201,46 @@ fn cancellation_stops_a_native_loop_reading_data() {
     let after = native_tier::stats();
     assert!(after.osr > before.osr, "el bucle no corría en nativo: {:?} → {:?}", before, after);
 }
+
+/// v0.6.55 (R4): un array no es verdadero ni falso. Un bucle nativo que pregunta la verdad de
+/// valores con caja (`when v`, `not v`, `v and …`) sale a la VM cuando le toca un array, y la VM da
+/// el error con el texto de cada sitio (el de la referencia).
+#[test]
+fn a_native_condition_on_an_array_exits_with_the_vm_error() {
+    synsema_jit::install();
+    let cases = [
+        ("when v\n        set n to n + 1", "an array is not true or false — some(m) / every(m) for a mask, length(a) > 0 for \"not empty\""),
+        ("when not v\n        set n to n + 1", "not needs true or false, got a mask — negate a mask with logical_not(m)"),
+        ("when v and i > 0\n        set n to n + 1", "and needs true or false, got a mask — combine masks with logical_and(m1, m2)"),
+        ("when i < 0 or v\n        set n to n + 1", "or needs true or false, got a mask — combine masks with logical_or(m1, m2)"),
+    ];
+    for (body, want) in cases {
+        let src = format!(
+            "let vals be [[1], [], \"s\", \"\", 3, 0, array([1, 5]) > 2]\nlet n be 0\neach i in range(0, 300000)\n    let k be i % 6\n    when i == 299999\n        set k to 6\n    let v be vals[k]\n    {}\nprint(n)\n",
+            body
+        );
+        let before = native_tier::stats();
+        let r = run_source(&src, "truth.syn");
+        let after = native_tier::stats();
+        assert!(!r.success, "tenía que fallar:\n{}", src);
+        assert!(r.errors.iter().any(|e| e.contains(want)), "{:?}\n{}", r.errors, src);
+        assert!(after.osr > before.osr, "el bucle no entró al código nativo:\n{}", src);
+        assert!(after.deopts > before.deopts, "el bucle no salió a la VM:\n{}", src);
+    }
+}
+
+/// v0.6.55 (R5, N4 de la auditoría): `set` sobre arrays en un bucle que entra al código nativo
+/// (que sale a la VM en el paso del array): escribe en el lugar y no toca a los alias.
+#[test]
+fn a_native_loop_writes_arrays_with_value_semantics() {
+    synsema_jit::install();
+    let src = "let z be zeros(1000)\nlet snap be z\nlet T be zeros([2, 3, 4])\nlet xs be [array([1, 2]), array([3, 4])]\nlet ys be xs\nlet M be zeros([10, 10])\n\
+        each i in range(0, 200000)\n    set z[i % 1000] to i\n    set T[i % 2][i % 3][i % 4] to i\n    set xs[1][0] to i\n    set M[i % 10][(i + 1) % 10] to M[i % 10][(i + 1) % 10] + 1\n\
+        print(sum(snap))\nprint(z[999])\nprint(T[1][2][3])\nprint(xs[1][0])\nprint(ys)\nprint(sum(M))\n";
+    let before = native_tier::stats();
+    let r = run_source(src, "set.syn");
+    let after = native_tier::stats();
+    assert!(r.success, "{:?}", r.errors);
+    assert_eq!(r.output.join("\n"), "0.0\n199999.0\n199991.0\n199999.0\n[[1, 2], [3, 4]]\n200000.0");
+    assert!(after.osr > before.osr, "el bucle no entró al código nativo");
+}

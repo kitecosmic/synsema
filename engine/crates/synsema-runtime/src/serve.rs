@@ -2305,6 +2305,7 @@ fn with_serve_interp<R>(
     // v0.6.47 (T1): cada entrada (request, tick del cron, handler de socket) es su propia corrida,
     // con su propio corte y sus propios agentes: el intérprete del worker no arrastra los de la
     // anterior.
+    // (v0.6.55: también suelta las entradas muertas de un `set` que falló en la entrada anterior.)
     base.interp.set_run_cut(Arc::new(synsema_core::interpreter::RunCut::default()));
     let held = if crate::host::labels() { Some(hold_serve_log(&mut base.interp)) } else { None };
     // v0.6.47 (T1): lo que esta entrada escribe en el blackboard va al diario de su corrida, como

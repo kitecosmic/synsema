@@ -59,6 +59,7 @@ pub mod discovery;
 pub mod hashing;
 // Bits sobre enteros de 64 bits y `xor_bytes` (HB2, v0.6.44). Puro.
 pub mod bits;
+pub mod ndarray_ops;
 // v0.6.45 (B1, B2): gzip/gunzip, url_encode/url_decode.
 pub mod encoding;
 // v0.6.45 (B3): header(r, nombre) sin distinguir mayúsculas.

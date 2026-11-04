@@ -6,6 +6,102 @@ Each says what changed, why, and what to write instead.
 
 Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the release date.
 
+## v0.6.55 — 2026-11-04
+
+**Engine.**
+- **An array carries its element type:** `f64` or `bool` (the mask that comparisons return),
+  behind the same pointer, so a value is still 24 bytes. A mask prints as `[false, true]`, `to_list` gives booleans, `json` gives `true`/`false`, it keeps its type across
+  `parallel_map` and the snapshots of `serve`, and the charts and database parameters reject it
+  (`chart_svg: a mask (bool array) is not a series — m * 1.0 gives 0/1 floats`; for a parameter,
+  `sql: a mask (bool array) is not a vector — …`).
+- **Comparisons give masks.** `a > 2`, `2 < a`, `a >= b` (numpy broadcasting) return a mask; `NaN`
+  compares `false`. `dtype(a)` is `"f64"` or `"bool"`. A mask in arithmetic is 0/1 (`m * 1.0`),
+  `sum(m)` is the count of trues (an integer; by axis, the counts), `mean(m)` the fraction. Masks are not ordered
+  (`m > m` is an error) and a list is never turned into an array behind your back
+  (`a > [1, 2]` → `… make it an array first: array(xs)`).
+- **Elementwise builtins:** `equal`, `not_equal`, `logical_and`, `logical_or`, `logical_not`,
+  `if_else(m, x, y)` (numpy's three-argument `where`), `maximum`, `minimum` (NaN propagates), and
+  `clamp` on arrays (with two numbers they follow the language: `maximum(2, 3)` is `3`, like
+  `max`, and `equal` compares big integers exactly, like `==`). `where(a, m)` keeps the elements where the mask is true (`a[m]` in numpy);
+  `some(m)`, `every(m)`, `count_where(m)`, and `some`/`every`/`count_where` with a predicate over an
+  array; `apply` that returns bools gives a mask. `any`, `all`, `clip` and `scatter_add` are not
+  defined and say what to write instead.
+- **Index with positions and write into an array.** `M[[1, 0]]` and `a[array([0, 3])]` give those
+  rows in that order (a position may repeat); `take(M, [1, 0], axis = 1)` does it on any axis (with
+  more than one axis the axis is required: numpy's `take` without one flattens). `set a[1] to 9`,
+  `set M[0] to array([7, 7])` (a number fills the row), `set M[0][1] to 9` and
+  `set a[[0, 2]] to array([4, 4])` (a repeated position keeps the last value) write the array.
+  Writing has value semantics, like lists: an alias, a task's argument or the array an `each`
+  walks do not change, and an array nobody else holds is written in place, without a copy per
+  write — `set T[i][j][k]` writes the element into `T` without copying its row, and the array a
+  module exports is written in place by its tasks and from outside (`set m.STATE[1] to 70`). A mask holds `true`/`false` and an `f64` array numbers (`set a[0] to true` → `… use 1.0`);
+  a mask as a position is an error that names `where(a, m)` / `if_else(m, 0, a)`. An index that
+  rebinds the variable it writes (`set a[f()]` where `f` does `set a to …`) is an error
+  (`set: the index changed 'a' while it was being written …`): the write never lands in the array
+  the variable held before. With `--labels` an array is private as a whole: it takes values at most
+  as private as the variable it is reached from (`set m.a[0]` is checked against `m`); writing into an array inside a list or map takes indices that run no
+  code (`let i be f()` first), and when the statement touched private data the errors of the write
+  reach the operator as a diagnostic (the program sees the fixed cut text). An alias taken inside the
+  index is `in_use` with and without `--labels`.
+- **`index_add(a, positions, values, axis = 0)`** returns a new array with the values added at those
+  positions; repeated positions accumulate in order (the gradient of an embedding).
+- **`each` walks an array** along its first axis: the elements of a 1-D array (numbers, or
+  booleans for a mask) and the rows of a matrix, reading each one when its turn comes (it does not
+  build them all first); `{ each }` in templates too. A 0-d array is an error.
+- **Numeric functions work elementwise:** `sign`, `gamma`, `lgamma`, `erf`, `erfc`, `factorial`
+  (as `f64`), `real`, `imag`, `conj`, `arg`; `is_nan`, `is_finite`, `is_infinite` give masks;
+  `pow`, `atan2`, `hypot`, `log_base`, `beta`, `gcd` and `lcm` broadcast; `round_to(a, 2)`. A test
+  walks every numeric builtin with an array so none is left out; `complex` on an array says that
+  arrays hold `f64` or `bool`.
+- **`transpose(a, axes)`** reorders the axes (`np.transpose`; a negative axis counts from the end).
+  **`matmul` takes batches** (3-D or more, the batch axes broadcast like numpy's; 2-D with 3-D too).
+  `matmul` and `dot` with a matrix and a vector name the Synsema form, with the vector's length
+  (`… for a matrix times a vector: matmul(M, reshape(v, [3, 1]))`); before, each pointed to the
+  other.
+- **Arrays to bytes and back:** `array_to_bytes(a, "f64" | "f32" | "bool")` and
+  `array_from_bytes(b, "f32", shape = [2, 3])`, little-endian in C order; `f32` rounds to nearest
+  and reads back as `f64`.
+- **Seeded random arrays:** `random_normal(g, [2, 3], mean = 0, std = 1)` and
+  `random_uniform(g, [2, 2], low = 0, high = 1)` give the same numbers as numpy's
+  `default_rng(seed).normal(…, size)` / `.uniform(…, size)`, bit for bit; without a shape they give
+  one number (`random_uniform(g)` is `g()`).
+- The errors of comparisons, `==`, conditions, broadcasting and array indexing say the line
+  (`file.syn:3:6: an array is not true or false — …`).
+- **Fixed:** with `--labels`, `apply` over a private array (or with a captured private value) stopped
+  the run with `private(x)`; it now gives a private array.
+- **Fixed (since before this version, for lists):** with `--labels`, an error of `set` that depends on
+  private data — an out-of-range private index (`set xs[secret]`), the length of a private list or
+  array walked with a public index, the shape or the type of a private value — could be caught with
+  `try/recover` and showed the data in its text. It now stops the run like the same error in a read
+  (`xs[secret]`): it is not caught and the run stops with `private(x)` and the place.
+- A `set` that fails halfway through its path and is caught no longer keeps a copy of the array alive
+  until much later (each caught failure on a large matrix held a full copy). The same holds for a
+  failed block of `synsema test`, a failed line of the REPL and the next entry of a `serve` worker.
+
+**Breaking.**
+- **`==`/`!=` with an array no longer answer `false` in silence.** Two arrays are still compared as
+  whole values (same type, shape and values). Against a number, a list or another type it is an
+  error that names the elementwise form (`== compares whole values; for elementwise: equal(a, 3)`);
+  a mask against a `f64` array is an error too. `x == nothing` still answers `false`. `in`, `match`
+  and `contains` do not change.
+- **An array is never true or false.** `when a`, `while m`, `assert(m)`, a guard, `and`/`or`/`not`
+  and a predicate that returns an array are errors that suggest `some(m)` / `every(m)`,
+  `length(a) > 0` or `logical_and`. Before, a non-empty array counted as true.
+- `arrays do not support ordering comparisons` is gone (comparisons work now).
+- **With `--labels`, a `try` whose body wrote into a private list, map or array runs its `recover`
+  under that private context**, as if it had read it (the write now counts as touching the private
+  data; a read already did this). A `recover` that then assigns a public variable stops the run. To
+  count failures in public, move the write out of the `try` or make the counter private.
+- **`-m` on a mask is an error**, like `-true` (numpy rejects it too): `logical_not(m)` flips it,
+  `0 - m` gives the 0/-1 floats. Negating a `f64` array works.
+- `each x in a` over an array walks it instead of failing with `Cannot iterate over array`, and
+  `Cannot set index on array` is gone (`set a[i]` works).
+
+**`perf-guard` allows +0.3 % over its anchor** (was +0.2 %). With `lto = true`, a change in one part
+of the engine moves how LLVM inlines code elsewhere: in this release `s_csv` on the tree-walker
+grew +0.22 % inside an `IndexMap::get` with `csv.rs` untouched, and the VM loop
+moved 1-1.7 % depending on the build machine. The anchor was re-measured on CI for this release.
+
 ## v0.6.54 — 2026-11-02
 
 **Behavior changes (read these first).**

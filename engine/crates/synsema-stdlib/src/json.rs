@@ -434,11 +434,11 @@ pub fn dumps_syn_into(v: &SynValue, out: &mut String) {
 }
 
 /// `array` (Batch 5) → lista JSON anidada (row-major); el caso 0-D es un número.
-fn array_view_to_json(a: &ndarray::ArrayViewD<f64>) -> Json {
+fn array_view_to_json<T: Copy>(a: &ndarray::ArrayViewD<T>, elem: fn(T) -> Json) -> Json {
     if a.ndim() == 0 {
-        Json::Float(*a.first().unwrap())
+        elem(*a.first().unwrap())
     } else {
-        Json::Array(a.outer_iter().map(|s| array_view_to_json(&s)).collect())
+        Json::Array(a.outer_iter().map(|s| array_view_to_json(&s, elem)).collect())
     }
 }
 
@@ -479,7 +479,11 @@ pub fn syn_to_json(v: &SynValue) -> Json {
             obj(vec![("re", Json::Float(z.re)), ("im", Json::Float(z.im))])
         }
         // `array` en un body JSON → lista anidada (NumPy-like). Batch 5.
-        SynValue::Array(a) => array_view_to_json(&a.view()),
+        // Una máscara → `true`/`false` (v0.6.55).
+        SynValue::Array(a) => match &**a {
+            synsema_core::types::NdArray::F64(x) => array_view_to_json(&x.view(), Json::Float),
+            synsema_core::types::NdArray::Bool(x) => array_view_to_json(&x.view(), Json::Bool),
+        },
         // `private` en un body serializado: fail-closed, como el secret. Como BUILTIN,
         // `json_encode` nunca ve un Private (el despacho etiquetado del intérprete le entrega
         // El valor sin etiquetas y envuelve el texto resultante con ellas). Llegar acá con un
@@ -784,6 +788,14 @@ mod tests {
 
     /// `dumps_syn` escribe sin el árbol intermedio: tiene que dar los mismos bytes que
     /// `dumps(&syn_to_json(v))` en todo lo que escribe directo y en lo que delega.
+    #[test]
+    fn v0655_a_mask_is_true_false_in_json() {
+        let m = synsema_core::types::syn_mask(ndarray::ArrayD::from_shape_vec(ndarray::IxDyn(&[4]), vec![false, true, false, true]).unwrap());
+        assert_eq!(dumps_syn(&m), "[false, true, false, true]");
+        let f = synsema_core::types::syn_array(ndarray::ArrayD::from_shape_vec(ndarray::IxDyn(&[2]), vec![1.0, 2.5]).unwrap());
+        assert_eq!(dumps_syn(&f), "[1.0, 2.5]");
+    }
+
     #[test]
     fn dumps_syn_matches_the_tree() {
         let texts = [
