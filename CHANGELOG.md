@@ -6,7 +6,7 @@ Each says what changed, why, and what to write instead.
 
 Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the release date.
 
-## v0.6.55 — unreleased
+## v0.6.55 — 2026-11-04
 
 **Engine.**
 - **An array carries its element type:** `f64` or `bool` (the mask that comparisons return),
