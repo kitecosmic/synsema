@@ -769,6 +769,29 @@ fn r1_m3_replay_compares_the_trusted_modules() {
     assert_eq!(code, 2, "{}", err);
 }
 
+/// v0.6.56 (lo encontró el CI de este PR, con `r1_m3` rojo): una clave de auditor que empieza con
+/// `--` (una de cada 4 096) se acepta en `run --auditor <clave>` y en `test --auditor <clave>`; un
+/// flag en el lugar de la clave sigue siendo «requires a value».
+#[test]
+fn an_auditor_key_that_starts_with_two_dashes_is_a_key() {
+    let dir = project("audkey-dashes");
+    std::fs::write(dir.join("p.syn"), "print(1)\n").unwrap();
+    std::fs::write(dir.join("p.test.syn"), "test \"a\"\n    assert_eq(1, 1)\n").unwrap();
+    let (sk, pk) = (0..200_000).map(|_| auditor_keys()).find(|(_, pk)| pk.starts_with("--")).expect("una clave con --");
+    let (code, out, err) = synsema(&dir, &["run", "--auditor", &pk, "p.syn"], None);
+    assert_eq!((code, out.trim()), (0, "1"), "{}", err);
+    let opened = open_receipt(&receipt_in(&err), &sk);
+    assert!(opened["header"].is_object(), "{}", opened);
+    let (code, out, err) = synsema(&dir, &["test", "--auditor", &pk, "p.test.syn"], None);
+    assert_eq!(code, 0, "{}{}", out, err);
+    let (code, _, err) = synsema(&dir, &["run", "--auditor", "--flat", "p.syn"], None);
+    assert_eq!(code, 2, "{}", err);
+    assert!(err.contains("--auditor requires a value"), "{}", err);
+    let (code, _, err) = synsema(&dir, &["test", "--auditor", "--flat", "p.test.syn"], None);
+    assert_eq!(code, 2, "{}", err);
+    assert!(err.contains("--auditor needs a value"), "{}", err);
+}
+
 /// B3 (A7 fila 8): una corrida que termina con `exit(n)` se compara hasta el final.
 #[test]
 fn r1_b3_replay_of_an_exit_compares_to_the_end() {

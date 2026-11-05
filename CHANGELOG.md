@@ -90,6 +90,18 @@ is linear (it was quadratic in the number of chunks: 786 KB in 1-byte chunks too
 **Fixed: signed zero.** `cumsum` of an array that starts with `-0.0` keeps `-0.0` (numpy), and `dot`
 of two empty vectors is `0.0`, not `-0.0`, in `f64` and in `f32`.
 
+**Fixed: an auditor key that starts with `--`.** The public key of `synsema receipt keygen` is
+base64url of 32 random bytes, and one in 4096 starts with `--`: `run --auditor <key>` and
+`test --auditor <key>` took it for a flag (`--auditor requires a value`). A valid auditor key is now
+taken as the value; a flag in its place (`run --auditor --flat`) is still that error. `serve` and
+`run --auditor=<key>` already took it.
+
+**The `perf-guard` anchor was re-measured on CI** (`engine/perf/baseline.json`, from this release's
+PR), with the new row `s_arrays_small` (arithmetic on small arrays). Three rows went over the
++0.3 % budget in code this release did not touch: `o_plus` (jit) +0.57 %, in the allocator
+(`malloc_consolidate`, `unlink_chunk`), and `s_text_join` (jit and vm) +0.33 %, in
+`__memcmp_avx2_movbe`.
+
 ## v0.6.55 — 2026-11-04
 
 **Engine.**
