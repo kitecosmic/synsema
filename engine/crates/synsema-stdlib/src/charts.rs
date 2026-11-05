@@ -41,8 +41,12 @@ fn err(msg: impl Into<String>) -> Control {
 }
 
 /// Los números de un array para graficar; una máscara no es una serie (v0.6.55).
-fn chart_nums<'a>(a: &'a synsema_core::types::NdArray, name: &str) -> Result<&'a ndarray::ArrayD<f64>, Control> {
-    a.as_f64().ok_or_else(|| err(format!("{}: a mask (bool array) is not a series — m * 1.0 gives 0/1 floats", name)))
+/// Un `f32` grafica sus valores exactos (v0.6.56).
+fn chart_nums<'a>(a: &'a synsema_core::types::NdArray, name: &str) -> Result<std::borrow::Cow<'a, ndarray::ArrayD<f64>>, Control> {
+    if a.dtype() == "bool" {
+        return Err(err(format!("{}: a mask (bool array) is not a series — m * 1.0 gives 0/1 floats", name)));
+    }
+    Ok(a.numbers_f64())
 }
 
 // =========================================================

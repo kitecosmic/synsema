@@ -145,9 +145,9 @@ fn ndarray_helpers() {
     assert!(b.is_empty() && b.ndim() == 1 && b.dtype() == "bool" && b.as_f64().is_none());
     let f = NdArray::from(ArrayD::from_elem(IxDyn(&[2, 2]), 1.5));
     assert_eq!((f.len(), f.shape()), (4, &[2usize, 2][..]));
-    assert!(matches!(f.to_f64(), std::borrow::Cow::Borrowed(_)), "un f64 no se copia");
+    assert!(matches!(f.numbers_f64(), std::borrow::Cow::Borrowed(_)), "un f64 no se copia");
     let m = NdArray::from(ArrayD::from_shape_vec(IxDyn(&[2]), vec![true, false]).unwrap());
-    assert_eq!(m.to_f64().iter().copied().collect::<Vec<_>>(), vec![1.0, 0.0]);
+    assert_eq!(m.numbers_f64().iter().copied().collect::<Vec<_>>(), vec![1.0, 0.0]);
 }
 
 /// `fill_nan` sobre una máscara: no tiene NaN, queda igual (y sigue siendo máscara).

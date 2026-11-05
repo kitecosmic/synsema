@@ -590,7 +590,7 @@ fn reject_sealed(v: &SynValue, who: &str) -> Result<(), String> {
     match v {
         SynValue::Secret(s) => s.expose_bytes_checked(who).map(|_| ()),
         // v0.6.55: una máscara no es un vector de números (pgvector, columnas): que lo diga.
-        SynValue::Array(a) if a.as_f64().is_none() => Err(format!(
+        SynValue::Array(a) if a.dtype() == "bool" => Err(format!(
             "{}: a mask (bool array) is not a vector — m * 1.0 gives 0/1 floats",
             who
         )),
@@ -915,8 +915,11 @@ fn list_to_vector_text(items: &[SynValue]) -> String {
 }
 
 fn array_to_vector_text(a: &synsema_core::types::NdArray) -> String {
-    let a = a.to_f64();
-    let parts: Vec<String> = a.iter().map(|f| f.to_string()).collect();
+    // v0.6.56: un `f32` va con su decimal más corto (pgvector guarda `float4`).
+    let parts: Vec<String> = match a {
+        synsema_core::types::NdArray::F32(x) => x.iter().map(|f| f.to_string()).collect(),
+        _ => a.numbers_f64().iter().map(|f| f.to_string()).collect(),
+    };
     format!("[{}]", parts.join(","))
 }
 

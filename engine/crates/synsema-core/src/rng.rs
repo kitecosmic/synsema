@@ -664,6 +664,48 @@ fn samples(
     Ok(out)
 }
 
+/// v0.6.56 (diseño §3.1): una muestra en `f32` es la de `f64` redondeada (igual bit a bit a
+/// `astype(…, "f32")` y a `normal(size=n).astype(np.float32)`; gasta el mismo flujo). En la uniforme,
+/// los límites son `f32(low)` y `f32(high)` (F3, como todo número suelto junto a un `f32`): si el
+/// redondeo llega a `f32(high)`, la muestra es el `f32` anterior, nunca debajo de `f32(low)`. Así, desde
+/// el lenguaje, `u >= low` y `u < high` son siempre verdad (ronda 2, N3: la ronda 1 comparaba con el
+/// `high` exacto y `u < high`, que redondea `high`, podía dar `false`).
+fn to_f32(x: f64, dist: Dist) -> f32 {
+    let y = x as f32;
+    match dist {
+        Dist::Uniform { low, high } if high > low && y >= high as f32 => {
+            let h = high as f32;
+            // El anterior a `h` hacia `-inf` (`f32::next_down`, a mano: el MSRV no lo tiene).
+            let below = if h > 0.0 {
+                f32::from_bits(h.to_bits() - 1)
+            } else if h == 0.0 {
+                -f32::from_bits(1)
+            } else {
+                f32::from_bits(h.to_bits() + 1)
+            };
+            below.max(low as f32)
+        }
+        // Rondas 3 (M3) y 4 (M1): una muestra `f32` es siempre finita. Con `high > low`, un `+inf` ya lo
+        // saca el brazo de arriba (`y >= f32(high)`); si `f32(low)` es `-inf`, una muestra que redondea a
+        // `-inf` pasa a `-f32::MAX` (y `u >= low` sigue siendo verdad). Con el intervalo invertido
+        // (`low > high`, que numpy admite) puede salir `+inf` cerca de `low`: pasa a `f32::MAX`.
+        Dist::Uniform { .. } if y.is_infinite() => f32::MAX.copysign(y),
+        _ => y,
+    }
+}
+
+/// Un límite de la uniforme en un error, escrito como lo escribe `print` (ronda 3, M2): un entero sin
+/// decimales (`low = 0`, como lo escribió el programa; `num_kw_of` ya lo pasó a `f64`) y el resto como
+/// un float de Synsema (`3e+38`, `1e-45`, `inf`). `{}` de Rust escribía los 40 dígitos de `1e39`.
+fn bound_text(x: f64) -> String {
+    // `-0.0` va como `print` lo escribe (`-0.0`), no como el entero `0`.
+    if x.fract() == 0.0 && x.abs() < 1e16 && !(x == 0.0 && x.is_sign_negative()) {
+        format!("{}", x as i64)
+    } else {
+        crate::number::py_float_str(x)
+    }
+}
+
 /// Un número sin forma; con forma (`[2, 3]` o un entero), un array de esas muestras.
 fn draw(
     interp: &mut crate::interpreter::Interpreter,
@@ -672,9 +714,23 @@ fn draw(
     who: &str,
     loc: &crate::tokens::SourceLocation,
 ) -> Result<SynValue, Control> {
+    let k = crate::arrays::ctor_dtype(interp.kwarg("dtype"), who)?;
+    // Ronda 2 (N3): en `f32` el intervalo es `[f32(low), f32(high))`; si los dos redondean al mismo
+    // `f32`, está vacío y ninguna muestra cumpliría `u < high`.
+    if let (crate::arrays::Num::F32, Dist::Uniform { low, high }) = (k, dist) {
+        if low < high && low as f32 == high as f32 {
+            return Err(err(format!(
+                "{}: low = {} and high = {} round to the same f32, so [low, high) is empty in f32 — widen the interval or use dtype = \"f64\"",
+                who,
+                bound_text(low),
+                bound_text(high)
+            )));
+        }
+    }
     let g = &args[0];
     let Some(shape) = args.get(1) else {
-        return Ok(syn_float(samples(interp, g, 1, dist, loc)?[0]));
+        let x = samples(interp, g, 1, dist, loc)?[0];
+        return Ok(syn_float(if k == crate::arrays::Num::F32 { to_f32(x, dist) as f64 } else { x }));
     };
     let shape = crate::arrays::shape_from(shape, who)?;
     let n = shape
@@ -682,6 +738,12 @@ fn draw(
         .try_fold(1usize, |acc, &d| acc.checked_mul(d))
         .ok_or_else(|| err(format!("{}: shape {:?} is too large", who, shape)))?;
     let xs = samples(interp, g, n, dist, loc)?;
+    if k == crate::arrays::Num::F32 {
+        let ys: Vec<f32> = xs.into_iter().map(|x| to_f32(x, dist)).collect();
+        return Ok(crate::types::syn_array32(
+            ndarray::ArrayD::from_shape_vec(ndarray::IxDyn(&shape), ys).expect("n es el producto de la forma"),
+        ));
+    }
     Ok(crate::types::syn_array(
         ndarray::ArrayD::from_shape_vec(ndarray::IxDyn(&shape), xs).expect("n es el producto de la forma"),
     ))
@@ -700,7 +762,12 @@ pub fn b_uniform(
         return Err(err("random_uniform(g, shape, low = 0, high = 1): pass a generator from rng(seed)"));
     }
     if !(high - low).is_finite() {
-        return Err(err(format!("random_uniform: high - low must be finite, got low = {} and high = {}", low, high)));
+        // Los números como los escribe `print` (ronda 3, M2; `{}` de Rust escribía los 40 dígitos de 1e39).
+        return Err(err(format!(
+            "random_uniform: high - low must be finite, got low = {} and high = {}",
+            bound_text(low),
+            bound_text(high)
+        )));
     }
     draw(interp, args, Dist::Uniform { low, high }, "random_uniform", loc)
 }

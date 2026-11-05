@@ -70,7 +70,7 @@ fn unary_float(args: &[SynValue], name: &str, f: impl Fn(f64) -> f64) -> Result<
     arity(args, 1, name)?;
     // v0.6.29 (DATOS-10/11): sobre un array, elemento a elemento.
     if let SynValue::Array(a) = arg(args, 0)? {
-        return Ok(crate::types::syn_array(a.to_f64().mapv(f)));
+        return Ok(crate::arrays::map_f64(a, f));
     }
     Ok(syn_float(f(num(args, 0, name)?.to_f64())))
 }
@@ -106,7 +106,7 @@ fn unary_poly(
     arity(args, 1, name)?;
     match arg(args, 0)? {
         SynValue::Number(n) => Ok(syn_float(real(n.to_f64()))),
-        SynValue::Array(a) => Ok(crate::types::syn_array(a.to_f64().mapv(real))),
+        SynValue::Array(a) => Ok(crate::arrays::map_f64(a, real)),
         SynValue::Complex(z) => Ok(SynValue::Complex(cplx(*z))),
         other => Err(err(format!("{} expects a number, got {}", name, other.type_name()))),
     }
@@ -159,7 +159,7 @@ pub fn abs(args: &[SynValue]) -> Result<SynValue, Control> {
         return Ok(syn_float(z.norm()));
     }
     if let SynValue::Array(a) = arg(args, 0)? {
-        return Ok(crate::types::syn_array(a.to_f64().mapv(f64::abs)));
+        return Ok(crate::arrays::map_f64(a, f64::abs));
     }
     let n = num(args, 0, "abs")?;
     Ok(syn_number(match n {
@@ -423,7 +423,7 @@ pub fn factorial(args: &[SynValue]) -> Result<SynValue, Control> {
     // elementos son enteros no negativos, como el escalar.
     if let SynValue::Array(a) = arg(args, 0)? {
         crate::arrays::require_whole(args, "factorial")?;
-        if a.to_f64().iter().any(|x| *x < 0.0) {
+        if a.numbers_f64().iter().any(|x| *x < 0.0) {
             return Err(err("factorial expects a non-negative integer"));
         }
         return Ok(crate::arrays::map_f64(a, |n| {
@@ -634,7 +634,7 @@ fn data_f64(args: &[SynValue], name: &str) -> Result<Vec<f64>, Control> {
             }
             out
         }
-        SynValue::Array(a) => a.to_f64().iter().copied().collect(),
+        SynValue::Array(a) => a.numbers_f64().iter().copied().collect(),
         other => {
             return Err(err(format!(
                 "{} expects a list of numbers or an array, got {}",
@@ -673,7 +673,7 @@ pub fn median(args: &[SynValue]) -> Result<SynValue, Control> {
     arity(args, 1, "median")?;
     let mut vals = data_f64(args, "median")?;
     vals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
-    Ok(syn_float(percentile_of_sorted(&vals, 50.0)))
+    Ok(crate::arrays::Num::of_value(&args[0]).number(percentile_of_sorted(&vals, 50.0)))
 }
 
 pub fn percentile(args: &[SynValue]) -> Result<SynValue, Control> {
@@ -687,7 +687,7 @@ pub fn percentile(args: &[SynValue]) -> Result<SynValue, Control> {
     }
     let mut vals = data_f64(args, "percentile")?;
     vals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
-    Ok(syn_float(percentile_of_sorted(&vals, p)))
+    Ok(crate::arrays::Num::of_value(&args[0]).number(percentile_of_sorted(&vals, p)))
 }
 
 /// Bordes del histograma: `bins` entero (default 10, rango [min,max] equiespaciado —

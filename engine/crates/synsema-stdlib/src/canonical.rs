@@ -206,6 +206,82 @@ fn write(v: &SynValue, out: &mut String, depth: usize, path: &str) -> Result<(),
     Ok(())
 }
 
+/// v0.6.56 (diseño §3.6, ajuste 1 de Joel): los bytes del linaje de un valor que trae arrays, con
+/// `encoding: "ndarray"`. Cada array, a cualquier profundidad, se reemplaza por el mapa
+/// `{dtype: dtype(a), shape: shape(a), data: to_list(flatten(a))}` (en ese orden de claves), y el
+/// resultado es `json_encode` de eso. Así un `f32` y un `f64` con los mismos valores, o un array y la
+/// lista con sus números, dan hashes distintos. `None` si el valor no trae ningún array (sigue
+/// "jcs"/"json"). El nombre de la receta se cambia si la receta cambia (recibos viejos intactos).
+///
+/// Lo que fija los bytes (ronda 1, M3), para que un tercero la recalcule:
+/// - las claves de un mapa del programa van ordenadas como en "jcs" (por unidades de código UTF-16,
+///   RFC 8785 §3.2.3): dos mapas iguales armados en otro orden dan el mismo hash. El mapa de un
+///   array va siempre `dtype`, `shape`, `data`;
+/// - los números y el texto se escriben como `json_encode` (`1.0`, `0.10000000149011612`; un NaN o
+///   un infinito salen `NaN`/`Infinity`, que no son JSON estricto);
+/// - más de `MAX_DEPTH` (64) niveles: no es esta receta (`None`), y el valor sigue por "jcs", que da
+///   su error de profundidad.
+pub fn lineage_ndarray(v: &SynValue) -> Option<String> {
+    fn has_array(v: &SynValue, depth: usize) -> Option<bool> {
+        if depth > MAX_DEPTH {
+            return None;
+        }
+        Some(match v {
+            SynValue::Array(_) => true,
+            SynValue::List(l) => {
+                let mut any = false;
+                for x in list_values(l).iter() {
+                    any |= has_array(x, depth + 1)?;
+                }
+                any
+            }
+            SynValue::Map(m) => {
+                let mut any = false;
+                for (_, x) in m.borrow().iter() {
+                    any |= has_array(x, depth + 1)?;
+                }
+                any
+            }
+            _ => false,
+        })
+    }
+    fn typed(v: &SynValue) -> SynValue {
+        match v {
+            SynValue::Array(a) => {
+                let mut m = synsema_core::types::SynMap::new();
+                m.insert("dtype", syn_text(a.dtype()));
+                m.insert(
+                    "shape",
+                    synsema_core::types::syn_list(a.shape().iter().map(|&d| synsema_core::types::syn_int(d as i64)).collect()),
+                );
+                let flat: Vec<SynValue> = match &**a {
+                    synsema_core::types::NdArray::F64(x) => x.iter().map(|&f| synsema_core::types::syn_float(f)).collect(),
+                    synsema_core::types::NdArray::F32(x) => x.iter().map(|&f| synsema_core::types::syn_float(f as f64)).collect(),
+                    synsema_core::types::NdArray::Bool(x) => x.iter().map(|&b| synsema_core::types::syn_bool(b)).collect(),
+                };
+                m.insert("data", synsema_core::types::syn_list(flat));
+                synsema_core::types::syn_map(m)
+            }
+            SynValue::List(l) => synsema_core::types::syn_list(list_values(l).iter().map(typed).collect()),
+            SynValue::Map(m) => {
+                let m = m.borrow();
+                let mut keys: Vec<&synsema_core::types::Key> = m.keys().collect();
+                keys.sort_by(|a, b| a.encode_utf16().cmp(b.encode_utf16()));
+                let mut out = synsema_core::types::SynMap::new();
+                for k in keys {
+                    out.insert(k.to_string(), typed(&m[k.as_str()]));
+                }
+                synsema_core::types::syn_map(out)
+            }
+            other => other.clone(),
+        }
+    }
+    if has_array(v, 0) != Some(true) {
+        return None;
+    }
+    Some(crate::json::dumps_syn(&typed(v)))
+}
+
 /// Los bytes canónicos (UTF-8) de un valor, como texto.
 pub fn canonical_json(v: &SynValue) -> Result<String, Control> {
     let mut out = String::new();
@@ -340,5 +416,53 @@ mod tests {
         assert_eq!(canon(&v), "{\"a\":\"tab\\there\",\"b\":[{\"a\":null,\"z\":\"x\"}]}");
         assert_eq!(canon(&text("/slash and ünïcode ✓")), "\"/slash and ünïcode ✓\"");
         assert_eq!(canon(&text("\u{1}\u{1f}\u{7f}")), "\"\\u0001\\u001f\u{7f}\"");
+    }
+
+    /// v0.6.56: la receta "ndarray" lleva dtype y forma; f32 ≠ f64 y array ≠ lista.
+    #[test]
+    fn lineage_ndarray_marks_dtype_and_shape() {
+        use synsema_core::types::{syn_array, syn_array32};
+        let a64 = syn_array(ndarray::ArrayD::from_shape_vec(ndarray::IxDyn(&[1, 2]), vec![1.0, 0.5]).unwrap());
+        let a32 = syn_array32(ndarray::ArrayD::from_shape_vec(ndarray::IxDyn(&[1, 2]), vec![1.0f32, 0.5]).unwrap());
+        let s64 = lineage_ndarray(&a64).unwrap();
+        let s32 = lineage_ndarray(&a32).unwrap();
+        assert_eq!(s64, "{\"dtype\": \"f64\", \"shape\": [1, 2], \"data\": [1.0, 0.5]}");
+        assert_eq!(s32, "{\"dtype\": \"f32\", \"shape\": [1, 2], \"data\": [1.0, 0.5]}");
+        assert_ne!(s64, s32);
+        // La lista [[1, 0.5]] no trae arrays: sigue por "jcs", con otros bytes.
+        let l = syn_list(vec![syn_list(vec![syn_int(1), float(0.5)])]);
+        assert_eq!(lineage_ndarray(&l), None);
+        assert_ne!(canon(&l), s64);
+        // A cualquier profundidad, y una máscara con sus booleanos.
+        let m = map(vec![("x", syn_list(vec![a32.clone()]))]);
+        assert_eq!(
+            lineage_ndarray(&m).unwrap(),
+            "{\"x\": [{\"dtype\": \"f32\", \"shape\": [1, 2], \"data\": [1.0, 0.5]}]}"
+        );
+        let b = synsema_core::types::syn_mask(
+            ndarray::ArrayD::from_shape_vec(ndarray::IxDyn(&[2]), vec![true, false]).unwrap(),
+        );
+        assert_eq!(lineage_ndarray(&b).unwrap(), "{\"dtype\": \"bool\", \"shape\": [2], \"data\": [true, false]}");
+        // El valor exacto del f32, no su decimal corto: 0.1f32 = 0.10000000149011612.
+        let t = syn_array32(ndarray::ArrayD::from_shape_vec(ndarray::IxDyn(&[1]), vec![0.1f32]).unwrap());
+        assert!(lineage_ndarray(&t).unwrap().contains("0.10000000149011612"));
+        // Ronda 1, M3: las claves del programa ordenadas como en "jcs" (el mismo mapa en otro orden
+        // da los mismos bytes); el mapa del array queda dtype, shape, data.
+        let ab = map(vec![("b", a32.clone()), ("a", syn_int(1))]);
+        let ba = map(vec![("a", syn_int(1)), ("b", a32.clone())]);
+        assert_eq!(lineage_ndarray(&ab), lineage_ndarray(&ba));
+        assert_eq!(
+            lineage_ndarray(&ab).unwrap(),
+            "{\"a\": 1, \"b\": {\"dtype\": \"f32\", \"shape\": [1, 2], \"data\": [1.0, 0.5]}}"
+        );
+        // Más de 64 niveles: no es esta receta (sigue por "jcs", que da su error de profundidad).
+        let mut deep = a32.clone();
+        for _ in 0..64 {
+            deep = syn_list(vec![deep]);
+        }
+        assert!(lineage_ndarray(&deep).is_some());
+        let deeper = syn_list(vec![deep]);
+        assert_eq!(lineage_ndarray(&deeper), None);
+        assert!(canonical_json(&deeper).is_err());
     }
 }

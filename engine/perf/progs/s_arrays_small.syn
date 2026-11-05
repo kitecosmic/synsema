@@ -1,0 +1,11 @@
+-- v0.6.56 (auditoría, ronda 1, N1): cuentas con arrays chicos. Lo que paga un paso de entrenamiento
+-- con tensores chicos; ninguna otra fila opera con arrays.
+let a be array([1, 2, 3, 4])
+let b be array([4, 3, 2, 1])
+let s be 0
+each i in range(0, 20000)
+    let c be a + b
+    let d be c * 2
+    let e be d > 3
+    set s to s + 1
+print(s)

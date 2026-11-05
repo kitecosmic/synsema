@@ -203,7 +203,9 @@ fn arrays_to_bytes_and_back() {
     assert_eq!(t("print(hex(array_to_bytes(array([1, 0, 1]) > 0)))"), "0x010001");
     // Una máscara como número es 0/1 (R2).
     assert_eq!(t("print(hex(array_to_bytes(array([1, 0]) > 0, \"f32\")))"), "0x0000803f00000000");
-    assert_eq!(t("print(array_from_bytes(array_to_bytes(x, \"f32\"), \"f32\"))"), "[1.5, -2, 0.10000000149011612]");
+    // v0.6.56 (breaking): "f32" lee un array `f32`, que se muestra con su decimal más corto.
+    assert_eq!(t("print(array_from_bytes(array_to_bytes(x, \"f32\"), \"f32\"))"), "[1.5, -2, 0.1]");
+    assert_eq!(t("print(to_list(array_from_bytes(array_to_bytes(x, \"f32\"), \"f32\")))"), "[1.5, -2.0, 0.10000000149011612]");
     assert_eq!(t("print(array_from_bytes(array_to_bytes(x), \"f64\") == x)"), "true");
     assert_eq!(
         t("print(array_from_bytes(array_to_bytes(arange(0, 6), \"f32\"), \"f32\", shape = [2, 3]))"),
@@ -220,8 +222,12 @@ fn arrays_to_bytes_and_back() {
         "array_from_bytes: shape [2, 3] needs 24 bytes, got 16",
     );
     err_has("print(array_from_bytes(bytes(\"a\"), \"bool\"))", "array_from_bytes: byte 97 at position 0 is not a bool (0 or 1)");
-    err_has("print(array_to_bytes(a, \"f16\"))", "array_to_bytes: dtype must be \"f64\", \"f32\" or \"bool\", got \"f16\"");
-    err_has("print(array_from_bytes(bytes(\"\"), 4))", "array_from_bytes: dtype must be \"f64\", \"f32\" or \"bool\", got number");
+    // v0.6.56: "f16" y "bf16" son formatos de bytes válidos; el error sigue para los demás.
+    err_has(
+        "print(array_to_bytes(a, \"i8\"))",
+        "array_to_bytes: dtype must be \"f64\", \"f32\", \"f16\", \"bf16\" or \"bool\", got \"i8\"",
+    );
+    err_has("print(array_from_bytes(bytes(\"\"), 4))", "array_from_bytes: dtype must be \"f64\", \"f32\", \"f16\", \"bf16\" or \"bool\", got number");
     err_has("print(array_to_bytes(a, \"bool\"))", "array_to_bytes: \"bool\" is for masks and this array is f64 — compare first: a != 0");
     err_has("print(array_from_bytes(\"abc\", \"f64\"))", "array_from_bytes expects bytes, got text");
     err_has("print(array_to_bytes([1, 2]))", "array_to_bytes expects an array, got list");
