@@ -129,7 +129,11 @@ rows. Full pipeline: [dataviz.md](dataviz.md) § Data analysis; contracts: [buil
 | `a[i] = v` / `a[[0, 2]] = v` / `M[0] = 7` | `set a[i] to v` / `set a[[0, 2]] to v` / `set M[0] to 7` | value semantics: an alias does not change (numpy views do) |
 | `np.add.at(a, idx, v)` | `let b be index_add(a, idx, v)` | returns a NEW array; repeated positions accumulate |
 | `for x in arr:` / `for row in M:` | `each x in a` / `each row in M` | first axis, like numpy |
-| `a.astype(np.float32).tobytes()` / `np.frombuffer(b, np.float32).reshape(2, 3)` | `array_to_bytes(a, "f32")` / `array_from_bytes(b, "f32", shape = [2, 3])` | little-endian, C order; `f32` reads back as `f64` |
+| `a.astype(np.float32).tobytes()` / `np.frombuffer(b, np.float32).reshape(2, 3)` | `array_to_bytes(a, "f32")` / `array_from_bytes(b, "f32", shape = [2, 3])` | little-endian, C order; since v0.6.56 `"f32"` reads back as an `f32` array |
+| `np.zeros(3, dtype=np.float32)` / `a.astype(np.float32)` / `a.dtype` | `zeros(3, dtype = "f32")` / `astype(a, "f32")` / `dtype(a)` | v0.6.56+; `f32` in, `f32` out; a loose number rounds to `f32` like numpy 2 |
+| `w32 + a64` (numpy promotes to float64) | an **error**: `cannot mix an f32 array and an f64 array — convert one first: astype(x, "f32") or astype(x, "f64")` | convert one side on purpose |
+| `w[0] == 0.1` → `True` (numpy 2 compares in float32) | `w[0] == 0.1` → **`false`**: `w[0]` is the exact value, `0.10000000149011612` | `equal(w, 0.1)` compares in `f32` |
+| `np.frombuffer(b, np.float16)` / bfloat16 weights | `array_from_bytes(b, "f16")` / `array_from_bytes(b, "bf16")` → an `f32` array | `f16`/`bf16` are byte formats, not dtypes |
 | `np.transpose(a, (2, 0, 1))` / batched `A @ B` | `transpose(a, [2, 0, 1])` / `matmul(A, B)` | `matmul` broadcasts the batch axes like numpy |
 | `rng.normal(0, 1, size=(2, 3))` / `rng.uniform(0, 1, size=4)` | `random_normal(g, [2, 3], mean = 0, std = 1)` / `random_uniform(g, [4], low = 0, high = 1)` | bit for bit numpy's |
 | `np.concatenate` / `np.stack` / `np.argmax` / `np.cumsum` / `np.diff` | `concat([a, b], axis = 0)` / `stack([a, b])` / `argmax(x, axis = k)` / `cumsum(x)` / `diff(x)` | `axis` is named |
