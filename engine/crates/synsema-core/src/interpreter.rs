@@ -310,7 +310,7 @@ fn pred_truth_error(who: &str, loc: &SourceLocation) -> Control {
 
 #[inline(never)]
 pub(crate) fn array_truth_error(v: &SynValue, at: TruthAt) -> Control {
-    let mask = matches!(crate::labels::unwrap(v), SynValue::Array(a) if a.as_f64().is_none());
+    let mask = matches!(crate::labels::unwrap(v), SynValue::Array(a) if a.dtype() == "bool");
     let got = if mask { "a mask" } else { "an array" };
     match at {
         TruthAt::Cond => err(ARRAY_NOT_A_CONDITION),
@@ -569,14 +569,13 @@ pub struct TrustedTool {
     pub hook: TrustedScopeHook,
 }
 
-/// Ver `BuiltinTask::meta`. Las tablas (`BUILTIN_ARITY`, `BUILTIN_KWARGS`, `LINEAGE_SOURCES`)
-/// siguen siendo la fuente de verdad; esto es su lectura para un builtin concreto.
+/// Ver `BuiltinTask::meta`. Las tablas (`BUILTIN_ARITY`, `LINEAGE_SOURCES`) siguen siendo la fuente
+/// de verdad; esto es su lectura para un builtin concreto. `BUILTIN_KWARGS` se lee al usarlo
+/// (`BuiltinTask::kwargs`).
 #[derive(Clone, Copy, Debug)]
 pub struct BuiltinMeta {
     /// `(mínimo, máximo)` de argumentos (ver `builtin_arity`).
     pub arity: (usize, Option<usize>),
-    /// Argumentos nombrados que acepta sin `param_names` (`BUILTIN_KWARGS`).
-    pub kwargs: &'static [&'static str],
     /// Lo que devuelve entra al programa desde afuera y se anota en el linaje (`LINEAGE_SOURCES`).
     pub lineage_source: bool,
     /// Constructor de un tipo o de una variante (`Point(…)`, `Order.paid(…)`): cuenta sus campos él.
@@ -604,12 +603,18 @@ impl BuiltinTask {
         };
         let meta = BuiltinMeta {
             arity,
-            kwargs: crate::builtin_arity::kwargs_of(&name),
             lineage_source: LINEAGE_SOURCES.contains(&name.as_str()),
             constructor: name.starts_with(|c: char| c.is_ascii_uppercase()),
             registered: false,
         };
         BuiltinTask { name, func, param_count, param_names, meta, trusted: None, ctor: None }
+    }
+
+    /// Argumentos nombrados que acepta sin `param_names` (`BUILTIN_KWARGS`). v0.6.56: se consulta al
+    /// usarlo (una llamada con nombre, el camino raro) y no al registrar: `new` corre por cada uno
+    /// de los ~1000 builtins de cada intérprete, y cada fila de la tabla lo encarecía (`perf-guard`).
+    pub fn kwargs(&self) -> &'static [&'static str] {
+        crate::builtin_arity::kwargs_of(&self.name)
     }
 }
 
@@ -2313,7 +2318,7 @@ impl Drop for Interpreter {
 #[cold]
 #[inline(never)]
 fn builtin_named_arg(bt: &BuiltinTask, kw: &mut SynMap, n: String, v: SynValue, loc: &SourceLocation) -> Result<(), Control> {
-    let allowed = bt.meta.kwargs;
+    let allowed = bt.kwargs();
     if allowed.contains(&n.as_str()) {
         if kw.contains_key(&n) {
             return Err(err_at(format!("duplicate argument '{}'", n), loc));
@@ -5374,14 +5379,16 @@ impl Interpreter {
 
         // -- Arrays numéricos n-dimensionales + álgebra lineal (Batch 5). PUROS. --
         // construcción.
-        self.register("array", 1, Rc::new(|_i, a, _l| crate::arrays::array(a)));
-        self.register("zeros", 1, Rc::new(|_i, a, _l| crate::arrays::zeros(a)));
-        self.register("ones", 1, Rc::new(|_i, a, _l| crate::arrays::ones(a)));
-        self.register("full", 2, Rc::new(|_i, a, _l| crate::arrays::full(a)));
-        self.register("arange", -1, Rc::new(|_i, a, _l| crate::arrays::arange(a)));
-        self.register("linspace", 3, Rc::new(|_i, a, _l| crate::arrays::linspace(a)));
-        self.register("identity", 1, Rc::new(|_i, a, _l| crate::arrays::identity(a)));
-        self.register("eye", 1, Rc::new(|_i, a, _l| crate::arrays::eye(a)));
+        // v0.6.56: `dtype = "f32"` (specs/v0.6.56-diseno.md §3.1).
+        self.register("array", 1, Rc::new(|i, a, _l| { let d = i.kwarg("dtype"); crate::arrays::array(a, d) }));
+        self.register("zeros", 1, Rc::new(|i, a, _l| { let d = i.kwarg("dtype"); crate::arrays::zeros(a, d) }));
+        self.register("ones", 1, Rc::new(|i, a, _l| { let d = i.kwarg("dtype"); crate::arrays::ones(a, d) }));
+        self.register("full", 2, Rc::new(|i, a, _l| { let d = i.kwarg("dtype"); crate::arrays::full(a, d) }));
+        self.register("arange", -1, Rc::new(|i, a, _l| { let d = i.kwarg("dtype"); crate::arrays::arange(a, d) }));
+        self.register("linspace", 3, Rc::new(|i, a, _l| { let d = i.kwarg("dtype"); crate::arrays::linspace(a, d) }));
+        self.register("identity", 1, Rc::new(|i, a, _l| { let d = i.kwarg("dtype"); crate::arrays::identity(a, d) }));
+        self.register("eye", 1, Rc::new(|i, a, _l| { let d = i.kwarg("dtype"); crate::arrays::eye(a, d) }));
+        self.register("astype", 2, Rc::new(|_i, a, _l| crate::arrays::astype(a)));
         // Introspección / conversión / forma.
         self.register("shape", 1, Rc::new(|_i, a, _l| crate::arrays::shape(a)));
         self.register("ndim", 1, Rc::new(|_i, a, _l| crate::arrays::ndim(a)));
@@ -9603,8 +9610,9 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                 Ok(SynValue::Number(Number::from_bigint(q)))
             }
             SynValue::Number(n) => Ok(SynValue::Number(n.clone())), // Int/Big ya son enteros
-            // v0.6.29: sobre un array, elemento a elemento (sigue siendo un array de floats).
-            SynValue::Array(a) => Ok(crate::types::syn_array(a.to_f64().mapv(op))),
+            // v0.6.29: sobre un array, elemento a elemento (sigue siendo un array de floats; un
+            // `f32` sigue `f32`, v0.6.56).
+            SynValue::Array(a) => Ok(crate::arrays::map_f64(a, op)),
             _ => Err(err(format!("{} expects a number, got {}", name, v.type_name()))),
         }
     }
@@ -11040,7 +11048,9 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
     /// elemento (`s_each_list` +0,29 %). Sin `#[cold]` (donde-nace-cada-cosa §C: sólo con PGO).
     #[inline(never)]
     fn apply_array(&mut self, func: SynValue, a: &crate::types::NdArray, loc: &SourceLocation) -> Result<SynValue, Control> {
-        let a = a.to_f64();
+        // v0.6.56: un `f32` sale `f32` (cada resultado se redondea, como `set w[i]`).
+        let kind = crate::arrays::Num::of(a);
+        let a = a.numbers_f64();
         let mut out = Vec::with_capacity(a.len());
         // v0.6.55: si todos los resultados son bool, el resultado es una máscara.
         let mut bools: Vec<bool> = Vec::new();
@@ -11073,26 +11083,35 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                 ndarray::ArrayD::from_shape_vec(a.raw_dim(), bools).map_err(|e| err(e.to_string()))?,
             ));
         }
-        Ok(crate::types::syn_array(
-            ndarray::ArrayD::from_shape_vec(a.raw_dim(), out).map_err(|e| err(e.to_string()))?,
-        ))
+        Ok(kind.wrap(ndarray::ArrayD::from_shape_vec(a.raw_dim(), out).map_err(|e| err(e.to_string()))?))
     }
 
     /// `where(a, pred)` sobre un array: los elementos que cumplen, como array 1-D. Fuera de línea,
     /// como `apply_array`.
     #[inline(never)]
     fn where_array(&mut self, pred: SynValue, a: &crate::types::NdArray, loc: &SourceLocation) -> Result<SynValue, Control> {
-        let a = a.to_f64();
-        let mut out = Vec::new();
-        for x in a.iter() {
-            if pred_truth(&self.call_value(pred.clone(), vec![syn_float(*x)], loc)?, "where", loc)? {
-                out.push(*x);
-            }
+        use crate::types::NdArray;
+        // v0.6.56 (ajuste 4): conserva el tipo de elemento, como `where(a, m)`. El predicado recibe
+        // lo que da `each`: números (el valor exacto de un `f32`) o, de una máscara, bool.
+        let elems: Vec<SynValue> = match a {
+            NdArray::F64(x) => x.iter().map(|v| syn_float(*v)).collect(),
+            NdArray::F32(x) => x.iter().map(|v| syn_float(*v as f64)).collect(),
+            NdArray::Bool(x) => x.iter().map(|v| syn_bool(*v)).collect(),
+        };
+        let mut keep = Vec::with_capacity(elems.len());
+        for x in elems {
+            keep.push(pred_truth(&self.call_value(pred.clone(), vec![x], loc)?, "where", loc)?);
         }
-        let n = out.len();
-        Ok(crate::types::syn_array(
-            ndarray::ArrayD::from_shape_vec(ndarray::IxDyn(&[n]), out).map_err(|e| err(e.to_string()))?,
-        ))
+        fn pick<T: Copy>(x: &ndarray::ArrayD<T>, keep: &[bool]) -> ndarray::ArrayD<T> {
+            let v: Vec<T> = x.iter().zip(keep).filter(|(_, k)| **k).map(|(v, _)| *v).collect();
+            let n = v.len();
+            ndarray::ArrayD::from_shape_vec(ndarray::IxDyn(&[n]), v).expect("1-D")
+        }
+        Ok(match a {
+            NdArray::F64(x) => crate::types::syn_array(pick(x, &keep)),
+            NdArray::F32(x) => crate::types::syn_array32(pick(x, &keep)),
+            NdArray::Bool(x) => crate::types::syn_mask(pick(x, &keep)),
+        })
     }
 
     /// `some`/`every`/`count_where` sobre un array (v0.6.55): con una máscara sola, sus verdaderos;
@@ -11105,10 +11124,11 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
             match &args[0] {
                 SynValue::Array(a) => match &**a {
                     NdArray::Bool(m) => (m.iter().filter(|b| **b).count(), m.len()),
-                    NdArray::F64(_) => {
+                    other => {
                         return Err(err(format!(
-                            "{} expects a mask (bool array) or a predicate, got a f64 array — compare first: a > 0",
-                            who
+                            "{} expects a mask (bool array) or a predicate, got a {} array — compare first: a > 0",
+                            who,
+                            other.dtype()
                         )))
                     }
                 },
@@ -11127,6 +11147,7 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
             };
             let elems: Vec<SynValue> = match &*a {
                 NdArray::F64(x) => x.iter().map(|v| syn_float(*v)).collect(),
+                NdArray::F32(x) => x.iter().map(|v| syn_float(*v as f64)).collect(),
                 NdArray::Bool(x) => x.iter().map(|v| syn_bool(*v)).collect(),
             };
             let total = elems.len();

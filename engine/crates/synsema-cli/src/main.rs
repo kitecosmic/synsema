@@ -1722,7 +1722,7 @@ fn cmd_run(args: &[String]) -> ExitCode {
             "--flat" => flat = true,
             "--replay-any-program" => replay_any_program = true,
             flag @ ("--auditor" | "--receipt" | "--replay") => match rest.get(i + 1) {
-                Some(v) if !v.starts_with("--") => {
+                Some(v) if sealed_receipt::is_flag_value(flag, v) => {
                     match flag {
                         "--auditor" => auditor_flag = Some(v.clone()),
                         "--receipt" => receipt_flag = Some(v.clone()),
@@ -2271,7 +2271,7 @@ fn cmd_test(args: &[String]) -> ExitCode {
             "--flat" => flat = true,
             "-v" | "--verbose" => verbose = true,
             flag @ ("--auditor" | "--receipt") => match host.rest.get(i + 1) {
-                Some(v) if !v.starts_with("--") => {
+                Some(v) if sealed_receipt::is_flag_value(flag, v) => {
                     if flag == "--auditor" {
                         auditor_flag = Some(v.clone());
                     } else {

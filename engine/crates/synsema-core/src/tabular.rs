@@ -466,6 +466,14 @@ fn canon_key(v: &SynValue, out: &mut String) {
                     let _ = write!(out, "{};", crate::number::py_float_str(x));
                 }
             }
+            // v0.6.56: un `f32` nunca es igual a un `f64` (E2): otra clave.
+            crate::types::NdArray::F32(a) => {
+                let _ = write!(out, "F{:?}:", a.shape());
+                for x in a.iter() {
+                    let x = if *x == 0.0 { 0.0 } else { *x as f64 };
+                    let _ = write!(out, "{};", crate::number::py_float_str(x));
+                }
+            }
             // Una máscara nunca es igual a un array `f64` (R3): otra clave.
             crate::types::NdArray::Bool(a) => {
                 let _ = write!(out, "M{:?}:", a.shape());
@@ -1240,13 +1248,18 @@ pub fn fill_nan(args: &[SynValue]) -> Result<SynValue, Control> {
                 })
                 .collect(),
         )),
-        Some(SynValue::Array(a)) => match a.as_f64() {
-            Some(a) => {
+        Some(SynValue::Array(a)) => match &**a {
+            crate::types::NdArray::F64(a) => {
                 let f = fill.to_f64();
                 Ok(crate::types::syn_array(a.mapv(|x| if x.is_nan() { f } else { x })))
             }
+            // v0.6.56: el relleno se redondea a `f32`.
+            crate::types::NdArray::F32(a) => {
+                let f = fill.to_f64() as f32;
+                Ok(crate::types::syn_array32(a.mapv(|x| if x.is_nan() { f } else { x })))
+            }
             // Una máscara no tiene NaN: queda igual.
-            None => Ok(SynValue::Array(a.clone())),
+            crate::types::NdArray::Bool(_) => Ok(SynValue::Array(a.clone())),
         },
         Some(other) => Err(err(format!("fill_nan: expected a list or an array, got {}", other.type_name()))),
         None => Err(err("fill_nan(values, number)")),

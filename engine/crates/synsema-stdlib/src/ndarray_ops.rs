@@ -13,9 +13,10 @@
 use std::rc::Rc;
 
 use ndarray::{ArrayD, Dimension, IxDyn, Zip};
-use synsema_core::arrays::{broadcast_shape, elem_operand, positions, take_axis, zip_broadcast, PosFor};
+use synsema_core::arrays::{broadcast_shape, out_num, positions, take_axis, zip_broadcast, zip_real, Num, PosFor, Real};
+use synsema_core::by_num;
 use synsema_core::interpreter::{Control, Interpreter, RuntimeError};
-use synsema_core::types::{syn_array, syn_bool, syn_float, syn_mask, syn_text, NdArray, SynValue};
+use synsema_core::types::{syn_array, syn_array32, syn_bool, syn_float, syn_mask, syn_text, NdArray, SynValue};
 
 fn err(msg: impl Into<String>) -> Control {
     Control::Error(RuntimeError::new(msg))
@@ -49,7 +50,7 @@ pub fn register_ndarray_builtins(interp: &Interpreter) {
     interp.register_builtin("index_add", 3, Rc::new(|i, a, _l| index_add(i, a)));
 }
 
-/// `dtype(a)`: `"f64"` o `"bool"` (R1).
+/// `dtype(a)`: `"f64"`, `"f32"` o `"bool"` (R1; `f32` desde 0.6.56).
 pub fn dtype(args: &[SynValue]) -> Result<SynValue, Control> {
     arity(args, 1, "dtype")?;
     match &args[0] {
@@ -58,16 +59,15 @@ pub fn dtype(args: &[SynValue]) -> Result<SynValue, Control> {
     }
 }
 
-/// Los dos operandos como `f64` (array o número; una máscara es 0/1). Al menos uno tiene que ser
-/// array (dos números los resuelven `equal`/`extreme` con los números del lenguaje).
-fn operands<'a>(
+/// Los dos operandos en el tipo `T` (array o número; una máscara es 0/1; el número ya en `T`: F3).
+/// Al menos uno tiene que ser array (dos números los resuelven `equal`/`extreme` con los números del
+/// lenguaje); el tipo lo eligió `out_num` (un `f32` con un `f64` es E1).
+#[allow(clippy::type_complexity)]
+fn operands<'a, T: Real>(
     args: &'a [SynValue],
     name: &str,
-) -> Result<(std::borrow::Cow<'a, ArrayD<f64>>, std::borrow::Cow<'a, ArrayD<f64>>), Control> {
-    if !matches!(args[0], SynValue::Array(_)) && !matches!(args[1], SynValue::Array(_)) {
-        return Err(two_scalars(&args[0], &args[1], name));
-    }
-    let one = |v: &'a SynValue| match elem_operand(v) {
+) -> Result<(std::borrow::Cow<'a, ArrayD<T>>, std::borrow::Cow<'a, ArrayD<T>>), Control> {
+    let one = |v: &'a SynValue| match T::operand(v) {
         Some(a) => Ok(a),
         None => Err(match v {
             SynValue::List(_) => err(format!("{}: make the list an array first: array(xs)", name)),
@@ -75,6 +75,14 @@ fn operands<'a>(
         }),
     };
     Ok((one(&args[0])?, one(&args[1])?))
+}
+
+/// El tipo de salida de `equal`/`maximum`/…: error si no hay ningún array, o si mezclan `f32` y `f64`.
+fn kind_of(args: &[SynValue], name: &str) -> Result<Num, Control> {
+    if !matches!(args[0], SynValue::Array(_)) && !matches!(args[1], SynValue::Array(_)) {
+        return Err(two_scalars(&args[0], &args[1], name));
+    }
+    out_num(name, &[&args[0], &args[1]])
 }
 
 /// Dos números (M4 de la auditoría de v0.6.55): su orden con los números del lenguaje, no por `f64`
@@ -111,9 +119,13 @@ fn equal(args: &[SynValue], name: &str, f: fn(f64, f64) -> bool) -> Result<SynVa
         let eq = o == Some(std::cmp::Ordering::Equal);
         return Ok(syn_bool(if name == "equal" { eq } else { !eq }));
     }
-    let (a, b) = operands(args, name)?;
-    let m = zip_broadcast(&a, &b, f).map_err(|e| prefixed(e, name))?;
-    Ok(syn_mask(m))
+    // v0.6.56: en `f32` se compara en `f32` (`equal(w, 0.1)` sobre un `f32` 0.1 es verdadero).
+    let k = kind_of(args, name)?;
+    by_num!(k, T => {
+        let (a, b) = operands::<T>(args, name)?;
+        let m = zip_broadcast(&a, &b, |x: T, y: T| f(x.f(), y.f())).map_err(|e| prefixed(e, name))?;
+        Ok(syn_mask(m))
+    })
 }
 
 /// `maximum`/`minimum`: elemento a elemento; un `NaN` se propaga (numpy).
@@ -129,10 +141,13 @@ fn extreme(args: &[SynValue], name: &str, f: fn(f64, f64) -> f64) -> Result<SynV
             }
         });
     }
-    let (a, b) = operands(args, name)?;
-    let r = zip_broadcast(&a, &b, |x, y| if x.is_nan() || y.is_nan() { f64::NAN } else { f(x, y) })
-        .map_err(|e| prefixed(e, name))?;
-    Ok(syn_array(r))
+    let k = kind_of(args, name)?;
+    by_num!(k, T => {
+        let (a, b) = operands::<T>(args, name)?;
+        let r = zip_real(&a, &b, |x, y| if x.is_nan() || y.is_nan() { f64::NAN } else { f(x, y) })
+            .map_err(|e| prefixed(e, name))?;
+        Ok(T::wrap(r))
+    })
 }
 
 /// El error de forma del broadcasting, con el nombre de la función adelante.
@@ -151,9 +166,10 @@ fn mask_arg<'a>(v: &'a SynValue, name: &str) -> Result<&'a ArrayD<bool>, Control
     match v {
         SynValue::Array(a) => match &**a {
             NdArray::Bool(m) => Ok(m),
-            NdArray::F64(_) => Err(err(format!(
-                "{} expects masks (bool arrays), got a f64 array — compare first: a > 0",
-                name
+            other => Err(err(format!(
+                "{} expects masks (bool arrays), got a {} array — compare first: a > 0",
+                name,
+                other.dtype()
             ))),
         },
         o => Err(err(format!("{} expects masks (bool arrays), got {}", name, o.type_name()))),
@@ -181,7 +197,7 @@ pub fn if_else(args: &[SynValue]) -> Result<SynValue, Control> {
         match v {
             SynValue::Array(a) => match &**a {
                 NdArray::Bool(b) => Some(b),
-                NdArray::F64(_) => None,
+                _ => None,
             },
             _ => None,
         }
@@ -203,16 +219,20 @@ pub fn if_else(args: &[SynValue]) -> Result<SynValue, Control> {
         let (vm, vx, vy) = (bview(m, &shape), bview(x, &shape), bview(y, &shape));
         return Ok(syn_mask(Zip::from(vm).and(vx).and(vy).map_collect(|&c, &p, &q| if c { p } else { q })));
     }
-    fn one(v: &SynValue) -> Result<std::borrow::Cow<'_, ArrayD<f64>>, Control> {
-        elem_operand(v).ok_or_else(|| match v {
+    fn one<T: Real>(v: &SynValue) -> Result<std::borrow::Cow<'_, ArrayD<T>>, Control> {
+        T::operand(v).ok_or_else(|| match v {
             SynValue::List(_) => err("if_else: make the list an array first: array(xs)"),
             o => err(format!("if_else expects arrays or numbers for the values, got {}", o.type_name())),
         })
     }
-    let (x, y) = (one(&args[1])?, one(&args[2])?);
-    let shape = shape3(x.shape(), y.shape())?;
-    let (vm, vx, vy) = (bview(m, &shape), bview(&x, &shape), bview(&y, &shape));
-    Ok(syn_array(Zip::from(vm).and(vx).and(vy).map_collect(|&c, &p, &q| if c { p } else { q })))
+    // v0.6.56: `if_else(m, w, 0)` es `f32`; con un `f32` y un `f64`, E1.
+    let k = out_num("if_else", &[&args[1], &args[2]])?;
+    by_num!(k, T => {
+        let (x, y) = (one::<T>(&args[1])?, one::<T>(&args[2])?);
+        let shape = shape3(x.shape(), y.shape())?;
+        let (vm, vx, vy) = (bview(m, &shape), bview(&x, &shape), bview(&y, &shape));
+        Ok(T::wrap(Zip::from(vm).and(vx).and(vy).map_collect(|&c, &p, &q| if c { p } else { q })))
+    })
 }
 
 fn bview<'a, T>(a: &'a ArrayD<T>, shape: &[usize]) -> ndarray::ArrayViewD<'a, T> {
@@ -236,6 +256,7 @@ pub fn transpose(args: &[SynValue]) -> Result<SynValue, Control> {
     let axes = permutation(&args[1], a.ndim())?;
     Ok(match &**a {
         NdArray::F64(x) => syn_array(x.view().permuted_axes(IxDyn(&axes)).to_owned()),
+        NdArray::F32(x) => syn_array32(x.view().permuted_axes(IxDyn(&axes)).to_owned()),
         NdArray::Bool(x) => syn_mask(x.view().permuted_axes(IxDyn(&axes)).to_owned()),
     })
 }
@@ -281,8 +302,37 @@ pub fn matmul(args: &[SynValue]) -> Result<SynValue, Control> {
     if a.ndim() < 2 || b.ndim() < 2 || (a.ndim() == 2 && b.ndim() == 2) {
         return synsema_core::arrays::matmul(args);
     }
-    let (a, b) = (a.to_f64(), b.to_f64());
-    batched_matmul(&a, &b)
+    // v0.6.56 (F7): `f32` en `f32` de punta a punta; con un `f64`, E1.
+    by_num!(out_num("matmul", &[&args[0], &args[1]])?, T => {
+        let (a, b) = (T::of_nd(a), T::of_nd(b));
+        batched_matmul::<T>(&a, &b)
+    })
+}
+
+/// El producto 2-D de un lote, en el tipo del lote (faer en `f64` o en `f32`).
+trait Gemm: Real {
+    fn gemm(a: ndarray::ArrayView2<Self>, b: ndarray::ArrayView2<Self>, out: &mut Vec<Self>);
+}
+
+impl Gemm for f64 {
+    fn gemm(sa: ndarray::ArrayView2<f64>, sb: ndarray::ArrayView2<f64>, out: &mut Vec<f64>) {
+        let (m, k, p) = (sa.nrows(), sa.ncols(), sb.ncols());
+        let fa = faer::Mat::<f64>::from_fn(m, k, |i, j| sa[[i, j]]);
+        let fb = faer::Mat::<f64>::from_fn(k, p, |i, j| sb[[i, j]]);
+        let mut c = faer::Mat::<f64>::zeros(m, p);
+        faer::linalg::matmul::matmul(c.as_mut(), faer::Accum::Replace, fa.as_ref(), fb.as_ref(), 1.0, faer::Par::Seq);
+        for i in 0..m {
+            for j in 0..p {
+                out.push(c[(i, j)]);
+            }
+        }
+    }
+}
+
+impl Gemm for f32 {
+    fn gemm(sa: ndarray::ArrayView2<f32>, sb: ndarray::ArrayView2<f32>, out: &mut Vec<f32>) {
+        out.extend(synsema_core::arrays::matmul_f32_2d(sa, sb).iter().copied());
+    }
 }
 
 /// `matmul` con un vector (N3 de la auditoría de v0.6.55): numpy lo acepta y quita el eje; acá la
@@ -305,7 +355,7 @@ fn matmul_vector_error(a: &[usize], b: &[usize]) -> Control {
 }
 
 #[inline(never)]
-fn batched_matmul(a: &ArrayD<f64>, b: &ArrayD<f64>) -> Result<SynValue, Control> {
+fn batched_matmul<T: Gemm>(a: &ArrayD<T>, b: &ArrayD<T>) -> Result<SynValue, Control> {
     let (na, nb) = (a.ndim(), b.ndim());
     let (m, k) = (a.shape()[na - 2], a.shape()[na - 1]);
     let (k2, p) = (b.shape()[nb - 2], b.shape()[nb - 1]);
@@ -326,50 +376,65 @@ fn batched_matmul(a: &ArrayD<f64>, b: &ArrayD<f64>) -> Result<SynValue, Control>
     let with = |x: usize, y: usize| batch.iter().copied().chain([x, y]).collect::<Vec<_>>();
     let av = bview(a, &with(m, k));
     let bv = bview(b, &with(k, p));
-    let mut out: Vec<f64> = Vec::with_capacity(batch.iter().product::<usize>() * m * p);
+    let mut out: Vec<T> = Vec::with_capacity(batch.iter().product::<usize>() * m * p);
     for idx in ndarray::indices(IxDyn(&batch)) {
         let (mut sa, mut sb) = (av.view(), bv.view());
         for &i in idx.slice() {
             sa = sa.index_axis_move(ndarray::Axis(0), i);
             sb = sb.index_axis_move(ndarray::Axis(0), i);
         }
-        let fa = faer::Mat::<f64>::from_fn(m, k, |i, j| sa[[i, j]]);
-        let fb = faer::Mat::<f64>::from_fn(k, p, |i, j| sb[[i, j]]);
-        let mut c = faer::Mat::<f64>::zeros(m, p);
-        faer::linalg::matmul::matmul(c.as_mut(), faer::Accum::Replace, fa.as_ref(), fb.as_ref(), 1.0, faer::Par::Seq);
-        for i in 0..m {
-            for j in 0..p {
-                out.push(c[(i, j)]);
-            }
-        }
+        let (sa, sb) = (sa.into_dimensionality::<ndarray::Ix2>(), sb.into_dimensionality::<ndarray::Ix2>());
+        T::gemm(sa.expect("2-D del lote"), sb.expect("2-D del lote"), &mut out);
     }
-    Ok(syn_array(ArrayD::from_shape_vec(IxDyn(&with(m, p)), out).expect("forma del lote")))
+    Ok(T::wrap(ArrayD::from_shape_vec(IxDyn(&with(m, p)), out).expect("forma del lote")))
 }
 
 // =========================================================
 // Ítem 8: arrays <-> bytes (little-endian, orden C)
 // =========================================================
 
-/// Nombre y bytes por elemento de `"f64"`, `"f32"` o `"bool"`.
+/// Nombre y bytes por elemento de `"f64"`, `"f32"`, `"bool"` y (v0.6.56, formatos de bytes:
+/// diseño §3.7) `"f16"`, `"bf16"`.
 fn elem_size(name: &str, t: &SynValue) -> Result<(&'static str, usize), Control> {
     match t {
         SynValue::Text(s) => match s.as_ref() {
             "f64" => Ok(("f64", 8)),
             "f32" => Ok(("f32", 4)),
             "bool" => Ok(("bool", 1)),
-            other => Err(err(format!("{}: dtype must be \"f64\", \"f32\" or \"bool\", got \"{}\"", name, other))),
+            "f16" => Ok(("f16", 2)),
+            "bf16" => Ok(("bf16", 2)),
+            other => Err(err(format!(
+                "{}: dtype must be \"f64\", \"f32\", \"f16\", \"bf16\" or \"bool\", got \"{}\"",
+                name, other
+            ))),
         },
         other => Err(err(format!(
-            "{}: dtype must be \"f64\", \"f32\" or \"bool\", got {}",
+            "{}: dtype must be \"f64\", \"f32\", \"f16\", \"bf16\" or \"bool\", got {}",
             name,
             other.type_name()
         ))),
     }
 }
 
+/// Un elemento a 2 bytes, redondeado al más cercano desde su valor (sin pasar por otro tipo: un
+/// `f64` va directo, sin doble redondeo); fuera de rango, ±inf.
+fn half_bytes(a: &NdArray, bf: bool) -> Vec<u8> {
+    fn put<T: Copy>(x: &ArrayD<T>, f: impl Fn(T) -> [u8; 2]) -> Vec<u8> {
+        x.iter().flat_map(|&v| f(v)).collect()
+    }
+    match (a, bf) {
+        (NdArray::F64(x), false) => put(x, |v| half::f16::from_f64(v).to_le_bytes()),
+        (NdArray::F64(x), true) => put(x, |v| half::bf16::from_f64(v).to_le_bytes()),
+        (NdArray::F32(x), false) => put(x, |v| half::f16::from_f32(v).to_le_bytes()),
+        (NdArray::F32(x), true) => put(x, |v| half::bf16::from_f32(v).to_le_bytes()),
+        (NdArray::Bool(m), false) => put(m, |v| half::f16::from_f32(v as u8 as f32).to_le_bytes()),
+        (NdArray::Bool(m), true) => put(m, |v| half::bf16::from_f32(v as u8 as f32).to_le_bytes()),
+    }
+}
+
 /// `array_to_bytes(a)` / `array_to_bytes(a, "f32")`: los elementos en orden C, little-endian. Sin
-/// tipo, el del array (`f64` o `bool`). Una máscara como número es 0/1 (R2); `"bool"` pide una
-/// máscara. A `f32` se redondea al más cercano.
+/// tipo, el del array (`f64`, `f32` o `bool`). Una máscara como número es 0/1 (R2); `"bool"` pide
+/// una máscara. A `f32`, `f16` y `bf16` se redondea al más cercano.
 pub fn array_to_bytes(args: &[SynValue]) -> Result<SynValue, Control> {
     if args.is_empty() || args.len() > 2 {
         return Err(err(format!("array_to_bytes expects 1 or 2 argument(s), got {}", args.len())));
@@ -384,20 +449,23 @@ pub fn array_to_bytes(args: &[SynValue]) -> Result<SynValue, Control> {
     };
     let out: Vec<u8> = match (t, &**a) {
         ("bool", NdArray::Bool(m)) => m.iter().map(|&x| x as u8).collect(),
-        ("bool", NdArray::F64(_)) => {
-            return Err(err(
-                "array_to_bytes: \"bool\" is for masks and this array is f64 — compare first: a != 0",
-            ))
+        ("bool", other) => {
+            return Err(err(format!(
+                "array_to_bytes: \"bool\" is for masks and this array is {} — compare first: a != 0",
+                other.dtype()
+            )))
         }
-        ("f32", _) => a.to_f64().iter().flat_map(|&x| (x as f32).to_le_bytes()).collect(),
-        _ => a.to_f64().iter().flat_map(|&x| x.to_le_bytes()).collect(),
+        ("f32", _) => f32::of_nd(a).iter().flat_map(|&x| x.to_le_bytes()).collect(),
+        ("f16", _) => half_bytes(a, false),
+        ("bf16", _) => half_bytes(a, true),
+        _ => a.numbers_f64().iter().flat_map(|&x| x.to_le_bytes()).collect(),
     };
     Ok(synsema_core::types::syn_bytes(out))
 }
 
 /// `array_from_bytes(b, "f32", shape = [2, 3])`: el array de esos bytes (little-endian, orden C).
-/// Sin `shape`, 1-D. `"f32"` es el formato de los bytes: el array es `f64` (hasta 0.6.56).
-/// `"bool"` da una máscara y cada byte es 0 o 1.
+/// Sin `shape`, 1-D. `"f32"` da un array `f32` (desde 0.6.56; antes, `f64`); `"f16"` y `"bf16"`
+/// también dan `f32` (ensanchar es exacto). `"bool"` da una máscara y cada byte es 0 o 1.
 pub fn array_from_bytes(interp: &mut Interpreter, args: &[SynValue]) -> Result<SynValue, Control> {
     let shape = interp.kwarg("shape");
     arity(args, 2, "array_from_bytes")?;
@@ -441,12 +509,17 @@ pub fn array_from_bytes(interp: &mut Interpreter, args: &[SynValue]) -> Result<S
             }
             syn_mask(ArrayD::from_shape_vec(dims, b.iter().map(|&x| x == 1).collect()).expect("forma verificada"))
         }
-        "f32" => syn_array(
-            ArrayD::from_shape_vec(
-                dims,
-                b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]) as f64).collect(),
-            )
-            .expect("forma verificada"),
+        "f32" => syn_array32(
+            ArrayD::from_shape_vec(dims, b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect())
+                .expect("forma verificada"),
+        ),
+        "f16" => syn_array32(
+            ArrayD::from_shape_vec(dims, b.chunks_exact(2).map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32()).collect())
+                .expect("forma verificada"),
+        ),
+        "bf16" => syn_array32(
+            ArrayD::from_shape_vec(dims, b.chunks_exact(2).map(|c| half::bf16::from_le_bytes([c[0], c[1]]).to_f32()).collect())
+                .expect("forma verificada"),
         ),
         _ => syn_array(
             ArrayD::from_shape_vec(
@@ -526,26 +599,31 @@ pub fn index_add(interp: &mut Interpreter, args: &[SynValue]) -> Result<SynValue
         return Err(err("index_add: a 0-dimensional array has no axis"));
     }
     let pos = positions(&args[1], a.shape()[axis], axis, PosFor::Builtin("index_add"))?;
-    let values = elem_operand(&args[2]).ok_or_else(|| match &args[2] {
-        SynValue::List(_) => err("index_add: make the list an array first: array(xs)"),
-        o => err(format!("index_add expects an array or a number for the values, got {}", o.type_name())),
-    })?;
-    let mut region = a.shape().to_vec();
-    region[axis] = pos.len();
-    let Some(vb) = values.broadcast(IxDyn(&region)) else {
-        return Err(err(format!(
-            "index_add: the values have shape {:?} and the selection {:?}",
-            values.shape(),
-            region
-        )));
-    };
-    let mut out = a.to_f64().into_owned();
-    for (n, &p) in pos.iter().enumerate() {
-        let src = vb.index_axis(ndarray::Axis(axis), n);
-        let mut dst = out.index_axis_mut(ndarray::Axis(axis), p);
-        dst += &src;
+    // v0.6.56: un `f32` suma en `f32`, en el orden de las posiciones (`np.add.at`); con un `f64`, E1.
+    let k = out_num("index_add", &[&args[0], &args[2]])?;
+    fn go<T: Real + std::ops::AddAssign>(a: &NdArray, values: &SynValue, axis: usize, pos: &[usize]) -> Result<SynValue, Control> {
+        let values = T::operand(values).ok_or_else(|| match values {
+            SynValue::List(_) => err("index_add: make the list an array first: array(xs)"),
+            o => err(format!("index_add expects an array or a number for the values, got {}", o.type_name())),
+        })?;
+        let mut region = a.shape().to_vec();
+        region[axis] = pos.len();
+        let Some(vb) = values.broadcast(IxDyn(&region)) else {
+            return Err(err(format!(
+                "index_add: the values have shape {:?} and the selection {:?}",
+                values.shape(),
+                region
+            )));
+        };
+        let mut out = T::of_nd(a).into_owned();
+        for (n, &p) in pos.iter().enumerate() {
+            let src = vb.index_axis(ndarray::Axis(axis), n);
+            let mut dst = out.index_axis_mut(ndarray::Axis(axis), p);
+            dst.zip_mut_with(&src, |d, &s| *d += s);
+        }
+        Ok(T::wrap(out))
     }
-    Ok(syn_array(out))
+    by_num!(k, T => go::<T>(a, &args[2], axis, &pos))
 }
 
 #[cfg(test)]

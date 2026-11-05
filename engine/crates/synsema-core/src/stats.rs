@@ -261,14 +261,16 @@ pub fn builtin(interp: &mut Interpreter, args: &[SynValue], kind: Kind) -> Resul
 
 fn reduce_array(a: &crate::types::NdArray, kind: Kind, axis: Option<i64>, lvl: f64, ddof: f64) -> Result<SynValue, Control> {
     let who = kind.name();
-    let a: &ArrayD<f64> = &a.to_f64();
+    // v0.6.56 (F6): un `f32` se acumula en `f64` y sale redondeado a `f32` una vez.
+    let out = crate::arrays::Num::of(a);
+    let a: &ArrayD<f64> = &a.numbers_f64();
     if a.is_empty() && !matches!(kind, Kind::Sum | Kind::Product) {
         return Err(err(format!("{} of an empty array", who)));
     }
     match axis {
         None => {
             let vals: Vec<f64> = a.iter().copied().collect();
-            Ok(syn_float(reduce_f64(kind, &vals, lvl, ddof)))
+            Ok(out.number(reduce_f64(kind, &vals, lvl, ddof)))
         }
         Some(k) => {
             let nd = a.ndim() as i64;
@@ -276,11 +278,11 @@ fn reduce_array(a: &crate::types::NdArray, kind: Kind, axis: Option<i64>, lvl: f
             if k2 < 0 || k2 >= nd {
                 return Err(err(format!("{}: axis {} out of range for a {}-D array", who, k, nd)));
             }
-            let out = a.map_axis(Axis(k2 as usize), |lane| {
+            let r = a.map_axis(Axis(k2 as usize), |lane| {
                 let v: Vec<f64> = lane.iter().copied().collect();
                 reduce_f64(kind, &v, lvl, ddof)
             });
-            Ok(crate::arrays::nd_value(out))
+            Ok(out.result(r))
         }
     }
 }

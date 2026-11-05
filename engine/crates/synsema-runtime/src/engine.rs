@@ -664,6 +664,10 @@ pub(crate) fn wire_common_with_state(
     synsema_stdlib::tools::register_tool_builtins(interp);
     // Linaje (DATOS-17): los resultados estructurados se hashean sobre su JSON canónico.
     interp.lineage_canonical = Some(Rc::new(|v: &synsema_core::types::SynValue| {
+        // v0.6.56: un valor con arrays lleva su `dtype` y su forma (receta "ndarray").
+        if let Some(s) = synsema_stdlib::canonical::lineage_ndarray(v) {
+            return Some((s.into_bytes(), "ndarray"));
+        }
         match synsema_stdlib::canonical::canonical_json(v) {
             Ok(s) => Some((s.into_bytes(), "jcs")),
             // JCS no lleva enteros de más de 2^53: el JSON exacto de `json_encode`.

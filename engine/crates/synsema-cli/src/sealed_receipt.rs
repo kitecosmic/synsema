@@ -32,6 +32,14 @@ pub struct Auditor {
     run_key: RunKey,
 }
 
+/// v0.6.56: ¿`v` es el valor del flag `flag`? Un valor nunca empieza con `--` (así
+/// `run --auditor --flat` es un error claro), salvo la clave de `--auditor`: es base64url de 32 bytes
+/// al azar y una de cada 4 096 empieza con `--` (el CI lo encontró: `synsema receipt keygen` daba
+/// claves que `run --auditor <clave>` rechazaba). Un flag nunca es una clave válida.
+pub fn is_flag_value(flag: &str, v: &str) -> bool {
+    !v.starts_with("--") || (flag == "--auditor" && sealed::parse_auditor_key(v).is_ok())
+}
+
 /// `--auditor`/`--receipt` del subcomando (o los knobs). `Ok(None)` sin auditor: todo queda como
 /// antes. Un `--receipt` sin auditor es un error (no hay recibo que escribir).
 pub fn from_flags(cmd: &str, flag: Option<String>, dest: Option<String>) -> Result<Option<Auditor>, ExitCode> {

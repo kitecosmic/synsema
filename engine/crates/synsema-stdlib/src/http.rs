@@ -609,7 +609,7 @@ fn connect_and_send(
 }
 
 /// Conecta (TCP, o TLS para `https`), envía el request y lee la respuesta cruda
-/// (head + body) hasta EOF. Base compartida por `do_request` (→ `String`) y
+/// (head + body) hasta su fin (`read_response`, v0.6.56). Base compartida por `do_request` (→ `String`) y
 /// `http_request_bytes` (→ bytes crudos, para descargar binarios sin corromperlos).
 fn fetch_raw(
     method: &str,
@@ -622,9 +622,166 @@ fn fetch_raw(
     // v0.6.42 — bajo `serve`, el hilo que espera la red suelta su permiso de ejecución.
     let _w = synsema_core::waiting::waiting();
     let (mut stream, info) = connect_and_send(method, url, headers, body, timeout_secs, tls)?;
-    let mut buf = Vec::new();
-    read_to_end_tolerant(&mut stream, &mut buf)?;
+    let buf = read_response(&mut stream, method)?;
     Ok((buf, info))
+}
+
+/// v0.6.56 (ítem 7): dónde termina el cuerpo de una respuesta (RFC 9112 §6.3), para no esperar a
+/// que el servidor cierre: el pedido manda `Connection: close`, pero Chrome, varios proxies y
+/// servidores embebidos contestan y dejan la conexión abierta.
+enum Framing {
+    /// `HEAD`, 1xx, 204 y 304: sin cuerpo aunque digan `Content-Length`.
+    Empty,
+    /// Exactamente estos bytes (en el streaming, los que faltan).
+    Length(usize),
+    /// Hasta el chunk de largo 0 y sus trailers.
+    Chunked(ChunkDecoder),
+    /// Ni largo ni chunked (HTTP/1.0, o un servidor que no lo dice): hasta EOF.
+    UntilClose,
+}
+
+fn framing_of(method: &str, status: i64, headers: &[(String, String)]) -> Framing {
+    if method.eq_ignore_ascii_case("HEAD") || (100..200).contains(&status) || status == 204 || status == 304 {
+        return Framing::Empty;
+    }
+    if let Some((_, te)) = headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("transfer-encoding")) {
+        // Con otra codificación de transferencia el fin sólo lo marca el cierre (§6.3, punto 4).
+        return if te.to_ascii_lowercase().contains("chunked") {
+            Framing::Chunked(ChunkDecoder::new())
+        } else {
+            Framing::UntilClose
+        };
+    }
+    // Varios `Content-Length` distintos, o uno que no es un número: el largo no es confiable.
+    let mut len: Option<usize> = None;
+    // Un header puede traer una lista de valores iguales (`2, 2`, la deja un proxy que une
+    // headers): RFC 9110 §8.6 deja tomarla como un solo largo (ronda 1, M1).
+    for (_, v) in headers.iter().filter(|(k, _)| k.eq_ignore_ascii_case("content-length")) {
+        // Los elementos vacíos de la lista se ignoran (RFC 9110 §5.6.1) y un largo es sólo dígitos
+        // (§8.6, `1*DIGIT`: nada de `+2`) (ronda 2, M4).
+        for part in v.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+            let n = if part.bytes().all(|b| b.is_ascii_digit()) { part.parse::<usize>().ok() } else { None };
+            match (n.ok_or(()), len) {
+                (Ok(n), None) => len = Some(n),
+                (Ok(n), Some(m)) if n == m => {}
+                _ => return Framing::UntilClose,
+            }
+        }
+    }
+    len.map_or(Framing::UntilClose, Framing::Length)
+}
+
+/// Un 1xx que no es 101 es intermedio (`100 Continue`, `103 Early Hints`): la respuesta de verdad
+/// viene después, por la misma conexión.
+fn is_interim(status: i64) -> bool {
+    (100..200).contains(&status) && status != 101
+}
+
+/// Tope del head de una respuesta (status + headers, sin el cuerpo): uno más largo es un servidor
+/// roto u hostil. 1 MiB, como `DefaultMaxHeaderBytes` de Go.
+const MAX_HEAD: usize = 1 << 20;
+
+fn head_too_large() -> String {
+    format!("the HTTP response head is larger than {} bytes", MAX_HEAD)
+}
+
+/// Sin el fin del head en `read` bytes: ya no puede caber. El fin (`\r\n\r\n`) empieza a lo sumo
+/// 3 bytes antes del final de lo leído, así que hasta `MAX_HEAD + 3` todavía puede ser un head de
+/// `MAX_HEAD` bytes (ronda 2, M3).
+fn head_cut(read: usize) -> bool {
+    read > MAX_HEAD + 3
+}
+
+/// Cuántos 1xx intermedios se saltean antes de la respuesta (ronda 2, M4): un servidor podría
+/// mandarlos para siempre. Go corta igual («too many 1xx informational responses»).
+const MAX_INTERIM: usize = 8;
+
+fn too_many_interim() -> String {
+    format!("the server sent more than {} interim (1xx) responses", MAX_INTERIM)
+}
+
+/// El fin del head en `buf`, buscando sólo en lo que no se miró (ronda 1, N3: buscar desde 0 en
+/// cada lectura era cuadrático, 6,5 s de CPU para un head de 16 MB). `scanned` es hasta dónde ya
+/// se buscó sin encontrarlo; vuelve a 0 cuando `buf` pierde su principio.
+fn head_end(buf: &[u8], scanned: &mut usize) -> Option<usize> {
+    let from = (*scanned).saturating_sub(3).min(buf.len());
+    match buf[from..].windows(4).position(|w| w == b"\r\n\r\n") {
+        Some(p) => Some(from + p),
+        None => {
+            *scanned = buf.len();
+            None
+        }
+    }
+}
+
+/// v0.6.56 (ítem 7): lee una respuesta (head + body crudos, como antes) y para cuando está
+/// completa según su `Framing`, sin esperar el EOF. rustls es estricto: si el peer cierra el TLS
+/// sin el alert `close_notify` (común en servidores y balanceadores, p. ej. MiniMax) devuelve
+/// `UnexpectedEof`; con bytes ya recibidos no es error. Un EOF antes de tiempo entrega lo que
+/// llegó (lo que `parse_response` ya toleraba). Sólo es error real si NO se recibió nada.
+pub(crate) fn read_response<R: Read>(stream: &mut R, method: &str) -> Result<Vec<u8>, String> {
+    let mut buf: Vec<u8> = Vec::new();
+    let mut chunk = [0u8; 8192];
+    // Dónde empieza el cuerpo (después del head final) y cuánto del cuerpo vio el de-chunker.
+    let mut body_at: Option<usize> = None;
+    let mut framing = Framing::UntilClose;
+    let mut fed = 0usize;
+    let mut scanned = 0usize;
+    let mut interim = 0usize;
+    loop {
+        // Buscar el head (y saltear los 1xx intermedios) con lo que ya llegó.
+        while body_at.is_none() {
+            let Some(p) = head_end(&buf, &mut scanned) else {
+                if head_cut(buf.len()) {
+                    return Err(head_too_large());
+                }
+                break;
+            };
+            if p > MAX_HEAD {
+                return Err(head_too_large());
+            }
+            let (status, headers) = parse_head(&String::from_utf8_lossy(&buf[..p]));
+            if is_interim(status) {
+                interim += 1;
+                if interim > MAX_INTERIM {
+                    return Err(too_many_interim());
+                }
+                buf.drain(..p + 4);
+                scanned = 0;
+                continue;
+            }
+            body_at = Some(p + 4);
+            framing = framing_of(method, status, &headers);
+        }
+        if let Some(at) = body_at {
+            let body = buf.len() - at;
+            match &mut framing {
+                Framing::Empty => {
+                    buf.truncate(at);
+                    return Ok(buf);
+                }
+                Framing::Length(n) if body >= *n => {
+                    buf.truncate(at + *n);
+                    return Ok(buf);
+                }
+                Framing::Chunked(d) => {
+                    d.feed(&buf[at + fed..]);
+                    fed = body;
+                    if d.complete() {
+                        return Ok(buf);
+                    }
+                }
+                _ => {}
+            }
+        }
+        match stream.read(&mut chunk) {
+            Ok(0) => return Ok(buf),
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof && !buf.is_empty() => return Ok(buf),
+            Err(e) => return Err(e.to_string()),
+        }
+    }
 }
 
 /// Como `http_request` pero entrega el BODY incrementalmente: parsea el head, y va
@@ -634,7 +791,7 @@ fn fetch_raw(
 /// POR `read()` → mide **silencio** entre bytes, no duración total: una respuesta
 /// larga que gotea fluye; un host mudo sigue fallando al timeout.
 ///
-/// Tolerancia EOF: mismo criterio que `read_to_end_tolerant` — un `UnexpectedEof`
+/// Tolerancia EOF: mismo criterio que `read_response` — un `UnexpectedEof`
 /// durante el body (head ya recibido) NO es error (peers que cierran TLS sin
 /// `close_notify`, p.ej. MiniMax).
 pub fn http_request_stream(
@@ -653,17 +810,33 @@ pub fn http_request_stream(
     // Fase 1: acumular hasta el fin del head (`\r\n\r\n`) y parsearlo. Un EOF antes
     // de completar el head sí es error (respuesta malformada, como en parse_response).
     let mut acc: Vec<u8> = Vec::new();
-    let (status, resp_headers, leftover) = loop {
+    let mut scanned = 0usize;
+    let mut interim = 0usize;
+    let (status, resp_headers, leftover) = 'head: loop {
+        // v0.6.56: un 1xx intermedio se saltea; la respuesta de verdad viene después.
+        while let Some(split) = head_end(&acc, &mut scanned) {
+            if split > MAX_HEAD {
+                return Err(head_too_large());
+            }
+            let head = String::from_utf8_lossy(&acc[..split]).to_string();
+            let (status, headers) = parse_head(&head);
+            if is_interim(status) {
+                interim += 1;
+                if interim > MAX_INTERIM {
+                    return Err(too_many_interim());
+                }
+                acc.drain(..split + 4);
+                scanned = 0;
+                continue;
+            }
+            break 'head (status, headers, acc.split_off(split + 4));
+        }
+        if head_cut(acc.len()) {
+            return Err(head_too_large());
+        }
         match stream.read(&mut read_buf) {
             Ok(0) => return Err("malformed HTTP response".to_string()),
-            Ok(n) => {
-                acc.extend_from_slice(&read_buf[..n]);
-                if let Some(split) = acc.windows(4).position(|w| w == b"\r\n\r\n") {
-                    let head = String::from_utf8_lossy(&acc[..split]).to_string();
-                    let (status, headers) = parse_head(&head);
-                    break (status, headers, acc.split_off(split + 4));
-                }
-            }
+            Ok(n) => acc.extend_from_slice(&read_buf[..n]),
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
                 return Err("malformed HTTP response".to_string())
             }
@@ -671,31 +844,44 @@ pub fn http_request_stream(
         }
     };
 
-    // Fase 2: body incremental, des-chunkeado al vuelo si corresponde.
-    let chunked = resp_headers.iter().any(|(k, v)| {
-        k.eq_ignore_ascii_case("transfer-encoding") && v.to_ascii_lowercase().contains("chunked")
-    });
-    let mut decoder = ChunkDecoder::new();
+    // Fase 2: body incremental, des-chunkeado al vuelo si corresponde. v0.6.56 (ítem 7): termina
+    // cuando la respuesta está completa según su `Framing`, sin esperar a que el servidor cierre.
+    let mut framing = framing_of(method, status, &resp_headers);
+    // `true` si la respuesta terminó (o el callback cortó): no hay que leer más.
     let mut push = |raw: &[u8], on_data: &mut dyn FnMut(&[u8]) -> bool| -> bool {
-        let bytes = if chunked { decoder.feed(raw) } else { raw.to_vec() };
+        let (bytes, done) = match &mut framing {
+            Framing::Empty => return true,
+            Framing::Length(left) => {
+                let take = (*left).min(raw.len());
+                *left -= take;
+                (raw[..take].to_vec(), *left == 0)
+            }
+            Framing::Chunked(d) => {
+                let b = d.feed(raw);
+                (b, d.complete())
+            }
+            Framing::UntilClose => (raw.to_vec(), false),
+        };
         // El callback puede correr código del usuario (un `llm_stream` con su task): mientras
         // corre, vuelve a contar contra la CPU del pool (sección inversa de la espera).
-        bytes.is_empty() || {
+        let go_on = bytes.is_empty() || {
             let _r = synsema_core::waiting::resumed();
             on_data(&bytes)
-        }
+        };
+        done || !go_on
     };
-    if !push(&leftover, on_data) {
+    if push(&leftover, on_data) {
         return Ok((status, resp_headers));
     }
     loop {
         match stream.read(&mut read_buf) {
             Ok(0) => break,
             Ok(n) => {
-                if !push(&read_buf[..n], on_data) {
+                if push(&read_buf[..n], on_data) {
                     break;
                 }
             }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
             // Head + bytes ya recibidos → cierre sin close_notify tolerado.
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
             Err(e) => return Err(e.to_string()),
@@ -834,18 +1020,6 @@ fn parse_response_bytes(buf: &[u8]) -> Result<BytesResponse, String> {
     Ok((status, body, headers))
 }
 
-/// Lee hasta EOF tolerando el cierre sin `close_notify`. rustls es estricto: si el peer
-/// cierra el TLS sin el alert `close_notify` (común en muchos servidores/LBs, p.ej.
-/// MiniMax) devuelve `UnexpectedEof` — pero con `Connection: close` los bytes recibidos
-/// ya son la respuesta completa. Sólo es error real si NO se recibió nada.
-fn read_to_end_tolerant<R: Read>(stream: &mut R, buf: &mut Vec<u8>) -> Result<(), String> {
-    match stream.read_to_end(buf) {
-        Ok(_) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof && !buf.is_empty() => Ok(()),
-        Err(e) => Err(e.to_string()),
-    }
-}
-
 fn parse_response(buf: &[u8]) -> Result<HttpResult, String> {
     let text = String::from_utf8_lossy(buf);
     // El head es ASCII → el offset de char en `text` == offset de byte en `buf`.
@@ -888,6 +1062,21 @@ struct ChunkDecoder {
     /// Bytes crudos aún no decodificados (fragmento de línea de tamaño o de trailer).
     buf: Vec<u8>,
     state: ChunkState,
+    /// v0.6.56: llegó el chunk de largo 0 (no un tamaño inválido): faltan los trailers, que
+    /// terminan en una línea vacía.
+    last_chunk: bool,
+    /// Hasta dónde de `buf` ya se buscó el fin de la línea de tamaño sin encontrarlo (ronda 2, N1).
+    scanned: usize,
+}
+
+/// Tope de la línea de tamaño de un chunk (con sus extensiones), como `maxLineLength` del lector
+/// chunked de Go. Una más larga es un tamaño inválido: corta y entrega lo acumulado (ronda 2, N1).
+const MAX_CHUNK_LINE: usize = 4096;
+
+/// Sin `\r\n` en `len` bytes de línea: ya no puede medir `MAX_CHUNK_LINE`. Su `\r` puede ser el último
+/// byte leído y el `\n` venir en la lectura siguiente (ronda 3, M1; lo mismo que `head_cut`).
+fn chunk_line_cut(len: usize) -> bool {
+    len > MAX_CHUNK_LINE + 1
 }
 
 enum ChunkState {
@@ -903,29 +1092,64 @@ enum ChunkState {
 
 impl ChunkDecoder {
     fn new() -> Self {
-        Self { buf: Vec::new(), state: ChunkState::Size }
+        Self { buf: Vec::new(), state: ChunkState::Size, last_chunk: false, scanned: 0 }
+    }
+
+    /// v0.6.56 (ítem 7): la respuesta chunked está completa: el chunk 0 y la línea vacía que
+    /// cierra los trailers (o un tamaño inválido, que corta como siempre). Trailers de más de
+    /// 64 KiB también cortan: no se espera para siempre a un servidor que no los termina.
+    fn complete(&self) -> bool {
+        matches!(self.state, ChunkState::Done)
+            && (!self.last_chunk
+                || self.buf.starts_with(b"\r\n")
+                || self.buf.windows(4).any(|w| w == b"\r\n\r\n")
+                || self.buf.len() > 64 * 1024)
     }
 
     /// Alimenta bytes crudos; devuelve los datos de chunk decodificados hasta ahora
     /// (los datos se emiten a medida que llegan — no se espera el chunk completo).
     fn feed(&mut self, input: &[u8]) -> Vec<u8> {
         if matches!(self.state, ChunkState::Done) {
+            // v0.6.56: se guardan los trailers hasta su fin (`complete`); los datos ya terminaron.
+            if !self.complete() {
+                self.buf.extend_from_slice(input);
+            }
             return Vec::new();
         }
         self.buf.extend_from_slice(input);
+        // Ronda 2 (N2): se avanza un cursor y se suelta lo consumido una sola vez al salir; un
+        // `drain` por chunk movía todo el resto del buffer (cuadrático en la cantidad de chunks).
+        let mut pos = 0usize;
         let mut out: Vec<u8> = Vec::new();
         loop {
             match self.state {
                 ChunkState::Size => {
-                    let Some(line_end) = self.buf.windows(2).position(|w| w == b"\r\n") else {
+                    // Ronda 2 (N1): el fin de la línea se busca sólo en lo que no se miró.
+                    let from = self.scanned.saturating_sub(1).max(pos);
+                    let Some(rel) = self.buf[from..].windows(2).position(|w| w == b"\r\n") else {
+                        self.scanned = self.buf.len();
+                        if chunk_line_cut(self.buf.len() - pos) {
+                            self.state = ChunkState::Done;
+                        }
                         break;
                     };
+                    let line_end = from + rel;
+                    if line_end - pos > MAX_CHUNK_LINE {
+                        self.state = ChunkState::Done;
+                        break;
+                    }
                     // El tamaño puede traer extensiones tras `;` — quedate sólo con el hex.
-                    let size_line = String::from_utf8_lossy(&self.buf[..line_end]).to_string();
+                    let size_line = String::from_utf8_lossy(&self.buf[pos..line_end]).to_string();
                     let hex = size_line.split(';').next().unwrap_or("").trim().to_string();
-                    self.buf.drain(..line_end + 2);
+                    pos = line_end + 2;
+                    self.scanned = pos;
                     match usize::from_str_radix(&hex, 16) {
-                        Ok(0) | Err(_) => {
+                        Ok(0) => {
+                            self.state = ChunkState::Done;
+                            self.last_chunk = true;
+                            break;
+                        }
+                        Err(_) => {
                             self.state = ChunkState::Done;
                             break;
                         }
@@ -933,12 +1157,12 @@ impl ChunkDecoder {
                     }
                 }
                 ChunkState::Data { remaining } => {
-                    if self.buf.is_empty() {
+                    if pos == self.buf.len() {
                         break;
                     }
-                    let take = remaining.min(self.buf.len());
-                    out.extend_from_slice(&self.buf[..take]);
-                    self.buf.drain(..take);
+                    let take = remaining.min(self.buf.len() - pos);
+                    out.extend_from_slice(&self.buf[pos..pos + take]);
+                    pos += take;
                     if take == remaining {
                         // Saltá el `\r\n` que cierra el chunk.
                         self.state = ChunkState::Skip { remaining: 2 };
@@ -948,11 +1172,11 @@ impl ChunkDecoder {
                     }
                 }
                 ChunkState::Skip { remaining } => {
-                    if self.buf.is_empty() {
+                    if pos == self.buf.len() {
                         break;
                     }
-                    let take = remaining.min(self.buf.len());
-                    self.buf.drain(..take);
+                    let take = remaining.min(self.buf.len() - pos);
+                    pos += take;
                     if take == remaining {
                         self.state = ChunkState::Size;
                     } else {
@@ -963,6 +1187,8 @@ impl ChunkDecoder {
                 ChunkState::Done => break,
             }
         }
+        self.buf.drain(..pos);
+        self.scanned = self.scanned.saturating_sub(pos);
         out
     }
 }
@@ -1227,6 +1453,302 @@ mod tests {
                 Err(_) => break,
             }
         }
+    }
+
+    /// v0.6.56 (ítem 7): un servidor que contesta y NO cierra (Chrome, proxies, servidores
+    /// embebidos). Escribe cada tramo con una pausa y retiene la conexión 3 s: el cliente tiene que
+    /// terminar al completar la respuesta, no al cerrar ni al vencer su timeout (5 s).
+    fn holding_server(parts: Vec<&'static [u8]>) -> String {
+        let (url, _handle) = one_shot_server(move |mut sock| {
+            drain_request(&mut sock);
+            for p in parts {
+                sock.write_all(p).unwrap();
+                thread::sleep(TestDuration::from_millis(50));
+            }
+            thread::sleep(TestDuration::from_secs(3));
+        });
+        url
+    }
+
+    fn quick(method: &str, parts: Vec<&'static [u8]>) -> HttpResult {
+        let url = holding_server(parts);
+        let t0 = std::time::Instant::now();
+        let r = host::http_request(method, &url, None, None, None, 5);
+        assert!(t0.elapsed() < TestDuration::from_secs(2), "esperó al cierre: {:?} ({:?})", t0.elapsed(), r.error);
+        r
+    }
+
+    #[test]
+    fn response_ends_at_content_length_without_close() {
+        let r = quick("GET", vec![b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n", b"{}"]);
+        assert_eq!((r.status, r.body.as_str(), r.error.clone()), (200, "{}", None));
+        // Lo que sobra después del largo no es del cuerpo.
+        let r = quick("GET", vec![b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}EXTRA"]);
+        assert_eq!(r.body, "{}");
+        // Varios `Content-Length` iguales valen; uno solo partido en dos lecturas también.
+        let r = quick("GET", vec![b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\ncontent-length: 4\r\n\r\nab", b"cd"]);
+        assert_eq!(r.body, "abcd");
+    }
+
+    #[test]
+    fn response_ends_at_the_last_chunk_and_its_trailers() {
+        let r = quick("GET", vec![b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\n{}\r\n", b"0\r\n\r\n"]);
+        assert_eq!((r.status, r.body.as_str()), (200, "{}"));
+        // Trailers partidos: se espera la línea vacía que los cierra.
+        let r = quick(
+            "GET",
+            vec![b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\nX-Sum: 1\r\n", b"\r\n"],
+        );
+        assert_eq!(r.body, "abc");
+        // El `0\r\n` y el `\r\n` final en lecturas distintas.
+        let r = quick("GET", vec![b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n1\r\nz\r\n0\r\n", b"\r\n"]);
+        assert_eq!(r.body, "z");
+    }
+
+    #[test]
+    fn head_204_and_304_have_no_body() {
+        let r = quick("HEAD", vec![b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\n"]);
+        assert_eq!((r.status, r.body.as_str(), r.error.clone()), (200, "", None));
+        let r = quick("GET", vec![b"HTTP/1.1 204 No Content\r\nContent-Length: 5\r\n\r\n"]);
+        assert_eq!((r.status, r.body.as_str()), (204, ""));
+        let r = quick("GET", vec![b"HTTP/1.1 304 Not Modified\r\nTransfer-Encoding: chunked\r\n\r\n"]);
+        assert_eq!((r.status, r.body.as_str()), (304, ""));
+    }
+
+    #[test]
+    fn an_interim_1xx_is_skipped() {
+        let r = quick(
+            "GET",
+            vec![b"HTTP/1.1 100 Continue\r\n\r\n", b"HTTP/1.1 103 Early Hints\r\nLink: </a>\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"],
+        );
+        assert_eq!((r.status, r.body.as_str()), (200, "ok"));
+    }
+
+    /// Ronda 1, M1: una lista de largos iguales en un header vale; si difieren, hasta el cierre.
+    #[test]
+    fn a_list_of_equal_lengths_is_one_length() {
+        let r = quick("GET", vec![b"HTTP/1.1 200 OK\r\nContent-Length: 2, 2\r\n\r\nok"]);
+        assert_eq!((r.status, r.body.as_str(), r.error.clone()), (200, "ok", None));
+        let h = |v: &str| vec![("Content-Length".to_string(), v.to_string())];
+        assert!(matches!(framing_of("GET", 200, &h("2, 2")), Framing::Length(2)));
+        assert!(matches!(framing_of("GET", 200, &h("2,2,2")), Framing::Length(2)));
+        assert!(matches!(framing_of("GET", 200, &h("2, 3")), Framing::UntilClose));
+        // Ronda 2 (M4): los elementos vacíos se ignoran; un largo es sólo dígitos.
+        assert!(matches!(framing_of("GET", 200, &h("2,")), Framing::Length(2)));
+        assert!(matches!(framing_of("GET", 200, &h("2, , 2")), Framing::Length(2)));
+        assert!(matches!(framing_of("GET", 200, &h("+2")), Framing::UntilClose));
+        assert!(matches!(framing_of("GET", 200, &h("2, +2")), Framing::UntilClose));
+        assert!(matches!(framing_of("GET", 200, &h(" , ")), Framing::UntilClose));
+    }
+
+    /// Un lector que entrega de a 8 KiB (como un socket).
+    struct Drip(std::io::Cursor<Vec<u8>>);
+    impl Read for Drip {
+        fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+            let n = out.len().min(8192);
+            self.0.read(&mut out[..n])
+        }
+    }
+
+    /// Ronda 1, N3: el fin del head se busca sólo en lo nuevo (antes, 6,5 s de CPU con 16 MB), y un
+    /// head de más de 1 MiB corta con su error en los dos lectores.
+    #[test]
+    fn a_long_head_is_read_in_linear_time_and_has_a_ceiling() {
+        let mut head = b"HTTP/1.1 200 OK\r\n".to_vec();
+        while head.len() < MAX_HEAD - 2048 {
+            head.extend_from_slice(format!("X-Pad-{}: {}\r\n", head.len(), "a".repeat(900)).as_bytes());
+        }
+        head.extend_from_slice(b"Content-Length: 2\r\n\r\nokEXTRA");
+        let raw = read_response(&mut Drip(std::io::Cursor::new(head)), "GET").unwrap();
+        assert!(raw.ends_with(b"\r\n\r\nok"));
+        // Ronda 2 (M2): sin umbral de tiempo. Con `scanned` pasado el primer fin, `head_end`
+        // encuentra el segundo: buscar desde 0 encontraría el primero.
+        let two = b"AB\r\n\r\nCDEF\r\n\r\n";
+        let mut scanned = 8;
+        assert_eq!(head_end(two, &mut scanned), Some(10));
+        let mut scanned = 0;
+        assert_eq!(head_end(two, &mut scanned), Some(2));
+        // Sin fin de head: corta al pasar el tope, no espera ni junta para siempre.
+        let endless = b"HTTP/1.1 200 OK\r\n".iter().copied().chain(std::iter::repeat(b'a').take(MAX_HEAD + 20_000)).collect();
+        let e = read_response(&mut Drip(std::io::Cursor::new(endless)), "GET").unwrap_err();
+        assert_eq!(e, "the HTTP response head is larger than 1048576 bytes");
+        // El de streaming, contra un servidor que manda un head sin fin.
+        let url = holding_server(vec![b"HTTP/1.1 200 OK\r\n", Box::leak(vec![b'a'; MAX_HEAD + 20_000].into_boxed_slice())]);
+        let e = host::http_request_stream("GET", &url, None, None, 5, &mut |_| true).unwrap_err();
+        assert_eq!(e, "the HTTP response head is larger than 1048576 bytes");
+        // El `\r\n\r\n` partido entre dos lecturas se encuentra igual.
+        let mut c = Drip(std::io::Cursor::new(b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\nz".to_vec()));
+        let mut scanned = 0;
+        let buf = b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r";
+        assert_eq!(head_end(buf, &mut scanned), None);
+        assert_eq!(scanned, buf.len());
+        let mut more = buf.to_vec();
+        more.extend_from_slice(b"\nz");
+        assert_eq!(head_end(&more, &mut scanned), Some(buf.len() - 3));
+        assert!(read_response(&mut c, "GET").unwrap().ends_with(b"\r\n\r\nz"));
+    }
+
+    /// Un lector que entrega cada parte en una lectura.
+    struct Parts(std::collections::VecDeque<Vec<u8>>);
+    impl Read for Parts {
+        fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+            let Some(mut p) = self.0.pop_front() else { return Ok(0) };
+            let n = p.len().min(out.len());
+            out[..n].copy_from_slice(&p[..n]);
+            if n < p.len() {
+                self.0.push_front(p.split_off(n));
+            }
+            Ok(n)
+        }
+    }
+
+    /// Un head cuyo `\r\n\r\n` empieza en `p` (los bytes antes del fin).
+    fn head_of(p: usize) -> Vec<u8> {
+        let mut h = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nX: ".to_vec();
+        h.resize(p, b'a');
+        h.extend_from_slice(b"\r\n\r\nok");
+        h
+    }
+
+    /// Ronda 2 (M3): el tope se mide sobre el head, no sobre lo leído. Un head de `MAX_HEAD` bytes
+    /// cortado en la lectura justo dentro de su `\r\n\r\n` pasa; uno de `MAX_HEAD + 1`, no.
+    #[test]
+    fn the_head_ceiling_is_on_the_head_not_on_what_was_read() {
+        for p in [MAX_HEAD - 2, MAX_HEAD] {
+            let mut h = head_of(p);
+            let rest = h.split_off(p + 3);
+            let mut r = Parts(vec![h, rest].into());
+            let raw = read_response(&mut r, "GET").unwrap_or_else(|e| panic!("p = {}: {}", p, e));
+            assert!(raw.ends_with(b"\r\n\r\nok"));
+        }
+        let mut r = Parts(vec![head_of(MAX_HEAD + 1)].into());
+        assert_eq!(read_response(&mut r, "GET").unwrap_err(), head_too_large());
+    }
+
+    /// Ronda 2 (M4): hasta 8 respuestas 1xx intermedias se saltean; la novena corta con su error.
+    #[test]
+    fn too_many_interim_responses_is_an_error() {
+        let many = |n: usize| {
+            let mut v = b"HTTP/1.1 100 Continue\r\n\r\n".repeat(n);
+            v.extend_from_slice(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+            v
+        };
+        let raw = read_response(&mut Drip(std::io::Cursor::new(many(8))), "GET").unwrap();
+        assert!(raw.starts_with(b"HTTP/1.1 200 OK") && raw.ends_with(b"ok"));
+        let e = read_response(&mut Drip(std::io::Cursor::new(many(9))), "GET").unwrap_err();
+        assert_eq!(e, "the server sent more than 8 interim (1xx) responses");
+        let url = holding_server(vec![&*Box::leak(many(9).into_boxed_slice())]);
+        let e = host::http_request_stream("GET", &url, None, None, 5, &mut |_| true).unwrap_err();
+        assert_eq!(e, "the server sent more than 8 interim (1xx) responses");
+    }
+
+    /// Ronda 3 (M1): una línea de tamaño de exactamente 4096 bytes vale, llegue entera o cortada justo
+    /// después de su `\r`; una de 4097 es un tamaño inválido de las dos formas.
+    #[test]
+    fn the_chunk_size_line_ceiling_does_not_depend_on_the_reads() {
+        let line = |n: usize| {
+            let mut l = b"1;".to_vec();
+            l.resize(n, b'e');
+            l
+        };
+        let tail: &[u8] = b"\nz\r\n0\r\n\r\n";
+        for (n, want) in [(4096usize, &b"z"[..]), (4097, &b""[..])] {
+            let mut whole = line(n);
+            whole.push(b'\r');
+            whole.extend_from_slice(tail);
+            let mut d = ChunkDecoder::new();
+            assert_eq!(d.feed(&whole), want, "{} bytes de una vez", n);
+            let mut d = ChunkDecoder::new();
+            let mut cut = line(n);
+            cut.push(b'\r');
+            let mut out = d.feed(&cut);
+            out.extend(d.feed(tail));
+            assert_eq!(out, want, "{} bytes cortados en el \\r", n);
+            assert!(d.complete());
+        }
+    }
+
+    /// Ronda 2 (N1): una línea de tamaño sin fin corta al pasar 4096 bytes (tamaño inválido: se
+    /// entrega lo acumulado). `scanned` queda al final de lo mirado (con el tope, buscar de nuevo desde
+    /// el principio de la línea tendría un costo acotado, así que eso no se prueba por tiempo).
+    #[test]
+    fn a_chunk_size_line_has_a_ceiling() {
+        let mut d = ChunkDecoder::new();
+        assert_eq!(d.feed(b"2\r\nok\r\n"), b"ok");
+        d.feed(&[b'a'; 3000]);
+        assert_eq!(d.scanned, d.buf.len());
+        assert!(!d.complete());
+        d.feed(&[b'a'; 3000]);
+        assert!(d.complete(), "una línea de más de 4096 bytes es un tamaño inválido");
+        assert!(!d.last_chunk);
+        // Por `read_response`: un head chunked y 2 MiB sin `\r\n` terminan con el cuerpo de antes.
+        let mut raw = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nok\r\n".to_vec();
+        raw.extend(std::iter::repeat(b'a').take(2 << 20));
+        let got = read_response(&mut Drip(std::io::Cursor::new(raw)), "GET").unwrap();
+        assert!(got.len() < 64 * 1024, "leyó {} bytes", got.len());
+        // Una línea partida byte a byte se encuentra igual (el `\r` y el `\n` en lecturas distintas).
+        let mut d = ChunkDecoder::new();
+        let mut out = Vec::new();
+        for b in b"3;ext=1\r\nabc\r\n0\r\n\r\n" {
+            out.extend(d.feed(&[*b]));
+        }
+        assert_eq!(out, b"abc");
+        assert!(d.complete() && d.last_chunk);
+    }
+
+    /// Ronda 2 (N2): de-chunkear muchos chunks chicos es lineal. Con un `drain` por chunk, 2¹⁸ chunks
+    /// de 1 byte cuestan segundos en debug (×4 por cada ×2); con el cursor, milisegundos: el umbral de
+    /// 1 s queda lejos de los dos lados.
+    #[test]
+    fn many_small_chunks_dechunk_in_linear_time() {
+        let raw = b"1\r\nx\r\n".repeat(1 << 18);
+        let mut all = raw.clone();
+        all.extend_from_slice(b"0\r\n\r\n");
+        let t0 = std::time::Instant::now();
+        let out = dechunk_bytes(&all);
+        assert_eq!(out.len(), 1 << 18);
+        assert!(t0.elapsed() < TestDuration::from_secs(1), "cuadrático: {:?}", t0.elapsed());
+    }
+
+    #[test]
+    fn without_a_length_the_body_runs_to_the_close() {
+        let (url, _h) = one_shot_server(|mut sock| {
+            drain_request(&mut sock);
+            sock.write_all(b"HTTP/1.0 200 OK\r\n\r\nab").unwrap();
+            thread::sleep(TestDuration::from_millis(100));
+            sock.write_all(b"cd").unwrap();
+        });
+        let r = host::http_request("GET", &url, None, None, None, 5);
+        assert_eq!((r.status, r.body.as_str()), (200, "abcd"));
+    }
+
+    #[test]
+    fn the_stream_reader_also_ends_without_close() {
+        for parts in [
+            vec![&b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nab"[..], b"cdIGNORED"],
+            vec![&b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nab\r\n"[..], b"2\r\ncd\r\n0\r\n\r\n"],
+        ] {
+            let url = holding_server(parts);
+            let t0 = std::time::Instant::now();
+            let mut got: Vec<u8> = Vec::new();
+            let (status, _) = host::http_request_stream("GET", &url, None, None, 5, &mut |b| {
+                got.extend_from_slice(b);
+                true
+            })
+            .unwrap();
+            assert!(t0.elapsed() < TestDuration::from_secs(2), "el stream esperó al cierre: {:?}", t0.elapsed());
+            assert_eq!((status, got.as_slice()), (200, &b"abcd"[..]));
+        }
+        let url = holding_server(vec![b"HTTP/1.1 204 No Content\r\nContent-Length: 3\r\n\r\n"]);
+        let t0 = std::time::Instant::now();
+        let mut calls = 0;
+        let (status, _) = host::http_request_stream("GET", &url, None, None, 5, &mut |_| {
+            calls += 1;
+            true
+        })
+        .unwrap();
+        assert!(t0.elapsed() < TestDuration::from_secs(2));
+        assert_eq!((status, calls), (204, 0));
     }
 
     #[test]

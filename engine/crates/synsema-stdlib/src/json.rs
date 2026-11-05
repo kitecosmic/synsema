@@ -482,6 +482,10 @@ pub fn syn_to_json(v: &SynValue) -> Json {
         // Una máscara → `true`/`false` (v0.6.55).
         SynValue::Array(a) => match &**a {
             synsema_core::types::NdArray::F64(x) => array_view_to_json(&x.view(), Json::Float),
+            // v0.6.56 (diseño §3.6): el decimal más corto que vuelve al mismo `f32`.
+            synsema_core::types::NdArray::F32(x) => {
+                array_view_to_json(&x.view(), |v| Json::Float(synsema_core::types::f32_shortest(v)))
+            }
             synsema_core::types::NdArray::Bool(x) => array_view_to_json(&x.view(), Json::Bool),
         },
         // `private` en un body serializado: fail-closed, como el secret. Como BUILTIN,

@@ -24,7 +24,7 @@ fn expected(b: &BuiltinTask) -> ((usize, Option<usize>), &'static [&'static str]
 fn check(b: &BuiltinTask) {
     let (arity, kwargs, lineage, constructor) = expected(b);
     assert_eq!(b.meta.arity, arity, "aridad de {}", b.name);
-    assert_eq!(b.meta.kwargs, kwargs, "kwargs de {}", b.name);
+    assert_eq!(b.kwargs(), kwargs, "kwargs de {}", b.name);
     assert_eq!(b.meta.lineage_source, lineage, "linaje de {}", b.name);
     assert_eq!(b.meta.constructor, constructor, "constructor {}", b.name);
 }

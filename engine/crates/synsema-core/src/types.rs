@@ -459,10 +459,26 @@ pub fn array_display(a: &ArrayD<f64>) -> String {
     display_with(a, |x| trim_float(*x))
 }
 
+/// v0.6.56: el `f64` cuyo decimal más corto es el decimal más corto de `x` como `f32` (`0.1f32` →
+/// `0.1`, no `0.10000000149011612`). Lo usan la impresión y `json` de un array `f32` (diseño §3.6).
+pub fn f32_shortest(x: f32) -> f64 {
+    if !x.is_finite() {
+        return x as f64;
+    }
+    // `{:e}` da los dígitos más cortos que vuelven al mismo `f32`; con ≤ 9 dígitos, el `f64` más
+    // cercano a ese decimal tiene ese mismo decimal como su repr más corto.
+    format!("{:e}", x).parse::<f64>().unwrap_or(x as f64)
+}
+
 /// El repr de un `array` de cualquier tipo de elemento: una máscara se ve `[false, true]`.
 pub fn nd_display(a: &NdArray) -> String {
     match a {
         NdArray::F64(a) => array_display(a),
+        NdArray::F32(a) if a.len() > 100 => {
+            let shape: Vec<String> = a.shape().iter().map(|d| d.to_string()).collect();
+            format!("array(shape=[{}], {} elements, f32)", shape.join(", "), a.len())
+        }
+        NdArray::F32(a) => display_with(a, |x| trim_float(f32_shortest(*x))),
         NdArray::Bool(a) => display_with(a, |b| if *b { "true".to_string() } else { "false".to_string() }),
     }
 }
@@ -564,6 +580,11 @@ pub fn syn_complex(re: f64, im: f64) -> SynValue {
 pub fn syn_array(a: ArrayD<f64>) -> SynValue {
     SynValue::Array(crate::types::Obj::new(NdArray::F64(a)))
 }
+/// v0.6.56: un array `f32`.
+pub fn syn_array32(a: ArrayD<f32>) -> SynValue {
+    SynValue::Array(crate::types::Obj::new(NdArray::F32(a)))
+}
+
 /// Construye una máscara (array `bool`).
 pub fn syn_mask(a: ArrayD<bool>) -> SynValue {
     SynValue::Array(crate::types::Obj::new(NdArray::Bool(a)))
@@ -573,15 +594,18 @@ pub fn syn_mask(a: ArrayD<bool>) -> SynValue {
 // NdArray — el contenido de un `array` con su tipo de elemento (v0.6.55)
 // =========================================================
 //
-// specs/v0.6.55-diseno.md §2. Los nombres de `dtype` son fijos: `f64`, `bool` y (0.6.56) `f32`.
-// Las operaciones que no miran el tipo piden `to_f64()`: prestado si es `F64`, convertido a 0/1
-// si es `Bool` (R2). Sólo las que dependen del tipo (comparaciones, `sum`, máscaras, escritura,
-// salida y snapshots) hacen `match`. Agregar `F32` es un brazo más acá y en esos pocos sitios.
+// specs/v0.6.55-diseno.md §2 y specs/v0.6.56-diseno.md. Los nombres de `dtype` son fijos: `f64`,
+// `f32` y `bool`. `numbers_f64()` da los números como `f64` (prestado si es `F64`, convertido si no):
+// lo usa sólo quien calcula en `f64` y después devuelve el tipo que corresponde (diseño 0.6.56, F1:
+// «`f32` entra, `f32` sale»). Se llamaba `to_f64` hasta 0.6.55; el nombre nuevo obligó a revisar
+// cada sitio.
 
 /// El contenido de un `array`: un bloque n-dimensional de un solo tipo de elemento.
 #[derive(Clone, Debug)]
 pub enum NdArray {
     F64(ArrayD<f64>),
+    /// v0.6.56: precisión simple (4 bytes por elemento).
+    F32(ArrayD<f32>),
     /// Una máscara: lo que da una comparación.
     Bool(ArrayD<bool>),
 }
@@ -591,12 +615,14 @@ impl NdArray {
     pub fn dtype(&self) -> &'static str {
         match self {
             NdArray::F64(_) => "f64",
+            NdArray::F32(_) => "f32",
             NdArray::Bool(_) => "bool",
         }
     }
     pub fn shape(&self) -> &[usize] {
         match self {
             NdArray::F64(a) => a.shape(),
+            NdArray::F32(a) => a.shape(),
             NdArray::Bool(a) => a.shape(),
         }
     }
@@ -607,19 +633,27 @@ impl NdArray {
     pub fn len(&self) -> usize {
         match self {
             NdArray::F64(a) => a.len(),
+            NdArray::F32(a) => a.len(),
             NdArray::Bool(a) => a.len(),
         }
     }
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
-    /// Los números del array: prestados si es `f64`; una máscara se convierte a 0/1 (R2).
+    /// Los números del array como `f64`: prestados si es `f64`; un `f32` se ensancha (exacto) y una
+    /// máscara da 0/1 (R2). Quien lo usa decide el tipo de salida (`is_f32`).
     #[inline]
-    pub fn to_f64(&self) -> std::borrow::Cow<'_, ArrayD<f64>> {
+    pub fn numbers_f64(&self) -> std::borrow::Cow<'_, ArrayD<f64>> {
         match self {
             NdArray::F64(a) => std::borrow::Cow::Borrowed(a),
+            NdArray::F32(a) => std::borrow::Cow::Owned(a.mapv(|x| x as f64)),
             NdArray::Bool(a) => std::borrow::Cow::Owned(a.mapv(|b| if b { 1.0 } else { 0.0 })),
         }
+    }
+    /// v0.6.56: si el array es `f32`.
+    #[inline]
+    pub fn is_f32(&self) -> bool {
+        matches!(self, NdArray::F32(_))
     }
     /// El bloque `f64` si el array es `f64` (sin convertir).
     #[inline]
@@ -637,6 +671,7 @@ impl PartialEq for NdArray {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (NdArray::F64(a), NdArray::F64(b)) => a == b,
+            (NdArray::F32(a), NdArray::F32(b)) => a == b,
             (NdArray::Bool(a), NdArray::Bool(b)) => a == b,
             _ => false,
         }
@@ -646,6 +681,11 @@ impl PartialEq for NdArray {
 impl From<ArrayD<f64>> for NdArray {
     fn from(a: ArrayD<f64>) -> Self {
         NdArray::F64(a)
+    }
+}
+impl From<ArrayD<f32>> for NdArray {
+    fn from(a: ArrayD<f32>) -> Self {
+        NdArray::F32(a)
     }
 }
 impl From<ArrayD<bool>> for NdArray {
@@ -658,6 +698,7 @@ impl From<ArrayD<bool>> for NdArray {
 #[derive(Clone, Debug, PartialEq)]
 pub enum SendArray {
     F64(Vec<f64>),
+    F32(Vec<f32>),
     Bool(Vec<bool>),
 }
 
@@ -666,6 +707,7 @@ impl SendArray {
     pub fn len(&self) -> usize {
         match self {
             SendArray::F64(d) => d.len(),
+            SendArray::F32(d) => d.len(),
             SendArray::Bool(d) => d.len(),
         }
     }
@@ -676,6 +718,7 @@ impl SendArray {
     pub fn byte_len(&self) -> usize {
         match self {
             SendArray::F64(d) => d.len() * 8,
+            SendArray::F32(d) => d.len() * 4,
             SendArray::Bool(d) => d.len(),
         }
     }
@@ -688,6 +731,7 @@ impl SendArray {
         }
         match self {
             SendArray::F64(d) => NdArray::F64(build(shape, d)),
+            SendArray::F32(d) => NdArray::F32(build(shape, d)),
             SendArray::Bool(d) => NdArray::Bool(build(shape, d)),
         }
     }
@@ -798,6 +842,7 @@ pub fn to_send(v: &SynValue) -> SendValue {
             a.shape().to_vec(),
             match &**a {
                 NdArray::F64(x) => SendArray::F64(x.iter().copied().collect()),
+                NdArray::F32(x) => SendArray::F32(x.iter().copied().collect()),
                 NdArray::Bool(x) => SendArray::Bool(x.iter().copied().collect()),
             },
         ),

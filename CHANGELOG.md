@@ -6,6 +6,102 @@ Each says what changed, why, and what to write instead.
 
 Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the release date.
 
+## v0.6.56 — 2026-11-05
+
+**Engine.**
+- **`f32` arrays.** An array is now `f64`, `f32` or `bool`; an `f32` array takes half the memory
+  (`ones([1000000], dtype = "f32")` is about 4 MB). `array`, `zeros`, `ones`, `full`, `arange`,
+  `linspace`, `identity`, `eye`, `random_normal` and `random_uniform` take `dtype = "f32"` (the
+  default stays `"f64"`), and `astype(a, "f32" | "f64" | "bool")` converts (`astype` of a mask gives
+  0/1, to `"bool"` is `a != 0` with NaN true, like numpy). `dtype(a)` says `"f32"`.
+- **The rule: `f32` in, `f32` out.** Arithmetic, comparisons, the elementwise functions (`exp`,
+  `sqrt`, `tanh`, `maximum`, `clamp`, `if_else`, `where`, `apply`, …), reductions by axis,
+  `cumsum`, `diff`, `concat`/`stack`, indexing, `transpose`, `reshape`, `index_add`, `matmul` and the
+  linear algebra (`dot`, `solve`, `inv`, `svd`, `lstsq`, `cov`, `corr`, `polyfit`, …) keep `f32`.
+  A loose number is rounded to `f32` first (`w * 0.1` multiplies by the `f32` nearest to 0.1, like
+  numpy 2; the coefficients of `polyval` given as a list too), and a mask takes the type of the other
+  side (`m * w` is `f32`).
+- **Mixing `f32` and `f64` is an error**, never a silent promotion: `w + a` →
+  `'+': cannot mix an f32 array and an f64 array — convert one first: astype(x, "f32") or astype(x, "f64")`.
+  The same text for every operation (`matmul`, `concat`, `set`, `if_else`, …), with the order of the
+  operands.
+- **How it computes.** Each element is computed in `f64` and rounded once to `f32`: bit for bit with
+  numpy for `+ - * / // % sqrt atan2 hypot`; for `exp`, `ln`, `sin`, `tanh` and the rest of libm it
+  is almost always the correctly rounded result (≤ 1 ulp; it is not compared bit for bit across
+  systems). Reductions accumulate in `f64` and round once at the end (more exact than numpy's `f32`
+  pairwise sum); `cumsum` accumulates in `f32`, in order, like numpy. `random_uniform(…, dtype =
+  "f32")` is the `f64` draw rounded, between `low` and `high` taken as `f32` (the way `u < high`
+  compares them): it never gives `high`, since a draw that rounds up to it becomes the `f32` just
+  below, so `every(u >= low)` and `every(u < high)` are always true; a sample is always finite, even
+  with `low` or `high` outside the `f32` range. When `low` and `high` round to the same `f32` the
+  interval is empty, and it says so (`random_uniform: low = 1e-45 and high = 2e-45 round to the same
+  f32, so [low, high) is empty in f32 — widen the interval or use dtype = "f64"`). `matmul` in `f32`
+  is native (faer's `f32` kernel), not `f64` rounded.
+- **Reading an `f32` gives a Synsema number with the exact value**: `w[0]`, `each`, `to_list` and a
+  reduction to a scalar give `0.10000000149011612` for an element stored as 0.1. Printing and `json_encode` use the
+  shortest decimal that reads back to the same `f32` (`[0.1, 0.33333334]`); an array with more than
+  100 elements prints as `array(shape=[…], N elements, f32)`. Vector parameters of the databases
+  are written the same way.
+- **`f16` and `bf16` are byte formats.** `array_to_bytes(a, "f16" | "bf16")` writes them and
+  `array_from_bytes(b, "f16" | "bf16")` reads them into an `f32` array (model weights). They are not
+  array dtypes: `zeros([2], dtype = "f16")` says so and names `array_from_bytes`.
+- `array_to_bytes(w)` of an `f32` array writes 4 bytes per element (its own type); `"f64"` widens it.
+- **`concat([m, m])` and `stack` of masks give a mask** (before, `f64` 0/1). A mask with a number
+  array gives that array's type.
+- **`where(a, (x) => …)` keeps the array's type**, and on a mask the predicate receives `true`/`false`
+  (before, `f64` 0/1).
+
+**Breaking.**
+- **`array_from_bytes(b, "f32")` returns an `f32` array** (before, `f64` with the widened values).
+  It prints its shortest decimals (`[1.5, -2, 0.1]`); mixed with an `f64` array it is the mixing
+  error. To keep the old behavior: `astype(array_from_bytes(b, "f32"), "f64")`.
+- **The lineage of a value with arrays carries their type and shape** (`encoding: "ndarray"`). Every
+  array, `f64` included, is hashed as `{dtype, shape, data}` (`json_encode` of the value with each
+  array replaced by that map). Before, `array([[1, 2]])` and the list `[[1, 2]]` had the same hash;
+  now an `f32` and an `f64` with the same values, or an array and the list of its numbers, differ.
+  Receipts recorded before keep their `"json"`/`"jcs"` encoding and still verify; a new run of the
+  same program over arrays commits to different bytes. The recipe, so that anyone can recompute it:
+  the keys of a map are sorted as in `"jcs"` (by UTF-16 code units), the map of an array is always
+  `dtype`, `shape`, `data` in that order, numbers and text are written as `json_encode` writes them
+  (`1.0`, `0.10000000149011612`; NaN and infinities as `NaN`/`Infinity`), and a value nested deeper
+  than 64 levels is not this recipe (it goes to `"jcs"`, which rejects it).
+- `w[0] == 0.1` is `false` for an `f32` array (`w[0]` is `0.10000000149011612`): compare in `f32`
+  with `equal(w, 0.1)`, or round the number first.
+- The `dtype` error of `array_to_bytes`/`array_from_bytes` lists the new formats
+  (`dtype must be "f64", "f32", "f16", "bf16" or "bool", got …`).
+
+**Fixed: `http_get` and the other `http_*` stop when the response is complete.** They read until
+the server closed the connection, so a server that answers and keeps it open (Chrome's
+`/json/list`, several proxies and embedded servers) made them wait for the whole `timeout` and fail
+with `os error 10060`. Now they read the headers and then exactly `Content-Length` bytes, or up to
+the last chunk and its trailers when chunked; the response to a `HEAD`, a `204` and a `304` have no
+body, and an interim `1xx` (`100 Continue`, `103 Early Hints`) is skipped. A `Content-Length` that
+lists the same number several times (`2, 2`, left by a proxy; empty elements are skipped) is that
+length; a length is only digits (`+2` is invalid). A response with
+neither a length nor chunked reads until the close, and so does one with an invalid or contradictory
+length or a transfer coding other than chunked. The streaming reader of `llm_stream` and the
+providers follows the same rule, and so does `attest` talking to the dstack agent. A response head
+(status line and headers) larger than 1 MiB is an error
+(`the HTTP response head is larger than 1048576 bytes`), and so are more than 8 interim responses
+(`the server sent more than 8 interim (1xx) responses`). A chunk size line longer than 4096 bytes is
+an invalid size, which ends the body there, as an invalid size always did. Decoding many small chunks
+is linear (it was quadratic in the number of chunks: 786 KB in 1-byte chunks took 2.4 s of CPU).
+
+**Fixed: signed zero.** `cumsum` of an array that starts with `-0.0` keeps `-0.0` (numpy), and `dot`
+of two empty vectors is `0.0`, not `-0.0`, in `f64` and in `f32`.
+
+**Fixed: an auditor key that starts with `--`.** The public key of `synsema receipt keygen` is
+base64url of 32 random bytes, and one in 4096 starts with `--`: `run --auditor <key>` and
+`test --auditor <key>` took it for a flag (`--auditor requires a value`). A valid auditor key is now
+taken as the value; a flag in its place (`run --auditor --flat`) is still that error. `serve` and
+`run --auditor=<key>` already took it.
+
+**The `perf-guard` anchor was re-measured on CI** (`engine/perf/baseline.json`, from this release's
+PR), with the new row `s_arrays_small` (arithmetic on small arrays). Three rows went over the
++0.3 % budget in code this release did not touch: `o_plus` (jit) +0.57 %, in the allocator
+(`malloc_consolidate`, `unlink_chunk`), and `s_text_join` (jit and vm) +0.33 %, in
+`__memcmp_avx2_movbe`.
+
 ## v0.6.55 — 2026-11-04
 
 **Engine.**

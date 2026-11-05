@@ -834,7 +834,7 @@ mod dstack {
 
     /// `POST <path>` con body JSON; devuelve el body de un 200 o el error con el status.
     #[cfg(unix)]
-    fn post_json(ep: &Endpoint, path: &str, body: &str) -> Result<String, String> {
+    pub(super) fn post_json(ep: &Endpoint, path: &str, body: &str) -> Result<String, String> {
         use std::io::{Read, Write};
         let timeout = Some(std::time::Duration::from_secs(20));
         let req = format!(
@@ -843,9 +843,24 @@ mod dstack {
             body.len(),
             body
         );
-        let mut raw = Vec::new();
+        let raw: Vec<u8>;
         // Auditoría externa: tope de lectura (un quote + event log entran de sobra en 1 MiB).
         const MAX_RESPONSE: u64 = 1 << 20;
+        // v0.6.56 (ronda 1, M5): la respuesta termina en su `Content-Length` o en el chunk final,
+        // sin esperar a que el agente cierre (como `http_get`). El perfil puro no trae `http.rs`:
+        // ahí lee hasta el cierre, como antes.
+        fn read_all<R: Read>(r: &mut R) -> Result<Vec<u8>, String> {
+            #[cfg(feature = "native")]
+            {
+                crate::http::read_response(r, "POST").map_err(|e| format!("attest: dstack read: {}", e))
+            }
+            #[cfg(not(feature = "native"))]
+            {
+                let mut raw = Vec::new();
+                r.read_to_end(&mut raw).map_err(|e| format!("attest: dstack read: {}", e))?;
+                Ok(raw)
+            }
+        }
         match ep {
             Endpoint::Unix { path: sock, .. } => {
                 let mut s = std::os::unix::net::UnixStream::connect(sock)
@@ -853,7 +868,7 @@ mod dstack {
                 let _ = s.set_read_timeout(timeout);
                 let _ = s.set_write_timeout(timeout);
                 s.write_all(req.as_bytes()).map_err(|e| format!("attest: dstack write: {}", e))?;
-                s.take(MAX_RESPONSE).read_to_end(&mut raw).map_err(|e| format!("attest: dstack read: {}", e))?;
+                raw = read_all(&mut s.take(MAX_RESPONSE))?;
             }
             Endpoint::Tcp(addr) => {
                 let mut s = std::net::TcpStream::connect(addr)
@@ -861,7 +876,7 @@ mod dstack {
                 let _ = s.set_read_timeout(timeout);
                 let _ = s.set_write_timeout(timeout);
                 s.write_all(req.as_bytes()).map_err(|e| format!("attest: dstack write: {}", e))?;
-                s.take(MAX_RESPONSE).read_to_end(&mut raw).map_err(|e| format!("attest: dstack read: {}", e))?;
+                raw = read_all(&mut s.take(MAX_RESPONSE))?;
             }
         }
         if raw.len() as u64 >= MAX_RESPONSE {
@@ -2613,5 +2628,27 @@ mod tests {
         assert!(parse_http_response(&split_utf8).is_err(), "truncado → error, no panic");
         // Y un status line con bytes inválidos tampoco.
         assert!(parse_http_response(b"HTTP/1.1 \xff\xfe\r\n\r\nx").is_err());
+    }
+
+    /// v0.6.56 (ronda 1, M5): el agente de dstack contesta y no cierra; la lectura termina en el
+    /// `Content-Length`, no a los 20 s del timeout.
+    #[cfg(all(unix, feature = "native"))]
+    #[test]
+    fn dstack_reply_ends_at_its_length_without_close() {
+        use std::io::{Read, Write};
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap().to_string();
+        let t = std::thread::spawn(move || {
+            let (mut s, _) = l.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = s.read(&mut buf);
+            s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}").unwrap();
+            std::thread::sleep(std::time::Duration::from_secs(4));
+        });
+        let t0 = std::time::Instant::now();
+        let body = dstack::post_json(&dstack::Endpoint::Tcp(addr), "/GetQuote", "{}").unwrap();
+        assert_eq!(body, "{}");
+        assert!(t0.elapsed() < std::time::Duration::from_secs(2), "esperó el cierre: {:?}", t0.elapsed());
+        t.join().unwrap();
     }
 }
