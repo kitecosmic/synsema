@@ -2,7 +2,9 @@
 
 Read this FIRST if something fails. Each row is a real mistake that costs hours to debug.
 
-> **Just upgraded and something that worked now fails?** Start at *Upgrading to v0.6.54* (an
+> **Just upgraded and something that worked now fails?** Start at *Upgrading to v0.6.56*
+> (`array_from_bytes(b, "f32")` gives an `f32` array, the lineage of arrays), then *v0.6.55* (`==` and
+> the truth of arrays), then *Upgrading to v0.6.54* (an
 > unknown `run_program` option, a non-ASCII host in WebAssembly), then *Upgrading to v0.6.53* (gates in
 > `parallel_map`/agents no longer approve themselves, nothing scheduled from a `sandbox`, `ask`
 > falls back to text, a `secret()` to `run`'s child), then *v0.6.52*, then *v0.6.51* (no output
@@ -19,6 +21,19 @@ Read this FIRST if something fails. Each row is a real mistake that costs hours 
 > Behavioral surprises · Anti-patterns · Secrets & config
 > Coming from Python? The traps that LOOK like Python but aren't are also collected in
 > [python-diff.md](python-diff.md).
+
+## Upgrading to v0.6.56 — what behaves differently
+
+| You see | What changed | What to write |
+|---|---|---|
+| `array_from_bytes(b, "f32")` + an `f64` array → ``'+': cannot mix an f32 array and an f64 array — convert one first: astype(x, "f32") or astype(x, "f64")`` | **breaking:** `array_from_bytes(b, "f32")` returns an **`f32` array** (before, `f64` with the widened values); it prints its shortest decimals (`[1.5, -2, 0.1]`) | `astype(array_from_bytes(b, "f32"), "f64")` keeps the old behavior; or keep everything in `f32` |
+| a receipt or `lineage()` entry over arrays says `encoding: "ndarray"` and its hash changed | **breaking:** every array, `f64` included, is hashed as `{dtype, shape, data}`; an array and the list of its numbers no longer share a hash | recompute with the recipe (builtins.md § lineage table); receipts recorded before keep `"json"`/`"jcs"` and still verify |
+| `w[0] == 0.1` is `false` for an `f32` array (numpy 2 says `True`) | reading an `f32` gives its exact value, `0.10000000149011612` | `equal(w, 0.1)` (compares in `f32`), or round the number first |
+| `w + a` with an `f32` and an `f64` array is an error | no silent promotion (numpy promotes to `float64`) | `astype(x, "f32")` or `astype(x, "f64")` on one side |
+| `zeros([2], dtype = "f16")` → ``zeros: "f16" is a byte format, not an array dtype — array_from_bytes(b, "f16") reads it as f32`` | `f16`/`bf16` exist only as byte formats | `array_from_bytes(b, "f16")` → `f32` |
+| `random_uniform(g, [n], low = 1, high = 1.00000001, dtype = "f32")` → ``… round to the same f32, so [low, high) is empty in f32 — widen the interval or use dtype = "f64"`` | in `f32` the interval is `[f32(low), f32(high))` | widen it, or `dtype = "f64"` |
+| `http_get` to a server that keeps the connection open answers at once (it used to wait the whole `timeout` and fail with `os error 10060`) | the response ends at `Content-Length` or the last chunk, not at the close | — (more than 8 `1xx` responses, or a head over 1 MiB, is now an error) |
+| `run --auditor <key>` → `--auditor requires a value` with a key from `synsema receipt keygen` | fixed: one key in 4096 starts with `--` and was taken for a flag | — (before v0.6.56: `--auditor=<key>`) |
 
 ## Upgrading to v0.6.55 — what behaves differently
 

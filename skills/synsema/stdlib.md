@@ -65,6 +65,18 @@ value …, or leave it out`; an unbound secret → the `require secret("K") for 
 practice; `http_get`/`http_delete` do not take it (`unknown parameter 'form'`) — use
 `http(method = …, url = u, form = {…})`.
 
+**A response ends where the server says (v0.6.56+):** the client reads the headers, then exactly
+`Content-Length` bytes or the chunks up to the last one and its trailers — not until the close. A
+server that answers and keeps the connection open (Chrome's `/json/list`, proxies, embedded servers)
+answers at once; before v0.6.56 it cost the whole `timeout` and failed with `os error 10060`. `HEAD`,
+`204` and `304` have no body; an interim `1xx` (`100 Continue`, `103 Early Hints`) is skipped, more than
+8 → `the server sent more than 8 interim (1xx) responses`; a `Content-Length` repeating one number
+(`2, 2`) is that length, digits only; no length and no chunked (or an invalid length, or another
+transfer coding) reads until the close; a head over 1 MiB → `the HTTP response head is larger than
+1048576 bytes`; a chunk size line over 4096 bytes is an invalid size and ends the body. The same for
+`llm_stream`, the LLM providers and `attest` (dstack). Measured against a server that never closes
+(engine v0.6.56): Content-Length, chunked and `103` + `200` all answer in well under a second.
+
 **Redirects are not followed** (any version): a `3xx` comes back as the response with its
 `Location` (`header(r, "location")`); your code decides. An embedder implementing `http` receives
 `redirect: "error"` when the request carries a secret (v0.6.46+) and must honor it.

@@ -406,8 +406,9 @@ chain RPC reads (the **sha256 of the query**, never the text), socket/process me
 a model (`reason`/`decide`/`analyze`/`generate`: source `llm`, the prompt's hash), `read_line`
 (stdin), what `run`/`run_program` returned — each with the sha256 of the bytes the program received
 and an `encoding` that says which bytes those were (`"text"`, `"bytes"`, `"jcs"` =
-`canonical_json(x)`, or `"json"` = `json_encode(x)` when the value holds an integer beyond 2^53), so
-a verifier can recompute every hash.
+`canonical_json(x)`, `"json"` = `json_encode(x)` when the value holds an integer beyond 2^53, or —
+v0.6.56+ — `"ndarray"` for a value with arrays, each hashed as `{dtype, shape, data}`; recipe in
+builtins.md § lineage), so a verifier can recompute every hash.
 `lineage()` returns that list; `receipt()` carries it as `credentialSubject.inputs` next to
 `program_sha`, `engine`, the capability audit and `declared_result_sha256` — and, v0.6.46+,
 `credentialSubject.outputs`: every file the run wrote (`write_file`/`append_file`/`edit_file`/
