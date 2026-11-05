@@ -6,7 +6,7 @@ Each says what changed, why, and what to write instead.
 
 Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the release date.
 
-## v0.6.56 — unreleased
+## v0.6.56 — 2026-11-05
 
 **Engine.**
 - **`f32` arrays.** An array is now `f64`, `f32` or `bool`; an `f32` array takes half the memory
