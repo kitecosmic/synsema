@@ -159,7 +159,8 @@ covers what was kept). `truncated > 0` → raise the size.
 "HPKE-Base-X25519-SHA256-AES128GCM", engine, program_sha (= synsema code sha = receipt()'s),
 config_sha (null except run --attest / serve --attested), started (UTC, seconds), run_key {alg,
 public, identity}, auditor, seed_sha256 (= sha256 of the seed's bytes), public_entries,
-sealed_bytes}, "public": [...], "sealed": "<base64url enc‖ct>", "root": "<hex>", "signature":
+sealed_bytes, compute (v0.6.57+: `{device, os, arch, isa, cores, threads, matmul_bitwise}`, the same
+as `receipt().credentialSubject.compute`)}, "public": [...], "sealed": "<base64url enc‖ct>", "root": "<hex>", "signature":
 "<base64url>"}`.
 - `public` = entries made with the PC public, in order, by `kind`: `capability` (the `--audit json`
   line, no `ts`), `input` (lineage entry), `output`. Sealed = `capability` (with `ts`) and `op`
@@ -292,6 +293,16 @@ difference 1. Not opened → `--replay: f is not an opened receipt (run synsema 
 `serve` has no `--replay`. Pass `--labels` if the run had it. **Effects are real** (files are
 written again). If the envelope cut sealed entries it warns `the recorded run truncated N sealed
 entries; …`.
+**The platform (v0.6.57+):** before running, `--replay` compares the header's `compute` with this
+machine and prints lines on stderr; it never changes the verdict, and the lines are there also when
+the replay then fails. Either side `matmul_bitwise: false` (or missing) → always a warning, even
+for two identical ARM machines: `synsema run --replay: warning: recorded on macos/aarch64 neon+fma,
+8 cores, 8 threads; replayed on windows/x86_64 avx2+fma, 12 cores, 12 threads: outside the bitwise
+promise of matmul (x86-64 with AVX2+FMA or AVX-512), results that depend on matmul may differ in the
+last bits, and so may what the program reads`. Both `true` but `isa`/`cores`/`threads` differ → `…
+note: recorded on …; replayed on …; matmul gives the same bits on both`. Another `os` → `… warning:
+exp, ln, sin, tanh and the rest of libm come from the system and may differ in the last bit between
+linux and windows`. A receipt without `compute` (before v0.6.57) → nothing.
 
 **What it does NOT hide:** that the run touched private data (`steps: null`), the run's wall-clock
 time (`started`, when the receipt appears), whether it stopped on an error/limit (exit code; an error
