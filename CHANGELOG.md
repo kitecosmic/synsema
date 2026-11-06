@@ -6,7 +6,7 @@ Each says what changed, why, and what to write instead.
 
 Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the release date.
 
-## v0.6.57 — unreleased
+## v0.6.57 — 2026-11-06
 
 **Engine.**
 - **`matmul` uses every core and the bits do not change.** The threads split the output into tiles
