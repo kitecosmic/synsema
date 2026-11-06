@@ -43,6 +43,7 @@ num-complex.workspace = true
 # Arrays n-dimensionales + álgebra lineal (Batch 5): ndarray + faer, puro-Rust sin C.
 ndarray.workspace = true
 faer.workspace = true
+pulp.workspace = true
 # base58 (Batch 11): formato de bytes()/decode() (Solana/Bitcoin). Crate canónico
 # puro-Rust — código de direcciones de dinero: no se hand-rollea. base32 sí es
 # hand-rolled en bytesutil (RFC 4648, trivial).

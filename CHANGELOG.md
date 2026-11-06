@@ -6,6 +6,58 @@ Each says what changed, why, and what to write instead.
 
 Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the release date.
 
+## v0.6.57 — unreleased
+
+**Engine.**
+- **`matmul` uses every core and the bits do not change.** The threads split the output into tiles
+  and each element is still one sum in one thread, so 1 thread and 12 threads give the same bits.
+  Products with several batches (`matmul` of 3-D arrays) split the batches the same way. `matmul` no
+  longer converts the arrays to another library's layout on the way in and out.
+- **The bitwise promise of `matmul`.** On x86-64 with AVX2+FMA (the full x86-64-v3 level) or AVX-512
+  (any OS, any number of threads), `matmul` follows a written order and gives the same bits on every
+  machine: for each element, `k` in blocks of 512; each block is a chain of fused multiply-adds
+  starting at `-0.0`, with `k` increasing; the blocks are added in order (`k = 0` gives `+0`). That
+  covers `f64` and `f32`, matrix × matrix, matrix × vector and vector × matrix. On ARM, WebAssembly
+  and x86 without FMA the result is correct but can differ in the last bits from one machine to
+  another; there is no promise there. A CPU that lacks part of x86-64-v3 (a VM that hides `movbe` or
+  `bmi2`, say) reports `"isa": "scalar"` and is outside the promise. The CI checks the promise on
+  Linux and Windows; macOS on x86-64 runs the same code (the kernel is chosen by the CPU, not the OS)
+  but no CI job runs it.
+- **`SYNSEMA_THREADS`** caps the threads of `matmul` (default: the logical cores). It is read from
+  the process environment, like the `serve` knobs. Under `serve`, each worker gets
+  `cores / workers` unless `SYNSEMA_THREADS` is set; inside `parallel_map`, each worker gets its share
+  of the caller's cap. A value that is not a whole number `>= 1` is reported once on stderr and
+  ignored.
+- **The receipt says where it ran.** `receipt()` has `credentialSubject.compute` and the sealed
+  receipt (`run --auditor`) has `header.compute`: `{"device": "cpu", "os": "linux", "arch": "x86_64",
+  "isa": "avx2+fma", "cores": 12, "threads": 12, "matmul_bitwise": true}`. `isa` is what `matmul` uses
+  on this machine (`"avx512f+fma"`, `"avx2+fma"`, `"neon+fma"` or `"scalar"`), `threads` is the cap
+  of the process (not how many a `matmul` used, which depends on the size of the data), and
+  `matmul_bitwise` says whether the promise of `matmul` applies here. It describes the platform, not
+  what the program computed, and has no CPU model.
+- **`--replay` says when the platform matters**, before it runs (also when the replay then fails): a
+  warning if either side is outside the promise of `matmul` (two ARM machines can differ too), a
+  warning if the operating system differs (`exp`, `ln`, `sin`, `tanh` and the rest come from the
+  system's libm), and a note if both are inside the promise with other instructions or threads. It
+  never changes the verdict; a receipt without `compute` says nothing.
+
+**Breaking.**
+- **Receipts have `compute`, so the receipt of the same program differs between machines**, also
+  with `--deterministic`. To compare two runs, compare `program_sha`, `declared_result_sha256`,
+  `inputs` and `outputs` instead of the hash of the whole receipt.
+- **`dot` adds in 16 lanes**: element `i` goes to lane `i mod 16`, each product is rounded before
+  it is added (no fused multiply-add), the lanes are added in a fixed tree (`+8`, `+4`, `+2`, `+1`)
+  and the elements past the last full group of 16 are added at the end, in order. It gives the same
+  bits on every platform and is several times faster. The last bits can differ from v0.6.56, which
+  added in order: `dot` of `[1e16, 1, 0, …, -1e16 (index 16), 0, …]` (32 elements) with `ones(32)` was
+  `0.0` and is now `1.0`. `dot` of `f32` arrays still accumulates in `f64` and rounds once.
+- **`matmul` of a matrix by one column (`[m, k]` by `[k, 1]`) follows the written order above**:
+  v0.6.56 added the whole `k` in one chain, so with `k > 512` the last bits can differ.
+
+**Fixed.**
+- The error of `complex` with an array named only `f64` and `bool`: it now says
+  `arrays hold f64, f32 or bool, not complex numbers`.
+
 ## v0.6.56 — 2026-11-05
 
 **Engine.**

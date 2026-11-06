@@ -136,6 +136,10 @@ jobs:
       # que ser privado y del usuario también en macOS (la misma rama de Unix que Linux).
       - name: Private approvals state on macOS (synsema-llm)
         run: cargo test --locked --manifest-path engine/Cargo.toml -p synsema-llm --lib human::tests
+      # v0.6.57: fuera de la promesa bit a bit (aarch64), los hilos de `matmul` igual no cambian los bits,
+      # y `dot` (sin FMA) da los mismos que en x86.
+      - name: matmul threads and dot on aarch64 (synsema-core)
+        run: cargo test --locked --manifest-path engine/Cargo.toml -p synsema-core --test it v0657_matmul -- --nocapture
       - name: Real .app on Apple Silicon (appended bundle keeps running; open + curl + shutdown)
         run: |
           set -euo pipefail
@@ -174,6 +178,36 @@ jobs:
   # artefacto synsema-wasm buildea, y las suites puras del lenguaje + la sonda
   # corren DE VERDAD bajo wasmtime. Ancla la garantía: una tanda futura que
   # rompa el perfil puro falla acá, no en el disco de alguien.
+  # v0.6.57: la promesa bit a bit de `matmul` (x86-64 con AVX2+FMA o AVX-512) en otro sistema y otro
+  # toolchain (Windows, msvc), y la invariancia de hilos en Linux ARM (fuera de la promesa). En Linux
+  # x86-64 lo corre `cargo test --workspace` (job test). El test compara contra el orden escrito y una
+  # huella fija del 512×512 (`GOLDEN_512`); `dot_fingerprint` (`GOLDEN_DOT`) corre sin condición en toda
+  # la matriz. macOS x86-64 no se corre (los runners Intel escasean; el núcleo se elige por CPU, no por
+  # sistema): el CHANGELOG lo dice.
+  matmul-promise:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master 2026-09-12; toolchain pinned below and in rust-toolchain.toml
+        with:
+          toolchain: "1.99.1"
+      - name: Cache cargo
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            engine/target
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-matmul-${{ hashFiles('engine/Cargo.lock') }}
+      - name: matmul in the written order, threads, dot (synsema-core)
+        run: cargo test --locked --manifest-path engine/Cargo.toml -p synsema-core --test it v0657_matmul -- --nocapture
+
   wasm:
     runs-on: ubuntu-26.04
     steps:
@@ -232,6 +266,13 @@ jobs:
           echo "$out" | grep -q "keccak_vacio=c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470"
           echo "$out" | grep -q "addr_key1=0x7E5F4552091A69125d5DfCb7b8C2659029395Bdf"
           echo "$out" | grep -q "svg_ok=true"
+      - name: Probe (dot da los mismos bits que en x86)
+        run: |
+          out=$(wasmtime run --dir . engine/target/wasm32-wasip1/wasm/synsema-wasm.wasm tests/wasm_dot.probe.syn)
+          echo "$out"
+          echo "$out" | grep -qx 'dot_f64=-27919116.465129998'
+          echo "$out" | grep -qx 'dot_f32=-27919116.0'
+          echo "$out" | grep -qx 'dot_tail=226.7701305'
       - name: Probe (agentes in-process, parallel_map secuencial, content)
         run: |
           out=$(wasmtime run --dir . engine/target/wasm32-wasip1/wasm/synsema-wasm.wasm tests/wasm_agents.probe.syn)

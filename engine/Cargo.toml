@@ -88,6 +88,16 @@ num-complex = "0.4"
 # multihilo. Queda el SIMD (pulp) → sigue rápido y 100% puro-Rust sin `*-sys`.
 ndarray = "0.16"
 faer = { version = "0.24", default-features = false, features = ["std", "linalg"] }
+# pulp (v0.6.57): ya venía con faer (mismo crate y versión del lock). `matmul` de una fila o una
+# columna lo usa para la FMA por instrucción con detección en tiempo de ejecución (`V3::try_new`),
+# sin `unsafe` propio: sólo `V3::try_new`, `vectorize` y `mul_add_f64x4`/`f32x8` (intrínsecos FMA).
+# pulp se compila con `std` igual (lo activa el `std` de faer y Cargo une las features), y con `std`
+# las funciones escalares `mul_add_f64s` de los tipos `Scalar128b/256b/512b` llaman a `f64::mul_add`
+# (la `fma()` de MinGW, incorrecta sin la instrucción). Nadie las alcanza: el camino sin V3 de
+# `matkernel` usa su propio `a*b + c`, y faer sin AVX2+FMA despacha a `pulp::Scalar`, cuyo
+# `mul_add_e_*` es `a*b + c`, igual que los núcleos escalares de gemm y nano-gemm (revisado en el
+# registro, 2026-11-05; la fase 0 lo midió: x86 sin AVX2 da las mismas huellas que wasm).
+pulp = { version = "0.22", default-features = false, features = ["x86-v3"] }
 # Postgres nativo (M1). Driver SYNC `postgres` (envuelve tokio-postgres con su propio
 # runtime tokio interno → el intérprete sigue sync). Puro-Rust + TLS rustls (mismo backend
 # ring que el resto de stdlib) → binario único intacto, sin `*-sys`.

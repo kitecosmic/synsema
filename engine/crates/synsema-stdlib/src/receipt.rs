@@ -67,6 +67,38 @@ fn label_to_syn(l: &[Rc<str>]) -> SynValue {
     syn_list(l.iter().map(|p| syn_text(p.to_string())).collect())
 }
 
+/// v0.6.57 (ítem 4): dónde corrió el cálculo, para el recibo (`credentialSubject.compute`) y el header
+/// del recibo sellado (`header.compute`). Una foto de la plataforma y de la configuración al emitirse:
+/// no depende de qué ni de cuánto calculó el programa, así que no filtra nada bajo etiquetas. Sin el
+/// modelo de la CPU (identifica el hardware) ni los hilos que usó `matmul` (dependen del tamaño de las
+/// matrices): `threads` es el tope del proceso. Regla y casos: specs/v0.6.57-recibo-compute.md.
+pub fn compute_json() -> serde_json::Value {
+    use synsema_core::matkernel as mk;
+    serde_json::json!({
+        "device": "cpu",
+        "os": compute_os(),
+        "arch": std::env::consts::ARCH,
+        "isa": mk::isa(),
+        "cores": mk::logical_cores(),
+        "threads": mk::process_thread_cap(),
+        "matmul_bitwise": mk::matmul_bitwise(),
+    })
+}
+
+/// El sistema operativo; en `wasm32-unknown-unknown` (el guest web) `consts::OS` es `""`.
+fn compute_os() -> &'static str {
+    match std::env::consts::OS {
+        "" => "unknown",
+        os => os,
+    }
+}
+
+/// El mismo `compute` como valor del lenguaje: se arma en un solo lugar (`compute_json`), así el
+/// recibo y el header sellado no pueden decir cosas distintas.
+fn compute_value() -> SynValue {
+    crate::json::json_to_syn(&compute_json())
+}
+
 /// `YYYY-MM-DDTHH:MM:SSZ` de un instante unix (calendario proléptico gregoriano; el
 /// algoritmo civil-from-days de Hinnant). Sin dependencia nueva. `pub` desde v0.6.46: el header del
 /// recibo sellado (CLI) también lo usa.
@@ -224,6 +256,7 @@ pub fn build_receipt(
         crate::attest::current_program_sha().map(|s| syn_text(hex_encode(&s))).unwrap_or_else(syn_nothing),
     );
     subject.insert("engine", syn_text(crate::attest::engine_version()));
+    subject.insert("compute", compute_value());
     if let Some(v) = result {
         if !matches!(v, SynValue::Nothing) {
             subject.insert(

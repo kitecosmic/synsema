@@ -33,6 +33,7 @@ pub mod loaded_modules;
 #[doc(hidden)]
 pub mod native_tier;
 pub mod math;
+pub mod matkernel;
 pub mod number;
 pub mod parser;
 pub mod reflexes;
