@@ -34,4 +34,5 @@ mod v0646_tanda_c;
 mod v0646_f1;
 mod v0650_modules;
 mod v0655_arrays;
+mod v0657_matmul;
 mod vm;

@@ -893,7 +893,7 @@ pub fn complex(args: &[SynValue]) -> Result<SynValue, Control> {
     arity(args, 2, "complex")?;
     if args.iter().any(|a| matches!(a, SynValue::Array(_))) {
         return Err(err(
-            "complex: arrays hold f64 or bool, not complex numbers — keep the real and imaginary parts as two arrays",
+            "complex: arrays hold f64, f32 or bool, not complex numbers — keep the real and imaginary parts as two arrays",
         ));
     }
     let re = num(args, 0, "complex")?.to_f64();

@@ -216,9 +216,12 @@ fn run_parallel(
     let shared = Mutex::new((mem, subject));
     // v0.6.51 (G1): los workers son de la corrida del llamador (su techo de serve, su mTLS).
     let run = synsema_core::run_scope::current();
+    // v0.6.57 (ítem 5): los workers se reparten el tope de hilos de `matmul` del llamador.
+    let mm_cap = (synsema_core::matkernel::thread_cap() / threads).max(1);
 
     let ran = scope.run(threads, INTERP_STACK_SIZE, |ctx, _t| {
         let _run = run.as_ref().map(|r| r.enter());
+        synsema_core::matkernel::set_local_thread_cap(mm_cap);
         let (mem, subject) = {
             let g = shared.lock().unwrap();
             (g.0.clone(), g.1.clone())

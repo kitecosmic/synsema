@@ -2636,6 +2636,10 @@ fn interp_pool() -> &'static InterpreterPool {
             .and_then(|s| s.trim().parse::<usize>().ok())
             .unwrap_or(DEFAULT_MAX_WAITING)
             .min(4096);
+        // v0.6.57 (ítem 5): sin `SYNSEMA_THREADS`, cada worker puede usar `núcleos / workers` hilos
+        // en `matmul`: varias requests con un `matmul` grande no se reparten la máquina de más.
+        let cores = synsema_core::matkernel::logical_cores();
+        synsema_core::matkernel::set_host_thread_cap((cores / workers).max(1));
         InterpreterPool::new(workers, max_waiting)
     })
 }

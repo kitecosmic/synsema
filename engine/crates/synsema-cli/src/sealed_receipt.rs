@@ -489,6 +489,11 @@ pub fn install_replay(path: &str, source: &str, filename: &str, any_program: boo
     if other_program {
         eprintln!("synsema run --replay: warning: this is not the program of the receipt (--replay-any-program); the result is not a verification");
     }
+    // v0.6.57 (ítem 4, N2): dónde corrió y dónde corre, al preparar y no en el veredicto: una diferencia
+    // de bits fuera de la promesa cambia el flujo y el replay falla, y ahí es donde el aviso importa.
+    for line in compute_notes(opened.pointer("/header/compute"), &synsema_stdlib::receipt::compute_json()) {
+        eprintln!("synsema run --replay: {}", line);
+    }
     let _ = REPLAY_INFO.set(ReplayInfo { other_program, clock_truncated: clock_cut > 0 });
     let size = opened.pointer("/header/sealed_bytes").and_then(|v| v.as_u64()).unwrap_or(sealed::DEFAULT_SEALED_BYTES as u64) as usize;
     let mut log = synsema_core::sealed::RunLog::new(size);
@@ -497,6 +502,51 @@ pub fn install_replay(path: &str, source: &str, filename: &str, any_program: boo
     log.replay_inputs = Some((inputs, 0));
     synsema_core::sealed::install_process(Some(std::sync::Arc::new(std::sync::Mutex::new(log))));
     Ok(())
+}
+
+/// v0.6.57 (ítem 4): lo que dice el replay sobre dónde corrió el recibo (`recorded`, su
+/// `header.compute`) y dónde corre (`here`). Nunca falla: la promesa dice qué influye y qué no
+/// (specs/v0.6.57-recibo-compute.md, filas 10–13).
+/// - sin `compute` grabado (recibo viejo): nada;
+/// - alguno con `matmul_bitwise` distinto de `true`, sean iguales o no (dos ARM iguales dan bits
+///   distintos): el aviso de que `matmul` está fuera de la promesa;
+/// - los dos `true` y otro `isa`/`cores`/`threads`: una nota (dan los mismos bits);
+/// - otro `os`: el aviso de la libm del sistema (fuera de la promesa en todos lados).
+pub fn compute_notes(recorded: Option<&serde_json::Value>, here: &serde_json::Value) -> Vec<String> {
+    let Some(rec) = recorded.filter(|v| v.is_object()) else {
+        return Vec::new();
+    };
+    let s = |v: &serde_json::Value, k: &str| match v.get(k) {
+        Some(serde_json::Value::String(t)) => t.clone(),
+        Some(serde_json::Value::Number(n)) => n.to_string(),
+        _ => "?".to_string(),
+    };
+    let bitwise = |v: &serde_json::Value| v.get("matmul_bitwise").and_then(|b| b.as_bool()).unwrap_or(false);
+    let place = |v: &serde_json::Value| {
+        format!("{}/{} {}, {} cores, {} threads", s(v, "os"), s(v, "arch"), s(v, "isa"), s(v, "cores"), s(v, "threads"))
+    };
+    let mut out = Vec::new();
+    if !bitwise(rec) || !bitwise(here) {
+        out.push(format!(
+            "warning: recorded on {}; replayed on {}: outside the bitwise promise of matmul (x86-64 with AVX2+FMA or AVX-512), results that depend on matmul may differ in the last bits, and so may what the program reads",
+            place(rec),
+            place(here)
+        ));
+    } else if ["isa", "cores", "threads"].iter().any(|k| s(rec, k) != s(here, k)) {
+        out.push(format!(
+            "note: recorded on {}; replayed on {}; matmul gives the same bits on both",
+            place(rec),
+            place(here)
+        ));
+    }
+    if s(rec, "os") != s(here, "os") {
+        out.push(format!(
+            "warning: exp, ln, sin, tanh and the rest of libm come from the system and may differ in the last bit between {} and {}",
+            s(rec, "os"),
+            s(here, "os")
+        ));
+    }
+    out
 }
 
 /// El veredicto de un `--replay` al terminar: `Ok(resumen)` si leyó exactamente lo grabado.
@@ -537,4 +587,70 @@ pub fn replay_verdict(run_failed: bool, exit_code: Option<i32>) -> Result<String
         format!("the same {} clock reading{}", clock_recorded, if clock_recorded == 1 { "" } else { "s" })
     };
     Ok(format!("replay: the {} inputs match the recorded run (same seed, {}){}", recorded, clock, other))
+}
+
+#[cfg(test)]
+mod compute_notes_tests {
+    use super::compute_notes;
+    use serde_json::json;
+
+    fn x86(os: &str, isa: &str, threads: u64) -> serde_json::Value {
+        json!({"device": "cpu", "os": os, "arch": "x86_64", "isa": isa, "cores": 12, "threads": threads, "matmul_bitwise": isa != "scalar"})
+    }
+    fn arm() -> serde_json::Value {
+        json!({"device": "cpu", "os": "linux", "arch": "aarch64", "isa": "neon+fma", "cores": 4, "threads": 4, "matmul_bitwise": false})
+    }
+
+    #[test]
+    fn same_place_inside_the_promise_says_nothing() {
+        // Fila 10.
+        assert!(compute_notes(Some(&x86("linux", "avx2+fma", 12)), &x86("linux", "avx2+fma", 12)).is_empty());
+    }
+
+    #[test]
+    fn other_threads_inside_the_promise_is_a_note() {
+        // Fila 11: avx2 → avx512 y otros hilos, los dos dentro de la promesa.
+        let n = compute_notes(Some(&x86("linux", "avx2+fma", 12)), &x86("linux", "avx512f+fma", 4));
+        assert_eq!(n.len(), 1, "{:?}", n);
+        assert!(n[0].starts_with("note: recorded on linux/x86_64 avx2+fma, 12 cores, 12 threads; replayed on linux/x86_64 avx512f+fma, 12 cores, 4 threads; matmul gives the same bits on both"), "{}", n[0]);
+    }
+
+    #[test]
+    fn outside_the_promise_always_warns_even_when_identical() {
+        // Fila 12: x86 → ARM.
+        let n = compute_notes(Some(&x86("linux", "avx2+fma", 12)), &arm());
+        assert_eq!(n.len(), 1, "{:?}", n);
+        assert!(n[0].starts_with("warning: recorded on linux/x86_64 avx2+fma"), "{}", n[0]);
+        assert!(n[0].contains("outside the bitwise promise of matmul"), "{}", n[0]);
+        // Fila 12b (N3): ARM → ARM idénticos también avisa.
+        let n = compute_notes(Some(&arm()), &arm());
+        assert_eq!(n.len(), 1, "{:?}", n);
+        assert!(n[0].contains("outside the bitwise promise of matmul"), "{}", n[0]);
+        // x86 sin V3 en los dos.
+        let n = compute_notes(Some(&x86("linux", "scalar", 4)), &x86("linux", "scalar", 4));
+        assert!(n[0].contains("outside the bitwise promise of matmul"), "{:?}", n);
+    }
+
+    #[test]
+    fn another_os_warns_of_libm() {
+        // Fila 12c (N1): Windows → Linux, los dos con la promesa de matmul.
+        let n = compute_notes(Some(&x86("windows", "avx2+fma", 12)), &x86("linux", "avx2+fma", 12));
+        assert_eq!(n.len(), 1, "{:?}", n);
+        assert_eq!(n[0], "warning: exp, ln, sin, tanh and the rest of libm come from the system and may differ in the last bit between windows and linux");
+        // Con otros hilos también: la nota y el aviso.
+        let n = compute_notes(Some(&x86("windows", "avx2+fma", 12)), &x86("linux", "avx2+fma", 2));
+        assert_eq!(n.len(), 2, "{:?}", n);
+    }
+
+    #[test]
+    fn an_old_receipt_says_nothing_and_a_missing_flag_is_false() {
+        // Fila 13.
+        assert!(compute_notes(None, &arm()).is_empty());
+        assert!(compute_notes(Some(&serde_json::Value::Null), &arm()).is_empty());
+        // `compute` sin `matmul_bitwise` (editado o de otro motor): cuenta como false.
+        let mut r = x86("linux", "avx2+fma", 12);
+        r.as_object_mut().unwrap().remove("matmul_bitwise");
+        let n = compute_notes(Some(&r), &x86("linux", "avx2+fma", 12));
+        assert!(n[0].contains("outside the bitwise promise"), "{:?}", n);
+    }
 }

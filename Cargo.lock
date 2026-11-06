@@ -3077,6 +3077,7 @@ dependencies = [
  "num-complex",
  "num-integer",
  "num-traits",
+ "pulp",
  "regex",
  "rust_decimal",
  "rustc-hash",

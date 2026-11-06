@@ -12,9 +12,8 @@ use crate::synlist::{list_values};
 use crate::types::SynMap;
 use ndarray::{ArrayD, Axis, IxDyn};
 
-use faer::linalg::matmul::matmul as faer_matmul_into;
 use faer::linalg::solvers::{DenseSolveCore, Solve};
-use faer::{Accum, Mat, Par};
+use faer::Mat;
 
 
 use crate::interpreter::{Control, RuntimeError};
@@ -1223,20 +1222,18 @@ fn faer_to_nd(m: &Mat<f64>) -> ArrayD<f64> {
     ArrayD::from_shape_fn(IxDyn(&[r, c]), |idx| m[(idx[0], idx[1])])
 }
 
-fn faer_mul(a: &Mat<f64>, b: &Mat<f64>) -> Mat<f64> {
-    let mut c = Mat::<f64>::zeros(a.nrows(), b.ncols());
-    faer_matmul_into(c.as_mut(), Accum::Replace, a.as_ref(), b.as_ref(), 1.0, Par::Seq);
-    c
-}
-
-/// v0.6.56 (F7): el producto de dos matrices `f32` en `f32`, con faer (sgemm).
-pub fn matmul_f32_2d(a: ndarray::ArrayView2<f32>, b: ndarray::ArrayView2<f32>) -> ArrayD<f32> {
-    let (m, k, p) = (a.nrows(), a.ncols(), b.ncols());
-    let fa = Mat::<f32>::from_fn(m, k, |i, j| a[[i, j]]);
-    let fb = Mat::<f32>::from_fn(k, p, |i, j| b[[i, j]]);
-    let mut c = Mat::<f32>::zeros(m, p);
-    faer_matmul_into(c.as_mut(), Accum::Replace, fa.as_ref(), fb.as_ref(), 1.0f32, Par::Seq);
-    ArrayD::from_shape_fn(IxDyn(&[m, p]), |idx| c[(idx[0], idx[1])])
+/// v0.6.57: el producto 2-D en el tipo del array (`f64` o `f32`, F7 de 0.6.56), en el orden escrito de
+/// `matkernel`, con hasta `threads` hilos (los bits no dependen de cuántos).
+pub fn matmul_2d<T: crate::matkernel::Elem>(
+    a: ndarray::ArrayView2<T>,
+    b: ndarray::ArrayView2<T>,
+    threads: usize,
+) -> ArrayD<T> {
+    let (m, k, n) = (a.nrows(), a.ncols(), b.ncols());
+    let (a, b) = (a.as_standard_layout(), b.as_standard_layout());
+    let (sa, sb) = (a.as_slice().expect("layout C"), b.as_slice().expect("layout C"));
+    let out = crate::matkernel::matmul_rm(sa, sb, m, k, n, threads);
+    ArrayD::from_shape_vec(IxDyn(&[m, n]), out).expect("forma m×n")
 }
 
 fn all_finite(m: &Mat<f64>) -> bool {
@@ -1262,20 +1259,24 @@ pub fn matmul(args: &[SynValue]) -> Result<SynValue, Control> {
             )));
         }
         let (a32, b32) = (f32::of_nd(a), f32::of_nd(b));
-        return Ok(syn_array32(matmul_f32_2d(view2(&a32), view2(&b32))));
+        let threads = crate::matkernel::thread_cap();
+        return Ok(syn_array32(matmul_2d(view2(&a32), view2(&b32), threads)));
     }
     let a = array_arg(args, 0, "matmul")?;
     let b = array_arg(args, 1, "matmul")?;
-    let fa = nd_to_faer(&a, "matmul")?;
-    let fb = nd_to_faer(&b, "matmul")?;
-    if fa.ncols() != fb.nrows() {
+    for x in [&a, &b] {
+        if x.ndim() != 2 {
+            return Err(err(format!("matmul: expected a 2D array (matrix), got {}-D", x.ndim())));
+        }
+    }
+    if a.shape()[1] != b.shape()[0] {
         return Err(err(format!(
             "matmul: incompatible shapes {:?} and {:?} (cols of A must equal rows of B)",
             a.shape(),
             b.shape()
         )));
     }
-    Ok(syn_array(faer_to_nd(&faer_mul(&fa, &fb))))
+    Ok(syn_array(matmul_2d(view2(&a), view2(&b), crate::matkernel::thread_cap())))
 }
 
 /// La vista 2-D de un array que ya se verificó 2-D.
@@ -1287,34 +1288,44 @@ pub fn view2<T>(x: &ArrayD<T>) -> ndarray::ArrayView2<'_, T> {
 pub fn dot(args: &[SynValue]) -> Result<SynValue, Control> {
     arity(args, 2, "dot")?;
     let k = out_num("dot", &[&args[0], &args[1]])?;
-    let a = array_arg(args, 0, "dot")?;
-    let b = array_arg(args, 1, "dot")?;
-    if a.ndim() == 1 && b.ndim() == 1 {
-        if a.len() != b.len() {
+    let (na, nb) = (nd_arg(args, 0, "dot")?, nd_arg(args, 1, "dot")?);
+    if na.ndim() == 1 && nb.ndim() == 1 {
+        if na.len() != nb.len() {
             return Err(err(format!(
                 "dot: vectors of different length ({} and {})",
-                a.len(),
-                b.len()
+                na.len(),
+                nb.len()
             )));
         }
-        // F6: acumulado en `f64`, redondeado una vez si entró un `f32`.
-        // Desde `0.0` como BLAS y numpy: la `Sum` de Rust arranca en `-0.0` y dos vectores vacíos
-        // daban `-0.0` (ronda 1, M2).
-        let s: f64 = a.iter().zip(b.iter()).fold(0.0, |s, (x, y)| s + x * y);
+        // v0.6.57: el orden escrito de `matkernel::dot_*` (16 carriles, árbol fijo, sin FMA): los
+        // mismos bits en toda plataforma. F6: acumulado en `f64`, redondeado una vez si entró un
+        // `f32`. Desde `+0.0` como BLAS y numpy (dos vectores vacíos dan `0`, ronda 1 de 0.6.56, M2).
+        let s = match k {
+            Num::F32 => {
+                let (a, b) = (f32::of_nd(na), f32::of_nd(nb));
+                let (a, b) = (a.as_standard_layout(), b.as_standard_layout());
+                crate::matkernel::dot_f32(a.as_slice().expect("layout C"), b.as_slice().expect("layout C"))
+            }
+            Num::F64 => {
+                let (a, b) = (na.numbers_f64(), nb.numbers_f64());
+                let (a, b) = (a.as_standard_layout(), b.as_standard_layout());
+                crate::matkernel::dot_f64(a.as_slice().expect("layout C"), b.as_slice().expect("layout C"))
+            }
+        };
         return Ok(k.number(s));
     }
     // v0.6.29 (DATOS-10): un nombre por concepto — `dot` es el producto interno de VECTORES;
     // el producto de matrices es `matmul` (en numpy `dot` hace las dos cosas y confunde).
     // Una matriz con un vector (`np.dot(M, v)`): la forma Synsema, con el largo del vector.
-    let hint = match (a.ndim(), b.ndim()) {
-        (2, 1) => format!("for a matrix times a vector: matmul(M, reshape(v, [{}, 1]))", b.len()),
-        (1, 2) => format!("for a vector times a matrix: matmul(reshape(v, [1, {}]), M)", a.len()),
+    let hint = match (na.ndim(), nb.ndim()) {
+        (2, 1) => format!("for a matrix times a vector: matmul(M, reshape(v, [{}, 1]))", nb.len()),
+        (1, 2) => format!("for a vector times a matrix: matmul(reshape(v, [1, {}]), M)", na.len()),
         _ => "for matrices use matmul(a, b)".to_string(),
     };
     Err(err(format!(
         "dot is the inner product of two 1-D vectors (got {}-D and {}-D) — {}",
-        a.ndim(),
-        b.ndim(),
+        na.ndim(),
+        nb.ndim(),
         hint
     )))
 }

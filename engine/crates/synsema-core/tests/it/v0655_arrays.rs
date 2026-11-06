@@ -620,10 +620,11 @@ print(conj({z}))")),
     );
     assert_eq!(close(&format!("arg(array([-1, 0, 2]))"), "[3.141592653589793, 0.0, 0.0]"), "true");
     assert_eq!(both(&format!("print(is_nan(arg({z})))")), "[false, false, false, true]");
-    assert_eq!(
-        both("print(complex(array([1]), 2))"),
-        "ERR: complex: arrays hold f64 or bool, not complex numbers — keep the real and imaginary parts as two arrays"
-    );
+    // v0.6.57: desde 0.6.56 un array también puede ser `f32`, y el texto lo nombra.
+    let complex_err =
+        "ERR: complex: arrays hold f64, f32 or bool, not complex numbers — keep the real and imaginary parts as two arrays";
+    assert_eq!(both("print(complex(array([1]), 2))"), complex_err);
+    assert_eq!(both("print(complex(array([1.0], dtype = \"f32\"), 0))"), complex_err);
 }
 
 /// El cierre de la lista (diseño §3.4): ningún builtin numérico de `math.rs` responde

@@ -289,8 +289,9 @@ fn permutation(v: &SynValue, n: usize) -> Result<Vec<usize>, Control> {
 // =========================================================
 
 /// `matmul(a, b)`: el 2-D es el del núcleo; con más ejes, un producto por lote, y los ejes de lote
-/// hacen broadcasting como numpy (`[1, 3, 4]` con `[7, 4, 5]` da `[7, 3, 5]`). `Par::Seq` (el
-/// paralelismo es de 0.6.56).
+/// hacen broadcasting como numpy (`[1, 3, 4]` con `[7, 4, 5]` da `[7, 3, 5]`). v0.6.57: cada producto en
+/// el orden escrito de `synsema_core::matkernel`; con varios lotes, los lotes se reparten entre hilos
+/// (cada producto en un hilo), así que los bits no dependen de cuántos hilos haya.
 pub fn matmul(args: &[SynValue]) -> Result<SynValue, Control> {
     arity(args, 2, "matmul")?;
     let (SynValue::Array(a), SynValue::Array(b)) = (&args[0], &args[1]) else {
@@ -307,32 +308,6 @@ pub fn matmul(args: &[SynValue]) -> Result<SynValue, Control> {
         let (a, b) = (T::of_nd(a), T::of_nd(b));
         batched_matmul::<T>(&a, &b)
     })
-}
-
-/// El producto 2-D de un lote, en el tipo del lote (faer en `f64` o en `f32`).
-trait Gemm: Real {
-    fn gemm(a: ndarray::ArrayView2<Self>, b: ndarray::ArrayView2<Self>, out: &mut Vec<Self>);
-}
-
-impl Gemm for f64 {
-    fn gemm(sa: ndarray::ArrayView2<f64>, sb: ndarray::ArrayView2<f64>, out: &mut Vec<f64>) {
-        let (m, k, p) = (sa.nrows(), sa.ncols(), sb.ncols());
-        let fa = faer::Mat::<f64>::from_fn(m, k, |i, j| sa[[i, j]]);
-        let fb = faer::Mat::<f64>::from_fn(k, p, |i, j| sb[[i, j]]);
-        let mut c = faer::Mat::<f64>::zeros(m, p);
-        faer::linalg::matmul::matmul(c.as_mut(), faer::Accum::Replace, fa.as_ref(), fb.as_ref(), 1.0, faer::Par::Seq);
-        for i in 0..m {
-            for j in 0..p {
-                out.push(c[(i, j)]);
-            }
-        }
-    }
-}
-
-impl Gemm for f32 {
-    fn gemm(sa: ndarray::ArrayView2<f32>, sb: ndarray::ArrayView2<f32>, out: &mut Vec<f32>) {
-        out.extend(synsema_core::arrays::matmul_f32_2d(sa, sb).iter().copied());
-    }
 }
 
 /// `matmul` con un vector (N3 de la auditoría de v0.6.55): numpy lo acepta y quita el eje; acá la
@@ -355,7 +330,7 @@ fn matmul_vector_error(a: &[usize], b: &[usize]) -> Control {
 }
 
 #[inline(never)]
-fn batched_matmul<T: Gemm>(a: &ArrayD<T>, b: &ArrayD<T>) -> Result<SynValue, Control> {
+fn batched_matmul<T: Real + synsema_core::matkernel::Elem>(a: &ArrayD<T>, b: &ArrayD<T>) -> Result<SynValue, Control> {
     let (na, nb) = (a.ndim(), b.ndim());
     let (m, k) = (a.shape()[na - 2], a.shape()[na - 1]);
     let (k2, p) = (b.shape()[nb - 2], b.shape()[nb - 1]);
@@ -376,7 +351,7 @@ fn batched_matmul<T: Gemm>(a: &ArrayD<T>, b: &ArrayD<T>) -> Result<SynValue, Con
     let with = |x: usize, y: usize| batch.iter().copied().chain([x, y]).collect::<Vec<_>>();
     let av = bview(a, &with(m, k));
     let bv = bview(b, &with(k, p));
-    let mut out: Vec<T> = Vec::with_capacity(batch.iter().product::<usize>() * m * p);
+    let mut pairs = Vec::with_capacity(batch.iter().product::<usize>());
     for idx in ndarray::indices(IxDyn(&batch)) {
         let (mut sa, mut sb) = (av.view(), bv.view());
         for &i in idx.slice() {
@@ -384,7 +359,33 @@ fn batched_matmul<T: Gemm>(a: &ArrayD<T>, b: &ArrayD<T>) -> Result<SynValue, Con
             sb = sb.index_axis_move(ndarray::Axis(0), i);
         }
         let (sa, sb) = (sa.into_dimensionality::<ndarray::Ix2>(), sb.into_dimensionality::<ndarray::Ix2>());
-        T::gemm(sa.expect("2-D del lote"), sb.expect("2-D del lote"), &mut out);
+        pairs.push((sa.expect("2-D del lote"), sb.expect("2-D del lote")));
+    }
+    let per = m * p;
+    let mut out: Vec<T> = vec![<T as synsema_core::matkernel::Elem>::ZERO; pairs.len() * per];
+    let cap = synsema_core::matkernel::thread_cap();
+    let t = synsema_core::matkernel::batch_threads::<T>(pairs.len(), m * k * p, cap);
+    // En wasm el `else` no tiene cuerpo (no hay hilos): el camino de un hilo se elige acá mismo y no
+    // depende de que `batch_threads` devuelva 1 (si no, el lote saldría en ceros sin error).
+    if t <= 1 || cfg!(target_family = "wasm") {
+        for ((sa, sb), o) in pairs.iter().zip(out.chunks_mut(per.max(1))) {
+            o.copy_from_slice(synsema_core::arrays::matmul_2d(sa.view(), sb.view(), cap).as_slice().expect("layout C"));
+        }
+    } else {
+        #[cfg(not(target_family = "wasm"))]
+        {
+            let chunk = pairs.len().div_ceil(t);
+            std::thread::scope(|s| {
+                for (ps, os) in pairs.chunks(chunk).zip(out.chunks_mut(chunk * per)) {
+                    s.spawn(move || {
+                        for ((sa, sb), o) in ps.iter().zip(os.chunks_mut(per)) {
+                            let c = synsema_core::arrays::matmul_2d(sa.view(), sb.view(), 1);
+                            o.copy_from_slice(c.as_slice().expect("layout C"));
+                        }
+                    });
+                }
+            });
+        }
     }
     Ok(T::wrap(ArrayD::from_shape_vec(IxDyn(&with(m, p)), out).expect("forma del lote")))
 }

@@ -11,3 +11,4 @@ mod mtls_handshake;
 mod openapi_golden;
 mod tls_integration;
 mod v0642_trust_proxy;
+mod v0657_batched;

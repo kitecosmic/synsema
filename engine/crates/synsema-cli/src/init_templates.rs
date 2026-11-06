@@ -270,6 +270,11 @@ pub const ENV_EXAMPLE: &str = r#"# Config del proyecto — Synsema auto-carga el
 # cola. Los extra se retiran apenas se vacia la cola. 0 = sin hilos extra (default 256):
 # SYNSEMA_SERVE_MAX_WAITING=256
 
+# Hilos de `matmul` (default: los nucleos de la maquina; bajo `serve`, nucleos / workers;
+# en `parallel_map` cada worker usa su parte). Los hilos no cambian los bits del resultado
+# en x86-64 con AVX2+FMA o AVX-512. Vale tambien fuera de `serve` (run, test, cron):
+# SYNSEMA_THREADS=4
+
 # Certificados automaticos (tls auto): tope de emisiones por hora (un `domain ask`
 # permisivo no puede quemar la cuota de la CA) y segundos de espera a que el TXT de
 # DNS-01 (`tls dns <task>`) se propague antes de pedir la validacion:
@@ -443,6 +448,8 @@ const HELLO_SYN_PAST: &[&str] = &[
 
 /// sha256 de cada contenido histórico de `.env.example` (ver `InitFile::past`).
 const ENV_EXAMPLE_PAST: &[&str] = &[
+    // v0.6.56: antes de SYNSEMA_THREADS (los hilos de matmul).
+    "3a58c25468c58751c0591fc39b1f2237ebd99cbc6869a6e1eff11decfb446e76",
     // v0.6.52: antes de SYNSEMA_REUSE_PORT (el traspaso sin corte).
     "ec3524a98aaae12f54cf4857dbb5e3ddbf3cac7fe5e79f33921fe37c38b55163",
     // v0.6.50: el skill se instalaba con `install-skill.sh` (sólo ~/.claude/skills).
@@ -1451,6 +1458,7 @@ mod tests {
             .chain(synsema_runtime::judge_provider::JUDGE_ENV_VARS.iter())
             .chain(crate::audit::HOST_ENV_VARS.iter())
             .chain(crate::sealed_receipt::RECEIPT_ENV_VARS.iter())
+            .chain(synsema_core::matkernel::COMPUTE_ENV_VARS.iter())
             .copied()
             .collect();
         let mentioned = mentioned_vars(ENV_EXAMPLE);

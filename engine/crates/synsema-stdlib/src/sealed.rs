@@ -392,6 +392,8 @@ pub fn build_receipt(log: &RunLog, ctx: &ReceiptContext<'_>) -> Result<Value, St
         "v": 1,
         "suite": SUITE,
         "engine": crate::attest::engine_version(),
+        // v0.6.57 (ítem 4): dónde corrió (público y firmado; en el AAD como el resto del header).
+        "compute": crate::receipt::compute_json(),
         "program_sha": ctx.program_sha,
         "config_sha": ctx.config_sha,
         "trusted": ctx.trusted,

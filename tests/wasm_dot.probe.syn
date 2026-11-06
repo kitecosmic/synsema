@@ -1,0 +1,10 @@
+-- v0.6.57: `dot` da los mismos bits en toda plataforma (16 carriles, sin FMA, árbol fijo).
+-- El CI la corre bajo wasmtime y compara con los valores de x86; el test de Rust
+-- `dot_fingerprint` cubre x86, ARM y macOS.
+let n be 4099
+let a be arange(0, n) * 0.37 - 700.3
+let b be arange(0, n) * -0.011 + 3.3
+print("dot_f64=" + text(dot(a, b)))
+print("dot_f32=" + text(dot(astype(a, "f32"), astype(b, "f32"))))
+let c be arange(0, 31) * 1e-3 + 1
+print("dot_tail=" + text(dot(c, c * 7.1)))
