@@ -106,6 +106,7 @@ see [secrets.md](secrets.md). Resolution: **process environment → `.env` file 
   | `SYNSEMA_ACME_DNS_WAIT` | `20` | v0.6.42+: seconds to wait for the DNS-01 TXT record (`tls dns`) to propagate |
   | `SYNSEMA_ACME_DIRECTORY` / `SYNSEMA_ACME_CA` | Let's Encrypt | another ACME directory (staging, your own CA) and the PEM of the CA that serves it |
   | `SYNSEMA_ACME_HTTP_PORT` | `80` | port of the HTTP-01 challenge listener (change it only if you forward external :80 to it) |
+  | `SYNSEMA_THREADS` | #cores | v0.6.57+: threads of `matmul`; under `serve` each worker gets `cores / workers` unless set; the bits do not change (builtins.md § Threads, and what repeats bit for bit) |
   | `SYNSEMA_SHUTDOWN_GRACE` | `10` | seconds to drain in-flight requests on SIGINT/SIGTERM; `0` = immediate |
   | `SYNSEMA_SSE_KEEPALIVE` | `15` | idle seconds before a `: keepalive` SSE comment; `0` off |
   | `SYNSEMA_WS_SERVER_PING` | `30` | server ping interval on `socket` routes; no pong in 2 intervals → `close`; `0` off |

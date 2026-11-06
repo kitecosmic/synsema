@@ -410,7 +410,9 @@ and an `encoding` that says which bytes those were (`"text"`, `"bytes"`, `"jcs"`
 v0.6.56+ — `"ndarray"` for a value with arrays, each hashed as `{dtype, shape, data}`; recipe in
 builtins.md § lineage), so a verifier can recompute every hash.
 `lineage()` returns that list; `receipt()` carries it as `credentialSubject.inputs` next to
-`program_sha`, `engine`, the capability audit and `declared_result_sha256` — and, v0.6.46+,
+`program_sha`, `engine`, `compute` (v0.6.57+: where it ran — os, arch, isa, cores, thread cap and
+`matmul_bitwise`; builtins.md § Threads, and what repeats bit for bit), the capability audit and
+`declared_result_sha256` — and, v0.6.46+,
 `credentialSubject.outputs`: every file the run wrote (`write_file`/`append_file`/`edit_file`/
 `zip_extract`/`tar_extract`, path + sha256; [observability.md](observability.md) § Outputs). Signed,
 one document then says: *this measured code read these inputs, wrote these files and declared this

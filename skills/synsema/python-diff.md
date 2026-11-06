@@ -117,6 +117,8 @@ rows. Full pipeline: [dataviz.md](dataviz.md) § Data analysis; contracts: [buil
 | `np.nanmean(xs)` / `df.mean()` (skips NaN) | `mean(xs)` skips **`nothing`** | NaN propagates in Synsema — `fill_nan` or `where(xs, is_finite)` first |
 | `np.percentile(xs, 90)` / `np.quantile(xs, 0.9)` | `percentile(xs, 90)` / `quantile(xs, 0.9)` | same interpolation (linear) |
 | `np.dot(A, B)` (matrices) / `A @ B` | `matmul(A, B)` | `dot` is 1-D vectors only |
+| `A @ B` gives other last bits with other BLAS threads / another machine | `matmul(A, B)`: every core, the same bits with any number of threads; bit for bit across x86-64 with AVX2+FMA or AVX-512 | v0.6.57+; `receipt().credentialSubject.compute.matmul_bitwise` says if it applies; `dot` is the same on every platform |
+| `OMP_NUM_THREADS=4` / `OPENBLAS_NUM_THREADS=4` | `SYNSEMA_THREADS=4` | v0.6.57+; process environment, not `.env` |
 | `np.eye(n)` | `identity(n)` | `eye` is a deprecated alias |
 | `a > 2` (a bool array) / `a[a > 2]` | `a > 2` (a mask, v0.6.55+) / `where(a, a > 2)` | `a[m]` is an error that names `where(a, m)` |
 | `np.where(c, x, y)` | `if_else(c, x, y)` | `where(a, m)` is the filter, `if_else` the three-argument form |

@@ -2,7 +2,8 @@
 
 Read this FIRST if something fails. Each row is a real mistake that costs hours to debug.
 
-> **Just upgraded and something that worked now fails?** Start at *Upgrading to v0.6.56*
+> **Just upgraded and something that worked now fails?** Start at *Upgrading to v0.6.57*
+> (the last bits of `dot`, `compute` in the receipt), then *v0.6.56*
 > (`array_from_bytes(b, "f32")` gives an `f32` array, the lineage of arrays), then *v0.6.55* (`==` and
 > the truth of arrays), then *Upgrading to v0.6.54* (an
 > unknown `run_program` option, a non-ASCII host in WebAssembly), then *Upgrading to v0.6.53* (gates in
@@ -21,6 +22,17 @@ Read this FIRST if something fails. Each row is a real mistake that costs hours 
 > Behavioral surprises · Anti-patterns · Secrets & config
 > Coming from Python? The traps that LOOK like Python but aren't are also collected in
 > [python-diff.md](python-diff.md).
+
+## Upgrading to v0.6.57 — what behaves differently
+
+| You see | What changed | What to write |
+|---|---|---|
+| `dot(x, y)` differs from v0.6.56 in the last bits (`dot` of `[1e16, 1, 0, …, -1e16 at index 16, 0, …]` with `ones(32)` was `0.0`, now `1.0`) | **breaking:** `dot` adds in 16 lanes with a fixed tree, without FMA — the same bits on every platform (before: in order) | nothing; compare floats with a tolerance across versions (builtins.md § Threads, and what repeats bit for bit) |
+| `matmul(A, x)` with `x` of shape `[k, 1]` and `k > 512` differs in the last bits | **breaking:** a matrix by one column follows the written order (blocks of 512); v0.6.56 added the whole `k` in one chain | nothing; it now matches matrix × matrix |
+| the receipt of the same program has another hash on another machine, also with `--deterministic` | `credentialSubject.compute` (and the sealed `header.compute`) says where it ran: os, arch, isa, cores, thread cap, `matmul_bitwise` | compare `program_sha`, `declared_result_sha256`, `inputs`, `outputs` |
+| `synsema run --replay: warning: recorded on …; replayed on …: outside the bitwise promise of matmul …` / `… note: … matmul gives the same bits on both` / `… libm come from the system …` | `--replay` compares the receipt's `compute` with this machine before running; it never changes the verdict | nothing; on a difference it explains why bits may differ |
+| `warning: SYNSEMA_THREADS="abc" is not a whole number >= 1; ignored (matmul uses the default)` | new knob: the threads of `matmul` (process environment, not `.env`) | `SYNSEMA_THREADS=4` |
+| `matmul` is faster and uses every core | the output is split between threads, the bits do not change | `SYNSEMA_THREADS=1` to keep it on one core |
 
 ## Upgrading to v0.6.56 — what behaves differently
 
