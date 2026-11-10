@@ -131,6 +131,7 @@ async fn run_task<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static, tim
     let f = synsema_core::run_scope::carry(f);
     let (tx, rx) = tokio::sync::oneshot::channel();
     let spawned = std::thread::Builder::new().name("acme-task".to_string()).stack_size(TASK_STACK).spawn(move || {
+        synsema_core::stack::enter_thread(TASK_STACK);
         let _ = tx.send(f());
     });
     if spawned.is_err() {

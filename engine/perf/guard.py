@@ -81,11 +81,21 @@ def measure_env():
 
 
 def measure(binary, prog, mode):
+    # v0.6.58 (B3 de la ronda 1): un programa también puede ser una carpeta `progs/<nombre>/` con su
+    # `main.syn`, su `synsema.json` y el caché de sus paquetes (`cache/`, relativo a la raíz del
+    # proyecto, así el entorno no lleva la ruta del checkout): un programa que usa paquetes.
+    folder = os.path.join(PROGS, prog)
+    env = measure_env()
+    if os.path.isdir(folder):
+        cwd, entry = folder, "main.syn"
+        env["SYNSEMA_MODULE_CACHE"] = "cache"
+    else:
+        cwd, entry = PROGS, prog + ".syn"
     with tempfile.TemporaryDirectory() as tmp:
         out = os.path.join(tmp, "cg.out")
         cmd = ["valgrind", "--tool=cachegrind", "--cache-sim=no", f"--cachegrind-out-file={out}",
-               binary, *MODES[mode], prog + ".syn"]
-        r = subprocess.run(cmd, cwd=PROGS, capture_output=True, text=True, env=measure_env())
+               binary, *MODES[mode], entry]
+        r = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, env=env)
         if r.returncode != 0 or not os.path.exists(out):
             raise SystemExit(f"{prog} ({mode}) falló (código {r.returncode}):\n{r.stdout}\n{r.stderr}")
         # `run` escribe su tiempo (`[12.3 ms]`) por stderr; cualquier otra línea es un error.
@@ -147,7 +157,10 @@ def main():
     if not a.bin:
         ap.error("--bin es obligatorio (salvo con --bless-from)")
     binary = os.path.abspath(a.bin)
-    progs = sorted(f[:-4] for f in os.listdir(PROGS) if f.endswith(".syn"))
+    progs = sorted(
+        [f[:-4] for f in os.listdir(PROGS) if f.endswith(".syn")]
+        + [d for d in os.listdir(PROGS) if os.path.isfile(os.path.join(PROGS, d, "main.syn"))]
+    )
     if a.only:
         wanted = set(a.only.split(","))
         progs = [p for p in progs if p in wanted]

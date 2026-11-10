@@ -2366,6 +2366,10 @@ pub(crate) fn build(
     // llamada ajena (sin valores: el entorno ya tiene lo suyo y el frame se desarma con el error).
     let mut exec_sites: Vec<ExecSite> = Vec::new();
     let mut exec_ptr_slots: Vec<StackSlot> = Vec::new();
+    // v0.6.58 (ronda 6): los búferes de las llamadas ajenas, compartidos por todos los sitios (cada
+    // uno los escribe, llama y los relee enseguida) y del tamaño del más grande. Uno por sitio hacía el
+    // frame proporcional a sitios × valores vivos (~2 MB con 1000 sitios y 80 valores).
+    let mut exec_bufs: Option<(StackSlot, StackSlot, StackSlot)> = None;
     let mut fail_block: Option<Block> = None;
     // Salida "antes de pc" (una por instrucción) y "después de la llamada en pc".
     let mut before: HashMap<usize, Block> = HashMap::new();
@@ -2818,9 +2822,22 @@ pub(crate) fn build(
                 }
                 let nflush = na as usize + ng as usize;
                 let size = nflush.max(reload.len()).max(1) as u32;
-                let mk = |b: &mut FunctionBuilder| b.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 8 * size, 3));
-                let (ts, bs, ps) = (mk(&mut b), mk(&mut b), mk(&mut b));
-                exec_ptr_slots.push(ps);
+                let (ts, bs, ps) = match exec_bufs {
+                    Some(bufs) => {
+                        for sl in [bufs.0, bufs.1, bufs.2] {
+                            let cur = &mut b.func.sized_stack_slots[sl].size;
+                            *cur = (*cur).max(8 * size);
+                        }
+                        bufs
+                    }
+                    None => {
+                        let mk = |b: &mut FunctionBuilder| b.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 8 * size, 3));
+                        let bufs = (mk(&mut b), mk(&mut b), mk(&mut b));
+                        exec_ptr_slots.push(bufs.2);
+                        exec_bufs = Some(bufs);
+                        bufs
+                    }
+                };
                 let put = |b: &mut FunctionBuilder, k: usize, (t, x, p): (Value, Value, Value)| {
                     b.ins().stack_store(I64, t, ts, 8 * k as i32);
                     b.ins().stack_store(I64, x, bs, 8 * k as i32);
@@ -3320,15 +3337,23 @@ pub(crate) fn build(
         let pi = b.ins().iconst(I64, i64::from(ex.point));
         b.ins().jump(groups[g].block, &[BlockArg::Value(pi)]);
     }
+    // v0.6.58 (B-r5-1): una sola ranura para todas las salidas (sale una por vez y no vuelve), del
+    // tamaño de la más grande. Una por grupo hacía el frame cuadrático en los locales vivos (cada
+    // `let` es otro grupo con un valor más): con 1000, ~4 MB por llamada y la recursión nativa
+    // desbordaba la pila a las ~130 llamadas.
+    let max_stored = groups.iter().map(|g| points[g.point as usize].stored()).max().unwrap_or(0);
+    let max_ptrs = groups.iter().map(|g| points[g.point as usize].ptrs()).max().unwrap_or(0);
+    let shared_slot = (!groups.is_empty()).then(|| b.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, (8 * max_stored.max(1)) as u32, 3)));
+    let shared_pslot = (max_ptrs > 0).then(|| b.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, (8 * max_ptrs) as u32, 3)));
+    ptr_slots.extend(shared_pslot);
     for g in &groups {
         b.switch_to_block(g.block);
         let pi = b.block_params(g.block)[0];
         let p = &points[g.point as usize];
         let (stored, nptr) = (p.stored(), p.ptrs());
-        let slot = b.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, (8 * stored.max(1)) as u32, 3));
-        // La ranura de punteros, sólo si hay (si no, la dirección es 0 y la cuenta también).
-        let pslot = (nptr > 0).then(|| b.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, (8 * nptr) as u32, 3)));
-        ptr_slots.extend(pslot);
+        let slot = shared_slot.expect("hay grupos");
+        // La ranura de punteros, sólo si esta salida tiene (si no, la dirección es 0 y la cuenta también).
+        let pslot = shared_pslot.filter(|_| nptr > 0);
         let (mut k, mut kp) = (0i32, 0i32);
         for ((place, kind), keep) in g.values.iter().zip(&g.keeps) {
             let pv = vs.p[f.var_of(*place)];

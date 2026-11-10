@@ -95,7 +95,8 @@ fn a_second_execute_does_not_lend_the_first_one_names() {
 /// el `execute`.
 #[test]
 fn run_block_after_execute_does_not_lend_the_names() {
-    let d = dir("block", "export task g()\n    give PROG\n");
+    // Carpeta propia: con la de `without_execute_…` (mismo nombre) los dos tests se la borraban en paralelo.
+    let d = dir("block-after", "export task g()\n    give PROG\n");
     let main = d.join("main.syn").to_string_lossy().into_owned();
     let mut interp = Interpreter::new();
     assert!(interp.execute(&parse_source("let PROG be 1\n", &main).unwrap()).is_ok());

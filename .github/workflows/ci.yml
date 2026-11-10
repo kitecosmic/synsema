@@ -301,6 +301,34 @@ jobs:
             $W tests/$f.probe.syn | grep -v '^fetch_error=' > wasm.out
             diff native.out wasm.out
           done
+      # v0.6.58 (§12, W1, W10): un proyecto con un paquete bajo wasmtime. El caché entra sólo por el
+      # knob y `--dir`; sin el knob, el error lo dice aunque haya HOME. El fixture se arma acá (los
+      # `*.json` del repo están en .gitignore): el índice del paquete y su hash de árbol.
+      - name: Project with a package (wasm)
+        run: |
+          set -euo pipefail
+          W=$PWD/engine/target/wasm32-wasip1/wasm/synsema-wasm.wasm
+          d=$(mktemp -d)
+          mkdir -p "$d/proj"
+          printf 'export task cual()\n    give "a package under wasmtime"\n' > "$d/m.syn"
+          m_sha=$(sha256sum "$d/m.syn" | cut -d' ' -f1)
+          printf '{"id": "example.com/tok", "version": "0.1.0", "main": "m.syn", "files": [{"path": "m.syn", "sha256": "%s"}]}' "$m_sha" > "$d/index.json"
+          i_sha=$(sha256sum "$d/index.json" | cut -d' ' -f1)
+          tree=$(printf '%s  m.syn\n%s  synsema.json\n' "$m_sha" "$i_sha" | LC_ALL=C sort | sha256sum | cut -d' ' -f1)
+          pkg="$d/cache/tree-sha256-$tree"
+          mkdir -p "$pkg"
+          cp "$d/m.syn" "$pkg/m.syn"
+          cp "$d/index.json" "$pkg/synsema.json"
+          printf '{"synsema": "0.6.58", "modules": {"tok": {"url": "https://example.com/tok", "id": "example.com/tok", "version": "0.1.0", "hash": "tree-sha256:%s"}}}' "$tree" > "$d/proj/synsema.json"
+          printf 'use "tok" as tok\nprint(tok.cual())\n' > "$d/proj/main.syn"
+          cd "$d/proj"
+          out=$(wasmtime run --dir . --dir "$d/cache::/cache" --env SYNSEMA_MODULE_CACHE=/cache "$W" main.syn)
+          test "$out" = "a package under wasmtime"
+          if wasmtime run --dir . --env HOME=/ "$W" main.syn 2>err.txt; then echo "ran without the cache knob"; exit 1; fi
+          grep -q 'this host has no module cache: pass SYNSEMA_MODULE_CACHE' err.txt
+          sed -i 's/wasmtime/wasmtimE/' "$pkg/m.syn"
+          if wasmtime run --dir . --dir "$d/cache::/cache" --env SYNSEMA_MODULE_CACHE=/cache "$W" main.syn 2>err.txt; then echo "a changed package ran"; exit 1; fi
+          grep -q 'no longer match their hash' err.txt
       # El front-end wasm honra el techo del host y no se traga flags desconocidas:
       # `--sandbox` deniega el `require random` de la sonda; `--bogus` es error (exit 2),
       # nunca "una ruta". Las familias nativas (net/db/cron) existen y fallan con la

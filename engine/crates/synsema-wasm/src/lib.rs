@@ -777,6 +777,8 @@ pub fn wire_pure(interp: &mut Interpreter, caps: &Rc<RefCell<CapabilitySet>>, ct
     }));
     // `sandbox under <caps>` (T1): techo delegado por bloque — mismo helper que el runtime.
     synsema_stdlib::captoken::install_ceiling_hook(interp, caps.clone());
+    // v0.6.58 (§6.1): el dominio de un paquete — mismo helper que el runtime.
+    synsema_stdlib::captoken::install_package_hook(interp, caps.clone());
 
     // Aislamiento de `sandbox`: guarda y VACÍA el CapabilitySet al entrar; restaura
     // al salir (stack para anidados) — idéntico al runtime.
@@ -1326,6 +1328,8 @@ pub fn run(source: &str, opts: &RunOptions) -> Report {
         Err(Control::Error(e)) => e.operator_detail.clone(),
         _ => None,
     };
+    // v0.6.58 (§12): los paquetes de la corrida van al header sellado, como en el nativo.
+    let run_modules = interp.run_modules().map(|m| m.to_json());
     let r = finish(interp, result);
     let receipt = match (&sealed_log, opts.auditor) {
         (Some(log), Some(auditor)) => {
@@ -1334,7 +1338,7 @@ pub fn run(source: &str, opts: &RunOptions) -> Report {
             let log = log.lock().unwrap_or_else(|p| p.into_inner());
             match synsema_stdlib::sealed::build_receipt(
                 &log,
-                &synsema_stdlib::sealed::ReceiptContext { auditor, key: &key, program_sha, config_sha: None, trusted: synsema_stdlib::sealed::trusted_shas(&opts.trusted, &opts.trusted_templates), started },
+                &synsema_stdlib::sealed::ReceiptContext { auditor, key: &key, program_sha, config_sha: None, trusted: synsema_stdlib::sealed::trusted_shas(&opts.trusted, &opts.trusted_templates), started, modules: run_modules },
             ) {
                 Ok(v) => Some(v),
                 // Sin recibo no hay salida: es lo que el host pidió al poner un auditor.

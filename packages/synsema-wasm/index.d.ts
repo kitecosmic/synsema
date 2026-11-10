@@ -79,7 +79,28 @@ export interface Host {
   sleep?: ((secs: number) => void | Promise<void>) | true;
 }
 
-export interface RunOptions {
+/**
+ * v0.6.58 — los paquetes que le pasás al motor, por su hash de árbol: `{"tree-sha256:…": {"<ruta>": "<texto>"}}`,
+ * con el `synsema.json` del paquete entre sus archivos (lo que `synsema get` dejó en el caché). El motor verifica
+ * cada hash antes de correr; un paquete que no coincide no corre.
+ */
+export type Packages = Record<string, Record<string, string>>;
+
+/** v0.6.58 — el proyecto de una llamada: el `synsema.json` del programa (texto u objeto) y sus paquetes. */
+export interface ProjectOptions {
+  /**
+   * El `synsema.json` del programa: fija qué paquete (y qué hash) es cada `use "nombre"`. El de una llamada
+   * reemplaza al de `load`/`loadNode`.
+   */
+  project?: string | Record<string, unknown>;
+  /**
+   * Los archivos de los paquetes que alcanza el programa. Los de una llamada se suman a los de `load`/`loadNode`.
+   * La instancia guarda lo verificado por su hash: lo que ya verificó no lo vuelve a hashear ni a copiar al Worker.
+   */
+  packages?: Packages;
+}
+
+export interface RunOptions extends ProjectOptions {
   filename?: string;
   /** Reemplaza al `.env`: `secret("KEY")`/`env("KEY")` resuelven de acá. */
   env?: Record<string, string>;
@@ -184,6 +205,8 @@ export interface RunResult {
    * armar, `ok` es false y `errors` lo dice.
    */
   receipt?: Record<string, unknown>;
+  /** v0.6.58 — los hashes que esta instancia ya verificó (no hace falta volver a mandarlos); en toda respuesta del motor. */
+  packages_held?: string[];
 }
 
 export interface TestResult {
@@ -192,11 +215,15 @@ export interface TestResult {
   failed: number;
   lines: string[];
   audit: AuditEntry[];
+  /** v0.6.58 — los hashes que esta instancia ya verificó (no hace falta volver a mandarlos); en toda respuesta del motor. */
+  packages_held?: string[];
 }
 
 export interface CheckResult {
   ok: boolean;
   errors: string[];
+  /** v0.6.58 — los hashes que esta instancia ya verificó (no hace falta volver a mandarlos); en toda respuesta del motor. */
+  packages_held?: string[];
 }
 
 export interface HandleRequest {
@@ -224,6 +251,8 @@ export interface HandleResult {
    * del operador: el programa (y el cliente) ven en `errors` un texto fijo, porque cuál sitio cortó lo eligió el
    * dato privado. No se lo devuelvas al modelo ni al cliente. */
   operator_detail?: string;
+  /** v0.6.58 — los hashes que esta instancia ya verificó (no hace falta volver a mandarlos); en toda respuesta del motor. */
+  packages_held?: string[];
 }
 
 export type ModuleSource = WebAssembly.Module | Uint8Array | ArrayBuffer | URL | string | Response;
@@ -238,7 +267,7 @@ export declare function instantiate(
   hostCall: (kind: string, payload: any) => any,
 ): Promise<{ exports: WebAssembly.Exports; call(request: object): any }>;
 
-export interface LoadOptions {
+export interface LoadOptions extends ProjectOptions {
   /** Cuántos Workers usa el modo asíncrono (default 1). Con más, `runAsync` corre en paralelo. */
   workers?: number;
   /**
@@ -271,7 +300,7 @@ export declare class Synsema {
   version(): string;
   run(source: string, opts?: RunOptions): RunResult;
   test(source: string, opts?: RunOptions): TestResult;
-  check(source: string, opts?: { filename?: string }): CheckResult;
+  check(source: string, opts?: { filename?: string } & ProjectOptions): CheckResult;
   handle(source: string, request: HandleRequest, opts?: RunOptions): HandleResult;
   /**
    * Modo asíncrono (Worker + Atomics): los hooks del host pueden ser async. Las llamadas esperan en

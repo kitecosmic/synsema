@@ -440,6 +440,16 @@ pub(crate) fn register_run_program_builtin(
             if let Some(s) = &child {
                 c.env("SYNSEMA_STATE_DIR", &s.dir);
             }
+            // v0.6.58 (§5.1, P11): el caché de paquetes del hijo es el del padre, absoluto. El programa
+            // no lo elige (no puede poner `SYNSEMA_*`); sin caché resoluble, el hijo no recibe ninguno.
+            if let Ok(dir) = synsema_core::modtable::cache_dir(i.project().and_then(|p| p.root.as_deref())) {
+                let abs = if dir.is_absolute() {
+                    dir
+                } else {
+                    std::env::current_dir().map(|c| c.join(&dir)).unwrap_or(dir)
+                };
+                c.env("SYNSEMA_MODULE_CACHE", abs);
+            }
             // Ronda 5 (B1): padre e hijo comparten la base; lo que el hijo escribió se trae al volver.
             // Un hijo `pure` no toca el disco: no hay nada que recargar (ronda 6, N1).
             let shares_memory =

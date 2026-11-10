@@ -151,7 +151,7 @@ pub fn build_receipt(
             .iter()
             .filter_map(|d| match &d.source {
                 DelegationSource::Token(id) => Some(syn_text(id.clone())),
-                DelegationSource::Block | DelegationSource::Caller => None,
+                DelegationSource::Block | DelegationSource::Caller | DelegationSource::Package(_) => None,
             })
             .collect();
         let audit = cs.audit_log.iter().map(|e| audit_to_syn(&AuditEntry::from(e))).collect();
@@ -256,6 +256,25 @@ pub fn build_receipt(
         crate::attest::current_program_sha().map(|s| syn_text(hex_encode(&s))).unwrap_or_else(syn_nothing),
     );
     subject.insert("engine", syn_text(crate::attest::engine_version()));
+    // v0.6.58 (§13): qué paquete corrió bajo cada nombre y qué paquetes había, de la tabla de la
+    // corrida. Sin paquetes no va.
+    if let Some(m) = interp.run_modules() {
+        let mut direct = SynMap::new();
+        for (n, id) in &m.direct {
+            direct.insert(n.as_str(), syn_text(id.clone()));
+        }
+        let mut packages = SynMap::new();
+        for (id, (v, h)) in &m.packages {
+            let mut p = SynMap::new();
+            p.insert("version", syn_text(v.clone()));
+            p.insert("hash", syn_text(h.clone()));
+            packages.insert(id.as_str(), syn_map(p));
+        }
+        let mut mods = SynMap::new();
+        mods.insert("direct", syn_map(direct));
+        mods.insert("packages", syn_map(packages));
+        subject.insert("modules", syn_map(mods));
+    }
     subject.insert("compute", compute_value());
     if let Some(v) = result {
         if !matches!(v, SynValue::Nothing) {

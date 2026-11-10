@@ -25,9 +25,36 @@ synsema run tools/embed.syn -- synsema-vela-guest.wasm my_app.syn my_app.wasm
 Test the program natively first — it is plain Synsema: `synsema test my_app.syn`. The kits
 (`SYNSEMA/vela-transfers` and the templates built on it) wrap this in `scripts/build.sh`.
 
+An app that uses packages (`use "tok"`, listed in its `synsema.json` and fetched with `synsema get`)
+goes in as what `synsema build` makes: the program, its `synsema.json` and its packages, each checked
+against its hash. Build it with the guest module as the engine binary, then embed the built file:
+
+```sh
+synsema build my_app.syn --engine-binary synsema-vela-guest.wasm -o my_app.built
+synsema run tools/embed.syn -- synsema-vela-guest.wasm my_app.built my_app.wasm
+```
+
+The guest mounts that bundle the way a `synsema build` binary does: the packages come only from the
+bundle, never from a cache or the network, and a file that does not match its hash is an error.
+
+Since v0.6.58 the slot (524 288 bytes) is `SYNSEMA.APPSLOT2`: magic (16) · the bundle's length as u32
+little-endian (4) · a `synsema build` bundle (payload, then its 64-byte trailer) · 0x20 filler, so a
+bundle fits up to 524 268 bytes. A `.syn` alone becomes a one-file bundle. A guest of v0.6.57 or
+older has the plain-text slot (`SYNSEMA.APPSLOT1`): the guest still runs a module embedded that way,
+but `embed.syn` refuses an old guest (it has no room for packages) and the `embed.syn` of v0.6.57
+says "no app slot" against a new one: use the tools of the same release as the guest.
+
 `tools/verify.syn` is the pair of `embed.syn`, for whoever receives a `.wasm` and wants to know what
-is in it: it reads the program out of the slot (`--extract out.syn` writes it), compares it with
-`--source app.syn` byte by byte, downloads the release's `synsema-vela-guest.wasm` (checked against
+is in it. It reads both slot formats and checks a bundle the way the guest does (trailer, sizes,
+sha256), and lists every file of the bundle and every package with its sha256. It reads the program
+out of the slot (refusing an entry name the guest would not read: not normalized, or twice; `--extract <dir>`
+writes the whole tree, packages under `pkg/`) and compares the app with
+`--source` byte by byte: a built app (`synsema build app.syn --engine-binary … -o app.built`) is
+compared bundle against bundle — every file, `synsema.json`, every package and the manifest, except
+`built_at` (the time of the build: a rebuild from the same source passes; anything else that differs is
+named); a `.syn` covers the
+main program only, so it fails when the slot carries anything else. Then it downloads the release's
+`synsema-vela-guest.wasm` (checked against
 its `.sha256`; `--audited <sha256>` pins the interpreter an external audit covered), rebuilds the
 module the way `embed.syn` would and reports the first differing offset — inside the slot (the
 program) or outside it (the interpreter) — then prints the module's sha256, the `wasmSha256` the
@@ -39,7 +66,7 @@ not downloadable by third parties, so `verify` serves whoever the app hands its 
 release, a CI artifact).
 
 ```sh
-synsema run tools/verify.syn -- my_app.wasm --release v0.6.23 --source my_app.syn [--audited <sha256>]
+synsema run tools/verify.syn -- my_app.wasm --release v0.6.58 --source build/my_app.built [--audited <sha256>]
 ```
 
 ## The adapter (Rust)

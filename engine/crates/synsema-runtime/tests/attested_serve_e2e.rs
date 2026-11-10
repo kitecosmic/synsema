@@ -219,6 +219,7 @@ fn well_known_attestation_binds_the_tls_key_to_the_program() {
         tls_key: "attested",
         profile: "native",
         drivers: vec!["mock"],
+        modules: None,
     };
     assert_eq!(cfg["drivers"], serde_json::json!(["mock"]), "T4: config nombra los drivers");
     assert_eq!(j["config_sha"], hex(&expected_cfg.sha()), "config_sha = sha256(json canónico del config publicado)");

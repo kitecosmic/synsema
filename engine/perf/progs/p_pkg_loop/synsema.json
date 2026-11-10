@@ -1,0 +1,10 @@
+{
+  "modules": {
+    "b": {
+      "url": "https://example.com/b",
+      "id": "example.com/b",
+      "version": "0.1.0",
+      "hash": "tree-sha256:efb777e3e92b18c457ecdecf1bf67c116fee4aedf1694f7df00f508b434b5d78"
+    }
+  }
+}

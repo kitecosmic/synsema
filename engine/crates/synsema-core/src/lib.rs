@@ -39,6 +39,8 @@ pub mod parser;
 pub mod reflexes;
 pub mod resolve;
 pub mod rng;
+pub mod modtable;
+pub mod project;
 pub mod run_scope;
 pub mod rng_ziggurat;
 pub mod stats;
@@ -52,6 +54,8 @@ pub mod tabular;
 pub mod temporal;
 pub mod route_meta;
 pub mod secret;
+/// v0.6.58 (M-r5-1): la pila que le queda al hilo (los de `serve` tienen 64 MB).
+pub mod stack;
 /// v0.6.46 (E6): el registro de la corrida para el recibo sellado.
 pub mod sealed;
 pub mod templates;

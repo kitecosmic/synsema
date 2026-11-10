@@ -105,6 +105,11 @@ pub struct Unit {
     pub scope: Option<ScopeId>,
 }
 
+/// v0.6.58 (M-r3-4): desde cuántos nombres un scope se resuelve por nombre (ver
+/// `Collector::huge_to_names`). Es el tope de registros de la VM (`vm::REG_LIMIT`): un frame en
+/// registros con todos sus nombres todavía cabe, y su `np + 1` no desborda.
+pub const SLOT_LIMIT: usize = 0x8000;
+
 /// Dónde está una variable.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Target {
@@ -179,6 +184,7 @@ pub fn resolve_block(stmts: &[Node]) -> Resolution {
     let mut c = Collector::default();
     c.units.push(Unit { kind: UnitKind::Program, node: 0, scope: None });
     c.block(stmts, None, 0);
+    c.huge_to_names();
     let Collector { scopes, units, opened } = c;
     let mut r = Resolver { scopes, opened: &opened, accesses: Vec::new(), loops: Vec::new(), defs: Vec::new() };
     r.block(stmts, None);
@@ -198,6 +204,7 @@ pub fn resolve_function(params: &[Arc<str>], body: &[Node]) -> (Resolution, Scop
         c.bind(Some(s), p);
     }
     c.block(body, Some(s), 0);
+    c.huge_to_names();
     let Collector { scopes, units, opened } = c;
     let mut r = Resolver { scopes, opened: &opened, accesses: Vec::new(), loops: Vec::new(), defs: Vec::new() };
     r.push(s, distinct(params.iter().map(|p| &**p)));
@@ -561,6 +568,17 @@ impl Collector {
     fn dynamic(&mut self, cur: Option<ScopeId>) {
         if let Some(s) = cur {
             self.scopes[s as usize].dynamic = true;
+        }
+    }
+
+    /// v0.6.58 (M-r3-4, previo): un slot es `u16` y un frame en registros pide un registro por
+    /// nombre. Un scope con [`SLOT_LIMIT`] nombres o más no tiene slots: se resuelve por nombre (como
+    /// uno `dynamic`, y como la referencia), así ningún índice se trunca ni desborda.
+    fn huge_to_names(&mut self) {
+        for sc in &mut self.scopes {
+            if sc.names.len() >= SLOT_LIMIT {
+                sc.dynamic = true;
+            }
         }
     }
 

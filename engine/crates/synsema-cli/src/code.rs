@@ -90,6 +90,19 @@ fn run_tool(root: &Root, name: &str, args: &Value) -> Result<Value, String> {
             return Err(format!("path not found: {}", p));
         }
     }
+    // B13 (ronda 1): toda tool de `code` revisa el mínimo del proyecto (§8), no sólo `sha` y `check`:
+    // un motor viejo no describe un programa escrito para uno nuevo.
+    if TOOLS.iter().any(|t| t.name == name) {
+        let at = match path {
+            Some(p) if std::path::Path::new(p).is_absolute() || !root.dir.join(p).exists() => std::path::PathBuf::from(p),
+            Some(p) => root.dir.join(p),
+            None => root.dir.clone(),
+        };
+        // La búsqueda sube desde la carpeta de la entrada: con una carpeta, desde ella misma.
+        let entry = if at.is_dir() { at.join("_") } else { at };
+        synsema_stdlib::project_owner::install();
+        synsema_core::project::check(&entry.to_string_lossy())?;
+    }
     Ok(match name {
         "outline" => codeintel::outline(root, path, args.get("full").and_then(Value::as_bool).unwrap_or(false)),
         "symbol" => codeintel::symbol(root, &name_arg(args)?, path),
@@ -132,9 +145,29 @@ fn program_sha_json(root: &Root, path: &str) -> Result<Value, String> {
         let shown = path.strip_prefix(&root.dir).unwrap_or(path);
         shown.to_string_lossy().replace('\\', "/").trim_start_matches("./").to_string()
     };
+    // v0.6.58 (§13, R9): los paquetes no entran a `program_sha`; van aparte, por su clave
+    // (`pkg:tree-sha256-…/main.syn`), nunca por la carpeta del caché (que está en el home).
+    let program = synsema_core::parser::parse_source(&source, &filename).map_err(|e| e.to_string())?;
+    let uses = synsema_core::loaded_modules::use_paths(&program);
+    let mut packages = Vec::new();
+    if !uses.is_empty() {
+        let project = synsema_core::project::resolve(&filename)?;
+        let table = synsema_core::modtable::build(&project, &filename, uses)?;
+        for p in &table.packages {
+            let main = p.index.main.clone().unwrap_or_default();
+            packages.push(json!({
+                "name": p.name,
+                "id": p.id,
+                "version": p.version,
+                "hash": p.hash,
+                "main": synsema_core::modtable::ModKey::Pkg { hash: p.hash.clone(), path: main }.display(),
+            }));
+        }
+    }
     Ok(json!({
         "program_sha": hex(&sha),
         "modules": modules.iter().map(|(p, h)| json!({"path": rel(p), "sha256": hex(h)})).collect::<Vec<_>>(),
+        "packages": packages,
     }))
 }
 

@@ -66,7 +66,7 @@ fn run_attest_prints_output_then_one_json_line_bound_to_program_input_output() {
     assert_eq!(j["config"]["tls_key"], "none");
     assert_eq!(j["config"]["profile"], "pure");
     assert_eq!(j["config"]["drivers"], serde_json::json!(["mock"]), "T4: config nombra los drivers");
-    let cfg = AttestConfig { labels: false, ceiling: Some(synsema_capabilities::model::build_ceiling_deterministic()), tls_key: "none", profile: "pure", drivers: vec!["mock"] };
+    let cfg = AttestConfig { labels: false, ceiling: Some(synsema_capabilities::model::build_ceiling_deterministic()), tls_key: "none", profile: "pure", drivers: vec!["mock"], modules: None };
     assert_eq!(j["config_sha"], hex(&cfg.sha()));
     // T4: `attestations` trae todos los documentos (acá uno); `attestation` queda como estaba.
     let all = j["attestations"].as_array().expect("attestations");
@@ -221,7 +221,7 @@ fn e6_attested_report_data() {
     assert_eq!(header["run_key"]["public"], j["run_key"], "el documento nombra la clave del recibo");
     assert_eq!(header["config_sha"], j["config_sha"]);
     let run_pub = synsema_core::bytesutil::b64url_decode(j["run_key"].as_str().unwrap()).unwrap();
-    let cfg = AttestConfig { labels: false, ceiling: Some(synsema_capabilities::model::build_ceiling_deterministic()), tls_key: "none", profile: "pure", drivers: vec!["mock"] };
+    let cfg = AttestConfig { labels: false, ceiling: Some(synsema_capabilities::model::build_ceiling_deterministic()), tls_key: "none", profile: "pure", drivers: vec!["mock"], modules: None };
     let doc = synsema_core::bytesutil::b64_decode(j["attestation"]["document"].as_str().unwrap()).unwrap();
     let payload = verify_nitro_document_with_root(&doc, &mock::root_der()).expect("documento válido");
     let mut bound = Vec::new();

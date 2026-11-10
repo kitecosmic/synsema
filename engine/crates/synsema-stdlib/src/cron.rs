@@ -28,6 +28,9 @@ use std::time::{Duration, Instant};
 
 use indexmap::IndexMap;
 
+/// La pila del hilo de un job (M-r6-1): la de un hilo de `serve` (`server.rs`, `SERVE_STACK_SIZE`).
+const CRON_STACK_SIZE: usize = 64 * 1024 * 1024;
+
 use synsema_core::clock::now_secs_f64;
 use synsema_core::interpreter::{Control, Interpreter};
 use synsema_core::number::py_float_str;
@@ -201,58 +204,67 @@ impl CronScheduler {
         };
         // v0.6.51 (G1): el job corre para la corrida que lo registró.
         let run = synsema_core::run_scope::current();
-        let jh = thread::spawn(move || {
-            let _run = run.as_ref().map(|r| r.enter());
-            loop {
-                match &schedule {
-                    Schedule::Every(secs) | Schedule::After(secs) => {
-                        let dur = Duration::from_secs_f64(secs.max(0.0));
-                        set_next(Some(now_secs_f64() + dur.as_secs_f64()));
-                        if Self::wait_parked(dur, &cancelled) {
-                            return;
-                        }
-                    }
-                    Schedule::At { expr, zone } => {
-                        // Próximo minuto de pared que matchea, DESPUÉS de ahora. Se espera
-                        // en tramos de ≤ 60 s recomputando contra el reloj de pared: un
-                        // salto del reloj (NTP) no deja al job dormido de más ni de menos.
-                        let target = match expr.next_after(now_secs_f64().floor() as i64, *zone) {
-                            Some(t) => t as f64,
-                            None => {
-                                set_next(None);
-                                return; // validado al registrar; defensivo
-                            }
-                        };
-                        set_next(Some(target));
-                        loop {
-                            let remaining = target - now_secs_f64();
-                            if remaining <= 0.0 {
-                                break;
-                            }
-                            let slice = Duration::from_secs_f64(remaining.min(60.0));
-                            if Self::wait_parked(slice, &cancelled) {
+        // v0.6.58 (M-r6-1): el tick crea y corre el intérprete en este hilo. Con la pila por defecto
+        // (2 MB) y sin avisarla, una recursión en el tick tumbaba el proceso (un `try` alrededor de la
+        // llamada, a las 23 llamadas en debug). Como un hilo de `serve`: 64 MB y avisa su pila, así
+        // el guardián da el error cuando no le queda.
+        let jh = thread::Builder::new()
+            .name("synsema-cron".to_string())
+            .stack_size(CRON_STACK_SIZE)
+            .spawn(move || {
+                synsema_core::stack::enter_thread(CRON_STACK_SIZE);
+                let _run = run.as_ref().map(|r| r.enter());
+                loop {
+                    match &schedule {
+                        Schedule::Every(secs) | Schedule::After(secs) => {
+                            let dur = Duration::from_secs_f64(secs.max(0.0));
+                            set_next(Some(now_secs_f64() + dur.as_secs_f64()));
+                            if Self::wait_parked(dur, &cancelled) {
                                 return;
                             }
                         }
+                        Schedule::At { expr, zone } => {
+                            // Próximo minuto de pared que matchea, DESPUÉS de ahora. Se espera
+                            // en tramos de ≤ 60 s recomputando contra el reloj de pared: un
+                            // salto del reloj (NTP) no deja al job dormido de más ni de menos.
+                            let target = match expr.next_after(now_secs_f64().floor() as i64, *zone) {
+                                Some(t) => t as f64,
+                                None => {
+                                    set_next(None);
+                                    return; // validado al registrar; defensivo
+                                }
+                            };
+                            set_next(Some(target));
+                            loop {
+                                let remaining = target - now_secs_f64();
+                                if remaining <= 0.0 {
+                                    break;
+                                }
+                                let slice = Duration::from_secs_f64(remaining.min(60.0));
+                                if Self::wait_parked(slice, &cancelled) {
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                    if cancelled.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    set_next(None);
+                    match task() {
+                        Ok(()) => {
+                            run_count.fetch_add(1, Ordering::SeqCst);
+                        }
+                        Err(()) => {
+                            errors.fetch_add(1, Ordering::SeqCst);
+                        }
+                    }
+                    if !schedule.repeating() {
+                        return;
                     }
                 }
-                if cancelled.load(Ordering::SeqCst) {
-                    return;
-                }
-                set_next(None);
-                match task() {
-                    Ok(()) => {
-                        run_count.fetch_add(1, Ordering::SeqCst);
-                    }
-                    Err(()) => {
-                        errors.fetch_add(1, Ordering::SeqCst);
-                    }
-                }
-                if !schedule.repeating() {
-                    return;
-                }
-            }
-        });
+            })
+            .expect("no se pudo crear el hilo del cron");
         jh.thread().clone() // jh se dropea → hilo desacoplado (detached)
     }
 
@@ -428,6 +440,10 @@ fn err(msg: &str) -> Control {
 /// tool de confianza, techo delegado de un captoken, agente). Bajo `serve`, desde un `sandbox`,
 /// la task escribía lo que el bloque no podía.
 fn not_in_a_narrowed_frame(i: &Interpreter, name: &str) -> Result<(), Control> {
+    // v0.6.58 (§6.4, K23): con un paquete en la pila (G-7: el origen de más arriba).
+    if let Some(msg) = i.package_later_error(name) {
+        return Err(err(&msg));
+    }
     if let Some(why) = i.frame_narrowing() {
         return Err(err(&format!(
             "{}: not allowed {} — the task would run later with the program's capabilities; schedule it outside",

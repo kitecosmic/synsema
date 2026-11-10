@@ -325,26 +325,30 @@ fn build(
     if !main_path.is_file() {
         return Err(format!("cannot read '{}'", main));
     }
-    let root: PathBuf = match main_path.parent() {
-        Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
-        _ => PathBuf::from("."),
+    let main_abs = main_path.canonicalize().map_err(|e| format!("cannot resolve '{}': {}", main, e))?;
+    let main_dir = main_abs.parent().ok_or_else(|| "main program has no folder".to_string())?.to_path_buf();
+    // v0.6.58 (§9, D-14): la raíz del bundle es la del proyecto (la carpeta de su `synsema.json`),
+    // no la del `.syn`: un `use "../lib/y.syn"` desde `scripts/` queda adentro (B6). Sin proyecto,
+    // la carpeta del `.syn`, como siempre.
+    let project = synsema_core::project::resolve(main)?;
+    let root = match (&project.manifest, &project.root) {
+        (Some(_), Some(r)) => r.canonicalize().map_err(|e| format!("cannot resolve the bundle root: {}", e))?,
+        _ => main_dir.clone(),
     };
-    let root = root.canonicalize().map_err(|e| format!("cannot resolve the bundle root: {}", e))?;
-    let main_name = main_path
-        .file_name()
-        .map(|s| s.to_string_lossy().into_owned())
-        .ok_or_else(|| "main program has no file name".to_string())?;
+    let main_name = main_abs
+        .strip_prefix(&root)
+        .map_err(|_| format!("'{}' is not under the project root {}", main, root.display()))?
+        .to_string_lossy()
+        .replace('\\', "/");
+    if main_name.is_empty() {
+        return Err("main program has no file name".to_string());
+    }
     if !main_name.ends_with(".syn") {
         return Err(format!("main program must be a .syn file: '{}'", main_name));
     }
 
-    // Las resoluciones de `use` (relativas al importador) y de templates (relativas al
-    // cwd) se hacen con cwd = raíz del bundle, así los paths resueltos SON las claves.
-    let prev_cwd = std::env::current_dir().map_err(|e| e.to_string())?;
-    std::env::set_current_dir(&root).map_err(|e| format!("cannot enter {}: {}", root.display(), e))?;
-    let result = collect(&main_name, includes, serve.is_some());
-    let _ = std::env::set_current_dir(&prev_cwd);
-    let (entries, bind_lit) = result?;
+    // Todo se lee desde el directorio actual, como `run` (M5): ver `collect`.
+    let (entries, bind_lit, packages) = collect(main, &main_name, &root, Path::new(out), includes, serve.is_some())?;
     // El bind horneado: `--bind` gana; si no vino, la cláusula `bind "…"` literal del serve
     // block; sin ninguna de las dos, un distribuible no adivina en qué interfaz escucha.
     if let Some(s) = serve.as_mut() {
@@ -453,9 +457,10 @@ fn build(
         mode: if serve.is_some() { BundleMode::Serve } else { BundleMode::Run },
         serve: serve.clone(),
         audit,
+        packages: Vec::new(),
     };
     let n = entries.len();
-    let b = Bundle::new(manifest, entries)?;
+    let b = if packages.is_empty() { Bundle::new(manifest, entries)? } else { Bundle::with_packages(manifest, entries, packages)? };
     let mut file = engine_bytes;
     let base = file.len() as u64;
     file.extend_from_slice(&b.serialize(base));
@@ -648,16 +653,97 @@ pub fn load_icon(path: &str) -> Result<IconSource, String> {
 /// Lee el programa principal, su clausura de `use` y templates, y los `--include`.
 /// Todos los nombres relativos a la raíz (= cwd durante la recolección).
 /// Devuelve las entradas del bundle y el `bind "…"` literal del serve block (si hay).
-fn collect(main_name: &str, includes: &[String], serve_mode: bool) -> Result<(Vec<(String, Vec<u8>)>, Option<String>), String> {
-    let source = std::fs::read_to_string(main_name).map_err(|e| format!("cannot read '{}': {}", main_name, e))?;
-    let program = synsema_core::parser::parse_source(&source, main_name).map_err(|e| e.to_string())?;
+/// Lo que `collect` junta: las entradas, el `bind` literal del serve y la sección de paquetes.
+type Collected = (Vec<(String, Vec<u8>)>, Option<String>, Vec<synsema_core::bundle::BundledPackage>);
+
+/// v0.6.58 (M5, ronda 1): todo se lee desde el directorio de quien invoca, como `run` (D-28): el
+/// `.syn` y sus `use` (relativos al importador), las plantillas, los `static` y los `--include`
+/// (relativos al directorio actual). Las claves del bundle son las que el binario busca al correr:
+/// la de un módulo, su ruta relativa a la raíz del proyecto (`root`, así `use "../lib/y.syn"` desde
+/// `scripts/` queda adentro, B6); la de una plantilla, un mount o un `--include`, su ruta relativa al
+/// directorio actual, que es como el programa la escribe y como el binario la pide.
+/// M7 (ronda 1): `f` (de un mount `dir`) tiene un segmento oculto: empieza con `.` y no es
+/// `.well-known`. La misma regla que aplica el server al servir.
+fn hidden_under(dir: &Path, f: &Path) -> bool {
+    let rest = f.strip_prefix(dir).unwrap_or(f);
+    rest.components().any(|c| match c {
+        std::path::Component::Normal(s) => {
+            let s = s.to_string_lossy();
+            s.starts_with('.') && s != ".well-known"
+        }
+        _ => false,
+    })
+}
+
+/// Ronda 3 (M-r3-2): el bundle tiene un solo espacio de nombres, y un mount sirve toda clave que cae
+/// bajo la suya. El programa, sus módulos y el `synsema.json` entran por su ruta desde la raíz del
+/// proyecto; los mounts, desde la carpeta actual. Cuando no son la misma carpeta, una de esas entradas
+/// puede caer bajo un mount que en el disco no la sirve (`lib/secret.syn` bajo `static "/" from "."`
+/// corrido desde `app/`). El binario la serviría: `build` falla en vez de distribuirla.
+fn rooted_not_served(static_dirs: &[String], rooted: &[(String, PathBuf)], root: &Path) -> Result<(), String> {
+    for dir in static_dirs {
+        let Some(mk) = bundle::mount_key(dir) else { continue };
+        let Ok(base) = Path::new(dir).canonicalize() else { continue };
+        for (key, src) in rooted {
+            let rest = if mk.is_empty() {
+                key.as_str()
+            } else if let Some(r) = key.strip_prefix(&format!("{}/", mk)) {
+                r
+            } else {
+                continue;
+            };
+            // Lo oculto no se sirve nunca (M7): no importa que esté.
+            if rest.split('/').any(|s| s.starts_with('.') && s != ".well-known") {
+                continue;
+            }
+            let disk = Path::new(dir).join(rest);
+            let same = disk.is_file()
+                && served_from_disk(&base, &disk)
+                && match (disk.canonicalize(), src.canonicalize()) {
+                    (Ok(a), Ok(b)) => a == b,
+                    _ => false,
+                };
+            if !same {
+                return Err(format!(
+                    "'{}' (the program, a module or synsema.json, from the project root) would be served by static \"{}\" in the built binary, and the disk does not serve it there; mount a folder that holds only what is served (static \"/\" from \"pub\"), or run synsema build from the project root ({}), where static \".\" is the project root and serves all of it, the code included",
+                    key,
+                    dir,
+                    root.display().to_string().trim_start_matches(r"\\?\")
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Ronda 2 (M-r2-2): lo que el disco serviría de `f` bajo el mount `base` (canónico): donde
+/// termina `f` siguiendo links (`read_within` del servidor) tiene que quedar adentro de la carpeta del
+/// mount y no ser algo oculto. Un link que sale de la carpeta, o que lleva a `.git`, no viaja.
+fn served_from_disk(base: &Path, f: &Path) -> bool {
+    match f.canonicalize() {
+        Ok(real) => real.starts_with(base) && !hidden_under(base, &real),
+        Err(_) => false,
+    }
+}
+
+/// `f` es el archivo que este build escribe (`-o`, o `-o x` → `x.exe` con un motor PE), de un
+/// build anterior.
+fn is_output(f: &Path, out: &Path) -> bool {
+    let Ok(a) = f.canonicalize() else { return false };
+    let exe = (out.extension().is_none()).then(|| out.with_extension("exe"));
+    std::iter::once(out.to_path_buf()).chain(exe).any(|o| o.canonicalize().is_ok_and(|b| b == a))
+}
+
+fn collect(main: &str, main_name: &str, root: &Path, out: &Path, includes: &[String], serve_mode: bool) -> Result<Collected, String> {
+    let source = std::fs::read_to_string(main).map_err(|e| format!("cannot read '{}': {}", main, e))?;
+    let program = synsema_core::parser::parse_source(&source, main).map_err(|e| e.to_string())?;
     // Un programa con `serve on` sólo sirve bajo el runtime de serve: sin `--serve` el binario
     // fallaría al correr con "serve is only available through the Synsema engine runtime" —
     // se dice acá, en el build.
     if synsema_core::route_meta::has_serve_block(&program) && !serve_mode {
         return Err(format!(
             "'{}' has a serve block; pass --serve (and --bind <addr>, or a `bind \"…\"` clause) to build a server binary",
-            main_name
+            main
         ));
     }
     let bind_lit = if serve_mode { synsema_core::route_meta::serve_bind_literal(&program)? } else { None };
@@ -665,59 +751,113 @@ fn collect(main_name: &str, includes: &[String], serve_mode: bool) -> Result<(Ve
     // el server los sirve del bundle antes que del disco. Un directorio que falta es un error
     // del build, no un 404 en producción.
     let static_dirs = synsema_core::route_meta::static_mount_dirs(&program)?;
-    let (modules, templates) = program_closure_with(&program, main_name, &|resolved: &str, raw: &str| {
+    let (modules, templates) = program_closure_with(&program, main, &|resolved: &str, raw: &str| {
         let src = std::fs::read_to_string(resolved).map_err(|_| format!("module not found: {}", raw))?;
         synsema_core::parser::parse_source(&src, resolved).map_err(|e| e.to_string())
     })?;
     let mut entries: Vec<(String, Vec<u8>)> = Vec::new();
-    let push = |name: String, bytes: Vec<u8>, entries: &mut Vec<(String, Vec<u8>)>| -> Result<(), String> {
-        let key = bundle::normalize_name(&name)
-            .ok_or_else(|| format!("'{}' escapes the bundle root ({})", name, std::env::current_dir().map(|p| p.display().to_string()).unwrap_or_default()))?;
-        if !entries.iter().any(|(k, _)| *k == key) {
-            entries.push((key, bytes));
+    // Una clave, un archivo: dos archivos distintos con la misma clave (una plantilla `lib/y.syn`
+    // del directorio actual y el módulo `lib/y.syn` de la raíz) son un error, no el primero que llegó.
+    let push = |key: String, shown: &str, bytes: Vec<u8>, entries: &mut Vec<(String, Vec<u8>)>| -> Result<(), String> {
+        match entries.iter().find(|(k, _)| *k == key) {
+            Some((_, b)) if *b != bytes => Err(format!("'{}' names two different files in the bundle ({})", key, shown)),
+            Some(_) => Ok(()),
+            None => {
+                entries.push((key, bytes));
+                Ok(())
+            }
         }
-        Ok(())
     };
-    push(main_name.to_string(), source.into_bytes(), &mut entries)?;
+    // La clave de lo relativo al directorio actual (plantillas, mounts, `--include`).
+    let cwd_key = |name: &str| -> Result<String, String> {
+        let name = name.trim_start_matches("./").trim_start_matches(".\\");
+        bundle::normalize_name(name).ok_or_else(|| {
+            format!("'{}' escapes the current directory ({})", name, std::env::current_dir().map(|p| p.display().to_string()).unwrap_or_default())
+        })
+    };
+    // La clave de un módulo: su ruta relativa a la raíz del proyecto.
+    let root_key = |path: &str| -> Result<String, String> {
+        let abs = Path::new(path).canonicalize().map_err(|e| format!("cannot resolve module {}: {}", path, e))?;
+        let rel = abs.strip_prefix(root).map_err(|_| format!("module {} is not under the bundle root {}", path, root.display()))?;
+        bundle::normalize_name(&rel.to_string_lossy().replace('\\', "/")).ok_or_else(|| format!("module {} escapes the bundle root {}", path, root.display()))
+    };
+    // M-r3-2 (ronda 3): lo que entra por su ruta desde la raíz del proyecto (el programa, sus
+    // módulos, el `synsema.json`), para ver al final si un mount `static` lo serviría.
+    let mut rooted: Vec<(String, PathBuf)> = vec![(main_name.to_string(), PathBuf::from(main))];
+    push(main_name.to_string(), main, source.into_bytes(), &mut entries)?;
     for m in modules {
         let bytes = std::fs::read(&m).map_err(|e| format!("cannot read module {}: {}", m, e))?;
-        push(m, bytes, &mut entries)?;
+        let key = root_key(&m)?;
+        rooted.push((key.clone(), PathBuf::from(&m)));
+        push(key, &m, bytes, &mut entries)?;
     }
     for t in templates {
         for tp in template_closure(&t)? {
             let bytes = std::fs::read(&tp).map_err(|e| format!("cannot read template {}: {}", tp, e))?;
-            push(tp, bytes, &mut entries)?;
+            push(cwd_key(&tp)?, &tp, bytes, &mut entries)?;
         }
     }
     for dir in &static_dirs {
         let p = Path::new(dir);
         if !p.is_dir() {
             return Err(format!(
-                "static mount '{}' (declared in the serve block) is not a directory under the bundle root",
+                "static mount '{}' (declared in the serve block) is not a directory under the current directory",
                 dir
             ));
         }
+        let base = p.canonicalize().map_err(|e| format!("static mount '{}': {}", dir, e))?;
         for f in expand_include(dir)? {
+            // M7 (ronda 1): lo que el mount no sirve (lo oculto, salvo `.well-known`) tampoco viaja
+            // en el binario, que se distribuye; ni el binario que se está escribiendo. M-r2-2: ni lo
+            // que un link lleva afuera de la carpeta o a algo oculto (la regla del disco).
+            if hidden_under(p, &f) || !served_from_disk(&base, &f) || is_output(&f, out) {
+                continue;
+            }
             let bytes = std::fs::read(&f).map_err(|e| format!("cannot read {}: {}", f.display(), e))?;
             let name = f.to_string_lossy().into_owned();
-            let name = name.trim_start_matches("./").trim_start_matches(".\\").to_string();
-            push(name, bytes, &mut entries)?;
+            push(cwd_key(&name)?, &name, bytes, &mut entries)?;
         }
     }
     for inc in includes {
         let mut found = 0usize;
         for p in expand_include(inc)? {
+            if is_output(&p, out) {
+                continue;
+            }
             let bytes = std::fs::read(&p).map_err(|e| format!("cannot read {}: {}", p.display(), e))?;
             let name = p.to_string_lossy().into_owned();
-            let name = name.trim_start_matches("./").trim_start_matches(".\\").to_string();
-            push(name, bytes, &mut entries)?;
+            push(cwd_key(&name)?, &name, bytes, &mut entries)?;
             found += 1;
         }
         if found == 0 {
             return Err(format!("--include '{}' matched nothing", inc));
         }
     }
-    Ok((entries, bind_lit))
+    // v0.6.58 (§9): el `synsema.json` del proyecto y los paquetes que alcanza el programa, leídos
+    // y verificados como al correr (la misma tabla). Uno fuera del caché es N5 acá (B3).
+    let mut packages = Vec::new();
+    let project = synsema_core::project::resolve(main)?;
+    if project.manifest.is_some() {
+        let jp = root.join("synsema.json");
+        let bytes = std::fs::read(&jp).map_err(|e| format!("cannot read synsema.json: {}", e))?;
+        rooted.push(("synsema.json".to_string(), jp.clone()));
+        push("synsema.json".to_string(), &jp.display().to_string(), bytes, &mut entries)?;
+        let uses = synsema_core::loaded_modules::use_paths(&program);
+        if !uses.is_empty() {
+            let table = synsema_core::modtable::build(&project, main, uses)?;
+            for p in &table.packages {
+                let mut files = vec![("synsema.json".to_string(), p.index_bytes.to_vec())];
+                let mut paths: Vec<&String> = p.files.keys().collect();
+                paths.sort();
+                for path in paths {
+                    files.push((path.clone(), p.files[path].to_vec()));
+                }
+                packages.push((p.hash.clone(), files));
+            }
+        }
+    }
+    rooted_not_served(&static_dirs, &rooted, root)?;
+    Ok((entries, bind_lit, packages))
 }
 
 /// `--include`: un archivo, un directorio (recursivo) o un patrón `*`/`?` de UN nivel

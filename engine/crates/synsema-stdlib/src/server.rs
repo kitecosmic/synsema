@@ -374,7 +374,7 @@ impl HostRouter {
                 // `synsema build`: si el directorio del mount viaja dentro del binario, se
                 // sirve de ahí (overlay: bundle antes que disco).
                 let bundled = synsema_core::bundle::mounted().and_then(|b| {
-                    let key = synsema_core::bundle::normalize_name(&m.dir)?;
+                    let key = synsema_core::bundle::mount_key(&m.dir)?;
                     b.has_prefix(&key).then_some(key)
                 });
                 Mount {
@@ -471,7 +471,8 @@ impl HostRouter {
                         },
                     };
                     let denies = !mount.deny.is_empty();
-                    if denies && static_denied(mount, &target) {
+                    // M7 (ronda 1): lo oculto (`.env`, `.git/`) no se publica; `.well-known` sí.
+                    if hidden_in_mount(&rest_of(base, &target)) || (denies && static_denied(mount, &target)) {
                         continue;
                     }
                     let data = match read_within(base, &target, denies.then_some(mount)) {
@@ -1941,10 +1942,26 @@ fn norm_prefix(prefix: &str) -> String {
 #[cold]
 #[inline(never)]
 fn static_denied(mount: &Mount, target: &Path) -> bool {
-    let rest = target.strip_prefix(&mount.base).unwrap_or(target).to_string_lossy().replace('\\', "/");
+    static_denied_rel(mount, &rest_of(&mount.base, target))
+}
+
+/// Los `deny` del mount sobre una ruta relativa al mount (`rest`), del disco o del bundle (M7).
+fn static_denied_rel(mount: &Mount, rest: &str) -> bool {
     let path = format!("{}/{}", mount.dir.trim_end_matches(['/', '\\']), rest.trim_start_matches('/'));
     let c = Capability::new(CapabilityType::FileRead, Some(path));
     mount.deny.iter().any(|d| d.covers_by_name(&c) || d.reaches_physically(&c))
+}
+
+/// v0.6.58 (M7, ronda 1): un mount estático publica sólo lo que el autor quiso publicar: ningún
+/// segmento de la ruta relativa al mount empieza con `.` (`.env`, `.git/`, `.ssh/`…), salvo
+/// `.well-known` (RFC 8615). Como `serve-static`/Express por defecto. Vale para el disco y el bundle.
+fn hidden_in_mount(rest: &str) -> bool {
+    rest.split(['/', '\\']).any(|s| s.starts_with('.') && s != ".well-known")
+}
+
+/// La ruta de `target` relativa a la carpeta del mount.
+fn rest_of(base: &Path, target: &Path) -> String {
+    target.strip_prefix(base).unwrap_or(target).to_string_lossy().replace('\\', "/")
 }
 
 fn within(base: &Path, target: &Path) -> bool {
@@ -1961,7 +1978,8 @@ fn read_within(base: &Path, target: &Path, denied: Option<&Mount>) -> Option<Vec
     use std::io::Read;
     let inside = |real: &str| {
         let real = Path::new(real);
-        if within(base, real) && !denied.is_some_and(|m| static_denied(m, real)) {
+        // M7: donde quedó abierto (un link) tampoco puede ser algo oculto del mount.
+        if within(base, real) && !hidden_in_mount(&rest_of(base, real)) && !denied.is_some_and(|m| static_denied(m, real)) {
             Ok(())
         } else {
             Err(())
@@ -1987,6 +2005,11 @@ fn resolve_in(base: &Path, rel: &str) -> Option<PathBuf> {
     if Path::new(rel).is_absolute() || (rel.len() > 1 && rel.as_bytes()[1] == b':') {
         return None;
     }
+    // Ronda 2 (B-r2-3): en Windows un `:` en un nombre abre un stream alternativo del archivo
+    // (`publico.txt:oculto`, `:Zone.Identifier`): lo que el mount publica es el archivo, no sus streams.
+    if cfg!(windows) && rel.contains(':') {
+        return None;
+    }
     let mut target = base.join(rel).canonicalize().ok()?;
     if !within(base, &target) {
         return None;
@@ -2008,8 +2031,12 @@ fn resolve_in(base: &Path, rel: &str) -> Option<PathBuf> {
 /// bundle queda expuesto por tener un `static`. Directorio → `index.html`; miss → el
 /// `fallback` del mount; nada → `None` (y se prueba el disco, como siempre).
 fn bundled_static(mount: &Mount, rel: &str) -> Option<(Vec<u8>, String, String)> {
+    bundled_static_in(synsema_core::bundle::mounted()?, mount, rel)
+}
+
+/// [`bundled_static`] contra un bundle dado (el montado, o uno en memoria en los tests).
+fn bundled_static_in(b: &synsema_core::bundle::Bundle, mount: &Mount, rel: &str) -> Option<(Vec<u8>, String, String)> {
     let dir = mount.bundled.as_deref()?;
-    let b = synsema_core::bundle::mounted()?;
     let lookup = |rel: &str| -> Option<(Vec<u8>, String)> {
         let rel = unquote(rel);
         let rel = rel.trim_start_matches('/');
@@ -2017,10 +2044,18 @@ fn bundled_static(mount: &Mount, rel: &str) -> Option<(Vec<u8>, String, String)>
         if Path::new(rel).is_absolute() || (rel.len() > 1 && rel.as_bytes()[1] == b':') {
             return None;
         }
-        let key = synsema_core::bundle::normalize_name(&format!("{}/{}", dir, rel))?;
+        // La raíz (`static "/" from "."`) es la clave vacía: el nombre es `rel` solo.
+        let joined = if dir.is_empty() { rel.to_string() } else { format!("{}/{}", dir, rel) };
+        let key = synsema_core::bundle::normalize_name(&joined)?;
         let key = if b.is_dir(&key) { format!("{}/index.html", key) } else { key };
-        if key != dir && !key.starts_with(&format!("{}/", dir)) {
+        if !dir.is_empty() && key != dir && !key.starts_with(&format!("{}/", dir)) {
             return None; // escapó del mount (`..`)
+        }
+        // M7 (ronda 1): lo del bundle sigue las mismas reglas que el disco: nada oculto y los
+        // `deny` del mount (antes no pasaba por ellos).
+        let rest = if dir.is_empty() { key.as_str() } else { key[dir.len()..].trim_start_matches('/') };
+        if hidden_in_mount(rest) || (!mount.deny.is_empty() && static_denied_rel(mount, rest)) {
+            return None;
         }
         let bytes = b.get(&key)?;
         Some((bytes.to_vec(), key))
@@ -2235,6 +2270,7 @@ impl PoolShared {
             .name(format!("synsema-interp-{}{}", n, if extra { "x" } else { "" }))
             .stack_size(SERVE_STACK_SIZE)
             .spawn(move || {
+                synsema_core::stack::enter_thread(SERVE_STACK_SIZE);
                 synsema_core::waiting::set_thread_hook(Some(pool_wait_hook));
                 EXTRA_POOL_THREAD.with(|c| c.set(extra));
                 THREAD_POOL.with(|p| *p.borrow_mut() = Some(shared.clone()));
@@ -4869,7 +4905,13 @@ async fn handle_request(
         if std::thread::Builder::new()
             .name("synsema-stream".to_string())
             .stack_size(SERVE_STACK_SIZE)
-            .spawn(synsema_core::run_scope::carry(job))
+            .spawn({
+                let job = synsema_core::run_scope::carry(job);
+                move || {
+                    synsema_core::stack::enter_thread(SERVE_STACK_SIZE);
+                    job()
+                }
+            })
             .is_err()
         {
             // Falló crear el hilo (sistema sin recursos): el job se dropeó → head_rx da Err
@@ -5920,6 +5962,24 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
+    /// Ronda 2 (B-r2-3): en Windows, `publico.txt:oculto` (un stream alternativo, también
+    /// `::$DATA`) no se sirve; el archivo sí.
+    #[cfg(windows)]
+    #[test]
+    fn an_alternate_data_stream_is_not_served() {
+        let d = std::env::temp_dir().join(format!("synsema-ads-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("publico.txt"), "publico").unwrap();
+        std::fs::write(d.join("publico.txt:oculto"), "ADS_SECRETO").unwrap();
+        let base = d.canonicalize().unwrap();
+        assert!(resolve_in(&base, "publico.txt").is_some());
+        for rel in ["publico.txt:oculto", "publico.txt::$DATA", "publico.txt:oculto:$DATA"] {
+            assert!(resolve_in(&base, rel).is_none(), "{}", rel);
+        }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
     /// v0.6.46 (ronda 1 de cf1, B6): un link cambiado después de `static_denied` hacia la carpeta
     /// negada, sin salir del mount, no sirve lo negado.
     #[cfg(any(target_os = "linux", windows))]
@@ -5955,6 +6015,58 @@ mod tests {
         assert!(read_within(&m.base, &target, Some(m)).is_none(), "sirvió lo negado");
         let _ = std::fs::remove_dir(d.join("css"));
         let _ = std::fs::remove_file(d.join("css"));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// v0.6.58 (M7, ronda 1): un mount no publica lo oculto (salvo `.well-known`), del disco ni del
+    /// bundle, y los `deny` del mount valen también para lo del bundle.
+    #[test]
+    fn a_static_mount_does_not_publish_hidden_files() {
+        assert!(hidden_in_mount(".env") && hidden_in_mount("a/.git/HEAD") && hidden_in_mount(".ssh/id"));
+        assert!(!hidden_in_mount(".well-known/security.txt") && !hidden_in_mount("a/b.txt") && !hidden_in_mount("x.env"));
+        // Disco.
+        let d = std::env::temp_dir().join(format!("synsema-m7-static-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join(".git")).unwrap();
+        std::fs::create_dir_all(d.join(".well-known")).unwrap();
+        std::fs::write(d.join(".env"), "API_KEY=x").unwrap();
+        std::fs::write(d.join(".git/HEAD"), "ref").unwrap();
+        std::fs::write(d.join(".well-known/security.txt"), "Contact: x").unwrap();
+        std::fs::write(d.join("a.txt"), "publico").unwrap();
+        let dir = d.to_string_lossy().replace('\\', "/");
+        let rt = static_rt(&dir);
+        let served = |rt: &ServeRuntime, p: &str| rt.default_host.serve_static_full(p, &[]).map(|r| r.status);
+        assert_eq!(served(&rt, "/a.txt"), Some(200));
+        assert_eq!(served(&rt, "/.well-known/security.txt"), Some(200));
+        assert_eq!(served(&rt, "/.env"), None);
+        assert_eq!(served(&rt, "/.git/HEAD"), None);
+        // Bundle (en memoria): lo mismo, y el `deny` del mount.
+        use synsema_core::bundle::{Bundle, BundleMode, Manifest, FORMAT};
+        let manifest = Manifest {
+            format: FORMAT,
+            engine: "vtest".into(),
+            main: "p.syn".into(),
+            ceiling: None,
+            profile: "native".into(),
+            built_at: "2026-11-08T00:00:00Z".into(),
+            mode: BundleMode::Run,
+            serve: None,
+            audit: None,
+            packages: Vec::new(),
+        };
+        let files = [("p.syn", "print(1)"), ("a.txt", "publico"), (".env", "API_KEY=x"), (".git/HEAD", "ref"), (".well-known/security.txt", "c"), ("secreto/k.txt", "negado")];
+        let b = Bundle::new(manifest, files.iter().map(|(k, v)| (k.to_string(), v.as_bytes().to_vec())).collect()).unwrap();
+        let mut rt = static_rt(".");
+        rt.default_host.static_mounts[0].bundled = Some(String::new());
+        rt.default_host.static_mounts[0].dir = ".".into();
+        rt.default_host.static_mounts[0].deny = vec![Capability::new(CapabilityType::FileRead, Some("./secreto/**".into()))];
+        let m = &rt.default_host.static_mounts[0];
+        let got = |p: &str| bundled_static_in(&b, m, p).map(|(data, _, _)| String::from_utf8(data).unwrap());
+        assert_eq!(got("/a.txt").as_deref(), Some("publico"));
+        assert_eq!(got("/.well-known/security.txt").as_deref(), Some("c"));
+        assert_eq!(got("/.env"), None);
+        assert_eq!(got("/.git/HEAD"), None);
+        assert_eq!(got("/secreto/k.txt"), None);
         let _ = std::fs::remove_dir_all(&d);
     }
 }

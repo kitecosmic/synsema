@@ -52,6 +52,9 @@ pub struct Manifest {
     /// `json` | `<ruta>` | `fd:N` | `unix:<ruta>`). Ausente en el JSON = sin audit, así un
     /// bundle anterior se lee igual y uno sin `--audit` no cambia ni un byte.
     pub audit: Option<String>,
+    /// v0.6.58 (§9, §5.3): los hashes de los paquetes del grafo, en el orden de su sección. Vacío =
+    /// sin la clave en el JSON y sin la sección: un bundle sin paquetes no cambia ni un byte.
+    pub packages: Vec<String>,
 }
 
 /// Modo de ejecución del binario construido.
@@ -150,6 +153,9 @@ impl Manifest {
         if let Some(a) = &self.audit {
             m.insert("audit".into(), serde_json::Value::from(a.clone()));
         }
+        if !self.packages.is_empty() {
+            m.insert("packages".into(), serde_json::Value::from(self.packages.clone()));
+        }
         serde_json::Value::Object(m).to_string()
     }
 
@@ -193,6 +199,20 @@ impl Manifest {
             Some(serde_json::Value::String(s)) if !s.is_empty() => Some(s.clone()),
             _ => None,
         };
+        let packages = match v.get("packages") {
+            None => Vec::new(),
+            Some(serde_json::Value::Array(xs)) => {
+                let mut out = Vec::with_capacity(xs.len());
+                for x in xs {
+                    match x.as_str() {
+                        Some(h) if crate::modtable::is_tree_hash(h) && !out.iter().any(|o: &String| o == h) => out.push(h.to_string()),
+                        _ => return Err("bundle manifest: packages is a list of distinct tree-sha256 hashes".to_string()),
+                    }
+                }
+                out
+            }
+            Some(_) => return Err("bundle manifest: packages is a list of distinct tree-sha256 hashes".to_string()),
+        };
         Ok(Manifest {
             format,
             engine: str_field("engine")?,
@@ -203,9 +223,14 @@ impl Manifest {
             mode,
             serve,
             audit,
+            packages,
         })
     }
 }
+
+/// Un paquete de la sección de paquetes: su hash y sus archivos (con su `synsema.json`), por ruta
+/// adentro del paquete.
+pub type BundledPackage = (String, Vec<(String, Vec<u8>)>);
 
 /// El bundle en memoria.
 #[derive(Debug)]
@@ -214,6 +239,9 @@ pub struct Bundle {
     files: HashMap<String, Vec<u8>>,
     /// Nombres en orden de inserción (determinismo del serializado y de `list`).
     order: Vec<String>,
+    /// v0.6.58 (§9, §5.3): la sección de paquetes, aparte de `files`. Nada que lea por ruta
+    /// (`get`, `list`, `render`, `static`, `read_file`) la ve: sólo la tabla, por hash.
+    packages: Vec<BundledPackage>,
 }
 
 /// Normaliza un nombre de bundle: `\` → `/`, colapsa `.`/`..`, sin `/` inicial ni final.
@@ -239,6 +267,40 @@ pub fn normalize_name(path: &str) -> Option<String> {
     Some(out.join("/"))
 }
 
+/// v0.6.58: la clave de la carpeta de un mount estático dentro del bundle. Como `normalize_name`,
+/// pero la raíz (`.`, `./`, `""`) es `Some("")`: `static "/" from "."` sirve lo que viaja en el
+/// binario (antes daba `None`, el mount caía al disco y en otra carpeta todo era 404).
+pub fn mount_key(dir: &str) -> Option<String> {
+    // N10 (ronda 1): la misma normalización que `normalize_name`, pero lo que queda vacío (`.`,
+    // `a/..`) es la raíz: antes `a/..` daba `None` y el mount caía al disco.
+    let p = dir.replace('\\', "/");
+    if p.starts_with('/') || p.chars().nth(1) == Some(':') {
+        return None;
+    }
+    let mut out: Vec<&str> = Vec::new();
+    for seg in p.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                out.pop()?;
+            }
+            s => out.push(s),
+        }
+    }
+    Some(out.join("/"))
+}
+
+/// Ronda 2 (M-r2-3): un nombre leído de un bundle ya viene normalizado (`build` sólo escribe esa
+/// forma). Otra forma (`./app.syn`, `a\b`, `x/../y`) se rechaza en vez de reescribirse: así lo que
+/// corre el motor y lo que muestra un verificador (`verify.syn`) son la misma entrada.
+fn stored_name(name: &str) -> Result<(), String> {
+    if normalize_name(name).as_deref() == Some(name) {
+        Ok(())
+    } else {
+        Err(format!("bundle: entry name '{}' is not normalized", name))
+    }
+}
+
 impl Bundle {
     /// Construye un bundle validando cada nombre.
     pub fn new(manifest: Manifest, entries: Vec<(String, Vec<u8>)>) -> Result<Bundle, String> {
@@ -250,9 +312,14 @@ impl Bundle {
             if key.len() > u16::MAX as usize {
                 return Err(format!("bundle: entry name too long: '{}'", name));
             }
-            if files.insert(key.clone(), bytes).is_none() {
-                order.push(key);
+            // Ronda 2 (M-r2-3): una sola entrada por nombre normalizado. Con `app.syn` y `./app.syn`
+            // el motor corría la última y un verificador que mira el nombre escrito veía la primera
+            // (`parse` además exige el nombre ya normalizado: lo que viaja no se reescribe).
+            if files.contains_key(&key) {
+                return Err(format!("bundle: the entry '{}' appears twice", name));
             }
+            files.insert(key.clone(), bytes);
+            order.push(key);
         }
         if normalize_name(&manifest.main).as_deref() != Some(manifest.main.as_str()) {
             return Err(format!("bundle: main '{}' is not a normalized bundle name", manifest.main));
@@ -260,7 +327,49 @@ impl Bundle {
         if !files.contains_key(&manifest.main) {
             return Err(format!("bundle: main '{}' is not among the entries", manifest.main));
         }
-        Ok(Bundle { manifest, files, order })
+        if !manifest.packages.is_empty() {
+            return Err("bundle: the manifest lists packages but the bundle has no package section".to_string());
+        }
+        Ok(Bundle { manifest, files, order, packages: Vec::new() })
+    }
+
+    /// v0.6.58 (§9): un bundle con la sección de paquetes. Sus hashes son los del manifiesto, en
+    /// el mismo orden; cada uno trae su `synsema.json`. Lo que lleva cada uno se verifica al armar
+    /// la tabla (el hash del árbol se recalcula sobre estos bytes), como desde el caché.
+    pub fn with_packages(mut manifest: Manifest, entries: Vec<(String, Vec<u8>)>, packages: Vec<BundledPackage>) -> Result<Bundle, String> {
+        let hashes: Vec<String> = packages.iter().map(|(h, _)| h.clone()).collect();
+        if !manifest.packages.is_empty() && manifest.packages != hashes {
+            return Err("bundle: the package section does not match the manifest".to_string());
+        }
+        manifest.packages = Vec::new();
+        let mut b = Bundle::new(manifest, entries)?;
+        // Ronda 3 (M-r3-1): una ruta repetida adentro de un paquete, o un paquete repetido, es la
+        // regla de `Bundle::new` en la sección de paquetes: el motor leería el primero y un
+        // verificador podría mostrar el otro.
+        let mut seen_hash = std::collections::HashSet::new();
+        for (h, files) in &packages {
+            if !seen_hash.insert(h.as_str()) {
+                return Err(format!("bundle: the package {} appears twice", h));
+            }
+            if !crate::modtable::is_tree_hash(h) || !files.iter().any(|(p, _)| p == "synsema.json") {
+                return Err(format!("bundle: package {} has no synsema.json", h));
+            }
+            if files.iter().any(|(p, _)| p.len() > u16::MAX as usize) {
+                return Err(format!("bundle: a path of package {} is too long", h));
+            }
+            let mut seen = std::collections::HashSet::new();
+            if let Some((p, _)) = files.iter().find(|(p, _)| !seen.insert(p.as_str())) {
+                return Err(format!("bundle: package {} has the path '{}' twice", h, p));
+            }
+        }
+        b.manifest.packages = hashes;
+        b.packages = packages;
+        Ok(b)
+    }
+
+    /// Los archivos de un paquete de la sección, por su hash.
+    pub fn package(&self, hash: &str) -> Option<&[(String, Vec<u8>)]> {
+        self.packages.iter().find(|(h, _)| h == hash).map(|(_, f)| f.as_slice())
     }
 
     pub fn get(&self, path: &str) -> Option<&[u8]> {
@@ -276,7 +385,7 @@ impl Bundle {
     /// `true` si el bundle tiene al menos una entrada bajo `dir/` (un mount estático
     /// declarado en el programa cuyos archivos viajan dentro del binario).
     pub fn has_prefix(&self, dir: &str) -> bool {
-        match normalize_name(dir) {
+        match mount_key(dir) {
             Some(d) if d.is_empty() => !self.order.is_empty(),
             Some(d) => {
                 let p = format!("{}/", d);
@@ -333,6 +442,22 @@ impl Bundle {
             out.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
             out.extend_from_slice(bytes);
         }
+        // v0.6.58: la sección de paquetes, sólo si hay (el manifiesto la anuncia).
+        // `n u32 | n × (hash_len u16 | hash | m u32 | m × (name_len u16 | name | len u64 | bytes))`.
+        if !self.packages.is_empty() {
+            out.extend_from_slice(&(self.packages.len() as u32).to_le_bytes());
+            for (hash, files) in &self.packages {
+                out.extend_from_slice(&(hash.len() as u16).to_le_bytes());
+                out.extend_from_slice(hash.as_bytes());
+                out.extend_from_slice(&(files.len() as u32).to_le_bytes());
+                for (name, bytes) in files {
+                    out.extend_from_slice(&(name.len() as u16).to_le_bytes());
+                    out.extend_from_slice(name.as_bytes());
+                    out.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+                    out.extend_from_slice(bytes);
+                }
+            }
+        }
         out
     }
 
@@ -362,21 +487,52 @@ impl Bundle {
             .map_err(|_| "bundle manifest is not UTF-8".to_string())?;
         let manifest = Manifest::from_json(manifest_src)?;
         let n = u32::from_le_bytes(take(&mut pos, 4)?.try_into().unwrap()) as usize;
-        let mut entries = Vec::with_capacity(n);
+        // B16 (ronda 1): `n` viene del payload; cada entrada ocupa al menos 10 bytes (largo del nombre y
+        // del contenido), así que la reserva no pasa de lo que queda: un `n` enorme da «truncated».
+        let mut entries = Vec::with_capacity(n.min(payload.len().saturating_sub(pos) / 10));
         for _ in 0..n {
             let name_len = u16::from_le_bytes(take(&mut pos, 2)?.try_into().unwrap()) as usize;
             let name = std::str::from_utf8(take(&mut pos, name_len)?)
                 .map_err(|_| "bundle entry name is not UTF-8".to_string())?
                 .to_string();
+            stored_name(&name)?;
             let len = u64::from_le_bytes(take(&mut pos, 8)?.try_into().unwrap());
             let len = usize::try_from(len).map_err(|_| "bundle: entry too large".to_string())?;
             let bytes = take(&mut pos, len)?.to_vec();
             entries.push((name, bytes));
         }
+        let mut packages: Vec<BundledPackage> = Vec::new();
+        if !manifest.packages.is_empty() {
+            // N10 (ronda 1): el payload terminó con las entradas: no es un bundle cortado, es uno sin la
+            // sección (el mismo texto que `Bundle::new`).
+            if pos == payload.len() {
+                return Err("bundle: the manifest lists packages but the bundle has no package section".to_string());
+            }
+            let n = u32::from_le_bytes(take(&mut pos, 4)?.try_into().unwrap()) as usize;
+            for _ in 0..n {
+                let hl = u16::from_le_bytes(take(&mut pos, 2)?.try_into().unwrap()) as usize;
+                let hash = std::str::from_utf8(take(&mut pos, hl)?).map_err(|_| "bundle package hash is not UTF-8".to_string())?.to_string();
+                let m = u32::from_le_bytes(take(&mut pos, 4)?.try_into().unwrap()) as usize;
+                let mut files = Vec::with_capacity(m.min(4096));
+                for _ in 0..m {
+                    let nl = u16::from_le_bytes(take(&mut pos, 2)?.try_into().unwrap()) as usize;
+                    let name = std::str::from_utf8(take(&mut pos, nl)?).map_err(|_| "bundle package path is not UTF-8".to_string())?.to_string();
+                    stored_name(&name)?;
+                    let len = u64::from_le_bytes(take(&mut pos, 8)?.try_into().unwrap());
+                    let len = usize::try_from(len).map_err(|_| "bundle: entry too large".to_string())?;
+                    files.push((name, take(&mut pos, len)?.to_vec()));
+                }
+                packages.push((hash, files));
+            }
+        }
         if pos != payload.len() {
             return Err("bundle: trailing bytes after the last entry".to_string());
         }
-        Bundle::new(manifest, entries)
+        if packages.is_empty() {
+            Bundle::new(manifest, entries)
+        } else {
+            Bundle::with_packages(manifest, entries, packages)
+        }
     }
 }
 
@@ -419,6 +575,28 @@ pub fn detect(exe: &Path) -> Result<Detected, String> {
     Ok(Detected::Bundle(bundle))
 }
 
+/// v0.6.58 (§12): un bundle entero en memoria (`payload ‖ trailer`, lo que [`Bundle::serialize`]
+/// escribe), con las mismas verificaciones que [`detect`]: el magic, que los largos cierren con el
+/// tamaño y el sha256 del payload. Es lo que lleva el slot `APPSLOT2` del guest de Vela: ahí no hay
+/// ejecutable adelante, así que el `offset` del trailer es 0.
+pub fn from_serialized(bytes: &[u8]) -> Result<Bundle, String> {
+    let total = bytes.len() as u64;
+    if total < TRAILER_LEN || &bytes[bytes.len() - 16..] != MAGIC {
+        return Err("not a Synsema bundle (no SYNSEMA-BUNDLE-1 trailer)".to_string());
+    }
+    let trailer = &bytes[bytes.len() - TRAILER_LEN as usize..];
+    let offset = u64::from_le_bytes(trailer[0..8].try_into().unwrap());
+    let payload_len = u64::from_le_bytes(trailer[8..16].try_into().unwrap());
+    if offset != 0 || payload_len.checked_add(TRAILER_LEN) != Some(total) {
+        return Err("bundle corrupt (trailer offsets do not match its size)".to_string());
+    }
+    let payload = &bytes[..payload_len as usize];
+    if Sha256::digest(payload)[..] != trailer[16..48] {
+        return Err("bundle corrupt (sha256 mismatch)".to_string());
+    }
+    Bundle::parse(payload).map_err(|e| format!("bundle corrupt ({})", e))
+}
+
 /// ¿Este ejecutable ya lleva un bundle? (sin verificar el sha: sólo el magic).
 pub fn is_built(exe: &Path) -> bool {
     let Ok(mut f) = std::fs::File::open(exe) else { return false };
@@ -447,6 +625,11 @@ pub fn get(path: &str) -> Option<&'static [u8]> {
     MOUNTED.get().and_then(|b| b.get(path))
 }
 
+/// v0.6.58 (§9): un paquete de la sección del bundle montado, por su hash.
+pub fn package(hash: &str) -> Option<&'static [(String, Vec<u8>)]> {
+    MOUNTED.get().and_then(|b| b.package(hash))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -462,7 +645,45 @@ mod tests {
             mode: BundleMode::Run,
             serve: None,
             audit: None,
+            packages: Vec::new(),
         }
+    }
+
+    /// v0.6.58 (§12): un bundle en memoria (el slot `APPSLOT2`) se lee con las verificaciones de
+    /// `detect`: el offset tiene que ser 0, los largos cerrar y el sha256 del payload coincidir.
+    #[test]
+    fn from_serialized_checks_like_detect() {
+        let b = Bundle::new(manifest(), vec![("lamp.syn".into(), b"print(1)\n".to_vec())]).unwrap();
+        let bytes = b.serialize(0);
+        let back = from_serialized(&bytes).unwrap();
+        assert_eq!(back.get("lamp.syn"), Some(&b"print(1)\n"[..]));
+        // Detrás de un ejecutable (offset ≠ 0) no es un slot.
+        assert!(from_serialized(&b.serialize(7)).unwrap_err().contains("trailer offsets"));
+        let mut changed = bytes.clone();
+        changed[10] ^= 1;
+        assert!(from_serialized(&changed).unwrap_err().contains("sha256 mismatch"));
+        assert!(from_serialized(&bytes[1..]).unwrap_err().contains("trailer offsets"));
+        assert!(from_serialized(b"short").unwrap_err().contains("not a Synsema bundle"));
+    }
+
+    /// v0.6.58 (B4): la carpeta raíz de un mount (`static "/" from "."`) tiene clave: la vacía.
+    /// Antes `normalize_name(".")` daba `None` y el mount del binario caía al disco.
+    #[test]
+    fn the_root_of_a_static_mount_is_in_the_bundle() {
+        for root in [".", "./", "", ".\\", "./."] {
+            assert_eq!(mount_key(root).as_deref(), Some(""), "{:?}", root);
+        }
+        assert_eq!(mount_key("./public/").as_deref(), Some("public"));
+        assert_eq!(mount_key("/"), None);
+        assert_eq!(mount_key("../x"), None);
+        // N10 (ronda 1): lo que vuelve a la raíz es la raíz; lo que sale, nada.
+        assert_eq!(mount_key("a/..").as_deref(), Some(""));
+        assert_eq!(mount_key("a/../b").as_deref(), Some("b"));
+        assert_eq!(mount_key("a/../.."), None);
+        assert_eq!(mount_key("C:/x"), None);
+        let b = Bundle::new(manifest(), vec![("lamp.syn".into(), b"print(1)\n".to_vec())]).unwrap();
+        assert!(b.has_prefix("."));
+        assert!(!b.has_prefix("./public"));
     }
 
     /// Un manifest `run` no escribe `mode`/`serve` (byte a byte el de v0.6.14); uno `serve`
@@ -535,12 +756,97 @@ mod tests {
         assert_eq!(back.list("").len(), 3);
     }
 
+    /// N10 (ronda 1): un manifiesto con paquetes y un payload sin la sección lo dice, no «truncated».
+    #[test]
+    fn packages_without_their_section_say_so() {
+        let b = Bundle::new(manifest(), vec![("lamp.syn".into(), b"print(1)\n".to_vec())]).unwrap();
+        let mut m = manifest();
+        m.packages = vec![format!("tree-sha256:{}", "0".repeat(64))];
+        let mj = m.to_json();
+        let mut payload = (mj.len() as u32).to_le_bytes().to_vec();
+        payload.extend_from_slice(mj.as_bytes());
+        let old = b.payload();
+        let oldm = u32::from_le_bytes(old[0..4].try_into().unwrap()) as usize;
+        payload.extend_from_slice(&old[4 + oldm..]);
+        assert_eq!(Bundle::parse(&payload).err().as_deref(), Some("bundle: the manifest lists packages but the bundle has no package section"));
+    }
+
+    /// B16 (ronda 1): un `n` de entradas enorme con el payload chico es «truncated», no un pánico al
+    /// reservar.
+    #[test]
+    fn a_huge_entry_count_is_truncated_not_a_panic() {
+        let b = Bundle::new(manifest(), vec![("lamp.syn".into(), b"print(1)\n".to_vec())]).unwrap();
+        let mut payload = b.payload();
+        let m = u32::from_le_bytes(payload[0..4].try_into().unwrap()) as usize;
+        payload[4 + m..8 + m].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert_eq!(Bundle::parse(&payload).err().as_deref(), Some("bundle: truncated"));
+    }
+
     #[test]
     fn entry_name_with_dotdot_rejected() {
         let r = Bundle::new(manifest(), vec![("lamp.syn".into(), vec![]), ("../x".into(), vec![])]);
         assert!(r.is_err());
         let r = Bundle::new(manifest(), vec![("lamp.syn".into(), vec![]), ("/etc/passwd".into(), vec![])]);
         assert!(r.is_err());
+    }
+
+    /// Ronda 2 (M-r2-3): un nombre sin normalizar o repetido no entra (con `lamp.syn` y
+    /// `./lamp.syn` el motor corría uno y un verificador veía el otro), tampoco al leer un slot.
+    #[test]
+    fn a_name_that_is_not_normalized_or_appears_twice_is_rejected() {
+        let honest = ("lamp.syn".to_string(), b"print(1)\n".to_vec());
+        let r = Bundle::new(manifest(), vec![honest.clone(), ("./lamp.syn".into(), b"print(2)\n".to_vec())]);
+        assert_eq!(r.err().as_deref(), Some("bundle: the entry './lamp.syn' appears twice"));
+        let r = Bundle::new(manifest(), vec![honest.clone(), honest.clone()]);
+        assert_eq!(r.err().as_deref(), Some("bundle: the entry 'lamp.syn' appears twice"));
+        // Al leer (el slot del guest, un `.built`): un nombre escrito en otra forma no se reescribe.
+        let b = Bundle::new(manifest(), vec![honest, ("x/y.syn".into(), b"print(2)\n".to_vec())]).unwrap();
+        let bytes = b.serialize(1000);
+        let payload_len = u64::from_le_bytes(bytes[bytes.len() - 56..bytes.len() - 48].try_into().unwrap()) as usize;
+        let mut payload = bytes[..payload_len].to_vec();
+        assert!(Bundle::parse(&payload).is_ok());
+        let at = payload.windows(7).position(|w| w == b"x/y.syn").unwrap();
+        for (form, says) in [(&b"./y.syn"[..], "'./y.syn'"), (b"x\\y.syn", "'x\\y.syn'"), (b"x/../ys", "'x/../ys'")] {
+            payload[at..at + 7].copy_from_slice(form);
+            let e = Bundle::parse(&payload).err().unwrap();
+            assert_eq!(e, format!("bundle: entry name {} is not normalized", says));
+        }
+    }
+
+    #[test]
+    fn a_package_with_a_path_twice_or_twice_in_the_section_is_rejected() {
+        // Ronda 3 (M-r3-1): lo que arma `build` (cada ruta una vez) se lee; una ruta repetida adentro
+        // de un paquete, o el mismo paquete dos veces, no (al armar y al leer el slot).
+        let h = format!("tree-sha256:{}", "a".repeat(64));
+        let app = vec![("lamp.syn".to_string(), b"print(1)\n".to_vec())];
+        let honest = vec![("synsema.json".to_string(), b"{}".to_vec()), ("m.syn".to_string(), b"export let P be 1\n".to_vec())];
+        let mut m = manifest();
+        m.packages = vec![h.clone()];
+        let b = Bundle::with_packages(m.clone(), app.clone(), vec![(h.clone(), honest.clone())]).unwrap();
+        let bytes = b.serialize(0);
+        let payload_len = u64::from_le_bytes(bytes[bytes.len() - 56..bytes.len() - 48].try_into().unwrap()) as usize;
+        assert!(Bundle::parse(&bytes[..payload_len]).is_ok());
+
+        let mut dup = honest.clone();
+        dup.push(("m.syn".to_string(), b"export let P be \"senuelo\"\n".to_vec()));
+        let e = Bundle::with_packages(m.clone(), app.clone(), vec![(h.clone(), dup.clone())]).err().unwrap();
+        assert_eq!(e, format!("bundle: package {} has the path 'm.syn' twice", h));
+        let mut m2 = manifest();
+        m2.packages = vec![h.clone(), h.clone()];
+        let e = Bundle::with_packages(m2, app.clone(), vec![(h.clone(), honest.clone()), (h.clone(), honest.clone())]).err().unwrap();
+        assert_eq!(e, format!("bundle: the package {} appears twice", h));
+
+        // Al leer: el payload con la sección escrita a mano (un `m.syn` más al final del paquete).
+        let mut payload = bytes[..payload_len].to_vec();
+        let count_at = payload.windows(h.len()).rposition(|w| w == h.as_bytes()).unwrap() + h.len();
+        let n = u32::from_le_bytes(payload[count_at..count_at + 4].try_into().unwrap());
+        payload[count_at..count_at + 4].copy_from_slice(&(n + 1).to_le_bytes());
+        let extra = b"export let P be \"senuelo\"\n";
+        payload.extend_from_slice(&(5u16).to_le_bytes());
+        payload.extend_from_slice(b"m.syn");
+        payload.extend_from_slice(&(extra.len() as u64).to_le_bytes());
+        payload.extend_from_slice(extra);
+        assert_eq!(Bundle::parse(&payload).err().unwrap(), format!("bundle: package {} has the path 'm.syn' twice", h));
     }
 
     #[test]

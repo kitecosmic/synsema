@@ -710,6 +710,9 @@ pub(crate) enum GlobalVal {
         /// Ronda 6 (N1): los nombres libres, si el original ya los calculó. La copia los hereda y no
         /// vuelve a recorrer el cuerpo (un `parallel_map` dentro de cada item de otro).
         free_names: Option<std::sync::Arc<HashSet<String>>>,
+        /// v0.6.58 (§6.4): la marca de la task (el paquete que la escribió). La tabla del proceso es
+        /// una sola y los workers la comparten, así que el índice vale del otro lado.
+        mark: u32,
     },
     /// v0.6.50 (B): una task exportada por una tool de confianza (el builtin que la envuelve). Viaja
     /// la task y el entorno de la tool (por id, una vez por foto, como un `Module`); del otro lado
@@ -719,7 +722,7 @@ pub(crate) enum GlobalVal {
         export: String,
         task: Box<GlobalVal>,
         env_id: String,
-        env: Option<Vec<(String, GlobalVal)>>,
+        env: Option<ModEnv>,
     },
     /// v0.6.50 (B): la vista de una tool (`use "trusted:t" as t`): del otro lado se registra como
     /// vista (`set t.X` es error) y queda en el caché de módulos.
@@ -756,7 +759,7 @@ pub(crate) enum GlobalVal {
         /// `Some(bindings)` SOLO en el primer encuentro del módulo en el árbol de
         /// snapshot (TODAS las bindings: exportadas + internas + `let`s); `None` en los
         /// siguientes (referencia por `id` al registro del rebuild).
-        env: Option<Vec<(String, GlobalVal)>>,
+        env: Option<ModEnv>,
     },
     /// Un map de DATOS cuyas entradas incluyen tasks/closures (p.ej. un callback en un
     /// map de config) pero que NO es un módulo importado. Se conserva como variante aparte
@@ -880,7 +883,7 @@ pub(crate) enum TaskRoot {
     Global,
     /// Cuelga del env de un módulo (`module:<id>`). Ronda 2 (R2, M1): el env viaja con la task si
     /// todavía no viajó en esta foto, así que no depende del orden de los `use`.
-    Module { id: String, env: Option<Vec<(String, GlobalVal)>> },
+    Module { id: String, env: Option<ModEnv> },
     /// Otra raíz (un fork, un template): cierra donde se reconstruye, como antes.
     Here,
 }
@@ -913,9 +916,23 @@ fn frame_bindings(f: &Rc<RefCell<Environment>>, names: &HashSet<String>, state: 
     Some(entries)
 }
 
+/// El entorno de un módulo en la foto: sus bindings y, si es de un paquete, su dueño (marca y
+/// nombre). v0.6.58 (§6.1, K31): del otro lado se registra como del paquete, así que sus
+/// exportaciones siguen siendo de sólo lectura en el worker. El dueño viaja como dato; nunca se
+/// deduce del id.
+pub(crate) struct ModEnv {
+    entries: Vec<(String, GlobalVal)>,
+    pkg: Option<(u32, String)>,
+}
+
 /// Las bindings de un env para la foto (sin los builtins, que cada intérprete tiene), marcado en
 /// curso mientras se recorren; `None` si ya viaja (o viajó) en este árbol.
-fn env_bindings(env: &Rc<RefCell<Environment>>, state: &mut SnapState) -> Option<Vec<(String, GlobalVal)>> {
+fn env_bindings(env: &Rc<RefCell<Environment>>, state: &mut SnapState) -> Option<ModEnv> {
+    let pkg = synsema_core::interpreter::package_owner_of_env(env).map(|(m, n)| (m, n.to_string()));
+    env_entries(env, state).map(|entries| ModEnv { entries, pkg })
+}
+
+fn env_entries(env: &Rc<RefCell<Environment>>, state: &mut SnapState) -> Option<Vec<(String, GlobalVal)>> {
     let key = Rc::as_ptr(env) as usize;
     if state.in_progress.contains(&key) || state.done.contains(&key) {
         return None;
@@ -975,6 +992,7 @@ fn task_global(t: &Rc<SynTaskValue>, state: &mut SnapState) -> GlobalVal {
         root,
         frames,
         free_names: t.free_names.get().cloned(),
+        mark: t.mark,
     }
 }
 
@@ -1152,7 +1170,7 @@ impl Bases {
 /// `reconstruct_task` de `parallel_map` (task aplicada, DE-030).
 pub(crate) fn rebuild_module_env(
     id: &str,
-    env: &[(String, GlobalVal)],
+    snap: &ModEnv,
     base: &Bases,
     registry: &mut ModuleRegistry,
     scope: Option<&synsema_core::frozen::ScopeCtx>,
@@ -1171,7 +1189,10 @@ pub(crate) fn rebuild_module_env(
     // Registrar ANTES de poblar: un map interno auto-referencial (TOOL_ALLOW — DE-032)
     // que aparezca durante la población resuelve a ESTE env en construcción.
     registry.insert(id.to_string(), module_env.clone());
-    for (k, gv) in env {
+    if let Some((mark, name)) = &snap.pkg {
+        synsema_core::interpreter::register_package_module(&module_env, *mark, name);
+    }
+    for (k, gv) in &snap.entries {
         let v = rebuild_global_val(gv, &module_env, base, registry, scope);
         module_env.borrow_mut().bindings.insert(k.clone(), v);
     }
@@ -1207,7 +1228,7 @@ pub(crate) fn rebuild_global_val(
         GlobalVal::Value(sv) => from_send(sv),
         GlobalVal::Frozen(f) => f.get(),
         GlobalVal::Scoped(i) => scope.expect("un valor con alcance se reconstruye dentro de su alcance").get(*i),
-        GlobalVal::Task { name, parameters, body, required_capabilities, root, frames, free_names } => {
+        GlobalVal::Task { name, parameters, body, required_capabilities, root, frames, free_names, mark } => {
             // Ronda 1 (A1) y ronda 2 (R2): cierra en su cadena, no donde está guardada. El módulo de
             // la raíz viene inline la primera vez en la foto o ya está en el registro; si no está en
             // ningún lado, un env vacío de ese módulo (el nombre falta; nunca el de otro módulo).
@@ -1245,6 +1266,7 @@ pub(crate) fn rebuild_global_val(
                 required_capabilities: required_capabilities.clone(),
                 code: Default::default(),
                 free_names: free_names.clone().map(std::cell::OnceCell::from).unwrap_or_default(),
+                mark: *mark,
             }))
         }
         GlobalVal::Module { id, is_alias, alias, env } => {
@@ -2696,6 +2718,7 @@ fn serve_continuation(
             .name(format!("approval:{}", s.id))
             .stack_size(APPROVAL_TASK_STACK)
             .spawn(move || {
+                synsema_core::stack::enter_thread(APPROVAL_TASK_STACK);
                 let _run = run.as_ref().map(|r| r.enter());
                 // La cola ya no existe: el serve terminó entre que se sacó la pendiente y acá. La
                 // pendiente vuelve al archivo y la resuelve la próxima corrida (G-4).
@@ -3140,7 +3163,7 @@ fn build_host_table(
             // servía el disco sin que el preámbulo lo dijera). Una carpeta que viaja dentro del
             // binario de `synsema build` es parte del programa y no lo pide, como `read_file`.
             let bundled = synsema_core::bundle::mounted()
-                .and_then(|b| synsema_core::bundle::normalize_name(&dir).map(|k| b.has_prefix(&k)))
+                .map(|b| b.has_prefix(&dir))
                 .unwrap_or(false);
             if !bundled {
                 let scope = format!("{}/**", dir.trim_end_matches(['/', '\\']));
@@ -3151,14 +3174,16 @@ fn build_host_table(
                         prefix_str, dir, scope
                     ))));
                 }
-                // v0.6.46: un `deny` que alcanza la carpeta entera deja el mount sin nada que servir:
-                // se dice al arrancar. Uno de adentro se mira por request (`server::static_denied`).
-                if let Some(d) = static_root_denied(&dir, denied_snap) {
-                    return Err(Control::Error(RuntimeError::new(format!(
-                        "static \"{}\" from \"{}\": this run denies reading that folder (deny {}, set by the host); serve another folder",
-                        prefix_str, dir, d
-                    ))));
-                }
+            }
+            // v0.6.46: un `deny` que alcanza la carpeta entera deja el mount sin nada que servir:
+            // se dice al arrancar. Uno de adentro se mira por request (`server::static_denied`).
+            // v0.6.58 (M7, ronda 1): también para una carpeta del bundle: el `deny` es del host que
+            // corre el binario, y lo del bundle no lo saltea.
+            if let Some(d) = static_root_denied(&dir, denied_snap) {
+                return Err(Control::Error(RuntimeError::new(format!(
+                    "static \"{}\" from \"{}\": this run denies reading that folder (deny {}, set by the host); serve another folder",
+                    prefix_str, dir, d
+                ))));
             }
             // `cache "<spec>"` → valor Cache-Control, validado ACÁ (arranque), nunca
             // en un request.
@@ -3192,7 +3217,7 @@ fn build_host_table(
                 dir,
                 cache: cache_val,
                 fallback: fallback_val,
-                deny: if bundled { Vec::new() } else { denied_snap.to_vec() },
+                deny: denied_snap.to_vec(),
             });
         }
     }
@@ -3724,7 +3749,7 @@ fn run_mounted_route(
         };
         let parent = task.closure_env.clone();
         interp.set_cancel_token(ctx.cancel.clone());
-        match interp.run_request_block_in(&task.body, request_bindings(ctx), &parent) {
+        match interp.run_request_block_marked(&task.body, request_bindings(ctx), &parent, task.mark) {
             Ok(_) => GiveOutcome::Give(None),
             Err(Control::Give(v)) => {
                 mark_if_response_refused(interp, &v);
@@ -3817,7 +3842,7 @@ fn run_mounted_stream(
             }
         }));
         let parent = task.closure_env.clone();
-        match interp.run_request_block_in(&task.body, request_bindings(ctx), &parent) {
+        match interp.run_request_block_marked(&task.body, request_bindings(ctx), &parent, task.mark) {
             Err(Control::Give(SynValue::Server(s))) if matches!(&*s, ServerValue::WithHeaders { .. }) => {
                 StreamEnd::Error(
                     "streaming responses do not accept with_header/set_cookie yet \
@@ -3893,7 +3918,7 @@ fn run_mounted_socket(
             })
             .collect();
         let parent = task.closure_env.clone();
-        let end = match interp.run_request_block_in(&flat, bindings, &parent) {
+        let end = match interp.run_request_block_marked(&flat, bindings, &parent, task.mark) {
             Ok(_) | Err(Control::Give(_)) | Err(Control::Stop(_)) => StreamEnd::Done,
             Err(Control::Error(e)) => StreamEnd::Error(e.to_string_for_client()),
         };
@@ -4843,6 +4868,10 @@ fn serve_inner(source: &str, filename: &str, secure: bool, overrides: ServeOverr
     // programa (par P-256 efímero + documento de la plataforma que ata sha256(spki ‖
     // program_sha)). Si la plataforma no responde, el servidor no arranca: error claro, nunca
     // Un serve "atestado" sin documento.
+    // v0.6.58 (A2 de la ronda 1): bajo `--attested`, la identidad y la corrida usan la MISMA tabla
+    // (una sola lectura del caché, §1): se arma acá, sus paquetes van a `config_sha`, y se instala en
+    // la corrida antes de la primera sentencia.
+    let mut attested_table: Option<std::sync::Arc<synsema_core::modtable::ModTable>> = None;
     if overrides.attested {
         // T5 — un `serve --attested` corre SIEMPRE con etiquetas de flujo. Hasta la ronda 3 eso lo
         // hacía sólo `cmd_serve` al parsear la flag, así que cualquier OTRO front-end que use esta
@@ -4903,6 +4932,16 @@ fn serve_inner(source: &str, filename: &str, secure: bool, overrides: ServeOverr
             },
             // Los llena `build_attested_identity` con los drivers elegidos (T4).
             drivers: Vec::new(),
+            // v0.6.58 (§13, D-15, R11): los paquetes del programa entran en `config_sha`.
+            modules: match synsema_core::modtable::table_for(source, filename) {
+                Ok(t) => {
+                    let t = t.map(std::sync::Arc::new);
+                    let m = t.as_ref().and_then(|t| t.run_modules()).map(|m| m.to_json());
+                    attested_table = t;
+                    m
+                }
+                Err(e) => return RunResult { success: false, output: Vec::new(), errors: vec![format!("Runtime error: {}", e)], ..Default::default() },
+            },
         };
         match synsema_stdlib::attest::build_attested_identity(source, filename, config)
             .and_then(synsema_stdlib::attest::install_attested_identity)
@@ -4915,6 +4954,10 @@ fn serve_inner(source: &str, filename: &str, secure: bool, overrides: ServeOverr
     }
 
     let mut interp = Interpreter::new();
+    if let Some(t) = attested_table {
+        interp.run_scope().ext::<synsema_core::modtable::TableSlot>().install(Ok(t.clone()));
+        synsema_core::modtable::note_run_table(filename, &t);
+    }
     let caps = Rc::new(RefCell::new(CapabilitySet::new("program")));
 
     // ── Memoria + progress compartidos entre el top-level y todos los handlers ──
@@ -5450,6 +5493,7 @@ let fs be mk(3)
             required_capabilities: Vec::new(),
             code: Default::default(),
             free_names: Default::default(),
+            mark: 0,
         });
         let n = synsema_core::interpreter::task_free_names(&t);
         assert!(n.contains("k"));

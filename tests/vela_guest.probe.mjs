@@ -22,6 +22,7 @@
 import { readFile } from "node:fs/promises";
 import { closeSync, mkdtempSync, openSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
+import { createHash } from "node:crypto";
 import { join } from "node:path";
 import { WASI } from "node:wasi";
 
@@ -55,24 +56,63 @@ for (const name of ["memory", "allocate", "deallocate", "load_module", "deploy",
 }
 check(!exportNames.has("_start"), "no _start (a reactor, not a WASI command)");
 
-// 3. El slot de la app: magic (16) · largo del nombre (1) · nombre (63) · largo u32 LE (4) ·
-// programa · relleno. Reescribirlo en el archivo es lo que hace tools/embed.syn, sin compilador.
-const SLOT_MAGIC = Buffer.from("SYNSEMA.APPSLOT1");
+// 3. El slot de la app (v0.6.58): magic SYNSEMA.APPSLOT2 (16) · largo u32 LE (4) · un bundle de
+// `synsema build` (payload ‖ trailer) · relleno. Reescribirlo en el archivo es lo que hace
+// tools/embed.syn, sin compilador. El guest también lee el slot de antes (APPSLOT1, el programa en
+// texto): `embedOld` lo escribe como el embed.syn de v0.6.57 (W7).
+const SLOT_MAGIC = Buffer.from("SYNSEMA.APPSLOT2");
+const OLD_MAGIC = Buffer.from("SYNSEMA.APPSLOT1");
 const SLOT_SIZE = 524288;
-const SLOT_HEADER = 16 + 1 + 63 + 4;
-function embed(original, program, name) {
-  const out = Buffer.from(original);
+const SLOT_HEADER = 16 + 4;
+const OLD_HEADER = 16 + 1 + 63 + 4;
+const u16 = (n) => { const b = Buffer.alloc(2); b.writeUInt16LE(n); return b; };
+const u32 = (n) => { const b = Buffer.alloc(4); b.writeUInt32LE(n); return b; };
+const u64 = (n) => { const b = Buffer.alloc(8); b.writeBigUInt64LE(BigInt(n)); return b; };
+const entry = (name, bytes) => Buffer.concat([u16(Buffer.byteLength(name)), Buffer.from(name), u64(bytes.length), bytes]);
+// Un bundle como lo escribe `synsema build`: `entries` = [[ruta, texto]], `packages` = [[hash, [[ruta, texto]]]].
+function bundleOf(main, entries, packages = []) {
+  const manifest = { format: 1, engine: "probe", main, ceiling: null, profile: "native", built_at: "" };
+  if (packages.length) manifest.packages = packages.map(([h]) => h);
+  const m = Buffer.from(JSON.stringify(manifest));
+  const parts = [u32(m.length), m, u32(entries.length), ...entries.map(([n, t]) => entry(n, Buffer.from(t)))];
+  if (packages.length) {
+    parts.push(u32(packages.length));
+    for (const [h, files] of packages) parts.push(u16(h.length), Buffer.from(h), u32(files.length), ...files.map(([n, t]) => entry(n, Buffer.from(t))));
+  }
+  const payload = Buffer.concat(parts);
+  const sha = createHash("sha256").update(payload).digest();
+  return Buffer.concat([payload, u64(0), u64(payload.length), sha, Buffer.from("SYNSEMA-BUNDLE-1")]);
+}
+function slotAt(out) {
   const off = out.indexOf(SLOT_MAGIC);
   if (off < 0 || out.indexOf(SLOT_MAGIC, off + 1) >= 0) throw new Error("expected exactly one app slot in the module");
-  const body = Buffer.from(program, "utf8");
-  if (body.length > SLOT_SIZE - SLOT_HEADER) throw new Error("program too big for the slot");
+  return off;
+}
+function embedRaw(original, bundle) {
+  const out = Buffer.from(original);
+  const off = slotAt(out);
+  if (bundle.length > SLOT_SIZE - SLOT_HEADER) throw new Error("bundle too big for the slot");
   const slot = Buffer.alloc(SLOT_SIZE, 0x20);
   SLOT_MAGIC.copy(slot, 0);
+  slot.writeUInt32LE(bundle.length, 16);
+  bundle.copy(slot, SLOT_HEADER);
+  slot.copy(out, off);
+  return out;
+}
+function embed(original, program, name) {
+  return embedRaw(original, bundleOf(name, [[name, program]]));
+}
+function embedOld(original, program, name) {
+  const out = Buffer.from(original);
+  const off = slotAt(out);
+  const body = Buffer.from(program, "utf8");
+  const slot = Buffer.alloc(SLOT_SIZE, 0x20);
+  OLD_MAGIC.copy(slot, 0);
   const n = Buffer.from(name, "utf8").subarray(0, 63);
   slot[16] = n.length;
   n.copy(slot, 17);
   slot.writeUInt32LE(body.length, 80);
-  body.copy(slot, SLOT_HEADER);
+  body.copy(slot, OLD_HEADER);
   slot.copy(out, off);
   return out;
 }
@@ -460,6 +500,83 @@ const tde = note("tamper", t.process(2, ALICE, 2, "{}", tpstate0));
 check(!("_vela" in JSON.parse(b64(tde.json.report))), "deanonymize's report (the whole state as the app sees it) has no _vela");
 check(fuels.tamper.size === 1 && fuels.tamper.has("0x7"), `one fuel for the embedded program too: ${[...fuels.tamper].join(", ")}`);
 t.close();
+
+
+// v0.6.58 (§12): el slot lleva un bundle con el programa, su synsema.json y sus paquetes (W4);
+// el slot de antes sigue andando (W7); y un slot que no se puede leer es un error que lo dice (W8b).
+console.log("== v0.6.58: packages in the app slot (W4), the old slot (W7), an unreadable slot (W8b)");
+{
+  for (const k of ["w4", "w4b", "w7", "w8b"]) fuels[k] = new Set();
+  const sha = (t) => createHash("sha256").update(t, "utf8").digest("hex");
+  const files = { "m.syn": 'export task cual()\n    give "from a package"\n' };
+  const index = JSON.stringify({ id: "example.com/tok", version: "0.1.0", main: "m.syn", files: Object.entries(files).map(([path, t]) => ({ path, sha256: sha(t) })) }, null, 2);
+  const lines = [...Object.entries(files).map(([p, t]) => `${sha(t)}  ${p}\n`), `${sha(index)}  synsema.json\n`].sort((a, b) => Buffer.compare(Buffer.from(a), Buffer.from(b)));
+  const hash = "tree-sha256:" + createHash("sha256").update(lines.join(""), "utf8").digest("hex");
+  const project = JSON.stringify({ synsema: "0.6.58", modules: { tok: { url: "https://example.com/tok", id: "example.com/tok", version: "0.1.0", hash } } });
+  const APP = 'use "tok" as tok\n\ntask deploy(ctx)\n    give {"state": {"t": tok.cual()}}\n';
+  const pkgFiles = [["synsema.json", index], ...Object.entries(files)];
+  const w4 = await boot(embedRaw(bytes, bundleOf("app.syn", [["app.syn", APP], ["synsema.json", project]], [[hash, pkgFiles]])), "w4");
+  const w4d = note("w4", w4.deploy(3, ""));
+  check(w4d.json.error === undefined && JSON.parse(b64(w4d.json.state)).t === "from a package", `W4: the app in the slot uses its package: ${w4d.text.slice(0, 120)}`);
+  w4.close();
+  // El mismo bundle con un byte del paquete cambiado: no corre, y el log dice por qué.
+  const bad = pkgFiles.map(([n, t]) => [n, n === "m.syn" ? t.replace("package", "packagE") : t]);
+  const w4b = await boot(embedRaw(bytes, bundleOf("app.syn", [["app.syn", APP], ["synsema.json", project]], [[hash, bad]])), "w4b");
+  const w4bd = note("w4b", w4b.deploy(3, ""));
+  check(w4bd.json.error === "runtime_error" && w4b.logs().includes("do not match their hash"), `W4: a changed byte in a package does not run: ${w4bd.text.slice(0, 80)}`);
+  w4b.close();
+  // Ronda 3 (M-r3-1): el paquete bueno con un segundo m.syn al final. El guest corría el primero y
+  // verify.syn mostraba el último; ahora el bundle no se lee.
+  const twice = [...pkgFiles, ["m.syn", 'export task cual()\n    give "senuelo"\n']];
+  const w4c = await boot(embedRaw(bytes, bundleOf("app.syn", [["app.syn", APP], ["synsema.json", project]], [[hash, twice]])), "w4c");
+  const w4cd = note("w4b", w4c.deploy(3, ""));
+  check(w4cd.json.error === "runtime_error" && !w4cd.text.includes("from a package"), `M-r3-1: a package with m.syn twice does not run: ${w4cd.text.slice(0, 80)}`);
+  check(w4c.logs().includes("has the path 'm.syn' twice"), `M-r3-1: the log says why: ${w4c.logs().split("\n").filter((l) => l.includes("app slot")).slice(0, 1)}`);
+  w4c.close();
+  // W7: un slot APPSLOT1 (el embed.syn de v0.6.57) anda como antes.
+  const OLD_APP = 'task deploy(ctx)\n    give {"state": {"v": "the old slot"}}\n';
+  const w7 = await boot(embedOld(bytes, OLD_APP, "viejo.syn"), "w7");
+  const w7d = note("w7", w7.deploy(4, ""));
+  check(w7d.json.error === undefined && JSON.parse(b64(w7d.json.state)).v === "the old slot", `W7: an APPSLOT1 slot still runs: ${w7d.text.slice(0, 80)}`);
+  check(w7.logs().includes("viejo.syn"), "W7: the old slot's name reaches the log");
+  w7.close();
+  // W8b: un APPSLOT2 con algo que no es un bundle: ni load_module ni deploy corren un programa vacío.
+  const w8 = await boot(embedRaw(bytes, Buffer.from("this is not a bundle")), "w8b");
+  const w8l = note("w8b", w8.loadModule(5));
+  const w8d = note("w8b", w8.deploy(5, ""));
+  check(w8l.json.error === "runtime_error" && w8d.json.error === "runtime_error", `W8b: an unreadable slot is an error: ${w8d.text.slice(0, 80)}`);
+  check(w8.logs().includes("the app slot holds a bundle that cannot be used (not a Synsema bundle"), `W8b: the log says what the slot holds: ${w8.logs().split("\n").filter((l) => l.includes("app slot")).slice(0, 1)}`);
+  w8.close();
+  // Ronda 2 (M-r2-3): `app.syn` y `./app.syn` en el mismo slot. El guest corría la última y
+  // `verify.syn` mostraba la primera; ahora el bundle no se lee.
+  const HONEST = 'task deploy(ctx)\n    give {"state": {"t": "honesto"}}\n';
+  const EVIL = 'task deploy(ctx)\n    give {"state": {"t": "MALO"}}\n';
+  const dup = await boot(embedRaw(bytes, bundleOf("app.syn", [["app.syn", HONEST], ["./app.syn", EVIL]])), "dup");
+  const dupd = note("w8b", dup.deploy(6, ""));
+  check(dupd.json.error === "runtime_error" && !dupd.text.includes("MALO"), `M-r2-3: a slot with app.syn and ./app.syn does not run: ${dupd.text.slice(0, 80)}`);
+  check(dup.logs().includes("is not normalized"), `M-r2-3: the log says why: ${dup.logs().split("\n").filter((l) => l.includes("app slot")).slice(0, 1)}`);
+  dup.close();
+  // Ronda 4 (M-r4-1): con las etiquetas el guest corre todo por la referencia, que baja una función
+  // de Rust por bloque: una task recursiva daba `RangeError` de Node antes del límite (con un literal
+  // de 40 000 elementos a las 599 llamadas; con 10 `when` anidados a las 126) y deploy no respondía.
+  // Ahora cada llamada cobra lo que anida su cuerpo y da el error de recursión.
+  fuels.rec = new Set();
+  const bigLit = "[" + Array.from({ length: 40000 }, () => "0").join(", ") + "]";
+  const REC = `task h(n)\n    let big be ${bigLit}\n    when n == 0\n        give 0\n    give h(n - 1) + 1\n\ntask deploy(ctx)\n    give {"state": {"t": h(599)}}\n`;
+  const rec = await boot(embedRaw(bytes, bundleOf("app.syn", [["app.syn", REC]])), "rec");
+  let recd;
+  try { recd = note("rec", rec.deploy(7, "")); } catch (e) { recd = { json: {}, text: "THROW " + String(e) }; }
+  check(recd.json.error === "runtime_error" && rec.logs().includes("maximum recursion depth exceeded"), `M-r4-1: a recursion through a big body is the recursion error, not the host's stack: ${recd.text.slice(0, 80)}`);
+  rec.close();
+  fuels.nest = new Set();
+  const whens = Array.from({ length: 10 }, (_, i) => "    ".repeat(i + 1) + "when true\n").join("");
+  const NEST = `task h(n)\n    when n == 0\n        give 0\n${whens}${"    ".repeat(11)}give h(n - 1) + 1\n    give -1\n\ntask deploy(ctx)\n    give {"state": {"t": h(300)}}\n`;
+  const nest = await boot(embedRaw(bytes, bundleOf("app.syn", [["app.syn", NEST]])), "nest");
+  let nestd;
+  try { nestd = note("nest", nest.deploy(7, "")); } catch (e) { nestd = { json: {}, text: "THROW " + String(e) }; }
+  check(nestd.json.error === "runtime_error" && nest.logs().includes("maximum recursion depth exceeded"), `M-r4-1: a recursion through 10 nested blocks is the recursion error, not the host's stack: ${nestd.text.slice(0, 80)}`);
+  nest.close();
+}
 
 console.log(failed === 0 ? "\nALL OK" : `\n${failed} FAILED`);
 process.exit(failed === 0 ? 0 : 1);

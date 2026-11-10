@@ -792,5 +792,106 @@ print("slept")`;
   check("startMs fuera de rango es un error", startErr && startErr.includes("startMs"), startErr);
 }
 
+
+// ---- v0.6.58 (§12): el proyecto y los paquetes que pasa el embebedor (W2, W3, W9) ----
+{
+  const sha = (t) => createHash("sha256").update(t, "utf8").digest("hex");
+  const pkg = (id, version, files) => {
+    const index = JSON.stringify({ id, version, main: "m.syn", files: Object.entries(files).map(([path, t]) => ({ path, sha256: sha(t) })) }, null, 2);
+    const lines = [...Object.entries(files).map(([p, t]) => `${sha(t)}  ${p}\n`), `${sha(index)}  synsema.json\n`];
+    lines.sort((a, b) => Buffer.compare(Buffer.from(a), Buffer.from(b)));
+    const hash = "tree-sha256:" + createHash("sha256").update(lines.join(""), "utf8").digest("hex");
+    return { hash, files: { "synsema.json": index, ...files } };
+  };
+  const tok = pkg("example.com/tok", "0.1.0", { "m.syn": 'export task cual()\n    give "tok de js"\n' });
+  const project = { synsema: "0.6.58", modules: { tok: { url: "https://example.com/tok", id: "example.com/tok", version: "0.1.0", hash: tok.hash } } };
+  const src = 'use "tok" as tok\nprint(tok.cual())\n';
+  const fresh = await Synsema.load(wasmPath, { project });
+  await fresh.ready();
+  const w3 = fresh.run(src);
+  check("v0.6.58 W3: sin el paquete en packages", !w3.ok && w3.errors[0].endsWith('use "tok": module tok 0.1.0 is not in the packages the host passed'), w3.errors);
+  const bad = { ...tok.files, "m.syn": tok.files["m.syn"].replace("js", "jS") };
+  const w2b = fresh.run(src, { packages: { [tok.hash]: bad } });
+  check("v0.6.58 W2: un byte cambiado no corre", !w2b.ok && w2b.errors[0].includes("do not match their hash") && !w2b.errors[0].includes("delete"), w2b.errors);
+  const w2 = fresh.run(src, { packages: { [tok.hash]: tok.files } });
+  check("v0.6.58 W2: con project y packages anda", w2.ok && w2.output[0] === "tok de js", w2);
+  const handler = 'require serve(8080)\nuse "tok" as tok\nserve on 8080\n    route "GET /"\n        give {"t": tok.cual()}\n';
+  let sent = 0;
+  const realCall = fresh._inst.call.bind(fresh._inst);
+  fresh._inst.call = (req) => {
+    if (req.packages) sent += Object.keys(req.packages).length;
+    return realCall(req);
+  };
+  let allOk = true;
+  for (let i = 0; i < 100; i++) {
+    const r = fresh.handle(handler, { method: "GET", path: "/" }, { packages: { [tok.hash]: tok.files } });
+    allOk = allOk && r.status === 200 && r.body.includes("tok de js");
+    const rr = fresh.run(src, { packages: { [tok.hash]: tok.files } });
+    allOk = allOk && rr.ok;
+  }
+  const stats = fresh._callSync({ op: "stats" });
+  check("v0.6.58 W9: 100 handle y 100 run con el mismo packages andan", allOk);
+  check("v0.6.58 W9: un solo hasheo por paquete", stats.packages_hashed === 1, stats);
+  check("v0.6.58 W9: lo verificado no se vuelve a mandar al módulo", sent === 0, sent);
+  // Lo mismo por el Worker: se manda una vez, y el Worker no lo vuelve a hashear.
+  const asy = await Synsema.load(wasmPath, { project, packages: { [tok.hash]: tok.files } });
+  let okA = true;
+  for (let i = 0; i < 20; i++) {
+    const r = await asy.runAsync(src);
+    okA = okA && r.ok && r.output[0] === "tok de js";
+  }
+  const sa = await asy._callAsync({ op: "stats" }, {});
+  check("v0.6.58 W9 (Worker): anda y hashea una vez", okA && sa.packages_hashed === 1, sa);
+  check("v0.6.58 W9 (Worker): el Worker guarda lo verificado", asy._bridges[0]._held && asy._bridges[0]._held.has(tok.hash), [...(asy._bridges[0]._held ?? [])]);
+  // M6 (ronda 1): un trap recrea la instancia del Worker, que no guarda nada: lo que el bridge creía
+  // guardado se olvida y la llamada siguiente vuelve a mandar el paquete.
+  const big = 'let xs be []\nlet i be 0\nwhile i < 5000000\n    set xs to xs + ["xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx" + text(i)]\n    set i to i + 1\nprint(length(xs))\n';
+  let trapped;
+  try { trapped = await asy.runAsync(big, { maxMemoryMb: 16 }); } catch (e) { trapped = { ok: false, errors: [String(e.message)] }; }
+  const after = await asy.runAsync(src);
+  check("v0.6.58 M6 (Worker): después de un trap, la misma llamada anda", !trapped.ok && after.ok && after.output[0] === "tok de js", { trapped: trapped.errors, after });
+  await asy.close();
+  const w5 = fresh.run("print(1)", { project: '{"synsema": "9.9.9"}' });
+  check("v0.6.58 W5: un proyecto que pide otro motor", !w5.ok && w5.errors[0].includes("this project needs synsema >= 9.9.9"), w5.errors);
+}
+
+// Ronda 4 (M-r4-1, B-r4-3): una recursión por código que corre la referencia (un cuerpo en frío, una
+// plantilla) desbordaba la pila del motor de JS antes del límite: trap y la instancia recreada. Ahora
+// el guardián cobra lo que anida y da el error, con cualquier anidamiento.
+{
+  const big = "[" + Array.from({ length: 40000 }, () => "0").join(", ") + "]";
+  const rec = (k, n) => {
+    let s = `task h(n)\n    let big be ${big}\n    when n == 0\n        give 0\n`;
+    let ind = "    ";
+    for (let i = 0; i < k; i++) { s += ind + "when true\n"; ind += "    "; }
+    return s + ind + "give h(n - 1) + 1\n" + (k ? "    give -1\n" : "") + `print(h(${n}))\n`;
+  };
+  const tsrc = 'export task g(n)\n    when n == 0\n        give "x"\n    give render("t.html", {"n": n - 1, "g": g})["body"]\n';
+  const tpl = (k) => "{ when true }".repeat(k) + "{ raw g(n) }" + "{ end }".repeat(k);
+  const trec = (k, n) => [`use "trusted:t" as t\nprint(length(t.g(${n})))\n`, { trusted: { t: { source: tsrc, templates: { "t.html": tpl(k) } } } }];
+  const run = (src, opts) => { try { return syn.run(src, opts); } catch (e) { return { ok: false, output: [], errors: ["TRAP " + String(e.message)] }; } };
+  for (const k of [0, 5, 30, 100, 1000]) {
+    const r = run(rec(k, 600));
+    check(`M-r4-1: cuerpo en frío con ${k} when × 600 llamadas da el error, sin trap`, !r.ok && r.errors[0].includes("maximum recursion depth exceeded"), r.errors);
+    const t = run(...trec(k, 600));
+    check(`B-r4-3: plantilla con ${k} bloques × 600 da el error, sin trap`, !t.ok && t.errors[0].includes("maximum recursion depth exceeded"), t.errors);
+  }
+  const low = run(rec(0, 100));
+  check("M-r4-1: debajo del límite, el resultado (cuerpo frío, 100 llamadas)", low.ok && low.output[0] === "100", low);
+  const nest = run(rec(1000, 1));
+  check("M-r4-1: 1000 when en frío sin recursión corren", nest.ok && nest.output[0] === "1", nest);
+  const tl = run(...trec(5, 50));
+  check("B-r4-3: plantilla con 5 bloques × 50 da el resultado", tl.ok && tl.output[0] === "1", tl);
+  // Con las etiquetas todo corre en la referencia: sin peso por cuerpo, una recursión plana hacía
+  // trap a las 563 llamadas y con 10 `when` a las 117. Ahora cada llamada cobra lo que anida.
+  const recl = (k, n) => rec(k, n).replace(/let big be \[[^\]]*\]/, "let big be [0]");
+  for (const k of [0, 10, 100]) {
+    const r = run(recl(k, 600), { labels: true });
+    check(`M-r4-1: con etiquetas, ${k} when × 600 llamadas da el error, sin trap`, !r.ok && r.errors[0].includes("maximum recursion depth exceeded"), r.errors);
+  }
+  const lowl = run(recl(0, 250), { labels: true });
+  check("M-r4-1: con etiquetas, una recursión plana de 250 da el resultado", lowl.ok && lowl.output[0] === "250", lowl);
+}
+
 console.log(failures ? `\n${failures} FAIL` : "\nall ok");
 process.exit(failures ? 1 : 0);

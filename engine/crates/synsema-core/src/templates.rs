@@ -23,7 +23,7 @@ use std::time::SystemTime;
 
 use crate::ast::Node;
 use crate::interpreter::{env_get, env_set, Control, Environment, Interpreter, RuntimeError, TemplateOpenHook};
-use crate::parser::{parse_each_clause, parse_expression_source};
+use crate::parser::{parse_each_clause, parse_expression_source, MAX_NEST, NEST_ERROR};
 use crate::types::{ServerValue, SynValue};
 
 /// Valor "raw response" (lo que devuelve `render`/`html`/`respond`): un valor del
@@ -39,6 +39,16 @@ pub fn make_raw(body: String, content_type: &str, status: i64) -> SynValue {
 
 fn terr(file: &str, line: usize, msg: &str) -> Control {
     Control::Error(RuntimeError::new(format!("{}:{}: {}", file, line, msg)))
+}
+
+/// v0.6.58 (M-r3-3): un bloque de plantilla adentro de otro (`each`, `when`, cada `otherwise
+/// when`, `fill`) es un nivel más, con el mismo tope que el código ([`MAX_NEST`]): el parser, el
+/// recorrido de `get` (`template_refs`) y el render bajan recursivos por el árbol.
+fn nest_in(depth: u32, file: &str, line: usize) -> Result<u32, Control> {
+    if depth >= MAX_NEST {
+        return Err(terr(file, line, &format!("{} {} levels", NEST_ERROR, MAX_NEST)));
+    }
+    Ok(depth + 1)
 }
 
 fn html_escape(s: &str) -> String {
@@ -119,7 +129,7 @@ fn resolve_template_path(path: &str) -> Result<PathBuf, String> {
 /// A diferencia de `canonicalize`, funciona sobre paths inexistentes y NO agrega
 /// el prefijo verbatim `\\?\` de Windows — clave para que el string resuelto sea
 /// byte-idéntico al del oráculo Python (`os.path.normpath`).
-fn lexical_normalize(p: &Path) -> PathBuf {
+pub(crate) fn lexical_normalize(p: &Path) -> PathBuf {
     use std::path::Component;
     let mut out = PathBuf::new();
     for comp in p.components() {
@@ -127,6 +137,27 @@ fn lexical_normalize(p: &Path) -> PathBuf {
             Component::CurDir => {}
             Component::ParentDir => {
                 out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// Como [`lexical_normalize`], pero un `..` sin nada que sacar en una ruta relativa se conserva
+/// (`../lib/y.syn` sigue siendo eso). En una absoluta, como siempre: la raíz no sube.
+fn lexical_normalize_keep_up(p: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for comp in p.components() {
+        match comp {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if matches!(out.components().next_back(), Some(Component::Normal(_))) {
+                    out.pop();
+                } else if p.is_relative() {
+                    out.push("..");
+                }
             }
             other => out.push(other.as_os_str()),
         }
@@ -142,10 +173,21 @@ fn lexical_normalize(p: &Path) -> PathBuf {
 /// emite un prefijo `\\?\` que `realpath` no; rompería la paridad de cualquier
 /// path que aparezca en un error/ubicación). Los errores citan el path RAW
 /// (nunca el resuelto), para no filtrar formas de path divergentes.
-pub(crate) fn resolve_module_path(
+pub(crate) fn resolve_module_path(raw_path: &str, base_dir: &Path, project_root: Option<&Path>) -> Result<String, String> {
+    resolve_module_path_in(raw_path, base_dir, project_root, true)
+}
+
+/// B15 (ronda 1): la ruta resuelta de un `use` de archivo con los mismos chequeos de forma y de
+/// contención por nombre, sin mirar si el archivo existe (el recorrido anota los que faltan).
+pub(crate) fn module_path_lexical(raw_path: &str, base_dir: &Path, project_root: Option<&Path>) -> Result<String, String> {
+    resolve_module_path_in(raw_path, base_dir, project_root, false)
+}
+
+fn resolve_module_path_in(
     raw_path: &str,
     base_dir: &Path,
     project_root: Option<&Path>,
+    must_exist: bool,
 ) -> Result<String, String> {
     // Una ruta drive-absoluta O con `/`/`\` inicial (root-relativa) se rechaza. El
     // chequeo del slash inicial mantiene la decisión idéntica entre plataformas/impls
@@ -162,8 +204,10 @@ pub(crate) fn resolve_module_path(
     if !raw_path.ends_with(".syn") {
         return Err(format!("module path must end in '.syn': '{}'", raw_path));
     }
-    let base = lexical_normalize(base_dir);
-    let target = lexical_normalize(&base.join(raw_path));
+    // v0.6.58 (B6): los `..` de adelante se conservan. Con la raíz del proyecto arriba del cwd
+    // (`cd scripts && run x.syn`, `synsema.json` en el padre), `../lib/y.syn` queda adentro de la
+    // raíz; `lexical_normalize` lo dejaba en `lib/y.syn`, relativo a otro lugar.
+    let target = lexical_normalize_keep_up(&base_dir.join(raw_path));
     // v0.6.20 — el límite de contención es la RAÍZ DEL PROYECTO (dir de la entrada) cuando
     // el host la conoce: `../` sube mientras el destino quede bajo esa raíz. Sin raíz
     // (`<stdin>`, embebedores que no la fijan) rige el criterio v0.6.19: el dir del importador.
@@ -191,6 +235,15 @@ pub(crate) fn resolve_module_path(
         return Err(format!("module path escapes the {}: '{}'", what, raw_path));
     }
     let resolved = target.to_string_lossy().to_string();
+    // N3 (ronda 1, K9): `pkg:` es el prefijo de las claves de los módulos de un paquete
+    // (`pkg:tree-sha256-…/x.syn`); un archivo local con ese nombre (posible en Unix) se confundiría
+    // con uno de un paquete en las tablas por texto (`loaded_modules`, `program_sha`).
+    if resolved.starts_with("pkg:") {
+        return Err(format!("module path must not start with 'pkg:', the prefix of a package's modules: '{}'", raw_path));
+    }
+    if !must_exist {
+        return Ok(resolved);
+    }
     // Overlay del bundle (`synsema build`): el módulo puede vivir dentro del ejecutable.
     if crate::bundle::get(&resolved).is_some() {
         return Ok(resolved);
@@ -457,13 +510,14 @@ fn parse_when_tail(
     filename: &str,
     cond: Node,
     line: usize,
+    depth: u32,
 ) -> Result<TNode, Control> {
-    let (then, term) = parse_block(segs, pos, filename, &["otherwise", "end"])?;
+    let (then, term) = parse_block(segs, pos, filename, &["otherwise", "end"], depth)?;
     let (head, rest) = split_head(&term);
     match head.as_str() {
         "end" => Ok(TNode::When { cond, then, els: Vec::new() }),
         "otherwise" if rest.is_empty() => {
-            let (els, t2) = parse_block(segs, pos, filename, &["end"])?;
+            let (els, t2) = parse_block(segs, pos, filename, &["end"], depth)?;
             if split_head(&t2).0 != "end" {
                 return Err(terr(filename, line, "missing '{ end }' for '{ when ... }'"));
             }
@@ -479,7 +533,7 @@ fn parse_when_tail(
             }
             let cond2 = parse_expression_source(&r2, filename)
                 .map_err(|e| terr(filename, line, &format!("invalid expression {{ {} }}: {}", r2, e)))?;
-            let nested = parse_when_tail(segs, pos, filename, cond2, line)?;
+            let nested = parse_when_tail(segs, pos, filename, cond2, line, nest_in(depth, filename, line)?)?;
             Ok(TNode::When { cond, then, els: vec![nested] })
         }
         _ => Err(terr(filename, line, "missing '{ end }' for '{ when ... }'")),
@@ -493,6 +547,7 @@ fn parse_block(
     pos: &mut usize,
     filename: &str,
     stop: &[&str],
+    depth: u32,
 ) -> Result<(Vec<TNode>, String), Control> {
     let mut out = Vec::new();
     while *pos < segs.len() {
@@ -513,12 +568,13 @@ fn parse_block(
                     "each" => {
                         let (var, coll) = parse_each_clause(&rest, filename)
                             .map_err(|e| terr(filename, line, &format!("invalid 'each' directive: {}", e)))?;
-                        let (body, term) = parse_block(segs, pos, filename, &["end", "otherwise"])?;
+                        let d = nest_in(depth, filename, line)?;
+                        let (body, term) = parse_block(segs, pos, filename, &["end", "otherwise"], d)?;
                         let (th, tr) = split_head(&term);
                         let els = match th.as_str() {
                             "end" => Vec::new(),
                             "otherwise" if tr.is_empty() => {
-                                let (e, t2) = parse_block(segs, pos, filename, &["end"])?;
+                                let (e, t2) = parse_block(segs, pos, filename, &["end"], d)?;
                                 if split_head(&t2).0 != "end" {
                                     return Err(terr(filename, line, "missing '{ end }' for '{ each ... }'"));
                                 }
@@ -536,7 +592,7 @@ fn parse_block(
                     "when" => {
                         let cond = parse_expression_source(&rest, filename)
                             .map_err(|e| terr(filename, line, &format!("invalid expression {{ {} }}: {}", rest, e)))?;
-                        out.push(parse_when_tail(segs, pos, filename, cond, line)?);
+                        out.push(parse_when_tail(segs, pos, filename, cond, line, nest_in(depth, filename, line)?)?);
                     }
                     "raw" => out.push(value_node(&rest, false, filename, line)?),
                     "include" => {
@@ -556,7 +612,7 @@ fn parse_block(
                     }
                     "fill" => {
                         let name = parse_str_literal(&rest, filename, line, "fill")?;
-                        let (body, term) = parse_block(segs, pos, filename, &["end"])?;
+                        let (body, term) = parse_block(segs, pos, filename, &["end"], nest_in(depth, filename, line)?)?;
                         if split_head(&term).0 != "end" {
                             return Err(terr(filename, line, "missing '{ end }' for '{ fill ... }'"));
                         }
@@ -582,7 +638,7 @@ fn parse_block(
 struct CachedTpl {
     mtime: SystemTime,
     size: u64,
-    tree: Rc<Vec<TNode>>,
+    tree: Rc<TplTree>,
 }
 
 thread_local! {
@@ -598,7 +654,7 @@ fn load_template(
     display: &str,
     raw_path: &str,
     open: Option<TemplateOpenHook>,
-) -> Result<Rc<Vec<TNode>>, Control> {
+) -> Result<Rc<TplTree>, Control> {
     let not_found = || Control::Error(RuntimeError::new(format!("template not found: {}", raw_path)));
     let bundled: Option<&'static [u8]> = crate::bundle::get(&target.to_string_lossy());
     let mut file = match (bundled, open) {
@@ -652,20 +708,54 @@ fn load_template(
     Ok(tree)
 }
 
-fn parse_tree(src: &str, display: &str) -> Result<Rc<Vec<TNode>>, Control> {
+fn parse_tree(src: &str, display: &str) -> Result<Rc<TplTree>, Control> {
     let segs = segments(src, display)?;
     let mut pos = 0;
-    let (tree, term) = parse_block(&segs, &mut pos, display, &[])?;
+    let (tree, term) = parse_block(&segs, &mut pos, display, &[], 0)?;
     if !term.is_empty() {
         return Err(terr(display, 1, &format!("'{{ {} }}' without a matching block", term)));
     }
-    Ok(Rc::new(tree))
+    let weight = crate::interpreter::template_weight(tpl_depth(&tree));
+    Ok(Rc::new(TplTree { nodes: tree, weight }))
+}
+
+/// Una plantilla parseada y lo que pesa en el guardián de recursión mientras se renderiza
+/// (v0.6.58, B-r4-3: `render_nodes` baja recursivo por los bloques, como la referencia por el
+/// árbol en M-r4-1).
+struct TplTree {
+    nodes: Vec<TNode>,
+    weight: usize,
+}
+
+impl std::ops::Deref for TplTree {
+    type Target = [TNode];
+    fn deref(&self) -> &[TNode] {
+        &self.nodes
+    }
+}
+
+/// Los niveles que baja el render: un bloque (`each`, `when`, `fill`, `include`) es uno más, y un
+/// hueco baja lo que su expresión (`run_depth`). Acotado por `MAX_NEST` (el parser de plantillas).
+fn tpl_depth(nodes: &[TNode]) -> usize {
+    use crate::ast_api::run_depth;
+    nodes
+        .iter()
+        .map(|n| match n {
+            TNode::Expr { node, .. } => run_depth(node),
+            TNode::Each { coll, body, els, .. } => 1 + run_depth(coll).max(tpl_depth(body)).max(tpl_depth(els)),
+            TNode::When { cond, then, els } => 1 + run_depth(cond).max(tpl_depth(then)).max(tpl_depth(els)),
+            TNode::Fill { body, .. } => 1 + tpl_depth(body),
+            TNode::Include { with_expr, .. } => 1 + with_expr.as_ref().map_or(0, run_depth),
+            TNode::Text(_) | TNode::Name { .. } | TNode::Slot { .. } | TNode::Layout { .. } => 0,
+        })
+        .max()
+        .unwrap_or(0)
 }
 
 /// v0.6.50 (D): los templates que el host le dio a una tool de confianza (`--trusted-templates`),
 /// leídos al arrancar. Cada uno se parsea la primera vez que se usa en este intérprete.
 pub struct ToolTemplates {
-    files: HashMap<String, (Rc<str>, std::cell::OnceCell<Rc<Vec<TNode>>>)>,
+    files: HashMap<String, (Rc<str>, std::cell::OnceCell<Rc<TplTree>>)>,
 }
 
 impl ToolTemplates {
@@ -698,22 +788,17 @@ fn not_a_tool_template(module: &str, path: &str) -> String {
 /// que le dio el host (sin disco, sin el bundle del programa, sin `file.read`: es parte de la
 /// tool); si no, del bundle o del disco, con el gate `file.read` (`gated`: el de nivel superior lo
 /// gatea `render_template`, los anidados acá).
-fn open_template(interp: &Interpreter, path: &str, gated: bool) -> Result<(String, Rc<Vec<TNode>>), Control> {
+fn open_template(interp: &mut Interpreter, path: &str, gated: bool) -> Result<(String, Rc<TplTree>), Control> {
+    // v0.6.58 (§6.3): adentro de un paquete, sólo sus plantillas (de la tabla), sin `file.read` y
+    // sin el disco: un nombre que no está da `template not found` (K10, K17, K29).
+    if interp.running_package() != 0 {
+        let set = interp.package_templates();
+        return open_in_set(&set, path, || format!("template not found: {}", path));
+    }
     if let Some((module, set)) = interp.current_tool_templates() {
         let set = set.ok_or_else(|| Control::Error(RuntimeError::new(tool_has_no_templates(module, path))))?;
-        let entry = crate::bundle::normalize_name(path).and_then(|k| set.files.get_key_value(&k));
-        let Some((key, (src, tree))) = entry else {
-            return Err(Control::Error(RuntimeError::new(not_a_tool_template(module, path))));
-        };
-        let display = key.rsplit('/').next().unwrap_or(key).to_string();
-        let tree = match tree.get() {
-            Some(t) => t.clone(),
-            None => {
-                let parsed = parse_tree(src, &display)?;
-                tree.get_or_init(|| parsed).clone()
-            }
-        };
-        return Ok((display, tree));
+        let module = module.to_string();
+        return open_in_set(&set, path, || not_a_tool_template(&module, path));
     }
     if gated {
         gate_nested_template(interp, path)?;
@@ -725,6 +810,23 @@ fn open_template(interp: &Interpreter, path: &str, gated: bool) -> Result<(Strin
         .unwrap_or_else(|| path.to_string());
     let tree = load_template(&target, &filename, path, interp.template_open_hook())?;
     Ok((filename, tree))
+}
+
+/// Una plantilla de un conjunto fijo (el de una tool o el de un paquete), parseada una vez.
+fn open_in_set(set: &ToolTemplates, path: &str, missing: impl FnOnce() -> String) -> Result<(String, Rc<TplTree>), Control> {
+    let entry = crate::bundle::normalize_name(path).and_then(|k| set.files.get_key_value(&k));
+    let Some((key, (src, tree))) = entry else {
+        return Err(Control::Error(RuntimeError::new(missing())));
+    };
+    let display = key.rsplit('/').next().unwrap_or(key).to_string();
+    let tree = match tree.get() {
+        Some(t) => t.clone(),
+        None => {
+            let parsed = parse_tree(src, &display)?;
+            tree.get_or_init(|| parsed).clone()
+        }
+    };
+    Ok((display, tree))
 }
 
 /// v0.6.50 (D): los templates que el host le da a una tool desde un directorio (`--trusted-templates
@@ -911,10 +1013,9 @@ fn render_nodes(
                     ))));
                 }
                 let (inc_name, inc_tree) = open_template(interp, path, true)?;
-                match with_expr {
-                    None => {
-                        render_nodes(&inc_tree, interp, env, out, &inc_name, slots, depth + 1)?;
-                    }
+                // B-r4-3: la plantilla incluida pesa en el guardián mientras se renderiza.
+                interp.with_stack_weight(inc_tree.weight, |interp| match with_expr {
+                    None => render_nodes(&inc_tree, interp, env, out, &inc_name, slots, depth + 1),
                     Some(expr) => {
                         let props = interp.eval(expr, env)?;
                         let m = match &props {
@@ -930,9 +1031,9 @@ fn render_nodes(
                         for (k, v) in m.borrow().iter() {
                             env_set(&child, k, v.clone());
                         }
-                        render_nodes(&inc_tree, interp, &child, out, &inc_name, slots, depth + 1)?;
+                        render_nodes(&inc_tree, interp, &child, out, &inc_name, slots, depth + 1)
                     }
-                }
+                })?;
             }
         }
     }
@@ -957,6 +1058,18 @@ fn render_file(
     }
     // El de nivel superior lo gatea `render_template`; un layout (depth > 0) se gatea acá.
     let (filename, tree) = open_template(interp, path, depth > 0)?;
+    // B-r4-3: la plantilla pesa en el guardián de recursión mientras se renderiza (con su layout).
+    interp.with_stack_weight(tree.weight, |interp| render_file_tree(interp, &filename, &tree, data, slots, depth))
+}
+
+fn render_file_tree(
+    interp: &mut Interpreter,
+    filename: &str,
+    tree: &TplTree,
+    data: Option<&SynValue>,
+    slots: &Slots,
+    depth: usize,
+) -> Result<String, Control> {
     let layout_path = tree.iter().find_map(|n| match n {
         TNode::Layout { path } => Some(path.clone()),
         _ => None,
@@ -1005,7 +1118,7 @@ pub fn render_template(
     // el host (`open_template`), sin `file.read`. Fuera, el gate `file.read` de la llamada de nivel
     // superior (el vector de LFI: el path puede venir de un request); uno del bundle es el programa y
     // no lo pide. Es la única entrada: `include` y los layouts se resuelven desde acá.
-    if !interp.in_trusted_scope() {
+    if !interp.in_trusted_scope() && interp.running_package() == 0 {
         let bundled = crate::bundle::normalize_name(path).is_some_and(|k| crate::bundle::get(&k).is_some());
         if !bundled {
             interp.gate_template_read(path)?;
@@ -1037,6 +1150,25 @@ pub fn check_program_static(
 /// Cómo obtener el programa de un módulo `use` ya resuelto: `(path resuelto, path crudo del
 /// `use`)` → programa. `check_program_static` lee y parsea del disco; `synsema code` inyecta su
 /// cache de parseo. Mismo recorrido y mismos errores en ambos casos.
+/// v0.6.58 (§4.1): ¿el `use` es de un módulo de archivo? (no `trusted:` ni un nombre). Un texto que no
+/// es ni lo uno ni lo otro también pasa, y da el error de siempre al resolverlo (`./x.txt`), o el de
+/// la tabla (`a/b`).
+fn is_file_use(raw: &str) -> bool {
+    matches!(crate::modtable::classify(raw), Ok(crate::modtable::UseKind::File))
+}
+
+/// v0.6.58 (§5.2): los nombres del programa, como al correr: arma la tabla (resuelve cada nombre,
+/// lee y verifica cada paquete) y devuelve su error, si hay. Sin ningún `use` de archivo o de nombre,
+/// no lee nada.
+fn check_names(program: &crate::ast::Program, file_path: &str) -> Result<(), String> {
+    let uses = crate::loaded_modules::use_paths(program);
+    if uses.iter().all(|u| u.starts_with("trusted:")) {
+        return Ok(());
+    }
+    let project = crate::project::resolve(file_path)?;
+    crate::modtable::build(&project, file_path, uses).map(|_| ())
+}
+
 pub type ModuleLoader<'a> = &'a dyn Fn(&str, &str) -> Result<crate::ast::Program, String>;
 
 /// `check_program_static` con el loader de módulos inyectado.
@@ -1048,14 +1180,15 @@ pub fn check_program_static_with(
     check_program_static_inner(program, file_path, load, None).map(|(counts, _warnings)| counts)
 }
 
-/// v0.6.20 — raíz del proyecto para el check: el dir del archivo de entrada. Una entrada
-/// sin dir (`<stdin>`, `<test>`) no tiene raíz → rige el criterio del importador.
+/// La raíz del proyecto para los recorridos estáticos: la misma que usa el intérprete (v0.6.58, §3:
+/// la carpeta del `synsema.json` más cercano, o la de la entrada). Una entrada sin dir (`<stdin>`,
+/// `<test>`) no tiene raíz → rige el criterio del importador. Un `synsema.json` roto lo reporta el
+/// chequeo previo del comando; acá cae a la carpeta de la entrada.
 fn project_root_of(entry: &str) -> Option<std::path::PathBuf> {
-    if entry.starts_with('<') {
-        return None;
+    match crate::project::resolve(entry) {
+        Ok(p) => p.root,
+        Err(_) => crate::project::entry_dir(entry),
     }
-    let parent = Path::new(entry).parent()?;
-    Some(if parent.as_os_str().is_empty() { std::path::PathBuf::from(".") } else { parent.to_path_buf() })
 }
 
 /// v0.6.20 — como `check_program_static_with`, y además devuelve los AVISOS: lo que corre
@@ -1201,6 +1334,9 @@ fn check_program_static_inner(
                 let project_root = project_root_of(stack.first().map(String::as_str).unwrap_or(file_path));
                 for (alias, raw, use_line) in &aliases {
                     if shadowed.contains(alias) {
+                        continue;
+                    }
+                    if !is_file_use(raw) {
                         continue;
                     }
                     let Ok(resolved) = resolve_module_path(raw, &base_dir, project_root.as_deref()) else { continue };
@@ -1368,7 +1504,8 @@ fn check_program_static_inner(
         let project_root = project_root_of(stack.first().map(String::as_str).unwrap_or(file_path));
         for raw in uses {
             // v0.6.46 (E3b): un módulo de confianza es del host (`--trusted`), no un archivo del proyecto.
-            if raw.starts_with("trusted:") {
+            // v0.6.58: un nombre es un paquete; lo revisó la tabla al empezar (`check_names`).
+            if !is_file_use(&raw) {
                 continue;
             }
             let resolved = resolve_module_path(&raw, &base_dir, project_root.as_deref())
@@ -1392,6 +1529,7 @@ fn check_program_static_inner(
         }
         Ok(())
     }
+    check_names(program, file_path)?;
     let mut seen = Vec::new();
     let mut stack = vec![file_path.to_string()];
     let mut modules = 0usize;
@@ -1438,7 +1576,8 @@ pub fn module_walk(uses: Vec<String>, file_path: &str, load: SourceLoader<'_>) -
         let base_dir = Path::new(importer).parent().map(|p| p.to_path_buf()).unwrap_or_default();
         for raw in uses {
             // v0.6.46 (E3b): un módulo de confianza es del host (`--trusted`), no un archivo del proyecto.
-            if raw.starts_with("trusted:") {
+            // v0.6.58: un paquete tampoco entra a `program_sha`: va en `modules` del recibo (§13).
+            if !is_file_use(&raw) {
                 continue;
             }
             let resolved = resolve_module_path(&raw, &base_dir, root).map_err(|e| format!("{}: {}", importer, e))?;
@@ -1462,6 +1601,56 @@ pub fn module_walk(uses: Vec<String>, file_path: &str, load: SourceLoader<'_>) -
     let mut stack = vec![file_path.to_string()];
     go(uses, file_path, root.as_deref(), &mut stack, &mut out, load)?;
     Ok(out)
+}
+
+/// Los `include`/`layout` de un árbol de plantilla, en orden.
+fn tnode_refs(nodes: &[TNode], acc: &mut Vec<String>) {
+    for n in nodes {
+        match n {
+            TNode::Include { path, .. } | TNode::Layout { path } => acc.push(path.clone()),
+            TNode::Each { body, els, .. } => {
+                tnode_refs(body, acc);
+                tnode_refs(els, acc);
+            }
+            TNode::When { then, els, .. } => {
+                tnode_refs(then, acc);
+                tnode_refs(els, acc);
+            }
+            TNode::Fill { body, .. } => tnode_refs(body, acc),
+            _ => {}
+        }
+    }
+}
+
+/// v0.6.58 (§10.3, paso 4): los `include`/`layout` de una plantilla en memoria (la de un paquete que
+/// `get` valida), sin abrir nada. Un error de sintaxis de la plantilla es el error.
+pub fn template_refs(src: &str, display: &str) -> Result<Vec<String>, String> {
+    let tree = parse_tree(src, display).map_err(|c| match c {
+        Control::Error(e) => e.into_message(),
+        _ => "template error".to_string(),
+    })?;
+    let mut out = Vec::new();
+    tnode_refs(&tree, &mut out);
+    Ok(out)
+}
+
+/// v0.6.58 (§10.3, paso 4): los `render("literal")` de un programa, con su línea.
+pub fn render_literals(program: &crate::ast::Program) -> Vec<(String, usize)> {
+    use crate::ast::NodeKind as NK;
+    let mut out = Vec::new();
+    for stmt in &program.statements {
+        crate::ast_api::walk(stmt, &mut |n| {
+            if let NK::TaskCall { name, arguments } = &n.kind {
+                if !matches!(&name.kind, NK::Identifier { name } if name == "render") {
+                    return;
+                }
+                if let Some(NK::TextLiteral { value }) = arguments.first().filter(|a| a.name.is_none()).map(|a| &a.value.kind) {
+                    out.push((value.clone(), n.location.line));
+                }
+            }
+        });
+    }
+    out
 }
 
 /// Cierre de un template: él y, recursivamente, sus `include`/`layout` literales (paths
@@ -1532,25 +1721,8 @@ fn validate_template_walk(
             Control::Error(e) => e.into_message(),
             _ => "template error".to_string(),
         })?;
-        fn refs(nodes: &[TNode], acc: &mut Vec<String>) {
-            for n in nodes {
-                match n {
-                    TNode::Include { path, .. } | TNode::Layout { path } => acc.push(path.clone()),
-                    TNode::Each { body, els, .. } => {
-                        refs(body, acc);
-                        refs(els, acc);
-                    }
-                    TNode::When { then, els, .. } => {
-                        refs(then, acc);
-                        refs(els, acc);
-                    }
-                    TNode::Fill { body, .. } => refs(body, acc),
-                    _ => {}
-                }
-            }
-        }
         let mut children = Vec::new();
-        refs(&tree, &mut children);
+        tnode_refs(&tree, &mut children);
         for child in children {
             walk(&child, depth + 1, seen, gate, skipped)?;
         }
@@ -1627,5 +1799,17 @@ mod v0620_tests {
         let mine = super::load_template(&a, "a.html", &ra, Some(hook)).unwrap_or_else(|_| panic!("a"));
         assert!(!Rc::ptr_eq(&other, &mine), "la carga de a.html trajo el árbol de b.html");
         let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
+#[cfg(test)]
+mod v0658_tests {
+    /// N3 (ronda 1, K9): una ruta local que queda como `pkg:…` no se acepta (es la forma de la clave
+    /// de un módulo de un paquete).
+    #[test]
+    fn a_local_module_path_cannot_look_like_a_package_key() {
+        let e = super::module_path_lexical("./pkg:tree-sha256-ab/x.syn", std::path::Path::new(""), None).unwrap_err();
+        assert_eq!(e, "module path must not start with 'pkg:', the prefix of a package's modules: './pkg:tree-sha256-ab/x.syn'");
+        assert_eq!(super::module_path_lexical("./lib/pkg:x.syn", std::path::Path::new(""), None).unwrap().replace('\\', "/"), "lib/pkg:x.syn");
     }
 }

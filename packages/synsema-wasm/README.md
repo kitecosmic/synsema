@@ -238,6 +238,34 @@ in a handler lists only what that request read (v0.6.46: not what the top-level 
 handler mode: `stream` (SSE), `proxy to`, rate limits, `static` mounts, vhosts, TLS —
 your edge platform does those before calling the handler.
 
+## Packages: `project`, `packages` (v0.6.58)
+
+There is no `synsema get` here and no module cache: you hand the engine the program's
+`synsema.json` and the files of the packages it pins, and the engine checks every package
+against its hash before the first statement runs.
+
+```js
+const syn = await Synsema.load(wasmBytes, {
+  project: synsemaJson,                       // the text of synsema.json (or the object)
+  packages: { "tree-sha256:3cdf…": { "synsema.json": "…", "m.syn": "…" } },
+});
+await syn.ready();
+syn.run('use "tok" as tok\nprint(tok.encode("hola"))\n');
+```
+
+- `packages` is what `synsema get` left in the cache: per hash, every file of the package by its
+  path, the package's own `synsema.json` included. Files are text.
+- Both options go to `load`/`loadNode` and to each call. A call's `project` replaces the
+  instance's; its `packages` add to the instance's.
+- A package missing from `packages` stops the run with
+  `use "tok": module tok 0.1.0 is not in the packages the host passed`, and one whose files changed
+  with `… the files of tok (tree-sha256:…) do not match their hash`.
+- The instance keeps what it verified, by hash: a later call that brings (or only names) a
+  verified hash does not hash it again, and `@synsema/wasm` does not copy it to the Worker again.
+  Each response with a `project` lists those hashes in `packages_held`.
+- `receipt()` and the sealed receipt's header name the packages that ran
+  (`modules.packages`, with their version and hash).
+
 ## Also: `test`, `check`, `version`
 
 `syn.test(source)` runs the file's `test` blocks; `syn.check(source)` parses and

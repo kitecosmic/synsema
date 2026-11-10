@@ -532,6 +532,9 @@ pub(crate) fn wire_common_with_state(
     mem_gate: MemoryGate,
     mem: Option<MemoryCtx>,
 ) {
+    // v0.6.58 (§3): el chequeo del dueño de `synsema.json` (una vez por proceso). Todo host nativo
+    // arma sus intérpretes por acá; sin el chequeo, el núcleo ignora el `synsema.json` (falla cerrado).
+    synsema_stdlib::project_owner::install();
     let child_state = mem.as_ref().and_then(|m| m.child.clone());
     // v0.6.53 (ronda 1, A1): lo que el core no sabe del recorte del marco: el techo delegado del
     // captoken de la request y el agente. Se mira al momento del gate (el set cambia por request).
@@ -541,11 +544,24 @@ pub(crate) fn wire_common_with_state(
             let c = c.borrow();
             if c.agent.is_some() {
                 Some("inside an agent")
-            } else if !c.delegated.is_empty() {
-                Some("under a delegated capability token")
+            } else if let Some(top) = c.delegated.last() {
+                // v0.6.58 (§6.4, G-7): el origen de más arriba.
+                Some(match top.source {
+                    synsema_capabilities::model::DelegationSource::Package(_) => "inside a package",
+                    _ => "under a delegated capability token",
+                })
             } else {
                 None
             }
+        }));
+        // v0.6.58 (M8, ronda 1): el dominio de un paquete que llegó como delegación (un worker de
+        // `parallel_map` que el paquete llamó) también es «dentro del paquete» para K23 y K24.
+        let c = caps.clone();
+        interp.set_package_frame_hook(Rc::new(move || {
+            c.borrow().delegated.iter().rev().find_map(|d| match &d.source {
+                synsema_capabilities::model::DelegationSource::Package(name) => Some(name.clone()),
+                _ => None,
+            })
         }));
     }
     // Etiquetas de flujo por proceso (`--labels`, `serve --attested`). Se fijan
@@ -834,6 +850,8 @@ pub(crate) fn wire_common_with_state(
     // `sandbox under <caps>` (T1): el cuerpo corre bajo un techo delegado apilado sobre el
     // mismo CapabilitySet. Mismo helper que el host wasm (paridad).
     synsema_stdlib::captoken::install_ceiling_hook(interp, caps.clone());
+    // v0.6.58 (§6.1): el dominio de un paquete, un techo delegado más (mismo helper que wasm).
+    synsema_stdlib::captoken::install_package_hook(interp, caps.clone());
     // Aislamiento de `sandbox`: al entrar guarda y VACÍA el CapabilitySet (deniega todo);
     // al salir, restaura. Stack para sandboxes anidados. Cubre TODOS los builtins gateados
     // de una sola vez (leen el mismo CapabilitySet vía el `caps` Rc compartido).

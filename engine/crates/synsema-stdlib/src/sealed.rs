@@ -291,6 +291,9 @@ pub struct ReceiptContext<'a> {
     pub trusted: Option<serde_json::Value>,
     /// v0.6.54: `None` (sale `null`) sin un reloj de verdad, en vez de 1970.
     pub started: Option<String>,
+    /// v0.6.58 (§13, R4): los paquetes de la corrida (`{"direct", "packages"}`), o `None` sin
+    /// paquetes (y entonces no va).
+    pub modules: Option<serde_json::Value>,
 }
 
 /// Todas las entradas en el orden de la corrida: cada sellada lleva `after`, cuántas públicas la
@@ -388,7 +391,7 @@ pub fn build_receipt(log: &RunLog, ctx: &ReceiptContext<'_>) -> Result<Value, St
     let seed = log.seed.clone().unwrap_or_default();
     let seed_raw = synsema_core::bytesutil::hex_decode(&seed).unwrap_or_default();
     let size = log.capacity();
-    let header = json!({
+    let mut header = json!({
         "v": 1,
         "suite": SUITE,
         "engine": crate::attest::engine_version(),
@@ -404,6 +407,10 @@ pub fn build_receipt(log: &RunLog, ctx: &ReceiptContext<'_>) -> Result<Value, St
         "public_entries": public.len(),
         "sealed_bytes": size,
     });
+    // v0.6.58 (§13, R4): firmado como el resto del header. Sin paquetes no va.
+    if let Some(m) = &ctx.modules {
+        header["modules"] = m.clone();
+    }
     let public_v = Value::Array(public.clone());
     // Lo que no entra se corta ADENTRO y se cuenta: el tamaño de afuera no cambia nunca. El registro
     // ya cortó al anotar (el reloj con tope propio); esto cubre lo que la estimación no vio. v0.6.46
@@ -689,6 +696,7 @@ pub fn request_finish() -> Result<(), String> {
                 config_sha: r.config_sha.clone(),
                 trusted: None,
                 started: Some(req.started.clone()),
+                modules: crate::attest::current_modules()?,
             },
         )?
     };
@@ -821,7 +829,7 @@ mod tests {
         let l = log.lock().unwrap();
         build_receipt(
             &l,
-            &ReceiptContext { auditor, key, program_sha: Some("ab".repeat(32)), config_sha: None, trusted: None, started: Some("2026-10-21T00:00:00Z".into()) },
+            &ReceiptContext { auditor, key, program_sha: Some("ab".repeat(32)), config_sha: None, trusted: None, started: Some("2026-10-21T00:00:00Z".into()), modules: None },
         )
         .unwrap()
     }
@@ -861,7 +869,7 @@ mod tests {
         }
         let t0 = std::time::Instant::now();
         let l = log.lock().unwrap();
-        let ctx = ReceiptContext { auditor: pk, key: &key, program_sha: None, config_sha: None, trusted: None, started: Some("2026-10-21T00:00:00Z".into()) };
+        let ctx = ReceiptContext { auditor: pk, key: &key, program_sha: None, config_sha: None, trusted: None, started: Some("2026-10-21T00:00:00Z".into()), modules: None };
         let r = build_receipt(&l, &ctx).unwrap();
         assert!(t0.elapsed() < std::time::Duration::from_secs(20), "{:?}", t0.elapsed());
         let o = open_receipt(&r, &sk).unwrap();
@@ -917,7 +925,7 @@ mod tests {
         let mut l = RunLog::new(16 * 1024);
         l.seed = Some("00".repeat(32));
         l.push_sealed(json!({"kind": "op", "line": "x"}).to_string());
-        let ctx = ReceiptContext { auditor: pk, key: &key, program_sha: None, config_sha: None, trusted: None, started: Some("s".into()) };
+        let ctx = ReceiptContext { auditor: pk, key: &key, program_sha: None, config_sha: None, trusted: None, started: Some("s".into()), modules: None };
         let good = build_receipt(&l, &ctx).unwrap();
         let mut forged = good.clone();
         forged["root"] = json!(hex_encode(&[7u8; 32]));

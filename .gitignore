@@ -15,6 +15,9 @@ build/
 !engine/crates/**/fixtures/**/*.json
 # El ancla del guardia de rendimiento (engine/perf/guard.py, job perf-guard): sin ella el job falla.
 !engine/perf/baseline.json
+# v0.6.58: los `synsema.json` de los programas del guardia que usan un paquete (el proyecto y el índice
+# del paquete en su `cache/`): sin ellos la fila `p_pkg_loop` falla en el CI.
+!engine/perf/progs/**/*.json
 # Los manifiestos del plugin de la skill (Claude Code y Codex) y sus marketplaces.
 !.claude-plugin/*.json
 !.codex-plugin/*.json

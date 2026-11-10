@@ -351,6 +351,15 @@ pub const ENV_EXAMPLE: &str = r#"# Config del proyecto — Synsema auto-carga el
 # cuenta; el tamano de afuera no cambia nunca:
 # SYNSEMA_RECEIPT_SEALED_BYTES=65536
 
+# ══ Modulos por nombre — `use "nombre"` y `synsema get` ══
+
+# Carpeta del cache de paquetes (por defecto ~/.synsema/modules). Relativa = relativa a la raiz
+# del proyecto (la carpeta del synsema.json). `synsema get` la llena; correr solo la lee:
+# SYNSEMA_MODULE_CACHE=./vendor
+# Carpetas cuyo synsema.json se usa aunque sea de otro usuario (contenedores de CI, Docker con el
+# repo montado, carpetas de red), separadas como PATH, o `*`. Sin esto se ignora con aviso:
+# SYNSEMA_SAFE_PROJECT=/repo
+
 # ══ Attestation (TEEs) — `synsema serve --attested` / `synsema run --attest` / attest() ══
 
 # Driver de attestation: uno o una lista separada por comas (p. ej. `tsm,nitro-tpm`: un documento
@@ -448,6 +457,8 @@ const HELLO_SYN_PAST: &[&str] = &[
 
 /// sha256 de cada contenido histórico de `.env.example` (ver `InitFile::past`).
 const ENV_EXAMPLE_PAST: &[&str] = &[
+    // v0.6.58: antes de SYNSEMA_MODULE_CACHE y SYNSEMA_SAFE_PROJECT (`use "nombre"`).
+    "b97b59ebbaa0abd67aae6e01e6ab269705d790426242fb437a459b05ada484fa",
     // v0.6.56: antes de SYNSEMA_THREADS (los hilos de matmul).
     "3a58c25468c58751c0591fc39b1f2237ebd99cbc6869a6e1eff11decfb446e76",
     // v0.6.52: antes de SYNSEMA_REUSE_PORT (el traspaso sin corte).

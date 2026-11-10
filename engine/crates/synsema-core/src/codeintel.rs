@@ -908,6 +908,14 @@ fn resolve_alias(root: &Root, from_abs: &Path, prog: &Program, alias: &str) -> O
 
 /// Path canónico de un `use "<path>"` visto desde `from_abs`.
 fn resolve_import(root: &Root, from_abs: &Path, path: &str) -> Option<PathBuf> {
+    // v0.6.58 (N16): un nombre se sigue hasta el `main` del paquete en el caché (verificado).
+    if matches!(crate::modtable::classify(path), Ok(crate::modtable::UseKind::Name)) {
+        // N6 (ronda 1): el proyecto es el de la raíz, también desde un archivo de un paquete del
+        // caché. Sin memoria entre llamadas: el MCP vive y tiene que ver un `synsema get` nuevo.
+        let entry = root.dir.join("_");
+        let (dir, main) = crate::modtable::static_main_path_in(&entry.to_string_lossy(), &from_abs.to_string_lossy(), path).ok()?;
+        return Some(canon(&dir.join(main)));
+    }
     let base = from_abs.parent().map(|p| p.to_path_buf()).unwrap_or_default();
     // v0.6.20 — `../` sube mientras quede bajo la raíz del proyecto (la de `synsema code`).
     let p = PathBuf::from(crate::templates::resolve_module_path(path, &base, Some(&root.dir)).ok()?);

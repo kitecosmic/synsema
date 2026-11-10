@@ -246,6 +246,13 @@ struct TaintFrame {
     depth: usize,
 }
 
+/// v0.6.58 (§6.1): lo que `cross_into` guarda para deshacer el cruce.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PkgSaved {
+    prev: u32,
+    pushed: bool,
+}
+
 /// Flujo no-lineal: error, `give` (return) o `stop` (break). Mapea las
 /// excepciones del intérprete Python (RuntimeError/GiveSignal/StopSignal).
 pub enum Control {
@@ -966,6 +973,49 @@ pub fn module_map_of_env(env: &Rc<RefCell<Environment>>) -> Option<crate::types:
     })
 }
 
+thread_local! {
+    /// v0.6.58 (§6.1, K31): los entornos de módulo de los paquetes, por dirección: la marca dueña y
+    /// el nombre del paquete. El `Weak` reserva la dirección (como `ModuleRegistry`).
+    static PKG_MODULE_ENVS: RefCell<HashMap<usize, (std::rc::Weak<RefCell<Environment>>, u32, Rc<str>)>> = RefCell::new(HashMap::new());
+}
+
+/// v0.6.58 (§6.1, K31): el paquete dueño del entorno de un módulo (marca y nombre), si es de uno.
+/// La foto de un worker lo lleva para registrarlo del otro lado.
+pub fn package_owner_of_env(env: &Rc<RefCell<Environment>>) -> Option<(u32, Rc<str>)> {
+    PKG_MODULE_ENVS.with(|r| {
+        let r = r.borrow();
+        let (e, mark, pkg) = r.get(&(Rc::as_ptr(env) as usize))?;
+        e.upgrade().filter(|x| Rc::ptr_eq(x, env))?;
+        Some((*mark, pkg.clone()))
+    })
+}
+
+/// Registra el entorno de un módulo de paquete (lo llama la carga de un `.syn` del paquete, y el
+/// rebuild de un worker con el dueño que viajó en la foto).
+pub fn register_package_module(env: &Rc<RefCell<Environment>>, mark: u32, name: &str) {
+    PKG_MODULE_ENVS.with(|r| {
+        let mut r = r.borrow_mut();
+        r.retain(|_, (e, _, _)| e.strong_count() > 0);
+        r.insert(Rc::as_ptr(env) as usize, (Rc::downgrade(env), mark, Rc::from(name)));
+    });
+}
+
+/// v0.6.58 (§6.1, K31): desde afuera de un paquete, cualquier escritura que llega al mapa de
+/// exportaciones del paquete es un error: cambiaría lo que hace el código que corre bajo su nombre
+/// sin cambiar el hash. Se mira el valor (el entorno del módulo), no el nombre. Desde adentro (el
+/// paquete que corre es el dueño), el paquete escribe su estado como siempre.
+#[cold]
+#[inline(never)]
+fn package_export_guard(menv: &Rc<RefCell<Environment>>, name: &str, running: u32, loc: &SourceLocation) -> Result<(), Control> {
+    match package_owner_of_env(menv) {
+        Some((mark, pkg)) if mark != running => Err(err_at(
+            format!("set {}.{}: a package's exports are read-only; its code is fixed by its hash", pkg, name),
+            loc,
+        )),
+        _ => Ok(()),
+    }
+}
+
 /// `set m.X to v` / `set m["X"] to v` sobre un módulo: religa SU variable (la que leen sus
 /// tasks), como `m.X = v` en Python; sus nombres son sus exportaciones y sus tasks no se
 /// reemplazan desde afuera.
@@ -975,7 +1025,9 @@ fn module_rebind(
     name: &str,
     value: SynValue,
     loc: &SourceLocation,
+    running: u32,
 ) -> Result<SynValue, Control> {
+    package_export_guard(menv, name, running, loc)?;
     let current = m.borrow().get(name).cloned();
     match current {
         None => Err(err_at(
@@ -1100,14 +1152,14 @@ fn cannot_set(obj: &SynValue, what: &str, loc: &SourceLocation) -> Control {
 
 /// La hoja de `set <camino>.campo to v` (sin etiquetas: ya se resolvieron), con el contenedor ya
 /// evaluado: lo mismo para el tree-walker y para la VM (F4.6a). Devuelve el valor escrito.
-pub(crate) fn set_leaf_prop(obj: &SynValue, property_name: &str, value: SynValue, loc: &SourceLocation) -> Result<SynValue, Control> {
+pub(crate) fn set_leaf_prop(obj: &SynValue, property_name: &str, value: SynValue, loc: &SourceLocation, running: u32) -> Result<SynValue, Control> {
     match obj {
         SynValue::Map(m) => {
             // `set m.X to v` sobre un módulo religa SU variable (la que leen sus tasks), como
             // `m.X = v` en Python; sus nombres son sus exportaciones y sus tasks no se reemplazan
             // desde afuera.
             if let Some(menv) = module_env_of_map(m) {
-                return module_rebind(m, &menv, property_name, value, loc);
+                return module_rebind(m, &menv, property_name, value, loc, running);
             }
             if is_trusted_view(m) {
                 trusted_view_set(m, property_name, loc)?;
@@ -1138,6 +1190,7 @@ pub(crate) fn set_leaf_index(
     root_now: &dyn Fn() -> Option<(usize, bool)>,
     labels: bool,
     touched: bool,
+    running: u32,
 ) -> Result<SynValue, Control> {
     match obj {
         SynValue::List(l) => {
@@ -1161,7 +1214,7 @@ pub(crate) fn set_leaf_index(
         SynValue::Map(m) => {
             // `set lib["X"] to v`: las mismas reglas que `set lib.X to v`.
             if let Some(menv) = module_env_of_map(m) {
-                return module_rebind(m, &menv, &idx.to_string(), value, loc);
+                return module_rebind(m, &menv, &idx.to_string(), value, loc, running);
             }
             if is_trusted_view(m) {
                 trusted_view_set(m, &idx.to_string(), loc)?;
@@ -1338,13 +1391,15 @@ fn binding_scope(env: &Rc<RefCell<Environment>>, name: &str) -> Option<Rc<RefCel
 
 /// Si `parent` es el mapa de un módulo y `name` una de sus exportaciones: acceso único a la
 /// VARIABLE del módulo (sincroniza el mapa). `None` si no es un módulo o no exporta ese nombre.
-fn module_var_unique(parent: &SynValue, name: &str) -> Option<SynValue> {
-    let SynValue::Map(m) = parent else { return None };
+fn module_var_unique(parent: &SynValue, name: &str, running: u32, loc: &SourceLocation) -> Result<Option<SynValue>, Control> {
+    let SynValue::Map(m) = parent else { return Ok(None) };
     if !m.borrow().contains_key(name) {
-        return None;
+        return Ok(None);
     }
-    let menv = module_env_of_map(m)?;
-    with_unique_binding(&menv, name, |slot| slot.clone())
+    let Some(menv) = module_env_of_map(m) else { return Ok(None) };
+    // v0.6.58 (K31): `set tok.VOCAB["a"]` llega acá (el paso del camino); la hoja, a `module_rebind`.
+    package_export_guard(&menv, name, running, loc)?;
+    Ok(with_unique_binding(&menv, name, |slot| slot.clone()))
 }
 
 /// Un camino que se puede leer dos veces sin efectos: una variable, `p.campo` o `p[k]` con
@@ -1531,8 +1586,74 @@ fn env_update(env: &Rc<RefCell<Environment>>, name: &str, value: SynValue) -> Re
 const MAX_RECURSION: usize = 3000;
 /// wasm32: el stack es lineal (fijado al linkear, ver `engine/.cargo/config.toml`) y un
 /// overflow es un TRAP que descarta la instancia del embebedor — el guard salta antes.
-#[cfg(target_arch = "wasm32")]
+/// La pila que se acaba es la del host (la del motor de JS, ~1 MB en Node y Chrome).
+#[cfg(all(target_arch = "wasm32", not(target_os = "wasi")))]
 const MAX_RECURSION: usize = 600;
+/// v0.6.58 (M-r4-1): wasip1 corre en wasmtime (el Executor de Vela, `wasmtime-go` con la
+/// configuración de fábrica; el CLI de wasmtime), cuya pila es la mitad: medido con el guest de
+/// Vela bajo wasmtime-go v1.0.0, la recursión de la referencia hace trap a las 250 llamadas con 0
+/// `when` anidados, 155 con 2, 98 con 5, 61 con 10, 25 con 30 y 8 con 100 (en Node, 563, 300, 193,
+/// 117, 46 y 15). Con la mitad del límite, una unidad del guardián es la misma pila que en el
+/// wasm-web y los pesos (`node_weight`, `body_weight`, `template_weight`) valen igual.
+#[cfg(all(target_arch = "wasm32", target_os = "wasi"))]
+const MAX_RECURSION: usize = 300;
+
+/// v0.6.58 (M-r4-1, B-r4-3): el guardián cuenta frames aproximados, no sólo llamadas. Lo que la
+/// referencia corre recursiva en Rust pesa, mientras corre, según los niveles del árbol que baja:
+/// con una recursión que pasa por ahí, el error salta antes de que se acabe la pila del host. Una
+/// unidad del guardián es la pila sobre `MAX_RECURSION` (nativo: 512 MB / 3000 ≈ 175 KB).
+/// - Un nodo frío que la VM le pasa a la referencia (`Exec`; todas las sentencias de una unidad en
+///   frío). Nativo: los primeros 8 niveles no pesan (caben en lo que ya cuesta una llamada: así un
+///   `try` o un cuerpo frío común llegan al mismo tope que en la referencia, y el oráculo coincide) y
+///   desde ahí, uno por cada 4. Medido en debug (ronda 4), sin peso: 2999 llamadas recursivas por
+///   un cuerpo frío corren hasta con 6 `when` anidados (profundidad ~11) y desbordan con 8 (~13); un
+///   nivel cuesta ~20 KB (30 `when` desbordan entre 600 y 1000 llamadas, 100 antes de 300). Donde
+///   el peso entra, la referencia sola también desbordaría. wasm32 (la pila del motor de JS, ~1 MB en Node y Chrome, que no
+///   se puede preguntar): 1 más un nivel por cada 2. Medido en el wasm-web con Node (sin peso, con
+///   `k` `when` anidados en un cuerpo frío): el trap cae a las 191 llamadas con k = 5, 121 con 10,
+///   55 con 30, 18 con 100, 7 con 300 y 2 con 1000: la pila entera son ~1650 niveles y una llamada
+///   fría plana cuesta ~3,6 (una unidad de las 600 son ~2,75 niveles, así que un nivel son ~0,36
+///   unidades y se cobra 0,5). Un árbol de `MAX_NEST` niveles sin recursión pesa ~513, debajo de 600.
+pub(crate) fn node_weight(depth: usize) -> usize {
+    if cfg!(target_arch = "wasm32") {
+        1 + depth / 2
+    } else {
+        depth.saturating_sub(8) / 4
+    }
+}
+
+/// - El cuerpo de una task que corre la referencia (las etiquetas encendidas, el modo referencia, la
+///   primera llamada, o un frame que la VM no pudo preparar), por cada llamada; `depth` es el
+///   `run_depth` más hondo de sus sentencias. Nativo: lo mismo que un nodo frío (medido en debug con
+///   `--labels`, sin peso: 2999 llamadas corren con 6 `when` anidados y desbordan con 8, el umbral
+///   del modo frío). wasm32: por lo menos 1, y ⌈(21·d − 92)/40⌉. Medido en el wasm-web con Node y
+///   las etiquetas (sin peso; `d` = k + 5 con `k` `when` anidados): el trap cae a las 563 llamadas
+///   con k = 0, 300 con 2, 193 con 5, 117 con 10, 46 con 30 y 15 con 100; el guest de Vela, un poco
+///   más (599, 348, 210, 126, 49, 16). Una llamada cuesta ~1,07 + 0,42·k unidades; con el margen de
+///   1,25, 1,33 + 0,525·k, y el peso es eso menos la unidad de la llamada (sin el mínimo de 1, una
+///   recursión plana llegaba a 600 y el trap cae antes).
+pub(crate) fn body_weight(depth: usize) -> usize {
+    if cfg!(target_arch = "wasm32") {
+        (21 * depth).saturating_sub(92).div_ceil(40).max(1)
+    } else {
+        node_weight(depth)
+    }
+}
+
+/// - Una plantilla que se renderiza (`render_nodes` baja una llamada por bloque). Un nivel cuesta
+///   bastante menos que en la referencia: en debug menos de 3,4 KB (50 bloques × 3000 llamadas
+///   corren), en release ~0,5 KB (500 bloques × 2999 desbordaban, 300 × 3000 no). Nativo: un nivel
+///   por cada 48. wasm32: 2 más un nivel por cada 3; medido en el wasm-web con Node (una plantilla
+///   con `k` `when` que se renderiza a sí misma por una task, con peso 1 + k/16): trap a las 195
+///   vueltas con k = 5, 77 con 30, 29 con 100, 11 con 300 y 4 con 1000. La pila son ~3800 niveles
+///   del render (un nivel ~0,16 unidades) y cada vuelta cuesta ~22 más (las dos llamadas y el render).
+pub(crate) fn template_weight(depth: usize) -> usize {
+    if cfg!(target_arch = "wasm32") {
+        2 + depth / 3
+    } else {
+        depth / 48
+    }
+}
 
 /// Builtins del core CONSCIENTES de etiquetas (reciben los argumentos envueltos):
 /// Los cuatro de la feature y `print` (redacta por Display, y además RECHAZA la llamada bajo
@@ -1925,6 +2046,10 @@ pub struct Interpreter {
     /// techo del host (fail-closed: mandan los dos, gana el más chico).
     request_spend_limits: Vec<(String, String)>,
     recursion_depth: usize,
+    /// v0.6.58 (M-r5-1): desde qué profundidad `call_value_named` mira más (`depth_refused`):
+    /// `MAX_RECURSION` en un hilo de 512 MB (el tope, sin costo), 64 en uno que avisó su pila
+    /// (`serve`: desde ahí mira también la pila que le queda).
+    recursion_cap: usize,
     /// Cancelación COOPERATIVA (timeout de handler, shutdown ordenado, `agent_stop`):
     /// `exec_block` la chequea por statement y las esperas largas (select/recv/sleep/
     /// wait_for/run) en su loop. Al verla → `Control::Error("cancelled: …")`; un
@@ -2017,12 +2142,12 @@ pub struct Interpreter {
     /// carga (detección de import circular) y una pila de listas de nombres
     /// exportados (un frame por módulo en carga; el frame base es el del
     /// entrypoint y nunca se cosecha → un `export` top-level del entrypoint se ignora).
-    module_cache: HashMap<String, SynValue>,
+    module_cache: HashMap<crate::modtable::ModKey, SynValue>,
     /// Los entornos de módulo de este intérprete: los que cargó (`load_module_inner`, v0.6.51) y
     /// los que el host reconstruyó para él (`parallel_map`, un agente, un worker de `serve`:
     /// `adopt_module_envs`). Son suyos: el `Drop` los vacía.
     owned_module_envs: Vec<Rc<RefCell<Environment>>>,
-    loading_modules: HashSet<String>,
+    loading_modules: HashSet<crate::modtable::ModKey>,
     exports_collector: Vec<Vec<String>>,
     /// Argumentos del programa (`args()`): lo que siguió al `--` en `synsema run`, o
     /// todo el argv en un binario `synsema build`. Datos que el invocador escribió para
@@ -2256,11 +2381,51 @@ pub struct Interpreter {
     /// v0.6.53 (ronda 1, A1): lo que sólo sabe el host sobre si el marco actual corre con MENOS
     /// que las capacidades del programa (un techo delegado, un agente). Ver `frame_narrowing`.
     frame_narrowing_hook: Option<FrameNarrowingHook>,
+    /// v0.6.58 (M8, ronda 1): el paquete cuyo dominio llegó como delegación (un worker de
+    /// `parallel_map` que el paquete llamó: su `pkg_stack` está vacío). Ver `package_in_stack`.
+    package_frame_hook: Option<PackageFrameHook>,
+    /// v0.6.58 (§6.1): el **paquete que corre**, la marca del código que está corriendo ahora (0 es
+    /// el programa). Una task o lambda que se crea lleva éste como marca. Al final del struct a
+    /// propósito (memoria `hot-path-exec-node-y-campos`).
+    cur_pkg: u32,
+    /// v0.6.58 (§6.1): distinto de 0 mientras haya un scope de confianza abierto (`trusted_depth`)
+    /// o el dominio de un paquete en la pila. El brazo `Task` mira `call_guard | mark` en una sola
+    /// rama: sin tools ni paquetes, una llamada del programa al programa no entra al camino frío.
+    call_guard: u32,
+    /// v0.6.58 (§3): el proyecto de la corrida (la raíz, su `synsema.json`), el mismo para todos los
+    /// intérpretes de la corrida. Lo fija `ensure_project` antes de la primera sentencia.
+    project: Option<std::sync::Arc<crate::project::Project>>,
+    /// v0.6.58 (§5.2): la tabla del proceso de la corrida (lo que se leyó y verificó antes de ejecutar).
+    mod_table: Option<std::sync::Arc<crate::modtable::ModTable>>,
+    /// v0.6.58 (§6.1): apila (`Some`) o desapila (`None`) el dominio de un paquete como un techo
+    /// delegado más. Lo cablea el host, que tiene el `CapabilitySet`.
+    pkg_scope_hook: Option<PackageScopeHook>,
+    /// v0.6.58 (§6.1, §6.4): las marcas de los paquetes cuyo dominio está apilado, de abajo arriba.
+    /// No vacía = hay un paquete en la pila (también dentro de un callback del programa).
+    pkg_stack: Vec<u32>,
+    /// v0.6.58 (§6.3): las plantillas de cada paquete (los archivos de su tabla que no son `.syn`),
+    /// armadas la primera vez que el paquete renderiza.
+    pkg_templates: HashMap<u32, Rc<crate::templates::ToolTemplates>>,
+    /// v0.6.58 (§6.3, K28): el padre del entorno de una plantilla de cada paquete: el entorno del
+    /// módulo `main` del paquete (que cuelga de los builtins), nunca `global_env`.
+    pkg_template_envs: HashMap<u32, Rc<RefCell<Environment>>>,
+    /// v0.6.58 (§6.1, G-1): los cruces que hizo el prólogo de un chunk de paquete en la VM:
+    /// `(vm_frames.len(), base, lo guardado)` del frame que cruzó, de abajo arriba.
+    pkg_frames: Vec<(usize, usize, PkgSaved)>,
 }
+
+/// v0.6.58 (§6.1): el dominio de un paquete al cruzar: `Some((marca, nombre, dominio))` lo apila
+/// (la marca 0 es el nivel superior de un paquete al cargarlo, con el dominio vacío); `None` lo
+/// desapila.
+pub type PackageScopeHook = Rc<dyn Fn(Option<(u32, &str, &[(String, Option<String>)])>)>;
 
 /// v0.6.53 (ronda 1, A1): ¿el marco actual está recortado respecto del programa, y por qué? El
 /// texto completa «not allowed …» (p. ej. "inside an agent").
 pub type FrameNarrowingHook = Rc<dyn Fn() -> Option<&'static str>>;
+
+/// v0.6.58 (M8, ronda 1): el nombre del paquete de más arriba cuyo dominio llegó como delegación
+/// (lo sabe el host, que arma el conjunto de capacidades), o `None`.
+pub type PackageFrameHook = Rc<dyn Fn() -> Option<String>>;
 
 /// v0.6.46 (ronda 1 de cf1, B2): el linaje que juntó un intérprete hijo (un worker de
 /// `parallel_map`), para sumarlo al del padre con [`Interpreter::absorb_lineage`].
@@ -2458,6 +2623,7 @@ impl Interpreter {
             request_identity: None,
             request_spend_limits: Vec::new(),
             recursion_depth: 0,
+            recursion_cap: if crate::stack::registered() { 64 } else { MAX_RECURSION },
             cancel: CancelToken::new(),
             ext: RefCell::new(HashMap::new()),
             grant_hook: None,
@@ -2472,6 +2638,16 @@ impl Interpreter {
             human_callback: None,
             human_defer_callback: None,
             frame_narrowing_hook: None,
+            package_frame_hook: None,
+            cur_pkg: 0,
+            call_guard: 0,
+            project: None,
+            mod_table: None,
+            pkg_scope_hook: None,
+            pkg_stack: Vec::new(),
+            pkg_templates: HashMap::new(),
+            pkg_template_envs: HashMap::new(),
+            pkg_frames: Vec::new(),
             llm_callback: None,
             llm_decide_callback: None,
             llm_step_callback: None,
@@ -3184,6 +3360,9 @@ impl Interpreter {
     /// llamador —lo que pasó adentro no tiñe su continuación: el `give` llega a un join point y
     /// el valor ya viaja etiquetado— salvo lo que ESCAPA del cuerpo del callee (un `stop` sin
     /// bucle propio), que corta el bucle de acá y por eso se suma a nuestra tinta.
+    /// v0.6.58: `inline(always)` porque con el brazo `Task` partido (la rama de la marca) LLVM la
+    /// sacaba de línea y cada llamada del tree-walker pagaba ~11 instrucciones más (cachegrind).
+    #[inline(always)]
     fn leave_call(&mut self, saved: TaintFrame) {
         let escaped = std::mem::replace(&mut self.escaping_taint, saved.escaping);
         self.loop_depth = saved.depth;
@@ -3366,9 +3545,35 @@ impl Interpreter {
         self.program_args = args;
     }
 
-    /// v0.6.20 — raíz del proyecto para `use "../"` (el host la conoce: dir de la entrada).
-    pub fn set_project_root(&mut self, root: std::path::PathBuf) {
-        self.project_root = Some(root);
+    /// v0.6.58 (§3): el proyecto de este intérprete. El host lo resuelve una vez por programa y lo
+    /// pasa a cada intérprete que crea; sin esto, el intérprete toma el de su corrida.
+    pub fn set_project(&mut self, project: std::sync::Arc<crate::project::Project>) {
+        self.project_root = project.root.clone();
+        self.project = Some(project);
+    }
+
+    /// v0.6.58 (§3): el proyecto de este intérprete, si ya se resolvió.
+    pub fn project(&self) -> Option<&std::sync::Arc<crate::project::Project>> {
+        self.project.as_ref()
+    }
+
+    /// v0.6.58 (§3): resuelve el proyecto de la corrida (una vez por corrida: lo comparten todos sus
+    /// intérpretes) a partir del archivo de entrada. Antes de la primera sentencia: un
+    /// `synsema.json` roto o un mínimo que este motor no cumple es un error de carga.
+    #[cold]
+    #[inline(never)]
+    fn ensure_project(&mut self, entry: &str) -> Result<(), Control> {
+        if self.project.is_some() {
+            return Ok(());
+        }
+        let slot = self.run_scope.ext::<crate::project::ProjectSlot>();
+        // Ronda 2 (M-r2-1): un proyecto que falla deja la corrida sin empezar (ver la tabla abajo).
+        let p = slot.get_or_resolve(entry).map_err(|e| {
+            crate::modtable::note_run_table_failed(entry);
+            err(e)
+        })?;
+        self.set_project(p);
+        Ok(())
     }
 
     /// v0.6.20 — pasos ejecutados hasta ahora (nodos que pasaron por `exec`).
@@ -4026,6 +4231,11 @@ impl Interpreter {
         self.frame_narrowing_hook = Some(hook);
     }
 
+    /// v0.6.58 (M8, ronda 1): cablea lo que el host sabe del paquete delegado (ver `PackageFrameHook`).
+    pub fn set_package_frame_hook(&mut self, hook: PackageFrameHook) {
+        self.package_frame_hook = Some(hook);
+    }
+
     /// v0.6.53 (ronda 1, A1): si el marco actual corre con MENOS que las capacidades del programa,
     /// el motivo. Lo que corre DESPUÉS en nombre del programa (la task de un `then`, una task de
     /// `cron_every`/`cron_after`) corre con las capacidades del programa, así que no se puede
@@ -4070,6 +4280,10 @@ impl Interpreter {
                 ))
             }
         };
+        // v0.6.58 (§6.4, K23): con un paquete en la pila, el texto del paquete.
+        if let Some(msg) = self.package_later_error(&format!("{} … then {}", action, task)) {
+            return Err(err_at(msg, loc));
+        }
         // Ronda 1, A1: la task corre después con las capacidades del programa.
         if let Some(why) = self.frame_narrowing() {
             return Err(err_at(
@@ -4363,7 +4577,7 @@ impl Interpreter {
     /// intérprete: un `use "trusted:<module>"` posterior (en una ruta) recibe una copia de ésta, sin
     /// volver a correr el nivel superior de la tool.
     pub fn adopt_trusted_view(&mut self, module: &str, view: &crate::types::MapRef) {
-        let key = format!("trusted:{}", module);
+        let key = crate::modtable::ModKey::Trusted(module.to_string());
         if !self.module_cache.contains_key(&key) {
             self.module_cache.insert(key, SynValue::Map(view.borrow().to_ref()));
         }
@@ -4399,7 +4613,10 @@ impl Interpreter {
     /// base de confianza (los builtins): un `{upper(x)}` del template de la tool no llama a lo que el
     /// programa definió con ese nombre. Ronda 3: hoy no se alcanza (`render` es error dentro de la
     /// tool, R3-A1); queda para cuando el host le dé a la tool sus templates.
-    pub(crate) fn template_parent(&self) -> Rc<RefCell<Environment>> {
+    pub(crate) fn template_parent(&mut self) -> Rc<RefCell<Environment>> {
+        if self.cur_pkg != 0 {
+            return self.package_template_parent();
+        }
         if self.trusted_depth > 0 {
             if let Some(b) = &self.trusted_base_env {
                 return b.clone();
@@ -4702,6 +4919,24 @@ impl Interpreter {
     /// del global — el caso de una ruta montada desde un módulo (`mount`): su cuerpo
     /// resuelve los helpers PRIVADOS del módulo por nombre simple, igual que una task
     /// exportada (DE-027).
+    /// v0.6.58 (§6.1, K34): el cuerpo de una task montada como ruta (`mount tok.rutas`) corre con
+    /// la marca de la task: si es de un paquete, después del cruce, y se deshace al volver.
+    pub fn run_request_block_marked(
+        &mut self,
+        stmts: &[Node],
+        bindings: Vec<(String, SynValue)>,
+        parent: &Rc<RefCell<Environment>>,
+        mark: u32,
+    ) -> Result<SynValue, Control> {
+        if mark == self.cur_pkg {
+            return self.run_request_block_in(stmts, bindings, parent);
+        }
+        let saved = self.cross_into(mark);
+        let r = self.run_request_block_in(stmts, bindings, parent);
+        self.cross_leave(saved);
+        r
+    }
+
     pub fn run_request_block_in(
         &mut self,
         stmts: &[Node],
@@ -4813,31 +5048,188 @@ impl Interpreter {
             )));
         }
         let base_dir = Path::new(importer_file).parent().unwrap_or_else(|| Path::new("."));
-        // v0.6.20 — la raíz del proyecto acota `../`: la fijó el host o se captura acá, en el
-        // primer `use` (siempre el top-level de la entrada; los `use` de un módulo corren
-        // DENTRO de ese primero). `<stdin>`/`<test>` sin dir → sin raíz → criterio v0.6.19.
-        if self.project_root.is_none() && !importer_file.starts_with('<') {
-            let root = if base_dir.as_os_str().is_empty() { Path::new(".") } else { base_dir };
-            self.project_root = Some(root.to_path_buf());
+        // v0.6.58 (§3, D-4): la raíz es la del proyecto de la corrida, nunca la del primer `use`.
+        // Un intérprete que no pasó por `execute` (un worker que sólo llama tasks) la toma de su
+        // corrida; si nadie la resolvió todavía, la resuelve con este archivo como entrada.
+        if self.project.is_none() {
+            self.ensure_project(importer_file)?;
+        }
+        // v0.6.58 (§4): un nombre, o cualquier `use` adentro de un paquete, va por la tabla.
+        // Un solo criterio de «archivo o nombre» en todo el motor: `modtable::classify` (una URL que
+        // termina en `.syn` no es un archivo).
+        if self.cur_pkg != 0 || !matches!(crate::modtable::classify(raw_path), Ok(crate::modtable::UseKind::File)) {
+            return self.load_by_table(raw_path, importer_file);
         }
         let resolved = resolve_module_path(raw_path, base_dir, self.project_root.as_deref()).map_err(err)?;
+        let key = crate::modtable::ModKey::File(resolved.clone());
 
-        if self.loading_modules.contains(&resolved) {
+        if self.loading_modules.contains(&key) {
             return Err(err(format!(
                 "circular import: module '{}' is already being loaded",
                 raw_path
             )));
         }
-        if let Some(cached) = self.module_cache.get(&resolved) {
+        if let Some(cached) = self.module_cache.get(&key) {
             return Ok(cached.clone());
         }
 
-        self.loading_modules.insert(resolved.clone());
+        self.loading_modules.insert(key.clone());
         let res = self.load_module_inner(raw_path, &resolved);
-        self.loading_modules.remove(&resolved);
+        self.loading_modules.remove(&key);
         let module_map = res?;
-        self.module_cache.insert(resolved, module_map.clone());
+        self.module_cache.insert(key, module_map.clone());
         Ok(module_map)
+    }
+
+    /// v0.6.58 (§5.2): la tabla de la corrida. La arma `execute` antes de la primera sentencia; un
+    /// intérprete que no pasó por ahí (un worker) la toma de su corrida.
+    #[cold]
+    #[inline(never)]
+    fn ensure_table(&mut self, entry: &str, uses: Vec<String>) -> Result<std::sync::Arc<crate::modtable::ModTable>, Control> {
+        if let Some(t) = &self.mod_table {
+            return Ok(t.clone());
+        }
+        // Ronda 2 (M-r2-1): si el proyecto o la tabla fallan, la corrida no empezó; se anota para que
+        // el recibo sellado diga «no corrió ningún paquete» en vez de negarse.
+        self.ensure_project(entry)?;
+        let project = self.project.clone().expect("ensure_project lo fijó");
+        let slot = self.run_scope.ext::<crate::modtable::TableSlot>();
+        let t = match slot.get_or_build(|| crate::modtable::build(&project, entry, uses)) {
+            Ok(t) => t,
+            Err(e) => {
+                crate::modtable::note_run_table_failed(entry);
+                return Err(err(e));
+            }
+        };
+        crate::modtable::note_run_table(entry, &t);
+        self.mod_table = Some(t.clone());
+        Ok(t)
+    }
+
+    /// v0.6.58 (§4): `use "nombre"`, o un `use` adentro de un paquete. Resuelve con la tabla (que ya
+    /// verificó todo antes de ejecutar) y carga el módulo del paquete en su marca.
+    #[cold]
+    #[inline(never)]
+    fn load_by_table(&mut self, raw_path: &str, importer_file: &str) -> Result<SynValue, Control> {
+        use crate::modtable::{classify, pkg_path_of, pkg_relative, ModKey, UseKind};
+        let kind = classify(raw_path).map_err(err)?;
+        let table = self.ensure_table(importer_file, vec![raw_path.to_string()])?;
+        let (pkg, path) = match (kind, self.cur_pkg) {
+            (UseKind::Name, 0) => {
+                let hash = self
+                    .project
+                    .as_ref()
+                    .and_then(|p| p.manifest.as_ref())
+                    .and_then(|m| m.module(raw_path))
+                    .and_then(|e| e.hash.clone());
+                let Some(pkg) = hash.and_then(|h| table.packages.iter().find(|p| p.hash == h).cloned()) else {
+                    // Lo que no está en la tabla ya dio su error antes de ejecutar; esto es un `use`
+                    // que el recorrido no vio (un embebedor que corre un bloque suelto): el mismo error
+                    // que habría dado el recorrido.
+                    let project = self.project.clone().expect("ensure_project lo fijó");
+                    let probe = crate::modtable::build(&project, importer_file, vec![raw_path.to_string()]);
+                    return Err(err(probe.err().unwrap_or_else(|| {
+                        format!("use \"{}\": the module is not in the table of this run (it was not reached before running)", raw_path)
+                    })));
+                };
+                let main = pkg.index.main.clone().unwrap_or_default();
+                (pkg, main)
+            }
+            (UseKind::Name, mark) => {
+                let me = table.package(mark).cloned().expect("paquete que corre");
+                let id = me.index.module(raw_path).and_then(|d| d.id.clone());
+                let project = self.project.clone().expect("ensure_project lo fijó");
+                let chosen = id.as_deref().and_then(|id| {
+                    let want = crate::modtable::normalize_id(id);
+                    let m = project.manifest.as_ref()?;
+                    m.modules
+                        .iter()
+                        .map(|(_, e)| e)
+                        .chain(m.indirect.iter().map(|(_, e)| e))
+                        .find(|e| e.id.as_deref().map(crate::modtable::normalize_id).as_deref() == Some(want.as_str()))
+                        .and_then(|e| e.hash.clone())
+                });
+                let Some(pkg) = chosen.and_then(|h| table.packages.iter().find(|p| p.hash == h).cloned()) else {
+                    return Err(err(format!(
+                        "use \"{}\" in {}: the dependency {} is not in synsema.json: run synsema get",
+                        raw_path,
+                        me.name,
+                        id.unwrap_or_else(|| raw_path.to_string())
+                    )));
+                };
+                let main = pkg.index.main.clone().unwrap_or_default();
+                (pkg, main)
+            }
+            (UseKind::File, 0) => unreachable!("un módulo de archivo del programa no pasa por la tabla"),
+            (UseKind::File, mark) => {
+                let me = table.package(mark).cloned().expect("paquete que corre");
+                let from = pkg_path_of(&me, importer_file);
+                let target = pkg_relative(&from, raw_path).map_err(err)?;
+                if !me.files.contains_key(&target) {
+                    return Err(err(format!("module not found: {}", raw_path)));
+                }
+                (me, target)
+            }
+            (UseKind::Trusted(_), _) => unreachable!("trusted: se resuelve antes"),
+        };
+        let key = ModKey::Pkg { hash: pkg.hash.clone(), path: path.clone() };
+        if self.loading_modules.contains(&key) {
+            return Err(err(format!("circular import: module '{}' is already being loaded", raw_path)));
+        }
+        if let Some(cached) = self.module_cache.get(&key) {
+            return Ok(cached.clone());
+        }
+        self.loading_modules.insert(key.clone());
+        let res = self.load_pkg_module(&pkg, &path, &key);
+        self.loading_modules.remove(&key);
+        let module_map = res?;
+        self.module_cache.insert(key, module_map.clone());
+        Ok(module_map)
+    }
+
+    /// Carga un `.syn` de un paquete desde la tabla: corre su nivel superior con la marca del paquete
+    /// (las tasks y lambdas que define la llevan) y cosecha sus exportaciones.
+    #[cold]
+    #[inline(never)]
+    fn load_pkg_module(
+        &mut self,
+        pkg: &std::sync::Arc<crate::modtable::Package>,
+        path: &str,
+        key: &crate::modtable::ModKey,
+    ) -> Result<SynValue, Control> {
+        let shown = key.display();
+        let bytes = pkg.files.get(path).ok_or_else(|| err(format!("module not found: {}", path)))?;
+        let source = std::str::from_utf8(bytes).map_err(|_| err(format!("module is not UTF-8: {}", shown)))?;
+        // El recorrido de la tabla ya lo parseó y lo revisó (`check_package_syn`) con estos bytes.
+        let (program, fresh) = self.module_ast(source, &shown)?;
+        if fresh {
+            crate::modtable::check_package_syn(&program, source, &pkg.name, &shown, path).map_err(err)?;
+        }
+        note_loaded_module(&shown, source, &program);
+        check_protected_names(&program)?;
+        self.set_declared_principals(&program);
+        let base = self.module_base();
+        let module_env = Environment::child(&base, &format!("module:{}", shown));
+        if pkg.index.main.as_deref() == Some(path) {
+            self.pkg_template_envs.entry(pkg.mark).or_insert_with(|| module_env.clone());
+        }
+        self.exports_collector.push(Vec::new());
+        let saved = self.cross_into_top_level(pkg.mark);
+        let exec_res = self.exec_block(&program.statements, &module_env);
+        self.cross_leave(saved);
+        let names = self.exports_collector.pop().unwrap_or_default();
+        exec_res?;
+        let mut exports = SynMap::new();
+        for name in names {
+            if let Some(v) = env_get(&module_env, &name) {
+                exports.insert(name, v);
+            }
+        }
+        let map = exports.into_ref();
+        register_module(&map, &module_env);
+        register_package_module(&module_env, pkg.mark, &pkg.name);
+        self.owned_module_envs.push(module_env);
+        Ok(SynValue::Map(map))
     }
 
     /// v0.6.46 (E3b): `use "trusted:nombre"`. El cuerpo corre bajo el scope de confianza, y cada
@@ -4847,7 +5239,8 @@ impl Interpreter {
     #[cold]
     #[inline(never)]
     fn load_trusted_module(&mut self, name: &str) -> Result<SynValue, Control> {
-        let key = format!("trusted:{}", name);
+        let key = crate::modtable::ModKey::Trusted(name.to_string());
+        let shown = key.display();
         // Ronda 1 (A2): cada `use` recibe SU copia de las exportaciones: lo que un importador
         // escribe en ella no lo ve la tool ni otro importador. Ronda 2 (N2): es una segunda defensa
         // sin test propio (hoy el `set` ya copia el mapa antes de escribirlo, porque el caché es
@@ -4864,18 +5257,18 @@ impl Interpreter {
             )));
         };
         if self.loading_modules.contains(&key) {
-            return Err(err(format!("circular import: module '{}' is already being loaded", key)));
+            return Err(err(format!("circular import: module '{}' is already being loaded", shown)));
         }
-        let program = parse_source(&source, &key).map_err(|e| err(e.to_string()))?;
-        note_loaded_module(&key, &source, &program);
+        let program = parse_source(&source, &shown).map_err(|e| err(e.to_string()))?;
+        note_loaded_module(&shown, &source, &program);
         check_protected_names(&program)?;
         for stmt in &program.statements {
             match &stmt.kind {
-                NodeKind::ServeBlock { .. } => return Err(err(format!("module '{}' must not contain a 'serve' block", key))),
+                NodeKind::ServeBlock { .. } => return Err(err(format!("module '{}' must not contain a 'serve' block", shown))),
                 NodeKind::RequireStatement { .. } => {
                     return Err(err(format!(
                         "module '{}' must not have a top-level 'require': each exported task declares its own",
-                        key
+                        shown
                     )))
                 }
                 _ => {}
@@ -4889,16 +5282,18 @@ impl Interpreter {
         // Ronda 1 (A1): hijo del preludio, no de `global_env`: los nombres libres del módulo son los
         // builtins, no lo que el programa definió antes o después del `use`.
         let base = self.trusted_base();
-        let module_env = Environment::child(&base, &format!("module:{}", key));
+        let module_env = Environment::child(&base, &format!("module:{}", shown));
         self.exports_collector.push(Vec::new());
         self.stdout_verdict = None;
         hook(Some((name, &[])));
         debug_assert!(!self.shortcuts, "a trusted scope opened with the VM on (it has no origin check)");
         self.trusted_depth += 1;
+        self.call_guard += 1;
         self.trusted_stack.push(name.to_string());
         let exec_res = self.exec_block(&program.statements, &module_env);
         self.trusted_stack.pop();
         self.trusted_depth -= 1;
+        self.call_guard -= 1;
         hook(None);
         self.stdout_verdict = None;
         let names = self.exports_collector.pop().unwrap_or_default();
@@ -4940,18 +5335,37 @@ impl Interpreter {
         Ok(SynValue::Map(copy))
     }
 
+    /// El fuente de un módulo de archivo (v0.6.58, §5.2): primero la tabla de la corrida (los bytes
+    /// que se leyeron una vez antes de ejecutar); si no está (un `use` que el recorrido no vio), el
+    /// bundle o el disco, como antes.
+    #[inline(never)]
+    fn module_source(&self, raw_path: &str, resolved: &str) -> Result<String, Control> {
+        // Un worker no armó la tabla: la de su corrida (R10: lo que corrió es lo que se leyó antes).
+        let table = self.mod_table.clone().or_else(|| self.run_scope.ext::<crate::modtable::TableSlot>().get());
+        if let Some(t) = table.as_ref() {
+            if let Some(src) = t.files.get(resolved) {
+                return Ok(src.to_string());
+            }
+            // B15 (ronda 1): el recorrido lo buscó antes de correr y no estaba: no se lee del disco
+            // ahora (R10), en ningún worker.
+            if let Some(why) = t.missing.get(resolved) {
+                let head = if why.starts_with("it did not exist") { "module not found" } else { "module cannot be read" };
+                return Err(err(format!("{}: {} ({})", head, raw_path, why)));
+            }
+        }
+        match crate::bundle::get(resolved) {
+            Some(bytes) => String::from_utf8(bytes.to_vec()).map_err(|_| err(format!("module is not UTF-8: {}", raw_path))),
+            None => std::fs::read_to_string(resolved).map_err(|_| err(format!("module not found: {}", raw_path))),
+        }
+    }
+
     fn load_module_inner(&mut self, raw_path: &str, resolved: &str) -> Result<SynValue, Control> {
         // Overlay del bundle (`synsema build`): el módulo puede vivir dentro del
         // ejecutable; si no está ahí, el disco como siempre.
-        let source = match crate::bundle::get(resolved) {
-            Some(bytes) => String::from_utf8(bytes.to_vec())
-                .map_err(|_| err(format!("module is not UTF-8: {}", raw_path)))?,
-            None => std::fs::read_to_string(resolved)
-                .map_err(|_| err(format!("module not found: {}", raw_path)))?,
-        };
+        let source = self.module_source(raw_path, resolved)?;
         // Un error de compilación del módulo se reporta como runtime (la operación
         // de import falló), igual que en el oráculo Python.
-        let program = parse_source(&source, resolved).map_err(|e| err(e.to_string()))?;
+        let (program, _) = self.module_ast(&source, resolved)?;
         // `program_sha` del recibo se calcula con ESTOS bytes, sin releer ni reparsear. Fuera de
         // línea y fría: dentro de esta función movía el acomodo del intérprete (+8 % en Windows sin
         // PGO, con las mismas instrucciones).
@@ -5759,6 +6173,11 @@ impl Interpreter {
 
     pub fn execute(&mut self, program: &Program) -> Result<SynValue, Control> {
         let _run = self.run_scope.enter();
+        // v0.6.58 (§3, §5.2): el proyecto y la tabla, antes de correr nada.
+        self.ensure_project(&program.location.file)?;
+        if program.has_file_use {
+            self.ensure_table(&program.location.file, crate::loaded_modules::use_paths(program))?;
+        }
         // T5 (B8): nombres protegidos → error de carga, antes de correr nada.
         check_protected_names(program)?;
         // v0.6.29: nombres que cambiaron antes de v1.0 → un aviso por stderr, una vez.
@@ -5868,6 +6287,11 @@ impl Interpreter {
         }
         // Setup: preámbulo + todas las sentencias no-`TestBlock`. Un fallo → outcome único.
         let setup: Result<(), Control> = (|| {
+            // v0.6.58 (§3, §5.2): el proyecto y la tabla, antes del setup.
+            self.ensure_project(&program.location.file)?;
+            if program.has_file_use {
+                self.ensure_table(&program.location.file, crate::loaded_modules::use_paths(program))?;
+            }
             // T5 (B8): nombres protegidos → error de carga.
             check_protected_names(program)?;
             // T5 (ronda 7): idem, antes del setup de los bloques `test`.
@@ -6578,6 +7002,7 @@ impl Interpreter {
                     required_capabilities: Vec::new(),
                     code: Default::default(),
                     free_names: Default::default(),
+                    mark: self.cur_pkg,
                 });
                 Ok(SynValue::Task(task))
             }
@@ -6734,6 +7159,11 @@ impl Interpreter {
         let NodeKind::AgentDefinition { name, body, .. } = &node.kind else { unreachable!("exec_agent_definition: otro nodo") };
         if self.trusted_depth > 0 {
             return Err(err_at(trusted_no_agents(name), &node.location));
+        }
+        // v0.6.58 (§6.4, K24): un agente corre en otro intérprete con su propio preámbulo de
+        // `require`: se saldría de la pila de techos del paquete.
+        if self.package_in_stack().is_some() {
+            return Err(err_at(package_no_agents(name), &node.location));
         }
         {
         self.agent_definitions.insert(name.clone(), (body.clone(), env.clone()));
@@ -7359,7 +7789,9 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
         // re-grantear para escapar del aislamiento / del least-privilege por-tool
         // (un `require` anidado bajo when/if no se extrae a required_capabilities,
         // así que llega acá en runtime).
-        if !self.in_sandbox() && !self.in_tool_scope() {
+        // v0.6.58 (§6.1, E-1): adentro de un paquete tampoco; lo que el paquete puede usar sale de su
+        // AST (el dominio), nunca de lo que corre.
+        if !self.in_sandbox() && !self.in_tool_scope() && self.cur_pkg == 0 {
             if let Some(hook) = self.grant_hook.clone() {
                 // Ubicación del `require` para el audit (`file`/`line` de un
                 // grant rechazado por el techo). Sólo si hay sink instalado.
@@ -7505,6 +7937,7 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                     required_capabilities: Vec::new(),
                     code: Default::default(),
                     free_names: Default::default(),
+                    mark: self.cur_pkg,
                 }));
                 map.insert(format!("_route_handler_{}", i), task);
                 let mut mm = SynMap::new();
@@ -7686,6 +8119,9 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
         if self.trusted_depth > 0 {
             return Err(err_at(trusted_no_agents(agent_name), loc));
         }
+        if self.package_in_stack().is_some() {
+            return Err(err_at(package_no_agents(agent_name), loc));
+        }
         {
         let def = match self.agent_definitions.get(agent_name) {
             Some(d) => (d.0.clone(), d.1.clone()),
@@ -7809,6 +8245,7 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
             required_capabilities: required_caps,
             code: Default::default(),
             free_names: Default::default(),
+            mark: self.cur_pkg,
         });
         let value = SynValue::Task(task);
         // Definir una task bajo PC es una asignación más (NSU estricto + el
@@ -8485,7 +8922,7 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                 } else {
                     (obj, value)
                 };
-                set_leaf_prop(&obj, property_name, value, loc)
+                set_leaf_prop(&obj, property_name, value, loc, self.cur_pkg)
             }
             NodeKind::IndexAccess { object, index } => {
                 let obj = self.exec_place(object, env)?;
@@ -8526,7 +8963,7 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                 // índice que no es literal lleva el PC, así que el contenedor tiene que cubrirlo y ya está
                 // en `seen`. Si algo se escapara de esta cuenta, el error saldría redactado: seguro.
                 let touched = self.labels && !self.seen.is_empty();
-                set_leaf_index(&obj, &idx, value, target, &target.location, loc, &root_now, self.labels, touched)
+                set_leaf_index(&obj, &idx, value, target, &target.location, loc, &root_now, self.labels, touched, self.cur_pkg)
             }
             _ => Err(err_at("Invalid set target", loc)),
         }
@@ -8814,7 +9251,7 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
         // `set d["STATE"][k]`, `set h.l.STATE[k]`: la VARIABLE del módulo, como `d.STATE`. (Sólo
         // un mapa puede ser un módulo: la clave como texto, sólo entonces.)
         if matches!(parent, SynValue::Map(_)) {
-            if let Some(v) = module_var_unique(&parent, &labels::unwrap(&idx).to_string()) {
+            if let Some(v) = module_var_unique(&parent, &labels::unwrap(&idx).to_string(), self.cur_pkg, loc)? {
                 return Ok(v);
             }
         }
@@ -8853,7 +9290,7 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
         // `set d.STATE[k] to v`: se escribe la VARIABLE del módulo (la misma que ven sus
         // tasks), copiándola antes sólo si alguien más guardó una foto (`let s be d.STATE`),
         // venga el mapa del módulo de una variable, de un re-export o de un campo.
-        if let Some(v) = module_var_unique(&parent, property_name) {
+        if let Some(v) = module_var_unique(&parent, property_name, self.cur_pkg, loc)? {
             return Ok(v);
         }
         if let SynValue::Map(m) = labels::unwrap(&parent) {
@@ -9083,6 +9520,7 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                 let parent = self.exec_place(object, env)?;
                 let SynValue::Map(m) = &parent else { return Err(lost()) };
                 if let Some(menv) = module_env_of_map(m) {
+                    package_export_guard(&menv, property_name, self.cur_pkg, loc)?;
                     return with_unique_binding(&menv, property_name, f).unwrap_or_else(|| Err(lost()));
                 }
                 let mut map = m.borrow_mut();
@@ -9103,6 +9541,9 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                         f(&mut items[j])
                     }
                     SynValue::Map(m) => {
+                        if let Some(menv) = module_env_of_map(m) {
+                            package_export_guard(&menv, &idx.to_string(), self.cur_pkg, loc)?;
+                        }
                         let mut map = m.borrow_mut();
                         let slot = map.get_mut(&idx.to_string()).ok_or_else(lost)?;
                         make_unique(slot);
@@ -9195,13 +9636,47 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
         loc: &SourceLocation,
     ) -> Result<SynValue, Control> {
         self.recursion_depth += 1;
-        if self.recursion_depth > MAX_RECURSION {
+        // M-r5-1: una sola comparación; en un hilo con menos pila que la calibrada (`serve`), pasadas
+        // las 64 llamadas también da el error cuando no le queda pila (lo pesado pasa por
+        // `with_stack_weight`, que siempre mira).
+        if self.recursion_depth > self.recursion_cap && self.depth_refused() {
             self.recursion_depth -= 1;
             return Err(err("maximum recursion depth exceeded"));
         }
         let result = self.call_value_named_inner(func, args, loc);
         self.recursion_depth -= 1;
         result
+    }
+
+    /// M-r5-1: pasado `recursion_cap`, el tope o la pila del hilo.
+    #[cold]
+    #[inline(never)]
+    fn depth_refused(&self) -> bool {
+        self.recursion_depth > MAX_RECURSION || crate::stack::short(0)
+    }
+
+    /// v0.6.58 (M-r4-1, B-r4-3): corre `f` con `w` niveles más en el guardián de recursión (ver
+    /// [`node_weight`] y [`template_weight`]); si no entran, el error de siempre.
+    #[inline(never)]
+    pub(crate) fn with_stack_weight<T>(&mut self, w: usize, f: impl FnOnce(&mut Self) -> Result<T, Control>) -> Result<T, Control> {
+        if w == 0 {
+            return f(self);
+        }
+        if self.recursion_depth + w > MAX_RECURSION || crate::stack::short(w) {
+            return Err(err("maximum recursion depth exceeded"));
+        }
+        self.recursion_depth += w;
+        let r = f(self);
+        self.recursion_depth = self.recursion_depth.saturating_sub(w);
+        r
+    }
+
+    /// v0.6.58 (M-r4-1): el cuerpo de una task por la referencia, con lo que pesa (`body_weight`)
+    /// en el guardián mientras corre.
+    #[inline(never)]
+    pub(crate) fn exec_body_weighted(&mut self, task: &SynTaskValue, env: &Rc<RefCell<Environment>>) -> Result<SynValue, Control> {
+        let w = task.code.body_weight(&task.body);
+        self.with_stack_weight(w, |i| i.exec_block(&task.body, env))
     }
 
     #[cold]
@@ -9290,139 +9765,16 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                 }
             }
             SynValue::Task(task) => {
-                // Ronda 2: dentro de una tool de confianza sólo corre código de la tool. Por acá entra
-                // toda llamada a una task (por nombre, desde un builtin, un template o un callback
-                // guardado), así que un camino nuevo no reabre el agujero. Sin `--trusted`, una lectura.
-                if self.trusted_depth > 0 {
-                    self.check_trusted_origin(&task, loc)?;
+                // v0.6.58 (§6.1): una sola rama. `call_guard` es distinto de 0 con una tool de
+                // confianza o un paquete en la pila, y la marca con una task de paquete; sin
+                // ninguno de los dos (el programa llamando al programa) no se entra al camino frío.
+                // Por acá entra toda llamada a una task del tree-walker (por nombre, desde un
+                // builtin, un template o un callback guardado), así que un camino nuevo no reabre
+                // el agujero de la ronda 2 de las tools ni el del paquete.
+                if (self.call_guard | task.mark) != 0 {
+                    return self.call_task_guarded(task, args, loc);
                 }
-                let call_env = self.acquire_frame(&task.closure_env, "call");
-                let nparams = task.parameters.len();
-                if args.iter().all(|(n, _)| n.is_none()) {
-                    // Todos posicionales (el caso común): el i-ésimo argumento es el i-ésimo
-                    // parámetro, sin repartir en slots (F1.7). Los de más (aridad permisiva, G3)
-                    // se sueltan antes de evaluar defaults, igual que en el reparto de abajo.
-                    args.truncate(nparams);
-                    let mut given = args.drain(..);
-                    for param in task.parameters.iter() {
-                        let v = match given.next() {
-                            Some((_, v)) => v,
-                            None => match &param.default {
-                                Some(default_node) => self.exec(default_node, &task.closure_env)?,
-                                None => SynValue::Nothing,
-                            },
-                        };
-                        env_set_shared(&call_env, &param.name, v);
-                    }
-                } else {
-                    // Repartición: cada slot de param recibe a lo sumo un valor.
-                    let mut slots: Vec<Option<SynValue>> = vec![None; nparams];
-                    let mut seen_named = false;
-                    let mut pos_idx = 0usize;
-                    for (name, value) in args.drain(..) {
-                        match name {
-                            None => {
-                                // Posicional tras nombrado → error (sintaxis nueva, G3).
-                                if seen_named {
-                                    return Err(err_at(
-                                        "positional argument after named argument",
-                                        loc,
-                                    ));
-                                }
-                                // Aridad permisiva (G3): un posicional extra se descarta,
-                                // igual que antes (no es error).
-                                if pos_idx < nparams {
-                                    slots[pos_idx] = Some(value);
-                                }
-                                pos_idx += 1;
-                            }
-                            Some(n) => {
-                                seen_named = true;
-                                match task.parameters.iter().position(|p| *p.name == *n) {
-                                    Some(idx) => {
-                                        if slots[idx].is_some() {
-                                            return Err(err_at(
-                                                format!("duplicate argument '{}'", n),
-                                                loc,
-                                            ));
-                                        }
-                                        slots[idx] = Some(value);
-                                    }
-                                    None => {
-                                        return Err(unknown_parameter(&n, task.parameters.iter().map(|p| &*p.name), loc))
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    // Llená cada param: valor recibido, o default (eval en call time en el
-                    // closure_env, G5), o `nothing` (aridad permisiva, G3).
-                    for (i, param) in task.parameters.iter().enumerate() {
-                        let v = match slots[i].take() {
-                            Some(v) => v,
-                            None => match &param.default {
-                                Some(default_node) => self.exec(default_node, &task.closure_env)?,
-                                None => SynValue::Nothing,
-                            },
-                        };
-                        env_set_shared(&call_env, &param.name, v);
-                    }
-                }
-                // T5 (regla 1.b) — la tinta de continuación del LLAMADOR VIAJA con la llamada.
-                // Vaciarla al entrar (lo que se hacía hasta la ronda 4) era la puerta más grande
-                // de la tanda: un helper SIN argumentos llamado desde un bucle ya teñido corría
-                // con tinta vacía y escribía estado público sin chequeo, así que
-                // `each i in range(0,256) / when secret == i / give` reconstruía el secreto
-                // entero en un contador público (medido: 181, y alcanza `write_file`, `remember`
-                // y una respuesta HTTP 200). El mismo helper CON argumento fallaba cerrado sólo
-                // por accidente: el argumento se evalúa en el llamador, bajo su tinta.
-                // Lo que sí es del cuerpo es lo que la task tiñe ADENTRO: al volver se restaura
-                // la tinta del llamador —también por el camino de error—, que es lo que evita el
-                // PC residual sobre su código público (un `give` llega a un join point y el
-                // valor ya viaja etiquetado).
-                let saved_taint = self.enter_call();
-                // La VM (F3) corre el cuerpo si lo tiene compilado y el frame se pudo preparar; si
-                // no, el tree-walker. Los dos devuelven lo mismo (el oráculo los compara).
-                let body = match self.vm_code_for(&task) {
-                    Some(code) if code.regframe => self.run_chunk_regframe(code, &call_env, &task.closure_env),
-                    Some(code) if code.frame.as_ref().is_some_and(|l| call_env.borrow_mut().bindings.lay_out(l, code.tagged)) => {
-                        self.run_chunk(code, &call_env)
-                    }
-                    _ => self.exec_block(&task.body, &call_env),
-                };
-                let out = match body {
-                    Ok(v) => Ok(v),
-                    Err(Control::Give(v)) => Ok(v),
-                    Err(other) => Err(other),
-                };
-                // T5 (ronda 5) — un `stop` que SALE de la task corta el bucle del LLAMADOR, y
-                // ahí la tinta no siempre llega a tiempo. Cuando la rama que lo dispara está en
-                // el cuerpo del callee (`task h(s, i) / when s == i / stop`), `taint_branch` la
-                // pone en la vuelta 0 y todo cierra. Pero si la rama está en el LLAMADOR y el
-                // salto es indirecto (`when secret == i / bail()`, con `task bail() / stop`),
-                // el predicado estático no puede verlo —saber si una llamada corta el bucle es
-                // interprocedural— y para cuando el `stop` dispara en la vuelta 181, las 181
-                // vueltas anteriores ya escribieron un contador público en claro. Medido: el
-                // secreto entero, con `label_of` vacío.
-                //
-                // Así que se rechaza el constructo: un `stop` bajo control privado no puede
-                // dejar la task donde está escrito. `escaping_taint` no vacío en este punto
-                // significa exactamente "un `stop` de este cuerpo salió bajo PC privado".
-                let escaping_stop =
-                    self.labels && matches!(out, Err(Control::Stop(_))) && !self.escaping_taint.is_empty();
-                let escaped_pc = if escaping_stop { self.safe_label(&self.escaping_taint) } else { String::new() };
-                self.leave_call(saved_taint);
-                if escaping_stop {
-                    return Err(err_labels(
-                        format!(
-                            "label_violation: 'stop' left the task '{}' under private control flow (pc = [{}]); a 'stop' that breaks the CALLER's loop cannot be checked until the loop has already run, so it is refused. Write the 'stop' in the loop it belongs to (give a value and decide there), or declassify(<the condition>, \"<why it may be published>\")",
-                            task.name, escaped_pc
-                        ),
-                        loc,
-                    ));
-                }
-                self.release_frame(call_env);
-                out
+                self.call_task_body(task, args, loc)
             }
             // Un callable etiquetado (p. ej. una lambda ligada dentro de un `when`
             // Privado) se llama bajo su etiqueta de PC y el resultado sale con ella: QUÉ
@@ -9437,6 +9789,317 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
             }
             other => Err(err_at(format!("Cannot call value of type {}", other.type_name()), loc)),
         }
+    }
+
+    /// v0.6.58 (§6.1): el camino frío del brazo `Task`. Primero el chequeo de origen de las tools
+    /// de confianza (ronda 2: dentro de una tool sólo corre código de la tool), como antes; después,
+    /// si la marca de la task no es el paquete que corre, el cruce (`cross_into`), que se deshace
+    /// al volver, también por error. El cruce corre antes de los defaults, así que un default
+    /// lleva la marca del llamado.
+    #[inline(never)]
+    fn call_task_guarded(&mut self, task: Rc<SynTaskValue>, args: &mut CallArgs, loc: &SourceLocation) -> Result<SynValue, Control> {
+        if self.trusted_depth > 0 {
+            self.check_trusted_origin(&task, loc)?;
+        }
+        if task.mark == self.cur_pkg {
+            return self.call_task_body(task, args, loc);
+        }
+        let saved = self.cross_into(task.mark);
+        let r = self.call_task_body(task, args, loc);
+        self.cross_leave(saved);
+        r
+    }
+
+    /// v0.6.58 (§6.1): el cruce. Pasa a correr el paquete `mark` (0 es el programa) y devuelve lo
+    /// que había, para `cross_leave`. Entrar a un paquete apila su dominio (una capa más de techo,
+    /// que sólo resta); cruzar a 0 (un callback del programa llamado desde un paquete) no desapila
+    /// nada: corre con la intersección.
+    #[inline(never)]
+    pub(crate) fn cross_into(&mut self, mark: u32) -> PkgSaved {
+        self.cross_into_with(mark, false)
+    }
+
+    /// El cruce al nivel superior de un paquete, al cargarlo (§6.1, «El resto»): corre con la marca
+    /// del paquete y un dominio **vacío** (K8c).
+    #[inline(never)]
+    pub(crate) fn cross_into_top_level(&mut self, mark: u32) -> PkgSaved {
+        self.cross_into_with(mark, true)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn cross_into_with(&mut self, mark: u32, top_level: bool) -> PkgSaved {
+        let saved = PkgSaved { prev: self.cur_pkg, pushed: mark != 0 };
+        if saved.pushed {
+            self.call_guard += 1;
+            self.pkg_stack.push(mark);
+            if let Some(hook) = self.pkg_scope_hook.clone() {
+                // Prestada, sin clonar el `Arc` (atómico) en cada cruce: el hook no toca al intérprete.
+                if self.mod_table.is_none() {
+                    self.run_table();
+                }
+                let table = self.mod_table.as_deref();
+                let name = table.and_then(|t| t.package(mark)).map(|p| p.name.as_str()).unwrap_or("?");
+                if top_level {
+                    hook(Some((0, name, &[])));
+                } else {
+                    hook(Some((mark, name, table.map(|t| t.domain(mark)).unwrap_or(&[]))));
+                }
+            }
+        }
+        self.cur_pkg = mark;
+        saved
+    }
+
+    /// v0.6.58 (§6.1): deshace un `cross_into`.
+    #[inline(never)]
+    pub(crate) fn cross_leave(&mut self, saved: PkgSaved) {
+        if saved.pushed {
+            self.call_guard -= 1;
+            self.pkg_stack.pop();
+            if let Some(hook) = self.pkg_scope_hook.clone() {
+                hook(None);
+            }
+        }
+        self.cur_pkg = saved.prev;
+    }
+
+    /// v0.6.58 (§5.2): la tabla de la corrida. Un intérprete que no la armó (un worker de
+    /// `parallel_map` o de `serve`) la toma de su corrida, que la comparte.
+    #[cold]
+    #[inline(never)]
+    fn run_table(&mut self) -> Option<std::sync::Arc<crate::modtable::ModTable>> {
+        if self.mod_table.is_none() {
+            self.mod_table = self.run_scope.ext::<crate::modtable::TableSlot>().get();
+        }
+        self.mod_table.clone()
+    }
+
+    /// v0.6.58 (§5.2): el AST de un módulo. El recorrido de la tabla ya parseó cada módulo que
+    /// alcanza; si los bytes son los mismos, se usa ése en vez de parsear otra vez (un programa con 50
+    /// módulos parseaba cada uno dos veces: +71 % de instrucciones al cargar). `true`: recién parseado.
+    #[cold]
+    #[inline(never)]
+    fn module_ast(&mut self, source: &str, name: &str) -> Result<(std::sync::Arc<crate::ast::Program>, bool), Control> {
+        if let Some(p) = self.run_table().and_then(|t| t.parsed_for(name, source)) {
+            return Ok((p, false));
+        }
+        MODULE_REPARSES.with(|c| c.set(c.get() + 1));
+        parse_source(source, name).map(|p| (std::sync::Arc::new(p), true)).map_err(|e| err(e.to_string()))
+    }
+
+    /// v0.6.58 (§6.1): el host cablea el dominio de los paquetes.
+    pub fn set_package_scope_hook(&mut self, hook: PackageScopeHook) {
+        self.pkg_scope_hook = Some(hook);
+    }
+
+    /// v0.6.58 (§13): los paquetes de la tabla de esta corrida, para `receipt()`. `None` sin
+    /// paquetes (o sin tabla: un programa sin `use`).
+    pub fn run_modules(&self) -> Option<crate::modtable::RunModules> {
+        let table = self.mod_table.clone().or_else(|| self.run_scope.ext::<crate::modtable::TableSlot>().get());
+        table.and_then(|t| t.run_modules())
+    }
+
+    /// v0.6.58 (§6.4): el nombre del paquete de más arriba en la pila, si hay alguno (también
+    /// dentro de un callback del programa llamado por el paquete).
+    pub fn package_in_stack(&self) -> Option<String> {
+        // M8 (ronda 1): sin paquete en la pila de este intérprete, el que llegó como delegación (un
+        // worker de `parallel_map` que el paquete llamó).
+        let Some(&mark) = self.pkg_stack.last() else {
+            return self.package_frame_hook.as_ref().and_then(|h| h());
+        };
+        let table = self.mod_table.clone().or_else(|| self.run_scope.ext::<crate::modtable::TableSlot>().get());
+        Some(table.as_ref().and_then(|t| t.package(mark)).map(|p| p.name.clone()).unwrap_or_else(|| format!("#{}", mark)))
+    }
+
+    /// v0.6.58 (§6.4, K23): lo que corre después (`cron_*`, `approve … then`) no se agenda con un
+    /// paquete en la pila, también desde un callback del programa que el paquete llamó: correría sin
+    /// los límites del paquete. `what` es lo que se intentó (`cron_after`, `approve … then f`).
+    pub fn package_later_error(&self, what: &str) -> Option<String> {
+        let name = self.package_in_stack()?;
+        Some(format!(
+            "{}: not allowed inside the package {} — the task would run later without the package's limits",
+            what, name
+        ))
+    }
+
+    /// v0.6.58 (§6.1): el paquete que corre (0 es el programa).
+    pub fn running_package(&self) -> u32 {
+        self.cur_pkg
+    }
+
+    /// v0.6.58 (§6.3): las plantillas del paquete que corre: los archivos de su tabla que no son
+    /// `.syn` (el hash fija su contenido, como el bundle). Nunca el disco ni el directorio actual.
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn package_templates(&mut self) -> Rc<crate::templates::ToolTemplates> {
+        let mark = self.cur_pkg;
+        if let Some(t) = self.pkg_templates.get(&mark) {
+            return t.clone();
+        }
+        let table = self.run_table();
+        let files: Vec<(String, String)> = table
+            .as_ref()
+            .and_then(|t| t.package(mark))
+            .map(|p| {
+                p.files
+                    .iter()
+                    .filter(|(k, _)| !k.ends_with(".syn"))
+                    .filter_map(|(k, b)| Some((k.clone(), std::str::from_utf8(b).ok()?.to_string())))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let set = Rc::new(crate::templates::ToolTemplates::new(&files));
+        self.pkg_templates.insert(mark, set.clone());
+        set
+    }
+
+    /// v0.6.58 (§6.3, K28): el padre del entorno de una plantilla del paquete que corre. Si el
+    /// intérprete no cargó el `main` del paquete (un worker), los builtins solos.
+    #[cold]
+    #[inline(never)]
+    fn package_template_parent(&mut self) -> Rc<RefCell<Environment>> {
+        if let Some(e) = self.pkg_template_envs.get(&self.cur_pkg) {
+            return e.clone();
+        }
+        self.module_base()
+    }
+
+    /// El cuerpo de una llamada a una task: el reparto de los argumentos, los defaults y el cuerpo
+    /// (VM o tree-walker). Lo llaman el brazo `Task` y su camino frío.
+    #[inline(always)]
+    fn call_task_body(&mut self, task: Rc<SynTaskValue>, args: &mut CallArgs, loc: &SourceLocation) -> Result<SynValue, Control> {
+        // v0.6.58 (§6.1): la red para un camino nuevo sin cruce (K39).
+        debug_assert_eq!(self.cur_pkg, task.mark, "entrada al cuerpo de una task sin cruce");
+        let call_env = self.acquire_frame(&task.closure_env, "call");
+        let nparams = task.parameters.len();
+        if args.iter().all(|(n, _)| n.is_none()) {
+            // Todos posicionales (el caso común): el i-ésimo argumento es el i-ésimo
+            // parámetro, sin repartir en slots (F1.7). Los de más (aridad permisiva, G3)
+            // se sueltan antes de evaluar defaults, igual que en el reparto de abajo.
+            args.truncate(nparams);
+            let mut given = args.drain(..);
+            for param in task.parameters.iter() {
+                let v = match given.next() {
+                    Some((_, v)) => v,
+                    None => match &param.default {
+                        Some(default_node) => self.exec(default_node, &task.closure_env)?,
+                        None => SynValue::Nothing,
+                    },
+                };
+                env_set_shared(&call_env, &param.name, v);
+            }
+        } else {
+            // Repartición: cada slot de param recibe a lo sumo un valor.
+            let mut slots: Vec<Option<SynValue>> = vec![None; nparams];
+            let mut seen_named = false;
+            let mut pos_idx = 0usize;
+            for (name, value) in args.drain(..) {
+                match name {
+                    None => {
+                        // Posicional tras nombrado → error (sintaxis nueva, G3).
+                        if seen_named {
+                            return Err(err_at(
+                                "positional argument after named argument",
+                                loc,
+                            ));
+                        }
+                        // Aridad permisiva (G3): un posicional extra se descarta,
+                        // igual que antes (no es error).
+                        if pos_idx < nparams {
+                            slots[pos_idx] = Some(value);
+                        }
+                        pos_idx += 1;
+                    }
+                    Some(n) => {
+                        seen_named = true;
+                        match task.parameters.iter().position(|p| *p.name == *n) {
+                            Some(idx) => {
+                                if slots[idx].is_some() {
+                                    return Err(err_at(
+                                        format!("duplicate argument '{}'", n),
+                                        loc,
+                                    ));
+                                }
+                                slots[idx] = Some(value);
+                            }
+                            None => {
+                                return Err(unknown_parameter(&n, task.parameters.iter().map(|p| &*p.name), loc))
+                            }
+                        }
+                    }
+                }
+            }
+            // Llená cada param: valor recibido, o default (eval en call time en el
+            // closure_env, G5), o `nothing` (aridad permisiva, G3).
+            for (i, param) in task.parameters.iter().enumerate() {
+                let v = match slots[i].take() {
+                    Some(v) => v,
+                    None => match &param.default {
+                        Some(default_node) => self.exec(default_node, &task.closure_env)?,
+                        None => SynValue::Nothing,
+                    },
+                };
+                env_set_shared(&call_env, &param.name, v);
+            }
+        }
+        // T5 (regla 1.b) — la tinta de continuación del LLAMADOR VIAJA con la llamada.
+        // Vaciarla al entrar (lo que se hacía hasta la ronda 4) era la puerta más grande
+        // de la tanda: un helper SIN argumentos llamado desde un bucle ya teñido corría
+        // con tinta vacía y escribía estado público sin chequeo, así que
+        // `each i in range(0,256) / when secret == i / give` reconstruía el secreto
+        // entero en un contador público (medido: 181, y alcanza `write_file`, `remember`
+        // y una respuesta HTTP 200). El mismo helper CON argumento fallaba cerrado sólo
+        // por accidente: el argumento se evalúa en el llamador, bajo su tinta.
+        // Lo que sí es del cuerpo es lo que la task tiñe ADENTRO: al volver se restaura
+        // la tinta del llamador —también por el camino de error—, que es lo que evita el
+        // PC residual sobre su código público (un `give` llega a un join point y el
+        // valor ya viaja etiquetado).
+        let saved_taint = self.enter_call();
+        // La VM (F3) corre el cuerpo si lo tiene compilado y el frame se pudo preparar; si
+        // no, el tree-walker. Los dos devuelven lo mismo (el oráculo los compara).
+        let body = match self.vm_code_for(&task) {
+            Some(code) if code.regframe => self.run_chunk_regframe(code, &call_env, &task.closure_env),
+            Some(code) if code.frame.as_ref().is_some_and(|l| call_env.borrow_mut().bindings.lay_out(l, code.tagged)) => {
+                self.run_chunk(code, &call_env)
+            }
+            // M-r4-1: un cuerpo ya medido que no pesa va directo (el camino de siempre, sin llamada).
+            _ if task.code.body_light() => self.exec_block(&task.body, &call_env),
+            _ => self.exec_body_weighted(&task, &call_env),
+        };
+        let out = match body {
+            Ok(v) => Ok(v),
+            Err(Control::Give(v)) => Ok(v),
+            Err(other) => Err(other),
+        };
+        // T5 (ronda 5) — un `stop` que SALE de la task corta el bucle del LLAMADOR, y
+        // ahí la tinta no siempre llega a tiempo. Cuando la rama que lo dispara está en
+        // el cuerpo del callee (`task h(s, i) / when s == i / stop`), `taint_branch` la
+        // pone en la vuelta 0 y todo cierra. Pero si la rama está en el LLAMADOR y el
+        // salto es indirecto (`when secret == i / bail()`, con `task bail() / stop`),
+        // el predicado estático no puede verlo —saber si una llamada corta el bucle es
+        // interprocedural— y para cuando el `stop` dispara en la vuelta 181, las 181
+        // vueltas anteriores ya escribieron un contador público en claro. Medido: el
+        // secreto entero, con `label_of` vacío.
+        //
+        // Así que se rechaza el constructo: un `stop` bajo control privado no puede
+        // dejar la task donde está escrito. `escaping_taint` no vacío en este punto
+        // significa exactamente "un `stop` de este cuerpo salió bajo PC privado".
+        let escaping_stop =
+            self.labels && matches!(out, Err(Control::Stop(_))) && !self.escaping_taint.is_empty();
+        let escaped_pc = if escaping_stop { self.safe_label(&self.escaping_taint) } else { String::new() };
+        self.leave_call(saved_taint);
+        if escaping_stop {
+            return Err(err_labels(
+                format!(
+                    "label_violation: 'stop' left the task '{}' under private control flow (pc = [{}]); a 'stop' that breaks the CALLER's loop cannot be checked until the loop has already run, so it is refused. Write the 'stop' in the loop it belongs to (give a value and decide there), or declassify(<the condition>, \"<why it may be published>\")",
+                    task.name, escaped_pc
+                ),
+                loc,
+            ));
+        }
+        self.release_frame(call_env);
+        out
     }
 
     fn exec_expect(
@@ -12686,10 +13349,12 @@ fn call_trusted(i: &mut Interpreter, tool: &TrustedTool, args: &mut CallArgs, lo
     (tool.hook)(Some((&tool.module, &tool.task.required_capabilities)));
     debug_assert!(!i.shortcuts, "a trusted scope opened with the VM on (it has no origin check)");
     i.trusted_depth += 1;
+    i.call_guard += 1;
     i.trusted_stack.push(tool.module.clone());
     let r = i.call_value_named(SynValue::Task(tool.task.clone()), args, loc);
     i.trusted_stack.pop();
     i.trusted_depth -= 1;
+    i.call_guard -= 1;
     (tool.hook)(None);
     i.stdout_verdict = None;
     r
@@ -12703,6 +13368,12 @@ fn trusted_no_agents(name: &str) -> String {
         "agent '{}': a trusted tool cannot define or spawn agents yet — the agent would run with the tool's capabilities next to the program's names; do the work in the tool's own tasks",
         name
     )
+}
+
+/// v0.6.58 (§6.4, K24).
+#[cold]
+fn package_no_agents(name: &str) -> String {
+    format!("agent '{}': a package cannot define or spawn agents", name)
 }
 
 /// v0.6.46 (E3b): ¿hay un callable (task, lambda, builtin) en el valor, a cualquier profundidad?
@@ -13687,6 +14358,16 @@ fn run_inner(source: &str, filename: &str) -> RunResult {
     }
 }
 
+thread_local! {
+    static MODULE_REPARSES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// v0.6.58 (§5.2): cuántos módulos tuvo que parsear el cargador en este hilo porque la tabla no
+/// traía su AST (o traía otros bytes). Con la tabla, cero: es lo que mira el test de la reutilización.
+pub fn module_reparses() -> u64 {
+    MODULE_REPARSES.with(|c| c.get())
+}
+
 /// Ejecuta un programa Synsema y devuelve su salida observable. Corre en un
 /// hilo dedicado con stack grande.
 pub fn run_source(source: &str, filename: &str) -> RunResult {
@@ -13776,6 +14457,7 @@ mod drop_tests {
                 required_capabilities: vec![],
                 code: Default::default(),
                 free_names: Default::default(),
+                mark: 0,
             }));
             interp.set_global("f", task); // global_env → task (la otra mitad)
             weak = Rc::downgrade(&interp.global_env);
@@ -13810,6 +14492,7 @@ mod drop_tests {
                 required_capabilities: vec![],
                 code: Default::default(),
                 free_names: Default::default(),
+                mark: 0,
             }));
             env.borrow_mut().bindings.insert("t", task); // child → task (otra mitad)
             weak = Rc::downgrade(&env);
@@ -13834,6 +14517,7 @@ mod drop_tests {
             required_capabilities: vec![],
             code: Default::default(),
             free_names: Default::default(),
+            mark: 0,
         })
     }
 

@@ -42,6 +42,27 @@ const DISCARD: Reg = Reg::MAX;
 /// de un cuerpo con frame en registros, no un lugar de la ventana.
 const PARAM: u16 = 0x8000;
 const NONE: u32 = u32::MAX;
+/// v0.6.58 (§6.1, G-1): las tres instrucciones del cruce de un paquete son formas de `Exec` con un
+/// `node` reservado (como `MakeMap` con `site`, F4.8g): una variante más en el `enum` movía el
+/// despacho entero +1,5 % (medido), y `Exec` ya es el camino frío. Sólo las emite un chunk con
+/// marca distinta de 0: el código del programa no tiene ninguna.
+/// - `EnterPkg` (`Exec { node: PKG_ENTER }`): el prólogo. Si el paquete que corre no es el del
+///   chunk, cruza y lo anota en `pkg_frames` con este frame; si es el suyo, nada.
+/// - `LeavePkg` (`PKG_LEAVE`): antes de cada `Give`, `End` y `StopOut`. Deshace el cruce de este
+///   frame, si cruzó.
+/// - `CallFromPkg` (`PKG_CALL`, `dst` = el registro de la función): antes de cada `Call`. Si el
+///   llamado es una task de otra marca, la llama por `call_value` (que cruza y vuelve, también por
+///   error) y salta el `Call`; si no, sigue al `Call`.
+pub(crate) const PKG_CALL: u32 = u32::MAX - 3;
+pub(crate) const PKG_LEAVE: u32 = u32::MAX - 2;
+pub(crate) const PKG_ENTER: u32 = u32::MAX - 1;
+/// La primera de las formas reservadas de `Exec` (ningún chunk tiene tantos nodos).
+pub(crate) const PKG_OPS: u32 = PKG_CALL;
+/// v0.6.58 (M-r4-1): `Exec { node: EXEC_HEAVY | h }` (debajo de `PKG_OPS`) corre el nodo de
+/// `chunk.heavy[h]` con su peso en el guardián de recursión: anida lo bastante para que la
+/// referencia, recursiva en Rust, gaste la pila antes del límite. Otra forma reservada, no una
+/// variante ni un brazo más: los dos movían el despacho de la VM hasta +3,6 % (cachegrind).
+pub(crate) const EXEC_HEAVY: u32 = 1 << 31;
 
 /// Un operando: un registro que se consume, uno que se copia, una constante o un slot del frame
 /// propio que está ligado seguro.
@@ -271,6 +292,9 @@ pub(crate) struct Chunk {
     /// ventana de locales de la VM (`vm_locals`) y el entorno del cuerpo es el `closure_env`. Sólo
     /// para cuerpos que nadie puede ver desde afuera (ver `regframe_eligible`).
     pub(crate) regframe: bool,
+    /// v0.6.58 (§6.1): la marca del código (0 es el programa). Con otra, el chunk lleva el cruce
+    /// (`PKG_ENTER`, `PKG_LEAVE`, `PKG_CALL`).
+    pub(crate) mark: u32,
     /// En un cuerpo con frame en registros: el slot de cada parámetro (en orden).
     param_slots: Vec<u16>,
     /// El tamaño de la ventana de locales de este cuerpo: el frame en registros (si lo es) y las
@@ -310,6 +334,8 @@ pub(crate) struct Chunk {
     /// F4.2: el estado de cada `LoopBack` (cuenta de vueltas, código nativo).
     #[cfg(feature = "native-tier")]
     loops: Box<[native::LoopState]>,
+    /// v0.6.58 (M-r4-1): los `Exec` pesados (ver `EXEC_HEAVY`): el nodo y su peso.
+    heavy: Box<[(u32, u16)]>,
 }
 
 /// F4.8g: un mapa literal con claves de texto constantes: las claves en orden y su forma (`None` si
@@ -462,6 +488,8 @@ pub(crate) struct VmFrame {
 pub struct TaskCode {
     code: std::cell::OnceCell<Rc<Chunk>>,
     calls: Cell<u32>,
+    /// v0.6.58 (M-r4-1): `body_weight` del cuerpo más 1 (0: todavía no se calculó).
+    weight: Cell<u16>,
     /// F4: el nivel nativo de esta task (cuántas llamadas lleva, y su código compilado).
     #[cfg(feature = "native-tier")]
     native: native::NativeState,
@@ -479,6 +507,23 @@ impl TaskCode {
     fn set(&self, c: Rc<Chunk>) {
         let _ = self.code.set(c);
     }
+    /// v0.6.58 (M-r4-1): el cuerpo ya se midió y no pesa en el guardián.
+    #[inline(always)]
+    pub(crate) fn body_light(&self) -> bool {
+        self.weight.get() == 1
+    }
+    /// v0.6.58 (M-r4-1): lo que pesa en el guardián el cuerpo corrido por la referencia; se calcula
+    /// la primera vez (el cuerpo no cambia).
+    pub(crate) fn body_weight(&self, body: &[Node]) -> usize {
+        let w = self.weight.get();
+        if w != 0 {
+            return usize::from(w - 1);
+        }
+        let d = body.iter().map(crate::ast_api::run_depth).max().unwrap_or(0);
+        let v = crate::interpreter::body_weight(d).min(usize::from(u16::MAX - 1));
+        self.weight.set(v as u16 + 1);
+        v
+    }
 }
 
 // =============================================================================================
@@ -488,15 +533,22 @@ impl TaskCode {
 /// El programa (las sentencias después del preámbulo `intent`/`require`), con las tasks y lambdas
 /// que define compiladas también.
 pub(crate) fn compile_program(stmts: &[Node]) -> Rc<Chunk> {
+    compile_program_marked(stmts, 0)
+}
+
+/// v0.6.58 (§6.1): un cuerpo de nivel superior con la marca del código que lo escribió (el de una
+/// ruta montada de un paquete). Sus tasks y lambdas llevan la misma.
+pub(crate) fn compile_program_marked(stmts: &[Node], mark: u32) -> Rc<Chunk> {
     let res = resolve::resolve_block(stmts);
-    let shared = Shared::new(&res);
+    let shared = Shared::new(&res, mark);
     compile_unit(&res, &shared, 0, None, &[], Body::Program(stmts))
 }
 
-/// El cuerpo de una task o lambda que definió el tree-walker, resuelto por sí solo.
-pub(crate) fn compile_function(params: &[Arc<str>], body: &[Node]) -> Rc<Chunk> {
+/// El cuerpo de una task o lambda que definió el tree-walker, resuelto por sí solo. `mark`: la de
+/// la task (v0.6.58, §6.1).
+pub(crate) fn compile_function(params: &[Arc<str>], body: &[Node], mark: u32) -> Rc<Chunk> {
     let (res, s) = resolve::resolve_function(params, body);
-    let shared = Shared::new(&res);
+    let shared = Shared::new(&res, mark);
     let refs: Vec<&Node> = body.iter().collect();
     compile_body(&res, &shared, s, params, &refs, false)
 }
@@ -546,14 +598,17 @@ fn compile_unit<'r>(
 ) -> Rc<Chunk> {
     let mut win = window_candidates(res, unit, frame_scope);
     let mut regframe = frame_scope.is_some_and(|s| regframe_eligible(res, s, &win));
+    let mut cold = false;
     loop {
         let mut c = Compiler::new(res, shared, frame_scope);
         c.window = win.clone();
         c.regframe = regframe;
+        c.all_cold = cold;
         c.lay_window(params);
         // F4.6c: un registro por cadena de texto de más de un `+`, antes que cualquier otro (así
         // ninguna llamada de adentro de una pieza lo pisa: su ventana empieza más arriba).
         let long_chains: usize = match &body {
+            _ if cold => 0,
             Body::Program(stmts) => stmts.iter().map(long_text_chains).sum(),
             Body::Task(stmts) => stmts.iter().map(|s| long_text_chains(s)).sum(),
             Body::Lambda(_) => 0,
@@ -563,6 +618,8 @@ fn compile_unit<'r>(
         for _ in 0..long_chains {
             c.reg();
         }
+        // v0.6.58 (§6.1): el prólogo del cruce, antes de todo el cuerpo.
+        c.pkg_op(0, PKG_ENTER);
         let chunk = match &body {
             Body::Program(stmts) => {
                 c.block(stmts, Some(0), false);
@@ -579,14 +636,24 @@ fn compile_unit<'r>(
                 c.at(&e.location);
                 c.emit(Ins::CheckCancel);
                 c.enter();
-                let v = c.expr(e);
+                let v = if c.all_cold { c.exec_expr(e, None) } else { c.expr(e) };
                 c.at(&e.location);
+                c.pkg_op(0, PKG_LEAVE);
                 c.emit(Ins::Give { src: v });
                 c.finish_checked()
             }
         };
         match chunk {
             Ok(chunk) => return chunk,
+            // M-r2-6: no cupo en los registros: otra vez, en frío (sentencias por el tree-walker,
+            // todos los nombres en frames, como la referencia). En frío no se piden registros por
+            // sentencia, así que el segundo intento cabe.
+            Err((bad, false)) if bad.is_empty() => {
+                assert!(!cold, "a cold unit cannot run out of registers");
+                cold = true;
+                win.clear();
+                regframe = false;
+            }
             Err((bad, frame_needed)) => {
                 win.retain(|s| !bad.contains(s));
                 regframe = regframe && !frame_needed && frame_scope.is_some_and(|s| regframe_eligible(res, s, &win));
@@ -660,13 +727,15 @@ struct Shared<'r> {
     /// Los cuerpos ya compilados, por scope: no dependen de lo que elija su padre (una task
     /// definida adentro de una vuelta le deja frame a esa vuelta).
     done: RefCell<HashMap<ScopeId, Rc<Chunk>>>,
+    /// v0.6.58 (§6.1): la marca de todo lo que se compila acá (el cuerpo y lo que define adentro).
+    mark: u32,
 }
 
 impl<'r> Shared<'r> {
-    fn new(res: &'r Resolution) -> Self {
+    fn new(res: &'r Resolution, mark: u32) -> Self {
         let layouts = res.scopes.iter().map(|s| Rc::new(Layout { names: s.names.clone() })).collect();
         let parents = res.scopes.iter().map(|s| s.parent).collect();
-        Shared { by_node: res.by_node(), layouts: Rc::new(layouts), parents: Rc::new(parents), done: RefCell::new(HashMap::new()) }
+        Shared { by_node: res.by_node(), layouts: Rc::new(layouts), parents: Rc::new(parents), done: RefCell::new(HashMap::new()), mark }
     }
 }
 
@@ -716,6 +785,7 @@ struct Compiler<'r, 's> {
     bad: Vec<ScopeId>,
     frame_needed: bool,
     node_spill: Vec<u32>,
+    heavy: Vec<(u32, u16)>,
     spills: Vec<Box<[Spill]>>,
     paths: Vec<PathDesc>,
     map_sites: Vec<MapSite>,
@@ -728,7 +798,17 @@ struct Compiler<'r, 's> {
     /// (el último si se repite, como la referencia) y dónde va el valor del bloque (`r0` si no).
     param_reg: HashMap<u16, Reg>,
     result_reg: Reg,
+    /// Ronda 2 (M-r2-6): el cuerpo pidió más registros que [`REG_LIMIT`]; lo que se compiló no
+    /// sirve y la unidad se compila otra vez en frío (`all_cold`).
+    too_big: bool,
+    /// Cada sentencia del cuerpo es un `Exec` (el tree-walker), sin ventana ni frame en registros.
+    all_cold: bool,
 }
+
+/// Ronda 2 (M-r2-6): los registros de un chunk. `Reg` es `u16` y `DISCARD` es el último: un cuerpo
+/// que pide más (una lista literal de 70 000 elementos, una cadena de 65 000 `|>`) se corre en el
+/// tree-walker, en vez de pisar registros (v0.6.57 daba `length` = 4465 sin error).
+const REG_LIMIT: Reg = 0x8000;
 
 impl<'r, 's> Compiler<'r, 's> {
     fn new(res: &'r Resolution, shared: &'s Shared<'r>, frame_scope: Option<ScopeId>) -> Self {
@@ -770,6 +850,7 @@ impl<'r, 's> Compiler<'r, 's> {
             bad: Vec::new(),
             frame_needed: false,
             node_spill: Vec::new(),
+            heavy: Vec::new(),
             spills: Vec::new(),
             paths: Vec::new(),
             map_sites: Vec::new(),
@@ -779,6 +860,8 @@ impl<'r, 's> Compiler<'r, 's> {
             key_ics: 0,
             param_reg: HashMap::new(),
             result_reg: 0,
+            too_big: false,
+            all_cold: false,
         }
     }
 
@@ -811,11 +894,29 @@ impl<'r, 's> Compiler<'r, 's> {
             self.win_off.insert(s, 0);
             n = names.len();
         }
+        // B-r3-1 (previo): un lugar de la ventana es `u16`. Si las vueltas de `each` no caben, la
+        // unidad se recompila en frío (sin ventana, M-r2-6); en este intento no entra ninguna (así
+        // ningún `off + slot` desborda: el código de este intento no corre). B-r4-2 (previo): el
+        // tope es `PARAM` lugares, no `u16::MAX`: en `TryInPlace` un `slot` con el bit `PARAM` es
+        // un parámetro, y un lugar de la ventana ≥ `PARAM` se leía como el registro de otro.
+        let mut fits = true;
         for &s in &self.window {
+            let len = self.res.scopes[s as usize].names.len();
+            if n + len > usize::from(PARAM) {
+                fits = false;
+                break;
+            }
             self.win_off.insert(s, n as u16);
-            n += self.res.scopes[s as usize].names.len();
+            n += len;
         }
-        self.nlocals = u16::try_from(n).expect("ventana de locales de más de 65535 lugares");
+        if !fits {
+            self.too_big = true;
+            for s in std::mem::take(&mut self.window) {
+                self.win_off.remove(&s);
+            }
+            n = n.min(u16::MAX as usize);
+        }
+        self.nlocals = n as u16;
     }
 
     /// Dónde empieza en la ventana un scope que vive en ella.
@@ -892,6 +993,23 @@ impl<'r, 's> Compiler<'r, 's> {
         self.cur_loc = (self.locs.len() - 1) as u32;
     }
 
+    /// v0.6.58 (§6.1): una de las formas reservadas de `Exec` (ver `PKG_OPS`), sólo en un chunk de
+    /// paquete. No es un nodo del tree-walker: no le pide nombres al frame (`needs_names`).
+    fn pkg_op(&mut self, dst: Reg, op: u32) {
+        if self.shared.mark == 0 {
+            return;
+        }
+        self.code.push(Ins::Exec { dst, node: op });
+        self.weight.push(std::mem::take(&mut self.pending));
+        self.loc.push(self.cur_loc);
+        self.stop_of.push(self.loops.last().copied().unwrap_or(NONE));
+    }
+
+    /// v0.6.58 (§6.1): `CallFromPkg` antes de un `Call` cuya función está en `func`.
+    fn pkg_call(&mut self, func: Reg) {
+        self.pkg_op(func, PKG_CALL);
+    }
+
     fn emit(&mut self, ins: Ins) {
         if matches!(ins, Ins::Exec { .. } | Ins::Define { .. } | Ins::MatchArm { .. } | Ins::EachInit { .. }) {
             self.needs_names();
@@ -914,11 +1032,23 @@ impl<'r, 's> Compiler<'r, 's> {
         }
     }
 
+    /// B-r3-1 (previo): el número de un bucle del nivel nativo es `u16`. Con todos usados, los
+    /// bucles que siguen se compilan sin OSR (el salto de siempre): corren igual, sólo que nunca
+    /// pasan al nivel nativo a mitad de camino.
+    #[cfg(feature = "native-tier")]
+    fn loop_full(&self) -> bool {
+        self.nloops == u16::MAX
+    }
+
     /// El salto hacia atrás de un `while`: `LoopBack` si hay nivel nativo (F4.2), si no el `Jump`
     /// de siempre (sin nivel nativo el despacho no paga nada por el OSR).
     fn loop_back(&mut self, head: u32) {
         #[cfg(feature = "native-tier")]
         if crate::native_tier::tier().is_some() {
+            if self.loop_full() {
+                self.emit(Ins::Jump { to: head });
+                return;
+            }
             let lp = self.nloops;
             self.nloops += 1;
             self.emit(Ins::LoopBack { to: head, lp, first: 0, n: 0 });
@@ -932,6 +1062,10 @@ impl<'r, 's> Compiler<'r, 's> {
     fn each_back(&mut self, head: u32, first: u16, n: u16) {
         #[cfg(feature = "native-tier")]
         if crate::native_tier::tier().is_some() {
+            if self.loop_full() {
+                self.emit(Ins::EachStepV { head, first, n });
+                return;
+            }
             let lp = self.nloops;
             self.nloops += 1;
             self.emit(Ins::LoopBack { to: head, lp, first, n });
@@ -951,6 +1085,12 @@ impl<'r, 's> Compiler<'r, 's> {
     }
 
     fn reg(&mut self) -> Reg {
+        // M-r2-6: sin lugar, la unidad se recompila en frío; hasta entonces un registro cualquiera
+        // (el código de este intento no corre).
+        if self.next_reg >= REG_LIMIT {
+            self.too_big = true;
+            return REG_LIMIT - 1;
+        }
         let r = self.next_reg;
         self.next_reg += 1;
         self.max_reg = self.max_reg.max(self.next_reg);
@@ -1020,6 +1160,21 @@ impl<'r, 's> Compiler<'r, 's> {
         (self.nodes.len() - 1) as u32
     }
 
+    /// Un nodo frío que corre la referencia (recursiva en Rust). v0.6.58 (M-r4-1): si anida lo
+    /// bastante para pesar en el guardián de recursión, la forma `EXEC_HEAVY` con su peso.
+    fn emit_exec(&mut self, n: &Node, dst: Reg) {
+        let node = self.cold(n);
+        let w = u16::try_from(node_weight(crate::ast_api::run_depth(n))).unwrap_or(u16::MAX);
+        if w == 0 {
+            self.emit(Ins::Exec { dst, node });
+        } else {
+            let h = self.heavy.len() as u32;
+            debug_assert!(h < PKG_OPS - EXEC_HEAVY);
+            self.heavy.push((node, w));
+            self.emit(Ins::Exec { dst, node: EXEC_HEAVY | h });
+        }
+    }
+
     /// Un nodo frío que la referencia corre con las variables de la ventana puestas en frames.
     fn cold_spilled(&mut self, n: &Node) -> u32 {
         let k = self.cold(n);
@@ -1064,7 +1219,14 @@ impl<'r, 's> Compiler<'r, 's> {
                 self.emit(Ins::CheckCancel);
             }
             let mark = self.next_reg;
-            self.stmt(s, if i == last { want } else { None });
+            if self.all_cold {
+                // M-r2-6: la sentencia entera por el tree-walker (los nombres van a los frames).
+                self.at(&s.location);
+                let dst = if i == last { want.unwrap_or(DISCARD) } else { DISCARD };
+                self.emit_exec(s, dst);
+            } else {
+                self.stmt(s, if i == last { want } else { None });
+            }
             self.flush();
             self.next_reg = mark;
         }
@@ -1115,7 +1277,11 @@ impl<'r, 's> Compiler<'r, 's> {
                     let (ic, slot) = match self.place(self.target(target)) {
                         Place::Free => (self.ic(), u16::MAX),
                         Place::Param(r) => (NONE, PARAM | r),
-                        Place::Win(k) => (NONE, k),
+                        Place::Win(k) => {
+                            // B-r4-2: `lay_window` deja la ventana debajo de `PARAM`.
+                            debug_assert!(k < PARAM, "un lugar de la ventana con el bit PARAM");
+                            (NONE, k)
+                        }
                         _ => (NONE, u16::MAX),
                     };
                     self.emit(Ins::TryInPlace { dst, node, name: nm, done, ic, slot });
@@ -1309,6 +1475,7 @@ impl<'r, 's> Compiler<'r, 's> {
                     None => Opnd::Const(self.konst(SynValue::Nothing)),
                 };
                 self.at(&n.location);
+                self.pkg_op(0, PKG_LEAVE);
                 self.emit(Ins::Give { src: v });
             }
             K::StopStatement { value } => {
@@ -1325,6 +1492,7 @@ impl<'r, 's> Compiler<'r, 's> {
                     None => {
                         let has = v.is_some();
                         let src = v.unwrap_or_else(|| Opnd::Const(self.konst(SynValue::Nothing)));
+                        self.pkg_op(0, PKG_LEAVE);
                         self.emit(Ins::StopOut { src, has });
                     }
                 }
@@ -1342,10 +1510,7 @@ impl<'r, 's> Compiler<'r, 's> {
                     (None, _) => {}
                 }
             }
-            _ => {
-                let node = self.cold(n);
-                self.emit(Ins::Exec { dst, node });
-            }
+            _ => self.emit_exec(n, dst),
         }
     }
 
@@ -1424,6 +1589,7 @@ impl<'r, 's> Compiler<'r, 's> {
                 let site = (self.sites.len() - 1) as u32;
                 self.at(&c.location);
                 let dst = self.reg();
+                self.pkg_call(func);
                 self.emit(Ins::Call { dst, func, args: first, n: arguments.len() as u16, site });
                 self.emit(Ins::EachInitV { src: Opnd::Reg(dst), node, it });
                 self.bind(done);
@@ -1482,6 +1648,11 @@ impl<'r, 's> Compiler<'r, 's> {
     fn set_value(&mut self, target: &Node, name: &str, value: &Node) -> Opnd {
         let k = text_chain_len(value, name);
         if k == 0 || (k > 1 && self.text_regs.1 == 0) {
+            return self.expr(value);
+        }
+        // B-r3-1 (previo): las cadenas y sus piezas se numeran con `u16`. Sin número libre, la
+        // expresión de siempre: el mismo resultado, sin el atajo.
+        if self.text_chains.len() >= u16::MAX as usize || self.text_members.len() + k > u16::MAX as usize {
             return self.expr(value);
         }
         let root = match self.place(self.target(target)) {
@@ -1722,6 +1893,10 @@ impl<'r, 's> Compiler<'r, 's> {
             K::MapLiteral { pairs } => {
                 self.enter();
                 let first = self.block_regs(2 * pairs.len());
+                if self.too_big {
+                    // M-r2-6: `2 * i as Reg` desbordaría; la unidad se recompila en frío.
+                    return Opnd::Reg(self.dst(want));
+                }
                 let end = first + 2 * pairs.len() as Reg;
                 for (i, (k, v)) in pairs.iter().enumerate() {
                     self.into_reg(k, first + 2 * i as Reg, end);
@@ -1776,6 +1951,7 @@ impl<'r, 's> Compiler<'r, 's> {
                             self.sites.push(CallSite { names: None, checked: false, append: None });
                             let site = (self.sites.len() - 1) as u32;
                             self.at(&t.location);
+                            self.pkg_call(func);
                             self.emit(Ins::Call { dst, func, args: first, n: 1, site });
                         }
                     }
@@ -1961,11 +2137,18 @@ impl<'r, 's> Compiler<'r, 's> {
         self.sites.push(CallSite { names, checked, append: None });
         let site = (self.sites.len() - 1) as u32;
         self.at(&n.location);
+        self.pkg_call(func);
         self.emit(Ins::Call { dst, func, args: first, n: total as u16, site });
     }
 
     /// `n` registros seguidos (para argumentos o elementos) y los temporales después.
     fn block_regs(&mut self, n: usize) -> Reg {
+        // M-r2-6: un bloque que no cabe marca la unidad y empieza en 0, así las cuentas de quien lo
+        // pidió (`first + i as Reg`) no desbordan; el código de este intento no corre.
+        if usize::from(self.next_reg) + n >= usize::from(REG_LIMIT) {
+            self.too_big = true;
+            return 0;
+        }
         let first = self.next_reg;
         for _ in 0..n {
             self.reg();
@@ -1986,8 +2169,7 @@ impl<'r, 's> Compiler<'r, 's> {
 
     fn exec_expr(&mut self, n: &Node, want: Option<Reg>) -> Opnd {
         let dst = self.dst(want);
-        let node = self.cold(n);
-        self.emit(Ins::Exec { dst, node });
+        self.emit_exec(n, dst);
         Opnd::Reg(dst)
     }
 
@@ -2016,6 +2198,11 @@ impl<'r, 's> Compiler<'r, 's> {
 
     /// Termina el chunk, o dice qué vueltas (y si el cuerpo) necesitan frame después de todo.
     fn finish_checked(self) -> Result<Rc<Chunk>, (Vec<ScopeId>, bool)> {
+        // M-r2-6: `(vacío, false)` no sale de otro caso: `compile_unit` lo lee como «recompilar en
+        // frío».
+        if self.too_big {
+            return Err((Vec::new(), false));
+        }
         if !self.bad.is_empty() || self.frame_needed {
             return Err((self.bad, self.frame_needed));
         }
@@ -2025,6 +2212,7 @@ impl<'r, 's> Compiler<'r, 's> {
 
     fn finish(mut self, result: Opnd) -> Rc<Chunk> {
         self.flush();
+        self.pkg_op(0, PKG_LEAVE);
         self.emit(Ins::End { src: result });
         let n = self.code.len();
         let target = |labels: &Vec<u32>, l: u32| labels[l as usize] as usize;
@@ -2074,6 +2262,9 @@ impl<'r, 's> Compiler<'r, 's> {
                     leader[i + 1] = true;
                 }
                 Ins::EachInit { .. } => leader[i + 1] = true,
+                // v0.6.58: el cruce no corta el bloque (el `Call` que sigue a `PKG_CALL` tiene que
+                // quedar pegado: el salto de la llamada ajena es al de después).
+                Ins::Exec { node, .. } if node >= PKG_OPS => {}
                 Ins::Exec { .. } | Ins::Call { .. } | Ins::CallBuiltin { .. } => leader[i + 1] = true,
                 #[cfg(feature = "native-tier")]
                 Ins::CallNative { .. } => leader[i + 1] = true,
@@ -2179,6 +2370,7 @@ impl<'r, 's> Compiler<'r, 's> {
             tagged,
             frame,
             regframe: self.regframe,
+            mark: self.shared.mark,
             param_slots: self.param_slots,
             nlocals: self.nlocals,
             node_spill: self.node_spill,
@@ -2197,6 +2389,7 @@ impl<'r, 's> Compiler<'r, 's> {
             loop_heads,
             #[cfg(feature = "native-tier")]
             loops: (0..self.nloops).map(|_| native::LoopState::default()).collect(),
+            heavy: self.heavy.into_boxed_slice(),
         })
     }
 }
@@ -2340,20 +2533,18 @@ pub(crate) struct LambdaCall<'a> {
 
 impl<'a> LambdaCall<'a> {
     /// Por la sesión, si la hay (o si ya se puede armar); `None`: por `call_fast`.
+    // v0.6.58: `inline(always)` y la apertura de la sesión aparte (fría). Con `#[inline]` solo, LLVM
+    // dejó de inlinearla en `item` cuando creció el código de alrededor: ~22 instrucciones más por
+    // elemento (prólogo, epílogo y la llamada; `s_records` vm +1,7 %).
     #[cfg(feature = "native-tier")]
-    #[inline]
+    #[inline(always)]
     fn native(&mut self, it: &mut Interpreter, pre: Option<&SynValue>, l: &ListRef, i: usize) -> Option<Result<SynValue, Control>> {
         if self.fast.is_none() {
             if self.off {
                 return None;
             }
             let t: &'a Rc<SynTaskValue> = self.task?;
-            if !t.code.native.ready() {
-                return None;
-            }
-            self.fast = it.vm_lambda_session(t, self.flag);
-            if self.fast.is_none() {
-                self.off = true;
+            if !t.code.native.ready() || !self.open(it, t) {
                 return None;
             }
         }
@@ -2362,6 +2553,19 @@ impl<'a> LambdaCall<'a> {
             self.off = true;
         }
         r
+    }
+
+    /// Arma la sesión (una vez por builtin: si no se puede, `off`).
+    #[cfg(feature = "native-tier")]
+    #[cold]
+    #[inline(never)]
+    fn open(&mut self, it: &mut Interpreter, t: &'a Rc<SynTaskValue>) -> bool {
+        self.fast = it.vm_lambda_session(t, self.flag);
+        if self.fast.is_none() {
+            self.off = true;
+            return false;
+        }
+        true
     }
 
     /// `f(l[i])`.
@@ -2428,7 +2632,8 @@ impl Interpreter {
             return None;
         }
         let params: Vec<Arc<str>> = task.parameters.iter().map(|p| p.name.clone()).collect();
-        task.code.set(compile_function(&params, &task.body));
+        // v0.6.58 (§6.1): con la marca de la task: el chunk de un paquete lleva su cruce.
+        task.code.set(compile_function(&params, &task.body, task.mark));
         task.code.get()
     }
 
@@ -2464,11 +2669,12 @@ impl Interpreter {
         const MAX: usize = 512;
         let key = (stmts.as_ptr() as usize, stmts.len());
         if let Some((body, chunk)) = self.vm_request_chunks.get(&key) {
-            if body.as_slice() == stmts {
+            if body.as_slice() == stmts && chunk.mark == self.cur_pkg {
                 return chunk.clone();
             }
         }
-        let chunk = compile_program(stmts);
+        // v0.6.58 (§6.1): el cuerpo de una ruta montada de un paquete corre con su marca (ya cruzó).
+        let chunk = compile_program_marked(stmts, self.cur_pkg);
         if self.vm_request_chunks.len() >= MAX {
             self.vm_request_chunks.clear();
         }
@@ -3259,6 +3465,16 @@ impl Interpreter {
                         }
                     }
                 }
+                // v0.6.58 (§6.1, M-r4-1): las formas reservadas (`PKG_OPS`, `EXEC_HEAVY`) van en el
+                // mismo brazo, a una función fría: un brazo más en este `match` mueve el despacho entero.
+                Ins::Exec { dst, node } if node >= EXEC_HEAVY => match self.vm_pkg_op(&chunk, &env, base, at, dst, node) {
+                    Ok(true) => {
+                        pc = at + 2;
+                        Ok(())
+                    }
+                    Ok(false) => Ok(()),
+                    Err(c) => Err(c),
+                },
                 Ins::Exec { dst, node } => self.exec(&chunk.nodes[node as usize], &env).map(|v| self.put(base, dst, v)),
                 Ins::Call { dst, func, args, n, site } => {
                     match self.vm_call(&chunk, base, at, dst, func, args, n, site) {
@@ -3472,6 +3688,15 @@ impl Interpreter {
             // `End` sale como `Give` para compartir este camino; al que llamó a `run_chunk` se le
             // devuelve lo mismo que `exec_block`: `Ok` con el valor de la última sentencia.
             let ended = matches!(ins, Ins::End { .. });
+            // v0.6.58 (§6.1): el cruce de un frame que sale sin su `LeavePkg` (un error, o un
+            // `give`/`stop` que salió de un nodo del tree-walker) se deshace cuando sale: este, acá,
+            // y cada llamador por el que sigue un error, abajo. Sólo un chunk con marca emite
+            // `PKG_ENTER`, así que se mira la marca del chunk, que ya está a mano. Ni el `return`
+            // ni las vueltas al llamador llevan nada: una llamada más en esas salidas reacomodaba
+            // el despacho entero (+1-2 % en la VM).
+            if chunk.mark != 0 {
+                self.vm_pkg_unwind(base);
+            }
             loop {
                 if self.vm_frames.len() == entry {
                     self.vm_iters.truncate(entry_iters);
@@ -3530,7 +3755,11 @@ impl Interpreter {
                     }
                     Err(other) => c = other,
                 }
-                // Sigue el error hacia arriba (un `Call` termina su bloque: no sobran pasos).
+                // Sigue el error hacia arriba (un `Call` termina su bloque: no sobran pasos). Este
+                // frame también sale sin su `LeavePkg`.
+                if chunk.mark != 0 {
+                    self.vm_pkg_unwind(base);
+                }
             }
         }
     }
@@ -4034,11 +4263,120 @@ impl Interpreter {
         Ok(Some(arm_env))
     }
 
+
+    /// v0.6.58 (§6.1, G-1): las formas reservadas de `Exec` de un chunk de paquete (ver `PKG_OPS`).
+    /// `Ok(true)` salta la instrucción que sigue (el `Call` de una llamada ajena ya hecha).
+    #[cold]
+    #[inline(never)]
+    fn vm_pkg_op(&mut self, chunk: &Chunk, env: &Rc<RefCell<Environment>>, base: usize, at: usize, dst: Reg, op: u32) -> Result<bool, Control> {
+        match op {
+            // M-r4-1: un `Exec` pesado: el nodo por la referencia, con su peso en el guardián.
+            op if op < PKG_OPS => {
+                let (node, w) = chunk.heavy[(op - EXEC_HEAVY) as usize];
+                let n = &chunk.nodes[node as usize];
+                let v = self.with_stack_weight(usize::from(w), |i| i.exec(n, env))?;
+                self.put(base, dst, v);
+                Ok(false)
+            }
+            PKG_ENTER => {
+                if self.cur_pkg != chunk.mark {
+                    let saved = self.cross_into(chunk.mark);
+                    self.pkg_frames.push((self.vm_frames.len(), base, saved));
+                }
+                Ok(false)
+            }
+            PKG_LEAVE => {
+                if let Some(&(l, b, saved)) = self.pkg_frames.last() {
+                    if l == self.vm_frames.len() && b == base {
+                        self.pkg_frames.pop();
+                        self.cross_leave(saved);
+                    }
+                }
+                Ok(false)
+            }
+            _ => {
+                // `PKG_CALL`: `dst` es el registro de la función del `Call` que sigue.
+                let foreign = matches!(&self.vm_regs[base + dst as usize], SynValue::Task(t) if t.mark != chunk.mark);
+                if !foreign {
+                    return Ok(false);
+                }
+                let (cdst, func, args, n, site) = match chunk.code[at + 1].get() {
+                    Ins::Call { dst, func, args, n, site } | Ins::CallBuiltin { dst, func, args, n, site } => (dst, func, args, n, site),
+                    #[cfg(feature = "native-tier")]
+                    Ins::CallNative { dst, func, args, n, site } => (dst, func, args, n, site),
+                    Ins::AppendInPlace { dst, func, args, site } => (dst, func, args, 2, site),
+                    other => unreachable!("PKG_CALL sin su Call: {:?}", other),
+                };
+                debug_assert_eq!(func, dst);
+                let f = std::mem::replace(&mut self.vm_regs[base + func as usize], SynValue::Nothing);
+                // `call_value_named`: el brazo `Task` cruza y vuelve, también por error (K40).
+                self.vm_call_generic(chunk, base, at + 1, cdst, f, base + args as usize, n as usize, site)?;
+                Ok(true)
+            }
+        }
+    }
+
+    /// v0.6.58 (§6.1, K35): un default de un parámetro, en la VM, se evalúa antes del prólogo del
+    /// llamado: con otra marca, adentro de su cruce (una lambda del default lleva la marca del
+    /// llamado y corre en su dominio). La comparación está sólo donde falta un argumento.
+    #[inline(always)]
+    fn vm_default(&mut self, t: &SynTaskValue, d: &Node) -> Result<SynValue, Control> {
+        if t.mark == self.cur_pkg {
+            self.exec(d, &t.closure_env)
+        } else {
+            self.vm_default_crossed(t, d)
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn vm_default_crossed(&mut self, t: &SynTaskValue, d: &Node) -> Result<SynValue, Control> {
+        let saved = self.cross_into(t.mark);
+        let r = self.exec(d, &t.closure_env);
+        self.cross_leave(saved);
+        r
+    }
+
+    /// v0.6.58 (§6.1): el cuerpo por el tree-walker cuando la VM no pudo preparar el frame (frío),
+    /// con el cruce si la task es de otra marca.
+    #[cold]
+    #[inline(never)]
+    fn vm_body_marked(&mut self, t: &SynTaskValue, call_env: &Rc<RefCell<Environment>>) -> Result<SynValue, Control> {
+        if t.mark == self.cur_pkg {
+            return self.exec_body_weighted(t, call_env);
+        }
+        let saved = self.cross_into(t.mark);
+        let r = self.exec_body_weighted(t, call_env);
+        self.cross_leave(saved);
+        r
+    }
+
+    /// v0.6.58 (§6.1): deshace los cruces de este frame (`base`, a la altura actual de `vm_frames`)
+    /// y de los de arriba que salen sin su `LeavePkg`: un error, o un `give`/`stop` que salió de un
+    /// nodo del tree-walker.
+    #[cold]
+    #[inline(never)]
+    fn vm_pkg_unwind(&mut self, base: usize) {
+        let len = self.vm_frames.len();
+        while let Some(&(l, b, saved)) = self.pkg_frames.last() {
+            if l < len || (l == len && b < base) {
+                break;
+            }
+            self.pkg_frames.pop();
+            self.cross_leave(saved);
+        }
+    }
+
     #[inline(never)]
     fn vm_define(&mut self, chunk: &Chunk, env: &Rc<RefCell<Environment>>, base: usize, dst: Reg, node: u32, child: u32) -> Result<(), Control> {
         let v = self.exec(&chunk.nodes[node as usize], env)?;
         if let SynValue::Task(t) = &v {
-            t.code.set(chunk.children[child as usize].clone());
+            // v0.6.58 (§6.1): el cuerpo compilado acá lleva el cruce de la marca de este chunk; una
+            // task con otra marca (el nivel superior de un paquete corre en el tree-walker, pero una
+            // ruta montada puede definir) se compila sola en su primera llamada (`compile_task`).
+            if t.mark == chunk.mark {
+                t.code.set(chunk.children[child as usize].clone());
+            }
         }
         self.put(base, dst, v);
         Ok(())
@@ -4225,7 +4563,7 @@ impl Interpreter {
             if done {
                 v
             } else {
-                set_leaf_prop(&obj, name, v, &chunk.locs[chunk.loc[at] as usize])?
+                set_leaf_prop(&obj, name, v, &chunk.locs[chunk.loc[at] as usize], self.cur_pkg)?
             }
         } else {
             // El índice, después el valor: en la referencia los dos ya están evaluados (el valor
@@ -4271,6 +4609,7 @@ impl Interpreter {
                     &root_now,
                     false,
                     false,
+                    self.cur_pkg,
                 )?
             }
         };
@@ -4358,7 +4697,7 @@ impl Interpreter {
                             std::mem::replace(&mut self.vm_regs[first + i], SynValue::Nothing)
                         } else {
                             match &param.default {
-                                Some(d) => match self.exec(d, &t.closure_env) {
+                                Some(d) => match self.vm_default(t, d) {
                                     Ok(v) => v,
                                     Err(e) => {
                                         self.recursion_depth -= 1;
@@ -4376,7 +4715,7 @@ impl Interpreter {
                     debug_assert!(!self.labels);
                     if !laid {
                         // No se pudo preparar el frame: el cuerpo por el tree-walker, como antes.
-                        let out = match self.exec_block(&t.body, &call_env) {
+                        let out = match self.vm_body_marked(t, &call_env) {
                             Ok(v) | Err(Control::Give(v)) => Ok(v),
                             Err(other) => Err(other),
                         };
@@ -4390,6 +4729,10 @@ impl Interpreter {
                     grow_regs(&mut self.vm_regs, new_base + code.nregs as usize);
                     let lbase = self.vm_locals.len();
                     self.vm_locals.resize(lbase + code.nlocals as usize, None);
+                    // v0.6.58 (§6.1, la red de debug): un chunk del programa (sin prólogo `PKG_ENTER`)
+                    // sólo se entra con el dominio del programa; uno de paquete cruza en su prólogo.
+                    // Una llamada que llega acá desde un paquete sin cruzar es un camino sin `PKG_CALL`.
+                    debug_assert!(code.mark != 0 || self.cur_pkg == 0, "entrada a un chunk del programa con el dominio del paquete #{}", self.cur_pkg);
                     return Ok(Some(Enter { code, env: call_env, base: new_base, lbase, top: new_base }));
                 }
             }
@@ -4419,7 +4762,7 @@ impl Interpreter {
         self.vm_locals.resize(lbase + code.nlocals as usize, None);
         for i in n.min(np)..np {
             let v = match &t.parameters[i].default {
-                Some(d) => match self.exec(d, &t.closure_env) {
+                Some(d) => match self.vm_default(t, d) {
                     Ok(v) => v,
                     Err(e) => {
                         self.vm_locals.truncate(lbase);
@@ -4446,10 +4789,25 @@ impl Interpreter {
         if let SynValue::Task(t) = f {
             if let Some(code) = self.vm_code_for(t) {
                 if code.regframe {
+                    // v0.6.58 (§6.1, F-1): una task con otra marca que el paquete que corre no entra
+                    // directo a su código: va por `call_value`, que cruza. Afuera de línea: con la
+                    // rama adentro, LLVM sacaba de línea lo de `vm_call_rust` (~44 instrucciones
+                    // por elemento en `where`/`apply`, cachegrind).
+                    if t.mark != self.cur_pkg {
+                        return self.call_fast_foreign(f, args, loc);
+                    }
                     return self.vm_call_rust(t, code, args);
                 }
             }
         }
+        let v: Vec<SynValue> = args.iter_mut().map(|a| std::mem::replace(a, SynValue::Nothing)).collect();
+        self.call_value(f.clone(), v, loc)
+    }
+
+    /// v0.6.58 (§6.1): `call_fast` a una task de otra marca: por `call_value`, que cruza.
+    #[cold]
+    #[inline(never)]
+    fn call_fast_foreign(&mut self, f: &SynValue, args: &mut [SynValue], loc: &SourceLocation) -> Result<SynValue, Control> {
         let v: Vec<SynValue> = args.iter_mut().map(|a| std::mem::replace(a, SynValue::Nothing)).collect();
         self.call_value(f.clone(), v, loc)
     }
@@ -4778,6 +5136,15 @@ impl Interpreter {
     #[cfg(feature = "native-tier")]
     #[allow(clippy::too_many_arguments)]
     fn vm_exec_call(&mut self, chunk: &Rc<Chunk>, base: usize, at: usize, dst: Reg, func: Reg, args: Reg, n: u16, site: u32) -> Result<(), Control> {
+        // v0.6.58 (A1 de la ronda 1): la llamada ajena de un bucle nativo corre desde su `Call`, sin
+        // el `PKG_CALL` de antes (en nativo es un `Nop`). En un chunk de paquete, una task de otra
+        // marca sale por donde sale `PKG_CALL`: `call_value_named`, que cruza (también a 0, el
+        // callback del programa) y vuelve.
+        if chunk.mark != 0 && matches!(&self.vm_regs[base + func as usize], SynValue::Task(t) if t.mark != chunk.mark) {
+            let f = std::mem::replace(&mut self.vm_regs[base + func as usize], SynValue::Nothing);
+            self.vm_call_generic(chunk, base, at, dst, f, base + args as usize, n as usize, site)?;
+            return Ok(());
+        }
         let Some(enter) = self.vm_call(chunk, base, at, dst, func, args, n, site)? else { return Ok(()) };
         let Enter { code, env: call_env, base: cbase, lbase, top } = enter;
         let saved = std::mem::replace(&mut self.vm_lbase, lbase);
