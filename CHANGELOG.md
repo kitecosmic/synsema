@@ -6,7 +6,7 @@ Each says what changed, why, and what to write instead.
 
 Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the release date.
 
-## v0.6.58 — unreleased
+## v0.6.58 — 2026-11-10
 
 **Language and engine.**
 - **`use "name"` loads a package by name.** The project file `synsema.json` says where each name
