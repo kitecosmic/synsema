@@ -21,10 +21,10 @@ host is a thin adapter in `packages/guests/<host>/` with the `.syn` embedded. No
 ## Your program → a module (no compiler); the adapter (Rust)
 
 An app author NEVER needs Rust. Every release ships `synsema-vela-guest.wasm` (the interpreter as a
-Vela guest) with an **app slot** — a fixed 512 KB data block with a header (`SYNSEMA.APPSLOT1` · name ·
-u32 LE length · program). `packages/guests/vela/tools/embed.syn` (in the kits: `scripts/embed.syn`)
-finds it in the file and overwrites it with a `.syn` in a second; the kits' `scripts/build.sh`
-downloads the release asset once and runs it:
+Vela guest) with an **app slot** — a fixed 512 KB (524 288 bytes) data block with a header.
+`packages/guests/vela/tools/embed.syn` (in the kits: `scripts/embed.syn`) finds it in the file and
+overwrites it with your app in a second; the kits' `scripts/build.sh` downloads the release asset once
+and runs it:
 
 ```sh
 synsema test app/app.syn                                                         # the app, natively (same code runs in the enclave)
@@ -32,6 +32,50 @@ synsema test --labels --cap-set stdout,declassify=app app/app.syn               
 synsema run scripts/embed.syn -- synsema-vela-guest.wasm app/app.syn build/app.wasm   # what scripts/build.sh does
 node scripts/smoke.mjs build/app.wasm                                            # optional; Node 20 or 24+ (NOT 22, see below)
 ```
+
+**An app with packages (v0.6.58+).** Since v0.6.58 the slot is `SYNSEMA.APPSLOT2`: magic (16 bytes) ·
+the bundle's length (u32 LE) · a `synsema build` bundle · 0x20 filler, so a bundle fits in up to
+524 268 bytes. A plain `.syn` given to `embed.syn` becomes a one-file bundle (nothing changes for you).
+An app that uses packages (`use "tok"`, its `synsema.json`, `synsema get` — modules.md) goes in as
+what `synsema build` makes with the guest as the engine:
+
+```sh
+synsema build app.syn --engine-binary synsema-vela-guest.wasm -o app.built        # program + synsema.json + packages, hashed
+synsema run tools/embed.syn -- synsema-vela-guest.wasm app.built app.wasm
+# app.wasm: 11440108 bytes, the bundle of app.built (1342 bytes in the slot), sha256 …
+synsema run tools/verify.syn -- app.wasm --release <tag> --source app.built [--extract out]
+```
+
+- The guest mounts the bundle like a built binary: packages come only from it (no cache, no network),
+  each checked against its hash. Measured under Node's WASI: a `deploy` that returns
+  `tok.greet("vela")` from a package answered `{"greeting":"hello vela"}`.
+- `embed.syn` refuses a built app that bakes a ceiling (`embed.syn: the bundle bakes a ceiling
+  (--sandbox or --cap-set); here the host sets it: build without it`) or `--serve`/`--audit` (`embed.syn:
+  the bundle bakes --serve or --audit, which only a native binary applies: build without them`) — the
+  guest would refuse it at deploy. An app plus packages larger than the slot: `the app and its bundle
+  are N bytes; the app slot holds at most 524268`.
+- **Tools and guest of the same release** (breaking): the new `embed.syn` against a v0.6.57 guest →
+  `embed.syn: this guest has no package slot (APPSLOT2); use the guest of v0.6.58 or newer`; the
+  v0.6.57 `embed.syn` against the new guest → `no app slot in this module: it needs a guest from
+  Synsema v0.6.23 or newer …` (misleading: it means "use the new embed.syn"). The new guest still
+  runs a module embedded the old way (`SYNSEMA.APPSLOT1`), and an already deployed `.wasm` keeps
+  working (it carries its own slot). The published guest's hash changed with the slot.
+- `verify.syn` reads both slot formats, lists every file and package of the slot with its sha256, and
+  `--extract <dir>` writes the whole tree (packages under `pkg/tree-sha256-<hex>/`). `--source
+  app.built` compares bundle against bundle (every file, `synsema.json`, every package and the
+  manifest except `built_at`: a rebuild from the same source passes) → `VERIFIED: the release's
+  interpreter, with exactly the app of app.built in its slot`. `--source app.syn` compares the main
+  program only, so with packages it fails: `source: identical to the main program, but the slot also
+  carries 1 other file(s) and 1 package(s) that a .syn does not cover: pass the built app (synsema
+  build … --engine-binary … -o app.built) as --source`. Usage: `synsema run verify.syn -- app.wasm
+  (--release <tag> | --asset <guest.wasm>) [--source app.built|app.syn] [--extract <dir>] [--audited
+  <sha256>] [--cache <dir>]`. It also refuses what the engine would not load (entry names not in normal
+  form or repeated, a package twice, a malformed package index, bytes after the section) and fails a
+  package whose minimum `synsema` is above the `--release`.
+- **Recursion in the guest:** it always runs with labels, so a recursive task reaches at most **150**
+  calls counting the exported task (measured: `f(148)` from `deploy` answers, `f(149)` is
+  `ERR runtime_error: Runtime error: maximum recursion depth exceeded`), fewer the deeper its body
+  nests. Natively the same app reaches 3000: write loops, not deep recursion, in a guest app.
 
 Only when changing the ADAPTER itself (packages/guests/vela):
 ```sh

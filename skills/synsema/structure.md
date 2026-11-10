@@ -24,6 +24,8 @@ engine/
     │       ├── addressable.rs       # token-efficient code addressing
     │       ├── templates.rs         # SSR template engine (render)
     │       ├── secret.rs            # opaque `secret` value (zeroize + constant-time eq)
+    │       ├── project.rs           # v0.6.58+: the project (nearest synsema.json, minimum version, keys)
+    │       ├── modtable.rs          # v0.6.58+: the process table — every module/package read and hashed once, before running
     │       └── flat_syntax.rs       # .fsyn → .syn translator
     │
     ├── synsema-capabilities/        # security layer (deny-by-default)
@@ -67,6 +69,7 @@ engine/
     │
     ├── synsema-cli/                 # the `synsema` binary
     │   └── src/main.rs             # subcommands: run / check / test / serve / conform / repl / daemon
+    │       get.rs                   # v0.6.58+: `synsema get` (fetch, verify, MVS, --accept, --check)
     │
     ├── synsema-wasm/                # lib (pure wiring, run/test/check/handle, HostProvider) + wasip1 CLI bin (v0.6.0+)
     └── synsema-wasm-web/            # cdylib wasm32-unknown-unknown: JSON ABI + `synsema_host` imports (browser/Node/Python/Go)
@@ -86,3 +89,19 @@ engine/
 Per-crate Rust tests under `crates/*/tests/` and `#[cfg(test)]` modules. Run with
 `cargo test --workspace`. The semantic-invariant net lives in `synsema-core` (equality/order/
 coercion property tests). `.syn`-level self-tests use the native test framework (`synsema test`).
+
+## A program's project (v0.6.58+)
+
+What a Synsema **app** folder looks like (not the engine): the project root is the folder of the
+nearest `synsema.json` at or above the entry file; `synsema init` writes one
+(`{"synsema": "<version>", "modules": {}}`) next to `hello.syn`, `.env.example`, `.gitignore` and
+`.mcp.json`.
+```
+my-app/
+├── synsema.json      # minimum engine + packages (name → url, pinned by hash by `synsema get`) — commit it
+├── main.syn          # entry; `use "./lib/x.syn"` (files) and `use "textkit"` (packages)
+├── lib/              # your modules; `../` reaches anything under the project root
+└── .synsema/         # local state (gitignored by init)
+```
+Packages live outside the project, in `~/.synsema/modules/` or `SYNSEMA_MODULE_CACHE` (process
+environment; relative = relative to the project root). See [modules.md](modules.md) § Packages.

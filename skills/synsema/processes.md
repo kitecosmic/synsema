@@ -322,6 +322,23 @@ Windows caps each near 32 767 characters. Past 30 000:
   `cron` tick or a `serve` handler): each process writes only the entries it changed, the child's new
   ids are marked (`mem_<n>_p<process>`), and the parent reloads when the child returns.
 
+**A child that uses packages (v0.6.58+).** The child's source is text, so it has a project only when
+you give it a `filename`: then it looks for `synsema.json` from its working folder (the `cwd` option,
+or the parent's) upward, like a file there. It reads packages from **the parent's cache**: the parent
+passes `SYNSEMA_MODULE_CACHE` to the child as an absolute path (also when `env` replaces the
+environment; the program cannot set it, it is a `SYNSEMA_*`). The child never downloads.
+```
+require sandbox_run
+let child be "use \"tok\" as tok\nprint(tok.greet(\"child\"))\n"
+let r be run_program(child, {"ceiling": "stdout", "timeout": 20, "filename": "child.syn", "cwd": "../proj"})
+-- r.output = ["hello child"]
+```
+Without `filename`: ``Runtime error: use "tok": a module by name is declared in synsema.json, and a
+program without a file has no synsema.json``. A package missing from the parent's cache: ``use "tok":
+module tok 0.1.0 is not downloaded: run synsema get (it needs the network)`` (run `get` in the parent's
+project). A `run_program` called from inside a package passes a ceiling no wider than that package's
+`requires` (modules.md).
+
 ### What the result carries — for an agent that repairs its own code (v0.6.54+)
 
 | Key | What it is |

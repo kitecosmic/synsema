@@ -422,6 +422,40 @@ of your contract, via `evm_tx` + `evm_send`). What it does not cover: values tha
 not reads (`env`/`secret`, the blackboard) and completeness across units. Full
 contract: [builtins.md](builtins.md) § Lineage.
 
+## Which packages ran — `modules` in the receipt (v0.6.58+)
+
+`program_sha` covers the program's own files; **packages (`use "tok"`, modules.md) do not enter it**.
+The receipt names them instead, from the table the engine built and verified before the first
+statement (not from what is on disk when the run ends: a program that rewrites its `synsema.json`
+while it runs does not change it):
+
+```json
+"modules": {"direct":   {"tok": "https://reg.example/tok"},
+            "packages": {"https://reg.example/tok": {"version": "0.1.0", "hash": "tree-sha256:1570…"}}}
+```
+
+- `receipt().credentialSubject.modules` and, in a sealed receipt (`--auditor`), `header.modules`
+  (signed). **Only with packages**: a program that reaches none has no `modules` key at all — also
+  when `synsema.json` declares a package the program never `use`s.
+- `direct`: each name the program itself uses → the `id` of the package it points to (the project's
+  `synsema.json` is not hashed anywhere, so pointing `tok` at another `id` must show). A package
+  reached only through another one is only in `packages` (its name is covered by the parent's hash).
+  `packages`: every package reached, by `id`, with `version` and `hash`. A `use "tok"` inside a branch
+  that never runs (or a private branch under `--labels`) is listed the same: the list never depends
+  on which branch ran.
+- The same in a `synsema build` binary (the packages travel in the bundle) and in wasm-web
+  (`project` + `packages`).
+- **`--replay` compares `modules` before `program_sha`.** Another package, version or `id`:
+  ``synsema run: --replay: the receipt's modules ({"direct":{…},"packages":{…"version":"0.1.0"}}) are not the ones here ({…"version":"0.2.0"}}}); to run against it anyway, add --replay-any-program (the result is not a verification)``
+  (exit 2). A receipt from before v0.6.58 (no `modules`) replayed where the program uses packages
+  gives the same error with `the receipt's modules (none)`. `--replay-any-program` runs it anyway and
+  ends with `(another program: not a verification)`.
+- **Attestation binds them:** `run --attest` and `serve --attested` add `modules` to `config`, so a
+  different package hash gives another `config_sha` (and another `report_data`). Measured with the
+  `mock` driver: the same `run --attest` with `tok` 0.1.0 and 0.2.0 → two `config_sha`. A program
+  without packages has no `modules` in `config`: its `config_sha` is computed as before (it still
+  changes with the engine version, which `config` names).
+
 ## Verifying what you downloaded
 
 Attestation answers *which code is running inside the enclave*. The question before it is *which
