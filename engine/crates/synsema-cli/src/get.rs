@@ -701,21 +701,24 @@ fn save_index(cache: &Path, hash: &str, bytes: &[u8]) -> Result<(), String> {
     let dir = path.parent().expect("index/");
     std::fs::create_dir_all(dir).map_err(|e| format!("get: {}: {}", dir.display(), e))?;
     let tmp = temp_name(dir, "index");
-    std::fs::write(&tmp, bytes).map_err(|e| format!("get: {}: {}", tmp.display(), e))?;
-    if let Err(e) = rename_retry(&tmp, &path) {
-        let _ = std::fs::remove_file(&tmp);
-        // Ronda 2 (B-r2-5): si no se pudo reemplazar (sólo lectura, sin permiso) y lo que quedó no es
-        // lo bueno, es un error que nombra el archivo; antes se avisaba «fetching it again», rc 0, y
-        // el índice seguía dañado. Otro `get` que ya escribió los mismos bytes no es error.
-        if !std::fs::read(&path).is_ok_and(|b| b == bytes) {
-            return Err(format!(
-                "get: the cached index {} does not match its hash and cannot be replaced ({}); delete it and run synsema get again",
-                path.display(),
-                e
-            ));
-        }
+    let written = std::fs::write(&tmp, bytes).and_then(|()| rename_retry(&tmp, &path));
+    let Err(e) = written else { return Ok(()) };
+    let _ = std::fs::remove_file(&tmp);
+    // Ronda 2 (B-r2-5): si no se pudo reemplazar (sólo lectura, sin permiso; en Unix la carpeta sin
+    // escritura falla ya al crear el temporal) y lo que quedó no es lo bueno, es un error que nombra
+    // el archivo; antes se avisaba «fetching it again», rc 0, y el índice seguía dañado. Otro `get`
+    // que ya escribió los mismos bytes no es error.
+    if std::fs::read(&path).is_ok_and(|b| b == bytes) {
+        return Ok(());
     }
-    Ok(())
+    if path.is_file() {
+        return Err(format!(
+            "get: the cached index {} does not match its hash and cannot be replaced ({}); delete it and run synsema get again",
+            path.display(),
+            e
+        ));
+    }
+    Err(format!("get: {}: {}", path.display(), e))
 }
 
 /// Instala un árbol: a una carpeta temporal, verificado, archivos de sólo lectura y renombrado. Si

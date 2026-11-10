@@ -14375,7 +14375,10 @@ pub fn run_source(source: &str, filename: &str) -> RunResult {
     let fname = filename.to_string();
     std::thread::Builder::new()
         .stack_size(INTERP_STACK_SIZE)
-        .spawn(move || run_inner(&src, &fname))
+        .spawn(move || {
+            crate::stack::enter_thread(INTERP_STACK_SIZE);
+            run_inner(&src, &fname)
+        })
         .expect("no se pudo crear el hilo del intérprete")
         .join()
         .unwrap_or_else(|p| RunResult {

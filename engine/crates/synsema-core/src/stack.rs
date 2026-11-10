@@ -1,11 +1,12 @@
 //! v0.6.58 (M-r5-1): la pila que le queda al hilo que corre el intérprete.
 //!
 //! El guardián de recursión (`MAX_RECURSION` y los pesos de `interpreter.rs`) está calibrado para
-//! un hilo de `INTERP_STACK_SIZE` (512 MB): una unidad son 512 MB / 3000. Un hilo con menos pila
-//! (los de `serve`, `stream`, las aprobaciones y ACME: 64 MB) avisa al empezar con [`enter_thread`],
-//! y desde ahí el guardián también da el error cuando lo que queda de pila no alcanza para lo que
-//! va a correr (en unidades del guardián). Un hilo que no avisa (los de 512 MB, wasm) queda como
-//! antes: sólo cuenta.
+//! un hilo de `INTERP_STACK_SIZE` (512 MB): una unidad son 512 MB / 3000. Todo hilo que corre el
+//! intérprete avisa su pila al empezar con [`enter_thread`] (los de 512 MB y los de 64 MB de
+//! `serve`, `stream`, `cron`, las aprobaciones y ACME), y desde ahí el guardián también da el error
+//! cuando lo que queda de pila no alcanza para lo que va a correr (en unidades del guardián): la
+//! calibración de un host (x86_64 Windows) no alcanza en otro (aarch64 debug usa más por llamada).
+//! Un hilo que no avisa (wasm, el de un embebedor) queda como antes: sólo cuenta.
 //!
 //! No hace falta preguntarle nada al SO: el hilo lo creamos nosotros con `stack_size(size)` y la
 //! dirección de una variable local al empezar es el tope de su pila.

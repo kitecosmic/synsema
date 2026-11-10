@@ -71,6 +71,10 @@ Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the rele
   `cron_every`/`cron_after` job, under `serve` and `run`: it ran on a 2 MB thread, and a recursion in
   the tick took the whole process down (one `try` around the call, at 23 calls in a debug build). A
   job now runs on a 64 MB thread, like a route, and gives the error.
+  Every thread that runs the interpreter (`run`, `test`, `serve` and the rest) now also looks at
+  the stack it has left: a host where each call takes more stack than the one the limit was
+  measured on (a debug build on macOS arm64: 6 nested `when` × 2999 calls with `--labels`) gives the
+  error instead of overflowing.
 - **Fix: a recursive task with many locals alive across the call** (about 80 or more) crashed the
   process on Windows (access violation, no message) once it ran native, past ~1000 calls; also a
   `serve`. A native frame no longer grows with the square of the locals (one deopt buffer shared by
@@ -147,6 +151,11 @@ Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the rele
   or `files`, a `main` it does not list; its paths; the section against the manifest; bytes after
   it) and fails a package whose minimum `synsema` is above the `--release`. A file the section
   carries and the index does not list is named, and `--source` does not pass it.
+
+**Security: SQLite 3.54.1 (`rusqlite` 0.41, `libsqlite3-sys` 0.39).** RUSTSEC-2026-0459, published
+on 2026-10-30, is a flaw in the C SQLite that v0.6.57 bundled (`libsqlite3-sys` 0.30.1). The engine
+now bundles the fixed SQLite. Only a SQLite database opened with `db_open` reaches it; the language does
+not change.
 
 **Breaking.**
 - **A `synsema.json` in the entry's folder or above is now read, and its folder is the project

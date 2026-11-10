@@ -5339,6 +5339,7 @@ pub fn run_serve_program_with_overrides(
     std::thread::Builder::new()
         .stack_size(INTERP_STACK_SIZE)
         .spawn(move || {
+            synsema_core::stack::enter_thread(INTERP_STACK_SIZE);
             let _run = run.enter();
             serve_inner(&src, &fname, secure, overrides)
         })

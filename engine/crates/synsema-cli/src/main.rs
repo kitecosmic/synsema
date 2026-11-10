@@ -747,7 +747,11 @@ fn on_engine_stack<F: FnOnce() -> ExitCode + Send>(f: F) -> ExitCode {
     std::thread::scope(|s| {
         match std::thread::Builder::new()
             .stack_size(synsema_runtime::engine::INTERP_STACK_SIZE)
-            .spawn_scoped(s, f)
+            .spawn_scoped(s, || {
+                // v0.6.58: el guardián de recursión mira la pila real de este hilo (ver `stack.rs`).
+                synsema_core::stack::enter_thread(synsema_runtime::engine::INTERP_STACK_SIZE);
+                f()
+            })
             .expect("no se pudo crear el hilo del motor")
             .join()
         {

@@ -1445,7 +1445,10 @@ fn spawn_run_ceiled(source: &str, filename: &str, secure: bool, ceiling: Option<
     let fname = filename.to_string();
     std::thread::Builder::new()
         .stack_size(INTERP_STACK_SIZE)
-        .spawn(move || run_inner(&src, &fname, secure, None, false, ceiling, false))
+        .spawn(move || {
+            synsema_core::stack::enter_thread(INTERP_STACK_SIZE);
+            run_inner(&src, &fname, secure, None, false, ceiling, false)
+        })
         .expect("no se pudo crear el hilo del motor")
         .join()
         .unwrap_or_else(|p| RunResult {
@@ -1579,7 +1582,10 @@ pub fn run_program_report(
     let fname = filename.to_string();
     let mut result = std::thread::Builder::new()
         .stack_size(INTERP_STACK_SIZE)
-        .spawn(move || run_inner(&src, &fname, false, Some(sw), live_output, ceiling, diagnostic))
+        .spawn(move || {
+            synsema_core::stack::enter_thread(INTERP_STACK_SIZE);
+            run_inner(&src, &fname, false, Some(sw), live_output, ceiling, diagnostic)
+        })
         .expect("no se pudo crear el hilo del motor")
         .join()
         .unwrap_or_else(|p| {
@@ -1723,7 +1729,10 @@ pub fn run_tests_ceiled(source: &str, filename: &str, ceiling: Option<Vec<Capabi
     let fname = filename.to_string();
     std::thread::Builder::new()
         .stack_size(INTERP_STACK_SIZE)
-        .spawn(move || run_tests_inner(&src, &fname, ceiling))
+        .spawn(move || {
+            synsema_core::stack::enter_thread(INTERP_STACK_SIZE);
+            run_tests_inner(&src, &fname, ceiling)
+        })
         .expect("no se pudo crear el hilo del motor")
         .join()
         .unwrap_or_else(|p| {
@@ -1976,7 +1985,10 @@ pub fn run_with_diagnostics_ceiled(source: &str, filename: &str, ceiling: Option
     let fname = filename.to_string();
     let mut run = std::thread::Builder::new()
         .stack_size(INTERP_STACK_SIZE)
-        .spawn(move || run_diag_inner(&src, &fname, Some(sw), ceiling))
+        .spawn(move || {
+            synsema_core::stack::enter_thread(INTERP_STACK_SIZE);
+            run_diag_inner(&src, &fname, Some(sw), ceiling)
+        })
         .expect("no se pudo crear el hilo del motor")
         .join()
         .unwrap_or_else(|p| DiagRun {
@@ -2052,6 +2064,7 @@ pub fn run_with_human(source: &str, filename: &str, default_approve: bool) -> Ru
     std::thread::Builder::new()
         .stack_size(INTERP_STACK_SIZE)
         .spawn(move || {
+            synsema_core::stack::enter_thread(INTERP_STACK_SIZE);
             run_configured(&src, &fname, move |interp| {
                 wire_human(interp, Arc::new(AutoHandler::new(default_approve, "")), None, false);
             })
@@ -2074,6 +2087,7 @@ pub fn run_capturing_llm(source: &str, filename: &str) -> (RunResult, Vec<(Strin
     let result = std::thread::Builder::new()
         .stack_size(INTERP_STACK_SIZE)
         .spawn(move || {
+            synsema_core::stack::enter_thread(INTERP_STACK_SIZE);
             run_configured(&src, &fname, move |interp| {
                 let cap = captured.clone();
                 interp.set_llm_callback(Rc::new(move |op: &str, prompt: &str, _principals: &[Rc<str>]| {
@@ -2106,6 +2120,7 @@ pub fn run_capturing_decide(
     let result = std::thread::Builder::new()
         .stack_size(INTERP_STACK_SIZE)
         .spawn(move || {
+            synsema_core::stack::enter_thread(INTERP_STACK_SIZE);
             run_configured(&src, &fname, move |interp| {
                 let cap = captured.clone();
                 interp.set_llm_decide_callback(Rc::new(move |prompt: &str, options: &[String]| {
@@ -2133,6 +2148,7 @@ pub fn run_with_llm(source: &str, filename: &str, responses: HashMap<String, Str
     std::thread::Builder::new()
         .stack_size(INTERP_STACK_SIZE)
         .spawn(move || {
+            synsema_core::stack::enter_thread(INTERP_STACK_SIZE);
             run_configured(&src, &fname, move |interp| {
                 let provider = Arc::new(MockProvider::new(responses));
                 // El mock keyea por `op` e ignora el prompt (retrocompat de los tests).
@@ -2157,6 +2173,7 @@ pub fn run_with_llm_steps(source: &str, filename: &str, steps: Vec<LlmStepRespon
     std::thread::Builder::new()
         .stack_size(INTERP_STACK_SIZE)
         .spawn(move || {
+            synsema_core::stack::enter_thread(INTERP_STACK_SIZE);
             run_configured(&src, &fname, move |interp| {
                 let provider = Arc::new(MockProvider::scripted(steps));
                 interp.set_llm_step_callback(Rc::new(
@@ -2182,6 +2199,7 @@ pub fn run_with_llm_stream(source: &str, filename: &str, chunks: Vec<String>) ->
     std::thread::Builder::new()
         .stack_size(INTERP_STACK_SIZE)
         .spawn(move || {
+            synsema_core::stack::enter_thread(INTERP_STACK_SIZE);
             run_configured(&src, &fname, move |interp| {
                 interp.set_llm_stream_callback(Rc::new(
                     move |_prompt: &str, _context: &str, sink: &mut dyn FnMut(&str) -> bool| {
@@ -2473,6 +2491,7 @@ fn spawn_agent(
         .name(id.clone())
         .stack_size(INTERP_STACK_SIZE)
         .spawn(move || {
+            synsema_core::stack::enter_thread(INTERP_STACK_SIZE);
             let _sealed = sealed_log.map(synsema_core::sealed::install_thread);
             let _run = run.as_ref().map(|r| r.enter());
             let (mut interp, caps) = match &builder {
@@ -2688,7 +2707,10 @@ impl Engine {
         let ceiling_arc = ceiling.map(Arc::new);
         std::thread::Builder::new()
             .stack_size(INTERP_STACK_SIZE)
-            .spawn(move || run_swarm_inner(&src, &fname, swarm, ceiling_arc))
+            .spawn(move || {
+                synsema_core::stack::enter_thread(INTERP_STACK_SIZE);
+                run_swarm_inner(&src, &fname, swarm, ceiling_arc)
+            })
             .expect("no se pudo crear el hilo del motor")
             .join()
             .unwrap_or_else(|p| RunResult {

@@ -215,7 +215,7 @@ impl DatabaseManager {
             }
             let rooted = path.starts_with('/') || matches!(path.as_bytes(), [c, b':', ..] if c.is_ascii_alphabetic());
             let path = if rooted || path == ":memory:" { path } else { format!("./{}", path) };
-            let conn = match mode {
+            let mut conn = match mode {
                 "readonly" => Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY),
                 "memory" => Connection::open_in_memory(),
                 _ => Connection::open(&path),
@@ -252,7 +252,9 @@ impl DatabaseManager {
                     }
                     _ => Authorization::Allow,
                 }
-            }));
+            }))
+            // rusqlite 0.41: instalarlo puede fallar; sin él no hay cierre de ATTACH, así que no se abre.
+            .map_err(sqlite_err)?;
             self.connections.insert(key.clone(), Backend::Sqlite(conn));
             if self.default_db.is_none() {
                 self.default_db = Some(key.clone());
@@ -625,7 +627,7 @@ fn sqlite_query(conn: &Connection, sql: &str, params: &[SynValue]) -> Result<Vec
     let pv: Vec<Value> = params.iter().map(syn_to_value).collect();
     let mut stmt = conn.prepare(sql).map_err(sqlite_err)?;
     // Las columnas como claves una vez por consulta: cada fila suma una referencia (F4.4).
-    let cols: Vec<Key> = stmt.column_names().iter().map(|s| Key::from(*s)).collect();
+    let cols: Vec<Key> = stmt.column_names().map(Key::from).collect();
     let mut rows = stmt
         .query(params_from_iter(pv.iter()))
         .map_err(sqlite_err)?;
