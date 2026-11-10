@@ -663,9 +663,12 @@ fn b_r8_1_a_recursion_in_the_repl_does_not_take_it_down() {
     let task = recursive_task(true, 6, 0);
     let lib = task.replacen("task h(n)", "export task h(n)", 1).replace("print(h(0))\n", "");
     std::fs::write(dir.join("libc6.syn"), lib).unwrap();
-    // Ronda 9 (B-r9-1): en aarch64 debug (frames más grandes que la calibración de x86_64) 2999
-    // puede dar el error, como en m_r4_1; 20 no (el guardián no mira la pila antes de 64 llamadas).
-    let host_may_refuse = cfg!(all(target_arch = "aarch64", debug_assertions));
+    // Este test mira que el REPL no se caiga: 20 y 3500, estrictos en todos lados. Con 2999, en
+    // debug, el número o el error: este cuerpo frío con 6 `when` cuesta casi una unidad de la
+    // calibración por llamada en Linux x86_64 debug (CI del PR #62: el error) y más en aarch64
+    // debug; en Windows debug da 2999. El que vigila que el aviso de pila no rechace de más es
+    // m_r4_1_a_recursion_in_the_reference_with_labels…, estricto fuera de aarch64 debug.
+    let host_may_refuse = cfg!(debug_assertions);
     for (n, want) in [(20, "20"), (2999, "2999"), (3500, "maximum recursion depth exceeded")] {
         let stdin = format!("use \"./libc6.syn\" as L\nprint(L.h({n}))\n");
         let (code, out, err) = synsema_env(&dir, &["repl"], Some(&stdin), &[]);
