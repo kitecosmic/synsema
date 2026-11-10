@@ -151,6 +151,39 @@ reading it — `file.read("dir/**")`.
 
 Plain `call`/normal invocation does NOT isolate — use `call_tool` for untrusted, model-chosen tools.
 
+## Packages run attenuated (v0.6.58+)
+
+Code from a **package** (`use "name"`, declared in `synsema.json` — see [modules.md](modules.md)
+§ Packages) runs with **the package's `requires` ∩ what is in force**: every task and lambda written
+in the package, by any path (a direct call, a callback the program passes in, a lambda the package
+returns and the program calls later, a `parallel_map` worker). Importing someone else's code gives
+it nothing by itself.
+
+- **The package's `requires`** is the union of every `require` written in it (any task, also inside
+  a `when`). `synsema get` writes it in `synsema.json` and prints it per task; a later version that
+  declares more is not written until you `--accept` it.
+- **A `require` inside a package grants nothing**: it declares. The program still has to grant it
+  (`require net("api.example.org")` in the program). Without the program's grant:
+  ``Capability not granted: net("127.0.0.1:19010") — this is a permission, not a bug: add `require net("127.0.0.1:19010")` to the program's preamble …``.
+- **What the package does not declare it cannot use, even if the program has it:**
+  `Capability not granted: net("127.0.0.1:19010") — the package pure does not declare it`.
+- **A callback the program passes to a package runs with the intersection**: with
+  `require file.read("./**")` in the program and nothing in the package,
+  `p.call_back(() => read_file("data.txt"))` →
+  `Capability not granted: file_read("data.txt") — the package pure does not declare it`.
+- The domain is the **whole package**, not each task: a package that declares `net(…)` in one task
+  may use it from any of its tasks (when the program granted it).
+- Inside a package, `cron_every`/`cron_after` (``cron_after: not allowed inside the package guard —
+  the task would run later without the package's limits``) and agents (`agent 'Helper': a package
+  cannot define or spawn agents`) are errors, and `get` refuses a package with a `require` outside a
+  task, a computed `require` (`require net(H)`), a `require` in a `test` block or a
+  `use "trusted:…"`.
+- After a refusal inside the package, the program keeps its own grants.
+
+Compare with a **trusted module** (`use "trusted:…"`, the host loads it): its exported tasks run with
+their **own** `require`s ∩ `--trusted-cap-set`, not the caller's, so they can do more than the
+program; a package can only do less.
+
 ## Sandbox blocks
 ```synsema
 sandbox

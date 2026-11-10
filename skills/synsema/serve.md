@@ -438,6 +438,24 @@ serve on 8090
 - **Path traversal is blocked, per mount.** `../`, encoded `..%2f`, absolute paths
   and symlinks or junctions leading out of the directory are rejected — the real path
   must stay inside that mount's root (and inside the `file.read` grant).
+- **Hidden files are never served (v0.6.58+, breaking).** A path with a segment that starts with
+  `.` is a 404, from the disk and from a `synsema build` binary: with `static "/" from "."`,
+  `/.env`, `/.git/HEAD` and `/%2eenv` answer `404 {"error": "no route for GET /.env", "status": 404}`.
+  The one exception is `/.well-known/…` (`/.well-known/security.txt` → 200). On Windows a `:` in
+  the path (an alternate data stream, `/public.txt:hidden`) is a 404 too. **To serve a dotfile on
+  purpose, give it a `route`** (routes win over static):
+  ```synsema
+  require serve(8080)
+  require file.read("**")
+  serve on 8080
+      static "/" from "./public"
+      route "GET /.webmanifest-extra"
+          give respond(read_file(".webmanifest-extra"), "text/plain")
+  ```
+  In a built binary that file must travel: `synsema build … --include .webmanifest-extra` (a
+  `static` mount never bundles hidden files; deploy.md § `build` with a project and packages).
+  `static "/" from "."` publishes everything else in the folder, the `.syn` code included — mount a
+  folder that holds only what is public.
 
 > **Same-origin tip:** if the landing page is served by `static` from the same
 > server as the API, the browser's `fetch` is **same-origin** and needs no CORS.
@@ -1459,6 +1477,17 @@ on what can be served — large uploads stream to disk rather than being buffere
   `SYNSEMA_SERVE_WORKERS` (process-wide, `synsema run` included), so the budget is not overshot;
   a call that gets no slot within `SYNSEMA_LLM_TIMEOUT` (or whose request was cancelled) returns a
   `[llm busy: …]` marker.
+- **Recursion in a route or a cron job (v0.6.58+).** A route and a `cron_every`/`cron_after` job
+  run on a thread with 64 MB of stack (`run` has 512 MB), and the recursion limit (3000 calls)
+  also stops where that stack ends: a runaway recursion is a 500 for that request
+  (`{"error": "maximum recursion depth exceeded", "status": 500}`) or `[cron] job 'tick' failed:
+  maximum recursion depth exceeded` in the log, and the server keeps serving. Before v0.6.58 it
+  could take the whole server down (v0.6.57 release, `serve --labels`, the call under 12 nested
+  `when` × 2999: stack overflow, every route gone). Measured (v0.6.58 release):
+  a flat recursion or one inside a `try` reaches `f(2999)` in a route, with or without `--labels`;
+  with `--labels` and the call under 6 nested `when`, `f(2695)` (2999 under `run`); 8, 12 and 30
+  nested `when` stop at 1499, 999 and 427 as under `run --labels`. In a cron job the tick's task is
+  one more call (`f(2998)`). Table and workarounds: [syntax.md](syntax.md) § Limits.
 
 ## Isolation
 

@@ -245,6 +245,81 @@ Paths are resolved relative to the working directory. For portability:
 - Avoid `/tmp` on cross-platform code (Windows maps it to `C:\tmp`)
 - Use `~/.synsema/` for agent state (auto-managed)
 
+## Limits: nesting and recursion (v0.6.58)
+
+Measured with the v0.6.58 release binary (Windows x86_64). The promise: **the result or an error,
+never the process down.**
+
+**Nesting: 1024 levels.** Code that nests deeper does not load:
+`Parse error: app.syn:1:1034: the code nests deeper than 1024 levels` (`synsema check` prints the
+same text after `Error:`; exit 1). What counts as a
+level, with the measured edges:
+- parentheses (`let x be ((…(1)…))`: 1023 pairs load, 1024 do not), and blocks (`when` inside
+  `when`: 1021 load, 1022 do not — the statement inside counts too);
+- a chain of operators: `1 + 1 + …` with 1000 terms loads, with 1100 it does not; the same for a
+  chain of `otherwise when` (1000 load, 1100 do not), of calls or of indexes;
+- the pieces of a backtick template: each text piece and each hole is a level, so 511 holes with
+  text between them (`` `a{x}a{x}…` ``) load and 512 do not; 1000 holes back to back load, 1100 do
+  not. A template inside a template adds up;
+- an HTML template for `render`/`include`/`layout`: more than 1024 nested blocks (`when`,
+  `otherwise when`, `each`, `fill`) is an error of the call, `page.html:1: the code nests deeper
+  than 1024 levels` (catchable with `try`). Holes side by side do not nest: 600 render fine.
+
+What to write instead (generated code is where this bites): a list literal does not nest (3000
+items load), so build long text with `join([...], "")`, add with `sum([...])`, pick among many
+cases with a map and `get(m, key, default)` instead of 1000 `otherwise when`, and split a huge
+generated body into tasks.
+
+**Recursion: 3000 calls.** A task that calls itself gives `f(2999)` with a base case at `0`
+(3000 calls); one more is `maximum recursion depth exceeded` — uncaught,
+`Runtime error: maximum recursion depth exceeded` and exit 1; `try`/`recover` catches it and the
+program goes on. The same under `run`, `test`, `repl`, `serve` and `cron`; an error in a route is
+a 500 (`{"error": "maximum recursion depth exceeded", "status": 500}`) and the server keeps
+serving. A tail call is not optimized: `give count_down(n - 1, acc + 1)` stops at 3000 too.
+
+**Some bodies reach fewer calls (v0.6.58+).** The limit also counts how deep the body nests when
+the call runs in the reference interpreter: always with `--labels`, and
+without labels for a body that nests deeply inside a `try`. Largest `n` for which `f(n)` gives the
+result (release, Windows):
+
+| body of the recursive task | `run` | `run --labels` | route of `serve --labels` |
+|---|---|---|---|
+| flat, or the call inside a `try` | 2999 | 2999 | 2999 |
+| the call under 6 nested `when` | 2999 | 2999 | 2695 |
+| under 8 nested `when` | 2999 | 1499 | 1499 |
+| under 12 nested `when` | 2999 | 999 | 999 |
+| under 30 nested `when` | 2999 | 427 | 427 |
+| under 100 nested `when` | 2999 | 119 | not measured |
+| inside a `try`, under 12 nested `when` | 999 | 999 | 999 (also without labels) |
+
+A route or a `cron` job runs on a thread with 64 MB of stack, and the limit also stops where that
+stack ends (the 2695 above; `run` has 512 MB). A cron job's task is one call itself: `f(2998)` in
+the tick, 2695 with 6 `when` and `--labels`. A template rendered inside the recursion costs only
+while it renders (100 nested blocks rendered on every call: `f(2997)`). Before v0.6.58 these
+bodies could take the process (or the whole server) down with a stack overflow.
+
+A deeply nested body costs only while it runs, so moving the nested part into a helper task the
+recursion calls gets most of the depth back (12 nested `when` with `--labels`: `f(999)` inline,
+`f(2997)` with the `when`s in `task deep_check(n)` and `when deep_check(n)` in `f`). To go
+deeper, iterate: a `while` loop has no depth limit, and a tree is walked with a list as an
+explicit stack (both measured: 1 000 000 iterations; a 10 000-level tree):
+
+```synsema
+task tree_sum(root)
+    let total be 0
+    let todo be [root]
+    while length(todo) > 0
+        let cur be todo[-1]
+        set todo to slice(todo, 0, length(todo) - 1)
+        set total to total + cur.v
+        each k in cur.kids
+            set todo to append(todo, k)
+    give total
+```
+
+Data has its own limit, not the 3000 calls: see [pitfalls.md](pitfalls.md) § Behavioral surprises
+(very deep nested lists).
+
 ## Flat syntax (.fsyn files)
 ```
 task name(params):

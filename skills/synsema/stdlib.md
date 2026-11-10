@@ -344,6 +344,36 @@ open the database by its path, e.g. db_open("./data/app.db")`). Connections run 
 **defensive mode**: `PRAGMA writable_schema`, `journal_mode=OFF` and hand writes to the schema or to
 FTS5's internal tables have no effect (FTS5 views, triggers and `rebuild` work).
 
+**One statement per call on SQLite (v0.6.58+, breaking).** `sql`, `sql_exec` and `sql_batch` run
+ONE statement. A second one in the same text is an error and **none** of them runs:
+``one SQL statement per call: this call has more than one (sql, sql_exec and sql_batch run one; before v0.6.58 the rest was dropped without a word); run each statement with its own call``
+(up to v0.6.57 the first ran and the rest was dropped: `sql_exec("CREATE TABLE u (x); CREATE TABLE v (y)")`
+created only `u`). What still works: a trailing `;` (also `;;`), trailing spaces, a trailing
+`-- comment`, a `;` inside a quoted text (`'a;b'`) or inside a parameter, and a
+`CREATE TRIGGER … BEGIN …; END` (one statement). Write a schema as one `sql_exec` per table.
+
+**The bundled SQLite is 3.54.1** (`sql("select sqlite_version() as v")` → `[{v: "3.54.1"}]`; v0.6.58
+updated it for a security fix). The agent memory (`require memory(...)`) is SQLite too.
+
+**Transactions.** Under `run` and `test`, `sql_exec("BEGIN")` … `sql_exec("COMMIT")` (or
+`"ROLLBACK"`) works: wrap the statements in `try`, `ROLLBACK` in `recover`. **In `serve`, do not
+use `BEGIN`/`COMMIT` (known limit, fixed in v0.6.59):** all routes share one connection, so a
+`BEGIN` in one route wraps the other routes' writes — a `ROLLBACK` erases a row another route
+already confirmed, and a second `BEGIN` fails with `cannot start a transaction within a
+transaction`. In a route, make each change one statement, which SQLite runs atomically:
+
+```
+-- a counter, safe under concurrent requests (50 at once → 50)
+sql_exec("INSERT INTO hits VALUES (?, 1) ON CONFLICT(page) DO UPDATE SET n = n + 1", ["home"])
+-- a guarded change: check and write in one statement, then read rows_affected
+let r be sql_exec("UPDATE stock SET left = left - 1 WHERE item = ? AND left >= 1", ["bolt"])
+when r.rows_affected == 0
+    give fail(409, "sold out")
+-- a copy of many rows in one statement
+sql_exec("INSERT INTO archive (item, qty) SELECT item, qty FROM orders WHERE item = ?", ["bolt"])
+```
+(Measured under `serve`: 20 concurrent takes of a stock of 10 → 10 orders, stock 0.)
+
 ```
 require db("./store.db")           -- declare the DB you use (db("*") / require db = any)
 

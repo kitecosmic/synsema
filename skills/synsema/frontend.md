@@ -161,6 +161,16 @@ See [modules.md](modules.md) and [serve.md](serve.md) for the rules.
   template **baked into a `synsema build` binary** needs no capability (it's the program).
 - **`static` needs `require file.read("<dir>/**")` (v0.6.45+)** — serving a folder is reading it;
   the serve refuses to start without it and names the line.
+- **A package's templates are its own (v0.6.58+).** `render`, `include` and `layout` written in a
+  package (`use "cards"`, see [modules.md](modules.md) § Packages) resolve only against the files of
+  the package's index — no `file.read`, never the disk, even when the program's folder has a file
+  with the same name; the program's own `render("card.html", …)` still reads the program's file.
+  A package template sees the builtins, never the program's names (`{ helper(1) }` with the program's
+  `task helper` → `Undefined variable: 'helper' — 'helper' is a name of the program that imports this
+  module, …`). A computed name the package lacks → `template not found: nope.html`; a program
+  template that does `{ layout "shell.html" }` of a package template → `template not found:
+  shell.html` (the package exposes a task that renders instead: `print(c.card("ana").body)`).
+  `synsema get` refuses a package whose literal `render("x.html")` is not in its files.
 
 ## Installable on phones and desktop — PWA (engine v0.6.15+)
 

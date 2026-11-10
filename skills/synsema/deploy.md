@@ -60,8 +60,56 @@ synsema build desk.syn -o desk --serve --no-console --icon icon.svg [--bundle]  
 - **Reach the engine** with `app --engine <subcommand>` (`app --engine version`, `app --engine run
   other.syn`) — the only way in, since the flags are now the program's argv. `app --engine update`
   is refused (rebuild instead). A tampered bundle refuses to run (`bundle corrupt`).
-- Errors (exit 2): `-o` missing, `--include` not found / escapes the bundle root, a `use` with a
-  **dynamic** path (the bundle is closed), building from an already-built binary.
+- Errors (exit 2): `-o` missing, `--include` not found (`synsema build: --include 'nothere.txt': not
+  found`) or outside the current folder (`synsema build: '../t.html' escapes the current directory
+  (<cwd>)`), a `use` with a **dynamic** path (the bundle is closed), building from an already-built
+  binary.
+
+### `build` with a project and packages (v0.6.58+)
+
+- **The bundle's root is the project root**: the folder of the nearest `synsema.json` above the
+  entry (modules.md); without one, as before. The bundle carries that `synsema.json` and every
+  package the program can reach (`use "tok"`), read from the module cache (`~/.synsema/modules` or
+  `SYNSEMA_MODULE_CACHE`) and checked against its hash. The binary runs them **from the bundle**:
+  no cache, no network, no `synsema get` on the target. It never reads a `synsema.json` from the
+  disk where it runs (a broken one, or one asking for `"synsema": "9.9.9"`, in its folder or above,
+  changes nothing) and does not check the minimum version again (it was checked when building).
+  `receipt().credentialSubject.modules` of the binary is the same as under `synsema run`.
+- A package that is not in the cache stops the build (exit 2, nothing written):
+  `synsema build: use "tok": module tok 0.1.0 is not downloaded: run synsema get (it needs the network)`.
+- `built app.exe (2 files, 50338147 bytes)` — the count is the program's files (the entry, its
+  modules, templates, static and `--include` files, and `synsema.json`); a package's files are not
+  counted.
+- **Templates, `static` folders and `--include` are read from the CURRENT folder, like `run`**
+  (breaking; before, from the entry's folder). Run `build` from the folder you run the program
+  from. Measured: `cd scripts && synsema build x.syn -o x1` and `synsema build scripts/x.syn -o x2`
+  (both `render("t.html")`) give binaries that print `scripts/t.html` and `./t.html` respectively —
+  each the same as `synsema run` from that folder. A `use "../lib/y.syn"` that leaves `scripts/` but
+  stays under the project root is bundled either way. A template and a module that land on the same
+  name with different bytes: `synsema build: 'lib/y.syn' names two different files in the bundle
+  (lib/y.syn)` (exit 2).
+- **`static "/" from "."` with the project root ABOVE the current folder** is refused, because the
+  binary would serve the program, its modules and `synsema.json` (they enter the bundle by their path
+  from the root) where the disk does not:
+  ``synsema build: 'app/main.syn' (the program, a module or synsema.json, from the project root) would be served by static "." in the built binary, and the disk does not serve it there; mount a folder that holds only what is served (static "/" from "pub"), or run synsema build from the project root (<root>), where static "." is the project root and serves all of it, the code included``.
+  Fix: `static "/" from "./pub"` (a folder with only the public files). Building from the root with
+  `static "/" from "."` works, and then **everything** in the folder is public and travels in the
+  binary — the code, and also any other file there (measured: two old builds sitting in the folder
+  made a 201 MB binary with 10 files). Prefer a dedicated folder.
+- **Fixed in v0.6.58: `static "/" from "."` in a built server** serves the files that travel in the
+  binary, from any working folder (before, the root folder had no name in the bundle, the mount fell
+  back to the disk, and the binary answered 404 when it ran from another folder).
+- **A package's files are never served or rendered by path.** In a built server
+  `GET /pkg:tree-sha256-<hex>/m.syn` (or any file of a package) is a 404, and the program's own
+  `render("pkg:tree-sha256-…/card.html")` is `template not found`; the package renders its own
+  templates (modules.md).
+- **Hidden files do not travel through a `static` mount** (v0.6.58+): `build` skips any path with a
+  segment that starts with `.` (`.env`, `.git/`), the binary it is writing, and what a link inside
+  the folder reaches outside it or in a hidden folder — the same files `serve` refuses from the disk
+  (serve.md § Static files). `--include` puts exactly what it names, a dotfile too:
+  `--include .env` puts your secrets **inside the binary** (anyone with the file can read them;
+  `static` still answers 404 for `/.env`). Pass secrets through the environment instead.
+
 - **Deploy from a minimal image WITH a libc** (`gcr.io/distroless/cc-debian12`, `debian:*-slim`; NOT `FROM scratch` — the Linux binary is glibc-linked) — `COPY app /app` + `ENTRYPOINT ["/app"]`. This is the
   most self-contained deploy: the program and its guardrails travel as one artifact.
 
@@ -122,6 +170,8 @@ see [secrets.md](secrets.md). Resolution: **process environment → `.env` file 
   | `SYNSEMA_IDENTITY` | (none) | v0.6.28+: the operator's identity for `synsema run` (the ledger, the per-identity LLM ceiling and receipts name it); environ or `.env` |
   | `SYNSEMA_IDENTITY_KEY` | (none) | v0.6.28+: the SERVER's ed25519 seed (64 hex) — signs the Agent Card at `/.well-known/agent-card.json` and gives the server its `did:key`; environ or `.env`; ignored under `serve --attested` (the attested key signs) |
   | `SYNSEMA_AUDIT` | (none) | `json` / `<path>` / `fd:N` / `unix:<path>` — the capability audit stream without the flag, also inside a `synsema build` binary; `--audit` wins (v0.6.20+) |
+  | `SYNSEMA_MODULE_CACHE` | `~/.synsema/modules` | v0.6.58+: the package cache that `synsema get` fills and `run`/`serve`/`test`/`build` only read; a relative path is relative to the project root (the folder of `synsema.json`), not to the current folder. Process environment only: a line in `.env` is ignored. `run_program` passes it to the child, absolute. A built binary does not use it (its packages travel inside). In wasm it is the only way to give a cache (§ WebAssembly) |
+  | `SYNSEMA_SAFE_PROJECT` | (none) | v0.6.58+: folders (separated like `PATH`) or `*` whose `synsema.json` is used even if another user owns it (one in the root of the system's temp folder is always ignored) — otherwise it is ignored with a warning (`… it belongs to another user (set SYNSEMA_SAFE_PROJECT=<folder> if it is yours)`); like git's `safe.directory` (CI containers, a repo mounted in Docker, network folders) |
   | `SYNSEMA_LLM_BUDGET` | unlimited | per-process LLM token ceiling — at the ceiling `reason`/`decide`/… degrade to a `[llm budget exceeded: …]` marker, never an error; unlike the rows above this one is also honored from `.env` — see [llm.md](llm.md) |
 
 - **Host ceiling for a whole server:** `synsema serve app.syn --sandbox` or
@@ -577,6 +627,42 @@ wasmtime). The native `synsema receipt open`/`verify` read it. Differences from 
   <X25519 public key> or set SYNSEMA_AUDITOR_KEY`), `--auditor` with `--test` (`--auditor seals a
   run; it does not go with --test`), `--receipt fd:N` (`not available in wasip1; use --receipt
   <path>`), a key that is not 32 bytes.
+
+**Packages in WebAssembly (v0.6.58+).** There is no `synsema get` in wasm: fetch the packages
+natively (`synsema get`), then hand the engine the project and the package files. Every package is
+checked against its hash before the first statement, as natively.
+- **wasip1** reads `synsema.json` through `--dir`, and the cache **only** from
+  `SYNSEMA_MODULE_CACHE` (never from `HOME`):
+  `wasmtime run --dir . --dir <cache>::/cache --env SYNSEMA_MODULE_CACHE=/cache synsema-wasm.wasm main.syn`.
+  Without the knob: `Runtime error: use "tok": this host has no module cache: pass SYNSEMA_MODULE_CACHE
+  (and the folder with --dir)`; a changed byte in the cache: `… the cached files of tok
+  (tree-sha256:1570…) no longer match their hash (changed on disk?); delete /cache/tree-sha256-<hex>
+  and run synsema get`. Under `node:wasi` the same: preopens `{".": <project>, "/cache": <cache>}` and
+  `env: {SYNSEMA_MODULE_CACHE: "/cache"}`. wasip1 and wasm-web do not check who owns `synsema.json`
+  (the host decides what to mount).
+- **wasm-web / `@synsema/wasm`**: `project` (the text of `synsema.json`, or the object in JS) and
+  `packages` (`{"tree-sha256:<hex>": {"<path>": "<text>", …}}` — every file of the package as
+  `synsema get` left it in `<cache>/tree-sha256-<hex>/`, its own `synsema.json` included) go in the
+  options of `load`/`loadNode` and of each call; a call's `project` replaces the instance's, its
+  `packages` add to them. Raw `call_json` takes the same two fields. Errors:
+  `Runtime error: use "tok": module tok 0.1.0 is not in the packages the host passed`;
+  `Runtime error: use "tok": the files of tok (tree-sha256:a703…) do not match their hash`;
+  `packages` without `project`: `packages: there is no project to use them (pass project, the text of
+  synsema.json)`; a minimum above the engine: `this project needs synsema >= 9.9.9; this is 0.6.58:
+  synsema update`.
+- The instance keeps the verified packages by hash (up to 128 MiB, the least used go first) and every
+  response says which in `packages_held`; a later call that only names a held hash is not hashed
+  again, and `@synsema/wasm` does not send it to the Worker again. **An instance is one trust
+  domain**: give each tenant its own instance if that matters. `receipt()` and the sealed header name
+  the packages that ran (attestation.md § Which packages ran).
+
+**Recursion limits in wasm (v0.6.58, measured with the release artifacts).** wasip1: **300** nested
+calls (`f(299)` of a one-line recursive task runs, `f(300)` gives `maximum recursion depth exceeded`;
+it was 600 — wasmtime gives wasm half the stack of Node or a browser), **150** with `--labels`.
+wasm-web: 600, and 300 with `labels: true`; a recursion through a `try` reaches at most 300, fewer
+the deeper its body nests (a `try` around the recursive call, after a `when`: between 100 and 150).
+The Vela guest (always labelled): at most 150 calls, counting the exported task (guests.md).
+Natively a flat recursion reaches 3000 (`f(2999)`). Always the runtime error, never a trap.
 
 ```js
 // embed (Node/Bun/browser) — @synsema/wasm
