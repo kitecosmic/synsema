@@ -210,6 +210,12 @@ not change.
   not find a slot in the new guest, and the new `embed.syn` refuses an old guest. Use the tools of the
   same release as the guest.
 
+**The `perf-guard` anchor was re-measured on CI** (`engine/perf/baseline.json`, from this release's
+PR). Five rows went over the +0.3 % budget, costs of this release measured and accepted in its
+review (the package mark on calls, the recursion guard): `c_call4` (jit) +0.72 %, `a_name64` (jit)
++0.60 %, `c_each_empty` (vm) +0.63 % and (jit) +0.33 %, and `s_text_join` (ref) +0.44 %, where each
+call of the reference interpreter checks the recursion guard.
+
 ## v0.6.57 — 2026-11-06
 
 **Engine.**
