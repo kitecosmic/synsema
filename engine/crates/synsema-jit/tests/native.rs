@@ -244,3 +244,64 @@ fn a_native_loop_writes_arrays_with_value_semantics() {
     assert_eq!(r.output.join("\n"), "0.0\n199999.0\n199991.0\n199999.0\n[[1, 2], [3, 4]]\n200000.0");
     assert!(after.osr > before.osr, "el bucle no entró al código nativo");
 }
+
+/// v0.6.58 (B-r5-1): una task recursiva con muchos locales vivos a través de la llamada tiene un
+/// frame nativo de más de 4 KB. Sin el sondeo de pila de Cranelift, en Windows saltaba la página de
+/// guarda y el proceso moría con 0xC0000005 al recursar nativo (~1000 llamadas).
+#[test]
+fn a_native_recursion_with_a_big_frame_does_not_skip_the_guard_page() {
+    synsema_jit::install();
+    for (locals, n) in [(100, 1200), (1000, 2999)] {
+        let mut s = String::from("task h(n)\n    when n == 0\n        give 0\n");
+        for i in 0..locals {
+            s.push_str(&format!("    let v{i} be n + {i}\n"));
+        }
+        s.push_str("    let r be h(n - 1) + 1\n    let t be 0\n");
+        for i in 0..locals {
+            s.push_str(&format!("    set t to t + v{i}\n"));
+        }
+        s.push_str(&format!("    give r + t - t\nprint(h({n}))\n"));
+        let before = native_tier::stats();
+        let r = run_source(&s, "lets.syn");
+        assert!(r.success, "{locals} locales × {n}: {:?}", r.errors);
+        assert_eq!(r.output, vec![n.to_string()], "{locals} locales × {n}");
+        assert!(native_tier::stats().entries > before.entries, "{locals} locales: no entró al código nativo");
+    }
+}
+
+/// v0.6.58 (ronda 6): los búferes de las llamadas ajenas (lo que corre la VM desde el código nativo)
+/// los comparten todos los sitios, del tamaño del más grande. Uno por sitio hacía el frame
+/// proporcional a sitios × valores vivos (~2 MB con 1000 sitios y 80 valores: un bucle así en una ruta
+/// de `serve`, con ~30 000 sitios, pasaba los 64 MB). Lo compartido da lo mismo, en nativo.
+#[test]
+fn many_foreign_calls_share_their_buffers_in_the_native_frame() {
+    synsema_jit::install();
+    native_tier::set_eager(true);
+    let (locals, sites, iters) = (80, 1000, 3);
+    let mut s = String::from("let t be 0
+");
+    s.push_str(&format!("each i in range({iters})
+"));
+    for k in 0..locals {
+        s.push_str(&format!("    let v{k} be upper(text({k}))
+"));
+    }
+    for k in 0..sites {
+        let v = k % locals;
+        s.push_str(&format!("    set v{v} to upper(v{v})
+"));
+    }
+    for k in 0..locals {
+        s.push_str(&format!("    set t to t + length(v{k}) * {}
+", k + 1));
+    }
+    // (Cada valor vivo pesa distinto en el total: un búfer mal leído lo cambia.)
+    let s = s + "print(t)
+";
+    let before = native_tier::stats();
+    let r = run_source(&s, "sites.syn");
+    assert!(r.success, "{:?}", r.errors);
+    let want = iters * (0..locals).map(|k| k.to_string().len() * (k + 1)).sum::<usize>();
+    assert_eq!(r.output, vec![want.to_string()]);
+    assert!(native_tier::stats().osr > before.osr, "el bucle no entró al código nativo");
+}

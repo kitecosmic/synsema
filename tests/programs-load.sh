@@ -20,6 +20,21 @@ if [ ! -x "$SYN" ]; then
   echo "programs-load: no synsema binary at $SYN (set SYN=...)" >&2; exit 2
 fi
 
+# A program whose project (the folder of the nearest `synsema.json`) carries its package cache in
+# `cache/` next to it runs with that cache, as perf-guard runs it (engine/perf/progs/p_pkg_loop:
+# `use "b"`); nothing is downloaded. Prints the cache folder, or nothing.
+project_cache() {
+  local d
+  d=$(dirname "$1")
+  while [ "$d" != "." ] && [ "$d" != "/" ]; do
+    if [ -f "$d/synsema.json" ]; then
+      [ -d "$d/cache" ] && (cd "$d/cache" && pwd)
+      return
+    fi
+    d=$(dirname "$d")
+  done
+}
+
 fail=0
 if [ $# -gt 0 ]; then
   ALL=("$@")
@@ -30,7 +45,7 @@ echo "programs under gate: ${#ALL[@]}"
 echo "== parse: synsema check (.syn only; check does not read the flat dialect)"
 for f in "${ALL[@]}"; do
   case "$f" in *.fsyn) continue ;; esac
-  if ! out=$("$SYN" check "$f" 2>&1); then
+  if ! out=$(SYNSEMA_MODULE_CACHE="$(project_cache "$f")" "$SYN" check "$f" 2>&1); then
     echo "::error file=$f::does not parse: $(echo "$out" | head -1)"; fail=1
   fi
 done
@@ -40,7 +55,7 @@ for f in "${ALL[@]}"; do
   # purpose for a `serve` program (which does not run under `test`). Without the `|| rc=$?` the job
   # died on the first expected case, before printing which one it was.
   rc=0
-  out=$(timeout 120 "$SYN" test --labels "$f" 2>&1) || rc=$?
+  out=$(SYNSEMA_MODULE_CACHE="$(project_cache "$f")" timeout 120 "$SYN" test --labels "$f" 2>&1) || rc=$?
   if [ $rc -eq 0 ]; then
     printf '   ok   %-62s %s\n' "$f" "$(echo "$out" | tail -1)"; continue
   fi

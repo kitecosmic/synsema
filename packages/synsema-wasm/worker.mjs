@@ -84,7 +84,8 @@ onMessage(async (m) => {
         post({ type: "fatal", message: `the module trapped and could not be instantiated again: ${safeMsg(e2)}` });
         return;
       }
-      if (e && e.synsemaResult) post({ type: "result", response: e.synsemaResult });
+      // M6 (ronda 1): la instancia nueva no guarda ningún paquete, diga lo que diga la vieja.
+      if (e && e.synsemaResult) post({ type: "result", response: { ...e.synsemaResult, packages_held: [] } });
       else post({ type: "error", message: `synsema: the module trapped (${safeMsg(e)}); the instance was recreated` });
     }
   }

@@ -82,15 +82,24 @@ use serde_json::{json, Map, Value};
 /// (`build.rs` lo llena con `SYNSEMA_VELA_APP`, default `app.syn`). La cabecera lo hace
 /// localizable en el `.wasm` ya compilado: `tools/embed.syn` lo sobreescribe con otro programa sin
 /// compilador de por medio — mismo intérprete, y el SHA-256 que Vela verifica cubre a los dos.
-/// Layout: magic (16) · largo del nombre (1) · nombre (63) · largo u32 LE (4) · programa · relleno.
-const SLOT_MAGIC: &[u8; 16] = b"SYNSEMA.APPSLOT1";
-/// La cabecera se reconoce por un hash del magic y no comparando contra `SLOT_MAGIC`: las
+///
+/// Dos formatos, cada uno con su magic (v0.6.58, E-10):
+/// - `APPSLOT1` (hasta v0.6.57; el guest lo sigue leyendo): magic (16) · largo del nombre (1) ·
+///   nombre (63) · largo u32 LE (4) · programa · relleno. Un programa sin paquetes.
+/// - `APPSLOT2` (desde v0.6.58; lo escriben `build.rs` y `embed.syn`): magic (16) · largo u32 LE (4)
+///   · un bundle de `synsema build` (`payload ‖ trailer`) · relleno. El bundle lleva el programa, su
+///   `synsema.json` y sus paquetes; el guest lo monta como un binario construido (§9, D-13).
+const SLOT_MAGIC1: &[u8; 16] = b"SYNSEMA.APPSLOT1";
+const SLOT_MAGIC2: &[u8; 16] = b"SYNSEMA.APPSLOT2";
+/// La cabecera se reconoce por un hash del magic y no comparando contra el literal: las
 /// herramientas exigen que el magic aparezca UNA vez en el `.wasm`, y desde rustc 1.99 (LLVM 23)
 /// la comparación con el literal deja una segunda copia en los datos del módulo. Un hash no se
 /// puede plegar de vuelta al literal, así que ningún optimizador la reintroduce.
-const SLOT_MAGIC_FNV: u64 = fnv1a64(SLOT_MAGIC);
+const SLOT_MAGIC1_FNV: u64 = fnv1a64(SLOT_MAGIC1);
+const SLOT_MAGIC2_FNV: u64 = fnv1a64(SLOT_MAGIC2);
 const SLOT_SIZE: usize = 524_288;
 const SLOT_HEADER: usize = 16 + 1 + 63 + 4;
+const SLOT2_HEADER: usize = 16 + 4;
 /// `static mut` a propósito: un `static` inmutable es una constante para LLVM, que podría plegar
 /// lecturas con el contenido del build; así siempre se lee lo que hay en memoria (lo parcheado).
 #[no_mangle]
@@ -112,31 +121,68 @@ const fn fnv1a64(b: &[u8]) -> u64 {
     h
 }
 
-fn slot_magic_ok(s: &[u8]) -> bool {
-    fnv1a64(&s[..16]) == SLOT_MAGIC_FNV
+/// Lo que hay en un slot, sin interpretar el bundle.
+#[derive(Debug, PartialEq)]
+enum Slot<'a> {
+    /// `APPSLOT1`: el nombre y el programa.
+    Program { name: &'a str, source: &'a str },
+    /// `APPSLOT2`: los bytes del bundle.
+    Bundle(&'a [u8]),
 }
 
-/// El programa (texto) que hay en el slot; vacío si la cabecera no es la esperada.
+/// Lee un slot. Un magic que no es ninguno de los dos, un largo que se pasa del slot o un programa
+/// que no es UTF-8 es un error que dice qué encontró (W8b): nunca un programa vacío.
+fn parse_slot(s: &[u8]) -> Result<Slot<'_>, String> {
+    if s.len() < SLOT_HEADER {
+        return Err(format!("the app slot holds {} bytes, less than a slot header, not a program", s.len()));
+    }
+    let magic = fnv1a64(&s[..16]);
+    if magic == SLOT_MAGIC2_FNV {
+        let len = u32::from_le_bytes([s[16], s[17], s[18], s[19]]) as usize;
+        if len > s.len() - SLOT2_HEADER {
+            return Err(format!("the app slot holds a bundle length of {} bytes, past the end of the slot ({} bytes), not a program", len, s.len() - SLOT2_HEADER));
+        }
+        return Ok(Slot::Bundle(&s[SLOT2_HEADER..SLOT2_HEADER + len]));
+    }
+    if magic == SLOT_MAGIC1_FNV {
+        let len = u32::from_le_bytes([s[80], s[81], s[82], s[83]]) as usize;
+        if len > s.len() - SLOT_HEADER {
+            return Err(format!("the app slot holds a program length of {} bytes, past the end of the slot ({} bytes), not a program", len, s.len() - SLOT_HEADER));
+        }
+        let source = core::str::from_utf8(&s[SLOT_HEADER..SLOT_HEADER + len])
+            .map_err(|_| "the app slot holds a program that is not UTF-8, not a program".to_string())?;
+        let n = s[16] as usize;
+        let name = if n == 0 || n > 63 { "app.syn" } else { core::str::from_utf8(&s[17..17 + n]).unwrap_or("app.syn") };
+        return Ok(Slot::Program { name, source });
+    }
+    let shown: String = s[..16].iter().map(|&b| if (0x20..0x7f).contains(&b) { b as char } else { '.' }).collect();
+    Err(format!("the app slot holds a header that is neither slot format ({:?}), not a program", shown))
+}
+
+/// La app del slot: `(nombre, programa)`, o el error que dice qué tiene el slot. Un bundle se monta
+/// acá, una vez (el slot no cambia en runtime).
+fn slot_app() -> &'static Result<(String, String), String> {
+    static APP: std::sync::OnceLock<Result<(String, String), String>> = std::sync::OnceLock::new();
+    APP.get_or_init(|| match parse_slot(app_slot())? {
+        Slot::Program { name, source } => Ok((name.to_string(), source.to_string())),
+        Slot::Bundle(b) => synsema_wasm_web::mount_bundle(b).map_err(|e| format!("the app slot holds a bundle that cannot be used ({}), not a program", e)),
+    })
+}
+
+/// El programa (texto) que hay en el slot; vacío si el slot no se puede leer (y entonces
+/// [`slot_error`] dice por qué: ninguna task corre).
 fn app_source() -> &'static str {
-    let s = app_slot();
-    if !slot_magic_ok(s) {
-        return "";
-    }
-    let len = u32::from_le_bytes([s[80], s[81], s[82], s[83]]) as usize;
-    if len > SLOT_SIZE - SLOT_HEADER {
-        return "";
-    }
-    core::str::from_utf8(&s[SLOT_HEADER..SLOT_HEADER + len]).unwrap_or("")
+    slot_app().as_ref().map(|(_, s)| s.as_str()).unwrap_or("")
 }
 
 /// El nombre del archivo del programa (para logs y errores), o `app.syn`.
 fn app_name() -> &'static str {
-    let s = app_slot();
-    let n = s[16] as usize;
-    if !slot_magic_ok(s) || n == 0 || n > 63 {
-        return "app.syn";
-    }
-    core::str::from_utf8(&s[17..17 + n]).unwrap_or("app.syn")
+    slot_app().as_ref().map(|(n, _)| n.as_str()).unwrap_or("app.syn")
+}
+
+/// Por qué el slot no tiene un programa, si no lo tiene.
+fn slot_error() -> Option<&'static str> {
+    slot_app().as_ref().err().map(String::as_str)
 }
 
 /// Techo del programa: sólo `stdout` (los `print` se recogen como logs). Sin `time` ni `random`
@@ -367,6 +413,10 @@ fn load_module_flow(app: &App, app_id: i64) -> Value {
     let ctx = json!({"app_id": app_id, "kind": "load_module", "params": Value::Null});
     let own_task = app.defines("load_module");
     let result = deploy_like(app, "load_module", Some("deploy"), ctx);
+    // v0.6.58 (W8b): con el slot roto, el warm-up tampoco contesta un estado vacío.
+    if app.slot_error.is_some() {
+        return result;
+    }
     // Sin `load_module` propia, un `deploy` que exige params (p. ej. la dirección de un trigger
     // contract) no debe tumbar el warm-up: el Executor descarta este estado (sigue con el
     // persistido, `getOrLoadModule` ignora lo devuelto) y sólo mira `error` — y un `error` acá
@@ -485,19 +535,21 @@ struct App<'a> {
     name: &'a str,
     /// El mayor literal de fuel del fuente (`"fuel": "N"`, `"fuel": N`, `let FUEL be "N"`), si hay.
     fuel_literal: Option<u128>,
+    /// v0.6.58 (W8b): por qué el slot no tiene un programa; con esto, ninguna task corre.
+    slot_error: Option<&'a str>,
 }
 
 impl App<'static> {
     fn production() -> Self {
         let fuel_literal = SLOT_FUEL.with(|c| *c.get_or_init(|| max_fuel_literal(app_source())));
-        App { source: app_source(), name: app_name(), fuel_literal }
+        App { source: app_source(), name: app_name(), fuel_literal, slot_error: slot_error() }
     }
 }
 
 impl<'a> App<'a> {
     #[cfg(test)]
     fn inline(source: &'a str) -> Self {
-        App { source, name: "inline.syn", fuel_literal: max_fuel_literal(source) }
+        App { source, name: "inline.syn", fuel_literal: max_fuel_literal(source), slot_error: None }
     }
 
     fn defines(&self, task: &str) -> bool {
@@ -1063,6 +1115,10 @@ fn driver_source(app: &App, task: &str) -> String {
 /// que la forma granular compile y cada campo se compruebe por separado, y `Sink::Log` para
 /// `invariants`, cuyas descripciones van al log del Executor.
 fn run_app_with(app: &App, task: &str, fallback: Option<&str>, ctx: &Value, root: Sink) -> AppRun {
+    // v0.6.58 (W8b): un slot que no se puede leer es un error, no un programa vacío.
+    if let Some(e) = app.slot_error {
+        return AppRun { result: Err(Failure::Runtime(e.to_string())), steps: 1, private_seen: false, detail_private: false };
+    }
     // Auditoría R2/M6: el programa no puede nombrar los ligados del driver. Fail-closed y antes
     // De correr nada: un `let __vela_in be …` sombreaba el ctx etiquetado.
     if let Some(line) = mentions_driver_name(app.source) {
@@ -2065,17 +2121,59 @@ mod tests {
         pad_event_data(ev, bucket).unwrap()
     }
 
-    #[test]
-    fn slot_header_is_recognized_by_hash() {
-        // El slot que embebió build.rs, y una cabecera con un byte cambiado.
-        assert!(slot_magic_ok(app_slot()));
-        assert!(!app_source().is_empty());
-        let mut bad = *SLOT_MAGIC;
-        bad[15] = b'2';
-        assert!(!slot_magic_ok(&bad));
-        assert!(!slot_magic_ok(&[0x20; 16]));
+    /// Un slot `APPSLOT1` tal cual lo escribe el `embed.syn` de v0.6.57.
+    fn slot1(name: &str, program: &str) -> Vec<u8> {
+        let mut s = Vec::with_capacity(SLOT_SIZE);
+        s.extend_from_slice(b"SYNSEMA.APPSLOT");
+        s.push(b'1');
+        s.push(name.len() as u8);
+        s.extend_from_slice(name.as_bytes());
+        s.resize(16 + 1 + 63, 0x20);
+        s.extend_from_slice(&(program.len() as u32).to_le_bytes());
+        s.extend_from_slice(program.as_bytes());
+        s.resize(SLOT_SIZE, 0x20);
+        s
     }
 
+    #[test]
+    fn the_built_slot_is_appslot2_with_a_bundle() {
+        // build.rs escribe `APPSLOT2` con un bundle de un solo archivo (sin montarlo acá: montarlo
+        // cambiaría a todos los tests de este binario; lo monta la sonda del `.wasm`).
+        match parse_slot(app_slot()).unwrap() {
+            Slot::Bundle(b) => assert!(b.ends_with(b"SYNSEMA-BUNDLE-1"), "{} bytes", b.len()),
+            other => panic!("{:?}", other),
+        }
+    }
+
+    #[test]
+    fn w7_an_appslot1_slot_still_runs() {
+        let s = slot1("viejo.syn", "task deploy(ctx)\n    give {\"state\": {}}\n");
+        assert_eq!(parse_slot(&s).unwrap(), Slot::Program { name: "viejo.syn", source: "task deploy(ctx)\n    give {\"state\": {}}\n" });
+    }
+
+    #[test]
+    fn w8b_a_slot_that_cannot_be_read_says_what_it_holds() {
+        let mut s = slot1("app.syn", "x");
+        s[15] = b'9';
+        assert_eq!(parse_slot(&s).unwrap_err(), "the app slot holds a header that is neither slot format (\"SYNSEMA.APPSLOT9\"), not a program");
+        assert!(parse_slot(&[0x20; SLOT_SIZE]).unwrap_err().contains("neither slot format"));
+        let mut long = slot1("app.syn", "x");
+        long[80..84].copy_from_slice(&(SLOT_SIZE as u32).to_le_bytes());
+        assert_eq!(
+            parse_slot(&long).unwrap_err(),
+            format!("the app slot holds a program length of {} bytes, past the end of the slot ({} bytes), not a program", SLOT_SIZE, SLOT_SIZE - SLOT_HEADER)
+        );
+        let mut bad_utf8 = slot1("app.syn", "ab");
+        bad_utf8[SLOT_HEADER] = 0xff;
+        assert_eq!(parse_slot(&bad_utf8).unwrap_err(), "the app slot holds a program that is not UTF-8, not a program");
+        let mut two = vec![0x20u8; SLOT_SIZE];
+        two[..15].copy_from_slice(b"SYNSEMA.APPSLOT");
+        two[15] = b'2';
+        two[16..20].copy_from_slice(&(SLOT_SIZE as u32).to_le_bytes());
+        assert!(parse_slot(&two).unwrap_err().starts_with("the app slot holds a bundle length of"));
+        // Y un bundle roto en un `APPSLOT2` lo dice el montaje (`mount_bundle`), sin montar nada.
+        assert!(synsema_wasm_web::mount_bundle(b"not a bundle").unwrap_err().contains("not a Synsema bundle"));
+    }
     #[test]
     fn numbers_round_trip() {
         assert_eq!(be_bytes_to_decimal(&[]), "0");

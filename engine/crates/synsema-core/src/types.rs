@@ -194,6 +194,12 @@ pub struct SynTaskValue {
     /// nada atrás. Quien arma un `SynTaskValue` nuevo pone `Default::default()`, salvo la copia de
     /// una foto, que trae los de su original (ronda 6, N1: es un `Arc` para que la foto lo comparta).
     pub free_names: std::cell::OnceCell<std::sync::Arc<std::collections::HashSet<String>>>,
+    /// v0.6.58 (§6.1): la **marca**, el paquete que escribió esta task o lambda (su índice en la
+    /// tabla del proceso; 0 es el programa y sus módulos de archivo). Se fija al crearla con el
+    /// paquete que corre, y llamarla cruza a ese paquete si no es el que corre (`cross_into`).
+    /// Viaja con el valor, así que no importa por dónde llegue la función. Al final del struct:
+    /// `SynValue` no crece (`Task` es un `Rc`).
+    pub mark: u32,
 }
 
 impl SynValue {

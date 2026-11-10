@@ -532,6 +532,9 @@ pub(crate) fn wire_common_with_state(
     mem_gate: MemoryGate,
     mem: Option<MemoryCtx>,
 ) {
+    // v0.6.58 (§3): el chequeo del dueño de `synsema.json` (una vez por proceso). Todo host nativo
+    // arma sus intérpretes por acá; sin el chequeo, el núcleo ignora el `synsema.json` (falla cerrado).
+    synsema_stdlib::project_owner::install();
     let child_state = mem.as_ref().and_then(|m| m.child.clone());
     // v0.6.53 (ronda 1, A1): lo que el core no sabe del recorte del marco: el techo delegado del
     // captoken de la request y el agente. Se mira al momento del gate (el set cambia por request).
@@ -541,11 +544,24 @@ pub(crate) fn wire_common_with_state(
             let c = c.borrow();
             if c.agent.is_some() {
                 Some("inside an agent")
-            } else if !c.delegated.is_empty() {
-                Some("under a delegated capability token")
+            } else if let Some(top) = c.delegated.last() {
+                // v0.6.58 (§6.4, G-7): el origen de más arriba.
+                Some(match top.source {
+                    synsema_capabilities::model::DelegationSource::Package(_) => "inside a package",
+                    _ => "under a delegated capability token",
+                })
             } else {
                 None
             }
+        }));
+        // v0.6.58 (M8, ronda 1): el dominio de un paquete que llegó como delegación (un worker de
+        // `parallel_map` que el paquete llamó) también es «dentro del paquete» para K23 y K24.
+        let c = caps.clone();
+        interp.set_package_frame_hook(Rc::new(move || {
+            c.borrow().delegated.iter().rev().find_map(|d| match &d.source {
+                synsema_capabilities::model::DelegationSource::Package(name) => Some(name.clone()),
+                _ => None,
+            })
         }));
     }
     // Etiquetas de flujo por proceso (`--labels`, `serve --attested`). Se fijan
@@ -834,6 +850,8 @@ pub(crate) fn wire_common_with_state(
     // `sandbox under <caps>` (T1): el cuerpo corre bajo un techo delegado apilado sobre el
     // mismo CapabilitySet. Mismo helper que el host wasm (paridad).
     synsema_stdlib::captoken::install_ceiling_hook(interp, caps.clone());
+    // v0.6.58 (§6.1): el dominio de un paquete, un techo delegado más (mismo helper que wasm).
+    synsema_stdlib::captoken::install_package_hook(interp, caps.clone());
     // Aislamiento de `sandbox`: al entrar guarda y VACÍA el CapabilitySet (deniega todo);
     // al salir, restaura. Stack para sandboxes anidados. Cubre TODOS los builtins gateados
     // de una sola vez (leen el mismo CapabilitySet vía el `caps` Rc compartido).
@@ -1427,7 +1445,10 @@ fn spawn_run_ceiled(source: &str, filename: &str, secure: bool, ceiling: Option<
     let fname = filename.to_string();
     std::thread::Builder::new()
         .stack_size(INTERP_STACK_SIZE)
-        .spawn(move || run_inner(&src, &fname, secure, None, false, ceiling, false))
+        .spawn(move || {
+            synsema_core::stack::enter_thread(INTERP_STACK_SIZE);
+            run_inner(&src, &fname, secure, None, false, ceiling, false)
+        })
         .expect("no se pudo crear el hilo del motor")
         .join()
         .unwrap_or_else(|p| RunResult {
@@ -1561,7 +1582,10 @@ pub fn run_program_report(
     let fname = filename.to_string();
     let mut result = std::thread::Builder::new()
         .stack_size(INTERP_STACK_SIZE)
-        .spawn(move || run_inner(&src, &fname, false, Some(sw), live_output, ceiling, diagnostic))
+        .spawn(move || {
+            synsema_core::stack::enter_thread(INTERP_STACK_SIZE);
+            run_inner(&src, &fname, false, Some(sw), live_output, ceiling, diagnostic)
+        })
         .expect("no se pudo crear el hilo del motor")
         .join()
         .unwrap_or_else(|p| {
@@ -1705,7 +1729,10 @@ pub fn run_tests_ceiled(source: &str, filename: &str, ceiling: Option<Vec<Capabi
     let fname = filename.to_string();
     std::thread::Builder::new()
         .stack_size(INTERP_STACK_SIZE)
-        .spawn(move || run_tests_inner(&src, &fname, ceiling))
+        .spawn(move || {
+            synsema_core::stack::enter_thread(INTERP_STACK_SIZE);
+            run_tests_inner(&src, &fname, ceiling)
+        })
         .expect("no se pudo crear el hilo del motor")
         .join()
         .unwrap_or_else(|p| {
@@ -1958,7 +1985,10 @@ pub fn run_with_diagnostics_ceiled(source: &str, filename: &str, ceiling: Option
     let fname = filename.to_string();
     let mut run = std::thread::Builder::new()
         .stack_size(INTERP_STACK_SIZE)
-        .spawn(move || run_diag_inner(&src, &fname, Some(sw), ceiling))
+        .spawn(move || {
+            synsema_core::stack::enter_thread(INTERP_STACK_SIZE);
+            run_diag_inner(&src, &fname, Some(sw), ceiling)
+        })
         .expect("no se pudo crear el hilo del motor")
         .join()
         .unwrap_or_else(|p| DiagRun {
@@ -2034,6 +2064,7 @@ pub fn run_with_human(source: &str, filename: &str, default_approve: bool) -> Ru
     std::thread::Builder::new()
         .stack_size(INTERP_STACK_SIZE)
         .spawn(move || {
+            synsema_core::stack::enter_thread(INTERP_STACK_SIZE);
             run_configured(&src, &fname, move |interp| {
                 wire_human(interp, Arc::new(AutoHandler::new(default_approve, "")), None, false);
             })
@@ -2056,6 +2087,7 @@ pub fn run_capturing_llm(source: &str, filename: &str) -> (RunResult, Vec<(Strin
     let result = std::thread::Builder::new()
         .stack_size(INTERP_STACK_SIZE)
         .spawn(move || {
+            synsema_core::stack::enter_thread(INTERP_STACK_SIZE);
             run_configured(&src, &fname, move |interp| {
                 let cap = captured.clone();
                 interp.set_llm_callback(Rc::new(move |op: &str, prompt: &str, _principals: &[Rc<str>]| {
@@ -2088,6 +2120,7 @@ pub fn run_capturing_decide(
     let result = std::thread::Builder::new()
         .stack_size(INTERP_STACK_SIZE)
         .spawn(move || {
+            synsema_core::stack::enter_thread(INTERP_STACK_SIZE);
             run_configured(&src, &fname, move |interp| {
                 let cap = captured.clone();
                 interp.set_llm_decide_callback(Rc::new(move |prompt: &str, options: &[String]| {
@@ -2115,6 +2148,7 @@ pub fn run_with_llm(source: &str, filename: &str, responses: HashMap<String, Str
     std::thread::Builder::new()
         .stack_size(INTERP_STACK_SIZE)
         .spawn(move || {
+            synsema_core::stack::enter_thread(INTERP_STACK_SIZE);
             run_configured(&src, &fname, move |interp| {
                 let provider = Arc::new(MockProvider::new(responses));
                 // El mock keyea por `op` e ignora el prompt (retrocompat de los tests).
@@ -2139,6 +2173,7 @@ pub fn run_with_llm_steps(source: &str, filename: &str, steps: Vec<LlmStepRespon
     std::thread::Builder::new()
         .stack_size(INTERP_STACK_SIZE)
         .spawn(move || {
+            synsema_core::stack::enter_thread(INTERP_STACK_SIZE);
             run_configured(&src, &fname, move |interp| {
                 let provider = Arc::new(MockProvider::scripted(steps));
                 interp.set_llm_step_callback(Rc::new(
@@ -2164,6 +2199,7 @@ pub fn run_with_llm_stream(source: &str, filename: &str, chunks: Vec<String>) ->
     std::thread::Builder::new()
         .stack_size(INTERP_STACK_SIZE)
         .spawn(move || {
+            synsema_core::stack::enter_thread(INTERP_STACK_SIZE);
             run_configured(&src, &fname, move |interp| {
                 interp.set_llm_stream_callback(Rc::new(
                     move |_prompt: &str, _context: &str, sink: &mut dyn FnMut(&str) -> bool| {
@@ -2455,6 +2491,7 @@ fn spawn_agent(
         .name(id.clone())
         .stack_size(INTERP_STACK_SIZE)
         .spawn(move || {
+            synsema_core::stack::enter_thread(INTERP_STACK_SIZE);
             let _sealed = sealed_log.map(synsema_core::sealed::install_thread);
             let _run = run.as_ref().map(|r| r.enter());
             let (mut interp, caps) = match &builder {
@@ -2670,7 +2707,10 @@ impl Engine {
         let ceiling_arc = ceiling.map(Arc::new);
         std::thread::Builder::new()
             .stack_size(INTERP_STACK_SIZE)
-            .spawn(move || run_swarm_inner(&src, &fname, swarm, ceiling_arc))
+            .spawn(move || {
+                synsema_core::stack::enter_thread(INTERP_STACK_SIZE);
+                run_swarm_inner(&src, &fname, swarm, ceiling_arc)
+            })
             .expect("no se pudo crear el hilo del motor")
             .join()
             .unwrap_or_else(|p| RunResult {

@@ -1400,6 +1400,41 @@ pub fn install_ceiling_hook(interp: &mut Interpreter, caps: Rc<RefCell<Capabilit
     }));
 }
 
+/// v0.6.58 (§6.1): el dominio de un paquete como un techo delegado más (igual en el nativo y en
+/// wasm). Al cruzar a un paquete se apila lo que declaran sus `require` (o nada, en su nivel
+/// superior); al volver se desapila. Sólo resta: una capability pasa si la cubren el set del
+/// programa, todos los techos de antes y el dominio. Cada dominio se arma una vez por marca.
+pub fn install_package_hook(interp: &mut Interpreter, caps: Rc<RefCell<CapabilitySet>>) {
+    // Uno por marca, armado la primera vez. Un `Vec` indexado por la marca (densa: `mark - 1` en la
+    // tabla) y no un `HashMap`: se consulta en cada cruce y el SipHash pesaba ~280 instrucciones.
+    let built: RefCell<Vec<Option<Rc<Delegation>>>> = RefCell::new(Vec::new());
+    interp.set_package_scope_hook(Rc::new(move |entry| match entry {
+        Some((mark, name, domain)) => {
+            let make = || {
+                let caps_of = domain
+                    .iter()
+                    .filter_map(|(n, s)| capability_type_from_name(n).map(|ty| Capability::new(ty, s.clone())))
+                    .collect();
+                Rc::new(Delegation::package(name, caps_of))
+            };
+            let d = if mark == 0 {
+                make()
+            } else {
+                let mut b = built.borrow_mut();
+                let i = mark as usize;
+                if b.len() <= i {
+                    b.resize(i + 1, None);
+                }
+                b[i].get_or_insert_with(make).clone()
+            };
+            caps.borrow_mut().push_delegation_rc(d);
+        }
+        None => {
+            caps.borrow_mut().pop_delegation();
+        }
+    }));
+}
+
 /// v0.6.46 (E3): `declassify` como capability, igual en el nativo y en wasm. Concede la de
 /// ambiente sólo sin techo (sin scope; v0.6.49, A1: con techo no hay nada de ambiente, la concede
 /// el `require declassify("P")` del programa dentro del techo) y cablea el gate: cada

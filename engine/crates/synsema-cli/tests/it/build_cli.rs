@@ -46,7 +46,7 @@ impl Drop for TempDir {
 
 /// Un proceso hijo (un servidor construido) que se mata al salir, también en un pánico: vivo,
 /// su .exe no se puede borrar.
-struct KillOnDrop(std::process::Child);
+pub(crate) struct KillOnDrop(pub(crate) std::process::Child);
 
 impl Drop for KillOnDrop {
     fn drop(&mut self) {
@@ -295,12 +295,12 @@ fn build_usage_errors_exit_2() {
 // flags horneados y sirve los mounts estáticos DESDE EL BUNDLE (una PWA de un solo binario).
 // =========================================================
 
-fn free_port() -> u16 {
+pub(crate) fn free_port() -> u16 {
     std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
 }
 
 /// Una request HTTP/1.1 cruda → (status, head, body).
-fn http(port: u16, path: &str) -> (u16, String, String) {
+pub(crate) fn http(port: u16, path: &str) -> (u16, String, String) {
     use std::io::{Read, Write};
     let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
     s.set_read_timeout(Some(std::time::Duration::from_secs(20))).unwrap();
@@ -338,7 +338,7 @@ fn serve_project(tag: &str, port: u16) -> TempDir {
     dir
 }
 
-fn wait_ready(port: u16) {
+pub(crate) fn wait_ready(port: u16) {
     let t0 = std::time::Instant::now();
     while t0.elapsed() < std::time::Duration::from_secs(60) {
         if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {

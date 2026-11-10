@@ -185,6 +185,52 @@ pub fn current_program_sha() -> Option<[u8; 32]> {
     }
 }
 
+/// v0.6.58 (§13): los paquetes del programa de este proceso (`{"direct", "packages"}`), o `None`
+/// sin paquetes. Como [`current_program_sha`]: bajo `serve --attested`, los de la identidad (que
+/// instaló su tabla en la corrida); si no, los de la tabla que armó la corrida del programa anotado
+/// (A2 de la ronda 1: nunca se relee el disco al final). Un error es error, no un header sin
+/// `modules`.
+pub fn current_modules() -> Result<Option<serde_json::Value>, String> {
+    if let Some(id) = attested_identity() {
+        return Ok(id.config.modules.clone());
+    }
+    let noted = match NOTED_PROGRAM.lock() {
+        Ok(n) => n,
+        Err(p) => p.into_inner(),
+    };
+    match &*noted {
+        Noted::One(source, filename) => ran_modules(source, filename),
+        _ => Ok(None),
+    }
+}
+
+/// Los paquetes que corrió `source` (en `filename`): los de la tabla que armó su corrida. Sin tabla,
+/// `None` si el programa no tiene un `use` que la arme (sólo `trusted:`, o ninguno: el mismo criterio
+/// que `execute`, `has_file_use`); si tiene, es un error (no se firma lo que no se leyó).
+pub fn ran_modules(source: &str, filename: &str) -> Result<Option<serde_json::Value>, String> {
+    if let Some(t) = synsema_core::modtable::run_table_of(filename) {
+        return Ok(t.run_modules().map(|m| m.to_json()));
+    }
+    // Ronda 2 (M-r2-1): una corrida que falló antes de su primera sentencia (no parsea, o su proyecto
+    // o su tabla dieron error) no corrió ningún paquete: el recibo sale sin `modules`, como en v0.6.57,
+    // y el error del programa se imprime. Lo que se niega es una corrida que empezó sin tabla.
+    if synsema_core::modtable::run_table_failed(filename) {
+        return Ok(None);
+    }
+    let Ok(program) = synsema_core::parser::parse_source(source, filename) else {
+        return Ok(None);
+    };
+    if !program.has_file_use {
+        return Ok(None);
+    }
+    Err("the run did not build its module table; refusing to name packages that were not read".to_string())
+}
+
+/// Los paquetes que alcanza `source` (en `filename`), como los nombra el recibo.
+pub fn modules_of(source: &str, filename: &str) -> Result<Option<serde_json::Value>, String> {
+    Ok(synsema_core::modtable::run_modules_of(source, filename)?.map(|m| m.to_json()))
+}
+
 /// El `program_sha` de un fuente con el mismo cálculo que el recibo ([`current_program_sha`]), sin
 /// el chequeo estático de [`program_sha`]. v0.6.49 (A7): `run --replay` lo compara con el del recibo
 /// antes de correr.
@@ -1381,6 +1427,9 @@ pub struct AttestConfig {
     /// Los drivers que atestan este proceso, en orden (T4: `["tsm", "nitro-tpm"]`). Entra en
     /// `config_sha`: un cliente sabe cuántos documentos tiene que encontrar.
     pub drivers: Vec<&'static str>,
+    /// v0.6.58 (§13, D-15, R11): los paquetes del programa (`{"direct", "packages"}`), o `None`
+    /// sin paquetes (y entonces la clave no va: `config_sha` no cambia para un programa sin ellos).
+    pub modules: Option<serde_json::Value>,
 }
 
 impl AttestConfig {
@@ -1398,12 +1447,18 @@ impl AttestConfig {
             }
         };
         let drivers = format!("[{}]", self.drivers.iter().map(|d| q(d)).collect::<Vec<_>>().join(","));
+        // `modules` ya sale con las claves en orden (`RunModules::to_json`) y sin espacios.
+        let modules = match &self.modules {
+            Some(m) => format!(",\"modules\":{}", m),
+            None => String::new(),
+        };
         format!(
-            "{{\"ceiling\":{},\"drivers\":{},\"engine\":{},\"labels\":{},\"profile\":{},\"tls_key\":{}}}",
+            "{{\"ceiling\":{},\"drivers\":{},\"engine\":{},\"labels\":{}{},\"profile\":{},\"tls_key\":{}}}",
             ceiling,
             drivers,
             q(engine_version()),
             self.labels,
+            modules,
             q(self.profile),
             q(self.tls_key)
         )
@@ -2307,7 +2362,7 @@ mod tests {
     }
 
     fn test_config() -> AttestConfig {
-        AttestConfig { labels: true, ceiling: None, tls_key: "attested", profile: "native", drivers: vec!["mock"] }
+        AttestConfig { labels: true, ceiling: None, tls_key: "attested", profile: "native", drivers: vec!["mock"], modules: None }
     }
 
     #[test]

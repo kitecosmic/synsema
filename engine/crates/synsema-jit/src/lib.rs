@@ -56,6 +56,11 @@ fn new_jit() -> Option<Jit> {
     // Como `JITBuilder::with_flags`: relocaciones de largo alcance y, en x86-64, PIC.
     flags.set("use_colocated_libcalls", "false").ok()?;
     flags.set("is_pic", if cfg!(target_arch = "x86_64") { "true" } else { "false" }).ok()?;
+    // v0.6.58 (B-r5-1): un frame de más de 4 KB (una task con ~80 locales vivos a través de la
+    // llamada) saltaba la página de guarda de la pila y, en Windows, el proceso moría con
+    // 0xC0000005 al recursar nativo. Cranelift sondea en línea sólo los frames de más de 4 KB.
+    flags.set("enable_probestack", "true").ok()?;
+    flags.set("probestack_strategy", "inline").ok()?;
     let isa = cranelift_native::builder().ok()?.finish(settings::Flags::new(flags)).ok()?;
     let mut jb = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
     jb.symbol("synsema_jit_deopt", abi::synsema_jit_deopt as *const u8);

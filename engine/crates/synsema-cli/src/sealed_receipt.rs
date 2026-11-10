@@ -160,7 +160,7 @@ impl Auditor {
         log.close();
         sealed::build_receipt(
             &log,
-            &sealed::ReceiptContext { auditor: self.key, key: &self.run_key, program_sha, config_sha, trusted: trusted_shas(), started: Some(self.started.clone()) },
+            &sealed::ReceiptContext { auditor: self.key, key: &self.run_key, program_sha, config_sha, trusted: trusted_shas(), started: Some(self.started.clone()), modules: synsema_stdlib::attest::current_modules()? },
         )
     }
 
@@ -419,9 +419,26 @@ pub fn install_replay(path: &str, source: &str, filename: &str, any_program: boo
         return Err(format!("--replay: {} is not an opened receipt (run `synsema receipt open <receipt> --key <private>` first)", path));
     }
     let seed = opened.get("seed").and_then(|v| v.as_str()).ok_or("--replay: the opened receipt has no seed")?;
+    // v0.6.58 (§13, R6, R8): los paquetes, antes que `program_sha` (que no los cubre). Un recibo
+    // viejo no tiene `modules`: con paquetes acá, es el mismo error con `none`.
+    let recorded_mods = opened.pointer("/header/modules").filter(|v| !v.is_null()).cloned();
+    let here_mods = synsema_stdlib::attest::modules_of(source, filename).map_err(|e| format!("--replay: {}", e))?;
+    let other_modules = if recorded_mods == here_mods {
+        false
+    } else if any_program {
+        true
+    } else {
+        let show = |m: &Option<serde_json::Value>| m.as_ref().map_or("none".to_string(), |v| v.to_string());
+        return Err(format!(
+            "--replay: the receipt's modules ({}) are not the ones here ({}); to run against it anyway, add --replay-any-program (the result is not a verification)",
+            show(&recorded_mods),
+            show(&here_mods)
+        ));
+    };
     let recorded_sha = opened.pointer("/header/program_sha").and_then(|v| v.as_str());
     let here = synsema_stdlib::attest::program_sha_of(source, filename).map(|s| synsema_core::bytesutil::hex_encode(&s));
-    let other_program = match (recorded_sha, here.as_deref()) {
+    let other_program = other_modules
+        || match (recorded_sha, here.as_deref()) {
         (Some(r), Some(h)) if r == h => false,
         (Some(r), Some(h)) if !any_program => {
             return Err(format!(

@@ -347,6 +347,11 @@ fn view_ins(c: &Chunk, pc: usize, env: &Rc<RefCell<Environment>>, me: Option<usi
         Ins::CheckCancel => NIns::CheckCancel,
         // F4.8d: un `TryInPlace` de camino que la VM dejó de probar (ver `vm_try_in_place`).
         Ins::Nop => NIns::Nop,
+        // v0.6.58 (§6.1, G-2): el cruce de un paquete es un no-op en nativo: a una unidad se entra
+        // con la marca ya cruzada (un `CallNative` de la misma marca, `call_fast` o la sesión después
+        // de su comparación), y una unidad sólo llama a tasks de su marca (`LoadCallee`, abajo); una
+        // de otra marca sale como llamada ajena, por la VM, que cruza.
+        Ins::Exec { node, .. } if node >= PKG_OPS => NIns::Nop,
         // F4.8d2: un texto constante (un literal): prestado de un sitio de la unidad.
         Ins::Const { dst, k } | Ins::Move { dst, src: Opnd::Const(k) } if matches!(c.consts[k as usize], SynValue::Text(_)) => {
             let SynValue::Text(t) = &c.consts[k as usize] else { unreachable!("texto") };
@@ -415,6 +420,15 @@ fn view_ins(c: &Chunk, pc: usize, env: &Rc<RefCell<Environment>>, me: Option<usi
                 // F4.8d2: en un bucle, una task que no se puede compilar (escribe una global, lee algo que
                 // el código nativo no representa, …) es una llamada ajena: la corre la VM.
                 SynValue::Task(y) if me.is_none() && !task_closes(&y) => NIns::LoadForeign { dst },
+                // v0.6.58 (§6.1, K36): nunca una task de otra marca adentro de la unidad: en un bucle
+                // es una llamada ajena (la VM cruza); en una task, la unidad no se compila.
+                SynValue::Task(y) if y.mark != c.mark => {
+                    if me.is_none() {
+                        NIns::LoadForeign { dst }
+                    } else {
+                        return None;
+                    }
+                }
                 SynValue::Task(y) => {
                     let to = b.callee(y);
                     b.deps.push(Dep { from: me, name: nm, to: Some(to), builtin: "" });
@@ -993,6 +1007,11 @@ impl Interpreter {
     /// Esta vez sigue en la VM.
     #[inline(never)]
     pub(super) fn vm_native_tier_up(&mut self, chunk: &Chunk, at: usize, t: &Rc<SynTaskValue>, first: usize, n: usize) {
+        // v0.6.58 (§6.1, G-2, K36b): un sitio pasa a `CallNative` sólo hacia una task de la misma
+        // marca; el del programa hacia una task de paquete queda `Call` y entra por el prólogo.
+        if t.mark != chunk.mark {
+            return;
+        }
         let params = self.vm_regs[first..first + n].iter().map(seen_of).collect();
         if !self.vm_native_prepare(t, params) {
             return;
@@ -1078,8 +1097,10 @@ impl Interpreter {
     ) -> Result<NativeStep, Control> {
         let first = base + args as usize;
         let nn = n as usize;
+        // v0.6.58 (§6.1, G-2): el sitio puede ver otra task después de reescribirse; una de otra
+        // marca vuelve a `Call` (entra por su prólogo, o por `PKG_CALL`, y cruza).
         let argv = match &self.vm_regs[base + func as usize] {
-            SynValue::Task(t) => native_args(t, &self.vm_regs[first..first + nn]),
+            SynValue::Task(t) if t.mark == chunk.mark => native_args(t, &self.vm_regs[first..first + nn]),
             _ => None,
         };
         let Some(argv) = argv else {
@@ -1179,7 +1200,9 @@ impl Interpreter {
     /// unidad, sus dependencias, las globales que lee) se verifica acá una vez; las globales se leen
     /// ahora (el código nativo no escribe nada: no cambian mientras la sesión sólo corre en nativo).
     pub(super) fn vm_lambda_session<'a>(&mut self, t: &'a Rc<SynTaskValue>, flag: &'a AtomicBool) -> Option<LambdaFast<'a>> {
-        if !self.vm_code_for(t)?.regframe {
+        // v0.6.58 (§6.1, F-1): una task con otra marca no abre sesión; cada elemento va por el
+        // camino que cruza.
+        if t.mark != self.cur_pkg || !self.vm_code_for(t)?.regframe {
             return None;
         }
         let unit = t.code.native.unit()?;

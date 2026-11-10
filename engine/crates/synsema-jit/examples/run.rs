@@ -27,6 +27,11 @@ fn main() {
     if !jitless {
         synsema_jit::install();
     }
+    // v0.6.58 (B3 de la ronda 1): sin un chequeo de dueño instalado el núcleo ignora el
+    // `synsema.json` (falla cerrado), y `perf-guard` mide un programa con paquetes
+    // (`engine/perf/progs/p_pkg_loop/`). Este runner sólo corre los programas del repo: los archivos
+    // son del checkout, así que se aceptan.
+    synsema_core::project::set_owner_check(|_| Ok(true));
     if reference {
         synsema_core::interpreter::set_reference_mode(true);
     }

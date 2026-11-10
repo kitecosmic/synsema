@@ -270,6 +270,17 @@ pub(crate) fn children(n: &Node) -> Vec<&Node> {
     }
 }
 
+/// v0.6.58 (M-r4-1): cuántos niveles baja la referencia, recursiva en Rust, para correr `n`: la
+/// profundidad del árbol sin entrar en el cuerpo de una lambda o de una task que `n` define (correr
+/// `n` sólo las crea; cuando se llaman, la llamada cuenta aparte). El parser acota el árbol a
+/// `MAX_NEST`, así que esta recursión también.
+pub(crate) fn run_depth(n: &Node) -> usize {
+    match &n.kind {
+        NodeKind::LambdaExpression { .. } | NodeKind::TaskDefinition { .. } => 1,
+        _ => 1 + children(n).into_iter().map(run_depth).max().unwrap_or(0),
+    }
+}
+
 /// Recorre el AST (pre-orden), llamando `visitor` en cada nodo.
 pub fn walk<'a>(node: &'a Node, visitor: &mut dyn FnMut(&'a Node)) {
     visitor(node);

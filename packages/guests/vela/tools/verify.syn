@@ -1,23 +1,26 @@
--- verify.syn — checks that a Vela guest module is a released interpreter plus the program in its
+-- verify.syn — checks that a Vela guest module is a released interpreter plus the app in its
 -- app slot, and nothing else. The pair of embed.syn: that one writes the slot, this one reads it
 -- back and rebuilds what the module SHOULD be from the release asset, then compares byte by byte.
 --
---   synsema run verify.syn -- app.wasm --release v0.6.23 [--source app.syn] [--extract out.syn]
+--   synsema run verify.syn -- app.wasm --release v0.6.58 [--source app.built|app.syn] [--extract <dir>]
 --                                      [--audited <sha256>] [--cache <dir>]
 --   synsema run verify.syn -- app.wasm --asset guest.wasm …      a guest on disk instead of the release's (offline)
 --
 -- In order:
---   1. finds the app slot (magic SYNSEMA.APPSLOT1) and reads the program's name and bytes out of
---      its header; `--extract` writes the program to a file, to read what really runs;
---   2. `--source`: the program in the slot must be byte-identical to that file;
+--   1. finds the app slot and reads the bundle out of it (refusing names the engine would not read);
+--      `--extract <dir>` writes the whole tree (files and packages) there, to read what really runs;
+--   2. `--source`: a built app (`synsema build app.syn --engine-binary … -o app.built`) is compared
+--      with the slot bundle against bundle — every file, synsema.json, every package and the manifest
+--      except built_at (the time of the build: a rebuild passes, anything else is named); a .syn is
+--      compared with the main program only, and fails when the slot carries anything else;
 --   3. downloads the release's synsema-vela-guest.wasm and its .sha256 from GitHub (following
 --      the redirect to GitHub's object store) and checks the asset against its sha256; `--cache
 --      <dir>` keeps the asset there and reuses it while its sha256 still matches;
 --   4. `--audited <sha256>`: the release asset must be the audited interpreter (SECURITY-GUEST.md
 --      names the sha256 an external audit covered);
---   5. embeds the extracted program into the asset exactly as embed.syn does and compares the
+--   5. embeds the slot's contents into the asset exactly as embed.syn does and compares the
 --      given module with the result: the first offset that differs, and whether it falls inside
---      the slot (the program or its header) or outside it (the interpreter is not the release's);
+--      the slot (the app or its header) or outside it (the interpreter is not the release's);
 --   6. prints the module's sha256 — the wasmSha256 in the deploy descriptor the chain checks.
 --
 -- `--release` is mandatory: a program cannot read the CLI's own version, and the interpreter in a
@@ -26,9 +29,14 @@
 -- Limit: the module a Manager runs is not downloadable by third parties (the Manager keeps the
 -- artifact). `verify` serves whoever the app hands its `.wasm` to — the kit's release, a CI
 -- artifact — and its sha256 is what to compare with the deploy descriptor's wasmSha256 on-chain.
--- Layout of the slot (524 288 bytes): magic (16) · name length (1) · name (63) · program length as
--- u32 little-endian (4) · the program, UTF-8 · 0x20 filler to the end. Programs up to 524 204 bytes.
-intent: "verify a Vela guest module: a release's interpreter plus the program in its slot, byte by byte"
+--
+-- Two layouts of the slot (524 288 bytes), one per magic:
+--   - SYNSEMA.APPSLOT2 (since v0.6.58): magic (16) · bundle length as u32 little-endian (4) · a
+--     `synsema build` bundle (payload, then its 64-byte trailer) · 0x20 filler. The bundle carries
+--     the program, its synsema.json and its packages; the program is the bundle's main file.
+--   - SYNSEMA.APPSLOT1 (up to v0.6.57): magic (16) · name length (1) · name (63) · program length
+--     as u32 little-endian (4) · the program, UTF-8 · 0x20 filler.
+intent: "verify a Vela guest module: a release's interpreter plus the app in its slot, byte by byte"
 
 -- The paths come from the command line (whoever runs the tool picks them), so the grant has no
 -- scope. Since v0.6.45 `*` in a file scope is only the files of one folder.
@@ -39,21 +47,37 @@ require net("github.com")
 require net("objects.githubusercontent.com")
 require net("release-assets.githubusercontent.com")
 
-let MAGIC be "SYNSEMA.APPSLOT1"
+let MAGIC be "SYNSEMA.APPSLOT2"
+let OLD_MAGIC be "SYNSEMA.APPSLOT1"
+let BUNDLE_MAGIC be "SYNSEMA-BUNDLE-1"
 let SLOT be 524288
-let HEADER be 16 + 1 + 63 + 4
+let HEADER be 16 + 4
+let OLD_HEADER be 16 + 1 + 63 + 4
+let TRAILER be 64
 let RELEASES be "https://github.com/kitecosmic/synsema/releases/download/"
 let ASSET be "synsema-vela-guest.wasm"
 
 -- ---- the slot (the same tasks as embed.syn; verify.syn must not `use` a program with a main) ----
 
+task u16_le(n)
+    give bytes([n % 256, floor(n / 256) % 256])
+
 task u32_le(n)
     give bytes([n % 256, floor(n / 256) % 256, floor(n / 65536) % 256, floor(n / 16777216) % 256])
 
-task u32_le_value(b)
-    give b[0] + b[1] * 256 + b[2] * 65536 + b[3] * 16777216
+task u64_le(n)
+    give u32_le(n % 4294967296) + u32_le(floor(n / 4294967296))
 
--- n bytes of 0x20: the filler build.rs uses, byte for byte, after the name and after the program.
+-- a little-endian number (the lengths in a slot header and in a bundle)
+task le_number(b)
+    let n be 0
+    let i be length(b) - 1
+    while i >= 0
+        set n to n * 256 + b[i]
+        set i to i - 1
+    give n
+
+-- n bytes of 0x20: the filler build.rs uses, byte for byte, after the app.
 -- Not zero on purpose — a long run of zeros could land in .bss or in a split segment, and the
 -- slot must stay ONE contiguous run of bytes in the file. Doubling: ~20 steps for a whole slot.
 task fill(n)
@@ -66,42 +90,332 @@ task base_name(path)
     let parts be split(replace(path, "\\", "/"), "/")
     give parts[length(parts) - 1]
 
-task slot_offset(wasm)
-    -- the whole module as hex, split on the magic: exactly one slot, byte-aligned
-    let parts be split(decode(wasm, "hex"), decode(bytes(MAGIC), "hex"))
-    when length(parts) < 2
+-- the slot: {"offset", "format": 2 or 1}. Exactly one slot of either magic, byte-aligned.
+task find_slot(wasm)
+    let hex be decode(wasm, "hex")
+    let found be []
+    each m in [{"magic": MAGIC, "format": 2}, {"magic": OLD_MAGIC, "format": 1}]
+        let parts be split(hex, decode(bytes(m["magic"]), "hex"))
+        when length(parts) > 2
+            raise("the module has more than one app slot; refusing to guess")
+        when length(parts) == 2
+            when length(parts[0]) % 2 != 0
+                raise("the app slot is not byte-aligned; refusing to guess")
+            set found to append(found, {"offset": floor(length(parts[0]) / 2), "format": m["format"]})
+    when length(found) == 0
         raise("no app slot in this module: it needs a guest from Synsema v0.6.23 or newer (the release asset " + ASSET + ")")
-    when length(parts) > 2
+    when length(found) > 1
         raise("the module has more than one app slot; refusing to guess")
-    when length(parts[0]) % 2 != 0
-        raise("the app slot is not byte-aligned; refusing to guess")
-    let off be floor(length(parts[0]) / 2)
-    when off + SLOT > length(wasm)
+    let s be found[0]
+    when s["offset"] + SLOT > length(wasm)
         raise("the module ends before its app slot does (" + text(length(wasm)) + " bytes)")
-    give off
+    give s
 
--- embed.syn's `embed`, taking the program as bytes: what the module must be if it is honest
-task embed_bytes(wasm, body, name)
-    let off be slot_offset(wasm)
-    when length(body) > SLOT - HEADER
-        raise("the program is " + text(length(body)) + " bytes; the app slot holds at most " + text(SLOT - HEADER))
-    let n be bytes(name)
-    when length(n) > 63
-        set n to slice(n, 0, 63)
-    let header be bytes(MAGIC) + bytes([length(n)]) + n + fill(63 - length(n)) + u32_le(length(body))
-    let slot be header + body + fill(SLOT - HEADER - length(body))
-    give slice(wasm, 0, off) + slot + slice(wasm, off + SLOT, length(wasm))
+task slot_offset(wasm)
+    give find_slot(wasm)["offset"]
 
--- what the slot holds: {offset, name, program (bytes)}
+-- the main program of a bundle (payload ‖ trailer), checked like the guest checks it:
+-- {"name", "program", "packages"}
+task read_bundle(b)
+    when length(b) < TRAILER or slice(b, length(b) - 16, length(b)) != bytes(BUNDLE_MAGIC)
+        raise("the app slot holds no bundle (no " + BUNDLE_MAGIC + " trailer)")
+    let t be slice(b, length(b) - TRAILER, length(b))
+    let plen be le_number(slice(t, 8, 16))
+    when le_number(slice(t, 0, 8)) != 0 or plen + TRAILER != length(b)
+        raise("the bundle in the app slot is corrupt (its trailer does not match its size)")
+    let payload be slice(b, 0, plen)
+    when sha256(payload) != slice(t, 16, 48)
+        raise("the bundle in the app slot is corrupt (sha256 mismatch)")
+    let mlen be le_number(slice(payload, 0, 4))
+    let manifest be json_decode(decode(slice(payload, 4, 4 + mlen)))
+    let pos be 4 + mlen
+    let n be le_number(slice(payload, pos, pos + 4))
+    set pos to pos + 4
+    let program be nothing
+    let entries be []
+    let seen be {}
+    let i be 0
+    while i < n
+        let nl be le_number(slice(payload, pos, pos + 2))
+        let name be checked_name(decode(slice(payload, pos + 2, pos + 2 + nl)))
+        when contains(keys(seen), name)
+            raise("the bundle in the app slot is not one the engine reads: the entry '" + name + "' appears twice")
+        set seen[name] to true
+        set pos to pos + 2 + nl
+        let len be le_number(slice(payload, pos, pos + 8))
+        set pos to pos + 8
+        set entries to append(entries, {"name": name, "bytes": slice(payload, pos, pos + len)})
+        when name == manifest["main"]
+            set program to slice(payload, pos, pos + len)
+        set pos to pos + len
+        set i to i + 1
+    when program == nothing
+        raise("the bundle in the app slot has no " + manifest["main"] + " (its main program)")
+    let packages be when contains(keys(manifest), "packages") then manifest["packages"] otherwise []
+    -- the package section (bundle.rs): u32 count; per package u16 + hash, u32 files, each file as an entry.
+    -- Ronda 4 (B-r4-1): the engine reads it only when the manifest lists packages, and then it must be
+    -- there, with the manifest's hashes in the same order and nothing after it.
+    let not_read be "the bundle in the app slot is not one the engine reads: "
+    let package_files be []
+    let hseen be {}
+    when length(packages) > 0
+        when pos >= plen
+            raise(not_read + "the manifest lists packages but the bundle has no package section")
+        let np be le_number(slice(payload, pos, pos + 4))
+        set pos to pos + 4
+        let j be 0
+        while j < np
+            let hl be le_number(slice(payload, pos, pos + 2))
+            let h be decode(slice(payload, pos + 2, pos + 2 + hl))
+            set pos to pos + 2 + hl
+            let nf be le_number(slice(payload, pos, pos + 4))
+            set pos to pos + 4
+            when contains(keys(hseen), h)
+                raise("the bundle in the app slot is not one the engine reads: the package " + h + " appears twice")
+            set hseen[h] to true
+            let files be []
+            let pseen be {}
+            let k be 0
+            while k < nf
+                let fl be le_number(slice(payload, pos, pos + 2))
+                let fname be checked_name(decode(slice(payload, pos + 2, pos + 2 + fl)))
+                when contains(keys(pseen), fname)
+                    raise("the bundle in the app slot is not one the engine reads: the package " + h + " has the path '" + fname + "' twice")
+                set pseen[fname] to true
+                set pos to pos + 2 + fl
+                let flen be le_number(slice(payload, pos, pos + 8))
+                set pos to pos + 8
+                set files to append(files, {"name": fname, "bytes": slice(payload, pos, pos + flen)})
+                set pos to pos + flen
+                set k to k + 1
+            set package_files to append(package_files, merge(package_as_read(h, files), {"hash": h, "raw": files}))
+            set j to j + 1
+        when json_encode(apply(package_files, (p) => p["hash"])) != json_encode(packages)
+            raise(not_read + "the package section does not match the manifest")
+    when pos != plen
+        raise(not_read + "trailing bytes after the last entry")
+    give {"name": manifest["main"], "program": program, "packages": packages, "entries": entries, "package_files": package_files, "manifest": manifest}
+
+-- the engine's rule for a name in a bundle (bundle::normalize_name, ronda 2 M-r2-3): it must already be
+-- in normal form — no `\`, no leading `/` or drive, no empty, `.` or `..` segment. The guest refuses
+-- anything else, so the program read here is the one that runs.
+task normal_name(name)
+    let p be replace(name, "\\", "/")
+    when starts_with(p, "/") or (length(p) > 1 and slice(p, 1, 2) == ":")
+        give nothing
+    let out be []
+    each seg in split(p, "/")
+        when seg == ".."
+            when length(out) == 0
+                give nothing
+            set out to slice(out, 0, length(out) - 1)
+        otherwise when seg != "" and seg != "."
+            set out to append(out, seg)
+    when length(out) == 0
+        give nothing
+    give join(out, "/")
+
+task checked_name(name)
+    when normal_name(name) != name
+        raise("the bundle in the app slot is not one the engine reads: the entry name '" + name + "' is not normalized")
+    give name
+
+-- the tree hash of a package (modtable::tree_hash, like Go's h1:): per file, its synsema.json too, a
+-- line "<sha256 hex>  <path>\n"; the lines sorted by bytes; the sha256 of them joined
+task tree_of(lines)
+    give "tree-sha256:" + sha_hex(bytes(join(sort(lines), "")))
+
+-- the engine's limits and names for a package (modtable.rs, project.rs)
+let INDEX_KEYS be ["synsema", "modules", "indirect", "id", "version", "main", "files"]
+let MODULE_KEYS be ["url", "id", "version", "hash", "requires"]
+let INDIRECT_KEYS be ["url", "version", "hash", "requires"]
+let MAX_FILES be 256
+let MAX_FILE_BYTES be 4194304
+let MAX_PACKAGE_BYTES be 33554432
+let MAX_PATH_BYTES be 128
+
+-- "a.b.c" as project::parse_three reads it (three numbers, no leading zeros, up to 9 digits), or nothing
+task version_triple(v)
+    when type_of(v) != "text"
+        give nothing
+    let parts be split(v, ".")
+    when length(parts) != 3
+        give nothing
+    each p in parts
+        when not matches(p, "0|[1-9][0-9]{0,8}")
+            give nothing
+    give apply(parts, (p) => int(p))
+
+-- a <= b for two triples
+task version_le(a, b)
+    each i in [0, 1, 2]
+        when a[i] != b[i]
+            give a[i] < b[i]
+    give true
+
+-- modtable::check_pkg_path: relative, `/` between segments of letters, digits, '.', '_' and '-' (not
+-- starting with '.' or '-', not ending with '.'), no name Windows reserves, 1 to 128 bytes
+task pkg_path_ok(p)
+    let n be length(bytes(p))
+    when n == 0 or n > MAX_PATH_BYTES
+        give false
+    each seg in split(p, "/")
+        when not matches(seg, "[A-Za-z0-9_][A-Za-z0-9._-]*") or ends_with(seg, ".")
+            give false
+        let stem be upper(split(seg, ".")[0])
+        when contains(["CON", "PRN", "AUX", "NUL"], stem)
+            give false
+        when length(stem) == 4 and (starts_with(stem, "COM") or starts_with(stem, "LPT")) and matches(slice(stem, 3, 4), "[0-9]")
+            give false
+    give true
+
+-- an entry of "modules" or "indirect" (project::parse_entry): an object with the known keys, a text
+-- "url", texts for the others and a list of texts for "requires"
+task entry_ok(e, known)
+    when type_of(e) != "map" or not contains(keys(e), "url")
+        give false
+    each k in keys(e)
+        when not contains(known, k)
+            give false
+        when k == "requires"
+            when type_of(e[k]) != "list"
+                give false
+            each r in e[k]
+                when type_of(r) != "text"
+                    give false
+        otherwise when type_of(e[k]) != "text"
+            give false
+    give true
+
+-- the index of a package as the engine reads it (ronda 4, B-r4-1: project::parse_manifest_of and
+-- modtable::load_package_with): UTF-8 without a BOM, a JSON object with only the known keys, each of
+-- its type; "id", "version", "main" and "files" present; the paths by modtable::check_pkg_paths (at
+-- most 256, none is synsema.json, none repeated or a folder of another, ignoring case). Gives the
+-- index, or nothing when the engine would refuse it.
+task index_as_read(raw)
+    when length(raw) >= 3 and slice(raw, 0, 3) == bytes([239, 187, 191])
+        give nothing
+    let index be nothing
+    try
+        let src be decode(raw)
+        when bytes(src) == raw
+            set index to json_decode(src)
+    recover e
+        give nothing
+    when type_of(index) != "map"
+        give nothing
+    each k in keys(index)
+        when not contains(INDEX_KEYS, k)
+            give nothing
+    when contains(keys(index), "synsema") and version_triple(index["synsema"]) == nothing
+        give nothing
+    each part in [["modules", MODULE_KEYS], ["indirect", INDIRECT_KEYS]]
+        when contains(keys(index), part[0])
+            when type_of(index[part[0]]) != "map"
+                give nothing
+            each name in keys(index[part[0]])
+                when part[0] == "modules" and not matches(name, "[a-z][a-z0-9_-]{0,63}")
+                    give nothing
+                when not entry_ok(index[part[0]][name], part[1])
+                    give nothing
+    each k in ["id", "version", "main"]
+        when not contains(keys(index), k) or type_of(index[k]) != "text"
+            give nothing
+    when not contains(keys(index), "files") or type_of(index["files"]) != "list" or length(index["files"]) > MAX_FILES
+        give nothing
+    let lows be []
+    each f in index["files"]
+        when type_of(f) != "map" or not contains(keys(f), "path") or not contains(keys(f), "sha256")
+            give nothing
+        each k in keys(f)
+            when k != "path" and k != "sha256"
+                give nothing
+        when type_of(f["path"]) != "text" or type_of(f["sha256"]) != "text" or not pkg_path_ok(f["path"])
+            give nothing
+        let low be lower(f["path"])
+        when low == "synsema.json" or contains(lows, low)
+            give nothing
+        set lows to append(lows, low)
+    each a in lows
+        each b in lows
+            when starts_with(b, a + "/")
+                give nothing
+    give index
+
+-- what the engine reads of a bundled package (ronda 3, M-r3-1; modtable::load_package_with): its
+-- synsema.json and the files that index lists, each against its sha256, and all of them against the
+-- package's hash. Those are the files shown and extracted; anything else in the section the engine
+-- never reads (named in "unlisted"). A package the engine refuses to load (ronda 4, B-r4-1: its
+-- index, its paths, the sizes, a main it does not list) is refused here too.
+-- Gives {"files", "unlisted", "min" (the "synsema" minimum as a triple, or nothing)}.
+task package_as_read(h, files)
+    let changed be "the bundle in the app slot is not one the engine runs: the files of package " + h + " do not match its hash"
+    let by be files_by_name(files)
+    when not contains(keys(by), "synsema.json")
+        raise(changed)
+    let index be index_as_read(by["synsema.json"])
+    when index == nothing
+        raise(changed)
+    let lines be [sha_hex(by["synsema.json"]) + "  synsema.json\n"]
+    let out be [{"name": "synsema.json", "bytes": by["synsema.json"]}]
+    let listed be {"synsema.json": true}
+    let total be length(by["synsema.json"])
+    each f in index["files"]
+        when not contains(keys(by), f["path"])
+            raise(changed)
+        let b be by[f["path"]]
+        set total to total + length(b)
+        when length(b) > MAX_FILE_BYTES or total > MAX_PACKAGE_BYTES
+            raise(changed)
+        when sha_hex(b) != f["sha256"]
+            raise(changed)
+        set listed[f["path"]] to true
+        set lines to append(lines, f["sha256"] + "  " + f["path"] + "\n")
+        set out to append(out, {"name": f["path"], "bytes": b})
+    when tree_of(lines) != h
+        raise(changed)
+    -- the main among the files the index lists (B-r5-2): the engine never loads "synsema.json"
+    when not contains(apply(index["files"], (f) => f["path"]), index["main"])
+        raise(changed)
+    let unlisted be where(apply(files, (f) => f["name"]), (n) => not contains(keys(listed), n))
+    let min be when contains(keys(index), "synsema") then version_triple(index["synsema"]) otherwise nothing
+    give {"files": out, "unlisted": unlisted, "min": min}
+
+-- what the slot holds: {offset, format, name, program (bytes), packages, raw (the slot's app bytes)}
 task slot_contents(wasm)
-    let off be slot_offset(wasm)
+    let s be find_slot(wasm)
+    let off be s["offset"]
+    when s["format"] == 2
+        let len be le_number(slice(wasm, off + 16, off + 20))
+        when len > SLOT - HEADER
+            raise("the slot header declares a bundle of " + text(len) + " bytes; the slot holds at most " + text(SLOT - HEADER))
+        let raw be slice(wasm, off + HEADER, off + HEADER + len)
+        let b be read_bundle(raw)
+        give {"offset": off, "format": 2, "name": b["name"], "program": b["program"], "packages": b["packages"], "entries": b["entries"], "package_files": b["package_files"], "raw": raw}
     let name_len be wasm[off + 16]
     when name_len > 63
         raise("the slot header names a program with " + text(name_len) + " bytes of name; the field holds 63")
-    let program_len be u32_le_value(slice(wasm, off + 80, off + 84))
-    when program_len > SLOT - HEADER
-        raise("the slot header declares a program of " + text(program_len) + " bytes; the slot holds at most " + text(SLOT - HEADER))
-    give {"offset": off, "name": decode(slice(wasm, off + 17, off + 17 + name_len)), "program": slice(wasm, off + HEADER, off + HEADER + program_len)}
+    let program_len be le_number(slice(wasm, off + 80, off + 84))
+    when program_len > SLOT - OLD_HEADER
+        raise("the slot header declares a program of " + text(program_len) + " bytes; the slot holds at most " + text(SLOT - OLD_HEADER))
+    let program be slice(wasm, off + OLD_HEADER, off + OLD_HEADER + program_len)
+    let nm be decode(slice(wasm, off + 17, off + 17 + name_len))
+    give {"offset": off, "format": 1, "name": nm, "program": program, "packages": [], "entries": [{"name": nm, "bytes": program}], "package_files": [], "raw": program}
+
+-- the slot bytes embed.syn writes for these contents (the format the slot was found in)
+task slot_bytes(slot)
+    when slot["format"] == 2
+        give bytes(MAGIC) + u32_le(length(slot["raw"])) + slot["raw"] + fill(SLOT - HEADER - length(slot["raw"]))
+    let n be bytes(slot["name"])
+    when length(n) > 63
+        set n to slice(n, 0, 63)
+    let header be bytes(OLD_MAGIC) + bytes([length(n)]) + n + fill(63 - length(n)) + u32_le(length(slot["raw"]))
+    give header + slot["raw"] + fill(SLOT - OLD_HEADER - length(slot["raw"]))
+
+-- embed.syn's `embed`: what the module must be if it is honest
+task embed_slot(wasm, slot)
+    let off be slot_offset(wasm)
+    give slice(wasm, 0, off) + slot_bytes(slot) + slice(wasm, off + SLOT, length(wasm))
 
 -- ---- comparing ----
 
@@ -127,15 +441,17 @@ task differing_offset(a, b, lo, hi, step)
     give nothing
 
 -- where a differing offset falls, and what that means
-task locate(off, slot_off)
+task locate(off, slot)
+    let slot_off be slot["offset"]
+    let header be when slot["format"] == 2 then HEADER otherwise OLD_HEADER
     when off < slot_off
         give "outside the app slot, before it (offset " + text(off) + "): the interpreter is not the release's"
     when off >= slot_off + SLOT
         give "outside the app slot, after it (offset " + text(off) + "): the interpreter is not the release's"
     let rel be off - slot_off
-    when rel < HEADER
-        give "inside the app slot's header (offset " + text(off) + ", slot byte " + text(rel) + "): the program's name or length differ"
-    give "inside the app slot (offset " + text(off) + ", program byte " + text(rel - HEADER) + "): the program differs"
+    when rel < header
+        give "inside the app slot's header (offset " + text(off) + ", slot byte " + text(rel) + "): the app's name or length differ"
+    give "inside the app slot (offset " + text(off) + ", app byte " + text(rel - header) + "): the app differs"
 
 -- a sha256 as people paste it → 64 lowercase hex digits
 task normalize_sha(s)
@@ -220,27 +536,177 @@ task parse_args(a)
         raise("--release and --asset exclude each other: the interpreter comes from the release's asset or from that file")
     give o
 
-let USAGE be "usage: synsema run verify.syn -- app.wasm (--release <tag> | --asset <guest.wasm>) [--source app.syn] [--extract out.syn] [--audited <sha256>] [--cache <dir>]"
+let USAGE be "usage: synsema run verify.syn -- app.wasm (--release <tag> | --asset <guest.wasm>) [--source app.built|app.syn] [--extract <dir>] [--audited <sha256>] [--cache <dir>]"
+
+-- Does the file end with a bundle trailer? (`synsema build` writes it after the engine binary.)
+task is_built(b)
+    give length(b) >= TRAILER and slice(b, length(b) - 16, length(b)) == bytes(BUNDLE_MAGIC)
+
+-- embed.syn's `bundle_from_built`: the bundle at the end of a built file, as the slot carries it
+-- (nothing in front, so the trailer's offset is 0), its sha256 checked.
+task bundle_from_built(b)
+    let t be slice(b, length(b) - TRAILER, length(b))
+    let plen be le_number(slice(t, 8, 16))
+    let start be length(b) - TRAILER - plen
+    when start < 0
+        raise("the bundle trailer of the --source file does not match its size")
+    let payload be slice(b, start, start + plen)
+    when sha256(payload) != slice(t, 16, 48)
+        raise("the bundle of the --source file is corrupt (sha256 mismatch)")
+    give payload + u64_le(0) + u64_le(plen) + slice(t, 16, 48) + bytes(BUNDLE_MAGIC)
+
+-- what differs between two read bundles (read_bundle), leaving out the manifest's built_at: the
+-- manifest fields, then each file and each package by name and bytes
+task bundle_differences(a, b)
+    let out be []
+    let fields be keys(a["manifest"])
+    each k in keys(b["manifest"])
+        when not contains(fields, k)
+            set fields to append(fields, k)
+    each k in fields
+        when k != "built_at"
+            let va be when contains(keys(a["manifest"]), k) then a["manifest"][k] otherwise nothing
+            let vb be when contains(keys(b["manifest"]), k) then b["manifest"][k] otherwise nothing
+            when json_encode(va) != json_encode(vb)
+                set out to append(out, "manifest " + k + " (slot " + json_encode(va) + ", built app " + json_encode(vb) + ")")
+    let fa be files_by_name(a["entries"])
+    let fb be files_by_name(b["entries"])
+    each n in keys(fa)
+        when not contains(keys(fb), n)
+            set out to append(out, "file " + n + " only in the slot")
+        otherwise when fa[n] != fb[n]
+            set out to append(out, "file " + n + " (slot sha256 " + sha_hex(fa[n]) + ", built app " + sha_hex(fb[n]) + ")")
+    each n in keys(fb)
+        when not contains(keys(fa), n)
+            set out to append(out, "file " + n + " only in the built app")
+    when json_encode(apply(a["entries"], (e) => e["name"])) != json_encode(apply(b["entries"], (e) => e["name"]))
+        set out to append(out, "the files are in another order")
+    let pa be packages_by_hash(a["package_files"])
+    let pb be packages_by_hash(b["package_files"])
+    when json_encode(keys(pa)) != json_encode(keys(pb))
+        set out to append(out, "packages (slot " + json_encode(keys(pa)) + ", built app " + json_encode(keys(pb)) + ")")
+    otherwise
+        each h in keys(pa)
+            when pa[h] != pb[h]
+                set out to append(out, "package " + h + " has other files or another order")
+    -- ronda 4 (N-r4-1): a file in the section that the package's index does not list (the engine
+    -- never reads it; a build never writes it), named apart
+    each side in [["slot", a], ["built app", b]]
+        each p in side[1]["package_files"]
+            each n in p["unlisted"]
+                set out to append(out, "package " + p["hash"] + " in the " + side[0] + " carries '" + n + "', which its index does not list")
+    give out
+
+task files_by_name(entries)
+    let m be {}
+    each e in entries
+        set m[e["name"]] to e["bytes"]
+    give m
+
+-- per package, every file of its section in order with its sha256 (ronda 4, N-r4-1: the bytes the
+-- slot carries, not only what the engine reads)
+task packages_by_hash(pkgs)
+    let m be {}
+    each p in pkgs
+        set m[p["hash"]] to json_encode(apply(p["raw"], (f) => [f["name"], sha_hex(f["bytes"])]))
+    give m
+
+-- the slot carries more than its main program: other files (modules, templates, synsema.json) or
+-- packages, which a .syn cannot vouch for
+task carries_more(slot)
+    give length(slot["entries"]) > 1 or length(slot["packages"]) > 0
 
 -- the verdicts that need no network, from the module's bytes and the options: a list of
--- {"ok": bool, "line": text}; `source` is the --source file's bytes or nothing
+-- {"ok": bool, "line": text}; `source` is the --source file's bytes or nothing.
+-- What `--source` covers (v0.6.58, A3 of the audit's round 1): a built app (`synsema build … -o
+-- app.built`) is compared bundle against bundle, byte by byte — every file and every package; a .syn
+-- covers the main program only, so it is a failed check when the slot carries anything else.
 task local_checks(wasm, slot, source)
-    let out be [{"ok": true, "line": "app slot at offset " + text(slot["offset"]) + ": program " + slot["name"] + " (" + text(length(slot["program"])) + " bytes), sha256 " + sha_hex(slot["program"])}]
+    let pk be when length(slot["packages"]) == 0 then "" otherwise ", with " + text(length(slot["packages"])) + " package(s) in its bundle"
+    let out be [{"ok": true, "line": "app slot at offset " + text(slot["offset"]) + ": program " + slot["name"] + " (" + text(length(slot["program"])) + " bytes" + pk + "), sha256 " + sha_hex(slot["program"])}]
+    when carries_more(slot)
+        each e in slot["entries"]
+            set out to append(out, {"ok": true, "line": "  file " + e["name"] + " (" + text(length(e["bytes"])) + " bytes), sha256 " + sha_hex(e["bytes"])})
+        each h in slot["packages"]
+            set out to append(out, {"ok": true, "line": "  package " + h})
+        each p in slot["package_files"]
+            each n in p["unlisted"]
+                set out to append(out, {"ok": true, "line": "  package " + p["hash"] + " carries '" + n + "', which its index does not list (the engine does not read it)"})
     when source != nothing
+        when is_built(source)
+            when slot["format"] != 2
+                set out to append(out, {"ok": false, "line": "source: a built app, but the slot holds a single program (SYNSEMA.APPSLOT1): compare it with that program's .syn"})
+                give out
+            let mine be bundle_from_built(source)
+            let d be first_difference(slot["raw"], mine)
+            when d == nothing
+                set out to append(out, {"ok": true, "line": "source: the slot's bundle is identical to the built app's (" + text(length(slot["entries"])) + " file(s), " + text(length(slot["packages"])) + " package(s))"})
+            otherwise
+                -- ronda 2 (B-r2-1): a rebuild from the same source differs in `built_at` (the time
+                -- of the build): everything else is compared field by field and file by file
+                let diffs be bundle_differences(read_bundle(slot["raw"]), read_bundle(mine))
+                when length(diffs) == 0
+                    set out to append(out, {"ok": true, "line": "source: the slot's bundle has the built app's files, packages and manifest byte for byte; only built_at (the time of the build, not part of the app) differs"})
+                otherwise
+                    set out to append(out, {"ok": false, "line": "source: the slot's bundle DIFFERS from the built app's at byte " + text(d) + ": " + join(diffs, "; ")})
+            give out
         let d be first_difference(slot["program"], source)
         when d == nothing
-            set out to append(out, {"ok": true, "line": "source: identical to the program in the slot"})
+            when carries_more(slot)
+                set out to append(out, {"ok": false, "line": "source: identical to the main program, but the slot also carries " + text(length(slot["entries"]) - 1) + " other file(s) and " + text(length(slot["packages"])) + " package(s) that a .syn does not cover: pass the built app (synsema build … --engine-binary … -o app.built) as --source"})
+            otherwise
+                set out to append(out, {"ok": true, "line": "source: identical to the program in the slot"})
         otherwise
             set out to append(out, {"ok": false, "line": "source: DIFFERS from the program in the slot at byte " + text(d) + " (slot program " + text(length(slot["program"])) + " bytes, source " + text(length(source)) + " bytes)"})
     give out
 
--- the module against the release asset with the slot's program embedded: one verdict
+-- the module against the release asset with the slot's app embedded: one verdict. It vouches for
+-- the interpreter and for the slot holding the bytes listed above; what those bytes are is what
+-- `--source` compares.
 task compare_with_release(wasm, slot, asset)
-    let expected be embed_bytes(asset, slot["program"], slot["name"])
+    let expected be embed_slot(asset, slot)
     let d be first_difference(wasm, expected)
     when d == nothing
-        give {"ok": true, "line": "VERIFIED: the module is the release's interpreter with exactly this program in its slot"}
-    give {"ok": false, "line": "MISMATCH " + locate(d, slot["offset"]) + " (module " + text(length(wasm)) + " bytes, expected " + text(length(expected)) + ")"}
+        give {"ok": true, "line": "interpreter: the module is the release's interpreter with exactly the app listed above in its slot"}
+    give {"ok": false, "line": "MISMATCH " + locate(d, slot) + " (module " + text(length(wasm)) + " bytes, expected " + text(length(expected)) + ")"}
+
+-- `--extract <dir>` (ronda 2, B-r2-2): the whole tree the slot carries, to read what really runs —
+-- every file under its name and each package's files under pkg/<hash, `:` as `-`>/. Every name went
+-- through checked_name, so nothing lands outside <dir>. An APPSLOT1 slot holds one program: the
+-- name in its header is checked the same way.
+task extract_tree(slot, dir)
+    let all be []
+    each e in slot["entries"]
+        set all to append(all, {"name": checked_name(e["name"]), "bytes": e["bytes"]})
+    each p in slot["package_files"]
+        let key be replace(p["hash"], ":", "-")
+        when normal_name(key) != key or contains(key, "/")
+            raise("the bundle in the app slot names a package '" + p["hash"] + "' that is not a hash")
+        each f in p["files"]
+            set all to append(all, {"name": "pkg/" + key + "/" + f["name"], "bytes": f["bytes"]})
+    each f in all
+        let parts be split(f["name"], "/")
+        when length(parts) > 1
+            make_dir(dir + "/" + join(slice(parts, 0, length(parts) - 1), "/"))
+        otherwise
+            make_dir(dir)
+        write_file(dir + "/" + f["name"], f["bytes"])
+    give length(all)
+
+-- ronda 4 (B-r4-1): a package whose index asks for a newer synsema than the module's interpreter
+-- is one the guest refuses to load (project::check_min). The release's version comes from --release
+-- (`v0.6.58`); with --asset it is not known, and the line says so.
+task min_checks(slot, release)
+    let out be []
+    let have be when release == nothing then nothing otherwise version_triple(when starts_with(release, "v") then slice(release, 1, length(release)) otherwise release)
+    each p in slot["package_files"]
+        when p["min"] != nothing
+            let need be join(apply(p["min"], (x) => text(x)), ".")
+            when have == nothing
+                set out to append(out, {"ok": true, "line": "package " + p["hash"] + " needs synsema >= " + need + ": the interpreter must be that version or newer (not checked: no --release)"})
+            otherwise when not version_le(p["min"], have)
+                set out to append(out, {"ok": false, "line": "package " + p["hash"] + " needs synsema >= " + need + ", and the release is " + release + ": the guest refuses to load it"})
+    give out
 
 task audited_check(asset_sha, audited)
     let want be normalize_sha(audited)
@@ -253,16 +719,17 @@ task run_verify(o)
     let slot be slot_contents(wasm)
     print(o["module"] + ": " + text(length(wasm)) + " bytes, sha256 " + sha_hex(wasm) + "  (the wasmSha256 the chain checks)")
     when o["extract"] != nothing
-        write_file(o["extract"], slot["program"])
-        print("program written to " + o["extract"])
+        let written be extract_tree(slot, o["extract"])
+        print(text(written) + " file(s) written under " + o["extract"] + " (the whole tree the slot carries; packages under pkg/)")
     let source be when o["source"] == nothing then nothing otherwise read_file_bytes(o["source"])
     let verdicts be local_checks(wasm, slot, source)
     when o["release"] == nothing and o["asset"] == nothing
         each v in verdicts
             print(v["line"])
-        raise("--release <tag> is required: which Synsema release's interpreter should this module carry? (e.g. --release v0.6.23 — a program cannot read the CLI's version, and the module's interpreter is the release it was built from, not the synsema running this tool; --asset <guest.wasm> takes a local guest instead, unchecked against any release)")
+        raise("--release <tag> is required: which Synsema release's interpreter should this module carry? (e.g. --release v0.6.58 — a program cannot read the CLI's version, and the module's interpreter is the release it was built from, not the synsema running this tool; --asset <guest.wasm> takes a local guest instead, unchecked against any release)")
     let asset be when o["asset"] == nothing then release_asset(o["release"], o["cache"]) otherwise local_asset(o["asset"])
     set verdicts to append(verdicts, {"ok": true, "line": asset["line"]})
+    set verdicts to verdicts + min_checks(slot, o["release"])
     when o["audited"] != nothing
         set verdicts to append(verdicts, audited_check(asset["sha256"], o["audited"]))
     set verdicts to append(verdicts, compare_with_release(wasm, slot, asset["bytes"]))
@@ -273,6 +740,10 @@ task run_verify(o)
             set failed to failed + 1
     when failed > 0
         raise(text(failed) + " check(s) failed: do not deploy this module, and do not trust a deployment whose wasmSha256 is " + sha_hex(wasm))
+    when o["source"] == nothing
+        print("VERIFIED: the release's interpreter, with the app listed above in its slot (not compared with any source: --source app.built compares every file)")
+    otherwise
+        print("VERIFIED: the release's interpreter, with exactly the app of " + o["source"] + " in its slot")
     print("sha256 " + sha_hex(wasm) + " is safe to compare with the deploy descriptor's wasmSha256")
 
 let a be args()
@@ -285,24 +756,41 @@ otherwise
 -- Tests (pure: no network): `synsema test verify.syn`
 -- ---------------------------------------------------------------------------------------
 
--- some bytes, then a slot laid out EXACTLY as build.rs writes it (magic · name length · name ·
--- filler to byte 80 · u32 LE · program · filler to the end), then more bytes; `filler(k)` gives
--- the k filler bytes, so a test can pin which filler is the right one
+-- The first eight bytes of every wasm module: "\0asm" and version 1.
+let WASM_HEAD be bytes([0, 97, 115, 109, 1, 0, 0, 0])
+
+-- embed.syn's `bundle_from_program`: a bundle of one program, as `synsema build` writes it
+task bundle_of(program, name)
+    let manifest be bytes(json_encode({"format": 1, "engine": "embed.syn", "main": name, "ceiling": nothing, "profile": "native", "built_at": ""}))
+    let body be bytes(program)
+    let n be bytes(name)
+    let payload be u32_le(length(manifest)) + manifest + u32_le(1) + u16_le(length(n)) + n + u64_le(length(body)) + body
+    give payload + u64_le(0) + u64_le(length(payload)) + sha256(payload) + bytes(BUNDLE_MAGIC)
+
+-- some bytes, then a slot laid out EXACTLY as build.rs writes it (magic · u32 LE · bundle ·
+-- filler to the end), then more bytes; `filler(k)` gives the k filler bytes, so a test can pin
+-- which filler is the right one
 task build_rs_module(program, filler)
-    let n be bytes("app.syn")
-    let header be bytes(MAGIC) + bytes([length(n)]) + n + filler(63 - length(n)) + u32_le(length(bytes(program)))
-    give bytes(" asm    before ") + header + bytes(program) + filler(SLOT - HEADER - length(bytes(program))) + bytes(" after")
+    let b be bundle_of(program, "app.syn")
+    give WASM_HEAD + bytes(" before ") + bytes(MAGIC) + u32_le(length(b)) + b + filler(SLOT - HEADER - length(b)) + bytes(" after")
 
 task fake_module(program)
     give build_rs_module(program, (k) => fill(k))
 
-test "u32 little-endian, both ways"
+-- a module of v0.6.57 or older: the program as text under APPSLOT1
+task old_module(program)
+    let n be bytes("app.syn")
+    let header be bytes(OLD_MAGIC) + bytes([length(n)]) + n + fill(63 - length(n)) + u32_le(length(bytes(program)))
+    give WASM_HEAD + bytes(" before ") + header + bytes(program) + fill(SLOT - OLD_HEADER - length(bytes(program))) + bytes(" after")
+
+test "little-endian numbers, both ways"
     assert_eq(u32_le(1), bytes([1, 0, 0, 0]))
     assert_eq(u32_le(258), bytes([2, 1, 0, 0]))
-    assert_eq(u32_le_value(u32_le(16777217)), 16777217)
-    assert_eq(u32_le_value(u32_le(524204)), 524204)
+    assert_eq(le_number(u32_le(16777217)), 16777217)
+    assert_eq(le_number(u32_le(524268)), 524268)
+    assert_eq(le_number(u64_le(4294967297)), 4294967297)
 
-test "the filler is 0x20, as in build.rs: a module filled like build.rs verifies against itself, a zero-filled one mismatches in the header"
+test "the filler is 0x20, as in build.rs: a module filled like build.rs verifies against itself, a zero-filled one mismatches in the slot"
     assert_eq(fill(0), bytes([]))
     assert_eq(fill(3), bytes([32, 32, 32]))
     assert_eq(length(fill(SLOT)), SLOT)
@@ -312,24 +800,44 @@ test "the filler is 0x20, as in build.rs: a module filled like build.rs verifies
     let zeros be build_rs_module(program, (k) => int_to_bytes(0, k))
     let v be compare_with_release(zeros, slot_contents(zeros), zeros)
     assert(not v["ok"])
-    assert(contains(v["line"], "header"))
-    -- the first byte that differs is the first filler byte, right after the name
-    assert_eq(first_difference(m, zeros), slot_offset(m) + 17 + length(bytes("app.syn")))
+    assert(contains(v["line"], "inside the app slot"))
+    -- the first byte that differs is the first filler byte, right after the bundle
+    let s be slot_contents(m)
+    assert_eq(first_difference(m, zeros), slot_offset(m) + HEADER + length(s["raw"]))
 
-test "the slot is found and its name and program are read back"
+test "the slot is found and its program is read back out of the bundle"
     let program be "task deploy(ctx)\n    give {\"state\": {}}\n"
     let m be fake_module(program)
     let s be slot_contents(m)
-    assert_eq(s["offset"], 15)
+    assert_eq(s["offset"], 16)
+    assert_eq(s["format"], 2)
     assert_eq(s["name"], "app.syn")
     assert_eq(s["program"], bytes(program))
+    assert_eq(s["packages"], [])
     -- what embed.syn writes, verify.syn reads: a round trip through another program and name
-    let other be bytes("task deploy(ctx)\n    give {\"state\": {\"v\": 2}}\n")
-    let s2 be slot_contents(embed_bytes(m, other, "other.syn"))
+    let other be "task deploy(ctx)\n    give {\"state\": {\"v\": 2}}\n"
+    let s2 be slot_contents(embed_slot(m, {"format": 2, "raw": bundle_of(other, "other.syn")}))
     assert_eq(s2["name"], "other.syn")
-    assert_eq(s2["program"], other)
+    assert_eq(s2["program"], bytes(other))
     assert_error(() => slot_contents(bytes("no slot here")))
     assert_error(() => slot_contents(m + m))
+
+test "a module of v0.6.57 or older (APPSLOT1) still verifies"
+    let program be "task deploy(ctx)\n    give {\"state\": {}}\n"
+    let m be old_module(program)
+    let s be slot_contents(m)
+    assert_eq(s["format"], 1)
+    assert_eq(s["name"], "app.syn")
+    assert_eq(s["program"], bytes(program))
+    assert(compare_with_release(m, s, m)["ok"])
+    let asset be old_module("-- the example app the release ships with\n")
+    assert(compare_with_release(m, s, asset)["ok"])
+
+test "a bundle that does not check out is an error, not a program"
+    let m be fake_module("x")
+    let off be slot_offset(m)
+    let broken be slice(m, 0, off + HEADER + 10) + bytes("Z") + slice(m, off + HEADER + 11, length(m))
+    assert_error(() => slot_contents(broken))
 
 test "the first difference is found byte-exactly, in and out of the slot, and length counts"
     let m be fake_module("x")
@@ -349,25 +857,26 @@ test "the first difference is found byte-exactly, in and out of the slot, and le
     let mid be int_to_bytes(0, 70000) + bytes([1]) + int_to_bytes(0, 229999)
     assert_eq(first_difference(big, mid), 70000)
 
-test "a differing offset is located: interpreter before / after the slot, header, or program"
-    let off be 15
-    assert(contains(locate(3, off), "before it"))
-    assert(contains(locate(off + SLOT + 2, off), "after it"))
-    assert(contains(locate(off + 20, off), "header"))
-    assert(contains(locate(off + HEADER + 7, off), "program byte 7"))
+test "a differing offset is located: interpreter before / after the slot, header, or app"
+    let s be {"offset": 15, "format": 2}
+    assert(contains(locate(3, s), "before it"))
+    assert(contains(locate(15 + SLOT + 2, s), "after it"))
+    assert(contains(locate(15 + 10, s), "header"))
+    assert(contains(locate(15 + HEADER + 7, s), "app byte 7"))
+    assert(contains(locate(15 + 30, {"offset": 15, "format": 1}), "header"))
 
-test "the module is compared with the release asset plus the slot's program"
+test "the module is compared with the release asset plus the slot's app"
     let program be "task process(ctx)\n    give {\"state\": {}}\n"
     let asset be fake_module("-- the example app the release ships with\n")
-    let m be embed_bytes(asset, bytes(program), "app.syn")
+    let m be embed_slot(asset, {"format": 2, "raw": bundle_of(program, "app.syn")})
     let slot be slot_contents(m)
     assert(compare_with_release(m, slot, asset)["ok"])
-    -- the same program in a module whose interpreter differs by one byte: out of the slot
+    -- the same app in a module whose interpreter differs by one byte: out of the slot
     let tampered be bytes([66]) + slice(m, 1, length(m))
     let v be compare_with_release(tampered, slot_contents(tampered), asset)
     assert(not v["ok"])
     assert(contains(v["line"], "before it"))
-    -- a slot whose padding is not zero is not what embed.syn writes: inside the slot
+    -- a slot whose padding is not 0x20 is not what embed.syn writes: inside the slot
     let dirty be slice(m, 0, slot["offset"] + SLOT - 1) + bytes([7]) + slice(m, slot["offset"] + SLOT, length(m))
     let v2 be compare_with_release(dirty, slot_contents(dirty), asset)
     assert(not v2["ok"])
@@ -396,17 +905,340 @@ test "--audited compares the release asset's sha256, whatever way the sha is pas
     assert_error(() => sha_of_listing("garbage"))
 
 test "the command line: one module, options with values, nothing unknown"
-    let o be parse_args(["app.wasm", "--release", "v0.6.23", "--source", "app.syn", "--audited", "abc", "--cache", "build"])
+    let o be parse_args(["app.wasm", "--release", "v0.6.58", "--source", "app.syn", "--audited", "abc", "--cache", "build"])
     assert_eq(o["module"], "app.wasm")
-    assert_eq(o["release"], "v0.6.23")
+    assert_eq(o["release"], "v0.6.58")
     assert_eq(o["source"], "app.syn")
     assert_eq(o["audited"], "abc")
     assert_eq(o["cache"], "build")
     assert_eq(o["extract"], nothing)
     assert_eq(parse_args(["--extract", "out.syn", "app.wasm"])["extract"], "out.syn")
     assert_eq(parse_args(["app.wasm", "--asset", "guest.wasm"])["asset"], "guest.wasm")
-    assert_error(() => parse_args(["app.wasm", "--asset", "guest.wasm", "--release", "v0.6.23"]))
+    assert_error(() => parse_args(["app.wasm", "--asset", "guest.wasm", "--release", "v0.6.58"]))
     assert_error(() => parse_args(["app.wasm", "--release"]))
     assert_error(() => parse_args(["app.wasm", "--bogus", "x"]))
     assert_error(() => parse_args(["a.wasm", "b.wasm"]))
     assert_error(() => parse_args([]))
+
+-- a bundle of several files (`files`: [name, text] pairs), as `synsema build` writes it
+task bundle_of_files(files, main)
+    let manifest be bytes(json_encode({"format": 1, "engine": "test", "main": main, "ceiling": nothing, "profile": "native", "built_at": ""}))
+    let payload be u32_le(length(manifest)) + manifest + u32_le(length(files))
+    each f in files
+        let n be bytes(f[0])
+        let body be bytes(f[1])
+        set payload to payload + u16_le(length(n)) + n + u64_le(length(body)) + body
+    give payload + u64_le(0) + u64_le(length(payload)) + sha256(payload) + bytes(BUNDLE_MAGIC)
+
+-- a built app: an engine in front of the bundle, the trailer's offset being the engine's size
+task built_of(b)
+    let plen be length(b) - TRAILER
+    let engine be bytes("ENGINE")
+    give engine + slice(b, 0, plen) + u64_le(length(engine)) + u64_le(plen) + slice(b, plen + 16, plen + 48) + bytes(BUNDLE_MAGIC)
+
+test "--source: a .syn does not vouch for a bundle with more files; the built app is compared whole"
+    let app be "use \"./lib.syn\" as lib\ntask process(ctx)\n    give {\"t\": lib.T}\n"
+    let honest be bundle_of_files([["app.syn", app], ["lib.syn", "export let T be \"ok\"\n"]], "app.syn")
+    let evil be bundle_of_files([["app.syn", app], ["lib.syn", "export let T be \"OTRO CODIGO\"\n"]], "app.syn")
+    let asset be fake_module("-- the example app the release ships with\n")
+    let mh be embed_slot(asset, {"format": 2, "raw": honest})
+    let me be embed_slot(asset, {"format": 2, "raw": evil})
+    let sh be slot_contents(mh)
+    let se be slot_contents(me)
+    -- each file is listed with its sha256
+    let listed be join(apply(local_checks(me, se, nothing), (v) => v["line"]), "\n")
+    assert(contains(listed, "file lib.syn"), listed)
+    assert(contains(listed, sha_hex(bytes("export let T be \"OTRO CODIGO\"\n"))), listed)
+    -- the main program alone is never enough: the check fails for both modules
+    each pair in [[mh, sh], [me, se]]
+        let v be local_checks(pair[0], pair[1], bytes(app))
+        let last be v[length(v) - 1]
+        assert(not last["ok"], last["line"])
+        assert(contains(last["line"], "does not cover"), last["line"])
+    -- the built app of the honest bundle: the honest module matches, the evil one differs
+    let built be built_of(honest)
+    let ok be local_checks(mh, sh, built)
+    assert(ok[length(ok) - 1]["ok"], ok[length(ok) - 1]["line"])
+    let bad be local_checks(me, se, built)
+    assert(not bad[length(bad) - 1]["ok"], bad[length(bad) - 1]["line"])
+    assert(contains(bad[length(bad) - 1]["line"], "DIFFERS"))
+
+-- a package as `synsema get` installs it: its index lists m.syn with its sha256. The hash was computed
+-- apart from this file (sha256sum over the sorted lines) and is the one of modtable's test
+-- `the_tree_hash_of_a_known_package` (ronda 3, M-r3-1)
+let PKG_INDEX be "{\"id\": \"https://r.example/p\", \"version\": \"0.1.0\", \"main\": \"m.syn\", \"files\": [{\"path\": \"m.syn\", \"sha256\": \"21bbab734f4f606cb951fe6f7f586606da275a417852e54ec1f406fe4321503d\"}]}"
+let PKG_HASH be "tree-sha256:3164aa678c8f770b5c57bd2d5d9daef3b69425c84320c50db0be0717b369b6cf"
+
+test "a package in the slot is read as the engine reads it: no repeats, its hash, only what its index lists"
+    let app be "use \"p\" as p\ntask process(ctx)\n    give {\"t\": p.P}\n"
+    let asset be fake_module("-- the example app the release ships with\n")
+    let slot_of be (pfiles) => embed_slot(asset, {"format": 2, "raw": bundle_with_package([["app.syn", app]], "app.syn", PKG_HASH, pfiles)})
+    let good be [["synsema.json", PKG_INDEX], ["m.syn", "export let P be 1\n"]]
+    let s be slot_contents(slot_of(good))
+    assert_eq(length(s["package_files"][0]["files"]), 2)
+    -- the engine reads the first m.syn (the one the hash fixes); a second one is refused, not shown
+    let r be refusal(() => slot_contents(slot_of(append(good, ["m.syn", "export let P be \"senuelo\"\n"]))))
+    assert(contains(r, "has the path 'm.syn' twice"), r)
+    -- a file the index does not list is never read by the engine: not shown, not extracted
+    let extra be slot_contents(slot_of(append(good, ["x.syn", "export let X be 1\n"])))
+    assert_eq(json_encode(apply(extra["package_files"][0]["files"], (f) => f["name"])), "[\"synsema.json\", \"m.syn\"]")
+    -- other bytes for m.syn: the engine refuses to load it, so the slot is not one that runs
+    let r2 be refusal(() => slot_contents(slot_of([["synsema.json", PKG_INDEX], ["m.syn", "export let P be 2\n"]])))
+    assert(contains(r2, "do not match its hash"), r2)
+    -- another index (each file still matches it): the tree is not the package's hash
+    let r2b be refusal(() => slot_contents(slot_of([["synsema.json", replace(PKG_INDEX, "0.1.0", "0.1.1")], ["m.syn", "export let P be 1\n"]])))
+    assert(contains(r2b, "do not match its hash"), r2b)
+    -- the same package twice
+    let two be bundle_with_package([["app.syn", app]], "app.syn", PKG_HASH, good)
+    let r3 be refusal(() => slot_contents(embed_slot(asset, {"format": 2, "raw": with_package_twice(two)})))
+    assert(contains(r3, "appears twice"), r3)
+    assert_eq(tree_of([sha_hex(bytes("export let P be 1\n")) + "  m.syn\n", sha_hex(bytes(PKG_INDEX)) + "  synsema.json\n"]), PKG_HASH)
+
+-- the bundle of `bundle_with_package` with its package section twice (the count says 2)
+task with_package_twice(b)
+    let plen be le_number(slice(b, length(b) - TRAILER + 8, length(b) - TRAILER + 16))
+    let payload be slice(b, 0, plen)
+    let mlen be le_number(slice(payload, 0, 4))
+    let manifest be json_decode(decode(slice(payload, 4, 4 + mlen)))
+    let pos be 4 + mlen
+    let n be le_number(slice(payload, pos, pos + 4))
+    set pos to pos + 4
+    let i be 0
+    while i < n
+        let nl be le_number(slice(payload, pos, pos + 2))
+        set pos to pos + 2 + nl
+        set pos to pos + 8 + le_number(slice(payload, pos, pos + 8))
+        set i to i + 1
+    let section be slice(payload, pos + 4, plen)
+    let man be bytes(json_encode(merge(manifest, {"packages": [manifest["packages"][0], manifest["packages"][0]]})))
+    let head be u32_le(length(man)) + man + slice(payload, 4 + mlen, pos)
+    let out be head + u32_le(2) + section + section
+    give out + u64_le(0) + u64_le(length(out)) + sha256(out) + bytes(BUNDLE_MAGIC)
+
+-- a bundle with one package (the section of bundle.rs after the entries)
+task bundle_with_package(files, main, hash, pfiles)
+    let manifest be bytes(json_encode({"format": 1, "engine": "test", "main": main, "ceiling": nothing, "profile": "native", "built_at": "", "packages": [hash]}))
+    let payload be u32_le(length(manifest)) + manifest + u32_le(length(files))
+    each f in files
+        let n be bytes(f[0])
+        let body be bytes(f[1])
+        set payload to payload + u16_le(length(n)) + n + u64_le(length(body)) + body
+    set payload to payload + u32_le(1) + u16_le(length(bytes(hash))) + bytes(hash) + u32_le(length(pfiles))
+    each f in pfiles
+        let n be bytes(f[0])
+        let body be bytes(f[1])
+        set payload to payload + u16_le(length(n)) + n + u64_le(length(body)) + body
+    give payload + u64_le(0) + u64_le(length(payload)) + sha256(payload) + bytes(BUNDLE_MAGIC)
+
+task refusal(f)
+    try
+        f()
+    recover e
+        give text(e)
+    give "no error"
+
+test "a slot the engine would not read is refused (app.syn and ./app.syn); --extract writes the whole tree"
+    let app be "use \"./lib.syn\" as lib\ntask process(ctx)\n    give {\"t\": lib.T}\n"
+    let asset be fake_module("-- the example app the release ships with\n")
+    -- the guest runs the last of two names that normalize alike: verify.syn must not show the first
+    let dup be bundle_of_files([["app.syn", app], ["./app.syn", "task process(ctx)\n    give {\"t\": \"MALO\"}\n"]], "app.syn")
+    let r be refusal(() => slot_contents(embed_slot(asset, {"format": 2, "raw": dup})))
+    assert(contains(r, "'./app.syn' is not normalized"), r)
+    let twice be bundle_of_files([["app.syn", app], ["app.syn", app]], "app.syn")
+    let r2 be refusal(() => slot_contents(embed_slot(asset, {"format": 2, "raw": twice})))
+    assert(contains(r2, "appears twice"), r2)
+    assert_eq(normal_name("a/../b"), "b")
+    assert_eq(normal_name("../x"), nothing)
+    assert_eq(normal_name("C:/x"), nothing)
+    -- the tree: every file and the package's files, not only the main program
+    let h be PKG_HASH
+    let ok be bundle_with_package([["app.syn", app], ["lib/x.syn", "export let T be \"ok\"\n"]], "app.syn", h, [["synsema.json", PKG_INDEX], ["m.syn", "export let P be 1\n"]])
+    let s be slot_contents(embed_slot(asset, {"format": 2, "raw": ok}))
+    let dir be ".verify-extract-test"
+    assert_eq(extract_tree(s, dir), 4)
+    assert_eq(read_file(dir + "/app.syn"), app)
+    assert_eq(read_file(dir + "/lib/x.syn"), "export let T be \"ok\"\n")
+    assert_eq(read_file(dir + "/pkg/" + replace(h, ":", "-") + "/m.syn"), "export let P be 1\n")
+    delete_dir(dir, {"recursive": true})
+    -- a package file named outside its folder is refused too
+    let bad be bundle_with_package([["app.syn", app]], "app.syn", h, [["../../evil.syn", "x"]])
+    let r3 be refusal(() => slot_contents(embed_slot(asset, {"format": 2, "raw": bad})))
+    assert(contains(r3, "is not normalized"), r3)
+
+-- a bundle with a given manifest (the rebuild of B-r2-1)
+task bundle_with_manifest(files, manifest_map)
+    let manifest be bytes(json_encode(manifest_map))
+    let payload be u32_le(length(manifest)) + manifest + u32_le(length(files))
+    each f in files
+        let n be bytes(f[0])
+        let body be bytes(f[1])
+        set payload to payload + u16_le(length(n)) + n + u64_le(length(body)) + body
+    give payload + u64_le(0) + u64_le(length(payload)) + sha256(payload) + bytes(BUNDLE_MAGIC)
+
+test "--source with a rebuilt app: only built_at may differ, anything else is named"
+    let app be "use \"./lib.syn\" as lib\ntask process(ctx)\n    give {\"t\": lib.T}\n"
+    let files be [["app.syn", app], ["lib.syn", "export let T be \"ok\"\n"]]
+    let man be {"format": 1, "engine": "0.6.58", "main": "app.syn", "ceiling": nothing, "profile": "native", "built_at": "2026-11-08T10:00:00Z"}
+    let asset be fake_module("-- the example app the release ships with\n")
+    let m be embed_slot(asset, {"format": 2, "raw": bundle_with_manifest(files, man)})
+    let s be slot_contents(m)
+    let last be (v) => v[length(v) - 1]
+    -- the same app built an hour later: verified, and the line says what was left out
+    let later be merge(man, {"built_at": "2026-11-08T11:00:00Z"})
+    let ok be last(local_checks(m, s, built_of(bundle_with_manifest(files, later))))
+    assert(ok["ok"], ok["line"])
+    assert(contains(ok["line"], "only built_at"), ok["line"])
+    -- another engine: not verified, and the field is named
+    let other be merge(later, {"engine": "0.6.57"})
+    let bad be last(local_checks(m, s, built_of(bundle_with_manifest(files, other))))
+    assert(not bad["ok"], bad["line"])
+    assert(contains(bad["line"], "manifest engine (slot \"0.6.58\", built app \"0.6.57\")"), bad["line"])
+    -- a file changed: named with both sha256
+    let changed be [["app.syn", app], ["lib.syn", "export let T be \"OTRO\"\n"]]
+    let bad2 be last(local_checks(m, s, built_of(bundle_with_manifest(changed, later))))
+    assert(not bad2["ok"], bad2["line"])
+    assert(contains(bad2["line"], "file lib.syn (slot sha256 "), bad2["line"])
+    -- a file more: named
+    let more be last(local_checks(m, s, built_of(bundle_with_manifest(files + [["x.syn", "1"]], later))))
+    assert(contains(more["line"], "file x.syn only in the built app"), more["line"])
+
+-- ---- ronda 4 (B-r4-1, N-r4-1): what the engine refuses to load is refused here ----
+
+-- a package's tree hash and index from its files ([path, text] pairs)
+task pkg_hash_of(index, files)
+    let lines be [sha_hex(bytes(index)) + "  synsema.json\n"]
+    each f in files
+        set lines to append(lines, sha_hex(bytes(f[1])) + "  " + f[0] + "\n")
+    give tree_of(lines)
+
+task index_with(fields, files)
+    give json_encode(merge(fields, {"files": apply(files, (f) => {"path": f[0], "sha256": sha_hex(bytes(f[1]))})}))
+
+-- a bundle with a manifest that lists `mhashes`, the package `sections` ([hash, files]) and `tail`
+-- after them
+task bundle_custom(files, main, mhashes, sections, tail)
+    let manifest be bytes(json_encode({"format": 1, "engine": "test", "main": main, "ceiling": nothing, "profile": "native", "built_at": "", "packages": mhashes}))
+    let payload be u32_le(length(manifest)) + manifest + u32_le(length(files))
+    each f in files
+        let n be bytes(f[0])
+        let body be bytes(f[1])
+        set payload to payload + u16_le(length(n)) + n + u64_le(length(body)) + body
+    set payload to payload + u32_le(length(sections))
+    each sec in sections
+        set payload to payload + u16_le(length(bytes(sec[0]))) + bytes(sec[0]) + u32_le(length(sec[1]))
+        each f in sec[1]
+            let n be bytes(f[0])
+            let body be bytes(f[1])
+            set payload to payload + u16_le(length(n)) + n + u64_le(length(body)) + body
+    set payload to payload + bytes(tail)
+    give payload + u64_le(0) + u64_le(length(payload)) + sha256(payload) + bytes(BUNDLE_MAGIC)
+
+let R4_APP be "use \"p\" as p\ntask process(ctx)\n    give {\"t\": p.P}\n"
+let R4_BASE be {"id": "https://r.example/p", "version": "0.1.0", "main": "m.syn"}
+let R4_M be [["m.syn", "export let P be 1\n"]]
+
+-- the slot of a module whose bundle carries one package with `index` and `files`, under their own hash
+task slot_with_index(index, files)
+    let h be pkg_hash_of(index, files)
+    let raw be bundle_with_package([["app.syn", R4_APP]], "app.syn", h, [["synsema.json", index]] + files)
+    give embed_slot(fake_module("-- the example app the release ships with\n"), {"format": 2, "raw": raw})
+
+test "a package index the engine refuses is refused, with the hash right (ronda 4, B-r4-1)"
+    -- the honest one reads
+    let s be slot_contents(slot_with_index(index_with(R4_BASE, R4_M), R4_M))
+    assert_eq(length(s["package_files"][0]["files"]), 2)
+    let refused be (index, files) => refusal(() => slot_contents(slot_with_index(index, files)))
+    let sp be [["m y.syn", "export let P be 1\n"]]
+    let ab be [["a", "x"], ["a/m.syn", "export let P be 1\n"]]
+    let ads be [["m.syn", "export let P be 1\n"], ["m.syn:oculto", "zzz"]]
+    let caps be [["m.syn", "export let P be 1\n"], ["M.syn", "x"]]
+    let con be [["m.syn", "export let P be 1\n"], ["con.txt", "x"]]
+    let cases be [
+        ["no main", index_with({"id": "https://r.example/p", "version": "0.1.0"}, R4_M), R4_M],
+        ["a main it does not list", index_with(merge(R4_BASE, {"main": "otro.syn"}), R4_M), R4_M],
+        ["the index as its main (ronda 5, B-r5-2)", index_with(merge(R4_BASE, {"main": "synsema.json"}), R4_M), R4_M],
+        ["a repeated main, the index last", replace(index_with(R4_BASE, R4_M), "\"files\":", "\"main\":\"synsema.json\",\"files\":"), R4_M],
+        ["no id nor version", index_with({"main": "m.syn"}, R4_M), R4_M],
+        ["a BOM", "\u{feff}" + index_with(R4_BASE, R4_M), R4_M],
+        ["an unknown key", index_with(merge(R4_BASE, {"xyz": 1}), R4_M), R4_M],
+        ["a path with a space", index_with(merge(R4_BASE, {"main": "m y.syn"}), sp), sp],
+        ["a path that is a folder of another", index_with(merge(R4_BASE, {"main": "a/m.syn"}), ab), ab],
+        ["a path with a colon", index_with(R4_BASE, ads), ads],
+        ["two paths that differ in case", index_with(R4_BASE, caps), caps],
+        ["a name Windows reserves", index_with(R4_BASE, con), con],
+        ["a minimum that is not three numbers", index_with(merge(R4_BASE, {"synsema": "0.6"}), R4_M), R4_M],
+        ["an id that is not text", index_with(merge(R4_BASE, {"id": 1}), R4_M), R4_M],
+        ["a module entry without url", index_with(merge(R4_BASE, {"modules": {"q": {"version": "1.0.0"}}}), R4_M), R4_M],
+        ["a module name in capitals", index_with(merge(R4_BASE, {"modules": {"Q": {"url": "https://r.example/q"}}}), R4_M), R4_M],
+        ["a files entry with another key", replace(index_with(R4_BASE, R4_M), "\"path\"", "\"x\": 1, \"path\""), R4_M]
+    ]
+    each c in cases
+        let r be refused(c[1], c[2])
+        assert(contains(r, "do not match its hash"), c[0] + ": " + r)
+    -- the same index with what the engine accepts reads: modules and indirect entries, a minimum
+    let fine be merge(R4_BASE, {"synsema": "0.6.0", "modules": {"q": {"url": "https://r.example/q", "requires": ["net"]}}, "indirect": {"https://r.example/z": {"url": "https://r.example/z", "hash": "h"}}})
+    assert_eq(length(slot_contents(slot_with_index(index_with(fine, R4_M), R4_M))["package_files"]), 1)
+
+test "the package section is the manifest's, with nothing after it (ronda 4, B-r4-1)"
+    let asset be fake_module("-- the example app the release ships with\n")
+    let index be index_with(R4_BASE, R4_M)
+    let h be pkg_hash_of(index, R4_M)
+    let good be [["synsema.json", index]] + R4_M
+    let other be "tree-sha256:" + sha_hex(bytes("otro"))
+    let read be (raw) => refusal(() => slot_contents(embed_slot(asset, {"format": 2, "raw": raw})))
+    assert_eq(read(bundle_custom([["app.syn", R4_APP]], "app.syn", [h], [[h, good]], "")), "no error")
+    let r1 be read(bundle_custom([["app.syn", R4_APP]], "app.syn", [other], [[h, good]], ""))
+    assert(contains(r1, "the package section does not match the manifest"), r1)
+    let r2 be read(bundle_custom([["app.syn", R4_APP]], "app.syn", [h, other], [[h, good]], ""))
+    assert(contains(r2, "the package section does not match the manifest"), r2)
+    let r3 be read(bundle_custom([["app.syn", R4_APP]], "app.syn", [h], [[h, good]], "BYTES-DE-MAS"))
+    assert(contains(r3, "trailing bytes after the last entry"), r3)
+    -- a manifest with packages and no section; a section the manifest does not list (the engine
+    -- does not read it: bytes after the entries)
+    let r4 be read(bundle_of_files([["app.syn", R4_APP]], "app.syn"))
+    assert_eq(r4, "no error")
+    let man be {"format": 1, "engine": "test", "main": "app.syn", "ceiling": nothing, "profile": "native", "built_at": "", "packages": [h]}
+    let r5 be read(bundle_with_manifest([["app.syn", R4_APP]], man))
+    assert(contains(r5, "no package section"), r5)
+    let r6 be read(bundle_custom([["app.syn", R4_APP]], "app.syn", [], [[h, good]], ""))
+    assert(contains(r6, "trailing bytes after the last entry"), r6)
+
+test "a package that needs a newer synsema than the release fails the check (ronda 4, B-r4-1)"
+    let index be index_with(merge(R4_BASE, {"synsema": "9.0.0"}), R4_M)
+    let s be slot_contents(slot_with_index(index, R4_M))
+    let bad be min_checks(s, "v0.6.58")
+    assert_eq(length(bad), 1)
+    assert(not bad[0]["ok"], bad[0]["line"])
+    assert(contains(bad[0]["line"], "needs synsema >= 9.0.0, and the release is v0.6.58"), bad[0]["line"])
+    -- with --asset the version is not known: said, not failed
+    let note be min_checks(s, nothing)
+    assert(note[0]["ok"] and contains(note[0]["line"], "not checked"), note[0]["line"])
+    -- an older minimum passes silently; the boundary is inclusive
+    let ok be slot_contents(slot_with_index(index_with(merge(R4_BASE, {"synsema": "0.6.58"}), R4_M), R4_M))
+    assert_eq(min_checks(ok, "v0.6.58"), [])
+    assert(not min_checks(ok, "v0.6.57")[0]["ok"])
+
+test "--source names a file the package's index does not list (ronda 4, N-r4-1)"
+    let index be index_with(R4_BASE, R4_M)
+    let h be pkg_hash_of(index, R4_M)
+    let asset be fake_module("-- the example app the release ships with\n")
+    let good be bundle_with_package([["app.syn", R4_APP]], "app.syn", h, [["synsema.json", index]] + R4_M)
+    let extra be bundle_with_package([["app.syn", R4_APP]], "app.syn", h, [["synsema.json", index]] + R4_M + [["x.bin", "CARGA OCULTA QUE NADIE LEE"]])
+    let wasm be embed_slot(asset, {"format": 2, "raw": extra})
+    let s be slot_contents(wasm)
+    -- the engine never reads x.bin: not among the files, named in the listing
+    assert_eq(json_encode(apply(s["package_files"][0]["files"], (f) => f["name"])), "[\"synsema.json\", \"m.syn\"]")
+    let listing be join(apply(local_checks(wasm, s, nothing), (v) => v["line"]), "\n")
+    assert(contains(listing, "carries 'x.bin', which its index does not list"), listing)
+    -- against the honest build: not "byte for byte", the file is named and the check fails
+    let v be local_checks(wasm, s, built_of(good))
+    let last be v[length(v) - 1]
+    assert(not last["ok"], last["line"])
+    assert(not contains(last["line"], "byte for byte"), last["line"])
+    assert(contains(last["line"], "in the slot carries 'x.bin', which its index does not list"), last["line"])
+    -- the same files in another order in the section: the bytes differ, and the check says so
+    let swapped be bundle_with_package([["app.syn", R4_APP]], "app.syn", h, R4_M + [["synsema.json", index]])
+    let ws be embed_slot(asset, {"format": 2, "raw": swapped})
+    let vs be local_checks(ws, slot_contents(ws), built_of(good))
+    assert(not vs[length(vs) - 1]["ok"], vs[length(vs) - 1]["line"])
+    assert(contains(vs[length(vs) - 1]["line"], "has other files or another order"), vs[length(vs) - 1]["line"])

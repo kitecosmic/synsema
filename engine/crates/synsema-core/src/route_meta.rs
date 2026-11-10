@@ -446,6 +446,13 @@ impl StaticProgram {
                 if path.starts_with("trusted:") {
                     continue;
                 }
+                // v0.6.58 (N16): un nombre, como al correr: el `main` del paquete, leído y verificado.
+                if matches!(crate::modtable::classify(path), Ok(crate::modtable::UseKind::Name)) {
+                    let (shown, src) = crate::modtable::static_main(file_path, path)?;
+                    let prog = crate::parser::parse_source(&src, &shown).map_err(|e| e.to_string())?;
+                    modules.insert(alias.clone(), prog);
+                    continue;
+                }
                 let resolved = crate::templates::resolve_module_path(path, &base_dir, Some(&base_dir))
                     .map_err(|e| format!("{}: {}", file_path, e))?;
                 let src = match crate::bundle::get(&resolved) {

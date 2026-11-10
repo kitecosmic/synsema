@@ -30,3 +30,8 @@ mod v0652_cli;
 mod v0653_cli;
 mod v0654_cli;
 mod v0657_cli;
+mod v0658_build_cli;
+mod v0658_get_cli;
+mod v0658_init_cli;
+mod v0658_receipt_cli;
+mod v0658_run_program_cli;

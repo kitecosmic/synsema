@@ -215,7 +215,7 @@ impl DatabaseManager {
             }
             let rooted = path.starts_with('/') || matches!(path.as_bytes(), [c, b':', ..] if c.is_ascii_alphabetic());
             let path = if rooted || path == ":memory:" { path } else { format!("./{}", path) };
-            let conn = match mode {
+            let mut conn = match mode {
                 "readonly" => Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY),
                 "memory" => Connection::open_in_memory(),
                 _ => Connection::open(&path),
@@ -252,7 +252,9 @@ impl DatabaseManager {
                     }
                     _ => Authorization::Allow,
                 }
-            }));
+            }))
+            // rusqlite 0.41: instalarlo puede fallar; sin él no hay cierre de ATTACH, así que no se abre.
+            .map_err(sqlite_err)?;
             self.connections.insert(key.clone(), Backend::Sqlite(conn));
             if self.default_db.is_none() {
                 self.default_db = Some(key.clone());
@@ -618,6 +620,14 @@ fn sqlite_err(e: rusqlite::Error) -> String {
             e
         );
     }
+    // M-r8-1 (v0.6.58): `rusqlite` 0.41 rechaza una cola con otra sentencia. Antes (0.30) corría la
+    // primera y descartaba el resto sin avisar; el error ahora dice qué hacer.
+    if matches!(e, rusqlite::Error::MultipleStatement) {
+        // Ronda 9: sin «after the first ';'» (un ';' dentro de un texto señalaba el equivocado) ni
+        // «inside a transaction» (en `serve` las rutas comparten la conexión: un BEGIN de una ruta
+        // envuelve las escrituras de las otras, M-r9-1).
+        return "one SQL statement per call: this call has more than one (sql, sql_exec and sql_batch run one; before v0.6.58 the rest was dropped without a word); run each statement with its own call".to_string();
+    }
     e.to_string()
 }
 
@@ -625,7 +635,7 @@ fn sqlite_query(conn: &Connection, sql: &str, params: &[SynValue]) -> Result<Vec
     let pv: Vec<Value> = params.iter().map(syn_to_value).collect();
     let mut stmt = conn.prepare(sql).map_err(sqlite_err)?;
     // Las columnas como claves una vez por consulta: cada fila suma una referencia (F4.4).
-    let cols: Vec<Key> = stmt.column_names().iter().map(|s| Key::from(*s)).collect();
+    let cols: Vec<Key> = stmt.column_names().map(Key::from).collect();
     let mut rows = stmt
         .query(params_from_iter(pv.iter()))
         .map_err(sqlite_err)?;
@@ -2492,6 +2502,23 @@ mod tests {
         }
         let e = m.execute("SELECT nada FROM ningun_lado", &[]).unwrap_err();
         assert!(!e.contains("db_open"), "otro error queda igual: {}", e);
+    }
+
+    /// M-r8-1 (v0.6.58): con `rusqlite` 0.41, otra sentencia después del primer `;` es un error que
+    /// dice qué hacer (antes corría la primera y descartaba el resto). No corre ninguna; una cola
+    /// con espacios, `;` o un comentario sigue andando.
+    #[test]
+    fn m_r8_1_more_than_one_statement_is_a_guided_error() {
+        let mut m = DatabaseManager::new();
+        m.open(":memory:", "memory").unwrap();
+        let guided = |e: String| assert!(e.starts_with("one SQL statement per call") && e.contains("its own call"), "{}", e);
+        guided(m.execute("CREATE TABLE u (x); CREATE TABLE v (y)", &[]).unwrap_err());
+        guided(m.query("SELECT 1 AS one; SELECT 2 AS two", &[]).unwrap_err());
+        guided(m.execute_many("CREATE TABLE w (x); SELECT 1", &[vec![]]).unwrap_err());
+        assert!(m.query("SELECT name FROM sqlite_master", &[]).unwrap().is_empty(), "no corrió la primera");
+        for q in ["SELECT 1 AS one; -- un comentario", "SELECT 1 AS one;   ", "SELECT 1 AS one;;"] {
+            assert_eq!(m.query(q, &[]).unwrap().len(), 1, "{}", q);
+        }
     }
 
     fn has_returning(sql: &str, d: SqlDialect) -> bool {

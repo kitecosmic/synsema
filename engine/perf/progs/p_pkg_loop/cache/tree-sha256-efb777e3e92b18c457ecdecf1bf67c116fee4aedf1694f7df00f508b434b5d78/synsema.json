@@ -1,0 +1,11 @@
+{
+  "id": "example.com/b",
+  "version": "0.1.0",
+  "main": "m.syn",
+  "files": [
+    {
+      "path": "m.syn",
+      "sha256": "9a6094c92ac6760504c273ff013579e04044eee99d009f2e991a2f64fee77af2"
+    }
+  ]
+}

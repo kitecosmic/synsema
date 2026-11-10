@@ -763,8 +763,13 @@ fn binop_arrays_f64(a: &ArrayD<f64>, b: &ArrayD<f64>, op: &str) -> Result<SynVal
     match broadcast_shape(a.shape(), b.shape()) {
         None => Err(err(format!("arrays of shape {:?} and {:?} are not broadcastable", a.shape(), b.shape()))),
         Some(shape) => {
-            let va = a.broadcast(IxDyn(&shape)).unwrap().to_owned();
-            let vb = b.broadcast(IxDyn(&shape)).unwrap().to_owned();
+            // v0.6.58 (ronda 3, rendimiento): un operando que ya tiene la forma del resultado no se
+            // difunde: `clone` da el mismo arreglo (valores y orden en memoria) que
+            // `broadcast(..).to_owned()` de su vista identidad, sin `upcast` ni `strides_equivalent`,
+            // que el reparto de LTO a veces deja sin inlinear (+0,65 % en `s_arrays_small`).
+            let own = |x: &ArrayD<f64>| if x.shape() == &shape[..] { x.clone() } else { x.broadcast(IxDyn(&shape)).unwrap().to_owned() };
+            let va = own(a);
+            let vb = own(b);
             let out = match op {
                 "+" => va + vb,
                 "-" => va - vb,

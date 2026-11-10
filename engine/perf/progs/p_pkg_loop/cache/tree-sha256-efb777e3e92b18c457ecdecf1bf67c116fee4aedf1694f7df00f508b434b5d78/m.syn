@@ -1,0 +1,5 @@
+export task suma(n)
+    let s be 0
+    each i in range(0, n)
+        set s to (s + i * 2) % 1000003
+    give s

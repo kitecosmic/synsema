@@ -360,7 +360,10 @@ impl ScopedFreeze {
                 let mut handles = Vec::with_capacity(threads);
                 let mut err = None;
                 for t in 0..threads {
-                    match std::thread::Builder::new().stack_size(stack).spawn_scoped(sc, move || work(ctx, t)) {
+                    match std::thread::Builder::new().stack_size(stack).spawn_scoped(sc, move || {
+                        crate::stack::enter_thread(stack);
+                        work(ctx, t)
+                    }) {
                         Ok(h) => handles.push(h),
                         Err(e) => {
                             err = Some(e);

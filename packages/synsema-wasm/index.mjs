@@ -393,6 +393,53 @@ function requestOf(op, source, opts = {}) {
   return r;
 }
 
+/**
+ * v0.6.58 (§12, E-12) — el proyecto de una llamada: `project` (el texto de `synsema.json`, o el
+ * objeto) y `packages` (`{"tree-sha256:…": {"<ruta>": "<texto>"}}`). Los de la llamada van sobre los
+ * de `load`/`loadNode`: el `project` de la llamada reemplaza al de la instancia y sus `packages` se
+ * suman a los de la instancia.
+ */
+function withProject(request, defaults, opts) {
+  const project = opts.project ?? defaults.project;
+  if (project == null) {
+    if (opts.packages != null) request.packages = opts.packages;
+    return request;
+  }
+  request.project = typeof project === "string" ? project : JSON.stringify(project);
+  const packages = { ...(defaults.packages ?? {}), ...(opts.packages ?? {}) };
+  if (Object.keys(packages).length > 0) request.packages = packages;
+  return request;
+}
+
+/**
+ * W9: lo que la instancia de wasm ya verificó no se vuelve a mandar (ni a copiar al Worker): el
+ * motor lo tiene guardado por su hash, que es el del contenido. `held` es el conjunto de esa
+ * instancia; se actualiza con `packages_held` de cada respuesta.
+ */
+function withoutHeld(request, held) {
+  if (!request.packages || !held || held.size === 0) return request;
+  const left = {};
+  let dropped = false;
+  for (const [h, files] of Object.entries(request.packages)) {
+    if (held.has(h)) dropped = true;
+    else left[h] = files;
+  }
+  if (!dropped) return request;
+  const r = { ...request };
+  if (Object.keys(left).length > 0) r.packages = left;
+  else delete r.packages;
+  return r;
+}
+
+function noteHeld(holder, response) {
+  // M6 (ronda 1): una respuesta sin `packages_held` (o un error, en `_dispatch`) no dice qué guarda
+  // la instancia, que pudo recrearse: se olvida todo y la próxima llamada manda los paquetes. Ronda 2
+  // (N-r2-3): el motor lo pone en TODA respuesta suya (`version`, sin proyecto, un error), así que
+  // sólo falta cuando no respondió el motor (un trap, el resultado que arma el Worker).
+  holder._held = response && Array.isArray(response.packages_held) ? new Set(response.packages_held) : null;
+  return response;
+}
+
 function normalizeRequest(request) {
   const headers = Array.isArray(request.headers)
     ? request.headers
@@ -422,6 +469,12 @@ export class Synsema {
     }
     this._startMs = opts.startMs;
     this._bridges = [];
+    // v0.6.58 (§12): el proyecto y los paquetes de todas las llamadas de esta instancia.
+    this._defaults = { project: opts.project, packages: opts.packages };
+  }
+
+  _req(op, source, opts) {
+    return withProject(requestOf(op, source, opts), this._defaults, opts);
   }
 
   /** Carga el .wasm (bytes, Module, URL/path, Response). */
@@ -471,7 +524,7 @@ export class Synsema {
     const inst = this._instSync();
     this._host = host;
     try {
-      return inst.call(request);
+      return noteHeld(inst, inst.call(withoutHeld(request, inst._held)));
     } catch (e) {
       // Un trap deja la instancia inservible: se recrea ya (sincrónico, con el Module compilado),
       // así la próxima llamada anda sin `await syn.ready()` (v0.6.45, D4). Si el host no deja
@@ -508,16 +561,16 @@ export class Synsema {
     return this._callSync({ op: "version" }).version;
   }
   run(source, opts = {}) {
-    return this._callSync(requestOf("run", source, opts), opts.host);
+    return this._callSync(this._req("run", source, opts), opts.host);
   }
   test(source, opts = {}) {
-    return this._callSync(requestOf("test", source, opts), opts.host);
+    return this._callSync(this._req("test", source, opts), opts.host);
   }
   check(source, opts = {}) {
-    return this._callSync({ op: "check", source, filename: opts.filename ?? "<embedded>" });
+    return this._callSync(withProject({ op: "check", source, filename: opts.filename ?? "<embedded>" }, this._defaults, opts));
   }
   handle(source, request, opts = {}) {
-    return this._callSync({ ...requestOf("handle", source, opts), request: normalizeRequest(request) }, opts.host);
+    return this._callSync({ ...this._req("handle", source, opts), request: normalizeRequest(request) }, opts.host);
   }
 
   // ---- modo asíncrono (Worker + Atomics) ----
@@ -591,7 +644,10 @@ export class Synsema {
   }
 
   _dispatch(b, it) {
-    b.call(it.request, it.host, it.timeoutMs).then(it.resolve, (e) => {
+    // W9: cada Worker tiene su instancia de wasm, y con ella lo que ya verificó.
+    b.call(withoutHeld(it.request, b._held), it.host, it.timeoutMs).then((r) => it.resolve(noteHeld(b, r)), (e) => {
+      // M6 (ronda 1): el Worker pudo recrear su instancia (un trap) o morir: no guarda nada.
+      b._held = null;
       // No se llegó a mandar (el Worker se cerró antes): vuelve al principio de la cola. Lo que sí
       // corrió (un timeout, un Worker que murió en el medio) NO se reintenta: pudo tener efectos.
       if (e && e.synsemaWorkerClosed && !this._closed) {
@@ -622,13 +678,13 @@ export class Synsema {
     });
   }
   async runAsync(source, opts = {}) {
-    return this._callAsync(requestOf("run", source, opts), opts);
+    return this._callAsync(this._req("run", source, opts), opts);
   }
   async testAsync(source, opts = {}) {
-    return this._callAsync(requestOf("test", source, opts), opts);
+    return this._callAsync(this._req("test", source, opts), opts);
   }
   async handleAsync(source, request, opts = {}) {
-    return this._callAsync({ ...requestOf("handle", source, opts), request: normalizeRequest(request) }, opts);
+    return this._callAsync({ ...this._req("handle", source, opts), request: normalizeRequest(request) }, opts);
   }
   /**
    * Termina los Workers del modo asíncrono. Es FINAL (ronda 2, B1): lo que esperaba en la cola falla

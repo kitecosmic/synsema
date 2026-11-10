@@ -20,3 +20,9 @@ crate-type = ["cdylib"]
 # acá se llama en-proceso y los ocho exports de Vela son traducciones de ida y vuelta.
 synsema-wasm-web = { path = "../../../engine/crates/synsema-wasm-web" }
 serde_json = { version = "1", features = ["preserve_order"] }
+
+# v0.6.58: `build.rs` escribe el slot como un bundle de `synsema build`, que lleva el sha256 del
+# payload (el mismo `sha2` que usa el motor).
+[build-dependencies]
+sha2 = "0.10"
+serde_json = "1"

@@ -30,6 +30,10 @@ const ALLOWED: &[&str] = &[
     "engine/crates/synsema-cli/src/stdio.rs",
     "engine/crates/synsema-stdlib/src/proc.rs",
     "engine/crates/synsema-stdlib/src/attest.rs",
+    // v0.6.58 (§3): el dueño de un `synsema.json` ya abierto (`geteuid` en Unix; `GetSecurityInfo`,
+    // `OpenProcessToken`, `GetTokenInformation`, `EqualSid` e `IsValidSid` en Windows), como
+    // `safe.directory` de git.
+    "engine/crates/synsema-stdlib/src/project_owner.rs",
     // v0.6.46 (E8): abrir un archivo sin seguir links en Windows (`NtCreateFile` con
     // `OBJ_DONT_REPARSE`, `GetFinalPathNameByHandleW`). Linux va por rustix, sin `unsafe`.
     "engine/crates/synsema-capabilities/src/nofollow.rs",

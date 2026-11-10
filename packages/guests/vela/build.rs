@@ -5,13 +5,48 @@
 //! intérprete, y el SHA-256 que Vela verifica onchain cubre intérprete + lógica. Un `.wasm` es
 //! exactamente una app.
 //!
-//! Layout del slot (SLOT_SIZE bytes): magic (16) · largo del nombre (1) · nombre (63) ·
-//! largo del programa u32 LE (4) · programa UTF-8 · relleno 0x20 hasta el final.
+//! Layout del slot (SLOT_SIZE bytes, v0.6.58): magic `SYNSEMA.APPSLOT2` (16) · largo del bundle u32
+//! LE (4) · un bundle de `synsema build` (`payload ‖ trailer`, ver `synsema_core::bundle`) · relleno
+//! 0x20 hasta el final. Acá el bundle lleva sólo el programa; uno con su `synsema.json` y sus
+//! paquetes lo escribe `embed.syn` a partir de lo que arma `synsema build`. El guest sigue leyendo
+//! el formato de antes (`APPSLOT1`, el programa en texto).
 use std::path::{Path, PathBuf};
 
-const SLOT_MAGIC: &[u8; 16] = b"SYNSEMA.APPSLOT1";
+use sha2::{Digest, Sha256};
+
+const SLOT_MAGIC: &[u8; 16] = b"SYNSEMA.APPSLOT2";
 const SLOT_SIZE: usize = 524_288;
-const HEADER: usize = 16 + 1 + 63 + 4;
+const HEADER: usize = 16 + 4;
+/// El trailer del bundle (`synsema_core::bundle`): offset u64 · largo del payload u64 · sha256 · magic.
+const BUNDLE_MAGIC: &[u8; 16] = b"SYNSEMA-BUNDLE-1";
+
+/// Un bundle de un solo archivo, con el mismo formato que escribe `synsema build`.
+fn bundle(name: &str, program: &[u8]) -> Vec<u8> {
+    let manifest = serde_json::json!({
+        "format": 1,
+        "engine": "vela-build.rs",
+        "main": name,
+        "ceiling": null,
+        "profile": "native",
+        "built_at": "",
+    })
+    .to_string();
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&(manifest.len() as u32).to_le_bytes());
+    payload.extend_from_slice(manifest.as_bytes());
+    payload.extend_from_slice(&1u32.to_le_bytes());
+    payload.extend_from_slice(&(name.len() as u16).to_le_bytes());
+    payload.extend_from_slice(name.as_bytes());
+    payload.extend_from_slice(&(program.len() as u64).to_le_bytes());
+    payload.extend_from_slice(program);
+    let sha = Sha256::digest(&payload);
+    let mut out = payload.clone();
+    out.extend_from_slice(&0u64.to_le_bytes());
+    out.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+    out.extend_from_slice(&sha);
+    out.extend_from_slice(BUNDLE_MAGIC);
+    out
+}
 
 fn main() {
     let manifest = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR");
@@ -20,21 +55,17 @@ fn main() {
         panic!("SYNSEMA_VELA_APP: cannot read the .syn program at {}: {}", src, e)
     });
     let name = Path::new(&src).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "app.syn".to_string());
-    let name_bytes: Vec<u8> = name.bytes().take(63).collect();
-    let program = text.as_bytes();
+    let b = bundle(&name, text.as_bytes());
     assert!(
-        program.len() <= SLOT_SIZE - HEADER,
-        "SYNSEMA_VELA_APP: the program is {} bytes; the app slot holds at most {}",
-        program.len(),
+        b.len() <= SLOT_SIZE - HEADER,
+        "SYNSEMA_VELA_APP: the program and its bundle are {} bytes; the app slot holds at most {}",
+        b.len(),
         SLOT_SIZE - HEADER
     );
     let mut slot = Vec::with_capacity(SLOT_SIZE);
     slot.extend_from_slice(SLOT_MAGIC);
-    slot.push(name_bytes.len() as u8);
-    slot.extend_from_slice(&name_bytes);
-    slot.resize(16 + 1 + 63, 0x20);
-    slot.extend_from_slice(&(program.len() as u32).to_le_bytes());
-    slot.extend_from_slice(program);
+    slot.extend_from_slice(&(b.len() as u32).to_le_bytes());
+    slot.extend_from_slice(&b);
     // El relleno no es cero a propósito: un bloque con ceros largos podría terminar en .bss o en un
     // segmento partido, y el slot debe ser UN tramo contiguo de bytes en el archivo.
     slot.resize(SLOT_SIZE, 0x20);

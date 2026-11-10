@@ -125,6 +125,9 @@ pub mod sealed;
 pub mod webpush;
 #[cfg(feature = "native")]
 pub mod proc;
+/// v0.6.58 (§3): ¿el `synsema.json` abierto es del usuario que corre? (lo registra el host nativo).
+#[cfg(feature = "native")]
+pub mod project_owner;
 #[cfg(feature = "native")]
 pub mod term;
 #[cfg(feature = "native")]

@@ -6,6 +6,226 @@ Each says what changed, why, and what to write instead.
 
 Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the release date.
 
+## v0.6.58 — 2026-11-10
+
+**Language and engine.**
+- **`use "name"` loads a package by name.** The project file `synsema.json` says where each name
+  comes from and pins it by hash:
+  `{"synsema": "0.6.58", "modules": {"tok": {"url": "https://reg.example/tok/0.1.0/synsema.json"}}}`.
+  `synsema get` downloads it, checks it and writes `id`, `version`, `hash` and `requires`. A name is
+  `^[a-z][a-z0-9_-]{0,63}$`; a path (`./x.syn`) and `trusted:` work as before; a URL in the code is
+  an error that says to put it in `synsema.json`.
+- **Nothing is downloaded when a program runs.** Before the first statement (`run`, `serve`, `test`,
+  `check`, `build`, `code`, `openapi` and the wasm hosts), the engine resolves every name the program
+  can reach, also inside a branch that never runs, reads every file of every package once, checks
+  every hash and keeps the bytes. A missing package, a changed byte in the cache or a malformed
+  `synsema.json` is an error at that point that names the command that fixes it
+  (`is not downloaded: run synsema get`, `the cached files of tok (…) no longer match their hash`).
+  Workers of `serve` and `parallel_map`, agents and `spawn` use those same bytes.
+- **The project** is the folder of the nearest `synsema.json` above the entry file. Without one, a
+  program works as before. `"synsema": "X.Y.Z"` is the minimum engine
+  (`this project needs synsema >= 0.6.60; this is 0.6.58: synsema update`); an unknown key is an error.
+  A `synsema.json` owned by another user, in the root of the system's temp folder, that cannot be
+  opened, or that is not a regular file, is ignored with a warning; `SYNSEMA_SAFE_PROJECT` (folders,
+  or `*`) accepts one owned by another user, like git's `safe.directory`; one in the root of the temp
+  folder is always ignored, like Go does. A
+  binary built with `synsema build` does not check the minimum again: it was checked when building.
+- **A package only uses what it declares, and only if the program granted it.** Every task and lambda
+  written in a package runs with the package's `requires` (the union of its `require`s) intersected
+  with what is in force, by any path: a call, a callback, a value returned and called later, a
+  worker. A `require` in a package goes inside a task, with literals; it does not grant anything by
+  itself. A callback the program passes to a package runs with the intersection. Inside a package,
+  `cron_every`, `cron_after`, `approve … then` and agents are errors (the code would run later or in
+  another interpreter without the package's limits), and `use "trusted:…"` is rejected. A package's
+  exports are read-only for the program.
+- **A package's templates are its own:** `render`, `include` and `layout` in a package resolve only
+  against the package's files, without `file.read` and without the disk; a template of the package
+  does not see the program's names.
+- **The receipt says which packages ran:** `credentialSubject.modules` and `header.modules` in the
+  sealed receipt (`{"direct": {"tok": "<id>"}, "packages": {"<id>": {"version", "hash"}}}`), only
+  with packages. `direct` has each name the program itself uses, with the package it points to; a
+  package reached only through another one is only in `packages`. `--replay` compares them before
+  `program_sha`; `--replay-any-program` runs anyway. The attestation (`serve --attested`,
+  `run --attest`) binds them in `config_sha`; for a program without packages `config_sha` is
+  unchanged.
+- **Nesting limit:** code that nests deeper than 1024 levels (parentheses, blocks, a chain of
+  operators, calls or indexes, a chain of `otherwise when`, the pieces of a template (each text and each hole is one level:
+  about 500 holes with text between them), also templates inside templates, and the blocks of an
+  HTML template (`when`, `otherwise when`, `each`, `fill`)) is an error with its line (`the code nests deeper than 1024 levels`),
+  the same in every host and in `synsema get`.
+- **Fix: a body with more than 32 767 values in flight** (a list literal of 70 000 items, 70 000
+  `|>` in one expression) gave a wrong result without an error: `length` of a 70 001-item list was
+  4465. Such a body now runs statement by statement in the reference interpreter, with the right
+  result. The same for 70 000 loops or `set s to s + …` in one body, more than 65 535 locals in
+  `each` bodies of a task, 65 535 parameters, or `set x to x + …` on a local past the 32 767th slot
+  of a task (before, `internal error in the engine`).
+- **Fix: a recursion through code the reference interpreter runs** (such a body, a `try`, a
+  template rendered inside the recursion, and every call with `--labels` or in the Vela guest,
+  which run all code there) crashed the host before the recursion limit: the process died with a
+  stack overflow (8 nested `when` × 2999 calls with `--labels`), and in wasm the module trapped
+  (`Maximum call stack size exceeded`; with labels, a flat recursion at 563 calls in the wasm-web
+  and at 250 in the Vela guest under wasmtime). The recursion limit now also counts how deep that
+  code nests (each nested block costs a stack frame per call), so it gives `maximum recursion
+  depth exceeded` first, in every host. In `serve` such a recursion took the whole server down,
+  not just the route (one `try` around it, at 1000 calls): a route runs on a thread with 64 MB of
+  stack, and there the limit now also looks at the stack the thread has left. The same in a
+  `cron_every`/`cron_after` job, under `serve` and `run`: it ran on a 2 MB thread, and a recursion in
+  the tick took the whole process down (one `try` around the call, at 23 calls in a debug build). A
+  job now runs on a 64 MB thread, like a route, and gives the error.
+  Every thread that runs the interpreter (`run`, `test`, `repl`, `serve` and the rest) now also looks at
+  the stack it has left: a host where each call takes more stack than the one the limit was
+  measured on (a debug build on macOS arm64: 6 nested `when` × 2999 calls with `--labels`) gives the
+  error instead of overflowing.
+- **Fix: a recursive task with many locals alive across the call** (about 80 or more) crashed the
+  process on Windows (access violation, no message) once it ran native, past ~1000 calls; also a
+  `serve`. A native frame no longer grows with the square of the locals (one deopt buffer shared by
+  all exits: with 1000 locals a frame took ~4 MB), and a frame larger than 4 KB probes the stack.
+- **Fix: a task with more than 65 535 names** (`let`, parameters) read the wrong variable when a
+  lambda captured one: with 70 000 `let`, `v0` gave the value of `v65536`. A frame with more than
+  32 767 names now looks them up by name, like the reference interpreter.
+- **Fix: a module of an entry outside the current folder** (`synsema run ../app/main.syn`) resolved
+  against the current folder: `use "./lib/a.syn"` loaded `./lib/a.syn` of the cwd if there was one, or
+  said `module not found`. It now resolves against the entry's folder.
+
+**`synsema get`.**
+- Fetches each package from its `url` (any `https`; `http` only to loopback; up to 5 redirects, only
+  to https, or from loopback to loopback), checks every file against the sha256 of the package's index, validates the package,
+  installs it in the cache (`~/.synsema/modules/`, or `SYNSEMA_MODULE_CACHE`, relative to the project
+  root) and writes `synsema.json`. A package is an index (`synsema.json` with `id`, `version`, `main`,
+  `files` with a sha256 each, and its own dependencies pinned with their hash) plus its files; the
+  hash is `tree-sha256:` over the index and every file, like Go's `h1:`.
+- **Transitive dependencies** use minimal version selection: for each `id` the highest version asked
+  for anywhere in the graph; the ones not named by the project go in `indirect`. The `id` is a URL
+  prefix: a package is fetched from under its `id`.
+- **Nothing that changes what runs is written silently.** Growing `requires`, a different version of
+  an `id` already written, a new `id` brought by a package already there, or a version raised by
+  another package all make `get` write nothing and print the command that accepts it, with the hash:
+  `synsema get --accept med@tree-sha256:…` (by a direct name, or by `id`).
+- `get --update <name>` fetches again and shows what changed; `get --check` checks, without the
+  network, that every entry is in the cache, matches its hash and gives the same selection.
+- A registry that changes a file without changing the index, or republishes a version with other
+  content, is an error and nothing is installed (`the registry changed the content of tok 0.1.0
+  without changing its version …`).
+- Limits: 256 files, 4 MiB per file, 32 MiB per package, 128 bytes per path, 1024 packages in the
+  graph, 64 levels of dependencies.
+- The path of a package `url` (and of every redirect) uses only letters, digits, `/` and
+  `- . _ ~ ! $ & ' ( ) * + , = : @`: no `%`-escapes, no `;`, no `\`, no `.` or `..` segment. What
+  reaches the registry is what was compared with the package's `id`, whatever the server normalizes.
+- A cached index that does not match its hash and cannot be replaced (read-only) is an error that
+  names the file.
+
+**Tooling.**
+- **`synsema build`** puts the project's `synsema.json` and the packages in the bundle; the binary runs
+  them from the bundle, without the cache and without the network. The bundle's root is the project
+  root.
+- **Fix: `static "/" from "."` in a built server** now serves the files that travel in the binary.
+  Before, the root folder had no name in the bundle, the mount fell back to the disk, and the binary
+  answered 404 when it ran from another folder. A package's files are never served by path.
+- **`synsema code sha --json`** adds `packages` (`name`, `id`, `version`, `hash`, `main` as
+  `pkg:tree-sha256-…/<file>`; empty without packages). Packages do not enter `program_sha`.
+- **`synsema init`** (also `--synfide`, `--pwa` and `--desktop`) writes `synsema.json` with
+  `{"synsema": "<version>", "modules": {}}` if there is none; an existing one is never touched.
+- **`run_program`** passes the parent's cache to the child (`SYNSEMA_MODULE_CACHE`, absolute).
+- **WebAssembly.** wasip1 reads `synsema.json` and the cache through `--dir`, and the cache only from
+  `SYNSEMA_MODULE_CACHE`:
+  `wasmtime run --dir . --dir <cache>::/cache --env SYNSEMA_MODULE_CACHE=/cache synsema-wasm.wasm main.syn`.
+  The embeddable engine's `call_json` (and `@synsema/wasm`: `project` and `packages` in the options of
+  `load`/`loadNode` and of each call) takes `project` (the text of `synsema.json`) and `packages`
+  (`{"tree-sha256:…": {"<path>": "<text>"}}`); the instance keeps the verified packages by hash (up
+  to 128 MiB, the least used go first) and says which in every response (`packages_held`), and
+  `@synsema/wasm` does not send them again. An instance is one trust domain: give each tenant its own
+  if that matters.
+- **The Vela guest** carries a `synsema build` bundle in its app slot (`SYNSEMA.APPSLOT2`), so an app
+  can use packages: `synsema build app.syn --engine-binary synsema-vela-guest.wasm -o app.built`, then
+  `synsema run tools/embed.syn -- synsema-vela-guest.wasm app.built app.wasm`. `embed.syn` refuses a
+  built app with a ceiling, `--serve` or `--audit` (the guest would refuse it at deploy).
+  `tools/verify.syn` reads both slot formats and lists every file and package of the slot.
+  `--source app.built` compares the whole bundle: every file, package and manifest field except
+  `built_at` (a rebuild from the same source passes; anything else that differs is named);
+  `--source app.syn` compares the main program only, so it fails (`does not cover`) when the slot
+  carries more than that file. `--extract <dir>` writes the whole tree the slot carries (packages
+  under `pkg/`). A bundle whose entry names (also inside a package) are not in normal form (`./app.syn`)
+  or repeat, or that carries a package twice, is refused by the engine and by `verify.syn`; and
+  `verify.syn` checks each package against its hash and shows and extracts only the files its
+  index lists, the ones the engine reads, so what it shows is what runs. It also refuses a package
+  the engine would not load (its index: a BOM, an unknown key, a missing `main`, `id`, `version`
+  or `files`, a `main` it does not list; its paths; the section against the manifest; bytes after
+  it) and fails a package whose minimum `synsema` is above the `--release`. A file the section
+  carries and the index does not list is named, and `--source` does not pass it.
+
+**Security: SQLite 3.54.1 (`rusqlite` 0.41, `libsqlite3-sys` 0.39).** RUSTSEC-2026-0459, published
+on 2026-10-30, is a flaw in the C SQLite that v0.6.57 bundled (`libsqlite3-sys` 0.30.1). The engine
+now bundles the fixed SQLite. A SQLite database opened with `db_open`, and the agent memory declared
+with `require memory(...)`, reach it. One behavior changed with it: more than one statement in one
+`sql`/`sql_exec`/`sql_batch` call is an error (see **Breaking**).
+
+**Breaking.**
+- **A `synsema.json` in the entry's folder or above is now read, and its folder is the project
+  root:** `use "../x.syn"` may reach any file under it (before, only under the entry's folder),
+  `synsema build` bundles from it, and a relative `SYNSEMA_MODULE_CACHE` is relative to it. Broken
+  JSON, an unknown key or a minimum version above the engine stops every command before it runs.
+  Rename an unrelated file with that name, or move the program.
+- **A `use` that is not a path to a `.syn` file is checked before the program runs**, also in a branch
+  or a task that never runs: `use "lib"` without a `synsema.json` that declares it, `use "https://…"`
+  or `use "data.json"` stop the program before its first statement (before, only when that line ran).
+  A `use` of a `.syn` file in a branch that does not run works as before. A local module path that
+  resolves to `pkg:…` (a folder with that name, possible only outside Windows) is an error: it is the
+  prefix of a package's modules.
+- **Modules are read once per process.** A program that rewrites a `.syn` and loads it again in a
+  `parallel_map` worker gets the first version, and a running `serve` no longer sees a change to a
+  module used inside a task: restart it. A `use` of a `.syn` file that did not exist when the program
+  started fails even if the file appears later
+  (`module not found: ./late.syn (it did not exist when the program started)`), and one that could
+  not be read then fails the same way (`module cannot be read: …`).
+- **`synsema build` reads templates, `static` folders and `--include` from the current folder**, like
+  `run` (before, from the entry's folder). Run `build` from the folder you run the program from.
+- **`static` no longer serves hidden files**: a path with a segment that starts with `.` (`/.env`,
+  `/.git/HEAD`) is a 404, from the disk and from a built binary, except `/.well-known/…`. Through a
+  `static` mount, `build` does not put them (or the binary it writes) in the bundle, nor what a link
+  inside the folder reaches outside it or in a hidden folder (the same as the disk); `--include` puts
+  what it names. A built server also applies a `deny` set by the host that embeds the engine. On
+  Windows a `:` in the path (an alternate data stream, `/file.txt:hidden`) is a 404. To serve a
+  dotfile on purpose, give it a `route`. When the project root (the folder of `synsema.json`) is above
+  the current folder, `build` fails if a `static` mount would serve the program, a module or
+  `synsema.json` that the disk does not serve there (`static "/" from "."` run from `app/`): mount a
+  folder that holds only what is served, or run `build` from the project root, where `"."` is the
+  project root and serves all of it, the code included.
+- **A recursion through code the reference interpreter runs reaches fewer calls** (above): each
+  call costs what its nesting costs on the stack. A recursive task whose body nests deeply inside a
+  `try`, has more than 32 767 locals, runs with `--labels`, or renders a template with deeply
+  nested blocks, stops with `maximum recursion depth exceeded` before 3000 calls, the deeper it
+  nests. Measured in a release build: with `--labels`, a body with 6 nested `when` still reaches
+  2999 calls, with 8 it stops at 1499, with 12 at 999 and with 30 at 427; a `try` around 12 nested
+  `when` stops at 999, with or without labels. Moving the nested blocks to a helper task reaches
+  2997 again. In a `serve` route such a recursion also stops where the route's 64 MB of stack ends
+  (a flat recursion with `--labels` reaches 2999 in release, about 1100 calls in a debug build); the
+  same in a `cron` job. In wasm, where the stack is
+  smaller, any such call costs at least one more level: a recursion through a `try`, or any
+  recursion with labels on, reaches at most half the limit (300 calls in the wasm-web). Calls that
+  run on the VM (most code) count as before.
+- **The recursion limit under WASI (wasip1) is 300 calls, not 600**: wasmtime, the runtime of the
+  Vela executor and of the wasip1 build, gives wasm half the stack of Node or a browser, and a
+  recursion trapped before the limit (at 250 flat calls in the Vela guest). A recursion in the Vela
+  guest, which runs with labels, reaches at most 150 calls, fewer the deeper its body nests.
+- **Code nested deeper than 1024 levels** no longer parses (above), including a template with more
+  than about 1 000 pieces (500 holes with text between them) and an HTML template with more than 1024
+  nested blocks.
+- **Vela: the app slot changed** (`SYNSEMA.APPSLOT1` → `SYNSEMA.APPSLOT2`) and the published guest's
+  hash with it. The new guest still runs a module embedded the old way; the `embed.syn` of v0.6.57 does
+  not find a slot in the new guest, and the new `embed.syn` refuses an old guest. Use the tools of the
+  same release as the guest.
+- **SQLite: one statement per `sql`, `sql_exec` or `sql_batch` call.** A second statement in the
+  same call is now an error (`one SQL statement per call: …`) and none of them runs. Before, the first
+  ran and the rest were dropped without a word: `sql_exec("CREATE TABLE u (x); CREATE TABLE v (y)")`
+  created only `u`. A trailing `;`, spaces or a comment still work. Run each statement with its own
+  call. It comes with the SQLite update (above).
+
+**The `perf-guard` anchor was re-measured on CI** (`engine/perf/baseline.json`, from this release's
+PR). Five rows went over the +0.3 % budget: `c_call4` (jit) +0.72 %, `a_name64` (jit) +0.60 %,
+`c_each_empty` (vm) +0.63 % and (jit) +0.33 %, and `s_text_join` (ref) +0.44 %. `s_text_join` (ref)
+is the recursion guard on each call of the reference interpreter, measured and accepted in review;
+the other four were not broken down.
+
 ## v0.6.57 — 2026-11-06
 
 **Engine.**

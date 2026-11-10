@@ -719,6 +719,67 @@ fn audit_json(audit: &[synsema_wasm::AuditEntry]) -> Value {
     )
 }
 
+/// v0.6.58 (§12): monta un bundle de `synsema build` (`payload ‖ trailer`) para esta instancia, una
+/// vez: desde ahí el proyecto, los paquetes, los módulos de archivo y las plantillas salen sólo de
+/// él, como en un binario construido (D-13). Devuelve el nombre del `.syn` principal y su texto,
+/// que el embebedor pasa como `source`/`filename` en cada llamada. Lo que el bundle hornea para
+/// el binario nativo (un techo, `--serve`, `--audit`) acá no tiene quién lo aplique: el techo lo
+/// pone el embebedor en cada llamada, así que un bundle con alguno de ellos es un error.
+pub fn mount_bundle(bytes: &[u8]) -> Result<(String, String), String> {
+    let b = synsema_core::bundle::from_serialized(bytes)?;
+    let m = &b.manifest;
+    if m.ceiling.is_some() {
+        return Err("the bundle bakes a ceiling (--sandbox or --cap-set); here the host sets it: build without it".to_string());
+    }
+    if m.serve.is_some() || m.audit.is_some() {
+        return Err("the bundle bakes --serve or --audit, which only a native binary applies: build without them".to_string());
+    }
+    let main = m.main.clone();
+    let source = match b.get(&main) {
+        Some(s) => String::from_utf8(s.to_vec()).map_err(|_| format!("the bundle's {} is not UTF-8", main))?,
+        None => return Err(format!("the bundle has no {} (its main program)", main)),
+    };
+    if !synsema_core::bundle::mount(b) {
+        return Err("this instance already has a bundle mounted".to_string());
+    }
+    Ok((main, source))
+}
+
+/// v0.6.58 (§12): el proyecto de la llamada. `project` es el texto de `synsema.json` y `packages`,
+/// `{"tree-sha256:…": {"<ruta>": "<texto>"}}`; el motor arma la tabla con ellos y verifica cada
+/// hash. Sin `project` no hay proyecto (y `packages` solo es un error: no hay a qué atarlos).
+fn host_project_of(req: &Map<String, Value>) -> Result<Option<(Vec<u8>, HashMap<String, synsema_core::modtable::HostFiles>)>, String> {
+    let project = match req.get("project") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(s)) => Some(s.as_bytes().to_vec()),
+        Some(_) => return Err("project: must be the text of synsema.json (a string)".to_string()),
+    };
+    let mut packages = HashMap::new();
+    match req.get("packages") {
+        None | Some(Value::Null) => {}
+        Some(Value::Object(m)) => {
+            if project.is_none() && !m.is_empty() {
+                return Err("packages: there is no project to use them (pass project, the text of synsema.json)".to_string());
+            }
+            for (hash, files) in m {
+                let Value::Object(fs) = files else {
+                    return Err(format!("packages[{:?}]: must be an object of path -> text", hash));
+                };
+                let mut out = Vec::with_capacity(fs.len());
+                for (path, text) in fs {
+                    let Value::String(t) = text else {
+                        return Err(format!("packages[{:?}][{:?}]: must be the text of the file", hash, path));
+                    };
+                    out.push((path.clone(), t.as_bytes().to_vec()));
+                }
+                packages.insert(hash.clone(), out);
+            }
+        }
+        Some(_) => return Err("packages: must be an object of hash -> {path: text}".to_string()),
+    }
+    Ok(project.map(|p| (p, packages)))
+}
+
 fn source_of(req: &Map<String, Value>) -> Result<String, String> {
     match req.get("source") {
         Some(Value::String(s)) => Ok(s.clone()),
@@ -730,6 +791,11 @@ fn dispatch(req: &Map<String, Value>) -> Value {
     let op = req.get("op").and_then(Value::as_str).unwrap_or("run");
     match op {
         "version" => json!({"version": synsema_wasm::version()}),
+        // v0.6.58 (W9): cuántos paquetes hasheó esta instancia y cuáles tiene verificados.
+        "stats" => json!({
+            "packages_hashed": synsema_core::modtable::host_packages_hashed(),
+            "packages_held": synsema_core::modtable::host_packages_held(),
+        }),
         "check" => {
             let source = match source_of(req) {
                 Ok(s) => s,
@@ -838,7 +904,7 @@ fn dispatch(req: &Map<String, Value>) -> Value {
                 }
             }
         }
-        other => err_response(&format!("unknown op {:?} (expected run|test|check|handle|version)", other)),
+        other => err_response(&format!("unknown op {:?} (expected run|test|check|handle|version|stats)", other)),
     }
 }
 
@@ -863,10 +929,26 @@ pub fn call_json(request: &str) -> String {
     synsema_stdlib::webauth::begin_call_entropy();
     IN_CALL.with(|c| c.set(true));
     let resp = match serde_json::from_str::<Value>(request) {
-        Ok(Value::Object(m)) => dispatch(&m),
+        Ok(Value::Object(m)) => match host_project_of(&m) {
+            Ok(call) => {
+                synsema_core::modtable::set_host_call(call);
+                let r = dispatch(&m);
+                synsema_core::modtable::set_host_call(None);
+                r
+            }
+            Err(e) => err_response(&e),
+        },
         Ok(_) => err_response("the request must be a JSON object"),
         Err(e) => err_response(&format!("invalid request JSON: {}", e)),
     };
+    // W9: lo que la instancia ya tiene verificado, para que el host no lo vuelva a mandar. Ronda 2
+    // (N-r2-3): en TODA respuesta del motor (también `version`, una llamada sin proyecto o un error),
+    // así un host sólo olvida lo guardado cuando no hubo respuesta del motor (un trap: la instancia se
+    // recreó); antes vaciaba su lista con cada respuesta sin el campo y volvía a mandar todo.
+    let mut resp = resp;
+    if let Value::Object(o) = &mut resp {
+        o.insert("packages_held".into(), json!(synsema_core::modtable::host_packages_held()));
+    }
     #[cfg(target_arch = "wasm32")]
     synsema_core::wasm_limits::disarm();
     #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]

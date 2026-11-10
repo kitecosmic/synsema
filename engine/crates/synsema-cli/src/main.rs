@@ -37,10 +37,11 @@ mod pe;
 mod stdio;
 mod synfide;
 mod update;
+mod get;
 mod code;
 mod sealed_receipt;
 
-const USAGE: &str = "uso: synsema <conform [--swarm] [--flat] | serve [--secure] [--watch] [--port N] [--domain d1,d2] [--tls-auto <email> | --tls-cert <p> --tls-key <p>] [--bind addr] [--trust-proxy ip,cidr] [--health <path>] [--attested] [--auditor <X25519 public key> [--receipt <ruta|fd:N>]] | run [--flat] [--explain] [--format human|json [--diagnostic]] [--provider <name>] [--attest] [--auditor <X25519 public key> [--receipt <ruta|fd:N>] | --replay <recibo abierto> [--replay-any-program]] <archivo.syn | -> [-- args...] | receipt <open <recibo> --key <privada> | verify <recibo> | keygen> | test [-v] [--auditor <X25519 public key> [--receipt <ruta|fd:N>]] <archivo|dir> | build <main.syn> -o <salida> [--include <p>]... [--engine-binary <ruta>] [--serve [--bind addr] ...] [--no-console] [--icon <svg|png|ico>] [--bundle [--name <n>] [--id <id>]] | check [--templates <dir>] | code <outline|symbol|refs|routes|caps|check|search|deps> [--json] | code --mcp | openapi [--out f] [--base-url URL] | tokens | ast | repl | daemon | init [dir] [--synfide | --pwa | --desktop] | llm status [--json] | version | update> [--sandbox | --cap-set <list> | --deterministic] [--trusted <nombre=ruta>]... [--trusted-cap-set <list>] [--trusted-templates <nombre=dir>]... [--labels] [--jitless] [--profile native|pure] [--audit json|<ruta>|fd:N|unix:<ruta>] [--env-file <path> | --no-env-file] <archivo.syn>";
+const USAGE: &str = "uso: synsema <conform [--swarm] [--flat] | serve [--secure] [--watch] [--port N] [--domain d1,d2] [--tls-auto <email> | --tls-cert <p> --tls-key <p>] [--bind addr] [--trust-proxy ip,cidr] [--health <path>] [--attested] [--auditor <X25519 public key> [--receipt <ruta|fd:N>]] | run [--flat] [--explain] [--format human|json [--diagnostic]] [--provider <name>] [--attest] [--auditor <X25519 public key> [--receipt <ruta|fd:N>] | --replay <recibo abierto> [--replay-any-program]] <archivo.syn | -> [-- args...] | receipt <open <recibo> --key <privada> | verify <recibo> | keygen> | test [-v] [--auditor <X25519 public key> [--receipt <ruta|fd:N>]] <archivo|dir> | build <main.syn> -o <salida> [--include <p>]... [--engine-binary <ruta>] [--serve [--bind addr] ...] [--no-console] [--icon <svg|png|ico>] [--bundle [--name <n>] [--id <id>]] | check [--templates <dir>] | code <outline|symbol|refs|routes|caps|check|search|deps> [--json] | code --mcp | openapi [--out f] [--base-url URL] | tokens | ast | repl | daemon | init [dir] [--synfide | --pwa | --desktop] | get [--update <nombre>] [--accept <nombre>@<hash>]... | get --check | llm status [--json] | version | update> [--sandbox | --cap-set <list> | --deterministic] [--trusted <nombre=ruta>]... [--trusted-cap-set <list>] [--trusted-templates <nombre=dir>]... [--labels] [--jitless] [--profile native|pure] [--audit json|<ruta>|fd:N|unix:<ruta>] [--env-file <path> | --no-env-file] <archivo.syn>";
 
 // `build_ceiling` (--sandbox/--cap-set → techo) vive en synsema-capabilities: lo comparten
 // este binario y `synsema-wasm` (mismas flags, misma semántica en los dos front-ends).
@@ -334,7 +335,7 @@ mod audit {
     /// Knobs del HOST que lee el CLI (espejo de `LLM_ENV_VARS`/`SERVE_ENV_VARS`…): el test
     /// anti-rot `env_example_in_sync_with_engine_knobs` los cruza con el `.env.example` de `init`.
     #[cfg(test)]
-    pub const HOST_ENV_VARS: &[&str] = &["SYNSEMA_AUDIT"];
+    pub const HOST_ENV_VARS: &[&str] = &["SYNSEMA_AUDIT", "SYNSEMA_MODULE_CACHE", "SYNSEMA_SAFE_PROJECT"];
 
     use std::io::Write;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -649,6 +650,9 @@ fn main() -> ExitCode {
     // v0.6.53 (G1): los sockets de la activación por socket de systemd, antes de cualquier hilo o
     // hijo (se marcan para que ningún hijo los herede).
     synsema_stdlib::listen::adopt_inherited();
+    // v0.6.58 (§3): el chequeo del dueño de `synsema.json`, para todo comando que lo lea (`code`,
+    // `build`, `get`, …), no sólo los que pasan por `project_preflight`.
+    synsema_stdlib::project_owner::install();
     let mut args: Vec<String> = std::env::args().collect();
     // F4: el nivel nativo para lo caliente (no cambia lo observable; ver synsema-jit), salvo con
     // `--jitless` o `serve --attested`: ahí no se crea el JIT (ni memoria ejecutable).
@@ -703,15 +707,18 @@ fn main() -> ExitCode {
         Some("openapi") => on_engine_stack(|| cmd_openapi(&args)),
         Some("tokens") => cmd_tokens(&args),
         Some("ast") => on_engine_stack(|| cmd_ast(&args)),
-        Some("repl") => {
+        // B-r8-1 (v0.6.58): el REPL corría en el hilo principal (1 MB en Windows) sin avisar su
+        // pila: una recursión de 20 llamadas con un cuerpo frío lo tumbaba.
+        Some("repl") => on_engine_stack(|| {
             update::notify_if_outdated();
             repl();
             ExitCode::SUCCESS
-        }
+        }),
         Some("daemon") => cmd_daemon(&args),
         Some("init") => cmd_init(&args),
         Some("llm") => cmd_llm(&args),
         Some("judge") => cmd_judge(&args),
+        Some("get") => on_engine_stack(|| get::cmd_get(&args[2..])),
         Some("update") => update::cmd_update(),
         // v0.6.49 (B5): `--help` era "subcomando desconocido"; ahora da el uso, a stdout y con 0.
         Some("help") | Some("--help") | Some("-h") => {
@@ -724,7 +731,7 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Some(other) => {
-            eprintln!("subcomando desconocido: '{}'. Disponibles: init, conform, serve, run, test, build, check, code, openapi, tokens, ast, repl, daemon, llm, version, update, help", other);
+            eprintln!("subcomando desconocido: '{}'. Disponibles: init, conform, serve, run, test, build, check, code, openapi, tokens, ast, repl, daemon, llm, get, version, update, help", other);
             ExitCode::from(2)
         }
         None => {
@@ -742,7 +749,11 @@ fn on_engine_stack<F: FnOnce() -> ExitCode + Send>(f: F) -> ExitCode {
     std::thread::scope(|s| {
         match std::thread::Builder::new()
             .stack_size(synsema_runtime::engine::INTERP_STACK_SIZE)
-            .spawn_scoped(s, f)
+            .spawn_scoped(s, || {
+                // v0.6.58: el guardián de recursión mira la pila real de este hilo (ver `stack.rs`).
+                synsema_core::stack::enter_thread(synsema_runtime::engine::INTERP_STACK_SIZE);
+                f()
+            })
             .expect("no se pudo crear el hilo del motor")
             .join()
         {
@@ -817,6 +828,33 @@ fn scaffold_file(base: &std::path::Path, f: &init_templates::InitFile) -> Result
             }
         },
     }
+}
+
+/// v0.6.58 (§3, I1, I2): `synsema.json` con la versión de este motor y sin módulos, **sólo si no
+/// existe**. No es un `InitFile`: es del proyecto desde que se escribe (lo edita `get`), así que no
+/// hay versiones de fábrica que refrescar ni un `.new` al lado. `create_new` no pisa uno que
+/// apareció entre la consulta y la escritura.
+fn init_project_manifest(base: &std::path::Path) -> Result<bool, ExitCode> {
+    let path = base.join("synsema.json");
+    let (a, b, c) = synsema_core::project::engine_version();
+    let text = format!("{{\n  \"synsema\": \"{}.{}.{}\",\n  \"modules\": {{}}\n}}\n", a, b, c);
+    let mut f = match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            println!("init: {} ya existe (no se toca)", path.display());
+            return Ok(false);
+        }
+        Err(e) => {
+            eprintln!("init: no se pudo escribir {}: {}", path.display(), e);
+            return Err(ExitCode::from(1));
+        }
+    };
+    if let Err(e) = std::io::Write::write_all(&mut f, text.as_bytes()) {
+        eprintln!("init: no se pudo escribir {}: {}", path.display(), e);
+        return Err(ExitCode::from(1));
+    }
+    println!("init: {} creado", path.display());
+    Ok(true)
 }
 
 /// Los PNG de la PWA, DERIVADOS de `public/icon.svg` con el rasterizador del motor
@@ -937,6 +975,11 @@ fn cmd_init(args: &[String]) -> ExitCode {
             Err(code) => return code,
         }
     }
+    match init_project_manifest(base) {
+        Ok(true) => created += 1,
+        Ok(false) => {}
+        Err(code) => return code,
+    }
     if with_pwa {
         for f in init_templates::PWA_FILES {
             // El resumen final de --pwa son los "próximos pasos", no un conteo.
@@ -1035,6 +1078,19 @@ fn effective_env_file() -> Option<String> {
 
 /// Windows: `fs::canonicalize` devuelve paths verbatim (`\\?\C:\…`) — sacá el prefijo
 /// para imprimir. En otras plataformas es identidad.
+/// v0.6.58 (§3, §8, P3): el proyecto de la entrada, antes de parsearla: un `synsema.json` roto o un
+/// mínimo que este motor no cumple corta acá, y no con un error de sintaxis de algo más nuevo.
+fn project_preflight(cmd: &str, entry: &str) -> Result<(), ExitCode> {
+    synsema_stdlib::project_owner::install();
+    match synsema_core::project::preflight(entry) {
+        Ok(_) => Ok(()),
+        Err(e) => {
+            eprintln!("synsema {}: {}", cmd, e);
+            Err(ExitCode::from(1))
+        }
+    }
+}
+
 fn strip_verbatim(p: &std::path::Path) -> String {
     let s = p.display().to_string();
     s.strip_prefix(r"\\?\").unwrap_or(&s).to_string()
@@ -1669,6 +1725,9 @@ fn cmd_serve(args: &[String]) -> ExitCode {
         return run_serve_watch(&path);
     }
 
+    if let Err(code) = project_preflight("serve", &path) {
+        return code;
+    }
     let source = match std::fs::read_to_string(&path) {
         Ok(s) => s,
         Err(e) => {
@@ -1839,6 +1898,9 @@ fn cmd_run(args: &[String]) -> ExitCode {
     if replay_flag.is_some() && (auditor.is_some() || explain || report_mode || attest) {
         eprintln!("synsema run: --replay runs the program again against an opened receipt; drop --auditor/--explain/--format json/--attest");
         return ExitCode::from(2);
+    }
+    if let Err(code) = project_preflight("run", if path == "-" { host.filename.as_deref().unwrap_or("<stdin>") } else { &path }) {
+        return code;
     }
     let (mut source, filename) = if path == "-" {
         use std::io::Read;
@@ -2198,6 +2260,8 @@ fn attest_run(source: &str, filename: &str, input: &[u8], result: &synsema_core:
         tls_key: "none",
         profile: "pure",
         drivers: drivers.iter().map(|d| d.name()).collect(),
+        // v0.6.58 (§13, D-15): los paquetes, atados como en el header sellado.
+        modules: synsema_stdlib::attest::ran_modules(source, filename)?,
     };
     let config_sha = config.sha();
     let mut bound = Vec::with_capacity(128);
@@ -2342,6 +2406,10 @@ fn cmd_test(args: &[String]) -> ExitCode {
     let mut total_passed = 0usize;
     let mut total_failed = 0usize;
     for file in &files {
+        if project_preflight("test", file).is_err() {
+            total_failed += 1;
+            continue;
+        }
         let mut source = match std::fs::read_to_string(file) {
             Ok(s) => s,
             Err(e) => {
@@ -2942,6 +3010,9 @@ fn cmd_check(args: &[String]) -> ExitCode {
         eprintln!("uso: synsema check [--templates <dir>] <archivo.syn>");
         return ExitCode::from(2);
     };
+    if let Err(code) = project_preflight("check", &path) {
+        return code;
+    }
     let source = match std::fs::read_to_string(&path) {
         Ok(s) => s,
         Err(e) => {
@@ -3068,6 +3139,9 @@ fn cmd_openapi(args: &[String]) -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    if let Err(code) = project_preflight("openapi", &path) {
+        return code;
+    }
     let source = match std::fs::read_to_string(&path) {
         Ok(s) => s,
         Err(e) => {

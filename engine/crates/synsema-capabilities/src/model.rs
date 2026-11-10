@@ -149,6 +149,8 @@ pub enum DelegationSource {
     /// v0.6.51 (C1): lo que limitaba al programa que lanzó éste con `run_program` (sus grants, su
     /// techo de host, sus `sandbox under`), heredado como capa: el hijo nunca llega más lejos.
     Caller,
+    /// v0.6.58 (§6.1): el dominio de un paquete (su `requires`), apilado mientras corre su código.
+    Package(String),
 }
 
 impl DelegationSource {
@@ -158,6 +160,7 @@ impl DelegationSource {
             DelegationSource::Token(_) => "token",
             DelegationSource::Block => "sandbox",
             DelegationSource::Caller => "caller",
+            DelegationSource::Package(_) => "package",
         }
     }
 }
@@ -198,6 +201,11 @@ impl Delegation {
         Delegation { caps, earlier: Vec::new(), source: DelegationSource::Caller, deterministic: false }
     }
 
+    /// v0.6.58 (§6.1): el dominio del paquete `name` (lo que declaran sus `require`).
+    pub fn package(name: impl Into<String>, caps: Vec<Capability>) -> Self {
+        Delegation { caps, earlier: Vec::new(), source: DelegationSource::Package(name.into()), deterministic: false }
+    }
+
     /// Los bloques anteriores de la cadena (raíz primero), cada uno una capa más.
     pub fn with_earlier(mut self, earlier: Vec<Vec<Capability>>) -> Self {
         self.earlier = earlier;
@@ -229,6 +237,7 @@ impl Delegation {
             }
             (DelegationSource::Block, _) => "above sandbox ceiling (sandbox under)".to_string(),
             (DelegationSource::Caller, _) => "above the ceiling of the calling program (run_program)".to_string(),
+            (DelegationSource::Package(name), _) => format!("the package {} does not declare it", name),
         }
     }
 }
@@ -875,6 +884,7 @@ pub fn private_dest_message(who: &str, dest: &str, ip: std::net::IpAddr, cause: 
                 DelegationSource::Token(id) => format!("delegated ceiling of token {}", id),
                 DelegationSource::Block => "enclosing `sandbox under` block".to_string(),
                 DelegationSource::Caller => "ceiling of the program that called run_program".to_string(),
+                DelegationSource::Package(name) => format!("domain of the package {}", name),
             },
             dest
         ),
@@ -1246,6 +1256,12 @@ impl CapabilitySet {
     /// Apila un techo delegado (el token de la request, un `sandbox under`).
     pub fn push_delegation(&mut self, delegation: Delegation) {
         self.delegated.push(Rc::new(delegation));
+    }
+
+    /// Apila un techo ya armado y compartido (v0.6.58: el dominio de un paquete, que se apila en
+    /// cada cruce sin copiarse).
+    pub fn push_delegation_rc(&mut self, delegation: Rc<Delegation>) {
+        self.delegated.push(delegation);
     }
 
     /// Quita el último techo delegado apilado (al salir de un `sandbox under`).
@@ -1673,7 +1689,8 @@ impl CapabilitySet {
         }
         for d in &self.delegated {
             let mut d = (**d).clone();
-            if d.source == DelegationSource::Block {
+            // El dominio de un paquete también viaja aplanado como capa del que llamó (P17).
+            if matches!(d.source, DelegationSource::Block | DelegationSource::Package(_)) {
                 d.source = DelegationSource::Caller;
             }
             out.push(d);
@@ -1822,6 +1839,9 @@ impl CapabilitySet {
                     "Capability not granted: {} — outside what the program that started this one with run_program could do; that program has to be able to do it first",
                     requested
                 ),
+                DelegationSource::Package(name) => {
+                    format!("Capability not granted: {} — the package {} does not declare it", requested, name)
+                }
             },
             DenyCause::IsolatedArea(area) => format!(
                 "Capability not granted: {} — the path goes through a link inside {}, a folder an isolated child could write to (run with \"isolate\"), so the child may have put it there. Links inside that folder are not followed for the rest of the run: read what the child wrote by its real place, and remove a link it left with delete_file()",

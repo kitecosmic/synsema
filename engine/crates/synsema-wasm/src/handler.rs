@@ -183,13 +183,17 @@ fn cache_key(source: &str, opts: &RunOptions) -> String {
         Some(p) => ["http", "kv", "kv_cas", "llm", "log", "sleep"].into_iter().filter(|w| p.offers(w)).collect(),
         None => Vec::new(),
     };
+    // v0.6.58 (§12): el proyecto que pasó el host también: con otro `synsema.json` es otra tabla de
+    // paquetes (los paquetes van fijados por hash en él, así que alcanza con su texto).
+    let project = synsema_core::modtable::host_manifest().map(|b| String::from_utf8_lossy(&b).into_owned()).unwrap_or_default();
     format!(
-        "{}\u{0}{}\u{0}{}\u{0}{}\u{0}{}\u{0}{}",
+        "{}\u{0}{}\u{0}{}\u{0}{}\u{0}{}\u{0}{}\u{0}{}",
         opts.filename,
         env.join(";"),
         ceiling.join(","),
         opts.labels,
         offers.join(","),
+        project,
         source
     )
 }

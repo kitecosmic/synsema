@@ -121,9 +121,20 @@ fn token_value_repr(v: &TokenValue) -> String {
     }
 }
 
+/// v0.6.58 (§4.3, D-22): el tope de anidamiento al parsear (expresiones, bloques, `-` encadenados).
+/// Un `.syn` más profundo es un error con su ubicación, no una pila desbordada. Lo usa `get` antes de
+/// instalar un paquete y cualquier carga después.
+/// 1024 y no menos: v0.6.52 garantiza que 1000 paréntesis anidados parsean sin desbordar (`v0652_cli`).
+pub const MAX_NEST: u32 = 1024;
+
+/// El principio del texto del error de [`MAX_NEST`] (`get` lo reconoce para dar el suyo, G23).
+pub const NEST_ERROR: &str = "the code nests deeper than";
+
 pub struct Parser {
     tokens: Vec<Token>,
     pos: usize,
+    /// v0.6.58 (D-22): cuántas expresiones, bloques o `-` hay abiertos (ver [`MAX_NEST`]).
+    nest: u32,
     /// >0 mientras se parsea dentro de un bloque `stream`.
     stream_depth: i64,
     /// v0.6.50 (A): vio un `use` de archivo (no `trusted:`). Ver `Program::has_file_use`.
@@ -138,6 +149,7 @@ impl Parser {
         Self {
             tokens,
             pos: 0,
+            nest: 0,
             stream_depth: 0,
             file_use: false,
             when_condition: 0,
@@ -654,12 +666,19 @@ impl Parser {
         let mut statements = Vec::new();
 
         self.skip_newlines();
+        self.enter_nest()?;
         while !self.at_end() && !self.check(TokenType::Dedent) {
-            if let Some(stmt) = self.parse_statement()? {
-                statements.push(stmt);
+            match self.parse_statement() {
+                Ok(Some(stmt)) => statements.push(stmt),
+                Ok(None) => {}
+                Err(e) => {
+                    self.nest -= 1;
+                    return Err(e);
+                }
             }
             self.skip_newlines();
         }
+        self.nest -= 1;
 
         if self.check(TokenType::Dedent) {
             self.advance();
@@ -752,7 +771,11 @@ The inline form belongs where a value is used: let x be when c then a otherwise 
                 self.skip_newlines();
                 if self.check(TokenType::When) {
                     // Ya estamos en la forma inline: lo que sigue es expresión.
-                    otherwise_when = Some(Box::new(self.parse_when(false)?));
+                    // Ronda 2 (M-r2-4): cada `otherwise when` es un nivel más del árbol.
+                    self.enter_nest()?;
+                    let r = self.parse_when(false);
+                    self.nest -= 1;
+                    otherwise_when = Some(Box::new(r?));
                 } else {
                     otherwise = Some(vec![self.parse_expression()?]);
                 }
@@ -777,7 +800,11 @@ The inline form belongs where a value is used: let x be when c then a otherwise 
             self.skip_newlines();
             if self.check(TokenType::When) {
                 // Un `otherwise when` de una cadena de bloques hereda la posición del raíz.
-                otherwise_when = Some(Box::new(self.parse_when(stmt_pos)?));
+                // Ronda 2 (M-r2-4): cada `otherwise when` es un nivel más del árbol.
+                self.enter_nest()?;
+                let r = self.parse_when(stmt_pos);
+                self.nest -= 1;
+                otherwise_when = Some(Box::new(r?));
             } else {
                 otherwise = Some(self.parse_block()?);
             }
@@ -2423,7 +2450,38 @@ The inline form belongs where a value is used: let x be when c then a otherwise 
     // =========================================================
 
     fn parse_expression(&mut self) -> Result<Node, ParseError> {
-        self.parse_pipe()
+        self.enter_nest()?;
+        let r = self.parse_pipe();
+        self.nest -= 1;
+        r
+    }
+
+    /// v0.6.58 (D-22): un nivel más de anidamiento, o el error de [`MAX_NEST`].
+    fn enter_nest(&mut self) -> Result<(), ParseError> {
+        if self.nest >= MAX_NEST {
+            return Err(self.nest_error());
+        }
+        self.nest += 1;
+        Ok(())
+    }
+
+    /// v0.6.58 (M1): una cadena `a + b + c …` o `a.b(c)[d] …` arma un árbol tan hondo como
+    /// operadores tiene, y quien lo recorre (`codegen`, el intérprete, `Drop`) baja recursivo
+    /// por él. Cada operando extra de una cadena entra un nivel con [`Parser::enter_nest`] y
+    /// este alcance devuelve el contador al nivel de entrada al terminar (bien o con error).
+    /// Cuenta de más cuando el operando de la derecha también anida (cota conservadora, falla
+    /// cerrado): el árbol nunca pasa de [`MAX_NEST`].
+    fn chain_scope(&mut self, f: impl FnOnce(&mut Self) -> Result<Node, ParseError>) -> Result<Node, ParseError> {
+        let saved = self.nest;
+        let r = f(self);
+        self.nest = saved;
+        r
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn nest_error(&self) -> ParseError {
+        ParseError::new(format!("{} {} levels", NEST_ERROR, MAX_NEST), self.current().location.clone())
     }
 
     /// `x |> f |> g(a)`: el operador de MENOR precedencia (v0.6.29), así `1 + 2 |> double`
@@ -2450,8 +2508,13 @@ The inline form belongs where a value is used: let x be when c then a otherwise 
     }
 
     fn parse_or(&mut self) -> Result<Node, ParseError> {
+        self.chain_scope(Self::parse_or_chain)
+    }
+
+    fn parse_or_chain(&mut self) -> Result<Node, ParseError> {
         let mut left = self.parse_and()?;
         while self.check(TokenType::Or) {
+            self.enter_nest()?;
             let op = self.advance();
             let right = self.parse_and()?;
             left = Node::new(
@@ -2467,8 +2530,13 @@ The inline form belongs where a value is used: let x be when c then a otherwise 
     }
 
     fn parse_and(&mut self) -> Result<Node, ParseError> {
+        self.chain_scope(Self::parse_and_chain)
+    }
+
+    fn parse_and_chain(&mut self) -> Result<Node, ParseError> {
         let mut left = self.parse_not()?;
         while self.check(TokenType::And) {
+            self.enter_nest()?;
             let op = self.advance();
             let right = self.parse_not()?;
             left = Node::new(
@@ -2486,7 +2554,10 @@ The inline form belongs where a value is used: let x be when c then a otherwise 
     fn parse_not(&mut self) -> Result<Node, ParseError> {
         if self.check(TokenType::Not) {
             let op = self.advance();
-            let operand = self.parse_not()?;
+            self.enter_nest()?;
+            let operand = self.parse_not();
+            self.nest -= 1;
+            let operand = operand?;
             return Ok(Node::new(
                 op.location,
                 NodeKind::UnaryOp {
@@ -2549,8 +2620,13 @@ The inline form belongs where a value is used: let x be when c then a otherwise 
     }
 
     fn parse_addition(&mut self) -> Result<Node, ParseError> {
+        self.chain_scope(Self::parse_addition_chain)
+    }
+
+    fn parse_addition_chain(&mut self) -> Result<Node, ParseError> {
         let mut left = self.parse_multiplication()?;
         while self.check_any(&[TokenType::Plus, TokenType::Minus]) {
+            self.enter_nest()?;
             let op = self.advance();
             let operator = if op.ty == TokenType::Plus { BinOp::Add } else { BinOp::Sub };
             let right = self.parse_multiplication()?;
@@ -2567,8 +2643,13 @@ The inline form belongs where a value is used: let x be when c then a otherwise 
     }
 
     fn parse_multiplication(&mut self) -> Result<Node, ParseError> {
+        self.chain_scope(Self::parse_multiplication_chain)
+    }
+
+    fn parse_multiplication_chain(&mut self) -> Result<Node, ParseError> {
         let mut left = self.parse_unary()?;
         while self.check_any(&[TokenType::Star, TokenType::Slash, TokenType::FloorDiv, TokenType::Percent]) {
+            self.enter_nest()?;
             let op = self.advance();
             let operator = match op.ty {
                 TokenType::Star => BinOp::Mul,
@@ -2592,7 +2673,10 @@ The inline form belongs where a value is used: let x be when c then a otherwise 
     fn parse_unary(&mut self) -> Result<Node, ParseError> {
         if self.check(TokenType::Minus) {
             let op = self.advance();
-            let operand = self.parse_unary()?;
+            self.enter_nest()?;
+            let operand = self.parse_unary();
+            self.nest -= 1;
+            let operand = operand?;
             return Ok(Node::new(
                 op.location,
                 NodeKind::UnaryOp {
@@ -2611,7 +2695,10 @@ The inline form belongs where a value is used: let x be when c then a otherwise 
         let left = self.parse_postfix()?;
         if self.check(TokenType::Power) {
             let op = self.advance();
-            let right = self.parse_unary()?;
+            self.enter_nest()?;
+            let right = self.parse_unary();
+            self.nest -= 1;
+            let right = right?;
             return Ok(Node::new(
                 op.location,
                 NodeKind::BinaryOp {
@@ -2625,10 +2712,15 @@ The inline form belongs where a value is used: let x be when c then a otherwise 
     }
 
     fn parse_postfix(&mut self) -> Result<Node, ParseError> {
+        self.chain_scope(Self::parse_postfix_chain)
+    }
+
+    fn parse_postfix_chain(&mut self) -> Result<Node, ParseError> {
         let mut node = self.parse_primary()?;
 
         loop {
             if self.check(TokenType::LParen) {
+                self.enter_nest()?;
                 let loc = self.location();
                 self.advance();
                 let args = self.enclosed(|p| {
@@ -2653,6 +2745,7 @@ The inline form belongs where a value is used: let x be when c then a otherwise 
                     },
                 );
             } else if self.check(TokenType::Dot) {
+                self.enter_nest()?;
                 let loc = self.location();
                 self.advance();
                 // `expect_name` (no `expect`): así `mod.decide(...)` da el error BUENO
@@ -2676,6 +2769,7 @@ The inline form belongs where a value is used: let x be when c then a otherwise 
                     },
                 );
             } else if self.check(TokenType::LBracket) {
+                self.enter_nest()?;
                 let loc = self.location();
                 self.advance();
                 let index = self.parse_expression()?;
@@ -2688,6 +2782,7 @@ The inline form belongs where a value is used: let x be when c then a otherwise 
                     },
                 );
             } else if self.check(TokenType::Of) {
+                self.enter_nest()?;
                 // "name of person" → PropertyAccess
                 let loc = self.location();
                 self.advance();
@@ -2796,6 +2891,13 @@ The inline form belongs where a value is used: let x be when c then a otherwise 
         segments: Vec<TemplateSegment>,
         loc: &SourceLocation,
     ) -> Result<Node, ParseError> {
+        // Ronda 2 (M-r2-4): una plantilla de N segmentos es una cadena de N `+` (un árbol N niveles
+        // hondo) y cada hueco se parsea con su propio parser: los dos cuentan para [`MAX_NEST`]
+        // desde el nivel de la plantilla (cota conservadora, como `chain_scope`).
+        let depth = self.nest.saturating_add(u32::try_from(segments.len()).unwrap_or(u32::MAX));
+        if depth > MAX_NEST {
+            return Err(self.nest_error());
+        }
         let mut node: Option<Node> = None;
         for seg in segments {
             let (part, op) = match seg {
@@ -2807,7 +2909,7 @@ The inline form belongs where a value is used: let x be when c then a otherwise 
                     // fuente (después de la `{` y de los espacios que el trim saca).
                     let lead = src.chars().take_while(|c| c.is_whitespace()).count();
                     let (line, col) = (interp_loc.line, interp_loc.column + 1 + lead);
-                    let mut e = self.parse_interp_expression(&src, loc).map_err(|mut e| {
+                    let mut e = self.parse_interp_expression(&src, loc, depth).map_err(|mut e| {
                         crate::ast_api::shift_location(&mut e.location, line, col);
                         e
                     })?;
@@ -2852,8 +2954,9 @@ The inline form belongs where a value is used: let x be when c then a otherwise 
         &self,
         src: &str,
         loc: &SourceLocation,
+        nest: u32,
     ) -> Result<Node, ParseError> {
-        match parse_expression_source(src.trim(), &loc.file) {
+        match parse_expression_source_at(src.trim(), &loc.file, nest) {
             Ok(node) => Ok(node),
             Err(CompileError::Parse(e)) => Err(e),
             Err(CompileError::Lex(e)) => Err(ParseError::new(e.message, e.location)),
@@ -3366,8 +3469,15 @@ fn c_comment_on(line: &str) -> bool {
 
 /// Parsea una sola expresión (para los holes `{ expr }` de templates).
 pub fn parse_expression_source(source: &str, filename: &str) -> Result<Node, CompileError> {
+    parse_expression_source_at(source, filename, 0)
+}
+
+/// Ronda 2 (M-r2-4): una expresión que vive `nest` niveles adentro de otra (el hueco de una
+/// plantilla): el tope de [`MAX_NEST`] cuenta desde ahí.
+fn parse_expression_source_at(source: &str, filename: &str, nest: u32) -> Result<Node, CompileError> {
     let tokens = Lexer::new(source, filename).tokenize_filtered()?;
     let mut parser = Parser::new(tokens, filename);
+    parser.nest = nest;
     Ok(parser.parse_expression()?)
 }
 
