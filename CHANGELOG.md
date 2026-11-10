@@ -27,7 +27,8 @@ Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the rele
   (`this project needs synsema >= 0.6.60; this is 0.6.58: synsema update`); an unknown key is an error.
   A `synsema.json` owned by another user, in the root of the system's temp folder, that cannot be
   opened, or that is not a regular file, is ignored with a warning; `SYNSEMA_SAFE_PROJECT` (folders,
-  or `*`) accepts one owned by another user or in the temp folder, like git's `safe.directory`. A
+  or `*`) accepts one owned by another user, like git's `safe.directory`; one in the root of the temp
+  folder is always ignored, like Go does. A
   binary built with `synsema build` does not check the minimum again: it was checked when building.
 - **A package only uses what it declares, and only if the program granted it.** Every task and lambda
   written in a package runs with the package's `requires` (the union of its `require`s) intersected
@@ -190,12 +191,15 @@ with `require memory(...)`, reach it. One behavior changed with it: more than on
   folder that holds only what is served, or run `build` from the project root, where `"."` is the
   project root and serves all of it, the code included.
 - **A recursion through code the reference interpreter runs reaches fewer calls** (above): each
-  call costs what its nesting costs on the stack. A recursive task whose body nests deeply (more
-  than about 12 levels of blocks) inside a `try` or a body with more than 32 767 locals,
-  run with `--labels`, or that renders a template with deeply nested blocks, stops with `maximum
-  recursion depth exceeded` before 3000 calls, the deeper it nests. In a `serve` route such a
-  recursion stops where the route's 64 MB of stack ends (about 1100 flat calls with `--labels` in a
-  debug build, more in release); the same in a `cron` job. In wasm, where the stack is
+  call costs what its nesting costs on the stack. A recursive task whose body nests deeply inside a
+  `try`, has more than 32 767 locals, runs with `--labels`, or renders a template with deeply
+  nested blocks, stops with `maximum recursion depth exceeded` before 3000 calls, the deeper it
+  nests. Measured in a release build: with `--labels`, a body with 6 nested `when` still reaches
+  2999 calls, with 8 it stops at 1499, with 12 at 999 and with 30 at 427; a `try` around 12 nested
+  `when` stops at 999, with or without labels. Moving the nested blocks to a helper task reaches
+  2997 again. In a `serve` route such a recursion also stops where the route's 64 MB of stack ends
+  (a flat recursion with `--labels` reaches 2999 in release, about 1100 calls in a debug build); the
+  same in a `cron` job. In wasm, where the stack is
   smaller, any such call costs at least one more level: a recursion through a `try`, or any
   recursion with labels on, reaches at most half the limit (300 calls in the wasm-web). Calls that
   run on the VM (most code) count as before.
