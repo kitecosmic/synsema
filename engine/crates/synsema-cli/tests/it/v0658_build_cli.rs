@@ -635,13 +635,45 @@ fn m_r4_1_a_recursion_in_the_reference_with_labels_hits_the_limit_not_the_stack(
     for (k, want) in [(8, None), (30, None), (100, None), (6, Some("2999")), (0, Some("2999"))] {
         std::fs::write(dir.join("h.syn"), recursive_task(false, k, 2999)).unwrap();
         let (code, out, err) = synsema_env(&dir, &["run", "--labels", "h.syn"], None, &[]);
-        // Con 6 y 0 el número, o (pila más chica por llamada, p. ej. aarch64 debug) el error de
-        // recursión: el hilo avisa su pila. Nunca el proceso abortado.
+        // Con 6 y 0, el número. Sólo en aarch64 debug (frames más grandes que la calibración de
+        // x86_64) vale también el error de recursión: el hilo avisa su pila. Nunca el proceso
+        // abortado. Ronda 8 (B-r8-2): en los demás hosts sigue estricto, así que un aviso de pila
+        // que rechace una recursión válida se ve en Windows y en Linux.
         let refused = code == 1 && err.contains("maximum recursion depth exceeded");
+        let host_may_refuse = cfg!(all(target_arch = "aarch64", debug_assertions));
+        eprintln!("k = {k}: rc {code}, {}", if refused { "el error de recursión" } else { out.trim() });
         match want {
-            Some(w) => assert!((code == 0 && out.trim() == w) || refused, "k = {k}: rc {code} {out}{err}"),
+            Some(w) => assert!(
+                (code == 0 && out.trim() == w) || (host_may_refuse && refused),
+                "k = {k}: rc {code} {out}{err}"
+            ),
             None => assert!(refused, "k = {k}: rc {code} {out}{err}"),
         }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Ronda 8 (B-r8-1): el REPL corría en el hilo principal (1 MB en Windows) sin avisar su pila: una
+/// task de cuerpo frío con 6 `when` lo tumbaba a las 20 llamadas (rc 127). Ahora corre en el hilo
+/// del motor, como `run`: 2999, y pasado el tope, el error.
+#[test]
+fn b_r8_1_a_recursion_in_the_repl_does_not_take_it_down() {
+    let dir = std::env::temp_dir().join(format!("synsema-br81-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let task = recursive_task(true, 6, 0);
+    let lib = task.replacen("task h(n)", "export task h(n)", 1).replace("print(h(0))\n", "");
+    std::fs::write(dir.join("libc6.syn"), lib).unwrap();
+    // Ronda 9 (B-r9-1): en aarch64 debug (frames más grandes que la calibración de x86_64) 2999
+    // puede dar el error, como en m_r4_1; 20 no (el guardián no mira la pila antes de 64 llamadas).
+    let host_may_refuse = cfg!(all(target_arch = "aarch64", debug_assertions));
+    for (n, want) in [(20, "20"), (2999, "2999"), (3500, "maximum recursion depth exceeded")] {
+        let stdin = format!("use \"./libc6.syn\" as L\nprint(L.h({n}))\n");
+        let (code, out, err) = synsema_env(&dir, &["repl"], Some(&stdin), &[]);
+        let all = format!("{out}{err}");
+        let refused = all.contains("maximum recursion depth exceeded");
+        eprintln!("n = {n}: rc {code}, {}", if refused { "el error de recursión" } else { want });
+        assert_eq!(code, 0, "n = {n}: {all}");
+        assert!(all.contains(want) || (n == 2999 && host_may_refuse && refused), "n = {n}: {all}");
     }
     let _ = std::fs::remove_dir_all(&dir);
 }

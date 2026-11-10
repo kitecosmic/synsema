@@ -707,11 +707,13 @@ fn main() -> ExitCode {
         Some("openapi") => on_engine_stack(|| cmd_openapi(&args)),
         Some("tokens") => cmd_tokens(&args),
         Some("ast") => on_engine_stack(|| cmd_ast(&args)),
-        Some("repl") => {
+        // B-r8-1 (v0.6.58): el REPL corría en el hilo principal (1 MB en Windows) sin avisar su
+        // pila: una recursión de 20 llamadas con un cuerpo frío lo tumbaba.
+        Some("repl") => on_engine_stack(|| {
             update::notify_if_outdated();
             repl();
             ExitCode::SUCCESS
-        }
+        }),
         Some("daemon") => cmd_daemon(&args),
         Some("init") => cmd_init(&args),
         Some("llm") => cmd_llm(&args),

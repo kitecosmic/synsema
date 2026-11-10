@@ -35,7 +35,11 @@ fn with_big_stack<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> 
     {
         std::thread::Builder::new()
             .stack_size(NATIVE_STACK)
-            .spawn(f)
+            .spawn(|| {
+                // N-r8-3 (v0.6.58): el guardián de recursión mira la pila real de este hilo.
+                synsema_core::stack::enter_thread(NATIVE_STACK);
+                f()
+            })
             .expect("no se pudo crear el hilo del motor")
             .join()
             .expect("el hilo del motor falló")

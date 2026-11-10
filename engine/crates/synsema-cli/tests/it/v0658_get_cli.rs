@@ -1345,6 +1345,30 @@ fn b9_a_damaged_cached_index_is_named_and_repaired() {
     assert_eq!(std::fs::read(&idx).unwrap(), b1.index());
 }
 
+/// Ronda 8 (N-r8-2): con la carpeta del proyecto sin escritura (Unix), `get` falla ya al crear el
+/// temporal de `synsema.json`; el error nombra `synsema.json`, no `.synsema.json.tmp-<pid>`.
+#[cfg(unix)]
+#[test]
+fn n_r8_2_an_unwritable_project_folder_names_synsema_json() {
+    use std::os::unix::fs::PermissionsExt;
+    let reg = Reg::start();
+    let b = reg.base();
+    let bpe = says(&format!("{}/bpe", b), "0.1.0", "b1");
+    let u = reg.publish("/bpe/0.1.0", &bpe);
+    let manifest = modules(&[("bpe", url(&u))]);
+    let p = Proj::new("nr82", manifest.clone());
+    p.ok(&[]);
+    // Otra vez sin el hash: `get` tiene que reescribir `synsema.json`.
+    p.write(manifest);
+    let mode = |m: u32| std::fs::set_permissions(&p.dir, std::fs::Permissions::from_mode(m)).unwrap();
+    mode(0o555);
+    let (code, _, err) = p.get(&[]);
+    mode(0o755);
+    assert_ne!(code, 0, "{}", err);
+    let want = format!("get: could not write {}: ", p.dir.join("synsema.json").display());
+    assert!(err.contains(&want) && !err.contains(".synsema.json.tmp-"), "{}", err);
+}
+
 /// N10 (ronda 1): `synsema get --help` sale por stdout con rc 0.
 #[test]
 fn n10_get_help_exits_zero() {

@@ -1249,8 +1249,9 @@ fn get(opts: &Opts, manifest: &Manifest, raw: &[u8], json_path: &Path, cache: &P
     }
     let new_text = write_manifest(raw, manifest, &g, &chosen, &reach)?;
     let tmp = json_path.with_file_name(format!(".synsema.json.tmp-{}", std::process::id()));
-    std::fs::write(&tmp, new_text.as_bytes()).map_err(|e| format!("get: {}: {}", tmp.display(), e))?;
-    rename_retry(&tmp, json_path).map_err(|e| {
+    // N-r8-2: el temporal y el rename son una sola escritura: en Unix, una carpeta sin escritura
+    // falla ya al crear el temporal, y el error nombra el archivo que el usuario ve.
+    std::fs::write(&tmp, new_text.as_bytes()).and_then(|()| rename_retry(&tmp, json_path)).map_err(|e| {
         let _ = std::fs::remove_file(&tmp);
         format!("get: could not write {}: {}", json_path.display(), e)
     })?;

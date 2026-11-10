@@ -620,6 +620,14 @@ fn sqlite_err(e: rusqlite::Error) -> String {
             e
         );
     }
+    // M-r8-1 (v0.6.58): `rusqlite` 0.41 rechaza una cola con otra sentencia. Antes (0.30) corría la
+    // primera y descartaba el resto sin avisar; el error ahora dice qué hacer.
+    if matches!(e, rusqlite::Error::MultipleStatement) {
+        // Ronda 9: sin «after the first ';'» (un ';' dentro de un texto señalaba el equivocado) ni
+        // «inside a transaction» (en `serve` las rutas comparten la conexión: un BEGIN de una ruta
+        // envuelve las escrituras de las otras, M-r9-1).
+        return "one SQL statement per call: this call has more than one (sql, sql_exec and sql_batch run one; before v0.6.58 the rest was dropped without a word); run each statement with its own call".to_string();
+    }
     e.to_string()
 }
 
@@ -2494,6 +2502,23 @@ mod tests {
         }
         let e = m.execute("SELECT nada FROM ningun_lado", &[]).unwrap_err();
         assert!(!e.contains("db_open"), "otro error queda igual: {}", e);
+    }
+
+    /// M-r8-1 (v0.6.58): con `rusqlite` 0.41, otra sentencia después del primer `;` es un error que
+    /// dice qué hacer (antes corría la primera y descartaba el resto). No corre ninguna; una cola
+    /// con espacios, `;` o un comentario sigue andando.
+    #[test]
+    fn m_r8_1_more_than_one_statement_is_a_guided_error() {
+        let mut m = DatabaseManager::new();
+        m.open(":memory:", "memory").unwrap();
+        let guided = |e: String| assert!(e.starts_with("one SQL statement per call") && e.contains("its own call"), "{}", e);
+        guided(m.execute("CREATE TABLE u (x); CREATE TABLE v (y)", &[]).unwrap_err());
+        guided(m.query("SELECT 1 AS one; SELECT 2 AS two", &[]).unwrap_err());
+        guided(m.execute_many("CREATE TABLE w (x); SELECT 1", &[vec![]]).unwrap_err());
+        assert!(m.query("SELECT name FROM sqlite_master", &[]).unwrap().is_empty(), "no corrió la primera");
+        for q in ["SELECT 1 AS one; -- un comentario", "SELECT 1 AS one;   ", "SELECT 1 AS one;;"] {
+            assert_eq!(m.query(q, &[]).unwrap().len(), 1, "{}", q);
+        }
     }
 
     fn has_returning(sql: &str, d: SqlDialect) -> bool {

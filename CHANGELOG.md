@@ -71,7 +71,7 @@ Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the rele
   `cron_every`/`cron_after` job, under `serve` and `run`: it ran on a 2 MB thread, and a recursion in
   the tick took the whole process down (one `try` around the call, at 23 calls in a debug build). A
   job now runs on a 64 MB thread, like a route, and gives the error.
-  Every thread that runs the interpreter (`run`, `test`, `serve` and the rest) now also looks at
+  Every thread that runs the interpreter (`run`, `test`, `repl`, `serve` and the rest) now also looks at
   the stack it has left: a host where each call takes more stack than the one the limit was
   measured on (a debug build on macOS arm64: 6 nested `when` × 2999 calls with `--labels`) gives the
   error instead of overflowing.
@@ -154,8 +154,9 @@ Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the rele
 
 **Security: SQLite 3.54.1 (`rusqlite` 0.41, `libsqlite3-sys` 0.39).** RUSTSEC-2026-0459, published
 on 2026-10-30, is a flaw in the C SQLite that v0.6.57 bundled (`libsqlite3-sys` 0.30.1). The engine
-now bundles the fixed SQLite. Only a SQLite database opened with `db_open` reaches it; the language does
-not change.
+now bundles the fixed SQLite. A SQLite database opened with `db_open`, and the agent memory declared
+with `require memory(...)`, reach it. One behavior changed with it: more than one statement in one
+`sql`/`sql_exec`/`sql_batch` call is an error (see **Breaking**).
 
 **Breaking.**
 - **A `synsema.json` in the entry's folder or above is now read, and its folder is the project
@@ -209,12 +210,17 @@ not change.
   hash with it. The new guest still runs a module embedded the old way; the `embed.syn` of v0.6.57 does
   not find a slot in the new guest, and the new `embed.syn` refuses an old guest. Use the tools of the
   same release as the guest.
+- **SQLite: one statement per `sql`, `sql_exec` or `sql_batch` call.** A second statement in the
+  same call is now an error (`one SQL statement per call: …`) and none of them runs. Before, the first
+  ran and the rest were dropped without a word: `sql_exec("CREATE TABLE u (x); CREATE TABLE v (y)")`
+  created only `u`. A trailing `;`, spaces or a comment still work. Run each statement with its own
+  call. It comes with the SQLite update (above).
 
 **The `perf-guard` anchor was re-measured on CI** (`engine/perf/baseline.json`, from this release's
-PR). Five rows went over the +0.3 % budget, costs of this release measured and accepted in its
-review (the package mark on calls, the recursion guard): `c_call4` (jit) +0.72 %, `a_name64` (jit)
-+0.60 %, `c_each_empty` (vm) +0.63 % and (jit) +0.33 %, and `s_text_join` (ref) +0.44 %, where each
-call of the reference interpreter checks the recursion guard.
+PR). Five rows went over the +0.3 % budget: `c_call4` (jit) +0.72 %, `a_name64` (jit) +0.60 %,
+`c_each_empty` (vm) +0.63 % and (jit) +0.33 %, and `s_text_join` (ref) +0.44 %. `s_text_join` (ref)
+is the recursion guard on each call of the reference interpreter, measured and accepted in review;
+the other four were not broken down.
 
 ## v0.6.57 — 2026-11-06
 
