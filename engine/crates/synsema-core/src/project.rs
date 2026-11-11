@@ -18,7 +18,7 @@ use std::sync::{Arc, OnceLock};
 
 /// La versión de este motor cuando el binario no es de un release (`cargo build`). Se sube al abrir
 /// la versión siguiente; `engine_version_is_not_behind_the_changelog` no deja que quede atrás.
-pub const DEV_VERSION: &str = "0.6.58";
+pub const DEV_VERSION: &str = "0.6.59";
 
 /// La versión del motor: la del release (`SYNSEMA_VERSION`, el tag, lo setea `release.yml`) o
 /// [`DEV_VERSION`] en un build de desarrollo (que cuenta como esa versión, §8).
@@ -582,7 +582,8 @@ mod tests {
             "synsema.json: unknown key \"module\" (known: \"synsema\", \"modules\", \"indirect\"; a package also has \"id\", \"version\", \"main\", \"files\")"
         );
         let e = parse_manifest(br#"{"synsema": "v0.6.58"}"#, "synsema.json").unwrap_err();
-        assert_eq!(e, "synsema.json: \"synsema\" is a minimum version like \"0.6.58\" (three numbers), not \"v0.6.58\"");
+        // El ejemplo del mensaje es la versión de este motor: sube con `DEV_VERSION`.
+        assert_eq!(e, format!("synsema.json: \"synsema\" is a minimum version like \"{}\" (three numbers), not \"v0.6.58\"", DEV_VERSION));
         let e = parse_manifest(b"{\n  \"modules\": {,}\n}", "synsema.json").unwrap_err();
         assert!(e.starts_with("synsema.json:2:"), "{}", e);
     }

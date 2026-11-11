@@ -40,6 +40,7 @@ mod hmac_bytes;
 mod v0655_arrays;
 mod v0656_f32;
 mod v0658_attenuation;
+mod v0659_transactions;
 mod llm_stream_e2e;
 mod llm_text_prompt;
 mod memory_declared;

@@ -147,7 +147,7 @@ pub const BUILTIN_CAPS: &[(&str, &str)] = &[
     ("algod", "net"), ("esplora", "net"),
     // bases de datos
     ("db_open", "db"), ("db_close", "db"), ("sql", "db"), ("sql_exec", "db"),
-    ("sql_tables", "db"), ("sql_batch", "db"), ("paged", "db"),
+    ("sql_tables", "db"), ("sql_batch", "db"), ("paged", "db"), ("sql_transaction", "db"),
     ("mongo_find", "db"), ("mongo_find_one", "db"), ("mongo_insert", "db"),
     ("mongo_insert_many", "db"), ("mongo_update", "db"), ("mongo_delete", "db"),
     ("mongo_count", "db"), ("mongo_aggregate", "db"), ("mongo_collections", "db"),

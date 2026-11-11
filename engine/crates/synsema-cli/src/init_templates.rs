@@ -352,6 +352,9 @@ pub const ENV_EXAMPLE: &str = r#"# Config del proyecto — Synsema auto-carga el
 # SYNSEMA_RECEIPT_SEALED_BYTES=65536
 
 # ══ Modulos por nombre — `use "nombre"` y `synsema get` ══
+# Estas dos se leen del ENTORNO del proceso (el shell, el servicio, el contenedor), NO de este
+# archivo: ponerlas en `.env` no tiene efecto. Por ejemplo:
+#   SYNSEMA_MODULE_CACHE=./vendor synsema run app.syn
 
 # Carpeta del cache de paquetes (por defecto ~/.synsema/modules). Relativa = relativa a la raiz
 # del proyecto (la carpeta del synsema.json). `synsema get` la llena; correr solo la lee:
@@ -457,6 +460,8 @@ const HELLO_SYN_PAST: &[&str] = &[
 
 /// sha256 de cada contenido histórico de `.env.example` (ver `InitFile::past`).
 const ENV_EXAMPLE_PAST: &[&str] = &[
+    // v0.6.59: antes de decir que SYNSEMA_MODULE_CACHE y SYNSEMA_SAFE_PROJECT no se leen de `.env`.
+    "ee32ce35f193a6188f3938ed4e6fec9650fb86652b1bdde10b112129ed14727e",
     // v0.6.58: antes de SYNSEMA_MODULE_CACHE y SYNSEMA_SAFE_PROJECT (`use "nombre"`).
     "b97b59ebbaa0abd67aae6e01e6ab269705d790426242fb437a459b05ada484fa",
     // v0.6.56: antes de SYNSEMA_THREADS (los hilos de matmul).
@@ -1220,6 +1225,16 @@ mod tests {
             assert!(t.contains("npx skills update -g") && t.contains("-s -- --agents"), "{}", t);
             assert!(!t.contains("curl -sL "), "{}", t);
         }
+    }
+
+    /// v0.6.59: el template presentaba SYNSEMA_MODULE_CACHE como una línea más para descomentar
+    /// en `.env`, y `.env` no se lee para ese knob ni para SYNSEMA_SAFE_PROJECT.
+    #[test]
+    fn env_example_says_which_knobs_are_not_read_from_dotenv() {
+        let section = ENV_EXAMPLE.split("══ Modulos por nombre").nth(1).expect("la sección de módulos");
+        let (note, rest) = section.split_once("# SYNSEMA_MODULE_CACHE=./vendor").expect("la línea del knob");
+        assert!(note.contains("se leen del ENTORNO del proceso") && note.contains("NO de este\n# archivo"), "{}", note);
+        assert!(rest.contains("# SYNSEMA_SAFE_PROJECT=/repo"));
     }
 
     #[test]

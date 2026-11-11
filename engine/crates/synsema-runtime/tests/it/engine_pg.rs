@@ -72,6 +72,153 @@ fn pg_gate_passes_routing_to_postgres() {
 // Tipos + pgvector (requieren Postgres real → #[ignore])
 // =========================================================
 
+/// v0.6.59 — `sql_transaction` en Postgres: deshace si la task falla y confirma si devuelve;
+/// adentro de otra es un savepoint; el DDL es transaccional (una tabla creada en una transacción
+/// que falla no queda); el control a mano es un error; y un statement que falla hace fallar la
+/// transacción aunque la task lo atrape (Postgres la deja abortada: un `COMMIT` ahí contesta
+/// `ROLLBACK` sin dar error, así que no se manda).
+#[test]
+#[ignore = "requiere un Postgres real (DATABASE_URL)"]
+fn pg_transactions() {
+    let url = pg_url().expect("DATABASE_URL no seteada");
+    let src = format!(
+        r#"require db("{url}")
+db_open("{url}")
+sql_exec("DROP TABLE IF EXISTS syn_m1_tx")
+sql_exec("DROP TABLE IF EXISTS syn_m1_tx2")
+sql_exec("CREATE TABLE syn_m1_tx (v int)")
+task count()
+    let rows be sql("SELECT COUNT(*) AS c FROM syn_m1_tx")
+    give text(rows[0]["c"])
+task fails()
+    sql_exec("INSERT INTO syn_m1_tx VALUES (1)")
+    raise("no")
+try
+    sql_transaction(fails)
+recover e
+    print(e + " " + count())
+sql_transaction(() => sql_exec("INSERT INTO syn_m1_tx VALUES (2)"))
+print(count())
+task nested()
+    sql_exec("INSERT INTO syn_m1_tx VALUES (3)")
+    try
+        sql_transaction(fails)
+    recover e
+        print("inner " + e)
+    give "outer"
+print(sql_transaction(nested) + " " + count())
+task ddl_inside()
+    sql_exec("CREATE TABLE syn_m1_tx2 (v int)")
+    sql_exec("INSERT INTO syn_m1_tx2 VALUES (1)")
+    raise("after ddl")
+try
+    sql_transaction(ddl_inside)
+recover e
+    print(e)
+print(text(length(sql("SELECT tablename FROM pg_tables WHERE tablename = 'syn_m1_tx2'"))))
+try
+    sql_exec("BEGIN")
+recover e
+    print(e)
+task caught_error()
+    try
+        sql_exec("INSERT INTO syn_m1_missing VALUES (1)")
+    recover e
+        print("ignored")
+    sql_exec("INSERT INTO syn_m1_tx VALUES (5)")
+try
+    sql_transaction(caught_error)
+recover e
+    print(e)
+task caught_and_silent()
+    sql_exec("INSERT INTO syn_m1_tx VALUES (6)")
+    try
+        sql_exec("INSERT INTO syn_m1_missing VALUES (1)")
+    recover e
+        print("ignored")
+    give "returned"
+try
+    print(sql_transaction(caught_and_silent))
+recover e
+    print(e)
+print(count())
+db_close()
+"#
+    );
+    let r = run_source(&src, "<t>");
+    assert!(r.success, "{:?}", r.errors);
+    let o = r.output;
+    assert_eq!(o.len(), 12, "{:?}", o);
+    assert_eq!(&o[..6], ["no 0", "1", "inner no", "outer 2", "after ddl", "0"], "{:?}", o);
+    assert!(o[6].starts_with("BEGIN, COMMIT, ROLLBACK and SAVEPOINT are not run by hand"), "{:?}", o);
+    assert_eq!(o[7], "ignored");
+    assert!(o[8].starts_with("sql_transaction: a statement failed inside this transaction"), "{:?}", o);
+    assert_eq!(o[9], "ignored");
+    assert!(o[10].starts_with("sql_transaction: a statement failed inside this transaction"), "la task devolvió, pero no se confirma: {:?}", o);
+    assert_eq!(o[11], "2", "{:?}", o);
+}
+
+/// v0.6.59 — lo que el motor no ve por las primeras palabras, medido contra un Postgres real: un
+/// `CALL` o un `DO` con `COMMIT` adentro. Postgres lo cierra solo: adentro de una transacción da
+/// «invalid transaction termination» (y la transacción falla, como con cualquier statement), y
+/// afuera confirma lo suyo sin dejar nada abierto. Una llamada lleva un solo statement. `total()`
+/// reabre la conexión: lo que hubiera quedado en una transacción abierta se pierde y no suma.
+#[test]
+#[ignore = "requiere un Postgres real (DATABASE_URL)"]
+fn pg_procedures_and_transactions() {
+    let url = pg_url().expect("DATABASE_URL no seteada");
+    let src = format!(
+        r#"require db("{url}")
+db_open("{url}")
+sql_exec("DROP TABLE IF EXISTS syn_m1_p")
+sql_exec("CREATE TABLE syn_m1_p (v int)")
+sql_exec("CREATE OR REPLACE PROCEDURE syn_m1_commit() LANGUAGE plpgsql AS 'BEGIN INSERT INTO syn_m1_p VALUES (1); COMMIT; INSERT INTO syn_m1_p VALUES (2); END'")
+task total()
+    db_close()
+    db_open("{url}")
+    let rows be sql("SELECT COALESCE(SUM(v), 0)::int AS s FROM syn_m1_p")
+    give text(rows[0]["s"])
+sql_exec("CALL syn_m1_commit()")
+sql_exec("INSERT INTO syn_m1_p VALUES (4)")
+print("A " + total())
+task call_inside()
+    sql_exec("INSERT INTO syn_m1_p VALUES (8)")
+    sql_exec("CALL syn_m1_commit()")
+try
+    sql_transaction(call_inside)
+recover e
+    print(e)
+print("B " + total())
+task do_inside()
+    sql_exec("INSERT INTO syn_m1_p VALUES (16)")
+    sql_exec("DO 'BEGIN COMMIT; END'")
+try
+    sql_transaction(do_inside)
+recover e
+    print(e)
+print("C " + total())
+sql_exec("DO 'BEGIN INSERT INTO syn_m1_p VALUES (32); COMMIT; END'")
+sql_exec("INSERT INTO syn_m1_p VALUES (64)")
+print("D " + total())
+try
+    sql_exec("INSERT INTO syn_m1_p VALUES (128); COMMIT")
+recover e
+    print("E refused")
+print("E " + total())
+db_close()
+"#
+    );
+    let r = run_source(&src, "<t>");
+    assert!(r.success, "{:?}", r.errors);
+    let o = r.output;
+    assert_eq!(o.len(), 8, "{:?}", o);
+    assert_eq!(o[0], "A 7", "afuera, el procedimiento confirma lo suyo y no deja nada abierto: {:?}", o);
+    assert!(o[1].contains("invalid transaction termination"), "{:?}", o);
+    assert_eq!(o[2], "B 7", "{:?}", o);
+    assert!(o[3].contains("invalid transaction termination"), "{:?}", o);
+    assert_eq!(&o[4..], ["C 7", "D 103", "E refused", "E 103"], "{:?}", o);
+}
+
 #[test]
 #[ignore = "requiere un Postgres real (DATABASE_URL)"]
 fn pg_types_roundtrip() {

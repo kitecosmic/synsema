@@ -818,6 +818,16 @@ impl Graph<'_> {
     /// Una versión por su hash, del caché (el árbol o el índice guardado) o de la red. Verifica que
     /// el índice sea el de la arista (G43) y su hash.
     fn obtain(&mut self, shown: &str, from: &str, e: &Edge, need_files: bool) -> Result<(), String> {
+        // v0.6.59: «nombre versión» en un mensaje; una entrada con el `hash` puesto a mano no
+        // tiene versión, y entonces va sólo el nombre (salía «notes  is not in the cache»).
+        fn named(name: &str, version: &str) -> String {
+            if version.is_empty() {
+                name.to_string()
+            } else {
+                format!("{} {}", name, version)
+            }
+        }
+
         if let Some(n) = self.nodes.get(&e.hash) {
             if !need_files || n.files.is_some() {
                 return Ok(());
@@ -848,21 +858,20 @@ impl Graph<'_> {
                 // `get` avisa que va a la red y lo reescribe (`save_index`).
                 if self.offline {
                     return Err(format!(
-                        "get --check: the cached index of {} {} ({}) is damaged: {}; run synsema get to fetch it again",
-                        shown,
-                        e.version,
+                        "get --check: the cached index of {} ({}) is damaged: {}; run synsema get to fetch it again",
+                        named(shown, &e.version),
                         short_hash(&e.hash),
                         ip.display()
                     ));
                 }
-                eprintln!("get: the cached index of {} {} ({}) is damaged; fetching it again", shown, e.version, short_hash(&e.hash));
+                eprintln!("get: the cached index of {} ({}) is damaged; fetching it again", named(shown, &e.version), short_hash(&e.hash));
             }
         }
         if self.offline {
             return Err(if need_files {
-                format!("get --check: {} {} is not in the cache: run synsema get", shown, e.version)
+                format!("get --check: {} is not in the cache: run synsema get", named(shown, &e.version))
             } else {
-                format!("get --check: the index of {} {} ({}) is not in the cache: run synsema get", shown, e.version, short_hash(&e.hash))
+                format!("get --check: the index of {} ({}) is not in the cache: run synsema get", named(shown, &e.version), short_hash(&e.hash))
             });
         }
         // B5 (ronda 1): lo que el índice dice ser (G43) y su hash, antes de validarlo.
@@ -877,10 +886,9 @@ impl Graph<'_> {
         let got_hash = tree.as_ref().map(|t| t.hash.clone()).or(declared).unwrap_or_default();
         if got_hash != e.hash {
             return Err(format!(
-                "get: {} pins {} {} as {}, but {} serves {}; nothing was installed",
+                "get: {} pins {} as {}, but {} serves {}; nothing was installed",
                 from,
-                e.id,
-                e.version,
+                named(&e.id, &e.version),
                 short_hash(&e.hash),
                 e.url,
                 short_hash(&got_hash)

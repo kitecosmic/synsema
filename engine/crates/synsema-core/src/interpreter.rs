@@ -4825,6 +4825,14 @@ impl Interpreter {
         self.redact_for_host(r)
     }
 
+    /// v0.6.59 — un builtin de fuera de core que recibe una task (`sql_transaction`) la llama con
+    /// esto. Es una llamada del programa, con el guardián de recursión y las etiquetas de siempre;
+    /// no una entrada del host como `call_task`, que abre un `run_scope` y redacta el resultado.
+    #[inline(never)]
+    pub fn call_callback(&mut self, func: SynValue, args: Vec<SynValue>, loc: &SourceLocation) -> Result<SynValue, Control> {
+        self.call_value(func, args, loc)
+    }
+
     /// Intent declarado (para enriquecer /llms.txt). Texto descriptivo, no gatea nada.
     pub fn intent(&self) -> Option<&str> {
         self.intent.as_deref()
