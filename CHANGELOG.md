@@ -6,7 +6,7 @@ Each says what changed, why, and what to write instead.
 
 Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the release date.
 
-## v0.6.59 — unreleased
+## v0.6.59 — 2026-11-11
 
 **Language and engine.**
 - **`sql_transaction(task)` runs a task as one SQL transaction.** It commits when the task returns

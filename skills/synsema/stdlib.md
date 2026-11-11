@@ -317,7 +317,7 @@ profile (needs sockets); `push_vapid_keys` is.
 
 Five backends, all pure-Rust (single static binary, no OpenSSL/`*-sys`), all opened with `db_open` and
 routed by the target. **Three API families:**
-- **SQL** (SQLite / Postgres / MySQL) — universal API `sql`/`sql_exec`/`sql_batch`/`sql_tables`/`paged`.
+- **SQL** (SQLite / Postgres / MySQL) — universal API `sql`/`sql_exec`/`sql_batch`/`sql_tables`/`paged`, and `sql_transaction(task)` (v0.6.59+).
 - **Document store** (MongoDB) — its own `mongo_*` API (no SQL); see [MongoDB](#mongodb-no-sql-document-store).
 - **Key-value / cache / structures** (Redis) — its own `redis_*` API (no SQL, no documents); see
   [Redis](#redis-no-sql-key-valuecachestructures).
@@ -344,23 +344,154 @@ open the database by its path, e.g. db_open("./data/app.db")`). Connections run 
 **defensive mode**: `PRAGMA writable_schema`, `journal_mode=OFF` and hand writes to the schema or to
 FTS5's internal tables have no effect (FTS5 views, triggers and `rebuild` work).
 
-**One statement per call on SQLite (v0.6.58+, breaking).** `sql`, `sql_exec` and `sql_batch` run
-ONE statement. A second one in the same text is an error and **none** of them runs:
-``one SQL statement per call: this call has more than one (sql, sql_exec and sql_batch run one; before v0.6.58 the rest was dropped without a word); run each statement with its own call``
-(up to v0.6.57 the first ran and the rest was dropped: `sql_exec("CREATE TABLE u (x); CREATE TABLE v (y)")`
-created only `u`). What still works: a trailing `;` (also `;;`), trailing spaces, a trailing
-`-- comment`, a `;` inside a quoted text (`'a;b'`) or inside a parameter, and a
-`CREATE TRIGGER … BEGIN …; END` (one statement). Write a schema as one `sql_exec` per table.
+**One statement per call (breaking: SQLite v0.6.58+, MySQL v0.6.59+; Postgres always refused a
+second one).** `sql`, `sql_exec` and `sql_batch` run ONE statement. A second one in the same text
+is an error and **none** of them runs. Write a schema as one `sql_exec` per table.
+- **SQLite:**
+  ``one SQL statement per call: this call has more than one (sql, sql_exec and sql_batch run one; before v0.6.58 the rest was dropped without a word); run each statement with its own call``
+  (up to v0.6.57 the first ran and the rest was dropped: `sql_exec("CREATE TABLE u (x); CREATE TABLE v (y)")`
+  created only `u`). What still works: a trailing `;` (also `;;`), trailing spaces, a trailing
+  `-- comment`, a `;` inside a quoted text (`'a;b'`) or inside a parameter, and a
+  `CREATE TRIGGER … BEGIN …; END` (one statement).
+- **MySQL (v0.6.59+):** the server's own syntax error, followed by
+  ``— if this call has more than one statement: one SQL statement per call (sql, sql_exec and sql_batch run one; before v0.6.59 a sql_exec without values ran them all in MySQL); run each statement with its own call``.
+  Up to v0.6.58 a `sql_exec` without a list of values ran every statement in its text. A procedure
+  or trigger body (`CREATE PROCEDURE … BEGIN …; …; END`) is one statement and works as before.
+  **What it costs:** a text without a `;` inside (a final one does not count) goes as before. A
+  text with a `;` inside, also in a literal or a comment (`VALUES ('a;b')`), is checked by the
+  server first: one more round trip, unless the connection ran that same text recently; a
+  `CREATE PROCEDURE … BEGIN …; END` pays it every time. With `?` and a list of values nothing
+  changes.
 
 **The bundled SQLite is 3.54.1** (`sql("select sqlite_version() as v")` → `[{v: "3.54.1"}]`; v0.6.58
 updated it for a security fix). The agent memory (`require memory(...)`) is SQLite too.
 
-**Transactions.** Under `run` and `test`, `sql_exec("BEGIN")` … `sql_exec("COMMIT")` (or
-`"ROLLBACK"`) works: wrap the statements in `try`, `ROLLBACK` in `recover`. **In `serve`, do not
-use `BEGIN`/`COMMIT` (known limit, fixed in v0.6.59):** all routes share one connection, so a
-`BEGIN` in one route wraps the other routes' writes — a `ROLLBACK` erases a row another route
-already confirmed, and a second `BEGIN` fails with `cannot start a transaction within a
-transaction`. In a route, make each change one statement, which SQLite runs atomically:
+### Transactions — `sql_transaction(task)` (v0.6.59+)
+
+`sql_transaction(task)` runs a task as ONE transaction on the default connection: all of its
+statements are written, or none. SQLite, Postgres and MySQL; the same under `run`, `test` and
+`serve`. It needs what `sql` needs (`require db(...)` and a `db_open` before it:
+`No database connection. Use db_open("path.db") first.`).
+
+```synsema
+require db(":memory:")
+db_open(":memory:", "memory")
+sql_exec("CREATE TABLE acct (name TEXT PRIMARY KEY, bal INTEGER CHECK (bal >= 0))")
+sql_exec("INSERT INTO acct VALUES ('ana', 100)")
+sql_exec("INSERT INTO acct VALUES ('bob', 0)")
+
+task move(src, dst, n)
+    sql_exec("UPDATE acct SET bal = bal + ? WHERE name = ?", [n, dst])
+    sql_exec("UPDATE acct SET bal = bal - ? WHERE name = ?", [n, src])
+    give sql("SELECT bal FROM acct WHERE name = ?", [src])[0].bal
+
+-- it commits when the task returns, and gives back what the task returned
+print(sql_transaction(() => move("ana", "bob", 30)))        -- 70
+
+-- the task fails: what it wrote is undone (bob's +500), and the error goes on unchanged
+try
+    sql_transaction(() => move("ana", "bob", 500))
+recover e
+    print(e)                                                -- CHECK constraint failed: bal >= 0
+print(sql("SELECT name, bal FROM acct ORDER BY name"))      -- [{name: "ana", bal: 70}, {name: "bob", bal: 30}]
+```
+
+**The rules** (each one measured):
+
+- **The argument is a task with no parameters, or a lambda `() => …`.** Values go in through the
+  lambda: `sql_transaction(() => move("ana", "bob", 30))`. Anything else fails before the
+  transaction opens: `sql_transaction("x")` or `sql_transaction()` →
+  `sql_transaction expects a task with no parameters: sql_transaction(() => …) or sql_transaction(my_task) — it commits when the task returns and rolls back if it fails`;
+  `sql_transaction(move)` →
+  `sql_transaction calls its task with no arguments, and task 'move' needs 'src' — pass the values in a lambda: sql_transaction(() => my_task(a, b))`
+  (a lambda with a parameter: `… and this lambda needs 'x' …`).
+- **It commits only when the task returns.** The result is what the task gave (`nothing` without
+  a `give`; `sql_transaction(() => sql_exec("INSERT …"))` → `{rows_affected: 1, last_id: 1}`).
+- **It rolls back when the task ends any other way:** a statement that fails, a `raise`, any
+  runtime error — the error reaches your `try`/`recover` unchanged — and an `exit` inside it (the
+  process exits with that code and nothing was written).
+- **A statement that fails makes its transaction fail, also when the task catches the error.**
+  The next statements fail without reaching the database, and when the task ends the transaction
+  rolls back with
+  `sql_transaction: a statement failed inside this transaction, so it rolls back (to survive a statement that may fail, run it in its own sql_transaction(task) and catch the error outside it) — the first error was: UNIQUE constraint failed: jobs.note`,
+  even if the task returned. It is what Postgres does with an aborted transaction; the three
+  engines behave the same. Do not `try` a statement inside a transaction and go on: give it its own
+  nested `sql_transaction` (next rule).
+- **Inside another `sql_transaction` it is a savepoint.** If the inner one fails only its
+  statements are undone; the outer one, if it catches the error, goes on and can commit. If the
+  outer one fails later, everything is undone, the inner one too.
+
+  ```synsema
+  require db(":memory:")
+  db_open(":memory:", "memory")
+  sql_exec("CREATE TABLE jobs (id INTEGER PRIMARY KEY, note TEXT UNIQUE)")
+
+  task add(note)
+      give sql_exec("INSERT INTO jobs (note) VALUES (?)", [note]).last_id
+
+  task import(notes)
+      let added be 0
+      each n in notes
+          try
+              sql_transaction(() => add(n))      -- its own savepoint: a duplicate undoes only itself
+              set added to added + 1
+          recover e
+              print("skipped " + n + ": " + text(e))
+      give added
+
+  print(sql_transaction(() => import(["a", "b", "a", "c"])))   -- skipped a: UNIQUE constraint failed: jobs.note, then 3
+  print(sql("SELECT note FROM jobs ORDER BY id"))             -- [{note: "a"}, {note: "b"}, {note: "c"}]
+  ```
+- **The transaction has the connection while its task runs.** In `serve` every route, cron job
+  and agent shares ONE connection; a `sql`/`sql_exec`/`sql_batch`/`sql_tables` of another one
+  **waits** until the transaction ends, so it is never inside it (its write is not undone by the
+  other's rollback). It waits up to 5 s, then fails with a catchable error:
+  `the database has been inside another task's transaction (sql_transaction) for more than 5 s: a transaction holds the connection until its task ends, so keep slow calls (sleep, http, an LLM) out of it, and do not wait inside it for another task that uses this database`.
+  So: read what you need from HTTP or an LLM **before** the transaction, and never wait inside it
+  for an agent that uses the database (it would wait for you: 5 s, then that error). Measured: a
+  route that waited 2 s behind another route's transaction answered normally; behind an 8 s one it
+  got the error at 5 s.
+- **What the program set on the connection holds inside:** `PRAGMA foreign_keys = ON`, a temporary
+  table, Postgres' `SET search_path` — it is the same connection. Set them **before** the
+  transaction: SQLite ignores `PRAGMA foreign_keys` inside one (it stays as it was, without an
+  error).
+- **SQLite opens it with `BEGIN IMMEDIATE`:** it takes the write lock at the start. If another
+  process holds it (its own transaction on the same file), this one fails at the start with
+  `database is locked` after SQLite's own 5 s wait, not at its first write. DDL inside is undone
+  too (a `CREATE TABLE` in a transaction that fails leaves no table; the same in Postgres).
+- **A `parallel_map` worker does not have the program's connection** (`sql` there fails with
+  `No database connection. Use db_open("path.db") first.`, inside or outside a transaction), so it
+  is never inside the transaction. A worker that opens the same SQLite file with its own `db_open`
+  while the transaction is open cannot write: `database is locked`, after 5 s. Do the parallel
+  work first and write the results in the transaction.
+- **`db_close()` inside** closes the connection when the transaction ends; `db_close()` and then
+  `db_open()` of the same database inside leave it open.
+- **With `--labels` it is a sink** like every builtin with an effect:
+  `label_violation: sql_transaction called under private control flow (pc = [app]); every builtin with an effect is a public sink, …`.
+  Call it outside the private branch.
+- **Not in the pure profile / wasm:**
+  `sql_transaction: not available in the pure profile — this run has no database drivers (drop --profile pure to run it natively)`.
+- **What it does not do:** take an isolation level or a read-only flag (in MySQL set the level on
+  the session before it, below), retry (the error is catchable: write the retry around it), span
+  two databases, or cover MongoDB/Redis (it is SQL only, on the default connection). In SQLite
+  there is no deferred or exclusive form: a long consistent read takes the write lock too.
+
+**`BEGIN`, `COMMIT`, `ROLLBACK` by hand are an error (v0.6.59+, breaking).** In `sql`, `sql_exec`
+and `sql_batch`, under `run`, `test` and `serve`, these never reach the database: `BEGIN`,
+`COMMIT`, `ROLLBACK`, `END`, `ABORT`, `SAVEPOINT`, `RELEASE`, `START TRANSACTION`,
+`PREPARE TRANSACTION` (any case, also behind a comment or spaces; in MySQL also `XA …` and any
+`SET` with `autocommit` in its text):
+`BEGIN, COMMIT, ROLLBACK and SAVEPOINT are not run by hand (since v0.6.59): a hand-made transaction on a shared connection wraps the writes of other tasks. Put the statements in a task and run sql_transaction(task) — it commits when the task returns and rolls back if it fails; inside one, another sql_transaction(task) is a savepoint`.
+Why: in `serve` a hand-made transaction wrapped the writes of the other routes (a `ROLLBACK`
+erased a row another route had already answered as saved). Before:
+`sql_exec("BEGIN")` … `sql_exec("COMMIT")`, with `sql_exec("ROLLBACK")` in a `recover`. Now: the
+statements in a task, and `sql_transaction(task)`. A `CREATE TRIGGER … BEGIN …; END` is not a
+transaction and works. In SQLite, a statement that leaves a transaction open some other way is an
+error too, and it is rolled back
+(`this statement left a transaction open on the connection, and it was rolled back. BEGIN, COMMIT, …`).
+
+**In a `serve` route.** One statement is atomic by itself and needs no transaction (and holds the
+connection the least):
 
 ```
 -- a counter, safe under concurrent requests (50 at once → 50)
@@ -372,7 +503,128 @@ when r.rows_affected == 0
 -- a copy of many rows in one statement
 sql_exec("INSERT INTO archive (item, qty) SELECT item, qty FROM orders WHERE item = ?", ["bolt"])
 ```
-(Measured under `serve`: 20 concurrent takes of a stock of 10 → 10 orders, stock 0.)
+
+When the change is several statements (read, decide, write two tables), put them in a task and
+run it with `sql_transaction`: no other route gets in between.
+
+```synsema
+require serve(8080)
+require db("./shop.db")
+db_open("./shop.db")
+sql_exec("CREATE TABLE IF NOT EXISTS stock (item TEXT PRIMARY KEY, left INTEGER)")
+sql_exec("CREATE TABLE IF NOT EXISTS orders (item TEXT, who TEXT)")
+
+task take(item, who)
+    let rows be sql("SELECT left FROM stock WHERE item = ?", [item])
+    when length(rows) == 0 or rows[0].left < 1
+        give false
+    sql_exec("UPDATE stock SET left = left - 1 WHERE item = ?", [item])
+    sql_exec("INSERT INTO orders VALUES (?, ?)", [item, who])
+    give true
+
+serve on 8080
+    route "POST /take/:who"
+        when sql_transaction(() => take("bolt", params.who))
+            give {"ok": true}
+        give fail(409, "sold out")
+```
+(Measured under `serve`: 20 concurrent `POST /take/…` on a stock of 10 → ten `200`, ten `409`,
+10 orders, stock 0.)
+
+**MySQL: what else the engine checks (v0.6.59+).** MySQL has statements that commit by
+themselves and procedures that manage transactions; the engine reads each statement and what the
+server reports after it (MySQL's session state tracking, asked for when the connection opens), so
+none of this passes in silence. Measured against MySQL 8.0; MariaDB and a proxy that spreads one
+connection over several (ProxySQL, RDS Proxy without pinning) are **not measured**.
+
+- **A statement that commits by itself is an error inside `sql_transaction`,** before it runs
+  (MySQL has no transactional DDL):
+  `sql_transaction: in MySQL a CREATE statement commits the open transaction (MySQL has no transactional DDL), so the transaction could not roll it back — run it outside sql_transaction`.
+  The list: `CREATE`, `ALTER`, `DROP`, `TRUNCATE`, `RENAME`, `GRANT`, `REVOKE`, `LOCK TABLES`,
+  `ANALYZE`, `OPTIMIZE`, `CHECK`, `REPAIR`, `CACHE INDEX`, `LOAD INDEX`, `FLUSH`, `RESET`,
+  `SET PASSWORD`, `SET DEFAULT ROLE`, `INSTALL`, `UNINSTALL`, `IMPORT TABLE`, `CLONE` and the
+  replication statements (`START`, `STOP`, `CHANGE`). `CREATE`/`DROP TEMPORARY TABLE` do not
+  commit and work inside.
+- **`PREPARE` and `EXECUTE` are an error** in `sql`, `sql_exec` and `sql_batch`:
+  `MySQL PREPARE and EXECUTE are not run from here (since v0.6.59): the statement they run is a text the engine does not see, and it could commit or roll back by hand. Pass the statement itself, with ? and a list of values — sql("SELECT … WHERE id = ?", [id]) — the engine prepares it`.
+  (Postgres and SQLite: nothing changes.)
+- **A comment that only some servers run, before the first word, is an error:** `/*!80000 … */`
+  with a version, or `/*M! … */` →
+  `a MySQL comment that only some servers run — /*!80000 … */ with a version, or /*M! … */ — before the first word of a statement is not run from here (since v0.6.59): whether the server runs what is inside depends on its version, so the engine cannot tell which statement this is. Write the statement itself, without that comment`.
+  **The lines `mysqldump` writes are of this kind** (`/*!40101 SET NAMES utf8 */`): a program that
+  feeds a dump to `sql_exec` line by line fails on the first one. Strip those lines, write the
+  statement inside them without the comment, or restore the dump with the `mysql` client.
+  `/*! … */` without a version works, and so does any of them after the first word
+  (`SELECT /*!80000 SQL_NO_CACHE */ …`), with two exceptions: right after `START` or `PREPARE` it
+  is an error, and right after `CREATE`, `DROP`, `SET` or `LOAD` it is an error inside a
+  transaction (`sql_transaction: in MySQL this CREATE statement may commit the open transaction: the comment after CREATE is one that only some servers run …`).
+- **`CALL` inside `sql_transaction`.** A procedure that only reads and writes runs inside the
+  transaction like any statement. One that ends it (`COMMIT`, `ROLLBACK`, `START TRANSACTION`, a
+  statement that commits) makes the `CALL` fail and the transaction with it:
+  `sql_transaction: this CALL ended the transaction — the procedure ran COMMIT, ROLLBACK or a statement that commits (START TRANSACTION and DDL do), or the server rolled it back — so what the transaction wrote before the CALL can no longer be rolled back or committed as one. A procedure called inside sql_transaction must not manage transactions`.
+  Call a procedure that manages its own transaction outside `sql_transaction`.
+- **`CALL` outside a transaction.** A procedure that opens and commits its own transaction is
+  fine, also the usual `SET autocommit = 0; START TRANSACTION; …; COMMIT` (with or without a
+  `SELECT` after its `COMMIT`): the engine turns `autocommit` back on when it returns. One that
+  leaves something a rollback would undo (a write it did not commit, a `SELECT … FOR UPDATE`) or a
+  `START TRANSACTION` it did not close is an error, and the engine rolls it back:
+  `this CALL left a transaction open on the connection, and it was rolled back: what the procedure had not committed is undone; what it had already committed stays, and so does a write to a table without transactions (MyISAM). On a shared connection an open transaction would wrap the writes of other tasks. A procedure that opens a transaction closes it before it returns; one that leaves the commit to its caller is called inside sql_transaction(task)`.
+  A `CALL` that fails gives its own error, and what it left open is rolled back too.
+- **A `CALL` whose procedure fails after it returned a result is an error (breaking).** Up to
+  v0.6.58 `sql("CALL p()")` gave the rows of the first `SELECT` and dropped the error. Now the
+  error comes out; inside `sql_transaction` it makes the transaction fail.
+- **A connection that cannot be cleaned is closed.** A procedure that leaves an XA transaction
+  active or idle (`XA START`, with or without `XA END`) leaves something `ROLLBACK` does not end:
+  `this CALL left a transaction open on the connection and it could not be rolled back (in MySQL, a procedure that leaves an XA transaction active or idle: ROLLBACK does not end one), so the connection was closed — open it again with db_open. …`.
+  From then on `sql` and the others fail with `No database connection. Use db_open("path.db") first.`
+  until the program calls `db_open` again — **in `serve`, for every route** (the connection is
+  shared and is not reopened by itself: catch that error and call `db_open`, or restart). A
+  procedure that **prepares** an XA transaction (`XA PREPARE`) leaves it on the server, not on the
+  connection: the `CALL` passes, and that transaction keeps its locks until someone runs
+  `XA COMMIT` or `XA ROLLBACK`; the engine does not see it.
+- **`autocommit` and the tracking variables belong to the engine:** `autocommit`,
+  `session_track_transaction_info`, `session_track_system_variables`. The engine sets
+  `autocommit = 1` when it connects (on a server where it is off by default, what a program wrote
+  outside a transaction was never committed; now it is). `SET autocommit …` is the by-hand error
+  above — it is any `SET` with the word `autocommit` in its text, also in a literal
+  (`SET @x = 'autocommit'`): rename the variable. A `SET` with a character that is not ASCII, or
+  one that names `session_track`, runs and the engine then asks the server how those variables
+  are (one more statement); if it turned `autocommit` off:
+  `this statement turned autocommit off on the connection, and the engine turns it back on (inside sql_transaction, when the transaction closes).`
+  Do not change them in stored code either (a procedure, a function called from a `SELECT`, a
+  trigger): the engine reads the statement and the server's report, not what stored code does
+  inside, and a later `CALL` that leaves a write pending could be committed without an error. The
+  savepoint names `synsema_call` and `synsema_tx_<n>` are the engine's too: do not use them in a
+  procedure.
+- **The check behind the one by text.** Outside a transaction, a statement that is not a `CALL`
+  and still leaves a transaction open is rolled back and is an error
+  (`this statement left a transaction open on the connection, and it was rolled back …`); inside
+  `sql_transaction`, one that ends the transaction makes it fail
+  (`sql_transaction: this statement ended the transaction — the server reports that it was committed or rolled back — …`).
+  No statement is known that passes the check by text and gets here; it is there for the case
+  where the engine reads a statement one way and the server another. `LOCK TABLES` outside a
+  transaction is not a transaction and works.
+- **A deadlock rolls back the whole transaction** of the loser, also what it wrote before a nested
+  `sql_transaction`: the outer one fails and its error names the deadlock. Retry the outer one.
+- **Isolation level:** `sql_exec("SET SESSION TRANSACTION ISOLATION LEVEL SERIALIZABLE")` before
+  the transaction (with `SESSION`: it stays for the connection). The session variable
+  `completion_type` does not change how a transaction ends.
+- **What a `CALL` costs** (statements sent to the server): outside a transaction, nothing more
+  when the procedure left nothing; one more to turn `autocommit` back on; one more to roll back
+  what it left open; one more when the `CALL` failed. Inside a transaction: two more per `CALL`,
+  and one more when a transaction that ran a `CALL` ends. On a server or proxy that does not report
+  its session state: two more per `CALL` outside a transaction (three when it left one open), a
+  `SELECT` after the procedure's `COMMIT` with `autocommit` off counts as a transaction left open,
+  and the level of `SET TRANSACTION ISOLATION LEVEL …` without `SESSION` is lost.
+
+**Postgres.** DDL is transactional (it rolls back with the rest). A `CALL` or a `DO` that runs
+`COMMIT` inside `sql_transaction` is refused by the server (`invalid transaction termination`) and
+the transaction fails like with any failed statement; outside one it commits its own work and
+leaves nothing open.
+
+**State taken by hand that is not a transaction** — MySQL `LOCK TABLES` and `GET_LOCK`, Postgres
+`pg_advisory_lock` — belongs to the connection, and in `serve` the connection is every route's: a
+lock one route takes is held for all of them. `sql_transaction` does not manage it.
 
 ```
 require db("./store.db")           -- declare the DB you use (db("*") / require db = any)

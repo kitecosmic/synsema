@@ -87,6 +87,7 @@ Also: the LLM words **`reason` / `decide` / `analyze` / `generate`** (like every
 | `hmac.new(k, m, sha256).digest()` | `hmac(m, k)` → bytes (v0.6.29+) |
 | `open(p).read()` / `requests.get(url)` | `read_file(p)` + `require file(...)` / `fetch(url)` + `require net(host)` |
 | `requests.post(url, json=d)` / `r.json()` / `r.content` | `http_post(url, d)` (a map → JSON + Content-Type, v0.6.20+) / `json of r` (`nothing` if not JSON) / `http_bytes(...)` → `bytes of r` |
+| `with conn:` / `conn.commit()` / `conn.rollback()` (sqlite3, psycopg) | `sql_transaction(() => my_task(a, b))` (v0.6.59+): commits when the task returns, rolls back if it fails; nested = savepoint. `sql_exec("BEGIN")`/`"COMMIT"` by hand is an **error**. Outside one, every statement commits by itself (there is no pending transaction to commit) — stdlib.md § Transactions |
 | `xs[::-1]` / `list(s)` | `reverse(xs)` (also text) / `split(s, "")` (v0.6.20+) |
 | `os.getcwd()` / `os.path.expanduser("~/x")` | `cwd()` + `require file.read(".")` / `"~/x"` works as-is in paths and scopes (v0.6.20+) |
 | `os.remove(p)` / `shutil.rmtree(p)` | `delete_file(p)` / `delete_dir(p, {"recursive": true})` + `file.write` on every path (v0.6.20+) |
