@@ -611,3 +611,73 @@ jobs:
         env:
           SYN: engine/target/debug/synsema
         run: bash tests/programs-load.sh
+
+  # v0.6.59: the MySQL and Postgres tests that need a server. `cargo test --workspace` skips them
+  # (`#[ignore]`), and they are the only ones that cover what the engine asks a real MySQL: one
+  # statement per call, a `CALL` that ends or leaves a transaction, `completion_type`, a deadlock.
+  #
+  # The servers are containers this runner starts for the run and throws away with it. Nothing of
+  # ours is reached and there is no secret: the password below belongs to that throwaway container,
+  # which is why it is written here. Images are pinned by digest, like the actions.
+  #
+  # Each step fails if no test ran: a renamed module would otherwise leave the filter matching
+  # nothing, and the job green.
+  databases:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    services:
+      mysql:
+        image: mysql:8.0@sha256:7dcddc01f13bab2f15cde676d44d01f61fc9f99fe7785e86196dfc07d358ae2b
+        env:
+          MYSQL_ROOT_PASSWORD: ci-throwaway
+          MYSQL_DATABASE: appdb
+        ports:
+          - 3306:3306
+        # Over TCP: while the image initialises, its temporary server listens on the socket only.
+        options: >-
+          --health-cmd "mysqladmin ping -h 127.0.0.1 -uroot -pci-throwaway --silent"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 30
+      postgres:
+        image: postgres:16@sha256:f9a7b9ebf6f56201f949db745e47bc423c0f0f8294bafe991cc10bf74b029657
+        env:
+          POSTGRES_PASSWORD: ci-throwaway
+          POSTGRES_DB: appdb
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d appdb"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master 2026-09-12; toolchain pinned below and in rust-toolchain.toml
+        with:
+          toolchain: "1.99.1"
+      - name: Cache cargo
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            engine/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('engine/Cargo.lock') }}
+      - name: MySQL tests that need a server
+        shell: bash
+        env:
+          MYSQL_URL: mysql://root:ci-throwaway@127.0.0.1:3306/appdb
+        run: |
+          cargo test --locked --manifest-path engine/Cargo.toml -p synsema-runtime --test it engine_mysql -- --ignored --test-threads=1 | tee mysql.out
+          grep -Eq '^test result: ok\. [1-9][0-9]* passed' mysql.out
+      # `pg_pgvector_knn` needs the `vector` extension, which this image does not have.
+      - name: Postgres tests that need a server
+        shell: bash
+        env:
+          DATABASE_URL: postgres://postgres:ci-throwaway@127.0.0.1:5432/appdb?sslmode=disable
+        run: |
+          cargo test --locked --manifest-path engine/Cargo.toml -p synsema-runtime --test it engine_pg -- --ignored --test-threads=1 --skip pgvector | tee pg.out
+          grep -Eq '^test result: ok\. [1-9][0-9]* passed' pg.out

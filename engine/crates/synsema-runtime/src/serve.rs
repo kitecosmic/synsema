@@ -191,6 +191,9 @@ pub(crate) struct CronExecEnv {
     /// Nombre de la memoria DECLARADA del programa (DB-M1) — `None` si no declara.
     /// Define el gate de los builtins de estado persistente en el intérprete del tick.
     mem_name: Option<crate::engine::MemName>,
+    /// v0.6.59 — bajo `run`/`test`: lo que el job imprime sale como lo imprime el programa, sin
+    /// el `[serve] ` que le pone el log de un servidor.
+    plain_output: bool,
 }
 
 /// Slot del entorno de ejecución: bajo serve se llena UNA vez (con el bind listo);
@@ -381,6 +384,12 @@ fn run_cron_tick_inner(
             // T1: un tick de cron corre EN NOMBRE de `cron:<job>` — el ledger de `spend`, el
             // techo LLM por identidad y el audit dicen qué job fue, nunca "nadie".
             let _cron_subject = crate::subject::Subject::cron(name).apply(interp, caps);
+            if env.plain_output {
+                interp.log_hook = Some(Arc::new(|line: &str| println!("{line}")));
+                // `log` no va por el hook: toma el camino del programa (stderr bajo `synsema run`,
+                // v0.6.42). Sin esto salía por stdout, y el del programa por stderr.
+                interp.log_hook_observes_only = true;
+            }
             let task = interp.global_env.borrow().bindings.get(name).cloned();
             match task {
                 Some(t @ (SynValue::Task(_) | SynValue::Builtin(_))) => {
@@ -485,6 +494,7 @@ pub(crate) fn run_mode_cron_executor(
             approvals: approvals.clone(),
             secure,
             mem_name: mem_name.clone(),
+            plain_output: true,
         };
         *ctx.slot.write().unwrap() = Some(env);
         let ctx = ctx.clone();
@@ -4692,6 +4702,7 @@ fn make_serve_hook(
             approvals: approvals.clone(),
             secure,
             mem_name: mem_name.clone(),
+            plain_output: false,
         };
         arm_cron(&cron, cron_env);
 
@@ -5186,6 +5197,7 @@ fn serve_inner(source: &str, filename: &str, secure: bool, overrides: ServeOverr
                 approvals: default_approvals(),
                 secure,
                 mem_name,
+                plain_output: false,
             };
             arm_cron(&cron, env);
             println!("Serving {} cron job(s). Press Ctrl+C to stop.", n_jobs);

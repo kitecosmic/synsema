@@ -108,7 +108,11 @@ fn p5_the_minimum_is_three_numbers() {
         fails(
             src,
             &entry,
-            &format!("synsema.json: \"synsema\" is a minimum version like \"0.6.58\" (three numbers), not \"{}\"", bad),
+            &format!(
+                "synsema.json: \"synsema\" is a minimum version like \"{}\" (three numbers), not \"{}\"",
+                synsema_core::project::DEV_VERSION,
+                bad
+            ),
         );
     }
 }

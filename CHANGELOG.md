@@ -6,6 +6,168 @@ Each says what changed, why, and what to write instead.
 
 Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the release date.
 
+## v0.6.59 — unreleased
+
+**Language and engine.**
+- **`sql_transaction(task)` runs a task as one SQL transaction.** It commits when the task returns
+  and gives back what the task returned; it rolls back when the task fails, and the error goes on
+  unchanged (also when the program ends inside it with `exit`):
+  `sql_transaction(() => sql_exec("INSERT INTO t VALUES (?)", [x]))`, or a task with no parameters.
+  SQLite, Postgres and MySQL, the same in `run`, `test` and `serve`.
+  - **The transaction has the connection while its task runs.** In `serve`, where the routes share
+    one connection, a `sql`/`sql_exec`/`sql_batch`/`sql_tables` of another route (or a cron job, or
+    an agent) waits until it ends, so it is never inside it: its write is not undone by the other
+    route's rollback. It waits up to 5 s; after that it fails with an error that says why
+    (`the database has been inside another task's transaction (sql_transaction) for more than 5 s`),
+    so keep slow calls (`sleep`, HTTP, an LLM) out of a transaction.
+  - **Inside another `sql_transaction` it is a savepoint:** if the inner one fails only its
+    statements are undone, and the outer one, if it catches the error, goes on and can commit.
+  - **A statement that fails makes its transaction fail,** also when the task catches the error and
+    goes on: the next statements fail without reaching the database and the transaction rolls back
+    (`sql_transaction: a statement failed inside this transaction, so it rolls back … the first
+    error was: …`). It is what Postgres does (the transaction is aborted); now it is the same in the
+    three. To survive a statement that may fail, run it in its own `sql_transaction` and catch the
+    error outside it.
+  - What the program set on the connection (`PRAGMA foreign_keys = ON`, a temporary table,
+    `SET search_path`) holds inside the transaction: it is the same connection.
+  - SQLite opens it with `BEGIN IMMEDIATE`: a conflict with another process shows up at the start,
+    after SQLite's own 5 s wait, not at the first write.
+  - In MySQL, a statement that commits the open transaction by itself is an error inside a
+    transaction, before it runs: MySQL could not roll it back. The list was measured against MySQL
+    8.0: `CREATE`, `ALTER`, `DROP`, `TRUNCATE`, `RENAME`, `GRANT`, `REVOKE`, `LOCK TABLES`,
+    `ANALYZE`, `OPTIMIZE`, `CHECK`, `REPAIR`, `CACHE INDEX`, `LOAD INDEX`, `FLUSH`, `RESET`,
+    `SET PASSWORD`, `SET DEFAULT ROLE`, `INSTALL`, `UNINSTALL`, `IMPORT TABLE`, `CLONE` and the
+    replication statements (`START`, `STOP`, `CHANGE`); not `CREATE`/`DROP TEMPORARY TABLE`.
+    With a comment that only some servers run right after `CREATE`, `DROP`, `SET` or `LOAD`
+    (`CREATE /*!50000 TEMPORARY */ TABLE …`) the engine cannot tell which statement it is, and
+    inside a transaction it counts as one that commits.
+  - In MySQL, a `CALL` inside a transaction is checked: if the procedure ended the transaction
+    (`COMMIT`, `ROLLBACK`, `START TRANSACTION` or a statement that commits), the `CALL` fails with
+    `sql_transaction: this CALL ended the transaction …` and the transaction fails, instead of going
+    on without one. A procedure that only reads and writes runs inside it as any statement.
+  - In MySQL, a `CALL` outside a transaction is checked too. A procedure that opens and commits its
+    own transaction is fine, also the usual `SET autocommit = 0; START TRANSACTION; …; COMMIT`, with
+    or without a `SELECT` after its `COMMIT`: the engine turns `autocommit` back on when the
+    procedure returns. One that leaves something a rollback would undo (a write it did not commit,
+    a `SELECT … FOR UPDATE`), or a `START TRANSACTION` it did not close, is an error,
+    `this CALL left a transaction open on the connection, and it was rolled back …`: what it had
+    not committed is undone, and what it had already committed stays (so does a write to a MyISAM
+    table). A `CALL` that fails gives its own error, and what it left open is rolled back too.
+  - If what a `CALL` left open cannot be rolled back, the connection is closed, and the error says
+    so (`this CALL left a transaction open on the connection and it could not be rolled back …, so
+    the connection was closed — open it again with db_open`). It is what a procedure that leaves an
+    XA transaction active or idle does (`XA START`, with or without `XA END`): `ROLLBACK` does not
+    end one, and a statement run on that connection afterwards would stay inside it, uncommitted.
+    The server ends the transaction when the connection closes. Until the program calls `db_open`
+    again, `sql` and the others fail with `No database connection`. A procedure that prepares an
+    XA transaction (`XA PREPARE`) leaves it on the server, not on the connection: the `CALL`
+    passes, and that transaction keeps its locks until someone runs `XA COMMIT` or `XA ROLLBACK`;
+    the engine does not see it.
+  - The engine learns what a `CALL` left from the server's answer to the `CALL` itself (MySQL's
+    session state tracking, asked for when the connection opens), so it sends nothing after a
+    `CALL` that left nothing. A server or a proxy that does not report it is asked after each
+    `CALL` instead, with two limits: a `SELECT` after the procedure's `COMMIT` with `autocommit`
+    off counts as a transaction left open, and the isolation level set for the next transaction
+    only (`SET TRANSACTION ISOLATION LEVEL …` without `SESSION`) is lost; set it with
+    `SET SESSION TRANSACTION ISOLATION LEVEL …`.
+  - `autocommit` and the two variables of that tracking (`session_track_transaction_info`,
+    `session_track_system_variables`) belong to the engine. After a `SET` whose text does not show
+    that it leaves them alone, the engine asks the server how they are: a `SET` that names
+    `session_track`, or one with a character that is not ASCII (MySQL takes `autocommít` for
+    `autocommit`). If the program changed the tracking, the connection is asked after each `CALL`,
+    as above. If it turned `autocommit` off, the `SET` is an error and the engine turns it back
+    on. A table called `session_tracking` changes nothing. Stored code that changes the tracking
+    variables hides what a `CALL` leaves on the connection: a procedure, a function called from a
+    `SELECT`, a trigger fired by an `INSERT`. The engine reads the statement and what the server
+    reports, not what stored code does inside.
+  - In MySQL the engine also reads what the server reports after every statement (the same
+    tracking: it sends nothing more). Outside a transaction, a statement that is not a `CALL` and
+    leaves a transaction open, however it is written, is an error and the transaction is rolled
+    back (`this statement left a transaction open on the connection, and it was rolled back …`);
+    one that leaves `autocommit` off is an error and the engine turns it back on. Inside
+    `sql_transaction`, a statement that ends the transaction makes it fail
+    (`sql_transaction: this statement ended the transaction …`): what the transaction wrote before
+    it is already committed or rolled back, and the error says so. It is the check behind the one
+    by text, for a statement the engine reads one way and the server another. `LOCK TABLES`
+    outside a transaction is not a transaction and works as before. A server or a proxy that does
+    not report its state has the check by text, and the engine still asks how `autocommit` is
+    after a `SET` it cannot read.
+  - What a `CALL` costs in MySQL. Outside a transaction: nothing when the procedure left nothing;
+    one more statement to turn `autocommit` back on, one more to roll back what it left open, and
+    one more when the `CALL` failed. Without the tracking, two more each time, and three when it
+    left a transaction open. Inside a transaction: two more each, and one more when a transaction
+    that ran a `CALL` ends. A `SET` the engine asks about costs one more statement. Opening a
+    connection sends one more statement, which asks for the tracking and sets `autocommit = 1`: on
+    a server where `autocommit` is off by default, what a program wrote outside a transaction was
+    never committed, and now it is.
+  - In Postgres the server refuses a `COMMIT` in a `CALL` or a `DO` inside a transaction
+    (`invalid transaction termination`), and the transaction fails like with any failed statement.
+  - In MySQL, the session variable `completion_type` does not change how a transaction ends: the
+    engine commits and rolls back with `AND NO CHAIN NO RELEASE`.
+  - A deadlock in MySQL rolls back the whole transaction of the loser, also what it wrote before a
+    nested `sql_transaction`: the outer one fails, and its error names the deadlock.
+  - `db_close()` and then `db_open()` of the same database inside a transaction leave it open when
+    the transaction ends (a `db_close()` alone closes it then).
+  - With `--labels` it is a sink like every builtin with an effect: it cannot be called under
+    private control flow.
+
+**Tooling.**
+- **Fix: `synsema get --check` printed two spaces** for a module whose `hash` was written by hand
+  without a `version` (`get --check: notes  is not in the cache`); also in the other messages that
+  name a module and its version.
+- **Fix: what a `cron_every`/`cron_after` job prints under `synsema run` came out with `[serve] `**
+  in front. It now prints like the program does: `print` to stdout, `log` to stderr. Under `serve`
+  nothing changes.
+- **`.env.example` (from `synsema init`) says that `SYNSEMA_MODULE_CACHE` and
+  `SYNSEMA_SAFE_PROJECT` are read from the process environment, not from `.env`.** It listed them
+  as two more lines to uncomment.
+
+**Breaking.**
+- **`BEGIN`, `COMMIT`, `ROLLBACK`, `END`, `ABORT`, `SAVEPOINT`, `RELEASE`, `START TRANSACTION` and
+  `PREPARE TRANSACTION` are an error in `sql`, `sql_exec` and `sql_batch`** (in MySQL also `XA …` and
+  `SET autocommit`), in `run`, `test` and `serve`, also behind a comment, and they do not reach the
+  database. In MySQL, `SET autocommit` is any `SET` with `autocommit` in its text, also between
+  backticks or in a literal (``SET `autocommit` = 0``); and a statement that starts with a comment
+  the server may or may not run is read both ways (`/*!99999 SELECT */ COMMIT` is a `COMMIT`
+  for MySQL 8.0). In `serve` a hand-made transaction wrapped the writes of the other routes: a `ROLLBACK`
+  erased a row another route had already answered as saved, and a second `BEGIN` failed with
+  `cannot start a transaction within a transaction`. Before:
+  `sql_exec("BEGIN")` … `sql_exec("COMMIT")`, with `sql_exec("ROLLBACK")` in a `recover`. Now: put
+  the statements in a task and call `sql_transaction(task)`.
+- **In SQLite, a statement that leaves a transaction open on the connection is an error** and the
+  transaction is rolled back.
+- **In MySQL, a `sql_exec` without values runs one statement, as in SQLite and Postgres.** It ran
+  every statement in the text (the driver always negotiates multi-statements), so
+  `sql_exec("UPDATE …; START TRANSACTION")` opened a transaction by hand without being seen. A text
+  with a second statement is now an error and nothing in it runs (MySQL's syntax error, with
+  `one SQL statement per call` after it): run each statement with its own call. A procedure or
+  trigger body (`CREATE PROCEDURE … BEGIN …; …; END`) is one statement and works as before.
+  What it costs: nothing for a text without a `;` (a final one does not count), which is one
+  statement and goes as before. A text with a `;` inside, also in a literal or a comment
+  (`VALUES ('a;b')`), is checked by the server and costs one more round trip, unless the
+  connection ran that same text recently and the server could prepare it: a
+  `CREATE PROCEDURE … BEGIN …; END` cannot be prepared, so it costs that round trip every time.
+  With `?` and a list of values nothing changes: the statement is prepared, as before.
+- **In MySQL, a `CALL` whose procedure fails after it returned a result is an error.** It passed
+  as a success: `sql("CALL p()")` gave the rows of the first `SELECT` and the error was dropped,
+  and `sql_exec("CALL p()")` returned as if the procedure had finished. Now the error comes out,
+  as when the procedure fails before its first `SELECT`; inside `sql_transaction` it makes the
+  transaction fail, like any statement that fails.
+- **In MySQL, a comment that only some servers run, before the first word of a statement, is an
+  error,** and the statement does not run: `/*!80000 … */` with a version, or `/*M! … */`. Whether
+  the server runs what is inside depends on its version, so the engine cannot tell which statement
+  it is: `/*!99999 SELECT */ CALL p()` is a `CALL` for MySQL 8.0, and it ran without the check of
+  a `CALL`. The lines `mysqldump` writes are of this kind (`/*!40101 SET NAMES utf8 */`): write the
+  statement itself, without the comment. `/*! … */` without a version is run by every server and
+  works as before, and so does any of them after the first word
+  (`SELECT /*!80000 SQL_NO_CACHE */ …`), with two exceptions: right after `START` or `PREPARE` it
+  is an error (it could be `START TRANSACTION`), and right after `CREATE`, `DROP`, `SET` or `LOAD`
+  it is an error inside a transaction (above).
+- **In MySQL, `PREPARE` and `EXECUTE` are an error in `sql`, `sql_exec` and `sql_batch`:** the
+  statement they run is a text the engine does not see (`PREPARE s FROM 'COMMIT'`, then
+  `EXECUTE s`, committed by hand). Pass the statement itself with `?` and a list of values; the
+  engine prepares it. In Postgres and SQLite nothing changes.
+
 ## v0.6.58 — 2026-11-10
 
 **Language and engine.**

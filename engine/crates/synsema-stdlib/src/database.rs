@@ -30,8 +30,8 @@ use synsema_core::types::{Key, MapObj, SynMap};
 use std::cell::RefCell;
 use std::error::Error as StdError;
 use std::rc::Rc;
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 use std::str::FromStr;
 
@@ -63,6 +63,9 @@ use crate::json::json_to_syn;
 pub trait DbHandle: Clone + 'static {
     fn read<R>(&self, f: impl FnOnce(&DatabaseManager) -> R) -> R;
     fn write<R>(&self, f: impl FnOnce(&mut DatabaseManager) -> R) -> R;
+    /// v0.6.59 — como `write`, para quien va a usar la conexión default y NO está en la transacción
+    /// que la tiene (`sql_transaction`): si está prestada, espera a que vuelva, hasta `TX_WAIT`.
+    fn write_unlent<R>(&self, f: impl FnOnce(&mut DatabaseManager) -> R) -> Result<R, String>;
 }
 
 impl DbHandle for Rc<RefCell<DatabaseManager>> {
@@ -71,6 +74,15 @@ impl DbHandle for Rc<RefCell<DatabaseManager>> {
     }
     fn write<R>(&self, f: impl FnOnce(&mut DatabaseManager) -> R) -> R {
         f(&mut self.borrow_mut())
+    }
+    fn write_unlent<R>(&self, f: impl FnOnce(&mut DatabaseManager) -> R) -> Result<R, String> {
+        // Un solo intérprete usa este gestor, y sus `sql*` van por la transacción mientras hay una:
+        // acá no hay a quién esperar.
+        let mut m = self.borrow_mut();
+        if m.lent.is_some() {
+            return Err(lent_busy(false));
+        }
+        Ok(f(&mut m))
     }
 }
 
@@ -81,6 +93,42 @@ impl DbHandle for Arc<Mutex<DatabaseManager>> {
     fn write<R>(&self, f: impl FnOnce(&mut DatabaseManager) -> R) -> R {
         f(&mut lock_shared_db(self))
     }
+    fn write_unlent<R>(&self, f: impl FnOnce(&mut DatabaseManager) -> R) -> Result<R, String> {
+        let mut m = lock_shared_db(self);
+        if m.lent.is_some() {
+            // Esperar a otra task es una espera: el hilo suelta su permiso de CPU.
+            let _w = synsema_core::waiting::waiting();
+            let returned = m.returned.clone();
+            let deadline = Instant::now() + TX_WAIT;
+            while m.lent.is_some() {
+                let left = deadline.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    return Err(lent_busy(true));
+                }
+                m = returned.wait_timeout(m, left).unwrap().0;
+            }
+        }
+        Ok(f(&mut m))
+    }
+}
+
+/// v0.6.59 — cuánto espera un `sql*` a que termine la transacción de otra task. Es la espera que
+/// `rusqlite` le pone a SQLite entre procesos (`busy_timeout`, 5 s). Sin tope, una transacción que
+/// espera a otra task (un agente) que espera la conexión no terminaría nunca.
+const TX_WAIT: Duration = Duration::from_secs(if cfg!(test) { 1 } else { 5 });
+
+#[cold]
+#[inline(never)]
+fn lent_busy(waited: bool) -> String {
+    let how = if waited {
+        format!("has been inside another task's transaction (sql_transaction) for more than {} s", TX_WAIT.as_secs())
+    } else {
+        "is inside a transaction (sql_transaction)".to_string()
+    };
+    format!(
+        "the database {}: a transaction holds the connection until its task ends, so keep slow calls (sleep, http, an LLM) out of it, and do not wait inside it for another task that uses this database",
+        how
+    )
 }
 
 /// v0.6.42 (auditoría ronda 2) — el lock de la base compartida de `serve`. Si está tomado (otro
@@ -114,7 +162,7 @@ pub type Row = SynMap;
 enum Backend {
     Sqlite(Connection),
     Postgres(Client),
-    Mysql(mysql::Conn),
+    Mysql(MysqlConn),
     /// MongoDB (no-SQL). Ya scoped al db del connstring; la API propia es `mongo_*`.
     Mongo(mongodb::sync::Database),
     /// Redis (M4, KV/cache/estructuras). Conexión sync ya scoped al db-index del connstring;
@@ -122,9 +170,89 @@ enum Backend {
     Redis(redis::Connection),
 }
 
+/// Una conexión MySQL, y lo que el servidor informa de ella en sus respuestas (el seguimiento de
+/// estado de sesión, que se pide en `mysql_connect`): el estado de la transacción y `autocommit`.
+/// El servidor los manda cuando cambian, así que se anotan después de CADA statement
+/// (`observe`): lo anotado es siempre lo último que dijo.
+struct MysqlConn {
+    conn: mysql::Conn,
+    /// `false`: el servidor (o un proxy en el medio) no lo informa, el programa cambió una de
+    /// las variables del seguimiento (`Backend::mysql_after_unread_set`), o llegó algo que no se
+    /// entiende. Entonces el estado se pregunta (`Backend::mysql_left_by_call`) y los dos
+    /// campos de abajo no valen.
+    tracked: bool,
+    /// El estado de la transacción (`mysql_tx_left`).
+    tx_state: String,
+    /// `autocommit` está en 1.
+    autocommit: bool,
+}
+
+impl MysqlConn {
+    /// Anota lo que informó la última respuesta. Un ERR no informa nada: lo que cambió durante
+    /// un statement que falla llega con el OK siguiente.
+    fn observe(&mut self) {
+        if !self.tracked {
+            return;
+        }
+        match mysql_tracked(&self.conn) {
+            Ok((state, autocommit)) => {
+                if let Some(state) = state {
+                    self.tx_state = state;
+                }
+                if let Some(autocommit) = autocommit {
+                    self.autocommit = autocommit;
+                }
+            }
+            Err(_) => self.tracked = false,
+        }
+    }
+
+    /// Un statement por el protocolo de texto, sin leer sus filas (`mysql_finish`).
+    fn text(&mut self, sql: &str) -> Result<(), mysql::Error> {
+        let r = self.conn.query_iter(sql).and_then(|mut result| mysql_finish(&mut result));
+        self.observe();
+        r
+    }
+
+    /// Un statement por el protocolo preparado, sin leer sus filas (`mysql_finish`).
+    fn prepared<S: mysql::prelude::AsStatement>(&mut self, stmt: S, params: mysql::Params) -> Result<(), mysql::Error> {
+        let r = self.conn.exec_iter(stmt, params).and_then(|mut result| mysql_finish(&mut result));
+        self.observe();
+        r
+    }
+}
+
+impl std::ops::Deref for MysqlConn {
+    type Target = mysql::Conn;
+    fn deref(&self) -> &mysql::Conn {
+        &self.conn
+    }
+}
+
+impl std::ops::DerefMut for MysqlConn {
+    fn deref_mut(&mut self) -> &mut mysql::Conn {
+        &mut self.conn
+    }
+}
+
 pub struct DatabaseManager {
     connections: IndexMap<String, Backend>,
     default_db: Option<String>,
+    /// v0.6.59 — la conexión default mientras la tiene una transacción (`sql_transaction`): no está
+    /// en `connections`, sino en el intérprete que la abrió.
+    lent: Option<Lent>,
+    /// Avisa a los que esperan en `write_unlent` cuando la transacción devuelve la conexión.
+    returned: Arc<Condvar>,
+}
+
+/// Lo que el gestor recuerda de la conexión prestada a una transacción.
+struct Lent {
+    key: String,
+    /// Su lugar en `connections`, para devolverla ahí (el orden decide la default al cerrar otra).
+    index: usize,
+    dialect: SqlDialect,
+    /// `db_close` de esta base mientras estaba prestada: al volver se cierra.
+    close_on_return: bool,
 }
 
 impl Default for DatabaseManager {
@@ -138,7 +266,65 @@ impl DatabaseManager {
         Self {
             connections: IndexMap::new(),
             default_db: None,
+            lent: None,
+            returned: Arc::new(Condvar::new()),
         }
+    }
+
+    /// `db_open` de una base ya abierta: está en `connections` o la tiene una transacción. En el
+    /// segundo caso deshace un `db_close` que llegó durante la transacción (si no, la base se
+    /// cerraba al terminar aunque lo último que pidió el programa fue abrirla) y, si no quedó
+    /// ninguna default (`close_all`), vuelve a serlo.
+    fn already_open(&mut self, key: &str) -> bool {
+        if self.connections.contains_key(key) {
+            return true;
+        }
+        let Some(l) = self.lent.as_mut().filter(|l| l.key == key) else { return false };
+        l.close_on_return = false;
+        if self.default_db.is_none() {
+            self.default_db = Some(key.to_string());
+        }
+        true
+    }
+
+    /// v0.6.59 — saca la conexión default para una transacción. Sólo una a la vez: el que llama
+    /// pasó por `write_unlent`.
+    fn lend(&mut self) -> Result<Backend, String> {
+        if self.lent.is_some() {
+            return Err(lent_busy(false));
+        }
+        let no_connection = || "No database connection. Use db_open(\"path.db\") first.".to_string();
+        let key = self.default_db.clone().ok_or_else(no_connection)?;
+        let dialect = match self.connections.get(&key).ok_or_else(no_connection)? {
+            Backend::Mongo(_) => return Err(mongo_not_sql()),
+            Backend::Redis(_) => return Err(redis_not_sql()),
+            b => b.dialect().ok_or_else(no_connection)?,
+        };
+        let (index, key, backend) = self.connections.shift_remove_full(&key).ok_or_else(no_connection)?;
+        self.lent = Some(Lent { key, index, dialect, close_on_return: false });
+        Ok(backend)
+    }
+
+    /// v0.6.59 — la transacción terminó. `None`: la conexión no quedó limpia y se cerró; la base
+    /// sigue siendo la default, sin conexión, y el próximo `sql*` pide `db_open` (no se pasa en
+    /// silencio a otra base).
+    fn give_back(&mut self, backend: Option<Backend>) {
+        if let Some(l) = self.lent.take() {
+            match backend {
+                Some(b) if !l.close_on_return => {
+                    let at = l.index.min(self.connections.len());
+                    self.connections.shift_insert(at, l.key, b);
+                }
+                Some(_) => {
+                    // Un `db_close` que llegó durante la transacción: como `close`.
+                    if self.default_db.as_deref() == Some(l.key.as_str()) {
+                        self.default_db = self.connections.keys().next().cloned();
+                    }
+                }
+                None => {}
+            }
+        }
+        self.returned.notify_all();
     }
 
     /// Abre una conexión. Rutea por scheme: `postgres://`/`postgresql://` → Postgres;
@@ -153,7 +339,7 @@ impl DatabaseManager {
         let target = normalized.as_str();
         if is_mongo_url(target) {
             let key = canon_url(target);
-            if self.connections.contains_key(&key) {
+            if self.already_open(&key) {
                 return Ok(key);
             }
             let db = mongo_connect(target)?;
@@ -164,7 +350,7 @@ impl DatabaseManager {
             Ok(key)
         } else if is_redis_url(target) {
             let key = canon_url(target);
-            if self.connections.contains_key(&key) {
+            if self.already_open(&key) {
                 return Ok(key);
             }
             let conn = redis_connect(target)?;
@@ -175,7 +361,7 @@ impl DatabaseManager {
             Ok(key)
         } else if is_pg_url(target) {
             let key = canon_url(target);
-            if self.connections.contains_key(&key) {
+            if self.already_open(&key) {
                 return Ok(key);
             }
             let client = pg_connect(target)?;
@@ -186,7 +372,7 @@ impl DatabaseManager {
             Ok(key)
         } else if is_mysql_url(target) {
             let key = canon_url(target);
-            if self.connections.contains_key(&key) {
+            if self.already_open(&key) {
                 return Ok(key);
             }
             let conn = mysql_connect(target)?;
@@ -197,7 +383,7 @@ impl DatabaseManager {
             Ok(key)
         } else {
             let key = if mode == "memory" { ":memory:".to_string() } else { target.to_string() };
-            if self.connections.contains_key(&key) {
+            if self.already_open(&key) {
                 return Ok(key);
             }
             // v0.6.45 — se abre la ruta NORMALIZADA, la misma que chequeó `require db(...)` (antes se
@@ -269,6 +455,11 @@ impl DatabaseManager {
             .map(|s| s.to_string())
             .or_else(|| self.default_db.clone());
         if let Some(t) = target {
+            // v0.6.59: la tiene una transacción; se cierra cuando termina.
+            if let Some(l) = self.lent.as_mut().filter(|l| l.key == t) {
+                l.close_on_return = true;
+                return;
+            }
             if self.connections.shift_remove(&t).is_some() && self.default_db.as_deref() == Some(&t) {
                 self.default_db = self.connections.keys().next().cloned();
             }
@@ -278,116 +469,61 @@ impl DatabaseManager {
     pub fn close_all(&mut self) {
         self.connections.clear();
         self.default_db = None;
+        if let Some(l) = self.lent.as_mut() {
+            l.close_on_return = true;
+        }
     }
 
     fn conn_mut(&mut self, db: Option<&str>) -> Result<&mut Backend, String> {
         let target = db.map(|s| s.to_string()).or_else(|| self.default_db.clone());
+        if let (Some(t), Some(l)) = (&target, &self.lent) {
+            if *t == l.key {
+                return Err(lent_busy(false));
+            }
+        }
         target
             .and_then(move |t| self.connections.get_mut(&t))
             .ok_or_else(|| "No database connection. Use db_open(\"path.db\") first.".to_string())
     }
 
+    /// Corre `f` sobre la conexión default, fuera de una transacción. Si el statement la dejó en
+    /// un estado del que el motor no la pudo sacar (`SqlConn::broken`), se cierra: la base sigue
+    /// siendo la default, sin conexión, y el próximo `sql*` pide `db_open` (como en `give_back`).
+    fn with_default<R>(&mut self, f: impl FnOnce(&mut SqlConn<'_>) -> Result<R, String>) -> Result<R, String> {
+        let mut conn = SqlConn { backend: self.conn_mut(None)?, failed: None, called: None, broken: false };
+        let r = f(&mut conn);
+        if conn.broken {
+            if let Some(key) = self.default_db.clone() {
+                self.connections.shift_remove(&key);
+            }
+        }
+        r
+    }
+
     /// Ejecuta un SELECT, devuelve filas como mapas columna→valor (ya en `SynValue`).
     pub fn query(&mut self, sql: &str, params: &[SynValue]) -> Result<Vec<Row>, String> {
-        reject_sealed_all(params, "sql")?;
-        match self.conn_mut(None)? {
-            Backend::Sqlite(c) => sqlite_query(c, sql, params),
-            Backend::Postgres(c) => pg_query(c, sql, params),
-            Backend::Mysql(c) => mysql_query(c, sql, params),
-            Backend::Mongo(_) => Err(mongo_not_sql()),
-            Backend::Redis(_) => Err(redis_not_sql()),
-        }
+        self.with_default(|c| c.query(sql, params))
     }
 
     /// Ejecuta INSERT/UPDATE/DELETE/CREATE. Devuelve (rows_affected, last_id).
     /// Postgres no tiene `last_insert_rowid` → `last_id = 0` (usar `INSERT … RETURNING id`).
     /// MySQL sí: `last_id = last_insert_id()` (a diferencia de PG).
     pub fn execute(&mut self, sql: &str, params: &[SynValue]) -> Result<(i64, i64), String> {
-        reject_sealed_all(params, "sql")?;
-        match self.conn_mut(None)? {
-            Backend::Sqlite(c) => {
-                let pv: Vec<Value> = params.iter().map(syn_to_value).collect();
-                let affected = c
-                    .execute(sql, params_from_iter(pv.iter()))
-                    .map_err(sqlite_err)?;
-                Ok((affected as i64, c.last_insert_rowid()))
-            }
-            Backend::Postgres(c) => {
-                let rewritten = rewrite_placeholders(sql);
-                let pg: Vec<PgParam> = params.iter().map(syn_to_pg).collect();
-                let refs: Vec<&(dyn ToSql + Sync)> = pg.iter().map(|p| p as &(dyn ToSql + Sync)).collect();
-                let n = c.execute(rewritten.as_str(), &refs).map_err(pg_err)?;
-                Ok((n as i64, 0))
-            }
-            // `?` nativo (sin reescritura). `last_insert_id()` real (0 si no aplica).
-            // Sin params → protocolo de TEXTO (`query_drop`): el de prepared statements
-            // rechaza el control de transacciones y otros comandos (ERROR 1295: "not
-            // supported in the prepared statement protocol"). Con params → prepared (binario)
-            // para el bind. `execute` no lee valores tipados (solo counts) → el protocolo no
-            // afecta el mapeo de tipos (a diferencia de `query`, que SIEMPRE va por binario).
-            Backend::Mysql(c) => {
-                if params.is_empty() {
-                    c.query_drop(sql).map_err(mysql_err)?;
-                } else {
-                    c.exec_drop(sql, mysql_params(params)).map_err(mysql_err)?;
-                }
-                Ok((c.affected_rows() as i64, c.last_insert_id() as i64))
-            }
-            Backend::Mongo(_) => Err(mongo_not_sql()),
-            Backend::Redis(_) => Err(redis_not_sql()),
-        }
+        self.with_default(|c| c.execute(sql, params))
     }
 
     /// Ejecuta una sentencia con múltiples sets de parámetros (batch).
     pub fn execute_many(&mut self, sql: &str, params_list: &[Vec<SynValue>]) -> Result<i64, String> {
-        params_list.iter().try_for_each(|p| reject_sealed_all(p, "sql"))?;
-        match self.conn_mut(None)? {
-            Backend::Sqlite(c) => {
-                let mut stmt = c.prepare(sql).map_err(sqlite_err)?;
-                let mut total: i64 = 0;
-                for params in params_list {
-                    let pv: Vec<Value> = params.iter().map(syn_to_value).collect();
-                    total += stmt
-                        .execute(params_from_iter(pv.iter()))
-                        .map_err(sqlite_err)? as i64;
-                }
-                Ok(total)
-            }
-            Backend::Postgres(c) => {
-                let rewritten = rewrite_placeholders(sql);
-                let stmt = c.prepare(rewritten.as_str()).map_err(pg_err)?;
-                let mut total: i64 = 0;
-                for params in params_list {
-                    let pg: Vec<PgParam> = params.iter().map(syn_to_pg).collect();
-                    let refs: Vec<&(dyn ToSql + Sync)> =
-                        pg.iter().map(|p| p as &(dyn ToSql + Sync)).collect();
-                    total += c.execute(&stmt, &refs).map_err(pg_err)? as i64;
-                }
-                Ok(total)
-            }
-            // Prepara una vez (`?` nativo) y reusa el statement por cada set de params.
-            Backend::Mysql(c) => {
-                let stmt = c.prep(sql).map_err(mysql_err)?;
-                let mut total: i64 = 0;
-                for params in params_list {
-                    c.exec_drop(&stmt, mysql_params(params)).map_err(mysql_err)?;
-                    total += c.affected_rows() as i64;
-                }
-                Ok(total)
-            }
-            Backend::Mongo(_) => Err(mongo_not_sql()),
-            Backend::Redis(_) => Err(redis_not_sql()),
-        }
+        self.with_default(|c| c.execute_many(sql, params_list))
     }
 
     /// El dialecto SQL de la conexión default (`None` sin conexión o si no es SQL).
     fn default_dialect(&self) -> Option<SqlDialect> {
-        match self.connections.get(self.default_db.as_ref()?)? {
-            Backend::Sqlite(_) => Some(SqlDialect::Sqlite),
-            Backend::Postgres(_) => Some(SqlDialect::Postgres),
-            Backend::Mysql(_) => Some(SqlDialect::Mysql),
-            Backend::Mongo(_) | Backend::Redis(_) => None,
+        let key = self.default_db.as_ref()?;
+        if let Some(l) = self.lent.as_ref().filter(|l| l.key == *key) {
+            return Some(l.dialect);
         }
+        self.connections.get(key)?.dialect()
     }
 
     /// Key de la conexión default (para el scope de la capability `db` en las ops de
@@ -397,36 +533,7 @@ impl DatabaseManager {
     }
 
     pub fn tables(&mut self) -> Result<Vec<String>, String> {
-        let (sql, col) = match self.conn_mut(None)? {
-            Backend::Sqlite(_) => (
-                "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name",
-                "name",
-            ),
-            Backend::Postgres(_) => (
-                "SELECT tablename FROM pg_catalog.pg_tables \
-                 WHERE schemaname NOT IN ('pg_catalog','information_schema') ORDER BY tablename",
-                "tablename",
-            ),
-            // `SHOW TABLES` da una columna de nombre dinámico (`Tables_in_<db>`); se usa
-            // information_schema con alias fijo `name` para leerla igual que los otros.
-            Backend::Mysql(_) => (
-                "SELECT table_name AS name FROM information_schema.tables \
-                 WHERE table_schema = DATABASE() ORDER BY table_name",
-                "name",
-            ),
-            // Mongo no es SQL: `sql_tables()` no aplica → `mongo_collections()`.
-            Backend::Mongo(_) => return Err(mongo_not_sql()),
-            // Redis no es SQL: `sql_tables()` no aplica → `redis_keys(pattern)`.
-            Backend::Redis(_) => return Err(redis_not_sql()),
-        };
-        let rows = self.query(sql, &[])?;
-        Ok(rows
-            .iter()
-            .filter_map(|r| match r.get(col) {
-                Some(SynValue::Text(s)) => Some(s.to_string()),
-                _ => None,
-            })
-            .collect())
+        self.with_default(|c| c.tables())
     }
 
     /// Devuelve la `Collection<Document>` de la conexión Mongo default, o un error simétrico
@@ -581,6 +688,1053 @@ impl DatabaseManager {
             cmd.arg(p.as_slice());
         }
         cmd.query::<redis::Value>(conn).map_err(redis_err)
+    }
+}
+
+// -- Las operaciones SQL de una conexión (v0.6.59: las usan el gestor y una transacción) --
+
+impl Backend {
+    /// El dialecto SQL (`None` si no es SQL).
+    fn dialect(&self) -> Option<SqlDialect> {
+        match self {
+            Backend::Sqlite(_) => Some(SqlDialect::Sqlite),
+            Backend::Postgres(_) => Some(SqlDialect::Postgres),
+            Backend::Mysql(_) => Some(SqlDialect::Mysql),
+            Backend::Mongo(_) | Backend::Redis(_) => None,
+        }
+    }
+
+    fn query(&mut self, sql: &str, params: &[SynValue]) -> Result<Vec<Row>, String> {
+        reject_sealed_all(params, "sql")?;
+        match self {
+            Backend::Sqlite(c) => sqlite_query(c, sql, params),
+            Backend::Postgres(c) => pg_query(c, sql, params),
+            Backend::Mysql(c) => mysql_query(c, sql, params),
+            Backend::Mongo(_) => Err(mongo_not_sql()),
+            Backend::Redis(_) => Err(redis_not_sql()),
+        }
+    }
+
+    fn execute(&mut self, sql: &str, params: &[SynValue]) -> Result<(i64, i64), String> {
+        reject_sealed_all(params, "sql")?;
+        match self {
+            Backend::Sqlite(c) => {
+                let pv: Vec<Value> = params.iter().map(syn_to_value).collect();
+                let affected = c
+                    .execute(sql, params_from_iter(pv.iter()))
+                    .map_err(sqlite_err)?;
+                Ok((affected as i64, c.last_insert_rowid()))
+            }
+            Backend::Postgres(c) => {
+                let rewritten = rewrite_placeholders(sql);
+                let pg: Vec<PgParam> = params.iter().map(syn_to_pg).collect();
+                let refs: Vec<&(dyn ToSql + Sync)> = pg.iter().map(|p| p as &(dyn ToSql + Sync)).collect();
+                let n = c.execute(rewritten.as_str(), &refs).map_err(pg_err)?;
+                Ok((n as i64, 0))
+            }
+            // `?` nativo (sin reescritura). `last_insert_id()` real (0 si no aplica).
+            // Con params, por el protocolo preparado (binario); sin params, `mysql_execute_one`
+            // elige: el de texto sólo para lo que es un statement solo. `execute` no lee valores
+            // tipados (sólo counts) → el protocolo no afecta el mapeo de tipos.
+            Backend::Mysql(c) => {
+                if params.is_empty() {
+                    mysql_execute_one(c, sql)?;
+                } else {
+                    c.prepared(sql, mysql_params(params)).map_err(mysql_err)?;
+                }
+                Ok((c.affected_rows() as i64, c.last_insert_id() as i64))
+            }
+            Backend::Mongo(_) => Err(mongo_not_sql()),
+            Backend::Redis(_) => Err(redis_not_sql()),
+        }
+    }
+
+    fn execute_many(&mut self, sql: &str, params_list: &[Vec<SynValue>]) -> Result<i64, String> {
+        params_list.iter().try_for_each(|p| reject_sealed_all(p, "sql"))?;
+        match self {
+            Backend::Sqlite(c) => {
+                let mut stmt = c.prepare(sql).map_err(sqlite_err)?;
+                let mut total: i64 = 0;
+                for params in params_list {
+                    let pv: Vec<Value> = params.iter().map(syn_to_value).collect();
+                    total += stmt
+                        .execute(params_from_iter(pv.iter()))
+                        .map_err(sqlite_err)? as i64;
+                }
+                Ok(total)
+            }
+            Backend::Postgres(c) => {
+                let rewritten = rewrite_placeholders(sql);
+                let stmt = c.prepare(rewritten.as_str()).map_err(pg_err)?;
+                let mut total: i64 = 0;
+                for params in params_list {
+                    let pg: Vec<PgParam> = params.iter().map(syn_to_pg).collect();
+                    let refs: Vec<&(dyn ToSql + Sync)> =
+                        pg.iter().map(|p| p as &(dyn ToSql + Sync)).collect();
+                    total += c.execute(&stmt, &refs).map_err(pg_err)? as i64;
+                }
+                Ok(total)
+            }
+            // Prepara una vez (`?` nativo) y reusa el statement por cada set de params.
+            Backend::Mysql(c) => {
+                let stmt = c.prep(sql).map_err(mysql_err)?;
+                let mut total: i64 = 0;
+                for params in params_list {
+                    c.prepared(&stmt, mysql_params(params)).map_err(mysql_err)?;
+                    total += c.affected_rows() as i64;
+                }
+                Ok(total)
+            }
+            Backend::Mongo(_) => Err(mongo_not_sql()),
+            Backend::Redis(_) => Err(redis_not_sql()),
+        }
+    }
+
+    /// La consulta que lista las tablas y la columna que trae el nombre.
+    fn tables_query(&self) -> Result<(&'static str, &'static str), String> {
+        Ok(match self {
+            Backend::Sqlite(_) => (
+                "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name",
+                "name",
+            ),
+            Backend::Postgres(_) => (
+                "SELECT tablename FROM pg_catalog.pg_tables \
+                 WHERE schemaname NOT IN ('pg_catalog','information_schema') ORDER BY tablename",
+                "tablename",
+            ),
+            // `SHOW TABLES` da una columna de nombre dinámico (`Tables_in_<db>`); se usa
+            // information_schema con alias fijo `name` para leerla igual que los otros.
+            Backend::Mysql(_) => (
+                "SELECT table_name AS name FROM information_schema.tables \
+                 WHERE table_schema = DATABASE() ORDER BY table_name",
+                "name",
+            ),
+            // Mongo no es SQL: `sql_tables()` no aplica → `mongo_collections()`.
+            Backend::Mongo(_) => return Err(mongo_not_sql()),
+            // Redis no es SQL: `sql_tables()` no aplica → `redis_keys(pattern)`.
+            Backend::Redis(_) => return Err(redis_not_sql()),
+        })
+    }
+
+    /// Un statement de control que arma el motor (`COMMIT`, `SAVEPOINT …`): sin parámetros y sin
+    /// pasar por `guard`. Postgres y MySQL, por el protocolo de texto (el de statements preparados
+    /// de MySQL rechaza el control de transacciones, ERROR 1295).
+    fn control(&mut self, sql: &str) -> Result<(), String> {
+        match self {
+            Backend::Sqlite(c) => c.execute_batch(sql).map_err(sqlite_err),
+            Backend::Postgres(c) => c.batch_execute(sql).map_err(pg_err),
+            Backend::Mysql(c) => c.text(sql).map_err(mysql_err),
+            Backend::Mongo(_) => Err(mongo_not_sql()),
+            Backend::Redis(_) => Err(redis_not_sql()),
+        }
+    }
+
+    /// Abre una transacción. SQLite con `BEGIN IMMEDIATE`: el conflicto con otro proceso aparece
+    /// acá, con la espera de `busy_timeout`, y no en el primer `INSERT`, donde SQLite ya no puede
+    /// reintentar. Una base abierta de sólo lectura también lo acepta (medido, en modo DELETE y WAL).
+    fn begin(&mut self) -> Result<(), String> {
+        let sql = match self {
+            Backend::Sqlite(_) => "BEGIN IMMEDIATE",
+            Backend::Mysql(_) => "START TRANSACTION",
+            _ => "BEGIN",
+        };
+        self.control(sql)
+    }
+
+    /// `COMMIT`. En MySQL, con `AND NO CHAIN NO RELEASE`: la variable de sesión `completion_type`
+    /// hace que un `COMMIT` a secas abra otra transacción (`CHAIN`) o corte la conexión
+    /// (`RELEASE`); dicho así, no depende de ella (medido en 8.0.46).
+    fn commit(&mut self) -> Result<(), String> {
+        let sql = match self {
+            Backend::Mysql(_) => "COMMIT AND NO CHAIN NO RELEASE",
+            _ => "COMMIT",
+        };
+        self.control(sql)
+    }
+
+    /// `ROLLBACK`. `true` si la conexión quedó fuera de una transacción. SQLite lo dice
+    /// (`is_autocommit`): un error grave ya la deshizo, y entonces el `ROLLBACK` falla sin que
+    /// haya nada abierto. En Postgres y MySQL, un `ROLLBACK` que falla es una conexión de la que
+    /// no se sabe nada.
+    fn rollback(&mut self) -> bool {
+        let sql = match self {
+            Backend::Mysql(_) => "ROLLBACK AND NO CHAIN NO RELEASE",
+            _ => "ROLLBACK",
+        };
+        let r = self.control(sql);
+        match self {
+            Backend::Sqlite(c) => c.is_autocommit(),
+            _ => r.is_ok(),
+        }
+    }
+
+    /// Un statement que dejó una transacción abierta fuera de `sql_transaction`. La deshace.
+    /// `Stray::left`: `Ok(true)` si había una; `Err` si no se pudo mirar (y entonces se deshace
+    /// igual, por las dudas). (`guard` rechaza el control a mano por su primera palabra; esto mira el estado
+    /// real de la conexión.)
+    /// - SQLite lo dice (`is_autocommit`), después de cada statement.
+    /// - MySQL, después de un statement `opaque` (un `CALL`; `ok`: si corrió sin error):
+    ///   `mysql_left_by_call`. Deja `autocommit` en 1, que es como lo necesita el motor, y sin
+    ///   decir nada: el programa no lo puede cambiar (`tx_guard`), así que sólo lo apaga un
+    ///   procedimiento. Va después del `ROLLBACK`: con una transacción en curso,
+    ///   `SET autocommit = 1` la confirma. Por eso mismo, una transacción en la que no hay nada
+    ///   que deshacer (`TxLeft::NothingToUndo`) no lleva `ROLLBACK`: la cierra ese `SET`, y no es
+    ///   un error.
+    ///
+    /// `Stray::clean`: la conexión quedó fuera de una transacción. Si el `ROLLBACK` falla no lo
+    /// está (medido en 8.0.46: un procedimiento que deja una transacción XA activa; el `ROLLBACK`
+    /// da ERROR 1399 y la conexión sigue adentro), y entonces no se puede seguir usando: lo que
+    /// se escribiera después quedaría en esa transacción, que nadie confirma.
+    ///
+    /// MySQL, después de un statement que NO es un `CALL`: `mysql_left_by_statement`. `read` es lo
+    /// que leyó `mysql_after_unread_set` (`Some(true)` si no hizo falta leer).
+    fn close_stray_transaction(&mut self, opaque: bool, ok: bool, read: Option<bool>) -> Stray {
+        match self {
+            Backend::Sqlite(c) if !c.is_autocommit() => {
+                let _ = c.execute_batch("ROLLBACK");
+                Stray { left: Ok(true), autocommit_off: false, clean: c.is_autocommit() }
+            }
+            Backend::Mysql(_) => {
+                let left = if opaque { self.mysql_left_by_call(ok) } else { Ok(self.mysql_left_by_statement(ok, read)) };
+                // Sin saber qué quedó, se limpia como si hubiera quedado todo.
+                let (tx, autocommit_off) = *left.as_ref().unwrap_or(&(TxLeft::Open, true));
+                let clean = tx != TxLeft::Open || self.rollback();
+                // `read` en `None`: no se pudo leer cómo quedó `autocommit`; se repone por las dudas.
+                if clean && (autocommit_off || read.is_none()) {
+                    self.restore_autocommit();
+                }
+                Stray { left: left.map(|(tx, _)| tx == TxLeft::Open), autocommit_off, clean }
+            }
+            _ => Stray { left: Ok(false), autocommit_off: false, clean: true },
+        }
+    }
+
+    /// MySQL, después de un statement de afuera que no es un `CALL`: qué transacción dejó, y si
+    /// dejó `autocommit` apagado (`mysql_statement_left`). Con seguimiento lo dijo el servidor en
+    /// la respuesta, sin otra ida y vuelta: es la red de fondo de `tx_guard`, que lee el texto.
+    fn mysql_left_by_statement(&self, ok: bool, read: Option<bool>) -> (TxLeft, bool) {
+        let Backend::Mysql(c) = self else { return (TxLeft::None, false) };
+        mysql_statement_left(c.tracked.then_some((c.tx_state.as_str(), c.autocommit)), ok, read)
+    }
+
+    /// MySQL: lo que el servidor informó hasta acá (el estado de la transacción y `autocommit`).
+    /// `None` sin seguimiento.
+    fn mysql_tracked_state(&self) -> Option<(String, bool)> {
+        match self {
+            Backend::Mysql(c) if c.tracked => Some((c.tx_state.clone(), c.autocommit)),
+            _ => None,
+        }
+    }
+
+    /// MySQL, adentro de `sql_transaction`: ¿la transacción que había antes del statement
+    /// (`before`, de `mysql_tracked_state`) ya no es la misma? (`mysql_tx_ended`)
+    fn mysql_tx_ended_since(&self, before: &str) -> bool {
+        match self {
+            Backend::Mysql(c) if c.tracked => mysql_tx_ended(before, &c.tx_state),
+            _ => false,
+        }
+    }
+
+    /// MySQL, después de un `CALL` de afuera: qué transacción dejó el procedimiento, y si hay que
+    /// reponer `autocommit`.
+    ///
+    /// **Con seguimiento** (`MysqlConn::tracked`) ya lo dijo el servidor, en la respuesta del
+    /// propio `CALL` y sin otra ida y vuelta (`MysqlConn::observe`). Un `CALL` que falla termina
+    /// en un ERR, que no informa nada: lo que dejó llega con el OK siguiente, y para eso va un
+    /// `DO 0` (medido en 8.0.46). `ok` es de fiar porque la respuesta se lee hasta el final
+    /// (`mysql_finish`).
+    ///
+    /// **Sin seguimiento**, se pregunta: fijar el nivel de aislamiento de la PRÓXIMA transacción
+    /// (el `SET` sin `SESSION` ni `GLOBAL`) da ERROR 1568 si hay una en curso, y pasa con
+    /// `autocommit = 0` si no quedó nada pendiente. Dos límites, que el seguimiento no tiene: no
+    /// distingue una lectura de una escritura pendiente, y pisa el nivel «de la próxima
+    /// transacción» que el programa haya fijado. `autocommit` se repone siempre: no se sabe.
+    fn mysql_left_by_call(&mut self, ok: bool) -> Result<(TxLeft, bool), String> {
+        let Backend::Mysql(c) = self else { return Ok((TxLeft::None, false)) };
+        if c.tracked && !ok {
+            c.text("DO 0").map_err(mysql_err)?;
+        }
+        // (El `DO 0` pudo traer algo que no se entiende: entonces también se pregunta.)
+        if c.tracked {
+            return Ok((mysql_tx_left(&c.tx_state, c.autocommit), !c.autocommit));
+        }
+        match c.query_drop(MYSQL_IN_TRANSACTION_PROBE) {
+            Ok(()) => Ok((TxLeft::None, true)),
+            Err(mysql::Error::MySqlError(e)) if e.code == MYSQL_TX_IN_PROGRESS => Ok((TxLeft::Open, true)),
+            Err(e) => Err(mysql_err(e)),
+        }
+    }
+
+    /// MySQL: ¿este statement es un `SET` que el motor no sabe leer como lo lee el servidor
+    /// (`mysql_unread_set`)? Después de uno así se mira lo que dejó (`mysql_after_unread_set`).
+    fn unread_set(&self, sql: &str) -> bool {
+        matches!(self, Backend::Mysql(_)) && mysql_unread_set(sql)
+    }
+
+    /// MySQL: lo que el motor sabe de `autocommit` sin preguntar. `None` sin seguimiento.
+    fn mysql_autocommit(&self) -> Option<bool> {
+        match self {
+            Backend::Mysql(c) if c.tracked => Some(c.autocommit),
+            _ => None,
+        }
+    }
+
+    /// MySQL, después de un `SET` del programa que el motor no sabe leer: le pregunta al servidor
+    /// cómo quedaron las variables que son del motor. No se fía del texto: el servidor reconoce
+    /// el nombre de una variable escrito de formas que el motor no (medido en 8.0.46:
+    /// `SET autocommít = 0` apaga `autocommit`), así que mira el resultado.
+    /// - `Some(true)`: `autocommit` está en 1; `Some(false)`: quedó apagado; `None`: no se pudo
+    ///   leer.
+    /// - Si el seguimiento de sesión ya no está como lo pidió `mysql_connect` (o no se pudo
+    ///   leer), la conexión queda sin seguimiento: desde ahí se pregunta
+    ///   (`mysql_left_by_call`).
+    fn mysql_after_unread_set(&mut self) -> Option<bool> {
+        let Backend::Mysql(c) = self else { return Some(true) };
+        // Sin seguimiento no se nombran sus variables: un servidor que no lo da puede no tenerlas.
+        let sql = if c.tracked { MYSQL_READ_BACK } else { "SELECT @@session.autocommit, 1, 1" };
+        let row: Result<Option<mysql::Row>, mysql::Error> = c.conn.query_first(sql);
+        c.observe();
+        let int = |row: &mysql::Row, i: usize| row.get_opt::<Option<i64>, usize>(i).and_then(Result::ok).flatten();
+        let read = row.ok().flatten().and_then(|row| Some((int(&row, 0)?, int(&row, 1), int(&row, 2))));
+        let Some((autocommit, state, variables)) = read else {
+            c.tracked = false;
+            return None;
+        };
+        if state != Some(1) || variables != Some(1) {
+            c.tracked = false;
+        }
+        c.autocommit = autocommit != 0;
+        Some(autocommit != 0)
+    }
+
+    /// MySQL, después de un `CALL` (afuera de una transacción, o al cerrar una en la que corrió
+    /// uno): el procedimiento pudo dejar `autocommit = 0` sin que se note (no confirma nada), y
+    /// entonces lo que se escriba después quedaría en una transacción que nadie confirma. Va
+    /// después del `COMMIT`/`ROLLBACK`: con una transacción abierta, `SET autocommit = 1` la
+    /// confirmaría.
+    fn restore_autocommit(&mut self) {
+        if let Backend::Mysql(_) = self {
+            let _ = self.control("SET autocommit = 1");
+        }
+    }
+
+    /// v0.6.59 — lo que un statement del programa no hace: manejar la transacción a mano. Mira las
+    /// primeras palabras de código; `in_tx`: dentro de `sql_transaction`.
+    fn guard(&self, sql: &str, in_tx: bool) -> Result<(), String> {
+        let Some(d) = self.dialect() else { return Ok(()) };
+        tx_guard(sql, d, in_tx)
+    }
+
+    /// Un statement que corre código que el motor no ve: en MySQL, un `CALL` (el cuerpo de un
+    /// procedimiento puede abrir, confirmar o deshacer una transacción). En Postgres el servidor
+    /// rechaza eso adentro de una transacción y no deja nada abierto afuera (medido en 16.15); en
+    /// SQLite no hay procedimientos.
+    fn opaque(&self, sql: &str) -> bool {
+        matches!(self, Backend::Mysql(_)) && mysql_opaque(sql)
+    }
+}
+
+/// MySQL: `CALL …` (también dentro de un comentario ejecutable: `MysqlHead`).
+fn mysql_opaque(sql: &str) -> bool {
+    mysql_head(sql).first_is(&["CALL"])
+}
+
+/// MySQL: cómo empieza un statement, leído de las dos maneras en que puede leerlo el servidor.
+///
+/// MySQL EJECUTA lo que va dentro de `/*! … */`. Con una versión (`/*!80000 … */`) lo ejecuta
+/// sólo un servidor de esa versión o posterior, y `/*M! … */` sólo MariaDB: el motor no sabe si
+/// el servidor al que le habla lo va a correr. Medido en 8.0.46: `/*!99999 SELECT */ COMMIT` es
+/// un `COMMIT` para el servidor; leído con el comentario como código empieza con `SELECT`.
+struct MysqlHead {
+    /// Las dos primeras palabras con TODOS los comentarios ejecutables leídos como código.
+    all: [String; 2],
+    /// Las dos primeras palabras que el servidor lee seguro: con los comentarios ejecutables sin
+    /// versión como código y los demás como comentarios.
+    sure: [String; 2],
+    /// Antes de `sure[i]` hay un comentario que sólo algunos servidores ejecutan: esa palabra
+    /// puede no ser la que ocupa ese lugar.
+    gap: [bool; 2],
+}
+
+impl MysqlHead {
+    /// ¿La primera palabra es una de éstas, en alguna de las dos lecturas?
+    fn first_is(&self, words: &[&str]) -> bool {
+        words.contains(&self.all[0].as_str()) || words.contains(&self.sure[0].as_str())
+    }
+}
+
+fn mysql_head(sql: &str) -> MysqlHead {
+    let pair = |mut words: Vec<String>| {
+        words.resize(2, String::new());
+        let second = words.pop().unwrap_or_default();
+        [words.pop().unwrap_or_default(), second]
+    };
+    if !sql.contains("/*") {
+        let words = pair(leading_words(sql, SqlDialect::Mysql, 2));
+        return MysqlHead { all: words.clone(), sure: words, gap: [false; 2] };
+    }
+    let all = pair(leading_words(&mysql_unwrap_executable_comments(sql, true), SqlDialect::Mysql, 2));
+    let mut gap = [false; 2];
+    let sure = pair(leading_words_marked(&mysql_unwrap_executable_comments(sql, false), SqlDialect::Mysql, 2, &mut gap));
+    MysqlHead { all, sure, gap }
+}
+
+/// MySQL: ¿el texto tiene esta palabra, en ASCII y sin mirar mayúsculas? No lee SQL: también
+/// cuenta adentro de un literal, de unas comillas o de un comentario. Leer dónde termina un
+/// literal depende del `sql_mode` del servidor (`NO_BACKSLASH_ESCAPES`, `ANSI_QUOTES`), y el
+/// servidor acepta el nombre de una variable entre comillas invertidas (medido en 8.0.46:
+/// ``SET `autocommit` = 0``). De más, nunca de menos.
+fn mysql_text_has(sql: &str, name: &str) -> bool {
+    let name = name.as_bytes();
+    sql.as_bytes().windows(name.len()).any(|w| w.eq_ignore_ascii_case(name))
+}
+
+/// MySQL: un `SET` del programa del que el motor no puede decir, por el texto, que no toca las
+/// variables que son suyas (`autocommit` y las del seguimiento de sesión):
+/// - tiene un carácter que no es ASCII: el servidor busca el nombre de una variable con la
+///   comparación de su juego de caracteres, que iguala letras con tilde y otras a su letra base
+///   (medido en 8.0.46: `autocommít`, `sessión_track_…`, `ſession_track_…`);
+/// - o nombra `session_track`.
+///
+/// Un `SET` en ASCII que nombra `autocommit` no llega acá: lo rechaza `tx_guard`. Sólo un `SET`
+/// cambia una variable de la sesión desde el programa (lo demás es el cuerpo de un procedimiento
+/// o de una función, que el motor no ve).
+fn mysql_unread_set(sql: &str) -> bool {
+    mysql_head(sql).first_is(&["SET"]) && (!sql.is_ascii() || mysql_text_has(sql, "session_track"))
+}
+
+/// El chequeo de `Backend::guard`, sobre el texto y el dialecto.
+fn tx_guard(sql: &str, d: SqlDialect, in_tx: bool) -> Result<(), String> {
+    let by_hand = |first: &str, second: &str| {
+        matches!(first, "BEGIN" | "COMMIT" | "ROLLBACK" | "SAVEPOINT" | "RELEASE" | "END" | "ABORT")
+            || (matches!(first, "START" | "PREPARE") && second == "TRANSACTION")
+    };
+    if d != SqlDialect::Mysql {
+        let words = leading_words(sql, d, 2);
+        let first = words.first().map(String::as_str).unwrap_or("");
+        let second = words.get(1).map(String::as_str).unwrap_or("");
+        return if by_hand(first, second) { Err(TX_BY_HAND.to_string()) } else { Ok(()) };
+    }
+    // MySQL: el statement se lee de las dos maneras en que lo puede leer el servidor
+    // (`MysqlHead`), y vale la peor.
+    let head = mysql_head(sql);
+    let (first, second) = (head.sure[0].as_str(), head.sure[1].as_str());
+    if by_hand(first, second)
+        || by_hand(&head.all[0], &head.all[1])
+        // La segunda palabra no se sabe.
+        || (head.gap[1] && matches!(first, "START" | "PREPARE"))
+        || head.first_is(&["XA"])
+        // `autocommit` en cualquier parte del texto de un `SET` (`mysql_text_has`).
+        || (head.first_is(&["SET"]) && mysql_text_has(sql, "autocommit"))
+    {
+        return Err(TX_BY_HAND.to_string());
+    }
+    // `PREPARE s FROM '…'` y `EXECUTE s` corren un statement que está en un texto (medido:
+    // `PREPARE s FROM 'COMMIT'` + `EXECUTE s` confirma, y con `SET autocommit = 0` deja la
+    // conexión compartida en una transacción). (`PREPARE TRANSACTION` ya salió arriba.)
+    if head.first_is(&["PREPARE", "EXECUTE"]) {
+        return Err(MYSQL_SQL_PREPARE.to_string());
+    }
+    // Lo que queda no es control de transacciones en ninguna de las dos lecturas, pero si la
+    // primera palabra depende de la versión del servidor, el motor no sabe qué statement es: no
+    // sabría si es un `CALL`, ni si confirma la transacción abierta.
+    if head.gap[0] {
+        return Err(MYSQL_COMMENT_FIRST.to_string());
+    }
+    // `CREATE`, `DROP`, `SET` y `LOAD` confirman o no según la segunda palabra: si no se sabe cuál
+    // es, cuenta como que sí.
+    if in_tx && head.gap[1] && matches!(first, "CREATE" | "DROP" | "SET" | "LOAD") {
+        return Err(format!(
+            "sql_transaction: in MySQL this {} statement may commit the open transaction: the comment after {} is one that only some servers run (/*!80000 … */ with a version, or /*M! … */), so the engine cannot tell which statement it is — run it outside sql_transaction, or write it without that comment",
+            first, first
+        ));
+    }
+    if in_tx && mysql_implicit_commit(first, second) {
+        let what = if matches!(first, "SET" | "LOAD") { format!("{} {}", first, second) } else { first.to_string() };
+        return Err(format!(
+            "sql_transaction: in MySQL a {} statement commits the open transaction (MySQL has no transactional DDL), so the transaction could not roll it back — run it outside sql_transaction",
+            what
+        ));
+    }
+    Ok(())
+}
+
+/// El control de transacciones escrito a mano (`tx_guard`).
+const TX_BY_HAND: &str = "BEGIN, COMMIT, ROLLBACK and SAVEPOINT are not run by hand (since v0.6.59): a hand-made transaction on a shared connection wraps the writes of other tasks. Put the statements in a task and run sql_transaction(task) — it commits when the task returns and rolls back if it fails; inside one, another sql_transaction(task) is a savepoint";
+
+/// MySQL: `PREPARE` y `EXECUTE` de SQL (`tx_guard`).
+const MYSQL_SQL_PREPARE: &str = "MySQL PREPARE and EXECUTE are not run from here (since v0.6.59): the statement they run is a text the engine does not see, and it could commit or roll back by hand. Pass the statement itself, with ? and a list of values — sql(\"SELECT … WHERE id = ?\", [id]) — the engine prepares it";
+
+/// MySQL: un comentario que sólo algunos servidores ejecutan, antes de la primera palabra del
+/// statement (`tx_guard`).
+const MYSQL_COMMENT_FIRST: &str = "a MySQL comment that only some servers run — /*!80000 … */ with a version, or /*M! … */ — before the first word of a statement is not run from here (since v0.6.59): whether the server runs what is inside depends on its version, so the engine cannot tell which statement this is. Write the statement itself, without that comment";
+
+/// MySQL: un statement que no es un `CALL` apagó `autocommit` (`SqlConn::run`). Sigue
+/// `TX_BY_HAND`.
+const TURNED_AUTOCOMMIT_OFF: &str = "this statement turned autocommit off on the connection, and the engine turns it back on (inside sql_transaction, when the transaction closes).";
+
+/// MySQL: un statement que no es un `CALL` terminó la transacción de `sql_transaction`
+/// (`SqlConn::run`, `mysql_tx_ended`).
+const TX_ENDED_BY_STATEMENT: &str = "sql_transaction: this statement ended the transaction — the server reports that it was committed or rolled back — so what the transaction wrote before it can no longer be rolled back or committed as one. A statement inside sql_transaction must not manage transactions";
+
+/// MySQL: un `CALL` cerró la transacción de `sql_transaction` (`SqlConn::run`).
+const TX_ENDED_BY_CALL: &str = "sql_transaction: this CALL ended the transaction — the procedure ran COMMIT, ROLLBACK or a statement that commits (START TRANSACTION and DDL do), or the server rolled it back — so what the transaction wrote before the CALL can no longer be rolled back or committed as one. A procedure called inside sql_transaction must not manage transactions";
+
+/// MySQL: un `CALL` dejó una transacción en curso fuera de `sql_transaction` (`SqlConn::run`).
+/// Lo que el procedimiento ya había confirmado no se deshace, y el mensaje lo dice: quien
+/// reintenta sin saberlo escribe dos veces.
+const CALL_LEFT_OPEN: &str = "this CALL left a transaction open on the connection, and it was rolled back: what the procedure had not committed is undone; what it had already committed stays, and so does a write to a table without transactions (MyISAM). On a shared connection an open transaction would wrap the writes of other tasks. A procedure that opens a transaction closes it before it returns; one that leaves the commit to its caller is called inside sql_transaction(task)";
+
+/// Lo que quedó abierto no se pudo deshacer, y la conexión se cerró (`SqlConn::run`). En MySQL,
+/// un procedimiento que deja una transacción XA activa: `ROLLBACK` no la termina. Va después de
+/// «this CALL» o «this statement».
+const LEFT_OPEN_STUCK: &str = "left a transaction open on the connection and it could not be rolled back (in MySQL, a procedure that leaves an XA transaction active or idle: ROLLBACK does not end one), so the connection was closed — open it again with db_open. A statement run on it afterwards would have stayed inside that transaction, uncommitted. The server ends the transaction when the connection closes; what the procedure had already committed stays";
+
+/// MySQL: no se pudo mirar el estado de la conexión después de un `CALL` (`SqlConn::run`).
+const CALL_UNCHECKED: &str = "the connection could not be checked after this CALL, so it was rolled back to leave no transaction open (what the procedure had already committed stays). The check failed with";
+
+/// MySQL: la sonda de `Backend::mysql_left_by_call`, para una conexión sin seguimiento.
+const MYSQL_IN_TRANSACTION_PROBE: &str = "SET @@transaction_isolation = @@SESSION.transaction_isolation";
+/// `ER_CANT_CHANGE_TX_CHARACTERISTICS`: «Transaction characteristics can't be changed while a
+/// transaction is in progress».
+const MYSQL_TX_IN_PROGRESS: u16 = 1568;
+
+/// MySQL: cómo quedaron las variables del motor (`Backend::mysql_after_unread_set`): `autocommit`,
+/// y si el seguimiento de sesión sigue como lo pidió `MYSQL_TRACK_SESSION` (la comparación la
+/// hace el servidor, sin mirar mayúsculas; medido en 8.0.46). Una lista que además sigue otras
+/// variables no es la del motor: de más, nunca de menos.
+const MYSQL_READ_BACK: &str = "SELECT @@session.autocommit, @@session.session_track_transaction_info = 'STATE', @@session.session_track_system_variables = 'autocommit'";
+
+/// MySQL, al conectar (`mysql_connect`): que el servidor informe en cada respuesta el estado de
+/// la transacción y los cambios de `autocommit`. La tercera asignación es el testigo: si la
+/// respuesta de este mismo `SET` trae `autocommit`, el seguimiento llega hasta acá (medido en
+/// 8.0.46: sin la capacidad `CLIENT_SESSION_TRACK` negociada no trae nada). Y deja `autocommit`
+/// en 1, que es como lo necesita el motor.
+const MYSQL_TRACK_SESSION: &str =
+    "SET SESSION session_track_transaction_info = 'STATE', session_track_system_variables = 'autocommit', autocommit = 1";
+
+/// Lo que un `CALL` de afuera dejó en la conexión (`Backend::mysql_left_by_call`).
+/// Lo que hizo `Backend::close_stray_transaction`.
+#[derive(Clone, PartialEq, Eq, Debug)]
+struct Stray {
+    /// `Ok(true)`: había una transacción abierta; `Err`: no se pudo mirar.
+    left: Result<bool, String>,
+    /// MySQL: `autocommit` quedó apagado (y ya se repuso). Después de un `CALL` no es un error:
+    /// es el patrón de siempre de un procedimiento.
+    autocommit_off: bool,
+    /// La conexión quedó fuera de una transacción.
+    clean: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum TxLeft {
+    /// Ninguna transacción.
+    None,
+    /// Una transacción que no abrió un `START TRANSACTION` y en la que no hay una escritura que
+    /// deshacer: la que deja una lectura con `autocommit = 0` (el patrón de siempre,
+    /// `SET autocommit = 0; START TRANSACTION; …; COMMIT`, seguido de un `SELECT`). Cerrarla no
+    /// pierde nada, así que no es un error; la cierra reponer `autocommit`.
+    NothingToUndo,
+    /// Una transacción con algo pendiente, o abierta con `START TRANSACTION`.
+    Open,
+}
+
+/// MySQL: el estado de la transacción que informa el servidor (`session_track_transaction_info =
+/// 'STATE'`), ocho caracteres: `T` explícita o `I` implícita; `r`/`R` leyó una tabla sin o con
+/// transacciones; `w`/`W` escribió en una; `s`/`S`; `L`. Un `_` donde no. Medido en 8.0.46: un
+/// `DELETE` que no borra nada y un `SELECT … FOR UPDATE` sin filas también marcan `W`.
+///
+/// Lo que no se reconoce cuenta como una transacción abierta: de más, nunca de menos. Una
+/// implícita sólo existe con `autocommit` apagado, así que con `autocommit` en 1 tampoco se
+/// reconoce.
+///
+/// La última marca, `L`, dice que hay tablas bloqueadas con `LOCK TABLES`: no es una transacción
+/// (medido: `_______L` hasta el `UNLOCK TABLES`, y un `CALL` en el medio daba el error de una
+/// transacción abierta).
+fn mysql_tx_left(state: &str, autocommit: bool) -> TxLeft {
+    let b = state.as_bytes();
+    let no_tx = |b: &[u8]| !b.is_empty() && b.iter().all(|&c| c == b'_');
+    if no_tx(b) || (b.len() == 8 && b[7] == b'L' && no_tx(&b[..7])) {
+        TxLeft::None
+    } else if b.first() == Some(&b'I') && !b.contains(&b'W') && !autocommit {
+        TxLeft::NothingToUndo
+    } else {
+        TxLeft::Open
+    }
+}
+
+/// MySQL: lo que dejó un statement de afuera que no es un `CALL` (`Backend::mysql_left_by_statement`).
+/// `tracked`: el estado y `autocommit` que informó el servidor, si hay seguimiento; `ok`: el
+/// statement corrió sin error; `read`: lo que leyó `mysql_after_unread_set`.
+///
+/// Afuera de una transacción y con `autocommit` en 1, ningún statement deja un estado que empiece
+/// con `T` o con `I` (medido en 8.0.46: `INSERT`, `SELECT … FOR UPDATE`, DDL, `LOCK TABLES`,
+/// `HANDLER`, `GET_LOCK`, `SET`): si lo hay, el statement abrió una transacción a mano, se
+/// escriba como se escriba. Sólo se miran esas dos letras: un estado que no se reconoce no es
+/// motivo para deshacer nada después de un statement común.
+///
+/// Un statement que falla no abre una transacción ni apaga `autocommit`, y un ERR no informa
+/// nada: ahí no se mira. Sin seguimiento sólo se sabe lo que se leyó.
+fn mysql_statement_left(tracked: Option<(&str, bool)>, ok: bool, read: Option<bool>) -> (TxLeft, bool) {
+    match tracked {
+        Some((state, autocommit)) if ok => {
+            let in_tx = matches!(state.as_bytes().first(), Some(b'T' | b'I'));
+            (if in_tx { mysql_tx_left(state, autocommit) } else { TxLeft::None }, !autocommit)
+        }
+        _ => (TxLeft::None, read == Some(false)),
+    }
+}
+
+/// MySQL, adentro de `sql_transaction`: ¿un statement terminó la transacción? `before` y `after`
+/// son el estado que informó el servidor antes y después de él. La transacción del motor empieza
+/// con `T`, y las marcas de lectura y escritura (las cuatro que siguen) sólo se suman mientras
+/// dura: no las saca un `ROLLBACK TO SAVEPOINT` (medido en 8.0.46). Así que terminó si ya no
+/// empieza con `T` (`COMMIT`, `ROLLBACK`, un statement que confirma) o si perdió una marca (un
+/// `COMMIT AND CHAIN`, o un `START TRANSACTION`, que confirman y abren otra: `T___W___` pasa a
+/// `T_______`).
+///
+/// Si `before` no empieza con `T` no se sabía que hubiera una transacción: no se mira.
+fn mysql_tx_ended(before: &str, after: &str) -> bool {
+    let (b, a) = (before.as_bytes(), after.as_bytes());
+    b.first() == Some(&b'T') && (a.first() != Some(&b'T') || (1..=4).any(|i| b.get(i).is_some_and(|&mark| mark != b'_') && a.get(i) != b.get(i)))
+}
+
+/// MySQL: lo que informó el servidor en su última respuesta: el estado de la transacción, si
+/// cambió, y `autocommit`, si lo asignaron (`true`: quedó en 1).
+fn mysql_tracked(c: &mysql::Conn) -> Result<(Option<String>, Option<bool>), String> {
+    use mysql::session_state_change::SessionStateChange;
+    let mut state = None;
+    let mut autocommit = None;
+    for info in c.session_state_changes().map_err(|e| e.to_string())? {
+        match info.decode().map_err(|e| e.to_string())? {
+            SessionStateChange::TransactionState(s) => state = Some(s.as_str().into_owned()),
+            SessionStateChange::SystemVariables(vars) => {
+                for v in vars {
+                    if v.name_str().eq_ignore_ascii_case("autocommit") {
+                        autocommit = Some(v.value_str().eq_ignore_ascii_case("ON"));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok((state, autocommit))
+}
+
+/// MySQL: los statements que confirman la transacción abierta («Statements That Cause an Implicit
+/// Commit» del manual), por su primera palabra. Medidos uno por uno contra MySQL 8.0.46
+/// (2026-11-10). `CREATE`, `DROP`, `SET` y `LOAD` dependen de la segunda palabra:
+/// `mysql_implicit_commit`.
+/// - No están `UNLOCK` (sólo confirma con tablas bloqueadas por `LOCK TABLES`, que adentro de una
+///   transacción se rechaza, y el `START TRANSACTION` del motor suelta las de antes) ni `PURGE`
+///   (medido: no confirma).
+/// - `RESET` se rechaza entero, aunque `RESET PERSIST` no confirma: de más, nunca de menos.
+const MYSQL_IMPLICIT_COMMIT: &[&str] = &[
+    "ALTER", "RENAME", "TRUNCATE", "GRANT", "REVOKE", "LOCK", "INSTALL", "UNINSTALL", "ANALYZE", "CACHE", "CHECK",
+    "FLUSH", "OPTIMIZE", "REPAIR", "RESET", "START", "STOP", "CHANGE", "IMPORT", "CLONE",
+];
+
+/// MySQL: ¿este statement confirma la transacción abierta?
+/// - `CREATE`/`DROP TEMPORARY TABLE` no (los demás `CREATE` y `DROP`, sí);
+/// - `SET PASSWORD` y `SET DEFAULT ROLE` sí (tocan las tablas de `mysql`); el resto de `SET`, no;
+/// - `LOAD INDEX INTO CACHE` sí; `LOAD DATA`, no;
+/// - `START` llega acá sin `TRANSACTION` (`START REPLICA`): también confirma.
+fn mysql_implicit_commit(first: &str, second: &str) -> bool {
+    match first {
+        "CREATE" | "DROP" => second != "TEMPORARY",
+        "SET" => matches!(second, "PASSWORD" | "DEFAULT"),
+        "LOAD" => second == "INDEX",
+        _ => MYSQL_IMPLICIT_COMMIT.contains(&first),
+    }
+}
+
+/// `sql_transaction` con algo que no es una task.
+const TX_USAGE: &str = "sql_transaction expects a task with no parameters: sql_transaction(() => …) or sql_transaction(my_task) — it commits when the task returns and rolls back if it fails";
+
+/// Un statement ya falló dentro de la transacción.
+#[cold]
+#[inline(never)]
+fn tx_failed(first: &str) -> String {
+    format!(
+        "sql_transaction: a statement failed inside this transaction, so it rolls back (to survive a statement that may fail, run it in its own sql_transaction(task) and catch the error outside it) — the first error was: {}",
+        first
+    )
+}
+
+/// El blanco de SQL: Postgres cuenta el tabulador vertical; el resto, los de siempre.
+fn is_sql_space(c: u8) -> bool {
+    matches!(c, b' ' | b'\t' | b'\n' | b'\r' | 0x0b | 0x0c)
+}
+
+/// Las primeras `n` palabras de código de un statement, en mayúsculas. Salta el blanco, `;`, `(`
+/// y los comentarios (`-- …`, `/* … */`, y `# …` en MySQL), y se corta en lo que no es una palabra.
+/// Un comentario termina en el primer `*/` (en Postgres se anidan): así se ve más código que el
+/// motor, nunca menos.
+fn leading_words(sql: &str, dialect: SqlDialect, n: usize) -> Vec<String> {
+    leading_words_marked(sql, dialect, n, &mut [])
+}
+
+/// `leading_words`, y en `gap[k]` si antes de la palabra `k` (o del final, si no la hay) se saltó
+/// un comentario ejecutable de MySQL (`/*!…` o `/*M!…`).
+fn leading_words_marked(sql: &str, dialect: SqlDialect, n: usize, gap: &mut [bool]) -> Vec<String> {
+    let b = sql.as_bytes();
+    let mut i = 0;
+    let mut out = Vec::with_capacity(n);
+    while out.len() < n {
+        loop {
+            match b.get(i) {
+                Some(&c) if is_sql_space(c) || c == b';' || c == b'(' => i += 1,
+                Some(b'-') if b.get(i + 1) == Some(&b'-') => {
+                    while i < b.len() && b[i] != b'\n' {
+                        i += 1;
+                    }
+                }
+                Some(b'#') if dialect == SqlDialect::Mysql => {
+                    while i < b.len() && b[i] != b'\n' {
+                        i += 1;
+                    }
+                }
+                // MySQL: el cierre de un comentario ejecutable ya abierto
+                // (`mysql_unwrap_executable_comments` borra la apertura): lo que sigue es código
+                // del mismo statement (medido en 8.0.46: `/*! START */ TRANSACTION` abre una
+                // transacción).
+                Some(b'*') if dialect == SqlDialect::Mysql && b.get(i + 1) == Some(&b'/') => i += 2,
+                Some(b'/') if b.get(i + 1) == Some(&b'*') => {
+                    if mysql_executable_comment(&b[i..]).is_some() {
+                        if let Some(g) = gap.get_mut(out.len()) {
+                            *g = true;
+                        }
+                    }
+                    i += 2;
+                    while i < b.len() && !(b[i] == b'*' && b.get(i + 1) == Some(&b'/')) {
+                        i += 1;
+                    }
+                    i = (i + 2).min(b.len());
+                }
+                _ => break,
+            }
+        }
+        let start = i;
+        while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
+            i += 1;
+        }
+        if i == start {
+            break;
+        }
+        out.push(sql[start..i].to_ascii_uppercase());
+    }
+    out
+}
+
+/// MySQL: si `b` empieza con la apertura de un comentario ejecutable, su largo y si lo ejecuta
+/// cualquier servidor (`true`: `/*!` a secas; `false`: `/*!` seguido de un dígito, que es una
+/// versión, o `/*M!`, que es de MariaDB).
+fn mysql_executable_comment(b: &[u8]) -> Option<(usize, bool)> {
+    match b {
+        [b'/', b'*', b'!', rest @ ..] => Some((3, !rest.first().is_some_and(u8::is_ascii_digit))),
+        [b'/', b'*', b'M', b'!', ..] => Some((4, false)),
+        _ => None,
+    }
+}
+
+/// MySQL y MariaDB ejecutan lo que va dentro de `/*! … */`, `/*!50000 … */` y `/*M! … */`: se
+/// borra la apertura (queda el contenido como código; el `*/` suelto lo salta `leading_words`). Con
+/// `all` en `false` sólo se abren los que ejecuta cualquier servidor
+/// (`mysql_executable_comment`); los demás quedan como comentarios.
+fn mysql_unwrap_executable_comments(sql: &str, all: bool) -> String {
+    let b = sql.as_bytes();
+    let mut out = String::with_capacity(sql.len());
+    let mut i = 0;
+    let mut from = 0;
+    while i + 2 < b.len() {
+        match mysql_executable_comment(&b[i..]) {
+            Some((len, always)) if all || always => {
+                out.push_str(&sql[from..i]);
+                out.push(' ');
+                i += len;
+                while i < b.len() && b[i].is_ascii_digit() {
+                    i += 1;
+                }
+                from = i;
+            }
+            _ => i += 1,
+        }
+    }
+    out.push_str(&sql[from..]);
+    out
+}
+
+/// Una conexión SQL en uso: la default del gestor, o la de una transacción (`failed` anota ahí el
+/// primer statement que falla).
+struct SqlConn<'a> {
+    backend: &'a mut Backend,
+    failed: Option<&'a mut Option<String>>,
+    /// De la transacción: corrió un statement opaco (`Backend::opaque`), o uno que dejó
+    /// `autocommit` apagado: al cerrarla se repone.
+    called: Option<&'a mut bool>,
+    /// Fuera de una transacción: lo que dejó abierto un statement no se pudo deshacer. El que
+    /// armó esta conexión la cierra (`DatabaseManager::with_default`).
+    broken: bool,
+}
+
+impl SqlConn<'_> {
+    fn run<R>(&mut self, sql: &str, f: impl FnOnce(&mut Backend) -> Result<R, String>) -> Result<R, String> {
+        // Regla 2 del diseño: después de un statement que falló, la transacción sólo puede
+        // deshacerse (Postgres ya la tiene abortada; en SQLite y MySQL se hace lo mismo).
+        if let Some(slot) = &self.failed {
+            if let Some(first) = &**slot {
+                return Err(tx_failed(first));
+            }
+        }
+        self.backend.guard(sql, self.failed.is_some())?;
+        let opaque = self.backend.opaque(sql);
+        let unread_set = self.backend.unread_set(sql);
+        let Some(slot) = self.failed.as_mut() else {
+            // Fuera de una transacción: nada queda abierto en la conexión compartida.
+            let r = f(self.backend);
+            let read = if unread_set { self.backend.mysql_after_unread_set() } else { Some(true) };
+            let stray = self.backend.close_stray_transaction(opaque, r.is_ok(), read);
+            if !stray.clean {
+                self.broken = true;
+                let what = if opaque { "this CALL" } else { "this statement" };
+                return Err(match r {
+                    Ok(_) => format!("{} {}", what, LEFT_OPEN_STUCK),
+                    Err(e) => format!("{} — and {} {}", e, what, LEFT_OPEN_STUCK),
+                });
+            }
+            return match stray.left {
+                // Afuera `autocommit` está en 1 (lo deja el motor al conectar y después de cada
+                // `CALL`): si quedó apagado, fue este statement.
+                Ok(false) if stray.autocommit_off && !opaque && r.is_ok() => Err(format!("{} {}", TURNED_AUTOCOMMIT_OFF, TX_BY_HAND)),
+                Ok(false) => r,
+                // El statement ya falló: sale su error (lo que dejó abierto ya se deshizo).
+                _ if r.is_err() => r,
+                Ok(true) if opaque => Err(CALL_LEFT_OPEN.to_string()),
+                Ok(true) => Err(format!("this statement left a transaction open on the connection, and it was rolled back. {}", TX_BY_HAND)),
+                Err(e) => Err(format!("{}: {}", CALL_UNCHECKED, e)),
+            };
+        };
+        if !opaque {
+            // Adentro, `autocommit` puede estar apagado desde antes (un `CALL` anterior): sólo se
+            // le carga a este statement si se sabe que estaba en 1. Reponerlo acá confirmaría la
+            // transacción: se repone al cerrarla (`called`).
+            let already_called = self.called.as_ref().is_some_and(|c| **c);
+            let before = self.backend.mysql_tracked_state();
+            let was_on = before.as_ref().map_or(!already_called, |(_, autocommit)| *autocommit);
+            let r = f(self.backend);
+            let autocommit = if unread_set { self.backend.mysql_after_unread_set() } else { self.backend.mysql_autocommit().or(Some(true)) };
+            if autocommit != Some(true) {
+                if let Some(c) = self.called.as_mut() {
+                    **c = true;
+                }
+            }
+            // La red de fondo de `tx_guard`: lo que informó el servidor (`mysql_tx_ended`).
+            let ended = r.is_ok() && before.is_some_and(|(state, _)| self.backend.mysql_tx_ended_since(&state));
+            let r = match r {
+                Ok(_) if ended => Err(TX_ENDED_BY_STATEMENT.to_string()),
+                Ok(_) if autocommit == Some(false) && was_on => Err(format!("{} {}", TURNED_AUTOCOMMIT_OFF, TX_BY_HAND)),
+                r => r,
+            };
+            if let Err(e) = &r {
+                **slot = Some(e.clone());
+            }
+            return r;
+        }
+        // Adentro de una transacción, un statement opaco (MySQL, `CALL`) va entre un savepoint y su
+        // `RELEASE`: un savepoint muere con su transacción, así que si ya no está, el procedimiento
+        // la cerró (aunque después haya abierto otra). Medido en 8.0.46.
+        if let Some(c) = self.called.as_mut() {
+            **c = true;
+        }
+        if let Err(e) = self.backend.control("SAVEPOINT synsema_call") {
+            **slot = Some(e.clone());
+            return Err(e);
+        }
+        let r = f(self.backend);
+        let ended = self.backend.control("RELEASE SAVEPOINT synsema_call").is_err();
+        match r {
+            Ok(_) if ended => {
+                **slot = Some(TX_ENDED_BY_CALL.to_string());
+                Err(TX_ENDED_BY_CALL.to_string())
+            }
+            Ok(v) => Ok(v),
+            Err(e) => {
+                let e = if ended { format!("{} — and {}", e, TX_ENDED_BY_CALL) } else { e };
+                **slot = Some(e.clone());
+                Err(e)
+            }
+        }
+    }
+
+    fn query(&mut self, sql: &str, params: &[SynValue]) -> Result<Vec<Row>, String> {
+        self.run(sql, |b| b.query(sql, params))
+    }
+
+    fn execute(&mut self, sql: &str, params: &[SynValue]) -> Result<(i64, i64), String> {
+        self.run(sql, |b| b.execute(sql, params))
+    }
+
+    fn execute_many(&mut self, sql: &str, params_list: &[Vec<SynValue>]) -> Result<i64, String> {
+        self.run(sql, |b| b.execute_many(sql, params_list))
+    }
+
+    fn tables(&mut self) -> Result<Vec<String>, String> {
+        let (sql, col) = self.backend.tables_query()?;
+        let rows = self.query(sql, &[])?;
+        Ok(rows
+            .iter()
+            .filter_map(|r| match r.get(col) {
+                Some(SynValue::Text(s)) => Some(s.to_string()),
+                _ => None,
+            })
+            .collect())
+    }
+}
+
+// -- La transacción de un intérprete (`sql_transaction`) --
+
+/// La transacción abierta de un intérprete: tiene la conexión mientras corre su task.
+struct Tx {
+    backend: Backend,
+    /// 1: la transacción; de 2 en adelante, savepoints.
+    depth: usize,
+    /// El primer statement que falló en el nivel abierto.
+    failed: Option<String>,
+    /// Corrió un statement opaco (MySQL, `CALL`): al cerrar se repone `autocommit`.
+    called: bool,
+}
+
+/// Una por registro de builtins: un intérprete, y en `serve` un worker.
+type TxCell = Rc<RefCell<Option<Tx>>>;
+
+fn savepoint(level: usize) -> String {
+    format!("synsema_tx_{}", level)
+}
+
+/// Corre `f` sobre la conexión SQL de este intérprete: la de su transacción si tiene una; si no,
+/// la default del gestor, esperando si la tiene la transacción de otra task.
+fn with_sql<H: DbHandle, R>(db: &H, tx: &TxCell, f: impl FnOnce(&mut SqlConn<'_>) -> Result<R, String>) -> Result<R, String> {
+    if let Some(t) = tx.borrow_mut().as_mut() {
+        return f(&mut SqlConn { backend: &mut t.backend, failed: Some(&mut t.failed), called: Some(&mut t.called), broken: false });
+    }
+    db.write_unlent(|m| m.with_default(f))?
+}
+
+/// Un nivel abierto por `sql_transaction`. Se cierra con `finish`; si se suelta sin eso (un pánico
+/// que desenrolla), deshace el nivel y devuelve la conexión.
+struct TxScope<H: DbHandle> {
+    db: H,
+    tx: TxCell,
+    level: usize,
+    done: bool,
+}
+
+impl<H: DbHandle> TxScope<H> {
+    /// `BEGIN` (saca la conexión del gestor) o, dentro de una transacción, un savepoint.
+    fn open(db: &H, tx: &TxCell) -> Result<Self, String> {
+        let mut cell = tx.borrow_mut();
+        let level = match cell.as_mut() {
+            Some(t) => {
+                if let Some(first) = &t.failed {
+                    return Err(tx_failed(first));
+                }
+                let level = t.depth + 1;
+                if let Err(e) = t.backend.control(&format!("SAVEPOINT {}", savepoint(level))) {
+                    t.failed = Some(e.clone());
+                    return Err(e);
+                }
+                t.depth = level;
+                level
+            }
+            None => {
+                let mut backend = db.write_unlent(|m| m.lend())??;
+                if let Err(e) = backend.begin() {
+                    let clean = backend.rollback();
+                    db.write(|m| m.give_back(clean.then_some(backend)));
+                    return Err(e);
+                }
+                *cell = Some(Tx { backend, depth: 1, failed: None, called: false });
+                1
+            }
+        };
+        Ok(TxScope { db: db.clone(), tx: tx.clone(), level, done: false })
+    }
+
+    /// La task terminó con `r`: confirma si devolvió y ningún statement falló; si no, deshace. El
+    /// error de la task sale tal cual.
+    fn finish<T, E>(mut self, r: Result<T, E>, err: impl FnOnce(String) -> E) -> Result<T, E> {
+        self.done = true;
+        let closed = self.end(r.is_ok());
+        match (r, closed) {
+            (Ok(v), Ok(())) => Ok(v),
+            (Ok(_), Err(e)) => Err(err(e)),
+            (Err(e), _) => Err(e),
+        }
+    }
+
+    /// Cierra el nivel. `Err`: no quedó confirmado aunque la task haya devuelto.
+    fn end(&mut self, returned: bool) -> Result<(), String> {
+        let Ok(mut cell) = self.tx.try_borrow_mut() else { return Ok(()) };
+        if self.level > 1 {
+            let Some(t) = cell.as_mut() else { return Ok(()) };
+            let failed = t.failed.take();
+            t.depth = self.level - 1;
+            let name = savepoint(self.level);
+            if returned && failed.is_none() {
+                let released = t.backend.control(&format!("RELEASE SAVEPOINT {}", name));
+                if let Err(e) = &released {
+                    t.failed = Some(e.clone());
+                }
+                return released;
+            }
+            // `ROLLBACK TO` deja el savepoint puesto: se suelta después. Si no se puede deshacer
+            // (MySQL, tras un deadlock, ya no tiene el savepoint), la de afuera tampoco confirma.
+            let mut undone = t.backend.control(&format!("ROLLBACK TO SAVEPOINT {}", name));
+            if undone.is_ok() {
+                undone = t.backend.control(&format!("RELEASE SAVEPOINT {}", name));
+            }
+            if let Err(e) = &undone {
+                // La de afuera cita el error que empezó todo (el deadlock), no el del savepoint.
+                t.failed = Some(failed.clone().unwrap_or_else(|| e.clone()));
+            }
+            return match failed {
+                Some(first) => Err(tx_failed(&first)),
+                None => undone,
+            };
+        }
+        let Some(t) = cell.take() else { return Ok(()) };
+        drop(cell);
+        let Tx { mut backend, failed, called, .. } = t;
+        let (closed, clean) = if returned && failed.is_none() {
+            match backend.commit() {
+                Ok(()) => (Ok(()), true),
+                Err(e) => {
+                    let clean = backend.rollback();
+                    (Err(format!("sql_transaction: COMMIT failed, nothing was committed: {}", e)), clean)
+                }
+            }
+        } else {
+            let clean = backend.rollback();
+            (failed.map_or(Ok(()), |first| Err(tx_failed(&first))), clean)
+        };
+        if clean && called {
+            backend.restore_autocommit();
+        }
+        self.db.write(|m| m.give_back(clean.then_some(backend)));
+        if clean {
+            closed
+        } else {
+            // Caso 16 del diseño: no se devuelve una conexión con una transacción abierta.
+            closed.and(Err("sql_transaction: the transaction could not be rolled back, so the connection was closed — open it again with db_open".to_string()))
+        }
+    }
+}
+
+impl<H: DbHandle> Drop for TxScope<H> {
+    fn drop(&mut self) {
+        if !self.done {
+            let _ = self.end(false);
+        }
     }
 }
 
@@ -1137,6 +2291,77 @@ fn mysql_err(e: mysql::Error) -> String {
     e.to_string()
 }
 
+/// MySQL, un `sql_exec` sin valores: **un statement por llamada**, como en SQLite y Postgres.
+///
+/// El driver negocia `CLIENT_MULTI_STATEMENTS` y no deja apagarlo: por el protocolo de texto el
+/// servidor corre todos los statements que haya en el texto (medido en v0.6.59: `INSERT …; COMMIT`
+/// confirmaba a mano, sin pasar por `tx_guard`, que mira las primeras palabras). El protocolo
+/// preparado acepta uno solo: a un texto con un segundo statement le contesta ERROR 1064 sin
+/// correr nada.
+///
+/// El de texto queda para dos casos, los dos con UN statement:
+/// - el texto no tiene un `;` (aparte del final): `mysql_single_statement`. Es el caso de casi
+///   todos, y cuesta una ida y vuelta, como antes de v0.6.59; preparar un texto que la conexión
+///   no tiene guardado cuesta dos (medido: 40 `INSERT` distintos tardaban el doble);
+/// - el servidor ya leyó el texto entero y dice que no se prepara (ERROR 1295: el cuerpo de un
+///   `CREATE PROCEDURE`, que lleva `;` adentro). Medido contra 8.0.46: con algo después del `;`
+///   final, también esos dan 1064.
+///
+/// Ese segundo caso paga la preparación fallida cada vez: lo que no se prepara no queda guardado.
+///
+/// Los dos códigos se miran en la respuesta de PREPARAR, no en la de ejecutar: un procedimiento
+/// puede dar el número que quiera (`SIGNAL … SET MYSQL_ERRNO = 1295`), y reintentar por texto un
+/// `CALL` que ya corrió lo corre dos veces.
+fn mysql_execute_one(c: &mut MysqlConn, sql: &str) -> Result<(), String> {
+    if let Some(one) = mysql_single_statement(sql) {
+        return c.text(one).map_err(mysql_err);
+    }
+    let stmt = match c.prep(sql) {
+        Ok(stmt) => stmt,
+        Err(mysql::Error::MySqlError(e)) if e.code == MYSQL_UNSUPPORTED_PS => return c.text(sql).map_err(mysql_err),
+        Err(mysql::Error::MySqlError(e)) if e.code == MYSQL_PARSE_ERROR && sql.trim_end().trim_end_matches(';').contains(';') => {
+            return Err(format!(
+                "{} — if this call has more than one statement: one SQL statement per call (sql, sql_exec and sql_batch run one; before v0.6.59 a sql_exec without values ran them all in MySQL); run each statement with its own call",
+                mysql::Error::MySqlError(e)
+            ));
+        }
+        Err(e) => return Err(mysql_err(e)),
+    };
+    c.prepared(&stmt, mysql::Params::Empty).map_err(mysql_err)
+}
+
+/// MySQL: lee una respuesta hasta el final. Un `CALL` contesta con un resultado por cada `SELECT`
+/// del procedimiento y uno más, vacío, cuando termina; si el procedimiento falla después de dar
+/// un resultado, el error llega en el lugar del siguiente. Soltar la respuesta sin leerla (lo
+/// que hacen `query_drop` y `exec_drop` del driver, y lo que hacía `sql` hasta v0.6.58 con lo que
+/// sigue al primer resultado) descarta ese error, y el `CALL` pasaba por bueno (medido en 8.0.46).
+/// Además, lo que quedó en la conexión viene en la última respuesta (`MysqlConn::observe`; medido
+/// con dos resultados y un `INSERT` pendiente entre los dos).
+fn mysql_finish<T: mysql::prelude::Protocol>(result: &mut mysql::QueryResult<'_, '_, '_, T>) -> Result<(), mysql::Error> {
+    while let Some(set) = result.iter() {
+        for row in set {
+            row?;
+        }
+    }
+    Ok(())
+}
+
+/// MySQL: el texto sin su `;` final, si no tiene ningún otro `;`. Los statements de un texto se
+/// separan con `;` y con nada más, así que un texto sin ese byte es UN statement para el
+/// servidor: no depende del `sql_mode` y no hay que leer literales ni comentarios como los lee
+/// MySQL. Con un `;` adentro de un literal o de un comentario da `None`, y ahí decide el servidor
+/// (`mysql_execute_one`).
+fn mysql_single_statement(sql: &str) -> Option<&str> {
+    let one = sql.trim_end();
+    let one = one.strip_suffix(';').unwrap_or(one);
+    (!one.contains(';')).then_some(one)
+}
+
+/// `ER_UNSUPPORTED_PS`: «This command is not supported in the prepared statement protocol yet».
+const MYSQL_UNSUPPORTED_PS: u16 = 1295;
+/// `ER_PARSE_ERROR`.
+const MYSQL_PARSE_ERROR: u16 = 1064;
+
 /// TLS es **opt-in** en MySQL (el contenedor dev es plaintext) y el parser de URL del crate
 /// `mysql` RECHAZA claves de query desconocidas (`UnknownParameter`) → no se puede pedir TLS
 /// con `?ssl-mode=…` directo. Por eso interceptamos NOSOTROS el hint, lo quitamos del url y
@@ -1180,17 +2405,34 @@ fn split_tls_hint(url: &str) -> (String, bool) {
 /// #1: un `db_open` a un host caído NO debe colgarse). TLS opt-in (rustls, backend ring vía
 /// webpki-roots): si el url lo pide, verifica el cert del server contra los root CAs
 /// embebidos. El contenedor dev es plaintext → por defecto sin SSL.
-fn mysql_connect(url: &str) -> Result<mysql::Conn, String> {
+///
+/// v0.6.59 — pide el seguimiento de estado de sesión (`MYSQL_TRACK_SESSION`). Un servidor o un
+/// proxy que no lo da (no negocia la capacidad, o no conoce las variables) deja la conexión sin
+/// seguimiento, y sirve igual. En los dos casos `autocommit` queda en 1.
+fn mysql_connect(url: &str) -> Result<MysqlConn, String> {
     // v0.6.42 — bajo `serve`, el hilo que espera la red suelta su permiso de ejecución.
     let _w = synsema_core::waiting::waiting();
     let (clean_url, wants_tls) = split_tls_hint(url);
     let opts = mysql::Opts::from_url(&clean_url).map_err(|e| e.to_string())?;
     let mut builder = mysql::OptsBuilder::from_opts(opts)
-        .tcp_connect_timeout(Some(Duration::from_secs(10)));
+        .tcp_connect_timeout(Some(Duration::from_secs(10)))
+        .additional_capabilities(mysql::consts::CapabilityFlags::CLIENT_SESSION_TRACK);
     if wants_tls {
         builder = builder.ssl_opts(Some(mysql::SslOpts::default()));
     }
-    mysql::Conn::new(builder).map_err(mysql_err)
+    let conn = mysql::Conn::new(builder).map_err(mysql_err)?;
+    // `autocommit: false` hasta que el servidor diga otra cosa: ése es el testigo.
+    let mut c = MysqlConn { conn, tracked: true, tx_state: "________".to_string(), autocommit: false };
+    let asked = c.text(MYSQL_TRACK_SESSION).is_ok();
+    c.tracked = asked && c.tracked && c.autocommit;
+    if !asked {
+        // Un `SET` que falla no asigna nada (medido en 8.0.46 con una variable que no existe):
+        // `autocommit` va solo. Con `autocommit = 0` de fábrica en el servidor, lo que el
+        // programa escribe fuera de una transacción no se confirmaría nunca, y desde v0.6.59 no
+        // puede mandar `COMMIT` a mano.
+        c.text("SET autocommit = 1").map_err(mysql_err)?;
+    }
+    Ok(c)
 }
 
 /// Params posicionales (`?` nativo). Vacío → `Params::Empty` (evita el chequeo de aridad
@@ -1223,27 +2465,37 @@ fn syn_to_mysql(v: &SynValue) -> mysql::Value {
     }
 }
 
-fn mysql_query(conn: &mut mysql::Conn, sql: &str, params: &[SynValue]) -> Result<Vec<Row>, String> {
+fn mysql_query(c: &mut MysqlConn, sql: &str, params: &[SynValue]) -> Result<Vec<Row>, String> {
+    let r = mysql_rows(&mut c.conn, sql, params);
+    c.observe();
+    r
+}
+
+fn mysql_rows(conn: &mut mysql::Conn, sql: &str, params: &[SynValue]) -> Result<Vec<Row>, String> {
     // v0.6.42 — bajo `serve`, el hilo que espera la red suelta su permiso de ejecución.
     let _w = synsema_core::waiting::waiting();
-    let result = conn.exec_iter(sql, mysql_params(params)).map_err(mysql_err)?;
+    let mut result = conn.exec_iter(sql, mysql_params(params)).map_err(mysql_err)?;
     let mut out = Vec::new();
     // Las columnas como claves una vez por consulta (F4.4); se rehacen si cambian.
     let mut keys: Vec<Key> = Vec::new();
-    for row_res in result {
-        let row = row_res.map_err(mysql_err)?;
-        let cols = row.columns(); // Arc<[Column]> (mismo orden que los valores)
-        let values = row.unwrap(); // Vec<Value>, consume la fila
-        if keys.len() != cols.len() || keys.iter().zip(cols.iter()).any(|(k, c)| k.as_str() != c.name_str()) {
-            keys = cols.iter().map(|c| Key::from(c.name_str().as_ref())).collect();
+    // Las filas del primer resultado (un `CALL` puede dar más: `mysql_finish`).
+    if let Some(set) = result.iter() {
+        for row_res in set {
+            let row = row_res.map_err(mysql_err)?;
+            let cols = row.columns(); // Arc<[Column]> (mismo orden que los valores)
+            let values = row.unwrap(); // Vec<Value>, consume la fila
+            if keys.len() != cols.len() || keys.iter().zip(cols.iter()).any(|(k, c)| k.as_str() != c.name_str()) {
+                keys = cols.iter().map(|c| Key::from(c.name_str().as_ref())).collect();
+            }
+            let mut m = SynMap::with_capacity(cols.len());
+            for (i, val) in values.into_iter().enumerate() {
+                let col = &cols[i];
+                m.insert(keys[i].clone(), mysql_cell_to_syn(val, col));
+            }
+            out.push(m);
         }
-        let mut m = SynMap::with_capacity(cols.len());
-        for (i, val) in values.into_iter().enumerate() {
-            let col = &cols[i];
-            m.insert(keys[i].clone(), mysql_cell_to_syn(val, col));
-        }
-        out.push(m);
     }
+    mysql_finish(&mut result).map_err(mysql_err)?;
     Ok(out)
 }
 
@@ -1846,6 +3098,10 @@ pub fn register_database_builtins<H: DbHandle>(
     db: H,
     caps: Rc<RefCell<CapabilitySet>>,
 ) {
+    // v0.6.59 — la transacción abierta de ESTE intérprete (`sql_transaction`): mientras hay una, sus
+    // `sql*` van por la conexión que ella tiene.
+    let tx: TxCell = Rc::new(RefCell::new(None));
+
     // db_open(target, mode?)
     {
         let db = db.clone();
@@ -1895,6 +3151,7 @@ pub fn register_database_builtins<H: DbHandle>(
     {
         let db = db.clone();
         let caps = caps.clone();
+        let tx = tx.clone();
         interp.register_builtin(
             "sql",
             -1,
@@ -1904,7 +3161,7 @@ pub fn register_database_builtins<H: DbHandle>(
                 if let Some(p) = db.read(|m| m.default_path()) {
                     require_db(&caps, &p, "sql()")?;
                 }
-                let rows = db.write(|m| m.query(&query, &params)).map_err(|e| sql_driver_error("sql", e))?;
+                let rows = with_sql(&db, &tx, |c| c.query(&query, &params)).map_err(|e| sql_driver_error("sql", e))?;
                 Ok(syn_list(rows.into_iter().map(syn_map).collect()))
             }),
         );
@@ -1914,6 +3171,7 @@ pub fn register_database_builtins<H: DbHandle>(
     {
         let db = db.clone();
         let caps = caps.clone();
+        let tx = tx.clone();
         interp.register_builtin(
             "sql_exec",
             -1,
@@ -1931,7 +3189,7 @@ pub fn register_database_builtins<H: DbHandle>(
                 {
                     return Err(err("sql_exec: this statement returns rows (RETURNING) — run it with sql(statement, params) to get them (nothing was executed)"));
                 }
-                let (affected, last_id) = db.write(|m| m.execute(&stmt, &params)).map_err(|e| sql_driver_error("sql_exec", e))?;
+                let (affected, last_id) = with_sql(&db, &tx, |c| c.execute(&stmt, &params)).map_err(|e| sql_driver_error("sql_exec", e))?;
                 let mut m = SynMap::new();
                 m.insert("rows_affected", syn_int(affected));
                 m.insert("last_id", syn_int(last_id));
@@ -1944,6 +3202,7 @@ pub fn register_database_builtins<H: DbHandle>(
     {
         let db = db.clone();
         let caps = caps.clone();
+        let tx = tx.clone();
         interp.register_builtin(
             "sql_tables",
             0,
@@ -1951,7 +3210,7 @@ pub fn register_database_builtins<H: DbHandle>(
                 if let Some(p) = db.read(|m| m.default_path()) {
                     require_db(&caps, &p, "sql_tables()")?;
                 }
-                let tables = db.write(|m| m.tables()).map_err(err)?;
+                let tables = with_sql(&db, &tx, |c| c.tables()).map_err(err)?;
                 Ok(syn_list(tables.iter().map(|t| syn_text(t.as_str())).collect()))
             }),
         );
@@ -1961,6 +3220,7 @@ pub fn register_database_builtins<H: DbHandle>(
     {
         let db = db.clone();
         let caps = caps.clone();
+        let tx = tx.clone();
         interp.register_builtin(
             "sql_batch",
             2,
@@ -1982,7 +3242,7 @@ pub fn register_database_builtins<H: DbHandle>(
                 {
                     return Err(err("sql_batch: this statement returns rows (RETURNING) — run it with sql(statement, params) for each row to get them (nothing was executed)"));
                 }
-                let affected = db.write(|m| m.execute_many(&stmt, &params_list)).map_err(|e| sql_driver_error("sql_batch", e))?;
+                let affected = with_sql(&db, &tx, |c| c.execute_many(&stmt, &params_list)).map_err(|e| sql_driver_error("sql_batch", e))?;
                 let mut m = SynMap::new();
                 m.insert("rows_affected", syn_int(affected));
                 Ok(syn_map(m))
@@ -1994,6 +3254,7 @@ pub fn register_database_builtins<H: DbHandle>(
     {
         let db = db.clone();
         let caps = caps.clone();
+        let tx = tx.clone();
         interp.register_builtin(
             "paged",
             -1,
@@ -2004,8 +3265,9 @@ pub fn register_database_builtins<H: DbHandle>(
                     require_db(&caps, &p, "paged()")?;
                 }
                 let dbf = db.clone();
+                let txf = tx.clone();
                 let fetch = move |limit: Option<i64>, offset: i64| -> Result<(Vec<SynValue>, i64), String> {
-                    dbf.write(|m| match limit {
+                    with_sql(&dbf, &txf, |m| match limit {
                         // limit None → materialización completa (sin contexto de serve).
                         None => {
                             let rows = m.query(&query, &params)?;
@@ -2031,6 +3293,42 @@ pub fn register_database_builtins<H: DbHandle>(
                     })
                 };
                 Ok(SynValue::Server(synsema_core::types::Obj::new(ServerValue::Paged(Rc::new(fetch)))))
+            }),
+        );
+    }
+
+    // sql_transaction(task) → lo que devuelve la task (v0.6.59). La task corre con la conexión
+    // default para ella sola: COMMIT si devuelve, ROLLBACK si sale de cualquier otra forma.
+    // Adentro de otra, es un savepoint. Diseño: specs/v0.6.59-transacciones-diseno.md.
+    {
+        let db = db.clone();
+        let caps = caps.clone();
+        let tx = tx.clone();
+        interp.register_builtin(
+            "sql_transaction",
+            1,
+            Rc::new(move |i, args, loc| {
+                let task = match args.first() {
+                    Some(t @ (SynValue::Task(_) | SynValue::Builtin(_))) => t.clone(),
+                    _ => return Err(err(TX_USAGE)),
+                };
+                // La task se llama sin argumentos, y una llamada interna no chequea la aridad: un
+                // parámetro sin default quedaría en `nothing` y la transacción correría igual.
+                if let SynValue::Task(t) = &task {
+                    if let Some(p) = t.parameters.iter().find(|p| p.default.is_none()) {
+                        let who = if t.name == "<lambda>" { "this lambda".to_string() } else { format!("task '{}'", t.name) };
+                        return Err(err(format!(
+                            "sql_transaction calls its task with no arguments, and {} needs '{}' — pass the values in a lambda: sql_transaction(() => my_task(a, b))",
+                            who, p.name
+                        )));
+                    }
+                }
+                if let Some(p) = db.read(|m| m.default_path()) {
+                    require_db(&caps, &p, "sql_transaction()")?;
+                }
+                let scope = TxScope::open(&db, &tx).map_err(err)?;
+                let r = i.call_callback(task, Vec::new(), loc);
+                scope.finish(r, err)
             }),
         );
     }
@@ -2478,6 +3776,873 @@ pub fn register_database_builtins<H: DbHandle>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- v0.6.59: transacciones (specs/v0.6.59-transacciones-diseno.md, la tabla de casos) ----
+
+    fn tx_db() -> (Rc<RefCell<DatabaseManager>>, TxCell) {
+        let mut m = DatabaseManager::new();
+        m.open(":memory:", "memory").unwrap();
+        m.execute("CREATE TABLE t (who TEXT)", &[]).unwrap();
+        (Rc::new(RefCell::new(m)), Rc::new(RefCell::new(None)))
+    }
+
+    fn shared_db() -> Arc<Mutex<DatabaseManager>> {
+        let mut m = DatabaseManager::new();
+        m.open(":memory:", "memory").unwrap();
+        m.execute("CREATE TABLE t (who TEXT)", &[]).unwrap();
+        Arc::new(Mutex::new(m))
+    }
+
+    fn ins<H: DbHandle>(db: &H, tx: &TxCell, who: &str) -> Result<(), String> {
+        with_sql(db, tx, |c| c.execute("INSERT INTO t VALUES (?)", &[syn_text(who)])).map(|_| ())
+    }
+
+    fn whos<H: DbHandle>(db: &H, tx: &TxCell) -> Vec<String> {
+        with_sql(db, tx, |c| c.query("SELECT who FROM t ORDER BY rowid", &[]))
+            .unwrap()
+            .iter()
+            .map(|r| r.get("who").map(|v| v.to_string()).unwrap_or_default())
+            .collect()
+    }
+
+    fn tx_tmp_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("synsema-v0659-{}-{}", name, std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Mutación M17: todo builtin que registra este módulo existe en el perfil puro y en wasm como
+    /// un stub que dice por qué no está (`pure::DB`). Sin este test, un builtin de base nuevo podía
+    /// faltar ahí (y dar `Undefined variable` en vez del mensaje del perfil) sin que nada lo notara.
+    #[test]
+    fn v0659_every_database_builtin_is_a_stub_in_the_pure_profile() {
+        fn builtins(interp: &Interpreter) -> std::collections::BTreeSet<String> {
+            let env = interp.global_env.borrow();
+            env.bindings.iter().filter(|(_, v)| matches!(v, SynValue::Builtin(_))).map(|(k, _)| k.to_string()).collect()
+        }
+        let bare = builtins(&Interpreter::new());
+        let interp = Interpreter::new();
+        let caps = Rc::new(RefCell::new(CapabilitySet::new("test")));
+        register_database_builtins(&interp, Rc::new(RefCell::new(DatabaseManager::new())), caps);
+        let ours: Vec<String> = builtins(&interp).difference(&bare).cloned().collect();
+        assert!(ours.len() > 20 && ours.iter().any(|n| n == "sql_transaction"), "{:?}", ours);
+        let missing: Vec<&String> = ours.iter().filter(|n| !crate::pure::DB.contains(&n.as_str())).collect();
+        assert!(missing.is_empty(), "builtins de base sin stub en `pure::DB`: {:?}", missing);
+    }
+
+    /// Casos 1 y 2: confirma si la task devuelve, deshace si da error, y la conexión vuelve al gestor.
+    #[test]
+    fn v0659_a_transaction_commits_on_return_and_rolls_back_on_error() {
+        let (db, tx) = tx_db();
+        let s = TxScope::open(&db, &tx).unwrap();
+        assert!(db.borrow().lent.is_some(), "la transacción tiene la conexión");
+        ins(&db, &tx, "a").unwrap();
+        assert_eq!(s.finish(Ok::<i32, String>(7), |e| e), Ok(7));
+        assert!(db.borrow().lent.is_none() && tx.borrow().is_none());
+        assert_eq!(whos(&db, &tx), ["a"]);
+
+        let s = TxScope::open(&db, &tx).unwrap();
+        ins(&db, &tx, "b").unwrap();
+        assert_eq!(s.finish(Err::<i32, String>("boom".into()), |e| e), Err("boom".to_string()));
+        assert_eq!(whos(&db, &tx), ["a"], "lo de la task que falló no queda");
+        assert!(db.borrow().lent.is_none() && tx.borrow().is_none());
+    }
+
+    /// Caso 4 (regla 2): un statement que falla hace fallar la transacción aunque la task lo atrape.
+    #[test]
+    fn v0659_a_failed_statement_fails_its_transaction() {
+        let (db, tx) = tx_db();
+        let s = TxScope::open(&db, &tx).unwrap();
+        ins(&db, &tx, "a").unwrap();
+        let first = with_sql(&db, &tx, |c| c.execute("INSERT INTO no_such_table VALUES (1)", &[])).unwrap_err();
+        assert!(first.contains("no_such_table"), "{}", first);
+        let next = ins(&db, &tx, "b").unwrap_err();
+        assert!(
+            next.starts_with("sql_transaction: a statement failed inside this transaction") && next.ends_with(&first),
+            "{}",
+            next
+        );
+        assert_eq!(s.finish(Ok::<(), String>(()), |e| e), Err(next));
+        assert!(whos(&db, &tx).is_empty());
+    }
+
+    /// Casos 5, 6 y 7: adentro de otra es un savepoint.
+    #[test]
+    fn v0659_a_nested_transaction_is_a_savepoint() {
+        let (db, tx) = tx_db();
+        // 5: la de adentro falla y la de afuera sigue.
+        let outer = TxScope::open(&db, &tx).unwrap();
+        ins(&db, &tx, "a").unwrap();
+        let inner = TxScope::open(&db, &tx).unwrap();
+        ins(&db, &tx, "b").unwrap();
+        assert_eq!(inner.finish(Err::<(), String>("x".into()), |e| e), Err("x".to_string()));
+        assert_eq!(whos(&db, &tx), ["a"]);
+        ins(&db, &tx, "c").unwrap();
+        outer.finish(Ok::<(), String>(()), |e| e).unwrap();
+        assert_eq!(whos(&db, &tx), ["a", "c"]);
+        // 5, con un statement que falla adentro: la de adentro da el error y la de afuera queda sana.
+        let outer = TxScope::open(&db, &tx).unwrap();
+        let inner = TxScope::open(&db, &tx).unwrap();
+        with_sql(&db, &tx, |c| c.execute("INSERT INTO no_such_table VALUES (1)", &[])).unwrap_err();
+        let e = inner.finish(Ok::<(), String>(()), |e| e).unwrap_err();
+        assert!(e.starts_with("sql_transaction: a statement failed inside this transaction"), "{}", e);
+        ins(&db, &tx, "d").unwrap();
+        outer.finish(Ok::<(), String>(()), |e| e).unwrap();
+        assert_eq!(whos(&db, &tx), ["a", "c", "d"]);
+        // 6 y 7: las dos devuelven y confirma la de afuera; si la de afuera falla, se deshace todo.
+        let outer = TxScope::open(&db, &tx).unwrap();
+        let inner = TxScope::open(&db, &tx).unwrap();
+        ins(&db, &tx, "e").unwrap();
+        inner.finish(Ok::<(), String>(()), |e| e).unwrap();
+        assert_eq!(whos(&db, &tx), ["a", "c", "d", "e"]);
+        outer.finish(Err::<(), String>("y".into()), |e| e).unwrap_err();
+        assert_eq!(whos(&db, &tx), ["a", "c", "d"]);
+        let outer = TxScope::open(&db, &tx).unwrap();
+        let inner = TxScope::open(&db, &tx).unwrap();
+        ins(&db, &tx, "f").unwrap();
+        inner.finish(Ok::<(), String>(()), |e| e).unwrap();
+        outer.finish(Ok::<(), String>(()), |e| e).unwrap();
+        assert_eq!(whos(&db, &tx), ["a", "c", "d", "f"]);
+    }
+
+    /// Casos 8 y 9: el control de transacciones a mano se rechaza por las primeras palabras de código.
+    #[test]
+    fn v0659_hand_made_transaction_control_is_refused() {
+        use SqlDialect::{Mysql, Postgres, Sqlite};
+        let refused = |sql: &str, d: SqlDialect| assert_eq!(tx_guard(sql, d, false), Err(TX_BY_HAND.to_string()), "{:?} {:?}", sql, d);
+        let allowed = |sql: &str, d: SqlDialect| assert_eq!(tx_guard(sql, d, false), Ok(()), "{:?} {:?}", sql, d);
+        for d in [Sqlite, Postgres, Mysql] {
+            for sql in [
+                "BEGIN",
+                "begin immediate",
+                "  \n\tCommit",
+                "ROLLBACK",
+                "rollback to x",
+                "SAVEPOINT a",
+                "RELEASE a",
+                "END",
+                "ABORT",
+                "START TRANSACTION",
+                "start\n transaction read only",
+                "PREPARE TRANSACTION 'x'",
+                "-- nota\nBEGIN",
+                "/* nota */ COMMIT",
+                "/* a */ /* b */\n-- c\n ROLLBACK",
+                ";BEGIN",
+                "(BEGIN",
+                "\u{b}BEGIN",
+                "BEGIN;",
+            ] {
+                refused(sql, d);
+            }
+            for sql in [
+                "SELECT 'BEGIN'",
+                "INSERT INTO t VALUES ('COMMIT')",
+                "SELECT 1 /* BEGIN */",
+                "SELECT 1 -- COMMIT",
+                "CREATE TRIGGER g AFTER INSERT ON t BEGIN SELECT 1; END",
+                "UPDATE t SET who = 'x' WHERE who = 'ROLLBACK'",
+                "START",
+                "ENDING",
+                "BEGINNING",
+                "",
+                "/* sólo un comentario",
+            ] {
+                allowed(sql, d);
+            }
+        }
+        // MySQL: `XA`, `SET autocommit`, `# …` y los comentarios que MySQL EJECUTA.
+        for sql in [
+            "XA START 'a'",
+            "SET autocommit = 0",
+            "set session AUTOCOMMIT=0",
+            "SET @@autocommit=0",
+            "SET sql_mode='', autocommit=0",
+            "# nota\nBEGIN",
+            "/*! START TRANSACTION */",
+            "/*!50000 BEGIN */",
+            "/*M! COMMIT */",
+            "/*! SET */ autocommit=0",
+            "SET /*! autocommit=0 */",
+            // Ronda 4, medido en 8.0.46: el servidor acepta el nombre entre comillas invertidas.
+            // `autocommit` cuenta en cualquier parte del texto de un `SET`.
+            "SET `autocommit` = 0",
+            "SET @@`autocommit` = 0",
+            "SET @@session.`AutoCommit` = 0",
+            "SET @a = 1, `autocommit` = 0",
+            "SET @x = 'autocommit'",
+            // Ronda 4, medido en 8.0.46: un comentario con una versión que el servidor no
+            // ejecuta. El statement se lee de las dos maneras y vale la peor.
+            "/*!99999 SELECT */ COMMIT",
+            "/*!999999 SELECT */ COMMIT",
+            "/*!99999 SELECT 1 */ BEGIN",
+            "/*M! SELECT */ ROLLBACK",
+            "/*!99999 SELECT */ SET autocommit = 0",
+            "/*!99999 SELECT */ XA START 'a'",
+            "/*!99999 SELECT */ /*! COMMIT */",
+            "/*!50000 XA */ START 'a'",
+            // El cierre del comentario no corta el statement (medido en 8.0.46).
+            "/*! START */ TRANSACTION",
+            "/*!50000 START */ TRANSACTION",
+            "/*! START */ /*! TRANSACTION */",
+            "/*! PREPARE */ TRANSACTION 'x'",
+            "START /*!99999 x */ TRANSACTION",
+            "START /*!50000 TRANSACTION */",
+            // La segunda palabra no se sabe: `START` cuenta como `START TRANSACTION`.
+            "START /*!99999 TRANSACTION */ REPLICA",
+            // (En 8.0 esto es `START TRANSACTION`, y no lo dice ninguna de las dos lecturas.)
+            "START /*!99999 x */ /*!50000 TRANSACTION */",
+            "PREPARE /*M! TRANSACTION */ s FROM 'x'",
+        ] {
+            refused(sql, Mysql);
+        }
+        for sql in [
+            "SET sql_mode = ''",
+            "SELECT 'SET autocommit=0'",
+            "/*! SELECT 1 */",
+            "SELECT 'EXECUTE s'",
+            "DEALLOCATE PREPARE s",
+            // `autocommit` sólo cuenta en un `SET`.
+            "SELECT autocommit FROM settings",
+            "INSERT INTO t VALUES ('autocommit')",
+            // Un comentario ejecutable después de la primera palabra no cambia qué statement es.
+            "SELECT /*!80000 SQL_NO_CACHE */ 1",
+            "SELECT /*! STRAIGHT_JOIN */ a FROM t",
+            "INSERT /*!50000 IGNORE */ INTO t VALUES (1)",
+            "SELECT 1 /*!99999 x */",
+            "SELECT 1 /*M! x */",
+            "CREATE /*!50000 TEMPORARY */ TABLE x (a INT)",
+            // Sin versión lo ejecuta cualquier servidor: es código, y la primera palabra se sabe.
+            "/*! SELECT */ 1",
+            "/*! INSERT */ /*!50000 IGNORE */ INTO t VALUES (1)",
+        ] {
+            allowed(sql, Mysql);
+        }
+        // Un comentario que sólo algunos servidores ejecutan, antes de la primera palabra: el
+        // motor no sabe qué statement es (ni si es un `CALL`), y no lo corre. Adentro y afuera.
+        for sql in [
+            "/*!99999 SELECT */ CALL p()",
+            "/*!80000 SELECT 1 */",
+            "/*!40101 SET NAMES utf8 */",
+            "/*M! SELECT 1 */",
+            "/*M!100100 SELECT 1 */",
+            "/*!99999 x */ /*!50000 y */ SELECT 1",
+            "-- nota\n/*!50000 SELECT */ SELECT 1",
+            "(/*!50000 SELECT */ SELECT 1)",
+            "/*! /*!99999 SELECT */ DO 1 */",
+            "/*!99999 x */",
+        ] {
+            for in_tx in [false, true] {
+                assert_eq!(tx_guard(sql, Mysql, in_tx), Err(MYSQL_COMMENT_FIRST.to_string()), "{:?} {}", sql, in_tx);
+            }
+        }
+        // En SQLite y Postgres `/*! … */` es un comentario como cualquier otro.
+        for d in [Sqlite, Postgres] {
+            refused("/*!99999 SELECT */ COMMIT", d);
+            allowed("/*!99999 COMMIT */ SELECT 1", d);
+            allowed("/*!80000 SELECT 1 */", d);
+        }
+        // En Postgres `SET autocommit` no abre nada: el servidor no tiene esa variable.
+        allowed("SET autocommit = 0", Postgres);
+        // MySQL: `PREPARE` y `EXECUTE` de SQL corren un statement que está en un texto (medido:
+        // `PREPARE s FROM 'COMMIT'` + `EXECUTE s` confirma). Adentro y afuera de una transacción.
+        for sql in [
+            "PREPARE s FROM 'COMMIT'",
+            "prepare s from @q",
+            "EXECUTE s",
+            "execute s using @a",
+            "/*! EXECUTE */ s",
+            "-- nota\nEXECUTE s",
+        ] {
+            for in_tx in [false, true] {
+                assert_eq!(tx_guard(sql, Mysql, in_tx), Err(MYSQL_SQL_PREPARE.to_string()), "{:?} {}", sql, in_tx);
+            }
+        }
+        // En Postgres `PREPARE` sólo admite SELECT/INSERT/UPDATE/DELETE/MERGE/VALUES (medido).
+        allowed("PREPARE s AS SELECT 1", Postgres);
+        allowed("EXECUTE s", Postgres);
+        allowed("EXECUTE s", Sqlite);
+    }
+
+    /// MySQL: un `CALL` es el statement que el motor no ve por dentro; sólo ahí se mira el estado.
+    #[test]
+    fn v0659_mysql_call_is_the_opaque_statement() {
+        for sql in [
+            "CALL p()",
+            "call p(1, 2)",
+            "  \n\tCall p()",
+            "/*! CALL */ p()",
+            "-- nota\nCALL p()",
+            "# nota\nCALL p()",
+            "(CALL p())",
+            // Ronda 4: en cualquiera de las dos lecturas (`tx_guard` rechaza las dos primeras).
+            "/*!99999 SELECT */ CALL p()",
+            "/*!50000 CALL */ p()",
+            "CALL /*!99999 x */ p()",
+        ] {
+            assert!(mysql_opaque(sql), "{:?}", sql);
+        }
+        for sql in ["SELECT 'CALL p()'", "CALLER", "INSERT INTO t VALUES ('CALL')", "SELECT 1 /* CALL p() */", "", "DO 1"] {
+            assert!(!mysql_opaque(sql), "{:?}", sql);
+        }
+        // SQLite no tiene procedimientos y Postgres rechaza el control adentro de uno: no se mira.
+        let mut sqlite = Backend::Sqlite(Connection::open_in_memory().unwrap());
+        assert!(!sqlite.opaque("CALL p()"));
+        for ok in [true, false] {
+            assert_eq!(
+                sqlite.close_stray_transaction(true, ok, Some(true)),
+                Stray { left: Ok(false), autocommit_off: false, clean: true },
+                "sin transacción abierta no hay nada que deshacer"
+            );
+            assert_eq!(sqlite.mysql_left_by_call(ok), Ok((TxLeft::None, false)), "mirar lo que dejó un CALL es de MySQL");
+        }
+    }
+
+    /// Ronda 3 (B-r3-1): el estado que informa MySQL después de un `CALL`, tal como se midió en
+    /// 8.0.46. Es un error lo que el `ROLLBACK` deshace (una `W`) y lo que se abrió a propósito
+    /// (una `T`); una lectura con `autocommit = 0` no: cerrarla no pierde nada.
+    #[test]
+    fn v0659_mysql_tracked_state_after_a_call() {
+        for (state, left) in [
+            ("________", TxLeft::None),
+            // `SET autocommit = 0; START TRANSACTION; INSERT; COMMIT; SELECT`: el patrón de siempre.
+            ("I_R___S_", TxLeft::NothingToUndo),
+            // `SET autocommit = 0` y una escritura en una tabla sin transacciones (MyISAM).
+            ("I__w____", TxLeft::NothingToUndo),
+            ("I_______", TxLeft::NothingToUndo),
+            // `SET autocommit = 0; INSERT` sin confirmar; un `DELETE` que no borra; `FOR UPDATE`.
+            ("I___W___", TxLeft::Open),
+            ("I___W_S_", TxLeft::Open),
+            ("I_R_W_S_", TxLeft::Open),
+            // `START TRANSACTION`, con lo que sea adentro (también nada).
+            ("T_______", TxLeft::Open),
+            ("T_R___S_", TxLeft::Open),
+            ("T___W___", TxLeft::Open),
+            ("T__w____", TxLeft::Open),
+            // Ronda 4: tablas bloqueadas con `LOCK TABLES`, sin transacción.
+            ("_______L", TxLeft::None),
+            ("T______L", TxLeft::Open),
+            ("I___W__L", TxLeft::Open),
+            ("___w___L", TxLeft::Open),
+            ("______L", TxLeft::Open),
+            // Lo que no se reconoce cuenta como abierta.
+            ("", TxLeft::Open),
+            ("X_______", TxLeft::Open),
+            ("_R______", TxLeft::Open),
+            ("____W___", TxLeft::Open),
+            ("i_______", TxLeft::Open),
+        ] {
+            assert_eq!(mysql_tx_left(state, false), left, "{:?}", state);
+        }
+        // Una implícita con `autocommit` en 1 no existe: tampoco se reconoce. Lo demás no cambia.
+        for (state, left) in [
+            ("________", TxLeft::None),
+            ("I_R___S_", TxLeft::Open),
+            ("I__w____", TxLeft::Open),
+            ("I___W___", TxLeft::Open),
+            ("T_______", TxLeft::Open),
+            ("T___W___", TxLeft::Open),
+        ] {
+            assert_eq!(mysql_tx_left(state, true), left, "{:?} con autocommit en 1", state);
+        }
+    }
+
+    /// Ronda 4: la red de fondo. Después de un statement que no es un `CALL`, lo que informó el
+    /// servidor dice si abrió una transacción o apagó `autocommit`, lo haya escrito como lo haya
+    /// escrito; y adentro de `sql_transaction`, si la terminó.
+    #[test]
+    fn v0659_mysql_what_the_server_reports_after_a_statement() {
+        // Afuera, con seguimiento y un statement que corrió.
+        for (state, autocommit, left) in [
+            ("________", true, (TxLeft::None, false)),
+            // `LOCK TABLES`: no es una transacción.
+            ("_______L", true, (TxLeft::None, false)),
+            // Un `START TRANSACTION` a mano.
+            ("T_______", true, (TxLeft::Open, false)),
+            ("T___W___", true, (TxLeft::Open, false)),
+            // `autocommit` apagado a mano, sin nada después.
+            ("________", false, (TxLeft::None, true)),
+            ("I___W___", false, (TxLeft::Open, true)),
+            ("I_R___S_", false, (TxLeft::NothingToUndo, true)),
+            // Un estado que no se reconoce y no empieza con `T` ni con `I`: no se deshace nada.
+            ("_R______", true, (TxLeft::None, false)),
+            ("", true, (TxLeft::None, false)),
+            ("X_______", true, (TxLeft::None, false)),
+        ] {
+            assert_eq!(mysql_statement_left(Some((state, autocommit)), true, Some(true)), left, "{:?} {}", state, autocommit);
+        }
+        // Un statement que falló: no se mira lo anotado (un ERR no informa nada).
+        assert_eq!(mysql_statement_left(Some(("T___W___", false)), false, Some(true)), (TxLeft::None, false));
+        // Sin seguimiento sólo se sabe lo que se leyó después de un `SET`.
+        assert_eq!(mysql_statement_left(None, true, Some(true)), (TxLeft::None, false));
+        assert_eq!(mysql_statement_left(None, true, Some(false)), (TxLeft::None, true));
+        assert_eq!(mysql_statement_left(None, true, None), (TxLeft::None, false));
+        assert_eq!(mysql_statement_left(None, false, Some(false)), (TxLeft::None, true));
+        // Con seguimiento, lo leído ya está en lo anotado.
+        assert_eq!(mysql_statement_left(Some(("________", false)), true, Some(false)), (TxLeft::None, true));
+
+        // Adentro: la transacción sigue.
+        for (before, after) in [
+            ("T_______", "T_______"),
+            ("T_______", "T___W___"),
+            ("T_R___S_", "T_R_W_S_"),
+            ("T_R_W_S_", "T_RwWsS_"),
+            ("T___W___", "T___W___"),
+            // Las marcas que no son de lectura ni de escritura no cuentan.
+            ("T___W_S_", "T___W___"),
+            ("T___W__L", "T___W___"),
+            // No se sabía que hubiera una transacción: no se mira.
+            ("________", "________"),
+            ("________", "T_______"),
+            ("I___W___", "________"),
+            ("", "________"),
+        ] {
+            assert!(!mysql_tx_ended(before, after), "{:?} -> {:?}", before, after);
+        }
+        // Adentro: terminó.
+        for (before, after) in [
+            // `COMMIT`, `ROLLBACK`, un DDL.
+            ("T_______", "________"),
+            ("T___W___", "________"),
+            // Con `autocommit` apagado, lo que sigue a un `COMMIT` es una implícita.
+            ("T___W___", "I___W___"),
+            // `COMMIT AND CHAIN`, `START TRANSACTION`: otra transacción, sin las marcas.
+            ("T___W___", "T_______"),
+            ("T_R_W_S_", "T___W___"),
+            ("T_RwWsS_", "T_R_W_S_"),
+            ("T_r_____", "T_______"),
+            ("T___W___", ""),
+            ("T___W___", "T"),
+        ] {
+            assert!(mysql_tx_ended(before, after), "{:?} -> {:?}", before, after);
+        }
+        // Sólo en una conexión MySQL con seguimiento.
+        let sqlite = Backend::Sqlite(Connection::open_in_memory().unwrap());
+        assert_eq!(sqlite.mysql_tracked_state(), None);
+        assert!(!sqlite.mysql_tx_ended_since("T___W___"));
+        assert_eq!(sqlite.mysql_left_by_statement(true, Some(false)), (TxLeft::None, false));
+    }
+
+    /// Ronda 4 (B-r4-2, N-r4-1): después de un `SET` del que el texto no alcanza para decir que
+    /// no toca las variables del motor, se le pregunta al servidor cómo quedaron. Sólo un `SET`:
+    /// una tabla que se llama `session_tracking` no cambia nada.
+    #[test]
+    fn v0659_mysql_a_set_the_engine_cannot_read() {
+        for sql in [
+            "SET SESSION session_track_transaction_info = 'OFF'",
+            "set session_track_system_variables = ''",
+            "SET @@SESSION.Session_Track_Schema = 0",
+            "SET @@session.`session_track_gtids` = 'OFF'",
+            "/*! SET session_track_state_change = 1 */",
+            "/*!50000 SET */ session_track_schema = 0",
+            "SET @n = (SELECT COUNT(*) FROM session_tracking)",
+            // Medido en 8.0.46: el servidor iguala estas letras a su letra base.
+            "SET autocomm\u{ed}t = 0",
+            "SET AUTOCOMM\u{cd}T = 0",
+            "SET SESSION sessi\u{f3}n_track_transaction_info = 'OFF'",
+            "SET \u{17f}ession_track_system_variables = ''",
+            "SET sess\u{131}on_track_transaction_info = 'OFF'",
+            "SET SESS\u{130}ON_TRACK_TRANSACTION_INFO = 'OFF'",
+            // Y lo que no toca nada, pero el texto no alcanza para saberlo.
+            "SET @a\u{f1}o = 1",
+            "SET @x = 'caf\u{e9}'",
+        ] {
+            assert!(mysql_unread_set(sql), "{:?}", sql);
+        }
+        for sql in [
+            "SET SESSION sql_mode = ''",
+            "SET @a = 1",
+            "SET SESSION TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+            // B-r4-2: no es un `SET`.
+            "INSERT INTO session_tracking VALUES (1)",
+            "SELECT * FROM user_session_tracker",
+            "SELECT 'session_track_transaction_info'",
+            "CREATE TABLE session_tracks (a INT)",
+            "INSERT INTO t VALUES ('a\u{f1}o')",
+            "CALL track_session()",
+            "UPDATE t SET a = 'caf\u{e9}'",
+            "",
+        ] {
+            assert!(!mysql_unread_set(sql), "{:?}", sql);
+        }
+        assert!(mysql_text_has("SET `AutoCommit` = 0", "autocommit"));
+        assert!(mysql_text_has("x session_TRACK y", "session_track"));
+        assert!(!mysql_text_has("SET autocomm\u{ed}t = 0", "autocommit"), "con otra letra no es el mismo texto: eso lo ve la lectura");
+        assert!(!mysql_text_has("auto commit", "autocommit") && !mysql_text_has("", "autocommit"));
+        // Sólo cuenta en una conexión MySQL: en las demás no hay nada que leer.
+        let mut sqlite = Backend::Sqlite(Connection::open_in_memory().unwrap());
+        assert!(!sqlite.unread_set("SET session_track_transaction_info = 'OFF'"));
+        assert_eq!(sqlite.mysql_autocommit(), None);
+        assert_eq!(sqlite.mysql_after_unread_set(), Some(true));
+    }
+
+    /// Ronda 4: cómo empieza un statement de MySQL, en las dos lecturas (`MysqlHead`).
+    #[test]
+    fn v0659_mysql_head_reads_a_statement_both_ways() {
+        let head = |sql: &str| {
+            let h = mysql_head(sql);
+            (h.all.join(" "), h.sure.join(" "), h.gap)
+        };
+        let s = |a: &str, b: &str, gap: [bool; 2]| (a.to_string(), b.to_string(), gap);
+        assert_eq!(head("select a from t"), s("SELECT A", "SELECT A", [false, false]));
+        assert_eq!(head("COMMIT"), s("COMMIT ", "COMMIT ", [false, false]));
+        assert_eq!(head(""), s(" ", " ", [false, false]));
+        // Un comentario común no es un hueco.
+        assert_eq!(head("/* nota */ SELECT /* otra */ a"), s("SELECT A", "SELECT A", [false, false]));
+        // Sin versión: código en las dos lecturas.
+        assert_eq!(head("/*! SELECT */ a"), s("SELECT A", "SELECT A", [false, false]));
+        // Con versión, o de MariaDB: código en una, comentario en la otra, y el hueco donde cae.
+        assert_eq!(head("/*!99999 SELECT */ COMMIT"), s("SELECT COMMIT", "COMMIT ", [true, false]));
+        assert_eq!(head("/*M! SELECT */ COMMIT"), s("SELECT COMMIT", "COMMIT ", [true, false]));
+        // El cierre de un comentario abierto no corta la lectura.
+        assert_eq!(head("/*! START */ TRANSACTION"), s("START TRANSACTION", "START TRANSACTION", [false, false]));
+        assert_eq!(head("/*! INSERT */ /*!50000 IGNORE */ INTO t"), s("INSERT IGNORE", "INSERT INTO", [false, true]));
+        assert_eq!(head("SELECT /*!80000 x */ a"), s("SELECT X", "SELECT A", [false, true]));
+        assert_eq!(head("SELECT a /*!80000 x */"), s("SELECT A", "SELECT A", [false, false]));
+        assert_eq!(head("/*!80000 x */"), s("X ", " ", [true, false]));
+        assert_eq!(head("SELECT /*!80000 x */"), s("SELECT X", "SELECT ", [false, true]));
+        // Uno con versión adentro de uno sin versión.
+        assert_eq!(head("/*! /*!99999 SELECT */ DO 1 */").2, [true, false]);
+        assert_eq!(mysql_executable_comment(b"/*! x"), Some((3, true)));
+        assert_eq!(mysql_executable_comment(b"/*!5 x"), Some((3, false)));
+        assert_eq!(mysql_executable_comment(b"/*M! x"), Some((4, false)));
+        assert_eq!(mysql_executable_comment(b"/* ! x"), None);
+        assert_eq!(mysql_executable_comment(b"/*"), None);
+    }
+
+    /// Ronda 4 (B-r4-1): una conexión de la que el motor no pudo sacar la transacción que quedó
+    /// abierta se cierra. La base sigue siendo la default, sin conexión: no se pasa en silencio a
+    /// otra, y `db_open` la vuelve a abrir.
+    #[test]
+    fn v0659_a_connection_that_could_not_be_cleaned_is_closed() {
+        let mut db = DatabaseManager::new();
+        let first = db.open(":memory:", "memory").unwrap();
+        let dir = std::env::temp_dir().join(format!("synsema-v0659-broken-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let other = db.open(dir.join("other.db").to_str().unwrap(), "readwrite").unwrap();
+        assert_eq!(db.default_path(), Some(first.clone()));
+        // Lo normal: nada se cierra.
+        db.with_default(|c| c.execute("CREATE TABLE t (a INT)", &[])).unwrap();
+        assert_eq!(db.query("SELECT COUNT(*) AS c FROM t", &[]).unwrap().len(), 1);
+        // La conexión quedó rota: sale el resultado del statement, y la conexión se cierra.
+        let r = db.with_default(|c| {
+            c.broken = true;
+            Err::<(), String>("lo que diga el statement".to_string())
+        });
+        assert_eq!(r, Err("lo que diga el statement".to_string()));
+        assert_eq!(db.query("SELECT 1", &[]).unwrap_err(), "No database connection. Use db_open(\"path.db\") first.");
+        assert_eq!(db.default_path(), Some(first.clone()), "la default no pasa a la otra base");
+        assert!(db.connections.contains_key(&other) && !db.connections.contains_key(&first));
+        // `db_open` la vuelve a abrir, y sigue siendo la default.
+        assert_eq!(db.open(":memory:", "memory").unwrap(), first);
+        assert_eq!(db.default_path(), Some(first));
+        assert_eq!(db.query("SELECT 1 AS a", &[]).unwrap().len(), 1);
+        db.close_all();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Ronda 2 (N-r2-1): el protocolo de texto de MySQL corre todos los statements de un texto,
+    /// así que sólo lo recibe un texto sin `;` (aparte del final), que es uno solo. Lo demás lo
+    /// decide el servidor al prepararlo.
+    #[test]
+    fn v0659_mysql_text_protocol_only_for_a_text_without_a_second_statement() {
+        for (sql, one) in [
+            ("INSERT INTO t VALUES (1)", "INSERT INTO t VALUES (1)"),
+            ("INSERT INTO t VALUES (1);", "INSERT INTO t VALUES (1)"),
+            ("INSERT INTO t VALUES (1) ;  \n\t", "INSERT INTO t VALUES (1) "),
+            ("CREATE PROCEDURE p() SELECT 1;", "CREATE PROCEDURE p() SELECT 1"),
+            ("SELECT 1 -- nota;", "SELECT 1 -- nota"),
+            ("", ""),
+            (";", ""),
+        ] {
+            assert_eq!(mysql_single_statement(sql), Some(one), "{:?}", sql);
+        }
+        for sql in [
+            "INSERT INTO t VALUES (1); COMMIT",
+            "INSERT INTO t VALUES (1);COMMIT;",
+            "INSERT INTO t VALUES (1);;",
+            "INSERT INTO t VALUES (1); -- nota",
+            "INSERT INTO t VALUES (1) /*! ; COMMIT */",
+            "INSERT INTO t VALUES (';')",
+            "SELECT 1 /* a;b */",
+            "CREATE PROCEDURE p() BEGIN SELECT 1; END",
+            "; COMMIT",
+        ] {
+            assert_eq!(mysql_single_statement(sql), None, "{:?}", sql);
+        }
+    }
+
+    /// Caso 17: en MySQL un DDL confirma la transacción abierta; adentro de una se rechaza antes.
+    #[test]
+    fn v0659_mysql_ddl_inside_a_transaction_is_refused() {
+        for sql in [
+            "CREATE TABLE x (a INT)",
+            "alter table x add b int",
+            "DROP TABLE x",
+            "TRUNCATE x",
+            "RENAME TABLE x TO y",
+            "LOCK TABLES x WRITE",
+            // Medidos contra MySQL 8.0.46: confirman, y no estaban en la lista de memoria.
+            "SET PASSWORD = 'x'",
+            "set password for 'u'@'h' = 'x'",
+            "SET DEFAULT ROLE r TO 'u'@'h'",
+            "LOAD INDEX INTO CACHE x",
+            "START REPLICA",
+            "IMPORT TABLE FROM 'x.sdi'",
+            "CLONE LOCAL DATA DIRECTORY = '/x'",
+            "CREATE INDEX i ON x (a)",
+            "DROP TABLE IF EXISTS x",
+            "GRANT SELECT ON x TO u",
+            "ANALYZE TABLE x",
+            "FLUSH TABLES",
+            "STOP REPLICA",
+        ] {
+            let e = tx_guard(sql, SqlDialect::Mysql, true).unwrap_err();
+            assert!(e.contains("commits the open transaction"), "{}: {}", sql, e);
+            assert_eq!(tx_guard(sql, SqlDialect::Mysql, false), Ok(()), "fuera de una transacción: {}", sql);
+            assert_eq!(tx_guard(sql, SqlDialect::Postgres, true), Ok(()), "Postgres tiene DDL transaccional: {}", sql);
+            assert_eq!(tx_guard(sql, SqlDialect::Sqlite, true), Ok(()), "{}", sql);
+        }
+        // Medidos: no confirman.
+        for sql in [
+            "CREATE TEMPORARY TABLE x (a INT)",
+            "DROP TEMPORARY TABLE x",
+            "INSERT INTO x VALUES (1)",
+            "SELECT 1",
+            "SET @a = 1",
+            "SET sql_mode = ''",
+            "SET ROLE NONE",
+            "SET default_storage_engine = InnoDB",
+            "SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED",
+            "LOAD DATA INFILE '/x' INTO TABLE x",
+            "PURGE BINARY LOGS BEFORE '2000-01-01'",
+            "UNLOCK TABLES",
+            "CALL p()",
+            "DO 1",
+        ] {
+            assert_eq!(tx_guard(sql, SqlDialect::Mysql, true), Ok(()), "{}", sql);
+        }
+        // Ronda 4: con un comentario que sólo algunos servidores ejecutan después de la primera
+        // palabra, la segunda no se sabe; en las cuatro que dependen de ella cuenta como que sí.
+        for sql in [
+            "CREATE /*!50000 TEMPORARY */ TABLE x (a INT)",
+            "DROP /*!99999 x */ TEMPORARY TABLE x",
+            "SET /*!99999 PASSWORD = 'x', */ @a = 1",
+            "LOAD /*M! INDEX INTO CACHE x */ DATA INFILE '/x' INTO TABLE x",
+        ] {
+            let e = tx_guard(sql, SqlDialect::Mysql, true).unwrap_err();
+            assert!(e.contains("may commit the open transaction"), "{}: {}", sql, e);
+            assert_eq!(tx_guard(sql, SqlDialect::Mysql, false), Ok(()), "fuera de una transacción: {}", sql);
+        }
+        // En las demás la segunda palabra no decide nada.
+        assert_eq!(tx_guard("SELECT /*!80000 SQL_NO_CACHE */ 1", SqlDialect::Mysql, true), Ok(()));
+        assert_eq!(tx_guard("INSERT /*!50000 IGNORE */ INTO t VALUES (1)", SqlDialect::Mysql, true), Ok(()));
+        assert!(tx_guard("ALTER /*!50000 ONLINE */ TABLE x ADD b INT", SqlDialect::Mysql, true).unwrap_err().contains("ALTER statement commits"));
+        let e = tx_guard("/*! SET */ PASSWORD = 'x'", SqlDialect::Mysql, true).unwrap_err();
+        assert!(e.starts_with("sql_transaction: in MySQL a SET PASSWORD statement commits"), "{}", e);
+        assert_eq!(tx_guard("/*! CREATE */ TEMPORARY TABLE x (a INT)", SqlDialect::Mysql, true), Ok(()));
+        // El mensaje nombra el statement: `SET` a secas no confirma.
+        let e = tx_guard("SET PASSWORD = 'x'", SqlDialect::Mysql, true).unwrap_err();
+        assert!(e.starts_with("sql_transaction: in MySQL a SET PASSWORD statement commits"), "{}", e);
+        let e = tx_guard("DROP TABLE x", SqlDialect::Mysql, true).unwrap_err();
+        assert!(e.starts_with("sql_transaction: in MySQL a DROP statement commits"), "{}", e);
+    }
+
+    /// Caso 8 en el gestor y adentro de una transacción, y caso 10: nada queda abierto en la
+    /// conexión compartida.
+    #[test]
+    fn v0659_nothing_leaves_a_transaction_open_on_the_shared_connection() {
+        let (db, tx) = tx_db();
+        assert_eq!(db.borrow_mut().execute("BEGIN", &[]), Err(TX_BY_HAND.to_string()));
+        assert_eq!(db.borrow_mut().query("SAVEPOINT a", &[]).unwrap_err(), TX_BY_HAND);
+        assert_eq!(db.borrow_mut().execute_many("COMMIT", &[vec![]]).unwrap_err(), TX_BY_HAND);
+        // Adentro de una transacción también, y sin hacerla fallar: no llegó a la base.
+        let s = TxScope::open(&db, &tx).unwrap();
+        assert_eq!(with_sql(&db, &tx, |c| c.execute("COMMIT", &[])).unwrap_err(), TX_BY_HAND);
+        ins(&db, &tx, "a").unwrap();
+        s.finish(Ok::<(), String>(()), |e| e).unwrap();
+        assert_eq!(whos(&db, &tx), ["a"]);
+        // Caso 10: una transacción abierta por otro camino se deshace y el statement da error.
+        if let Backend::Sqlite(c) = db.borrow_mut().conn_mut(None).unwrap() {
+            c.execute_batch("BEGIN").unwrap();
+        }
+        let e = ins(&db, &tx, "b").unwrap_err();
+        assert!(e.starts_with("this statement left a transaction open"), "{}", e);
+        assert_eq!(whos(&db, &tx), ["a"], "lo que quedó en esa transacción se deshizo");
+        ins(&db, &tx, "c").unwrap();
+        assert_eq!(whos(&db, &tx), ["a", "c"]);
+    }
+
+    /// Caso 14: un nivel que se suelta sin `finish` (un pánico que desenrolla) deshace y devuelve
+    /// la conexión.
+    #[test]
+    fn v0659_a_dropped_transaction_rolls_back_and_returns_the_connection() {
+        let (db, tx) = tx_db();
+        {
+            let _s = TxScope::open(&db, &tx).unwrap();
+            ins(&db, &tx, "a").unwrap();
+        }
+        assert!(db.borrow().lent.is_none() && tx.borrow().is_none());
+        assert!(whos(&db, &tx).is_empty());
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _s = TxScope::open(&db, &tx).unwrap();
+            ins(&db, &tx, "b").unwrap();
+            panic!("adentro de la task");
+        }));
+        assert!(r.is_err());
+        assert!(db.borrow().lent.is_none() && tx.borrow().is_none());
+        assert!(whos(&db, &tx).is_empty());
+    }
+
+    /// Casos 21 y 22, y el gestor mientras presta la conexión.
+    #[test]
+    fn v0659_lending_keeps_the_manager_consistent() {
+        // 21: sin conexión.
+        let db = Rc::new(RefCell::new(DatabaseManager::new()));
+        let tx: TxCell = Rc::new(RefCell::new(None));
+        assert_eq!(TxScope::open(&db, &tx).err().unwrap(), "No database connection. Use db_open(\"path.db\") first.");
+        // Mientras presta: la base sigue abierta y sigue siendo la default.
+        let (db, tx) = tx_db();
+        let s = TxScope::open(&db, &tx).unwrap();
+        assert_eq!(db.borrow().default_path().as_deref(), Some(":memory:"));
+        assert_eq!(db.borrow().default_dialect(), Some(SqlDialect::Sqlite));
+        assert_eq!(db.borrow_mut().open(":memory:", "memory").unwrap(), ":memory:");
+        assert!(db.borrow().connections.is_empty(), "no se abrió otra conexión a la misma base");
+        let e = db.borrow_mut().query("SELECT 1", &[]).unwrap_err();
+        assert!(e.contains("is inside a transaction (sql_transaction)"), "{}", e);
+        // 22: `db_close` adentro: termina la transacción y después se cierra.
+        ins(&db, &tx, "a").unwrap();
+        db.borrow_mut().close(None);
+        ins(&db, &tx, "b").unwrap();
+        assert_eq!(whos(&db, &tx), ["a", "b"]);
+        s.finish(Ok::<(), String>(()), |e| e).unwrap();
+        assert!(db.borrow().connections.is_empty() && db.borrow().default_path().is_none());
+        // `db_close` y después `db_open` de la misma base, adentro: lo último que pidió el programa
+        // fue abrirla, y al terminar sigue abierta (auditoría, B-2: quedaba sin conexión).
+        let (db, tx) = tx_db();
+        let s = TxScope::open(&db, &tx).unwrap();
+        ins(&db, &tx, "a").unwrap();
+        db.borrow_mut().close(None);
+        assert_eq!(db.borrow_mut().open(":memory:", "memory").unwrap(), ":memory:");
+        s.finish(Ok::<(), String>(()), |e| e).unwrap();
+        assert_eq!(db.borrow().default_path().as_deref(), Some(":memory:"));
+        assert_eq!(whos(&db, &tx), ["a"]);
+        // Lo mismo después de un `close_all`, que además deja al gestor sin default.
+        let s = TxScope::open(&db, &tx).unwrap();
+        db.borrow_mut().close_all();
+        assert!(db.borrow().default_path().is_none());
+        assert_eq!(db.borrow_mut().open(":memory:", "memory").unwrap(), ":memory:");
+        ins(&db, &tx, "b").unwrap();
+        s.finish(Ok::<(), String>(()), |e| e).unwrap();
+        assert_eq!(db.borrow().default_path().as_deref(), Some(":memory:"));
+        assert_eq!(whos(&db, &tx), ["a", "b"]);
+    }
+
+    /// La conexión vuelve a su lugar (el orden decide la default al cerrar otra); una que no quedó
+    /// limpia no vuelve, y la default NO pasa en silencio a otra base (caso 16).
+    #[test]
+    fn v0659_the_lent_connection_returns_to_its_place() {
+        let dir = tx_tmp_dir("order");
+        let a = dir.join("a.db").to_string_lossy().replace('\\', "/");
+        let b = dir.join("b.db").to_string_lossy().replace('\\', "/");
+        let mut m = DatabaseManager::new();
+        m.open(&a, "readwrite").unwrap();
+        m.open(&b, "readwrite").unwrap();
+        let conn = m.lend().unwrap();
+        assert_eq!(m.connections.keys().collect::<Vec<_>>(), [&b]);
+        m.give_back(Some(conn));
+        assert_eq!(m.connections.keys().collect::<Vec<_>>(), [&a, &b]);
+        assert_eq!(m.default_path().as_deref(), Some(a.as_str()));
+        drop(m.lend().unwrap());
+        m.give_back(None);
+        assert_eq!(m.default_path().as_deref(), Some(a.as_str()));
+        assert_eq!(m.query("SELECT 1", &[]).unwrap_err(), "No database connection. Use db_open(\"path.db\") first.");
+        m.close_all();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Una base abierta de sólo lectura también corre una transacción (`BEGIN IMMEDIATE` no falla
+    /// ahí, con el diario en modo DELETE ni en WAL).
+    #[test]
+    fn v0659_a_readonly_database_can_run_a_transaction() {
+        let dir = tx_tmp_dir("readonly");
+        for mode in ["DELETE", "WAL"] {
+            let path = dir.join(format!("ro-{}.db", mode)).to_string_lossy().replace('\\', "/");
+            {
+                let mut m = DatabaseManager::new();
+                m.open(&path, "readwrite").unwrap();
+                m.query(&format!("PRAGMA journal_mode = {}", mode), &[]).unwrap();
+                m.execute("CREATE TABLE t (who TEXT)", &[]).unwrap();
+                m.execute("INSERT INTO t VALUES ('a')", &[]).unwrap();
+            }
+            let mut m = DatabaseManager::new();
+            m.open(&path, "readonly").unwrap();
+            let db = Rc::new(RefCell::new(m));
+            let tx: TxCell = Rc::new(RefCell::new(None));
+            let s = TxScope::open(&db, &tx).unwrap_or_else(|e| panic!("{}: {}", mode, e));
+            assert_eq!(whos(&db, &tx), ["a"], "{}", mode);
+            s.finish(Ok::<(), String>(()), |e| e).unwrap();
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Caso 11, el de la auditoría (M-r9-1): lo que otra task escribe mientras hay una transacción
+    /// espera a que termine y NO entra en ella: sobrevive a su `ROLLBACK`. Y la otra task hace su
+    /// propia transacción sin error.
+    #[test]
+    fn v0659_another_tasks_write_waits_and_survives_the_rollback() {
+        let db = shared_db();
+        let tx: TxCell = Rc::new(RefCell::new(None));
+        let s = TxScope::open(&db, &tx).unwrap();
+        ins(&db, &tx, "a").unwrap();
+        let other = {
+            let db = db.clone();
+            std::thread::spawn(move || {
+                let mine: TxCell = Rc::new(RefCell::new(None));
+                let t0 = Instant::now();
+                ins(&db, &mine, "b").unwrap();
+                let waited = t0.elapsed();
+                let s2 = TxScope::open(&db, &mine).unwrap();
+                ins(&db, &mine, "b2").unwrap();
+                s2.finish(Ok::<(), String>(()), |e| e).unwrap();
+                waited
+            })
+        };
+        std::thread::sleep(Duration::from_millis(150));
+        assert_eq!(whos(&db, &tx), ["a"], "la otra task todavía espera");
+        s.finish(Err::<(), String>("rollback".into()), |e| e).unwrap_err();
+        let waited = other.join().unwrap();
+        assert!(waited >= Duration::from_millis(100), "esperó a la transacción: {:?}", waited);
+        assert_eq!(whos(&db, &tx), ["b", "b2"]);
+    }
+
+    /// Casos 12 y 13: pasada la espera, un error atrapable y no un cuelgue; la transacción sigue.
+    #[test]
+    fn v0659_waiting_for_a_transaction_has_a_limit() {
+        let db = shared_db();
+        let tx: TxCell = Rc::new(RefCell::new(None));
+        let s = TxScope::open(&db, &tx).unwrap();
+        let other = {
+            let db = db.clone();
+            std::thread::spawn(move || {
+                let mine: TxCell = Rc::new(RefCell::new(None));
+                let t0 = Instant::now();
+                let write = ins(&db, &mine, "b");
+                let open = TxScope::open(&db, &mine).err();
+                (write, open, t0.elapsed())
+            })
+        };
+        let (write, open, waited) = other.join().unwrap();
+        let e = write.unwrap_err();
+        assert!(e.contains("inside another task's transaction (sql_transaction)"), "{}", e);
+        assert_eq!(open, Some(e));
+        assert!(waited >= TX_WAIT * 2 - Duration::from_millis(50), "{:?}", waited);
+        ins(&db, &tx, "a").unwrap();
+        s.finish(Ok::<(), String>(()), |e| e).unwrap();
+        assert_eq!(whos(&db, &tx), ["a"]);
+    }
 
     /// v0.6.46 (backlog §10): el `ATTACH` a un archivo (y `VACUUM INTO`) que rechaza el authorizer
     /// salía como `not authorized`, sin decir por qué ni qué hacer.

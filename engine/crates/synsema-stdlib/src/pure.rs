@@ -61,6 +61,8 @@ pub const SOCKETS: &[&str] = &[
 ];
 pub const DB: &[&str] = &[
     "db_open", "db_close", "sql", "sql_exec", "sql_tables", "sql_batch", "paged",
+    // v0.6.59
+    "sql_transaction",
     "mongo_find", "mongo_find_one", "mongo_insert", "mongo_insert_many", "mongo_update",
     "mongo_delete", "mongo_count", "mongo_aggregate", "mongo_collections",
     "redis_get", "redis_set", "redis_del", "redis_exists", "redis_expire", "redis_ttl",

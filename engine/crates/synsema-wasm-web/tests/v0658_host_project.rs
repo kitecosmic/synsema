@@ -118,7 +118,8 @@ fn w2_w3_w5_w9_the_host_passes_the_project_and_its_packages() {
     let r = call(json!({"op": "run", "source": "print(1)", "project": "{\"synsema\": \"9.9.9\"}"}));
     assert_eq!(r["ok"], json!(false), "{}", r);
     let e = r["errors"][0].as_str().unwrap();
-    assert!(e.contains("this project needs synsema >= 9.9.9; this is 0.6.58: synsema update"), "{}", e);
+    let needs = format!("this project needs synsema >= 9.9.9; this is {}: synsema update", synsema_core::project::DEV_VERSION);
+    assert!(e.contains(&needs), "{}", e);
 
     // N8 (ronda 1): lo guardado tiene tope en bytes; al terminar una llamada se descartan los menos
     // usados y `packages_held` dice lo que quedó.

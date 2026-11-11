@@ -45,6 +45,8 @@ pub const LABEL_SINK_BUILTINS: &[&str] = &[
     "solana_wait",
     // Bases de datos (stdlib/database.rs)
     "db_open", "db_close", "sql", "sql_exec", "sql_batch", "sql_tables", "paged",
+    // v0.6.59: confirma o deshace lo que escribe su task.
+    "sql_transaction",
     "redis_get", "redis_set", "redis_del", "redis_incr", "redis_incrby", "redis_decr", "redis_exists", "redis_expire",
     "redis_persist", "redis_ttl", "redis_type", "redis_keys", "redis_mget", "redis_mset", "redis_hget", "redis_hset",
     "redis_hdel", "redis_hgetall", "redis_hincrby", "redis_lpush", "redis_rpush", "redis_lpop", "redis_rpop",
