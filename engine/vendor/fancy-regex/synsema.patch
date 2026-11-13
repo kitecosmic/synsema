@@ -1,0 +1,3410 @@
+diff -ru a/src/analyze.rs b/src/analyze.rs
+--- a/src/analyze.rs
++++ b/src/analyze.rs
+@@ -30,9 +30,11 @@
+ 
+ use crate::alloc::string::ToString;
+ use crate::parse::ExprTree;
++use crate::to_hir::{expr_to_hir, HirCtx};
+ use crate::vm::CaptureGroupRange;
+ use crate::{
+-    Assertion, AstNode, CaptureGroupTarget, CompileError, Error, Expr, LookAround, Result,
++    Assertion, AstNode, CaptureGroupTarget, CompileError, Error, Expr, LookAround, RegexOptions,
++    Result,
+ };
+ 
+ #[cfg(not(feature = "std"))]
+@@ -376,14 +378,32 @@
+                     child_inside_zero_rep,
+                     enclosing_group,
+                 )?;
+-                min_size = child_info.min_size * lo;
++                // Synsema: saturating, like the sizes around it. Two nested counts of 2^31 overflow
++                // `usize`: a panic in a build that checks it, and without the check a size that
++                // wraps around and makes a call that is not left-recursive look like one.
++                min_size = child_info.min_size.saturating_mul(lo);
+                 max_size = if hi == usize::MAX || child_info.max_size == usize::MAX {
+                     usize::MAX
+                 } else {
+                     child_info.max_size.saturating_mul(hi)
+                 };
+                 const_size = child_info.const_size && lo == hi;
+-                hard = child_info.hard;
++                // Synsema: a repetition with no upper bound whose body can match empty runs in the
++                // VM. The two engines read an iteration that reads nothing differently: the
++                // linear engine never follows one (it drops that way through the body and goes
++                // on to the next one that reads text), and the VM lets it through once and
++                // leaves the loop there, as Perl and PCRE do. So a group inside
++                // ends empty in the VM and with the last text it read in the linear engine
++                // (`(b?)*` on `b`), and when the body tries an empty way before one that reads
++                // text, the match itself is another (`(?:a?|b)+` on `ab`: `a` in the VM, `ab` in
++                // the linear engine). Where a repetition runs depends on what is around it (a
++                // look-around next to it, a look-ahead at the end that the optimizer hoists), so
++                // both changed with things that do not change what the pattern matches. A counted
++                // repetition has no loop, and a body that always reads text has no empty
++                // iteration: those read the same in both engines. `min_size` is zero for every
++                // body that can match empty (a count with its limits swapped, which the VM read
++                // with the smaller one, is an error in `parse_quantifier`).
++                hard = child_info.hard || (hi == usize::MAX && child_info.min_size == 0);
+                 children.push(child_info);
+             }
+             Expr::Delegate { .. } => {
+@@ -471,7 +491,7 @@
+                 )?;
+                 let child_info_truth = self.visit(
+                     true_branch,
+-                    min_pos_in_group + child_info_condition.min_size,
++                    min_pos_in_group.saturating_add(child_info_condition.min_size),
+                     inside_zero_rep,
+                     enclosing_group,
+                 )?;
+@@ -482,14 +502,15 @@
+                     enclosing_group,
+                 )?;
+ 
+-                min_size = child_info_condition.min_size
+-                    + min(child_info_truth.min_size, child_info_false.min_size);
++                min_size = child_info_condition
++                    .min_size
++                    .saturating_add(min(child_info_truth.min_size, child_info_false.min_size));
+                 max_size = max(child_info_truth.max_size, child_info_false.max_size);
+                 const_size = child_info_condition.const_size
+                     && child_info_truth.const_size
+                     && child_info_false.const_size
+                     // if the condition's size plus the truth branch's size is equal to the false branch's size then it's const size
+-                    && child_info_condition.min_size + child_info_truth.min_size == child_info_false.min_size;
++                    && child_info_condition.min_size.saturating_add(child_info_truth.min_size) == child_info_false.min_size;
+ 
+                 children.push(child_info_condition);
+                 children.push(child_info_truth);
+@@ -691,13 +712,23 @@
+         let reachable_groups = self.compute_reachable_groups();
+ 
+         // Check each reachable group for left recursion
+-        for &start_group in self.subroutine_calls.keys() {
++        // Synsema: one `visited` for all the starting groups, and the groups in order. Upstream
++        // starts each search with an empty `visited`, so a chain of G groups that call each
++        // other at their start is walked G times: 16,000 groups took 7.6 s to analyze. A group
++        // that a search has left has no cycle below it (the search would have found it), so a
++        // later search does not need to enter it again, and the first starting group from which
++        // there is a cycle is the same one. In order, because the group the error names is the
++        // first one found, and upstream walks a hash map: the same pattern could name one group
++        // in one run and another in the next.
++        let mut start_groups: Vec<usize> = self.subroutine_calls.keys().copied().collect();
++        start_groups.sort_unstable();
++        let mut visited = BitSet::new();
++        for start_group in start_groups {
+             if !reachable_groups.contains(start_group) {
+                 // Skip unreachable groups
+                 continue;
+             }
+ 
+-            let mut visited = BitSet::new();
+             let mut recursion_stack = BitSet::new();
+             if self.dfs_check_left_recursion(start_group, &mut visited, &mut recursion_stack)? {
+                 // Found left recursion
+@@ -1033,6 +1064,120 @@
+     Ok(analyzed)
+ }
+ 
++/// Synsema: `analyze` for a tree that is about to be compiled, with the options it is compiled
++/// with (what the linear engine gets is built from them: `HirCtx::from`). On top of what
++/// `analyze` says, an alternation that the linear engine would read in another order than it is
++/// written in is hard, and so is everything that contains it.
++///
++/// `regex_syntax` takes out of an alternation what all its branches start with, whatever it is
++/// (`lift_common_prefix`: `x*a|x*b` becomes `x*(?:a|b)`). When that beginning can end in more
++/// than one place, the factored form tries the ways in another order: `a?a|a?b` on `ab` is `a`
++/// as written (the first branch, with its `a?` empty), which is what Perl, Python and the VM
++/// give, and `ab` once factored. Where an alternation runs depends on what is around it, so
++/// the match changed with things that do not change what the pattern matches.
++///
++/// What `regex_syntax` makes of an alternation is not worked out from its shape: it is built,
++/// with the function that builds what the linear engine gets (`expr_to_hir`), and looked at.
++/// Working it out was a copy of the rules of another crate, and three audits in a row found a
++/// case the copy did not have (a count of something empty, a `{0}` of something unbounded,
++/// what is left of a `{0}` in the whole pattern).
++pub(crate) fn analyze_for_linear<'a>(
++    tree: &'a ExprTree,
++    ctx: AnalyzeContext,
++    options: &RegexOptions,
++) -> Result<Info<'a>> {
++    let mut info = analyze(tree, ctx)?;
++    Linear::new(options).settle(&mut info);
++    Ok(info)
++}
++
++/// Synsema: what the linear engine would be built with. An alternation reaches it in two ways,
++/// and they do not always build the same thing: with the whole pattern, where what is left of a
++/// `{0}` is kept for its groups (and is not always nothing: `(?:a?b?){0}` is two empty
++/// repetitions there), and in a piece that the VM hands over, where a `{0}` is nothing. (A
++/// DEFINE block is the other thing the two build differently: the places of its groups.) One
++/// translation context for each, with what `Regex::new_options` and `DelegateBuilder` give
++/// theirs, and each noting the alternations it builds that come out in the order they are
++/// written in.
++struct Linear {
++    whole: HirCtx,
++    piece: HirCtx,
++}
++
++impl Linear {
++    fn new(options: &RegexOptions) -> Self {
++        let mut whole = HirCtx::from(options);
++        whole.enable_preserve_zero_rep_captures();
++        whole.note_alternations();
++        let mut piece = HirCtx::from(options);
++        piece.note_alternations();
++        Linear { whole, piece }
++    }
++
++    /// Goes down to everything that can go to the linear engine: the largest parts of the tree
++    /// with nothing hard in them. Each is translated once (twice when the two ways differ in
++    /// it), so every node is translated a fixed number of times whatever the nesting, and then
++    /// its alternations are marked.
++    fn settle(&mut self, info: &mut Info<'_>) {
++        if info.hard {
++            for child in &mut info.children {
++                self.settle(child);
++            }
++            return;
++        }
++        // There is nothing to ask where there is no alternation, which is most pieces: those
++        // are not translated here at all.
++        if !has_alternation(info) {
++            return;
++        }
++        // Translated or not: an alternation that was not reached is not noted, and `mark` takes
++        // the ones that are not noted.
++        let places = self.piece.places();
++        let _ = expr_to_hir(info.expr, &mut self.piece);
++        // The two ways differ only at a `{0}` and at a DEFINE block (`HirCtx::places`): with
++        // neither in this part, the other translation would be this one again.
++        let both = self.piece.places() != places;
++        if both {
++            let _ = expr_to_hir(info.expr, &mut self.whole);
++        }
++        self.mark(info, both);
++    }
++
++    /// In a part of the tree that was just translated: marks as hard every alternation that is
++    /// not noted as written (in both ways, when both were translated), and whatever contains
++    /// one. Says whether it marked anything in `info`.
++    fn mark(&mut self, info: &mut Info<'_>, both: bool) -> bool {
++        // What a DEFINE block defines is not part of what was translated (the block is nothing
++        // where it stands): it is what the VM compiles when a definition is called, so it is
++        // settled on its own. And it marks nothing above it: the block is not hard whatever it
++        // holds, as in `analyze`.
++        if let Expr::DefineGroup { .. } = *info.expr {
++            for child in &mut info.children {
++                self.settle(child);
++            }
++            return false;
++        }
++        let mut marked = false;
++        for child in &mut info.children {
++            marked |= self.mark(child, both);
++        }
++        if matches!(*info.expr, Expr::Alt(_))
++            && !(self.piece.as_written(info.expr) && (!both || self.whole.as_written(info.expr)))
++        {
++            marked = true;
++        }
++        if marked {
++            info.hard = true;
++        }
++        marked
++    }
++}
++
++/// Synsema: whether there is an alternation in this part of the tree.
++fn has_alternation(info: &Info<'_>) -> bool {
++    matches!(*info.expr, Expr::Alt(_)) || info.children.iter().any(has_alternation)
++}
++
+ /// Determine if the expression will always only ever match at position 0.
+ /// Note that false negatives are possible - it can return false even if it could be anchored.
+ /// This should therefore only be treated as an optimization.
+diff -ru a/src/byte_set.rs b/src/byte_set.rs
+--- a/src/byte_set.rs
++++ b/src/byte_set.rs
+@@ -1,6 +1,6 @@
+ use regex_syntax::hir::{Class, ClassUnicode, ClassUnicodeRange, Hir, HirKind};
+ 
+-use crate::optimize::{optimize, OptimizeOptions};
++use crate::optimize::optimize;
+ use crate::to_hir::{parse_fragment, HirCtx};
+ use crate::{Expr, LookAround, RegexOptions, Result};
+ 
+@@ -323,12 +323,8 @@
+     // same tree the compile path would (KeepOut/trailing-lookahead skipped when
+     // the pattern must stay on the VM).
+     if options.should_optimize() {
+-        optimize(
+-            &mut tree,
+-            OptimizeOptions {
+-                find_not_empty: options.hard_regex_runtime_options.find_not_empty,
+-            },
+-        );
++        // Synsema: the options of the compile path, from the one place that builds them.
++        optimize(&mut tree, options.optimize_options());
+     }
+     Ok(byte_set_from_expr(&tree.expr, options))
+ }
+@@ -414,12 +410,8 @@
+     // `find_not_empty` is forwarded so the prefilter analyzes the same tree the
+     // compile path would.
+     if options.should_optimize() {
+-        optimize(
+-            &mut tree,
+-            OptimizeOptions {
+-                find_not_empty: options.hard_regex_runtime_options.find_not_empty,
+-            },
+-        );
++        // Synsema: the options of the compile path, from the one place that builds them.
++        optimize(&mut tree, options.optimize_options());
+     }
+     Ok(required_byte_set_from_expr(&tree.expr))
+ }
+diff -ru a/src/compile.rs b/src/compile.rs
+--- a/src/compile.rs
++++ b/src/compile.rs
+@@ -31,8 +31,6 @@
+ use regex_automata::meta::Regex as RaRegex;
+ use regex_automata::meta::{Builder as RaBuilder, Config as RaConfig};
+ use regex_automata::nfa::thompson::WhichCaptures;
+-#[cfg(feature = "variable-lookbehinds")]
+-use regex_automata::util::pool::Pool;
+ 
+ #[cfg(not(feature = "std"))]
+ use alloc::collections::BTreeMap as Map;
+@@ -43,7 +41,7 @@
+ use crate::seek::build_seek_pattern;
+ use crate::to_hir::{expr_to_hir, HirCtx};
+ #[cfg(feature = "variable-lookbehinds")]
+-use crate::vm::{CachePoolFn, HardVariableLookbehind, ReverseBackwardsDelegate};
++use crate::vm::{HardVariableLookbehind, ReverseBackwardsDelegate};
+ use crate::vm::{CaptureGroupRange, CaseiLiteral, CharClassMatcher, Delegate, Insn, Prog, Seek};
+ use crate::LookAround::*;
+ use crate::{
+@@ -65,17 +63,209 @@
+     /// this bounds the emitted instruction vector instead. `None` disables the
+     /// check, preserving the previous behavior.
+     max_prog_size: Option<usize>,
++    /// Synsema: what the program takes so far, in bytes: its instructions with what each one
++    /// owns (`insn_bytes`), the regexes and DFAs of the pieces handed to the linear engine, and
++    /// what the search cache of each of those holds whatever the text is.
++    size: usize,
++    /// Synsema: what `size` may reach (`CompileOptions::program_size_limit`).
++    size_limit: Option<usize>,
++    /// Synsema: one entry for each search cache of the program, of each kind
++    /// (`vm::SearchCaches`): what was counted for it into `size` (0 without a size limit).
++    meta_fresh: Vec<usize>,
++    lazy_fresh: Vec<usize>,
++}
++
++/// Synsema: what an instruction takes in memory, in bytes: the instruction itself and the text
++/// or the ranges it owns. The regex or the DFA of an instruction that searches is not here: two
++/// instructions can share one, and it is counted where it is built
++/// (`VMBuilder::new_meta_cache`, `VMBuilder::new_lazy_cache`).
++fn insn_bytes(insn: &Insn) -> usize {
++    use core::mem::size_of;
++    let owned = match insn {
++        Insn::Lit(s) => s.len(),
++        Insn::LitBytes(bytes) => bytes.len(),
++        Insn::LitCasei(lit) => lit.heap_bytes(),
++        Insn::CharClass(CharClassMatcher::Codepoint { ranges, name }) => {
++            ranges.len() * size_of::<(char, char)>() + name.as_ref().map_or(0, |n| n.len())
++        }
++        Insn::CharClass(CharClassMatcher::Byte { ranges, name }) => {
++            ranges.len() * size_of::<(u8, u8)>() + name.as_ref().map_or(0, |n| n.len())
++        }
++        Insn::Delegate(d) | Insn::AbsentRepeater(d) => d.pattern.len(),
++        Insn::Seek(s) => s.pattern.len(),
++        #[cfg(feature = "variable-lookbehinds")]
++        Insn::BackwardsDelegate(d) => d.pattern.len(),
++        #[cfg(feature = "variable-lookbehinds")]
++        Insn::HardVariableLookbehind(d) => d.pattern.len(),
++        _ => 0,
++    };
++    size_of::<Insn>().saturating_add(owned)
++}
++
++/// Synsema: where a regex handed to the linear engine comes from, for `fresh_meta_cache_bytes`.
++pub(crate) enum EngineSource<'a> {
++    /// It was built from this `Hir`.
++    Hir(&'a Hir),
++    /// It was built from this pattern, with the syntax of `options_to_rabuilder`.
++    Pattern(&'a str),
++}
++
++/// Synsema: how many states the forward NFA of `re` has, by building it again from the same
++/// source with the same configuration (`meta::Regex` does not give its NFA).
++fn nfa_states(re: &RaRegex, source: &EngineSource<'_>, options: &CompileOptions) -> Option<usize> {
++    use regex_automata::nfa::thompson;
++    use regex_automata::util::syntax;
++
++    let config = re.get_config();
++    let thompson_config = thompson::Config::new()
++        .utf8(config.get_utf8_empty())
++        .nfa_size_limit(config.get_nfa_size_limit())
++        .shrink(false)
++        .which_captures(config.get_which_captures());
++    let mut compiler = thompson::Compiler::new();
++    compiler.configure(thompson_config);
++    let nfa = match source {
++        EngineSource::Hir(hir) => compiler.build_from_hir(hir).ok()?,
++        EngineSource::Pattern(pattern) => {
++            let utf8 = matches!(options.bytes_mode, BytesMode::Unicode);
++            let syntax = syntax::Config::new().utf8(utf8).unicode(options.unicode);
++            let hir = syntax::parse_with(pattern, &syntax).ok()?;
++            compiler.build_from_hir(&hir).ok()?
++        }
++    };
++    Some(nfa.states().len())
++}
++
++/// Synsema: what the search cache of `re` holds whatever the text is, in bytes; `None` when
++/// that is more than `room`.
++///
++/// It is the cache with everything `regex_automata` puts in it for this regex, counted
++/// (`Cache::memory_usage`). A cache as `create_cache` returns it does not have the cache of the
++/// PikeVM yet: the meta engine makes that one the first time the PikeVM runs. `Cache::reset`
++/// makes it, so the cache counted here is one that was made and reset.
++///
++/// Almost all of it grows with the size of the regex, which is already built and counted. The
++/// part that does not is the table of the PikeVM: one row of capture slots for every state of
++/// the NFA, twice, so with G groups it grows with G times the states (2,000 empty groups: 270
++/// MB). That part is worked out before the cache is made, so that a regex whose table does not
++/// fit is an error and not an allocation: first from what the regex takes (every state is in
++/// there, so it cannot have more states than that), and only when that bound does not fit, from
++/// the NFA built again to count its states.
++pub(crate) fn fresh_meta_cache_bytes(
++    re: &RaRegex,
++    source: EngineSource<'_>,
++    options: &CompileOptions,
++    room: usize,
++) -> Option<usize> {
++    use core::mem::size_of;
++    use regex_automata::nfa::thompson;
++    use regex_automata::util::primitives::NonMaxUsize;
++
++    let slot_len = re.group_info().slot_len();
++    let fits = |states: usize| {
++        states
++            .checked_mul(slot_len)
++            .and_then(|slots| slots.checked_add(slot_len))
++            .and_then(|slots| slots.checked_mul(2 * size_of::<Option<NonMaxUsize>>()))
++            .map_or(false, |bytes| bytes <= room)
++    };
++    let at_most = re.memory_usage() / size_of::<thompson::State>();
++    if !fits(at_most) && !fits(nfa_states(re, &source, options)?) {
++        return None;
++    }
++    let mut cache = re.create_cache();
++    cache.reset(re);
++    let bytes = cache.memory_usage();
++    (bytes <= room).then_some(bytes)
+ }
+ 
+ impl VMBuilder {
+-    fn new(max_group: usize, max_prog_size: Option<usize>) -> VMBuilder {
++    fn new(
++        max_group: usize,
++        max_prog_size: Option<usize>,
++        size_limit: Option<usize>,
++    ) -> VMBuilder {
+         VMBuilder {
+             prog: Vec::new(),
+             n_saves: max_group * 2,
+             max_prog_size,
++            size: 0,
++            size_limit,
++            meta_fresh: Vec::new(),
++            lazy_fresh: Vec::new(),
+         }
+     }
+ 
++    /// Synsema: the error of a program over its size limit.
++    fn too_large(&self) -> Error {
++        too_large(self.size_limit.unwrap_or(usize::MAX), self.size)
++    }
++
++    /// Synsema: counts `bytes` more into the size of the program; an error when that takes it
++    /// over its limit. Everything the program holds is counted through here as it is built, so
++    /// compiling stops at the first piece that does not fit: without this, a subroutine call
++    /// that is expanded 3^19 times (`(a|b\g<1>\g<1>\g<1>)`) takes all the memory there is
++    /// before it returns.
++    fn charge(&mut self, bytes: usize) -> Result<()> {
++        self.size = self.size.saturating_add(bytes);
++        match self.size_limit {
++            Some(limit) if self.size > limit => Err(self.too_large()),
++            _ => Ok(()),
++        }
++    }
++
++    /// Synsema: what is left under the size limit.
++    fn room(&self) -> usize {
++        self.size_limit
++            .map_or(usize::MAX, |limit| limit.saturating_sub(self.size))
++    }
++
++    /// Synsema: counts a regex that an instruction will search with (what it takes, and what
++    /// its search cache holds before it reads any text) and gives the number of its cache.
++    /// Without a size limit nothing is counted, and no cache is made to count it.
++    fn new_meta_cache(
++        &mut self,
++        re: &RaRegex,
++        source: EngineSource<'_>,
++        options: &CompileOptions,
++    ) -> Result<usize> {
++        let mut fresh = 0;
++        if self.size_limit.is_some() {
++            self.charge(re.memory_usage())?;
++            match fresh_meta_cache_bytes(re, source, options, self.room()) {
++                Some(bytes) => {
++                    self.charge(bytes)?;
++                    fresh = bytes;
++                }
++                None => {
++                    self.size = self.size.saturating_add(self.room()).saturating_add(1);
++                    return Err(self.too_large());
++                }
++            }
++        }
++        let id = self.meta_fresh.len();
++        self.meta_fresh.push(fresh);
++        Ok(id)
++    }
++
++    /// Synsema: the same for the lazy DFA of a look-behind of variable length. The DFA does
++    /// not count its NFA (it shares it); here nobody else holds it.
++    #[cfg(feature = "variable-lookbehinds")]
++    fn new_lazy_cache(&mut self, dfa: &regex_automata::hybrid::dfa::DFA) -> Result<usize> {
++        let mut fresh = 0;
++        if self.size_limit.is_some() {
++            self.charge(
++                dfa.memory_usage()
++                    .saturating_add(dfa.get_nfa().memory_usage()),
++            )?;
++            fresh = dfa.create_cache().memory_usage();
++            self.charge(fresh)?;
++        }
++        let id = self.lazy_fresh.len();
++        self.lazy_fresh.push(fresh);
++        Ok(id)
++    }
++
+     fn build(
+         self,
+         bytes_mode: BytesMode,
+@@ -83,13 +273,20 @@
+         seek_pattern: String,
+         max_size: usize,
+     ) -> Prog {
++        // Synsema: the program lives as long as the regex does. Without the spare capacity of a
++        // vector that grew by doubling, what it holds is what the size limit counted (it held up
++        // to twice that).
++        let mut prog = self.prog;
++        prog.shrink_to_fit();
+         Prog::new(
+-            self.prog,
++            prog,
+             self.n_saves,
+             bytes_mode,
+             unicode,
+             seek_pattern,
+             max_size,
++            self.meta_fresh,
++            self.lazy_fresh,
+         )
+     }
+ 
+@@ -114,6 +311,8 @@
+                 )));
+             }
+         }
++        // Synsema: every instruction of the program is added here.
++        self.charge(insn_bytes(&insn))?;
+         self.prog.push(insn);
+         Ok(())
+     }
+@@ -159,12 +358,19 @@
+     /// Alternations (lookbehind branches especially) often repeat the same
+     /// fragment, and building a `meta::Regex` dominates compile time, so
+     /// identical fragments share one engine (cloning it is a cheap Arc copy).
+-    delegate_memo: Map<(String, bool), RaRegex>,
++    ///
++    /// Synsema: with the number of its search cache, which they share too: the VM runs one
++    /// search at a time.
++    delegate_memo: Map<(String, bool), (Arc<RaRegex>, usize)>,
+     /// For each group whose body refers to the group itself, the first of the two
+     /// slots that hold its previous capture while the group runs again.
+     previous_capture_slots: Map<usize, usize>,
+     /// The groups being compiled whose body refers to the group itself.
+     open_self_referencing_groups: Vec<usize>,
++    /// Synsema: the capture groups whose content is being compiled, the group itself or a copy
++    /// made by a subroutine call. A group entered while it is in here is a group called from
++    /// inside itself (`compile_group`).
++    open_groups: Vec<usize>,
+ }
+ 
+ #[cfg(feature = "variable-lookbehinds")]
+@@ -184,6 +390,15 @@
+                 .any(|branch| branch.is_literal_get_casei().is_none()))
+ }
+ 
++/// Synsema: whether matching `body` can write a capture group: one of its own, or one that a
++/// subroutine call in it writes (the group it calls, wherever that group is).
++fn writes_a_group(body: &Info<'_>) -> bool {
++    body.start_group() != body.end_group()
++        || body
++            .expr
++            .has_descendant_or_self(|expr| matches!(*expr, Expr::SubroutineCall(_)))
++}
++
+ /// Whether `body` reads a capture group set inside it, so an iteration can match
+ /// differently from an earlier one at the same position.
+ fn reads_own_captures(body: &Info<'_>) -> bool {
+@@ -214,19 +429,32 @@
+ 
+     fn compile_group(&mut self, group: usize, body: &Info<'_>, hard: bool) -> Result<()> {
+         let self_referencing = self.refers_to_group(body.expr, group, &mut Vec::new());
++        // Synsema: where the group starts is saved only where the group is not open. Upstream
++        // emits the instruction always and lets the VM decide whether the group is open, from
++        // the slots; it cannot tell a call from inside the group from a look-ahead or a call
++        // that enters the group further back than its last match, and the group came out with
++        // the start of one match and the end of another (`(\((?:[^()]|\g<1>)*\))` on
++        // `((a)(b))` gave `(b))`; `(?=b\g<1>)((?=))` on `b`, a start after the end). Here it is
++        // known: the group is open when its content is being compiled, as written or as the
++        // copy of a subroutine call.
++        let entered_from_inside = self.open_groups.contains(&group);
+         if self_referencing {
+             let previous = *self.previous_capture_slots.entry(group).or_insert_with(|| {
+                 let slot = self.b.newsave();
+                 self.b.newsave();
+                 slot
+             });
+-            self.b
+-                .add(Insn::SaveCaptureGroupStartKeepPrevious { group, previous })?;
++            if !entered_from_inside {
++                self.b
++                    .add(Insn::SaveCaptureGroupStartKeepPrevious { group, previous })?;
++            }
+             self.open_self_referencing_groups.push(group);
+-        } else {
++        } else if !entered_from_inside {
+             self.b.add(Insn::SaveCaptureGroupStart(group))?;
+         }
++        self.open_groups.push(group);
+         self.visit(body, hard)?;
++        self.open_groups.pop();
+         if self_referencing {
+             self.open_self_referencing_groups.pop();
+         }
+@@ -464,7 +692,7 @@
+                     // Compile the child expression as a delegate
+                     let delegate = DelegateBuilder::new(&self.options)
+                         .push(child_info)
+-                        .build_delegate(&self.options, &mut self.delegate_memo)?;
++                        .build_delegate(&self.options, &mut self.delegate_memo, &mut self.b)?;
+ 
+                     // Add the Absent instruction
+                     self.b.add(Insn::AbsentRepeater(delegate))?;
+@@ -761,6 +989,23 @@
+         let inner = &info.children[0];
+         match la {
+             LookBehind => {
++                // Synsema: a positive look-behind that is not of one fixed size, and whose body
++                // writes a capture group, is an error. What such a group holds depends on which
++                // of the ways below compiles the body: an easy body takes the start a reverse
++                // DFA finds and fills its groups with a forward search that is anchored at that
++                // start and not at its end (`(?<=(a|ab))c` on `abc` gave `a`, a group that ends
++                // before the look-behind); a hard one tries the starts from the nearest
++                // (`(?<=(\d+));` on `12345;`: `12345` one way, `5` the other); an alternation at
++                // the top is one look-behind for each branch. And the one way that is the same
++                // for every body, the VM, takes exponential steps on a body that can read the
++                // same text in more than one way. Engines do not agree either (Java takes the
++                // nearest start; V8 and .NET read the body from right to left). With one fixed
++                // size there is one start, and a negative look-behind leaves no groups.
++                if !inner.const_size && writes_a_group(inner) {
++                    return Err(Error::CompileError(Box::new(
++                        CompileError::LookBehindWritesGroup,
++                    )));
++                }
+                 if let &Info {
+                     const_size: false,
+                     expr: &Expr::Alt(_),
+@@ -891,7 +1136,9 @@
+                                     )?;
+                                     delegate_nodes.clear();
+ 
+-                                    go_back += child.min_size;
++                                    // Synsema: the sizes of the analysis saturate, and so does
++                                    // what is added from them.
++                                    go_back = go_back.saturating_add(child.min_size);
+                                     if go_back > 0 {
+                                         self.b.add(Insn::GoBack(go_back))?;
+                                     }
+@@ -1009,32 +1256,22 @@
+         let syntax = SyntaxConfig::new()
+             .utf8(matches!(self.options.bytes_mode, BytesMode::Unicode))
+             .unicode(self.options.unicode);
+-        let dfa = match dfa::DFA::builder()
+-            .configure(dfa_config)
+-            .thompson(thompson_config)
+-            .syntax(syntax)
+-            .build(&seek_pattern)
+-        {
+-            Ok(dfa) => Arc::new(dfa),
+-            Err(e) => {
+-                return Err(Error::CompileError(Box::new(CompileError::DfaBuildError(
+-                    seek_pattern,
+-                    e.to_string(),
+-                ))));
+-            }
+-        };
++        let dfa = Arc::new(build_reverse_dfa(
++            &seek_pattern,
++            dfa_config,
++            thompson_config,
++            syntax,
++            &self.options,
++        )?);
+ 
+-        let create: CachePoolFn = alloc::boxed::Box::new({
+-            let dfa = Arc::clone(&dfa);
+-            move || dfa.create_cache()
+-        });
+-        let cache_pool = Pool::new(create);
++        // Synsema: counted, and with a search cache of the program in place of a pool here.
++        let cache = self.b.new_lazy_cache(&dfa)?;
+ 
+         let hard_lb_pc = self.b.pc();
+         self.b
+             .add(Insn::HardVariableLookbehind(HardVariableLookbehind {
+                 dfa,
+-                cache_pool,
++                cache,
+                 pattern: seek_pattern,
+                 end_pos_slot: end_save,
+                 candidate_pos_slot: candidate_save,
+@@ -1090,26 +1327,16 @@
+             .utf8(matches!(self.options.bytes_mode, BytesMode::Unicode))
+             .unicode(self.options.unicode);
+         // Build a reverse DFA for the pattern
+-        let dfa = match dfa::DFA::builder()
+-            .configure(dfa_config)
+-            .thompson(thompson_config)
+-            .syntax(syntax)
+-            .build(pattern)
+-        {
+-            Ok(dfa) => Arc::new(dfa),
+-            Err(e) => {
+-                return Err(Error::CompileError(Box::new(CompileError::DfaBuildError(
+-                    pattern.to_string(),
+-                    e.to_string(),
+-                ))))
+-            }
+-        };
++        let dfa = Arc::new(build_reverse_dfa(
++            pattern,
++            dfa_config,
++            thompson_config,
++            syntax,
++            &self.options,
++        )?);
+ 
+-        let create: CachePoolFn = alloc::boxed::Box::new({
+-            let dfa = Arc::clone(&dfa);
+-            move || dfa.create_cache()
+-        });
+-        let cache_pool = Pool::new(create);
++        // Synsema: counted, and with a search cache of the program in place of a pool here.
++        let cache = self.b.new_lazy_cache(&dfa)?;
+ 
+         // Build the forward regex for capture group extraction. It is only run
+         // anchored (see vm.rs BackwardsDelegate) and exists precisely to report
+@@ -1123,13 +1350,21 @@
+         } else {
+             None
+         };
++        let forward_cache = match &forward_regex {
++            Some(re) => {
++                self.b
++                    .new_meta_cache(re, EngineSource::Pattern(pattern), &self.options)?
++            }
++            None => 0,
++        };
+ 
+         self.b
+             .add(Insn::BackwardsDelegate(ReverseBackwardsDelegate {
+                 dfa,
+-                cache_pool,
++                cache,
+                 pattern: pattern.to_string(),
+                 capture_group_extraction_inner: forward_regex,
++                forward_cache,
+                 capture_groups: capture_groups.to_option_if_non_empty(),
+             }))?;
+         Ok(())
+@@ -1174,6 +1409,15 @@
+             }
+         }
+ 
++        // Synsema: a batch of only DEFINE blocks is skipped for what it is. Upstream skipped it
++        // below, for its empty text; a block has a text now (the places of its groups, see
++        // `Expr::to_str`).
++        if infos
++            .iter()
++            .all(|info| matches!(*info.expr, Expr::DefineGroup { .. }))
++        {
++            return Ok(());
++        }
+         let mut delegate_builder = DelegateBuilder::new(&self.options);
+         for info in infos {
+             delegate_builder.push(info);
+@@ -1181,8 +1425,9 @@
+         // Skip emitting a delegate for an empty regex (e.g. a batch of
+         // only DefineGroups), as it would just match the empty string.
+         if !delegate_builder.is_empty() {
+-            self.b
+-                .add(delegate_builder.build(&self.options, &mut self.delegate_memo)?)?;
++            let insn =
++                delegate_builder.build(&self.options, &mut self.delegate_memo, &mut self.b)?;
++            self.b.add(insn)?;
+         }
+         Ok(())
+     }
+@@ -1266,10 +1511,14 @@
+             self.b.add(Insn::CharClass(matcher))?;
+         } else {
+             let compiled = compile_inner(pattern, &self.options, DelegateUsage::anchored(false))?;
++            let cache =
++                self.b
++                    .new_meta_cache(&compiled, EngineSource::Pattern(pattern), &self.options)?;
+             self.b.add(Insn::Delegate(Delegate {
+-                inner: compiled,
++                inner: Arc::new(compiled),
+                 pattern: pattern.to_string(),
+                 capture_groups: None,
++                cache,
+             }))?;
+         }
+ 
+@@ -1341,12 +1590,58 @@
+ 
+     let re = builder
+         .build(inner_re)
+-        .map_err(CompileError::InnerError)
+-        .map_err(|e| Error::CompileError(Box::new(e)))?;
++        .map_err(|e| inner_error(e, options))?;
+ 
+     Ok(re)
+ }
+ 
++/// Synsema: the error of a program over its size limit (`CompileError::ProgramTooLarge`).
++pub(crate) fn too_large(limit: usize, reached: usize) -> Error {
++    Error::CompileError(Box::new(CompileError::ProgramTooLarge { limit, reached }))
++}
++
++/// Synsema: the error of a regex that the linear engine did not build. With a size limit for
++/// the program, the limit of each piece comes from it (`RegexOptions::delegate_size_limit`), so
++/// a piece that goes over its own is a program that goes over its.
++fn inner_error(e: regex_automata::meta::BuildError, options: &CompileOptions) -> Error {
++    match (options.program_size_limit, e.size_limit()) {
++        (Some(limit), Some(_)) => too_large(limit, limit.saturating_add(1)),
++        _ => Error::CompileError(Box::new(CompileError::InnerError(e))),
++    }
++}
++
++/// Synsema: the reverse lazy DFA of a look-behind of variable length. Upstream hands the
++/// pattern to the builder of the DFA; this builds the NFA first, the way that builder does (it
++/// never compiles capture states), to tell an NFA over its size limit (the program is too
++/// large) from a pattern the DFA cannot take.
++#[cfg(feature = "variable-lookbehinds")]
++fn build_reverse_dfa(
++    pattern: &str,
++    dfa_config: regex_automata::hybrid::dfa::Config,
++    thompson_config: regex_automata::nfa::thompson::Config,
++    syntax: regex_automata::util::syntax::Config,
++    options: &CompileOptions,
++) -> Result<regex_automata::hybrid::dfa::DFA> {
++    use regex_automata::hybrid::dfa;
++    use regex_automata::nfa::thompson;
++
++    let failed = |e: String| {
++        Error::CompileError(Box::new(CompileError::DfaBuildError(pattern.to_string(), e)))
++    };
++    let nfa = thompson::Compiler::new()
++        .configure(thompson_config.which_captures(WhichCaptures::None))
++        .syntax(syntax)
++        .build(pattern)
++        .map_err(|e| match (options.program_size_limit, e.size_limit()) {
++            (Some(limit), Some(_)) => too_large(limit, limit.saturating_add(1)),
++            _ => failed(e.to_string()),
++        })?;
++    dfa::DFA::builder()
++        .configure(dfa_config)
++        .build_from_nfa(nfa)
++        .map_err(|e| failed(e.to_string()))
++}
++
+ /// Like [`compile_inner`], but from an already-built `Hir`, so the engine
+ /// doesn't parse the pattern a second time. The syntax config set by
+ /// `options_to_rabuilder` is ignored on this path — the `Hir` must already
+@@ -1360,8 +1655,7 @@
+ 
+     let re = builder
+         .build_from_hir(hir)
+-        .map_err(CompileError::InnerError)
+-        .map_err(|e| Error::CompileError(Box::new(e)))?;
++        .map_err(|e| inner_error(e, options))?;
+ 
+     Ok(re)
+ }
+@@ -1547,6 +1841,15 @@
+     /// recursion-depth cap is respected; this bounds the emitted instruction
+     /// vector instead. `None` disables the check.
+     pub max_prog_size: Option<usize>,
++    /// Synsema: optional limit, in bytes, for what the program takes before a search reads any
++    /// text: its instructions, the regexes and DFAs of the pieces handed to the linear engine,
++    /// and what the search cache of each holds when it is made. Over it, compiling fails with
++    /// `CompileError::ProgramTooLarge`. `None`, as upstream: no limit.
++    pub program_size_limit: Option<usize>,
++    /// Synsema: the root of the tree is the pattern between a start-of-text and an end-of-text
++    /// assertion (`RegexBuilder::full_match`), so the pattern as written, which is what `\g<0>`
++    /// calls, is its second child.
++    pub full_match: bool,
+ }
+ 
+ impl core::fmt::Debug for CompileOptions {
+@@ -1577,6 +1880,8 @@
+                 &self.delegate_dfa_skip_cache_capacity_check,
+             )
+             .field("max_prog_size", &self.max_prog_size)
++            .field("program_size_limit", &self.program_size_limit)
++            .field("full_match", &self.full_match)
+             .finish()
+     }
+ }
+@@ -1594,6 +1899,8 @@
+             delegate_dfa_size_limit: None,
+             delegate_dfa_skip_cache_capacity_check: true,
+             max_prog_size: None,
++            program_size_limit: None,
++            full_match: false,
+         }
+     }
+ }
+@@ -1605,15 +1912,27 @@
+     let mut group_info_map = Map::new();
+     populate_group_info_map(&mut group_info_map, info);
+ 
++    // Synsema: with `full_match` the whole pattern is the second child of the root; calling
++    // the root would call the two assertions around it too.
++    let root_info = match (options.full_match, info.children.get(1)) {
++        (true, Some(pattern)) => pattern,
++        _ => info,
++    };
++
+     let mut c = Compiler {
+-        b: VMBuilder::new(info.end_group(), options.max_prog_size),
++        b: VMBuilder::new(
++            info.end_group(),
++            options.max_prog_size,
++            options.program_size_limit,
++        ),
+         options,
+         inside_alternation: false,
+         group_info_map,
+         subroutine_recursion_stack: Vec::new(),
+         previous_capture_slots: Map::new(),
+         open_self_referencing_groups: Vec::new(),
+-        root_info: info,
++        open_groups: Vec::new(),
++        root_info,
+         delegate_memo: Map::new(),
+     };
+ 
+@@ -1629,9 +1948,15 @@
+                 if let Ok(inner) =
+                     compile_inner(&seek_pattern, &c.options, DelegateUsage::unanchored())
+                 {
++                    let cache = c.b.new_meta_cache(
++                        &inner,
++                        EngineSource::Pattern(&seek_pattern),
++                        &c.options,
++                    )?;
+                     c.b.add(Insn::Seek(Seek {
+                         inner,
+                         pattern: seek_pattern.clone(),
++                        cache,
+                     }))?;
+                     used_seek = true;
+                 }
+@@ -1700,7 +2025,9 @@
+         // TODO: might want to detect case of a group with no captures
+         //  inside, so we can run find() instead of captures()
+ 
+-        self.min_size += info.min_size;
++        // Synsema: the sizes of the analysis saturate (`(?:a{4294967295}){4294967295}` twice in
++        // a row), and so does their sum: it overflowed here.
++        self.min_size = self.min_size.saturating_add(info.min_size);
+         self.const_size &= info.const_size;
+         if self.capture_groups.is_none() {
+             self.capture_groups = Some(info.capture_groups);
+@@ -1738,7 +2065,8 @@
+     fn build(
+         &mut self,
+         options: &CompileOptions,
+-        memo: &mut Map<(String, bool), RaRegex>,
++        memo: &mut Map<(String, bool), (Arc<RaRegex>, usize)>,
++        b: &mut VMBuilder,
+     ) -> Result<Insn> {
+         // A single character class is matched directly, skipping engine
+         // construction entirely (see CharClassMatcher). A class has no capture
+@@ -1760,13 +2088,14 @@
+                 return Ok(Insn::CharClass(matcher));
+             }
+         }
+-        Ok(Insn::Delegate(self.build_delegate(options, memo)?))
++        Ok(Insn::Delegate(self.build_delegate(options, memo, b)?))
+     }
+ 
+     fn build_delegate(
+         &mut self,
+         options: &CompileOptions,
+-        memo: &mut Map<(String, bool), RaRegex>,
++        memo: &mut Map<(String, bool), (Arc<RaRegex>, usize)>,
++        b: &mut VMBuilder,
+     ) -> Result<Delegate> {
+         let capture_groups = self
+             .capture_groups
+@@ -1783,15 +2112,29 @@
+         // engine. Outer group numbering may differ between the two sites; that
+         // lives in `capture_groups` below, not in the engine.
+         let memo_key = (self.re.clone(), capture_groups.is_some());
+-        let compiled = match memo.get(&memo_key) {
+-            Some(engine) => engine.clone(),
++        // Synsema: the regex is counted into the size of the program, with its search cache,
++        // where it is built; an instruction that shares it shares the cache too.
++        let (compiled, cache) = match memo.get(&memo_key) {
++            Some((engine, cache)) => (Arc::clone(engine), *cache),
+             None => {
+-                let engine = match self.hirs.take() {
+-                    Some(hirs) => compile_inner_from_hir(&Hir::concat(hirs), options, usage)?,
+-                    None => compile_inner(&self.re, options, usage)?,
++                let (engine, cache) = match self.hirs.take() {
++                    Some(hirs) => {
++                        let hir = Hir::concat(hirs);
++                        let engine = compile_inner_from_hir(&hir, options, usage)?;
++                        let cache = b.new_meta_cache(&engine, EngineSource::Hir(&hir), options)?;
++                        (engine, cache)
++                    }
++                    None => {
++                        let engine = compile_inner(&self.re, options, usage)?;
++                        let cache =
++                            b.new_meta_cache(&engine, EngineSource::Pattern(&self.re), options)?;
++                        (engine, cache)
++                    }
+                 };
+-                memo.insert(memo_key, engine.clone());
+-                engine
++                // Synsema: one object for every instruction with this regex (see `Delegate::inner`).
++                let engine = Arc::new(engine);
++                memo.insert(memo_key, (Arc::clone(&engine), cache));
++                (engine, cache)
+             }
+         };
+ 
+@@ -1799,6 +2142,7 @@
+             inner: compiled,
+             pattern: self.re.clone(),
+             capture_groups,
++            cache,
+         })
+     }
+ }
+@@ -2179,7 +2523,7 @@
+         assert_eq!(prog.len(), 5, "prog: {:?}", prog);
+ 
+         assert_matches!(prog[0], Save(0));
+-        assert_matches!(&prog[1], BackwardsDelegate(ReverseBackwardsDelegate { pattern, dfa: _, cache_pool: _, capture_group_extraction_inner: None, capture_groups: None }) if pattern == "ab+");
++        assert_matches!(&prog[1], BackwardsDelegate(ReverseBackwardsDelegate { pattern, dfa: _, cache: _, capture_group_extraction_inner: None, forward_cache: _, capture_groups: None }) if pattern == "ab+");
+         assert_matches!(prog[2], Restore(0));
+         assert_matches!(prog[3], Lit(ref l) if l == "x");
+         assert_matches!(prog[4], End);
+@@ -2228,7 +2572,7 @@
+         assert_eq!(prog.len(), 5, "prog: {:?}", prog);
+ 
+         assert_matches!(prog[0], Save(2));
+-        assert_matches!(&prog[1], BackwardsDelegate(ReverseBackwardsDelegate { pattern, dfa: _, cache_pool: _, capture_group_extraction_inner: ref inner, capture_groups: Some(CaptureGroupRange(0, 1)) }) if pattern == "a(b+)" && inner.is_some());
++        assert_matches!(&prog[1], BackwardsDelegate(ReverseBackwardsDelegate { pattern, dfa: _, cache: _, capture_group_extraction_inner: ref inner, forward_cache: _, capture_groups: Some(CaptureGroupRange(0, 1)) }) if pattern == "a(b+)" && inner.is_some());
+         assert_matches!(prog[2], Restore(2));
+         assert_matches!(prog[3], Lit(ref l) if l == "x");
+         assert_matches!(prog[4], End);
+diff -ru a/src/error.rs b/src/error.rs
+--- a/src/error.rs
++++ b/src/error.rs
+@@ -30,6 +30,10 @@
+     UnclosedOpenParen,
+     /// Invalid repeat syntax
+     InvalidRepeat,
++    /// Synsema: a repetition count that does not fit in 32 bits, e.g. `a{4294967296}`
++    RepeatCountTooLarge,
++    /// Synsema: a repetition count with its minimum greater than its maximum, e.g. `a{3,2}`
++    RepeatCountOutOfOrder,
+     /// Pattern too deeply nested
+     RecursionExceeded,
+     /// Backslash without following character
+@@ -99,6 +103,20 @@
+     PatternCanNeverMatch,
+     /// An unresolved AST node was encountered during analysis (internal error)
+     UnresolvedAstNode(usize, String),
++    /// Synsema: what the regex takes before a search reads any text (the compiled program and
++    /// what each of its searches needs to start) is larger than the limit set with
++    /// `RegexBuilder::program_size_limit`. Compiling stops at the first piece that finds it over
++    /// the limit, so `reached` is little more than `limit` however large the whole would be.
++    ProgramTooLarge {
++        /// The limit, in bytes
++        limit: usize,
++        /// What had been counted when it stopped, in bytes
++        reached: usize,
++    },
++    /// Synsema: a positive look-behind that is not of one fixed size has a capture group in it,
++    /// or a subroutine call (which writes the group it calls), e.g. `(?<=(a|ab))c`. What such a
++    /// group holds is not one thing (see `Compiler::compile_lookaround`).
++    LookBehindWritesGroup,
+ }
+ 
+ /// An error as the result of executing a regex.
+@@ -111,6 +129,9 @@
+     /// Configure using
+     /// [`RegexBuilder::backtrack_limit`](struct.RegexBuilder.html#method.backtrack_limit).
+     BacktrackLimitExceeded,
++    /// Synsema: the search needed a step and its budget had none left
++    /// (`Regex::find_input_with_steps`, `Regex::captures_input_with_steps`).
++    StepLimitExceeded,
+ }
+ 
+ #[cfg(feature = "std")]
+@@ -124,6 +145,12 @@
+                 write!(f, "Opening parenthesis without closing parenthesis")
+             }
+             ParseError::InvalidRepeat => write!(f, "Invalid repeat syntax"),
++            ParseError::RepeatCountTooLarge => {
++                write!(f, "Repetition count is too large (the largest is 4294967295)")
++            }
++            ParseError::RepeatCountOutOfOrder => {
++                write!(f, "Repetition count has its minimum greater than its maximum")
++            }
+             ParseError::RecursionExceeded => write!(f, "Pattern too deeply nested"),
+             ParseError::TrailingBackslash => write!(f, "Backslash without following character"),
+             ParseError::InvalidEscape(s) => write!(f, "Invalid escape: {}", s),
+@@ -191,6 +218,15 @@
+             CompileError::UnresolvedAstNode(ix, node) => {
+                 write!(f, "Unresolved AST node encountered during analysis at position {}: {}", ix, node)
+             }
++            CompileError::LookBehindWritesGroup => write!(
++                f,
++                "A look-behind of variable length has a capture group or a subroutine call in it: \
++                 use (?:...) if the group is only for grouping, capture outside the look-behind, \
++                 or give the look-behind one fixed length"
++            ),
++            CompileError::ProgramTooLarge { limit, .. } => {
++                write!(f, "Compiled regex exceeds the size limit of {} bytes", limit)
++            }
+         }
+     }
+ }
+@@ -202,6 +238,7 @@
+             RuntimeError::BacktrackLimitExceeded => {
+                 write!(f, "Max limit for backtracking count exceeded")
+             }
++            RuntimeError::StepLimitExceeded => write!(f, "Step budget of the search exceeded"),
+         }
+     }
+ }
+diff -ru a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -68,7 +68,7 @@
+ mod vm;
+ 
+ use crate::analyze::can_compile_as_anchored;
+-use crate::analyze::{analyze, AnalyzeContext};
++use crate::analyze::{analyze_for_linear, AnalyzeContext};
+ use crate::compile::{compile, CompileOptions};
+ use crate::optimize::{optimize, OptimizeOptions};
+ use crate::parse::{ExprTree, NamedGroups, Parser};
+@@ -168,6 +168,27 @@
+     named_groups: Arc<NamedGroups>,
+ }
+ 
++/// Synsema: the search cache of a regex that goes whole to the linear engine, one per thread.
++/// Upstream searches with the pool that `regex_automata` keeps inside the regex, which nobody
++/// can count or drop; with this one, `Regex::search_cache_bytes` and
++/// `Regex::trim_search_caches` cover these regexes too.
++type WrapCache = Option<regex_automata::meta::Cache>;
++type WrapCachePool = regex_automata::util::pool::Pool<WrapCache, fn() -> WrapCache>;
++
++fn new_wrap_cache() -> WrapCache {
++    None
++}
++
++/// Synsema: runs a search of the wrapped regex `inner` with its cache of this thread.
++fn with_wrap_cache<R>(
++    pool: &WrapCachePool,
++    inner: &RaRegex,
++    search: impl FnOnce(&mut regex_automata::meta::Cache) -> R,
++) -> R {
++    let mut guard = pool.get();
++    search(guard.get_or_insert_with(|| inner.create_cache()))
++}
++
+ // Separate enum because we don't want to expose any of this
+ #[derive(Clone)]
+ enum RegexImpl {
+@@ -185,6 +206,11 @@
+         /// return None even though they exist in the regex-automata engine
+         /// for correct group-counting.
+         zero_rep_groups: BitSet,
++        /// Synsema: the search caches of `inner` (see `WrapCache`).
++        caches: Arc<WrapCachePool>,
++        /// Synsema: what a search cache of `inner` holds whatever the text is, as counted
++        /// inside the size limit (0 without one).
++        fresh_cache: usize,
+     },
+     Fancy {
+         prog: Arc<Prog>,
+@@ -376,11 +402,17 @@
+                 explicit_capture_group_0,
+                 zero_rep_groups,
+             } => {
+-                if zero_rep_groups.contains(i) {
++                // Synsema: the set has the numbers the groups have in what the linear engine
++                // was given, where an explicit group 0 moves every group one up. Upstream
++                // looked up the number the caller asks for: with a final look-ahead taken out
++                // of the pattern, `(x){0}(a)(?=b)` on `ab` gave an empty first group and no
++                // second one.
++                let at = i + if *explicit_capture_group_0 { 1 } else { 0 };
++                if zero_rep_groups.contains(at) {
+                     return None;
+                 }
+                 locations
+-                    .get_group(i + if *explicit_capture_group_0 { 1 } else { 0 })
++                    .get_group(at)
+                     .map(|span| (span.start, span.end))
+             }
+             CapturesImpl::Fancy { saves } => {
+@@ -393,6 +425,14 @@
+                     return None;
+                 }
+                 let hi = saves[slot + 1];
++                // Synsema: a group that did not end, or with its start after its end, has no
++                // text. Nothing builds one (see `Insn::SaveCaptureGroupStart`); this is so
++                // that a mistake there is a missing group and not a panic when the caller
++                // slices the text.
++                debug_assert!(lo <= hi, "group {} from {} to {}", i, lo, hi);
++                if hi == usize::MAX || lo > hi {
++                    return None;
++                }
+                 Some((lo, hi))
+             }
+         }
+@@ -539,6 +579,12 @@
+     /// recursion-depth cap is respected; this bounds the emitted instruction
+     /// vector instead. `None` disables the check.
+     max_prog_size: Option<usize>,
++    /// Synsema: see `RegexOptionsBuilder::program_size_limit`.
++    program_size_limit: Option<usize>,
++    /// Synsema: see `RegexOptionsBuilder::search_cache_limit`.
++    search_cache_limit: Option<usize>,
++    /// Synsema: see `RegexOptionsBuilder::full_match`.
++    full_match: bool,
+     oniguruma_mode: bool,
+     ignore_numbered_groups_when_named_groups_exist: bool,
+     hard_regex_runtime_options: HardRegexRuntimeOptions,
+@@ -556,6 +602,9 @@
+     /// compare a pattern against its optimized form, or compile a pattern without
+     /// optimization entirely.
+     optimize: bool,
++    /// Synsema: whether the optimization pass rewrites the repetitions of the pattern (see
++    /// `RegexOptionsBuilder::optimize_repeats`).
++    optimize_repeats: bool,
+     #[cfg(feature = "leftmost_longest")]
+     leftmost_longest: bool,
+ }
+@@ -579,6 +628,9 @@
+                 &self.delegate_dfa_skip_cache_capacity_check,
+             )
+             .field("max_prog_size", &self.max_prog_size)
++            .field("program_size_limit", &self.program_size_limit)
++            .field("search_cache_limit", &self.search_cache_limit)
++            .field("full_match", &self.full_match)
+             .field("oniguruma_mode", &self.oniguruma_mode)
+             .field(
+                 "ignore_numbered_groups_when_named_groups_exist",
+@@ -590,7 +642,8 @@
+             )
+             .field("seek_filter", &seek_filter_desc)
+             .field("delegate_prefilter", &self.delegate_prefilter)
+-            .field("optimize", &self.optimize);
++            .field("optimize", &self.optimize)
++            .field("optimize_repeats", &self.optimize_repeats);
+         #[cfg(feature = "leftmost_longest")]
+         debug.field("leftmost_longest", &self.leftmost_longest);
+         debug.finish()
+@@ -605,6 +658,9 @@
+             delegate_dfa_size_limit: None,
+             delegate_dfa_skip_cache_capacity_check: true,
+             max_prog_size: None,
++            program_size_limit: None,
++            search_cache_limit: None,
++            full_match: false,
+             oniguruma_mode: false,
+             ignore_numbered_groups_when_named_groups_exist: false,
+             hard_regex_runtime_options: HardRegexRuntimeOptions::default(),
+@@ -612,6 +668,7 @@
+             seek_filter: None, // when we are ready to enable seek by default, use: `Some(seek_pattern_is_useful)`
+             delegate_prefilter: true,
+             optimize: true,
++            optimize_repeats: true,
+             #[cfg(feature = "leftmost_longest")]
+             leftmost_longest: false,
+         }
+@@ -645,7 +702,28 @@
+     /// trailing-lookahead rewrites (which would make the pattern
+     /// delegatable, and the Wrap path can't reject empty matches).
+     fn should_optimize(&self) -> bool {
+-        self.optimize
++        // Synsema: `full_match` builds the root of the tree and counts on it reaching the
++        // compiler as it is; the optimizer rewrites roots.
++        self.optimize && !self.full_match
++    }
++
++    /// Synsema: what the optimization pass is told, in one place for the compile path and for
++    /// the prefilter helpers, which have to look at the same tree.
++    pub(crate) fn optimize_options(&self) -> OptimizeOptions {
++        OptimizeOptions {
++            find_not_empty: self.hard_regex_runtime_options.find_not_empty,
++            keep_repeats: !self.optimize_repeats,
++        }
++    }
++
++    /// Synsema: the size limit of each piece handed to the linear engine. With a limit for
++    /// the whole program, no piece may take more than that, so the engine stops building one
++    /// that would instead of finishing it to be counted.
++    fn piece_size_limit(&self) -> Option<usize> {
++        match (self.delegate_size_limit, self.program_size_limit) {
++            (Some(piece), Some(program)) => Some(piece.min(program)),
++            (piece, program) => piece.or(program),
++        }
+     }
+ 
+     fn compute_flags(&self) -> u32 {
+@@ -871,6 +949,46 @@
+         self
+     }
+ 
++    /// Synsema: limit, in bytes, for what the regex takes before a search reads any text: the
++    /// compiled program with the regexes of the pieces it hands to the linear engine, and what
++    /// the search cache of each of those holds when it is made (the table of the PikeVM, which
++    /// grows with the states of the piece times its capture groups). Over it, building the
++    /// regex fails with `CompileError::ProgramTooLarge`, and compiling stops there: without a
++    /// limit, a subroutine call that is expanded many times takes all the memory there is.
++    ///
++    /// The sizes are those of the target (a pointer is 4 bytes on wasm32). Default: no limit.
++    pub fn program_size_limit(&mut self, bytes: usize) -> &mut Self {
++        self.options.program_size_limit = Some(bytes);
++        self
++    }
++
++    /// Synsema: limit, in bytes, for what the search caches of the regex may grow while they
++    /// read text (the states of the lazy DFAs of the pieces handed to the linear engine).
++    /// After every search of a piece its cache is counted, and when all of them together have
++    /// grown more than the limit they are dropped; each is made again when its piece next
++    /// searches. A search gives the same result with a new cache. Default: no limit.
++    ///
++    /// For a regex that goes whole to the linear engine the limit does nothing: `regex_automata`
++    /// bounds the one cache it has. See `Regex::trim_search_caches`.
++    pub fn search_cache_limit(&mut self, bytes: usize) -> &mut Self {
++        self.options.search_cache_limit = Some(bytes);
++        self
++    }
++
++    /// Synsema: the regex matches only a whole text, from its start to its end.
++    ///
++    /// The pattern is parsed as written, and its tree goes between a start-of-text and an
++    /// end-of-text assertion; a call to the whole pattern (`\g<0>`) calls the pattern as
++    /// written, without the two assertions. Writing `^(?:` and `)$` around the text of the
++    /// pattern is not the same: `\g<0>` then calls the assertions too, a pattern in verbose
++    /// mode that ends in a comment takes the closing as part of the comment, and an unbalanced
++    /// pattern (`a)(b`) becomes valid. The tree is compiled as it is (as with
++    /// `optimize(false)`). Default: false.
++    pub fn full_match(&mut self, yes: bool) -> &mut Self {
++        self.options.full_match = yes;
++        self
++    }
++
+     /// Require that matches are non-empty (i.e. match at least one character).
+     ///
+     /// When this is enabled, any match attempt that would result in a zero-length match is
+@@ -927,6 +1045,24 @@
+         self
+     }
+ 
++    /// Synsema: whether the optimization pass rewrites the repetitions of the pattern
++    /// (nested-repeat simplification and ambiguous-concat-repeat rewriting, the two rewrites
++    /// that are always applied upstream; see [`optimize`](Self::optimize)). With `false` the
++    /// pass only does what makes a pattern delegatable (`\K` and trailing positive lookahead
++    /// hoisting), and every repetition is compiled as it was written.
++    ///
++    /// Why one would turn it off: the rewrite of two runs of the same expression around an
++    /// optional middle compares the two runs as expressions, and two capture groups with the
++    /// same contents are the same expression. In 0.20.2, `b(a){1,3}\n??(a){2,}` on `baaa`
++    /// comes out with group 1 unset where the pattern as written sets it, and
++    /// `(a){2,}(b)?(a)+` reports one group more than it has.
++    ///
++    /// Default is `true`, as upstream. Has no effect when `optimize` is `false`.
++    pub fn optimize_repeats(&mut self, yes: bool) -> &mut Self {
++        self.options.optimize_repeats = yes;
++        self
++    }
++
+     /// Enable leftmost-longest match semantics.
+     ///
+     /// When enabled, among all matches starting at the leftmost possible position,
+@@ -1290,6 +1426,24 @@
+         self
+     }
+ 
++    /// See [`RegexOptionsBuilder::program_size_limit`]
++    pub fn program_size_limit(&mut self, bytes: usize) -> &mut Self {
++        self.options.program_size_limit(bytes);
++        self
++    }
++
++    /// See [`RegexOptionsBuilder::search_cache_limit`]
++    pub fn search_cache_limit(&mut self, bytes: usize) -> &mut Self {
++        self.options.search_cache_limit(bytes);
++        self
++    }
++
++    /// See [`RegexOptionsBuilder::full_match`]
++    pub fn full_match(&mut self, yes: bool) -> &mut Self {
++        self.options.full_match(yes);
++        self
++    }
++
+     /// See [`RegexOptionsBuilder::oniguruma_mode`]
+     pub fn oniguruma_mode(&mut self, yes: bool) -> &mut Self {
+         self.options.oniguruma_mode(yes);
+@@ -1320,6 +1474,12 @@
+         self
+     }
+ 
++    /// Synsema: see [`RegexOptionsBuilder::optimize_repeats`]
++    pub fn optimize_repeats(&mut self, yes: bool) -> &mut Self {
++        self.options.optimize_repeats(yes);
++        self
++    }
++
+     /// See [`RegexOptionsBuilder::leftmost_longest`]
+     #[cfg(feature = "leftmost_longest")]
+     pub fn leftmost_longest(&mut self, yes: bool) -> &mut Self {
+@@ -1393,6 +1553,17 @@
+     pub(crate) fn new_options(pattern: String, options: &RegexOptions) -> Result<Regex> {
+         let mut tree = Expr::parse_tree_with_flags(&pattern, options.compute_flags())?;
+ 
++        // Synsema: `full_match`. The pattern was parsed as written; its tree goes between the
++        // two assertions (see `RegexOptionsBuilder::full_match`).
++        if options.full_match {
++            let written = core::mem::replace(&mut tree.expr, Expr::Empty);
++            tree.expr = Expr::Concat(vec![
++                Expr::Assertion(Assertion::StartText),
++                written,
++                Expr::Assertion(Assertion::EndText),
++            ]);
++        }
++
+         let find_not_empty = options.hard_regex_runtime_options.find_not_empty;
+         let disallow_empty_match_at_eof_after_newline = options
+             .hard_regex_runtime_options
+@@ -1416,9 +1587,12 @@
+             // with a fixup of the capture groups. `find_not_empty` is passed through so
+             // the KeepOut/trailing-lookahead rewrites (which would make the pattern
+             // delegatable, and the Wrap path can't reject empty matches) are skipped.
+-            optimize(&mut tree, OptimizeOptions { find_not_empty })
++            // Synsema: with what the options say about the repetitions (`optimize_options`).
++            optimize(&mut tree, options.optimize_options())
+         };
+-        let info = analyze(
++        // Synsema: the analysis gets the options, to build what the linear engine would get
++        // and ask `regex_syntax` what it makes of each alternation (`analyze_for_linear`).
++        let info = analyze_for_linear(
+             &tree,
+             AnalyzeContext {
+                 explicit_capture_group_0: requires_capture_group_fixup,
+@@ -1428,6 +1602,7 @@
+                 #[cfg(feature = "leftmost_longest")]
+                 leftmost_longest,
+             },
++            options,
+         )?;
+ 
+         if find_not_empty && info.const_size && info.min_size == 0 {
+@@ -1448,10 +1623,11 @@
+                 bytes_mode: options.bytes_mode,
+                 unicode: options.syntaxc.get_unicode()
+                     && !matches!(options.bytes_mode, BytesMode::Ascii),
+-                delegate_size_limit: options.delegate_size_limit,
++                delegate_size_limit: options.piece_size_limit(),
+                 delegate_dfa_size_limit: options.delegate_dfa_size_limit,
+                 delegate_dfa_skip_cache_capacity_check: options
+                     .delegate_dfa_skip_cache_capacity_check,
++                program_size_limit: options.program_size_limit,
+                 // The remaining fields (anchored, contains_subroutines, seek_filter,
+                 // disallow_empty_match_at_eof_after_newline) are irrelevant for a plain
+                 // delegate compile in the easy path and their defaults are correct.
+@@ -1472,10 +1648,35 @@
+             let utf8 = matches!(compile_options.bytes_mode, BytesMode::Unicode);
+             let mut hir_ctx = to_hir::HirCtx::new(compile_options.unicode, utf8);
+             hir_ctx.enable_preserve_zero_rep_captures();
+-            let inner = match to_hir::expr_to_hir(&tree.expr, &mut hir_ctx) {
+-                Some(hir) => compile::compile_inner_from_hir(&hir, &compile_options, usage)?,
++            let hir = to_hir::expr_to_hir(&tree.expr, &mut hir_ctx);
++            let inner = match &hir {
++                Some(hir) => compile::compile_inner_from_hir(hir, &compile_options, usage)?,
+                 None => compile::compile_inner(&re_cooked, &compile_options, usage)?,
+             };
++            // Synsema: there is no program; what the size limit counts is this regex and what
++            // its search cache holds whatever the text is.
++            let mut fresh_cache = 0;
++            if let Some(limit) = options.program_size_limit {
++                let taken = inner.memory_usage();
++                let source = match &hir {
++                    Some(hir) => compile::EngineSource::Hir(hir),
++                    None => compile::EngineSource::Pattern(&re_cooked),
++                };
++                let fresh = if taken <= limit {
++                    compile::fresh_meta_cache_bytes(
++                        &inner,
++                        source,
++                        &compile_options,
++                        limit - taken,
++                    )
++                } else {
++                    None
++                };
++                match fresh {
++                    Some(bytes) => fresh_cache = bytes,
++                    None => return Err(compile::too_large(limit, limit.saturating_add(1))),
++                }
++            }
+             return Ok(Regex {
+                 inner: RegexImpl::Wrap {
+                     inner,
+@@ -1483,12 +1684,16 @@
+                     explicit_capture_group_0: requires_capture_group_fixup,
+                     delegated_pattern: re_cooked,
+                     zero_rep_groups: hir_ctx.into_zero_rep_groups(),
++                    caches: Arc::new(regex_automata::util::pool::Pool::new(
++                        new_wrap_cache as fn() -> WrapCache,
++                    )),
++                    fresh_cache,
+                 },
+                 named_groups: Arc::new(tree.named_groups),
+             });
+         }
+ 
+-        let prog = compile(
++        let mut prog = compile(
+             &info,
+             CompileOptions {
+                 anchored: can_compile_as_anchored(&tree.expr),
+@@ -1498,13 +1703,17 @@
+                 bytes_mode: options.bytes_mode,
+                 unicode: options.syntaxc.get_unicode()
+                     && !matches!(options.bytes_mode, BytesMode::Ascii),
+-                delegate_size_limit: options.delegate_size_limit,
++                delegate_size_limit: options.piece_size_limit(),
+                 delegate_dfa_size_limit: options.delegate_dfa_size_limit,
+                 delegate_dfa_skip_cache_capacity_check: options
+                     .delegate_dfa_skip_cache_capacity_check,
+                 max_prog_size: options.max_prog_size,
++                program_size_limit: options.program_size_limit,
++                full_match: options.full_match,
+             },
+         )?;
++        // Synsema: the limit of its search caches.
++        prog.search_cache_limit = options.search_cache_limit.unwrap_or(usize::MAX);
+         Ok(Regex {
+             inner: RegexImpl::Fancy {
+                 prog: Arc::new(prog),
+@@ -1561,11 +1770,16 @@
+         input: RegexInput<'_, S>,
+     ) -> Result<bool> {
+         match &self.inner {
+-            RegexImpl::Wrap { inner, .. } => {
++            RegexImpl::Wrap { inner, caches, .. } => {
+                 if input.is_done() {
+                     Ok(false)
+                 } else {
+-                    Ok(inner.is_match(ra_input(&input)))
++                    // Synsema: with the cache of this regex (`with_wrap_cache`); `is_match` is
++                    // a search for where a match ends that stops at the first one.
++                    let earliest = ra_input(&input).earliest(true);
++                    Ok(with_wrap_cache(caches, inner, |cache| {
++                        inner.search_half_with(cache, &earliest).is_some()
++                    }))
+                 }
+             }
+             RegexImpl::Fancy { .. } => self.find_input_raw(&input, 0).map(|m| m.is_some()),
+@@ -1668,11 +1882,129 @@
+         self.find_input(RegexInput::new(input).from_pos(pos))
+     }
+ 
++    /// Synsema: the first match in the given search input, within a budget of steps. `steps`
++    /// is what the search may spend, and comes back with what is left, so several searches can
++    /// share one budget. Every instruction the backtracking VM runs takes a step (see
++    /// `vm::run_with` for what takes more); without one to take, the search ends with
++    /// `RuntimeError::StepLimitExceeded`. A regex that goes whole to the linear engine spends
++    /// nothing. `backtrack_limit` applies as in every other search.
++    pub fn find_input_with_steps<'t, S: input::Input + ?Sized>(
++        &self,
++        input: RegexInput<'t, S>,
++        steps: &mut u64,
++    ) -> Result<Option<S::Match<'t>>> {
++        Ok(self
++            .find_input_raw_with_steps(&input, 0, steps)?
++            .map(|(s, e)| input.haystack().make_match(s, e)))
++    }
++
++    /// Synsema: [`Regex::find_from_pos`] within a budget of steps (see
++    /// [`Regex::find_input_with_steps`]).
++    pub fn find_from_pos_with_steps<'t, S: input::Input + ?Sized>(
++        &self,
++        input: &'t S,
++        pos: usize,
++        steps: &mut u64,
++    ) -> Result<Option<S::Match<'t>>> {
++        self.find_input_with_steps(RegexInput::new(input).from_pos(pos), steps)
++    }
++
++    /// Synsema: the capture groups of the first match in the given search input, within a
++    /// budget of steps (see [`Regex::find_input_with_steps`]).
++    pub fn captures_input_with_steps<'t, S: input::Input + ?Sized>(
++        &self,
++        input: RegexInput<'t, S>,
++        steps: &mut u64,
++    ) -> Result<Option<Captures<'t, S>>> {
++        self.captures_input_with_steps_and_flags(&input, 0, steps)
++    }
++
++    /// Synsema: [`Regex::captures_from_pos`] within a budget of steps (see
++    /// [`Regex::find_input_with_steps`]).
++    pub fn captures_from_pos_with_steps<'t, S: input::Input + ?Sized>(
++        &self,
++        text: &'t S,
++        pos: usize,
++        steps: &mut u64,
++    ) -> Result<Option<Captures<'t, S>>> {
++        self.captures_input_with_steps(RegexInput::new(text).from_pos(pos), steps)
++    }
++
++    /// Synsema: how many instructions the compiled program has; 0 when the whole regex goes to
++    /// the linear engine. A search that does not repeat work runs each instruction at most
++    /// once per position of the text, so a caller can size a budget of steps from it.
++    pub fn program_len(&self) -> usize {
++        match &self.inner {
++            RegexImpl::Wrap { .. } => 0,
++            RegexImpl::Fancy { prog, .. } => prog.body.len(),
++        }
++    }
++
++    /// Synsema: what the search caches of this regex hold whatever the text is, in bytes, as
++    /// they were counted inside [`program_size_limit`](RegexBuilder::program_size_limit) when
++    /// the regex was compiled; 0 for a regex without a size limit. What the caches hold over
++    /// this is what they added while reading text, which is what
++    /// [`search_cache_limit`](RegexBuilder::search_cache_limit) bounds.
++    pub fn fresh_search_cache_bytes(&self) -> usize {
++        match &self.inner {
++            RegexImpl::Wrap { fresh_cache, .. } => *fresh_cache,
++            RegexImpl::Fancy { prog, .. } => prog.fresh_search_cache_bytes(),
++        }
++    }
++
++    /// Synsema: how many times the search caches of this regex were all dropped, in the
++    /// calling thread, for growing over
++    /// [`search_cache_limit`](RegexBuilder::search_cache_limit). A regex that goes whole to
++    /// the linear engine has one cache and no limit to drop it for: 0.
++    pub fn search_cache_drops(&self) -> usize {
++        match &self.inner {
++            RegexImpl::Wrap { .. } => 0,
++            RegexImpl::Fancy { prog, .. } => prog.search_cache_drops(),
++        }
++    }
++
++    /// Synsema: what the search caches of this regex hold for the calling thread, in bytes,
++    /// as `regex_automata` counts them (the process holds more: the count leaves out what the
++    /// allocator adds).
++    pub fn search_cache_bytes(&self) -> usize {
++        match &self.inner {
++            RegexImpl::Wrap { caches, .. } => {
++                caches.get().as_ref().map_or(0, |cache| cache.memory_usage())
++            }
++            RegexImpl::Fancy { prog, .. } => prog.search_cache_bytes(),
++        }
++    }
++
++    /// Synsema: drops the search caches of this regex for the calling thread when they hold
++    /// more than `keep` bytes. For a caller that keeps many regexes alive and wants a bound on
++    /// what all of them hold between searches.
++    pub fn trim_search_caches(&self, keep: usize) {
++        match &self.inner {
++            RegexImpl::Wrap { caches, .. } => {
++                let mut cache = caches.get();
++                if cache.as_ref().map_or(0, |cache| cache.memory_usage()) > keep {
++                    *cache = None;
++                }
++            }
++            RegexImpl::Fancy { prog, .. } => prog.trim_search_caches(keep),
++        }
++    }
++
+     pub(crate) fn find_input_raw<S: input::Input + ?Sized>(
+         &self,
+         input: &RegexInput<'_, S>,
+         option_flags: u32,
+     ) -> Result<Option<(usize, usize)>> {
++        let mut steps = u64::MAX;
++        self.find_input_raw_with_steps(input, option_flags, &mut steps)
++    }
++
++    pub(crate) fn find_input_raw_with_steps<S: input::Input + ?Sized>(
++        &self,
++        input: &RegexInput<'_, S>,
++        option_flags: u32,
++        steps: &mut u64,
++    ) -> Result<Option<(usize, usize)>> {
+         if input.is_done() {
+             return Ok(None);
+         }
+@@ -1680,27 +2012,36 @@
+             RegexImpl::Wrap {
+                 inner,
+                 explicit_capture_group_0,
++                caches,
+                 ..
+             } => {
+                 let mut delegated_input = ra_input(input);
+                 if input.is_anchored() {
+                     delegated_input = delegated_input.anchored(RaAnchored::Yes);
+                 }
+-                let result = if !*explicit_capture_group_0 {
+-                    inner.search(&delegated_input).map(|m| (m.start(), m.end()))
+-                } else {
+-                    // Only group 1's span is needed (the real match bounds of
+-                    // the rewritten pattern); a fixed 4-slot search avoids
+-                    // allocating full captures on every find.
+-                    let mut slots = [None; 4];
+-                    if inner.search_slots(&delegated_input, &mut slots).is_some() {
+-                        slots[2]
+-                            .zip(slots[3])
+-                            .map(|(start, end)| (start.get(), end.get()))
++                // Synsema: with the cache of this regex (`with_wrap_cache`).
++                let result = with_wrap_cache(caches, inner, |cache| {
++                    if !*explicit_capture_group_0 {
++                        inner
++                            .search_with(cache, &delegated_input)
++                            .map(|m| (m.start(), m.end()))
+                     } else {
+-                        None
++                        // Only group 1's span is needed (the real match bounds of
++                        // the rewritten pattern); a fixed 4-slot search avoids
++                        // allocating full captures on every find.
++                        let mut slots = [None; 4];
++                        if inner
++                            .search_slots_with(cache, &delegated_input, &mut slots)
++                            .is_some()
++                        {
++                            slots[2]
++                                .zip(slots[3])
++                                .map(|(start, end)| (start.get(), end.get()))
++                        } else {
++                            None
++                        }
+                     }
+-                };
++                });
+                 Ok(result)
+             }
+             RegexImpl::Fancy { prog, options, .. } => {
+@@ -1721,7 +2062,7 @@
+                 }
+                 // Span-only VM entry: nothing is moved out of the pooled
+                 // scratch, so this path is allocation-free per call.
+-                vm::run_spans(prog, input, option_flags, options)
++                vm::run_spans(prog, input, option_flags, options, steps)
+             }
+         }
+     }
+@@ -1875,6 +2216,16 @@
+         input: &RegexInput<'t, S>,
+         option_flags: u32,
+     ) -> Result<Option<Captures<'t, S>>> {
++        let mut steps = u64::MAX;
++        self.captures_input_with_steps_and_flags(input, option_flags, &mut steps)
++    }
++
++    pub(crate) fn captures_input_with_steps_and_flags<'t, S: input::Input + ?Sized>(
++        &self,
++        input: &RegexInput<'t, S>,
++        option_flags: u32,
++        steps: &mut u64,
++    ) -> Result<Option<Captures<'t, S>>> {
+         if input.is_done() {
+             return Ok(None);
+         }
+@@ -1885,6 +2236,7 @@
+                 inner,
+                 explicit_capture_group_0,
+                 zero_rep_groups,
++                caches,
+                 ..
+             } => {
+                 // find_not_empty patterns are always compiled as Fancy, so find_not_empty is
+@@ -1896,7 +2248,10 @@
+                 if input.is_anchored() {
+                     delegated_input = delegated_input.anchored(RaAnchored::Yes);
+                 }
+-                inner.captures(delegated_input, &mut locations);
++                // Synsema: with the cache of this regex (`with_wrap_cache`).
++                with_wrap_cache(caches, inner, |cache| {
++                    inner.search_captures_with(cache, &delegated_input, &mut locations)
++                });
+                 Ok(locations.is_match().then_some(Captures {
+                     inner: CapturesImpl::Wrap {
+                         locations,
+@@ -1928,7 +2283,7 @@
+                         0
+                     };
+                 }
+-                let result = vm::run(prog, input, option_flags, options)?;
++                let result = vm::run(prog, input, option_flags, options, steps)?;
+                 Ok(result.map(|mut saves| {
+                     saves.truncate(n_groups * 2);
+                     Captures {
+@@ -3183,8 +3538,23 @@
+                     buf.push(')');
+                 }
+             }
+-            Expr::DefineGroup { .. } => {
++            Expr::DefineGroup { ref definitions } => {
+                 // DEFINE groups match nothing - output empty string for delegation
++                // Synsema: nothing that matches, but the place of each group the block holds:
++                // an empty group that is never tried, so that the groups after the block keep
++                // their numbers here as in `expr_to_hir` (see its DEFINE arm). It is also what
++                // tells a piece with a block from the same piece without it: two pieces with
++                // the same text share an engine (`DelegateBuilder::build_delegate`), and
++                // `(a)x*(?(DEFINE)(q))(a)` in the VM read its last group with the engine of
++                // the first, one number early.
++                let groups = to_hir::group_count(definitions);
++                if groups > 0 {
++                    buf.push_str("(?:");
++                    for _ in 0..groups {
++                        buf.push_str("(){0}");
++                    }
++                    buf.push(')');
++                }
+             }
+             _ => panic!("attempting to format hard expr {:?}", self),
+         }
+diff -ru a/src/optimize.rs b/src/optimize.rs
+--- a/src/optimize.rs
++++ b/src/optimize.rs
+@@ -40,6 +40,10 @@
+     /// When true, skip the KeepOut (`\K`) and trailing-lookahead rewrites that
+     /// would otherwise make the pattern delegatable. See [`optimize`].
+     pub find_not_empty: bool,
++    /// Synsema: when true, skip the two rewrites of repetitions (nested-repeat simplification
++    /// and ambiguous-concat-repeat rewriting): every repetition is compiled as written. See
++    /// `RegexOptionsBuilder::optimize_repeats`. False, as upstream, by default.
++    pub keep_repeats: bool,
+ }
+ 
+ /// Rewrite the expression tree to help the VM compile an efficient program.
+@@ -79,9 +83,12 @@
+ 
+     // These rewrites preserve match and capture semantics, so they're safe to
+     // apply even when the pattern must stay on the VM (e.g. `find_not_empty`).
+-    let has_backrefs = !tree.backrefs.is_empty();
+-    optimize_nested_repeats(&mut tree.expr, has_backrefs);
+-    optimize_ambiguous_concat_repeats(&mut tree.expr);
++    // Synsema: unless the caller wants the repetitions as written.
++    if !options.keep_repeats {
++        let has_backrefs = !tree.backrefs.is_empty();
++        optimize_nested_repeats(&mut tree.expr, has_backrefs);
++        optimize_ambiguous_concat_repeats(&mut tree.expr);
++    }
+ 
+     requires_capture_group_fixup
+ }
+diff -ru a/src/parse.rs b/src/parse.rs
+--- a/src/parse.rs
++++ b/src/parse.rs
+@@ -177,9 +177,27 @@
+                 b'{' => {
+                     match self.parse_repeat(ix) {
+                         Ok((next, lo, hi, fixed)) => {
++                            // Synsema: a count with its minimum over its maximum is an error
++                            // (what the documentation of `oniguruma_mode` says it is). Upstream
++                            // takes it: the linear engine reads `a{3,2}` as `a{3}`, the VM as
++                            // `a{2}` and the DFA of a look-behind does not build, so what it
++                            // matched depended on what was around it; and the analysis gave it
++                            // the size of the larger count, so the VM looped on it without the
++                            // check for an empty iteration. In Oniguruma mode the limits are
++                            // swapped below.
++                            if lo > hi && !self.flag(FLAG_ONIGURUMA_MODE) {
++                                return Err(Error::ParseError(
++                                    ix,
++                                    ParseError::RepeatCountOutOfOrder,
++                                ));
++                            }
+                             ix = next - 1;
+                             (lo, hi, true, fixed)
+                         }
++                        // Synsema: a count that does not fit is an error, not a literal `{`.
++                        Err(e @ Error::ParseError(_, ParseError::RepeatCountTooLarge)) => {
++                            return Err(e);
++                        }
+                         Err(_) => {
+                             // Invalid repeat syntax, which results in `{` being treated as a literal
+                             return Ok((ix, child));
+@@ -214,6 +232,8 @@
+                 greedy = false;
+                 ix += 1;
+             }
++            // Synsema: whether the lazy `?` was written (see `stacked_quantifier` below).
++            let lazy = !greedy;
+             greedy ^= self.flag(FLAG_SWAP_GREED);
+             let mut atomic_group = false;
+             if self.flag(FLAG_ONIGURUMA_MODE) {
+@@ -225,8 +245,21 @@
+                     atomic_group = true;
+                 }
+             } else if ix < self.re.len() && self.re.as_bytes()[ix] == b'+' {
++                // Synsema: a quantifier takes one modifier. `a+?+` is a quantifier on a
++                // quantifier (upstream reads it as lazy and possessive at once).
++                if lazy {
++                    return Err(Error::ParseError(ix, ParseError::TargetNotRepeatable));
++                }
+                 ix += 1;
+                 atomic_group = true;
++                // Synsema: a possessive quantifier is greedy whatever `(?U)` says, as in PCRE.
++                // Upstream swaps it like any other, and `(?U)a++` came out lazy and possessive:
++                // it took the least it could and never gave it back (`(?U)a*+` matched nothing).
++                greedy = true;
++            }
++            // Synsema: nor a count after it.
++            if !self.flag(FLAG_ONIGURUMA_MODE) {
++                self.stacked_quantifier(ix)?;
+             }
+             if skip {
+                 return Ok((ix, child));
+@@ -283,6 +316,27 @@
+         Ok((ix, repeat))
+     }
+ 
++    /// Synsema: a counted repetition (`{n}`, `{n,}`, `{n,m}`) written right after a quantifier,
++    /// at `ix`, is an error: the one a `*`, `+` or `?` there already is (`a**`, `a{2}*`), and
++    /// what Perl ("Nested quantifiers") and Python ("multiple repeat") say. Upstream ends the
++    /// piece at the first quantifier, so the brace starts a new piece and is literal text:
++    /// `a{2}{3}` matched `aa{3}` and not `aaaaaa`, with no error. A brace that is not a count
++    /// (`a{2}{x}`, `a{2}{3` without its `}`) is the literal text it is everywhere else. Not in
++    /// Oniguruma mode, where quantifiers stack (`parse_piece`).
++    fn stacked_quantifier(&self, ix: usize) -> Result<()> {
++        let at = self.optional_whitespace(ix)?;
++        if at < self.re.len() && self.re.as_bytes()[at] == b'{' {
++            match self.parse_repeat(at) {
++                Ok(_) | Err(Error::ParseError(_, ParseError::RepeatCountTooLarge)) => {
++                    return Err(Error::ParseError(at, ParseError::TargetNotRepeatable));
++                }
++                // Not a count.
++                Err(_) => {}
++            }
++        }
++        Ok(())
++    }
++
+     fn is_repeatable(&self, child: &Expr) -> bool {
+         match child {
+             Expr::LookAround(_, _) => false,
+@@ -298,23 +352,37 @@
+     }
+ 
+     // ix, lo, hi, fixed (an interval with no comma, like `{3}`)
++    //
++    // Synsema: between the braces only the whitespace of verbose mode is skipped
++    // (`whitespace_in_count`), not a `(?#…)` comment. Upstream skips both, so `a{(?#c)2}` was the
++    // count `a{2}`; in Perl, PCRE2 and Python a brace with a comment inside is not a count, and
++    // the text is the literal `a{2}`.
+     fn parse_repeat(&self, ix: usize) -> Result<(usize, usize, usize, bool)> {
+-        let ix = self.optional_whitespace(ix + 1)?; // skip opening '{'
++        let ix = self.whitespace_in_count(ix + 1)?; // skip opening '{'
+         let bytes = self.re.as_bytes();
+         if ix == self.re.len() {
+             return Err(Error::ParseError(ix, ParseError::InvalidRepeat));
+         }
+         let mut end = ix;
++        // Synsema: where a count that does not fit starts. It is an error only once this is known
++        // to be a repetition, at the closing brace: until then the brace may still be a literal.
++        let mut too_large: Option<usize> = None;
+         let lo_omitted = bytes[ix] == b',';
+         let lo = if lo_omitted {
+             0
+-        } else if let Some((next, lo)) = parse_usize(self.re, ix) {
++        } else if let Some((next, lo)) = parse_repeat_count(self.re, ix) {
+             end = next;
+-            lo
++            match lo {
++                Some(lo) => lo,
++                None => {
++                    too_large = Some(ix);
++                    0
++                }
++            }
+         } else {
+             return Err(Error::ParseError(ix, ParseError::InvalidRepeat));
+         };
+-        let ix = self.optional_whitespace(end)?; // past lo number
++        let ix = self.whitespace_in_count(end)?; // past lo number
+         if ix == self.re.len() {
+             return Err(Error::ParseError(ix, ParseError::InvalidRepeat));
+         }
+@@ -323,10 +391,17 @@
+         let hi = match bytes[ix] {
+             b'}' => lo,
+             b',' => {
+-                end = self.optional_whitespace(ix + 1)?; // past ','
+-                if let Some((next, hi)) = parse_usize(self.re, end) {
++                end = self.whitespace_in_count(ix + 1)?; // past ','
++                if let Some((next, hi)) = parse_repeat_count(self.re, end) {
++                    let at = end;
+                     end = next;
+-                    hi
++                    match hi {
++                        Some(hi) => hi,
++                        None => {
++                            too_large = too_large.or(Some(at));
++                            usize::MAX
++                        }
++                    }
+                 } else if lo_omitted && self.flag(FLAG_ONIGURUMA_MODE) {
+                     // Oniguruma needs at least one of the limits, so `{,}` is literal text
+                     return Err(Error::ParseError(end, ParseError::InvalidRepeat));
+@@ -336,10 +411,13 @@
+             }
+             _ => return Err(Error::ParseError(ix, ParseError::InvalidRepeat)),
+         };
+-        let ix = self.optional_whitespace(end)?; // past hi number
++        let ix = self.whitespace_in_count(end)?; // past hi number
+         if ix == self.re.len() || bytes[ix] != b'}' {
+             return Err(Error::ParseError(ix, ParseError::InvalidRepeat));
+         }
++        if let Some(at) = too_large {
++            return Err(Error::ParseError(at, ParseError::RepeatCountTooLarge));
++        }
+         Ok((ix + 1, lo, hi, fixed))
+     }
+ 
+@@ -1284,16 +1362,17 @@
+         let inner_condition = condition;
+ 
+         let after = self.check_for_close_paren(end)?;
++        // Synsema: a conditional whose two branches are empty is still a conditional, and it
++        // matches whatever the condition says. Upstream gave back the condition alone, which is
++        // what `(?(1))` with no branches means here (go on only if the group matched): written
++        // with its branches, `(?(1)|)` failed when group 1 had not taken part, and in Perl and
++        // in Python it matches.
+         Ok((
+             after,
+-            if if_true == Expr::Empty && if_false == Expr::Empty {
+-                inner_condition
+-            } else {
+-                Expr::Conditional {
+-                    condition: Box::new(inner_condition),
+-                    true_branch: Box::new(if_true),
+-                    false_branch: Box::new(if_false),
+-                }
++            Expr::Conditional {
++                condition: Box::new(inner_condition),
++                true_branch: Box::new(if_true),
++                false_branch: Box::new(if_false),
+             },
+         ))
+     }
+@@ -1401,7 +1480,17 @@
+         }
+     }
+ 
+-    fn optional_whitespace(&self, mut ix: usize) -> Result<usize> {
++    fn optional_whitespace(&self, ix: usize) -> Result<usize> {
++        self.skip_whitespace(ix, true)
++    }
++
++    /// Synsema: what `parse_repeat` skips between the braces of a count: the whitespace and the
++    /// `#` comments of verbose mode, as upstream, and not a `(?#…)` comment.
++    fn whitespace_in_count(&self, ix: usize) -> Result<usize> {
++        self.skip_whitespace(ix, false)
++    }
++
++    fn skip_whitespace(&self, mut ix: usize, group_comments: bool) -> Result<usize> {
+         let bytes = self.re.as_bytes();
+         loop {
+             if ix == self.re.len() {
+@@ -1415,7 +1504,7 @@
+                     }
+                 }
+                 b' ' | b'\r' | b'\n' | b'\t' if self.flag(FLAG_IGNORE_SPACE) => ix += 1,
+-                b'(' if bytes[ix..].starts_with(b"(?#") => {
++                b'(' if group_comments && bytes[ix..].starts_with(b"(?#") => {
+                     ix += 3;
+                     loop {
+                         if ix >= self.re.len() {
+@@ -1658,6 +1747,26 @@
+     }
+ }
+ 
++/// Synsema: the count of a repetition (`{n}`, `{n,}`, `{n,m}`) at `ix`: `None` if there are no
++/// digits there; otherwise where the digits end and their value, or no value if they do not fit
++/// in 32 bits. `parse_repeat` makes that an error (`RepeatCountTooLarge`) when the braces do
++/// close: `a{4294967296}` is an error, and `a{4294967296` without its `}` is the literal it is
++/// upstream. Upstream reads the count with `parse_usize` and takes a number that does not fit as
++/// "not a count": the `{` becomes a literal (and an upper bound that does not fit, no bound at
++/// all), and where that happens depends on the width of `usize` (2^64 on a 64-bit target, 2^32
++/// on wasm32). With this the same pattern means the same on every target, and the limit is the
++/// one of the `regex` crate.
++fn parse_repeat_count(s: &str, ix: usize) -> Option<(usize, Option<usize>)> {
++    let mut end = ix;
++    while end < s.len() && s.as_bytes()[end].is_ascii_digit() {
++        end += 1;
++    }
++    if end == ix {
++        return None;
++    }
++    Some((end, s[ix..end].parse::<u32>().ok().map(|val| val as usize)))
++}
++
+ // return (ix, value)
+ pub(crate) fn parse_usize(s: &str, ix: usize) -> Option<(usize, usize)> {
+     let mut end = ix;
+diff -ru a/src/seek.rs b/src/seek.rs
+--- a/src/seek.rs
++++ b/src/seek.rs
+@@ -285,6 +285,13 @@
+             if precedence > 2 {
+                 buf.push_str("(?:");
+             }
++            // Synsema: a quantifier needs something to repeat, and what it repeats can write
++            // nothing here (an empty capture group, whose wrapper is dropped; a DEFINE block;
++            // an anchor that is left out). Upstream wrote the quantifier all the same, and it
++            // went to whatever came before: for `c+(){2}` the seek pattern was `c+{2}`, the
++            // starts it gave were the ones of `(?:c+){2}`, and `(?<=c+(){2}…)` did not match
++            // after one `c`.
++            let before = buf.len();
+             if !info.children.is_empty() {
+                 build_seek_pattern_impl(
+                     &info.children[0],
+@@ -296,6 +303,9 @@
+                     opts,
+                 );
+             }
++            if buf.len() == before {
++                buf.push_str("(?:)");
++            }
+             write_quantifier(buf, *lo, *hi, false);
+             if precedence > 2 {
+                 buf.push(')');
+diff -ru a/src/to_hir.rs b/src/to_hir.rs
+--- a/src/to_hir.rs
++++ b/src/to_hir.rs
+@@ -34,7 +34,7 @@
+ //! string path, preserving both behavior and error reporting.
+ 
+ use alloc::boxed::Box;
+-use alloc::collections::BTreeMap;
++use alloc::collections::{BTreeMap, BTreeSet};
+ use alloc::string::String;
+ use alloc::vec::Vec;
+ use core::convert::TryFrom;
+@@ -68,6 +68,14 @@
+     /// participate in matching, so their captures should return None even
+     /// though they exist in the HIR for group-counting purposes.
+     zero_rep_groups: BitSet,
++    /// Synsema: with `note_alternations`, the alternations this context built that
++    /// `Hir::alternation` gave back in the order they are written in (`reordered` says no): the
++    /// address of each `Expr::Alt`. `None`: nothing is noted, as upstream.
++    as_written: Option<BTreeSet<usize>>,
++    /// Synsema: how many times this context got to where `preserve_zero_rep_captures` is
++    /// read, which are two: a `{0}` repetition and a DEFINE block. A translation that goes
++    /// through neither builds the same thing with the option and without it.
++    places: usize,
+ }
+ 
+ impl HirCtx {
+@@ -79,6 +87,30 @@
+             fragments: BTreeMap::new(),
+             preserve_zero_rep_captures: false,
+             zero_rep_groups: BitSet::new(),
++            as_written: None,
++            places: 0,
++        }
++    }
++
++    /// Synsema: how many `{0}` repetitions and DEFINE blocks have been translated (see the
++    /// field).
++    pub(crate) fn places(&self) -> usize {
++        self.places
++    }
++
++    /// Synsema: from here on, note every alternation that comes out of `Hir::alternation` in the
++    /// order it is written in. For the analysis, which asks with `as_written`
++    /// (`analyze_for_linear`).
++    pub(crate) fn note_alternations(&mut self) {
++        self.as_written = Some(BTreeSet::new());
++    }
++
++    /// Synsema: whether this context built `alt` (this very node of the tree) and it came out
++    /// in the order it is written in. An alternation it did not get to build is not.
++    pub(crate) fn as_written(&self, alt: &Expr) -> bool {
++        match &self.as_written {
++            Some(noted) => noted.contains(&(alt as *const Expr as usize)),
++            None => false,
+         }
+     }
+ 
+@@ -113,7 +145,33 @@
+ /// covered. `None` is always safe: the caller falls back to the string path.
+ pub(crate) fn expr_to_hir(expr: &Expr, ctx: &mut HirCtx) -> Option<Hir> {
+     Some(match *expr {
+-        Expr::Empty | Expr::DefineGroup { .. } => Hir::empty(),
++        Expr::Empty => Hir::empty(),
++        // Synsema: a DEFINE block matches nothing where it stands, but the groups in it have
++        // their numbers, and the ones after it come after those. Upstream gave back nothing
++        // and counted nothing: every group after the block, in the same piece or with the
++        // whole pattern in the linear engine, got the number of a group of the block
++        // (`(?(DEFINE)(?<d>\d))(a)\g<d>` on `a1` left the second group unset), and with the
++        // whole pattern the last groups were missing. The numbers are skipped, and where the
++        // places of a `{0}` are kept (`preserve_zero_rep_captures`) so are these: an empty
++        // group for each, in the set of the groups that never take part.
++        Expr::DefineGroup { ref definitions } => {
++            ctx.places += 1;
++            let first = ctx.next_group;
++            ctx.next_group += group_count(definitions);
++            if !ctx.preserve_zero_rep_captures {
++                return Some(Hir::empty());
++            }
++            let mut kept = Vec::new();
++            for index in first..ctx.next_group {
++                ctx.zero_rep_groups.insert(index as usize);
++                kept.push(Hir::capture(Capture {
++                    index,
++                    name: None,
++                    sub: Box::new(Hir::empty()),
++                }));
++            }
++            Hir::concat(kept)
++        }
+         Expr::Any { newline, crlf } => {
+             let dot = match (newline, crlf, ctx.unicode, ctx.utf8) {
+                 (true, _, true, _) => Dot::AnyChar,
+@@ -227,7 +285,14 @@
+                 .iter()
+                 .map(|child| expr_to_hir(child, ctx))
+                 .collect::<Option<Vec<_>>>()?;
+-            Hir::alternation(subs)
++            let hir = Hir::alternation(subs);
++            // Synsema: what came out is looked at, for the analysis (`note_alternations`).
++            if let Some(noted) = &mut ctx.as_written {
++                if !reordered(&hir) {
++                    noted.insert(expr as *const Expr as usize);
++                }
++            }
++            hir
+         }
+         Expr::Group(ref child) => {
+             let index = ctx.next_group;
+@@ -252,6 +317,10 @@
+             // we keep those capture slots so group numbering stays consistent.
+             // When false (for per-fragment VM delegates), we let the
+             // simplification happen as it does for the string path.
++            // Synsema: counted, with the option on or off (`HirCtx::places`).
++            if lo == 0 && hi == 0 {
++                ctx.places += 1;
++            }
+             if lo == 0 && hi == 0 && ctx.preserve_zero_rep_captures {
+                 let sub = expr_to_hir(child, ctx)?;
+                 return Some(make_zero_rep_empty_with_captures(
+@@ -290,6 +359,53 @@
+     })
+ }
+ 
++/// Synsema: how many capture groups there are in `expr`, itself included. A group takes its
++/// number where the parser finds it, here as in the analysis.
++pub(crate) fn group_count(expr: &Expr) -> u32 {
++    let inside: u32 = expr.children_iter().map(group_count).sum();
++    inside + u32::from(matches!(*expr, Expr::Group(_)))
++}
++
++/// Synsema: whether what `Hir::alternation` gave back for an alternation tries its branches in
++/// another order than the alternation as written. It gives back one of three things: the
++/// alternation (with the ones inside it flattened into it, which keeps the order); a class or a
++/// literal, when every branch is one character; or a concatenation (`lift_common_prefix`): what
++/// every branch starts with, taken out once, and last of all the alternation of what was left
++/// of each branch. The third tries `x*(?:a|b)` where the pattern says `x*a|x*b`: every branch
++/// with the first way of the beginning, before any branch with the second. That changes which
++/// branch wins only when the beginning can end in more than one place.
++fn reordered(hir: &Hir) -> bool {
++    match hir.kind() {
++        HirKind::Alternation(_) | HirKind::Class(_) | HirKind::Literal(_) => false,
++        // The beginning is every part but the last.
++        HirKind::Concat(parts) => parts.iter().rev().skip(1).any(more_than_one_end),
++        // Nothing else comes out of an alternation. If it does, it is not as written.
++        _ => true,
++    }
++}
++
++/// Synsema: whether this can match, from one position, texts that end in different places. It
++/// says yes unless it knows otherwise, and what it knows comes from `regex_syntax` (the lengths
++/// it gives its own tree), not from the sizes of the analysis.
++fn more_than_one_end(hir: &Hir) -> bool {
++    let lengths = hir.properties();
++    // Everything it matches has the same length: zero for an assertion or an empty `{0}`, and
++    // no length at all (`None` twice) for what never matches.
++    if lengths.minimum_len() == lengths.maximum_len() {
++        return false;
++    }
++    match hir.kind() {
++        // One character, of whatever length in bytes.
++        HirKind::Class(_) => false,
++        // A fixed count of something that ends in one place.
++        HirKind::Repetition(rep) if rep.max == Some(rep.min) => more_than_one_end(&rep.sub),
++        HirKind::Concat(parts) => parts.iter().any(more_than_one_end),
++        // A capture group is not here: no two have the same number, so none is ever in what
++        // two branches have in common.
++        _ => true,
++    }
++}
++
+ /// Recursively replace the sub-expression of every [`Capture`] with
+ /// [`Hir::empty`] while preserving the capture group structure (index, name).
+ ///
+diff -ru a/src/vm.rs b/src/vm.rs
+--- a/src/vm.rs
++++ b/src/vm.rs
+@@ -83,15 +83,6 @@
+ use regex_automata::Anchored;
+ use regex_automata::Input;
+ 
+-#[cfg(feature = "variable-lookbehinds")]
+-pub(crate) type CachePoolFn = alloc::boxed::Box<
+-    dyn Fn() -> regex_automata::hybrid::dfa::Cache
+-        + Send
+-        + Sync
+-        + core::panic::UnwindSafe
+-        + core::panic::RefUnwindSafe,
+->;
+-
+ use crate::error::RuntimeError;
+ use crate::input::{Input as HaystackInput, RegexInput};
+ use crate::Assertion;
+@@ -286,6 +277,15 @@
+         CaseiLiteral { chars }
+     }
+ 
++    /// Synsema: what the literal owns on the heap, in bytes (`compile::insn_bytes`).
++    pub(crate) fn heap_bytes(&self) -> usize {
++        use core::mem::size_of;
++        self.chars
++            .iter()
++            .map(|ranges| size_of::<FoldRanges>() + ranges.len() * size_of::<(char, char)>())
++            .sum()
++    }
++
+     /// If the literal matches at `ix`, returns the matched byte length (which
+     /// can differ from the literal's own length under folding). `None` on no
+     /// match or end of input.
+@@ -335,12 +335,19 @@
+ #[derive(Clone)]
+ /// Delegate matching to the regex crate
+ pub struct Delegate {
+-    /// The regex
+-    pub inner: Regex,
++    /// The regex. Synsema: behind an `Arc`, so that the instructions that share a regex (the
++    /// `delegate_memo` of the compiler) share the object. A clone of a `meta::Regex` comes with
++    /// a pool of search caches of its own, some 4 KB that this fork never uses (it searches with
++    /// the caches of `SearchCaches`) and that the size limit of the program did not count: a
++    /// group with one delegate, copied 8 000 times by subroutine calls, held 46 MB for 11 counted.
++    pub inner: Arc<Regex>,
+     /// The regex pattern as a string
+     pub pattern: String,
+     /// The range of capture groups. None if there are no capture groups.
+     pub capture_groups: Option<CaptureGroupRange>,
++    /// Synsema: which of the search caches of the program this regex searches with
++    /// (`SearchCaches`). Two instructions with the same regex share one.
++    pub(crate) cache: usize,
+ }
+ 
+ impl core::fmt::Debug for Delegate {
+@@ -350,6 +357,7 @@
+             inner: _,
+             pattern,
+             capture_groups,
++            cache: _,
+         } = self;
+ 
+         f.debug_struct("Delegate")
+@@ -366,12 +374,18 @@
+     pub inner: Regex,
+     /// The seek-pattern string (for debug display).
+     pub pattern: String,
++    /// Synsema: which of the search caches of the program this regex searches with.
++    pub(crate) cache: usize,
+ }
+ 
+ impl core::fmt::Debug for Seek {
+     fn fmt(&self, f: &mut Formatter<'_>) -> core::fmt::Result {
+         // Ensures it fails to compile if the struct changes
+-        let Self { inner: _, pattern } = self;
++        let Self {
++            inner: _,
++            pattern,
++            cache: _,
++        } = self;
+ 
+         f.debug_struct("Seek").field("pattern", pattern).finish()
+     }
+@@ -384,10 +398,13 @@
+     pub pattern: String,
+     /// The delegate regex to match backwards (wrapped in Arc for sharing)
+     pub(crate) dfa: Arc<regex_automata::hybrid::dfa::DFA>,
+-    /// Cache pool for DFA searches
+-    pub(crate) cache_pool: Pool<regex_automata::hybrid::dfa::Cache, CachePoolFn>,
++    /// Synsema: which of the search caches of the program the DFA searches with. Upstream keeps
++    /// a pool of caches here.
++    pub(crate) cache: usize,
+     /// The forward regex for capture group extraction
+     pub(crate) capture_group_extraction_inner: Option<Regex>,
++    /// Synsema: the search cache of the forward regex, when there is one.
++    pub(crate) forward_cache: usize,
+     /// The range of capture groups. None if there are no capture groups.
+     pub capture_groups: Option<CaptureGroupRange>,
+ }
+@@ -399,8 +416,9 @@
+         let Self {
+             pattern,
+             dfa: _,
+-            cache_pool: _,
++            cache: _,
+             capture_group_extraction_inner: _,
++            forward_cache: _,
+             capture_groups,
+         } = self;
+ 
+@@ -419,8 +437,9 @@
+     pub pattern: String,
+     /// Reverse DFA for finding candidate start positions.
+     pub(crate) dfa: Arc<regex_automata::hybrid::dfa::DFA>,
+-    /// Cache pool for DFA searches.
+-    pub(crate) cache_pool: Pool<regex_automata::hybrid::dfa::Cache, CachePoolFn>,
++    /// Synsema: which of the search caches of the program the DFA searches with. Upstream keeps
++    /// a pool of caches here.
++    pub(crate) cache: usize,
+     /// Slot containing the lookbehind end position (saved by the outer Save).
+     pub end_pos_slot: usize,
+     /// Slot holding the lookbehind end position on entry, and `end + 1 + i` once candidate `i`
+@@ -434,7 +453,7 @@
+         let Self {
+             pattern,
+             dfa: _,
+-            cache_pool: _,
++            cache: _,
+             end_pos_slot,
+             candidate_pos_slot,
+         } = self;
+@@ -621,12 +640,222 @@
+ struct Scratch {
+     state: State,
+     inner_slots: Vec<Option<NonMaxUsize>>,
++    /// Synsema: the caches of the searches the program hands to the linear engine.
++    caches: SearchCaches,
+ }
+ 
+ fn new_scratch() -> Scratch {
+     Scratch {
+         state: State::new(0, MAX_STACK, 0),
+         inner_slots: Vec::new(),
++        caches: SearchCaches::default(),
++    }
++}
++
++/// Synsema: how many bytes of a stretch of the text one step pays for (see `spend`), and how
++/// many slots a step pays for where an instruction walks slots (setting them up, copying them,
++/// looking one up among those saved since the last branch).
++pub(crate) const BYTES_PER_STEP: usize = 16;
++const SLOTS_PER_STEP: usize = 16;
++/// Synsema: what comparing two characters under case folding takes, in steps, when they are not
++/// equal and not both ASCII: `chars_fold_equal` builds the fold class of one of them.
++const FOLD_STEPS: u64 = 16;
++
++/// Synsema: takes `n` steps from the budget of the search. Without them, the search ends with
++/// `RuntimeError::StepLimitExceeded` and the budget at zero.
++#[inline(always)]
++fn spend(steps: &mut u64, n: u64) -> Result<()> {
++    if *steps < n {
++        *steps = 0;
++        return Err(Error::RuntimeError(RuntimeError::StepLimitExceeded));
++    }
++    *steps -= n;
++    Ok(())
++}
++
++/// Synsema: the steps of a stretch of `len` bytes of text that an instruction read.
++#[inline(always)]
++fn stretch(len: usize) -> u64 {
++    (len / BYTES_PER_STEP) as u64
++}
++
++/// Synsema: a search cache that says how many bytes it holds.
++trait CacheBytes {
++    fn bytes(&self) -> usize;
++}
++
++impl CacheBytes for regex_automata::meta::Cache {
++    fn bytes(&self) -> usize {
++        self.memory_usage()
++    }
++}
++
++#[cfg(feature = "variable-lookbehinds")]
++impl CacheBytes for regex_automata::hybrid::dfa::Cache {
++    fn bytes(&self) -> usize {
++        self.memory_usage()
++    }
++}
++
++/// Synsema: the caches of one kind, by the number the compiler gave each
++/// (`Delegate::cache` and the like). For each one, what it holds before it reads any text
++/// (`fresh`: what the compiler counted, see `SearchCaches`) and what it held when it was last
++/// counted (`held`).
++#[derive(Debug)]
++struct CacheSet<C> {
++    made: Vec<Option<C>>,
++    fresh: Vec<usize>,
++    held: Vec<usize>,
++}
++
++impl<C> Default for CacheSet<C> {
++    fn default() -> Self {
++        CacheSet {
++            made: Vec::new(),
++            fresh: Vec::new(),
++            held: Vec::new(),
++        }
++    }
++}
++
++impl<C: CacheBytes> CacheSet<C> {
++    /// Makes room for one cache for each entry of `fresh` (what the compiler counted for each).
++    fn resize(&mut self, fresh: &[usize]) {
++        self.made.clear();
++        self.made.resize_with(fresh.len(), || None);
++        self.fresh.clear();
++        self.fresh.extend_from_slice(fresh);
++        self.held.clear();
++        self.held.resize(fresh.len(), 0);
++    }
++
++    /// The cache `id`; made with `make`, and counted into `total`, when it is not there.
++    fn get(&mut self, id: usize, total: &mut usize, make: impl FnOnce() -> C) -> &mut C {
++        let (fresh, held) = (&mut self.fresh[id], &mut self.held[id]);
++        self.made[id].get_or_insert_with(|| {
++            let cache = make();
++            let bytes = cache.bytes();
++            // Without a size limit the compiler counted nothing: what the cache has now is
++            // all that is known of what it has before it reads any text.
++            *fresh = (*fresh).max(bytes);
++            *held = bytes;
++            *total = total.saturating_add(bytes);
++            cache
++        })
++    }
++
++    /// Counts the cache `id` again, after a search used it. What it has grown is what it holds
++    /// over `fresh`: the part of `fresh` it has not made yet (the table of the PikeVM, which
++    /// `regex_automata` makes when the PikeVM first runs) is not growth when it appears.
++    fn count(&mut self, id: usize, total: &mut usize, grown: &mut usize) {
++        if let Some(cache) = &self.made[id] {
++            let now = cache.bytes();
++            let (fresh, held) = (self.fresh[id], self.held[id]);
++            *total = total.saturating_sub(held).saturating_add(now);
++            *grown = grown
++                .saturating_sub(held.saturating_sub(fresh))
++                .saturating_add(now.saturating_sub(fresh));
++            self.held[id] = now;
++        }
++    }
++
++    fn clear(&mut self) {
++        for cache in &mut self.made {
++            *cache = None;
++        }
++        for held in &mut self.held {
++            *held = 0;
++        }
++    }
++}
++
++/// Synsema: the search caches of a program, for one thread. Upstream keeps the cache of each
++/// piece handed to the linear engine inside that piece (a pool per regex and per DFA), where
++/// nothing counts what they hold. Here they are in the scratch of the program, one per regex or
++/// DFA that searches, and every search goes through `regex_automata` with its cache
++/// (`search_half_with`, `search_slots_with`, `try_search_rev`).
++///
++/// What a cache holds is two things. What it needs whatever the text is (the table of the
++/// PikeVM, mostly: states of the NFA times capture slots, twice) is the same for every search,
++/// and is counted when the regex is compiled, inside its size limit
++/// (`compile::fresh_meta_cache_bytes`); `regex_automata` makes that table when the PikeVM first
++/// runs, not when the cache is made, so the compiler counts a cache with everything in it, and
++/// that number is what each cache is measured against here. What a cache adds while it reads
++/// text (the states of the lazy DFAs) depends on the text, and that is what the limit of the
++/// program bounds (`Prog::search_cache_limit`): after every search the cache it used is counted
++/// again, and when all of them together hold more than `limit` over what the compiler counted,
++/// all are dropped and each is made again when its piece next searches. So dropping happens
++/// once per `limit` bytes of growth and not once per search, and what the caches hold at one
++/// time is what the compiler counted, the limit, and the growth of the last search of one
++/// piece (the cache of a lazy DFA has its own limit).
++#[derive(Debug, Default)]
++pub(crate) struct SearchCaches {
++    meta: CacheSet<regex_automata::meta::Cache>,
++    #[cfg(feature = "variable-lookbehinds")]
++    lazy: CacheSet<regex_automata::hybrid::dfa::Cache>,
++    /// What all the caches hold, as last counted.
++    total: usize,
++    /// What they hold over what the compiler counted for each.
++    grown: usize,
++    /// How many times they were all dropped for growing over the limit.
++    drops: usize,
++}
++
++impl SearchCaches {
++    /// Makes room for the caches of `prog`. A scratch belongs to one program, so this only
++    /// does something the first time.
++    fn prepare(&mut self, prog: &Prog) {
++        if self.meta.made.len() != prog.meta_fresh.len() {
++            self.meta.resize(&prog.meta_fresh);
++            self.total = 0;
++            self.grown = 0;
++        }
++        #[cfg(feature = "variable-lookbehinds")]
++        if self.lazy.made.len() != prog.lazy_fresh.len() {
++            self.lazy.resize(&prog.lazy_fresh);
++            self.total = 0;
++            self.grown = 0;
++        }
++    }
++
++    fn meta(&mut self, id: usize, re: &Regex) -> &mut regex_automata::meta::Cache {
++        self.meta.get(id, &mut self.total, || re.create_cache())
++    }
++
++    #[cfg(feature = "variable-lookbehinds")]
++    fn lazy(
++        &mut self,
++        id: usize,
++        dfa: &regex_automata::hybrid::dfa::DFA,
++    ) -> &mut regex_automata::hybrid::dfa::Cache {
++        self.lazy.get(id, &mut self.total, || dfa.create_cache())
++    }
++
++    /// After a search with the cache `id`: counts it, and drops them all when they have grown
++    /// more than `limit`.
++    fn searched_meta(&mut self, id: usize, limit: usize) {
++        self.meta.count(id, &mut self.total, &mut self.grown);
++        if self.grown > limit {
++            self.clear();
++            self.drops += 1;
++        }
++    }
++
++    #[cfg(feature = "variable-lookbehinds")]
++    fn searched_lazy(&mut self, id: usize, limit: usize) {
++        self.lazy.count(id, &mut self.total, &mut self.grown);
++        if self.grown > limit {
++            self.clear();
++            self.drops += 1;
++        }
++    }
++
++    fn clear(&mut self) {
++        self.meta.clear();
++        #[cfg(feature = "variable-lookbehinds")]
++        self.lazy.clear();
++        self.total = 0;
++        self.grown = 0;
+     }
+ }
+ 
+@@ -647,9 +876,18 @@
+     /// Maximum number of bytes this pattern can match. When `leftmost_longest` is enabled and a match
+     /// of this length is found, no longer match is possible, so backtracking can stop early.
+     pub max_size: usize,
++    /// Synsema: one entry for each search cache of the program, of each kind (`SearchCaches`):
++    /// what the compiler counted for it (0 when the program has no size limit).
++    meta_fresh: Vec<usize>,
++    #[cfg_attr(not(feature = "variable-lookbehinds"), allow(dead_code))]
++    lazy_fresh: Vec<usize>,
++    /// Synsema: how much the search caches may grow before they are all dropped
++    /// (`RegexBuilder::search_cache_limit`). `usize::MAX`, as upstream: no limit.
++    pub(crate) search_cache_limit: usize,
+ }
+ 
+ impl Prog {
++    #[allow(clippy::too_many_arguments)]
+     pub(crate) fn new(
+         body: Vec<Insn>,
+         n_saves: usize,
+@@ -657,6 +895,8 @@
+         unicode: bool,
+         seek_pattern: String,
+         max_size: usize,
++        meta_fresh: Vec<usize>,
++        lazy_fresh: Vec<usize>,
+     ) -> Prog {
+         Prog {
+             body,
+@@ -666,6 +906,38 @@
+             seek_pattern,
+             scratch_pool: Pool::new(new_scratch),
+             max_size,
++            meta_fresh,
++            lazy_fresh,
++            search_cache_limit: usize::MAX,
++        }
++    }
++
++    /// Synsema: what the search caches of the program hold before they read any text, as the
++    /// compiler counted them inside the size limit (0 without one).
++    pub(crate) fn fresh_search_cache_bytes(&self) -> usize {
++        self.meta_fresh
++            .iter()
++            .chain(self.lazy_fresh.iter())
++            .fold(0usize, |sum, bytes| sum.saturating_add(*bytes))
++    }
++
++    /// Synsema: how many times the search caches of the calling thread were all dropped for
++    /// growing over the limit.
++    pub(crate) fn search_cache_drops(&self) -> usize {
++        self.scratch_pool.get().caches.drops
++    }
++
++    /// Synsema: what the search caches of the calling thread hold, as counted after the last
++    /// search of each.
++    pub(crate) fn search_cache_bytes(&self) -> usize {
++        self.scratch_pool.get().caches.total
++    }
++
++    /// Synsema: drops the search caches of the calling thread when they hold more than `keep`.
++    pub(crate) fn trim_search_caches(&self, keep: usize) {
++        let mut scratch = self.scratch_pool.get();
++        if scratch.caches.total > keep {
++            scratch.caches.clear();
+         }
+     }
+ 
+@@ -711,6 +983,10 @@
+     /// Reusable buffer for `backtrack_cut`'s slot dedup, kept to avoid
+     /// allocating on every atomic-group exit.
+     cut_scratch: Vec<usize>,
++    /// Synsema: how many saved slots `save` and `backtrack_cut` looked at since the VM last
++    /// charged for them (`take_scanned`). Both look for a slot among those already saved, one
++    /// by one, so what an instruction costs there grows with the slots of the pattern.
++    scanned: usize,
+     #[cfg(feature = "leftmost_longest")]
+     /// Reusable buffer for the leftmost-longest best-saves snapshot. Kept
+     /// across runs so that the hot backtrack path in `Insn::End` doesn't
+@@ -749,6 +1025,7 @@
+             max_stack,
+             options,
+             cut_scratch: Vec::new(),
++            scanned: 0,
+             #[cfg(feature = "leftmost_longest")]
+             best_saves: Vec::new(),
+             #[cfg(feature = "leftmost_longest")]
+@@ -769,6 +1046,7 @@
+         self.nsave = 0;
+         self.explicit_sp = n_saves;
+         self.options = options;
++        self.scanned = 0;
+         #[cfg(feature = "leftmost_longest")]
+         {
+             // Mirror `saves` length so the reusable best-saves snapshot
+@@ -815,9 +1093,11 @@
+             if self.oldsave[self.oldsave.len() - i - 1].slot == slot {
+                 // already saved, just update
+                 self.saves[slot] = val;
++                self.scanned += i;
+                 return;
+             }
+         }
++        self.scanned += self.nsave;
+         self.oldsave.push(Save {
+             slot,
+             value: self.saves[slot],
+@@ -855,6 +1135,15 @@
+         self.saves[slot]
+     }
+ 
++    /// Synsema: the steps of the slots looked at since the last call. What does not make a
++    /// whole step stays for the next one.
++    #[inline(always)]
++    fn take_scanned(&mut self) -> u64 {
++        let steps = self.scanned / SLOTS_PER_STEP;
++        self.scanned %= SLOTS_PER_STEP;
++        steps as u64
++    }
++
+     // push a value onto the explicit stack; note: the entire contents of
+     // the explicit stack is saved and restored on backtrack.
+     fn stack_push(&mut self, val: usize) {
+@@ -919,6 +1208,7 @@
+         // for other old saves, keep them only if they're for a slot that we haven't saved yet
+         for ix in oldsave_end..self.oldsave.len() {
+             let Save { slot, .. } = self.oldsave[ix];
++            self.scanned += saved.len();
+             let new_slot = !saved.contains(&slot);
+             if new_slot {
+                 saved.push(slot);
+@@ -1025,6 +1315,151 @@
+     }
+ }
+ 
++/// Synsema: where a case-insensitive backreference to `literal` (the text of its group) ends
++/// when it matches at `ix`.
++///
++/// Upstream compares a stretch of the text as long in bytes as the group. Two characters that
++/// are equal under simple case folding can differ in length (`ẞ` U+1E9E takes 3 bytes and `ß`
++/// U+00DF takes 2; the Kelvin sign U+212A takes 3 and `k` takes 1), so that stretch can end in
++/// the middle of what the group would match, or after it. Here, in Unicode mode, the text is
++/// read one character for each character of the group, with the same equivalence
++/// (`chars_fold_equal`: the one of a case-insensitive literal), and the reference ends where
++/// the last of them does. A pair of characters that needs `chars_fold_equal` takes
++/// `FOLD_STEPS` steps.
++///
++/// It pays for the bytes it compares, like the reference that tells upper case from lower.
++/// When the text left is shorter than the group, upstream says "no" without looking, and so
++/// does this unless the text has a character with a shorter equivalent (`text_can_shrink`,
++/// worked out once per search, in `can_shrink`): a group is a piece of the text, so without one
++/// no group can match fewer bytes than it has. That keeps `(é+)\1`, which tries the reference
++/// once for every length of the group, at one comparison and not one per length.
++fn casei_backref_end<S: HaystackInput + ?Sized>(
++    s: &S,
++    ix: usize,
++    literal: &[u8],
++    unicode: bool,
++    steps: &mut u64,
++    can_shrink: &mut Option<bool>,
++) -> Result<Option<usize>> {
++    let same_len_end = ix + literal.len();
++    let bytes = s.as_bytes();
++    if same_len_end <= bytes.len() {
++        spend(steps, stretch(literal.len()))?;
++        if &bytes[ix..same_len_end] == literal {
++            return Ok(Some(same_len_end));
++        }
++    }
++    if !unicode {
++        // As upstream: ASCII-only folding over a stretch of the same length.
++        return Ok(matches_literal_casei(s, ix, same_len_end, literal, unicode)
++            .then_some(same_len_end));
++    }
++    if same_len_end > bytes.len() {
++        let can_shrink = match *can_shrink {
++            Some(known) => known,
++            None => {
++                spend(steps, stretch(bytes.len()))?;
++                *can_shrink.insert(text_can_shrink(bytes))
++            }
++        };
++        if !can_shrink {
++            return Ok(None);
++        }
++        spend(steps, stretch(bytes.len() - ix))?;
++    }
++    let Ok(literal) = core::str::from_utf8(literal) else {
++        return Ok(None);
++    };
++    let mut pos = ix;
++    for l in literal.chars() {
++        if pos >= bytes.len() {
++            return Ok(None);
++        }
++        let end = pos + codepoint_len(bytes[pos]);
++        if end > bytes.len() {
++            return Ok(None);
++        }
++        // The haystack is valid UTF-8 in Unicode mode; anything else does not match.
++        let Some(t) = core::str::from_utf8(&bytes[pos..end])
++            .ok()
++            .and_then(|t| t.chars().next())
++        else {
++            return Ok(None);
++        };
++        if t != l {
++            if t.is_ascii() && l.is_ascii() {
++                if !t.eq_ignore_ascii_case(&l) {
++                    return Ok(None);
++                }
++            } else {
++                spend(steps, FOLD_STEPS)?;
++                if !chars_fold_equal(t, l) {
++                    return Ok(None);
++                }
++            }
++        }
++        pos = end;
++    }
++    Ok(Some(pos))
++}
++
++/// Synsema: the characters that have, under simple case folding, an equivalent that takes fewer
++/// bytes in UTF-8 (`ſ` and `s`, the Kelvin sign and `k`, `ẞ` and `ß`…), as sorted ranges; `None`
++/// when the case folding tables are not there. For each length in UTF-8, they are what the
++/// shorter characters fold to among the characters of that length.
++fn build_shrinking_chars() -> Option<Box<[(char, char)]>> {
++    use regex_syntax::hir::{ClassUnicode, ClassUnicodeRange};
++
++    // The last character of the shorter lengths, and the characters of the next one.
++    let lengths: [(char, &[(char, char)]); 3] = [
++        ('\u{7F}', &[('\u{80}', '\u{7FF}')]),
++        ('\u{7FF}', &[('\u{800}', '\u{D7FF}'), ('\u{E000}', '\u{FFFF}')]),
++        ('\u{FFFF}', &[('\u{10000}', '\u{10FFFF}')]),
++    ];
++    let mut out = Vec::new();
++    for (last_shorter, longer) in lengths {
++        let mut folded = ClassUnicode::new([ClassUnicodeRange::new('\0', last_shorter)]);
++        folded.try_case_fold_simple().ok()?;
++        folded.intersect(&ClassUnicode::new(
++            longer.iter().map(|&(a, b)| ClassUnicodeRange::new(a, b)),
++        ));
++        out.extend(folded.ranges().iter().map(|r| (r.start(), r.end())));
++    }
++    Some(out.into())
++}
++
++/// Synsema: `build_shrinking_chars`, worked out once for the process where there is `std`.
++fn with_shrinking_chars<R>(f: impl FnOnce(Option<&[(char, char)]>) -> R) -> R {
++    #[cfg(feature = "std")]
++    {
++        static CHARS: std::sync::OnceLock<Option<Box<[(char, char)]>>> =
++            std::sync::OnceLock::new();
++        f(CHARS.get_or_init(build_shrinking_chars).as_deref())
++    }
++    #[cfg(not(feature = "std"))]
++    {
++        f(build_shrinking_chars().as_deref())
++    }
++}
++
++/// Synsema: whether a piece of `text` can be equal, without regard to case, to a text of fewer
++/// bytes: whether it has a character with a shorter equivalent. When it cannot be told (text
++/// that is not UTF-8, no case folding tables), yes.
++fn text_can_shrink(text: &[u8]) -> bool {
++    if text.is_ascii() {
++        return false;
++    }
++    let Ok(text) = core::str::from_utf8(text) else {
++        return true;
++    };
++    with_shrinking_chars(|chars| match chars {
++        Some(chars) => text
++            .chars()
++            .any(|c| !c.is_ascii() && range_contains(chars, c)),
++        None => true,
++    })
++}
++
+ fn matches_literal_casei<S: HaystackInput + ?Sized>(
+     s: &S,
+     ix: usize,
+@@ -1114,33 +1549,41 @@
+ 
+ /// Run the program with trace printing for debugging.
+ pub fn run_trace(prog: &Prog, s: &str, pos: usize) -> Result<Option<Vec<usize>>> {
++    let mut steps = u64::MAX;
+     run(
+         prog,
+         &RegexInput::new(s).from_pos(pos),
+         OPTION_TRACE,
+         &HardRegexRuntimeOptions::default(),
++        &mut steps,
+     )
+ }
+ 
+ /// Run the program with default options.
+ pub fn run_default(prog: &Prog, s: &str, pos: usize) -> Result<Option<Vec<usize>>> {
++    let mut steps = u64::MAX;
+     run(
+         prog,
+         &RegexInput::new(s).from_pos(pos),
+         0,
+         &HardRegexRuntimeOptions::default(),
++        &mut steps,
+     )
+ }
+ 
+ /// Run the program with options, returning the full saves vector on a match.
++///
++/// Synsema: `steps` is what the search may spend, and comes back with what is left (see
++/// `run_with`).
+ pub(crate) fn run<S: HaystackInput + ?Sized>(
+     prog: &Prog,
+     input: &RegexInput<'_, S>,
+     option_flags: u32,
+     options: &HardRegexRuntimeOptions,
++    steps: &mut u64,
+ ) -> Result<Option<Vec<usize>>> {
+     // The clone is the one allocation the caller keeps (it owns the captures).
+-    run_with(prog, input, option_flags, options, |state| {
++    run_with(prog, input, option_flags, options, steps, |state| {
+         state.saves.clone()
+     })
+ }
+@@ -1155,20 +1598,29 @@
+     input: &RegexInput<'_, S>,
+     option_flags: u32,
+     options: &HardRegexRuntimeOptions,
++    steps: &mut u64,
+ ) -> Result<Option<(usize, usize)>> {
+-    run_with(prog, input, option_flags, options, |state| {
++    run_with(prog, input, option_flags, options, steps, |state| {
+         (state.get(0), state.get(1))
+     })
+ }
+ 
+ /// Run the program with options; `extract` pulls the result out of the final
+ /// state before the scratch returns to the pool.
++///
++/// Synsema: `steps` is the budget of the search. Every instruction the VM runs takes one step.
++/// One that reads a stretch of the text (a literal, a delegate to the linear engine, a
++/// look-behind, `(?~…)`, a backreference, `\Z`) takes one more for every `BYTES_PER_STEP` bytes
++/// of the stretch; one that walks capture slots, one more for every `SLOTS_PER_STEP` slots.
++/// Without a step to take, the search ends with `RuntimeError::StepLimitExceeded`. With
++/// `u64::MAX` nothing reaches the limit, and the search is the one of upstream.
+ #[allow(clippy::cognitive_complexity)]
+ fn run_with<S: HaystackInput + ?Sized, T>(
+     prog: &Prog,
+     input: &RegexInput<'_, S>,
+     option_flags: u32,
+     options: &HardRegexRuntimeOptions,
++    steps: &mut u64,
+     extract: impl FnOnce(&State) -> T,
+ ) -> Result<Option<T>> {
+     if input.is_done() {
+@@ -1177,10 +1629,21 @@
+     let haystack = input.haystack();
+     let pos = input.effective_start();
+     let match_range = input.get_range();
++    // Synsema: starting a search sets up every slot of the program.
++    spend(steps, (prog.n_saves / SLOTS_PER_STEP) as u64)?;
+     let mut scratch_guard = prog.scratch_pool.get();
+-    let Scratch { state, inner_slots } = &mut *scratch_guard;
++    let Scratch {
++        state,
++        inner_slots,
++        caches,
++    } = &mut *scratch_guard;
+     state.reset(prog.n_saves, option_flags);
+     inner_slots.clear();
++    caches.prepare(prog);
++    let cache_limit = prog.search_cache_limit;
++    // Synsema: whether the text has a character with a shorter equivalent without regard to
++    // case; worked out when a reference first needs it (`casei_backref_end`).
++    let mut can_shrink: Option<bool> = None;
+     let look_matcher = LookMatcher::new();
+     #[cfg(feature = "std")]
+     if option_flags & OPTION_TRACE != 0 {
+@@ -1202,6 +1665,8 @@
+             if option_flags & OPTION_TRACE != 0 {
+                 println!("{}\t{} {:?}", ix, pc, prog.body[pc]);
+             }
++            // Synsema: one step for the instruction, and what the one before left to pay.
++            spend(steps, 1 + state.take_scanned())?;
+             match prog.body[pc] {
+                 Insn::End => {
+                     // save of end position into slot 1 is now done
+@@ -1281,6 +1746,8 @@
+                     }
+                 }
+                 Insn::Lit(ref val) => {
++                    // Synsema: a literal pays for the bytes it compares.
++                    spend(steps, stretch(val.len()))?;
+                     let ix_end = ix + val.len();
+                     if !matches_literal(haystack, ix, ix_end, val.as_bytes()) {
+                         break 'fail;
+@@ -1288,16 +1755,22 @@
+                     ix = ix_end
+                 }
+                 Insn::LitBytes(ref bytes) => {
++                    spend(steps, stretch(bytes.len()))?;
+                     let ix_end = ix + bytes.len();
+                     if !matches_literal(haystack, ix, ix_end, bytes) {
+                         break 'fail;
+                     }
+                     ix = ix_end
+                 }
+-                Insn::LitCasei(ref lit) => match lit.match_len(haystack, ix) {
+-                    Some(len) => ix += len,
+-                    None => break 'fail,
+-                },
++                Insn::LitCasei(ref lit) => {
++                    // Synsema: it decodes and looks up one character at a time; a character of
++                    // the literal pays like four bytes of a plain one.
++                    spend(steps, stretch(lit.chars.len() * 4))?;
++                    match lit.match_len(haystack, ix) {
++                        Some(len) => ix += len,
++                        None => break 'fail,
++                    }
++                }
+                 Insn::CharClass(ref matcher) => match matcher.match_len(haystack, ix) {
+                     Some(len) => ix += len,
+                     None => break 'fail,
+@@ -1322,16 +1795,15 @@
+                         }
+                         Assertion::EndTextIgnoreTrailingNewlines { crlf } => {
+                             let bytes = haystack.as_bytes();
+-                            let matched = if ix == bytes.len() {
+-                                // At the end of string
+-                                true
+-                            } else if crlf {
+-                                // In CRLF mode, trailing \r\n pairs and bare \n are ignored
+-                                bytes[ix..].iter().all(|&b| b == b'\n' || b == b'\r')
+-                            } else {
+-                                // Check if all remaining bytes are newlines
+-                                bytes[ix..].iter().all(|&b| b == b'\n')
+-                            };
++                            // Synsema: the same test as upstream (in CRLF mode, trailing \r\n
++                            // pairs and bare \n are ignored; otherwise, newlines), counting the
++                            // newlines it walks over to pay for them.
++                            let newlines = bytes[ix..]
++                                .iter()
++                                .take_while(|&&b| b == b'\n' || (crlf && b == b'\r'))
++                                .count();
++                            spend(steps, stretch(newlines))?;
++                            let matched = ix + newlines == bytes.len();
+                             slash_z_matched |= matched;
+                             matched
+                         }
+@@ -1451,14 +1923,14 @@
+                 Insn::Save(slot) => state.save(slot, ix),
+                 Insn::Save0(slot) => state.save(slot, 0),
+                 Insn::SaveCaptureGroupStart(group) => {
+-                    let start_slot = group * 2;
+-                    // if the capture group's start slot is empty
+-                    // i.e. execution is not currently inside this capture group
+-                    // or the end slot for that capture group is complete
+-                    // then we save the current position in the capture group start slot
+-                    if state.get(start_slot) == usize::MAX || state.get(start_slot + 1) <= ix {
+-                        state.save(start_slot, ix);
+-                    }
++                    // Synsema: upstream decides here whether the group is open (it does not
++                    // save when the group has an end ahead of `ix`), and a look-ahead or a
++                    // call that enters the group further back than its last match looks the
++                    // same: the group came out with the start of one match and the end of
++                    // another. The compiler knows where a group is entered while it is open,
++                    // and emits this instruction only where it is not
++                    // (`Compiler::compile_group`).
++                    state.save(group * 2, ix);
+                 }
+                 Insn::SaveCaptureGroupStartKeepPrevious { group, previous } => {
+                     let start_slot = group * 2;
+@@ -1542,12 +2014,21 @@
+                     }
+                 }
+                 Insn::GoBack(count) => {
++                    // Synsema: it pays for the bytes it walks, also when the text ends before
++                    // it walked all its characters.
++                    let from = ix;
++                    let mut walked = true;
+                     for _ in 0..count {
+                         if ix == 0 {
+-                            break 'fail;
++                            walked = false;
++                            break;
+                         }
+                         ix = prev_ix(haystack, ix, prog.bytes_mode);
+                     }
++                    spend(steps, stretch(from - ix))?;
++                    if !walked {
++                        break 'fail;
++                    }
+                 }
+                 Insn::ReverseLookbehindPosCheck {
+                     slot,
+@@ -1607,16 +2088,37 @@
+                         // Referenced group hasn't matched, so the backref doesn't match either
+                         break 'fail;
+                     }
++                    // Synsema: a group with its start after its end has no text. Nothing
++                    // builds one (see `SaveCaptureGroupStart`); this is so that a mistake there
++                    // is a reference that does not match and not a panic in the slice below.
++                    if lo > hi {
++                        break 'fail;
++                    }
+                     let ref_text = &haystack.as_bytes()[lo..hi];
+                     let ix_end = ix + ref_text.len();
+                     if casei {
+-                        if !matches_literal_casei(haystack, ix, ix_end, ref_text, unicode) {
++                        match casei_backref_end(
++                            haystack,
++                            ix,
++                            ref_text,
++                            unicode,
++                            steps,
++                            &mut can_shrink,
++                        )? {
++                            Some(end) => ix = end,
++                            None => break 'fail,
++                        }
++                    } else {
++                        // Synsema: it pays for the bytes it compares (none when the text left
++                        // is shorter than the group).
++                        if ix_end <= haystack.len() {
++                            spend(steps, stretch(ref_text.len()))?;
++                        }
++                        if !matches_literal(haystack, ix, ix_end, ref_text) {
+                             break 'fail;
+                         }
+-                    } else if !matches_literal(haystack, ix, ix_end, ref_text) {
+-                        break 'fail;
++                        ix = ix_end;
+                     }
+-                    ix = ix_end;
+                 }
+                 Insn::BackrefExistsCondition(slot) => {
+                     let lo = state.get(slot);
+@@ -1632,21 +2134,26 @@
+                 #[cfg(feature = "variable-lookbehinds")]
+                 Insn::BackwardsDelegate(ReverseBackwardsDelegate {
+                     ref dfa,
+-                    ref cache_pool,
++                    cache,
+                     pattern: _,
+                     ref capture_group_extraction_inner,
++                    forward_cache,
+                     capture_groups,
+                 }) => {
+                     // Use regex-automata to search backwards from current position
+-                    let mut cache_guard = cache_pool.get();
+                     let input = Input::new(haystack.as_bytes())
+                         .anchored(Anchored::Yes)
+                         .range(0..ix);
+ 
+-                    match dfa.try_search_rev(&mut cache_guard, &input) {
++                    // Synsema: with the cache of the program, counted after the search.
++                    let found = dfa.try_search_rev(caches.lazy(cache, dfa), &input);
++                    caches.searched_lazy(cache, cache_limit);
++                    match found {
+                         Ok(Some(match_result)) => {
+                             // Update ix to the start position of the match
+                             let match_start = match_result.offset();
++                            // Synsema: it pays for the stretch it matched.
++                            spend(steps, stretch(ix - match_start))?;
+ 
+                             if let Some(inner) = capture_group_extraction_inner {
+                                 if let Some(range) = capture_groups {
+@@ -1655,8 +2162,23 @@
+                                         .span(match_start..ix)
+                                         .anchored(Anchored::Yes);
+                                     inner_slots.resize((range.end() - range.start() + 1) * 2, None);
++                                    // Synsema: the forward search reads the stretch again and
++                                    // fills a slot per group.
++                                    spend(
++                                        steps,
++                                        stretch(ix - match_start)
++                                            + (inner_slots.len() / SLOTS_PER_STEP) as u64,
++                                    )?;
++                                    let matched = inner
++                                        .search_slots_with(
++                                            caches.meta(forward_cache, inner),
++                                            &forward_input,
++                                            inner_slots,
++                                        )
++                                        .is_some();
++                                    caches.searched_meta(forward_cache, cache_limit);
+ 
+-                                    if inner.search_slots(&forward_input, inner_slots).is_some() {
++                                    if matched {
+                                         // Store capture group positions, ignoring any whose range is earlier than what has been stored already
+                                         store_capture_groups(state, inner_slots, range, true);
+                                     } else {
+@@ -1677,7 +2199,7 @@
+                 #[cfg(feature = "variable-lookbehinds")]
+                 Insn::HardVariableLookbehind(HardVariableLookbehind {
+                     ref dfa,
+-                    ref cache_pool,
++                    cache,
+                     ref end_pos_slot,
+                     pattern: _,
+                     ref candidate_pos_slot,
+@@ -1691,30 +2213,44 @@
+                     if state.hard_lb_candidates_for != Some((pc, end_pos)) {
+                         state.hard_lb_candidates.clear();
+                         state.hard_lb_candidates_for = Some((pc, end_pos));
+-                        let mut cache_guard = cache_pool.get();
+                         let mut overlap_state =
+                             regex_automata::hybrid::dfa::OverlappingState::start();
+                         let input = Input::new(haystack.as_bytes())
+                             .anchored(Anchored::Yes)
+                             .range(0..end_pos);
++                        // Synsema: with the cache of the program, counted after the searches;
++                        // a step for every candidate, and the stretch back to the furthest one.
++                        let mut furthest = end_pos;
++                        let mut out_of_steps = false;
++                        let lazy = caches.lazy(cache, dfa);
+                         loop {
+-                            if backtrack_count + state.hard_lb_candidates.len()
++                            if usize::saturating_add(backtrack_count, state.hard_lb_candidates.len())
+                                 > options.backtrack_limit
+                             {
+                                 break;
+                             }
+-                            match dfa.try_search_overlapping_rev(
+-                                &mut cache_guard,
+-                                &input,
+-                                &mut overlap_state,
+-                            ) {
++                            if *steps == 0 {
++                                out_of_steps = true;
++                                break;
++                            }
++                            *steps -= 1;
++                            match dfa.try_search_overlapping_rev(lazy, &input, &mut overlap_state)
++                            {
+                                 Ok(()) => match overlap_state.get_match() {
+-                                    Some(m) => state.hard_lb_candidates.push(m.offset()),
++                                    Some(m) => {
++                                        furthest = furthest.min(m.offset());
++                                        state.hard_lb_candidates.push(m.offset())
++                                    }
+                                     None => break,
+                                 },
+                                 Err(_) => break,
+                             }
+                         }
++                        caches.searched_lazy(cache, cache_limit);
++                        if out_of_steps {
++                            return Err(Error::RuntimeError(RuntimeError::StepLimitExceeded));
++                        }
++                        spend(steps, stretch(end_pos - furthest))?;
+                     }
+ 
+                     // The candidate slot is `end_pos` on entry (saved just before this
+@@ -1751,27 +2287,41 @@
+                     ref inner,
+                     pattern: _,
+                     capture_groups,
++                    cache,
+                 }) => {
+                     let input = Input::new(haystack.as_bytes())
+                         .span(ix..haystack.len())
+                         .anchored(Anchored::Yes);
+-                    if let Some(range) = capture_groups {
++                    // Synsema: the searches go with the cache of the program, counted after
++                    // each one, and pay for the stretch they matched (and for the slots, one
++                    // per group, when there are groups to fill).
++                    let end = if let Some(range) = capture_groups {
+                         // Has capture groups, need to extract them
+                         inner_slots.resize((range.end() - range.start() + 1) * 2, None);
+-                        if inner.search_slots(&input, inner_slots).is_some() {
+-                            // store the capture groups, no need to check current state to see if new values are further to the right
+-                            store_capture_groups(state, inner_slots, range, false);
+-                            ix = inner_slots[1].unwrap().get();
+-                        } else {
+-                            break 'fail;
++                        spend(steps, (inner_slots.len() / SLOTS_PER_STEP) as u64)?;
++                        let matched = inner
++                            .search_slots_with(caches.meta(cache, inner), &input, inner_slots)
++                            .is_some();
++                        caches.searched_meta(cache, cache_limit);
++                        match (matched, inner_slots.get(1).copied().flatten()) {
++                            (true, Some(end)) => {
++                                // store the capture groups, no need to check current state to see if new values are further to the right
++                                store_capture_groups(state, inner_slots, range, false);
++                                end.get()
++                            }
++                            _ => break 'fail,
+                         }
+                     } else {
+                         // No groups, so we can use faster methods
+-                        match inner.search_half(&input) {
+-                            Some(m) => ix = m.offset(),
++                        let found = inner.search_half_with(caches.meta(cache, inner), &input);
++                        caches.searched_meta(cache, cache_limit);
++                        match found {
++                            Some(m) => m.offset(),
+                             _ => break 'fail,
+                         }
+-                    }
++                    };
++                    spend(steps, stretch(end - ix))?;
++                    ix = end;
+                 }
+                 Insn::AbsentRepeater(ref delegate) => {
+                     // The absent operator matches the shortest string not containing the delegate pattern
+@@ -1784,7 +2334,15 @@
+                         .span(ix..haystack.len())
+                         .anchored(Anchored::Yes);
+                     // capture groups in the delegate are always ignored, so we can use the quicker search_half method
+-                    let delegate_matches_here = delegate.inner.search_half(&input).is_some();
++                    // Synsema: with the cache of the program, and paying for the stretch.
++                    let found = delegate
++                        .inner
++                        .search_half_with(caches.meta(delegate.cache, &delegate.inner), &input);
++                    caches.searched_meta(delegate.cache, cache_limit);
++                    if let Some(m) = found {
++                        spend(steps, stretch(m.offset() - ix))?;
++                    }
++                    let delegate_matches_here = found.is_some();
+ 
+                     if delegate_matches_here {
+                         // Delegate matches at current position - we've reached the boundary
+@@ -1822,7 +2380,9 @@
+                         break 'fail;
+                     }
+                 }
+-                Insn::Seek(Seek { ref inner, .. }) => {
++                Insn::Seek(Seek {
++                    ref inner, cache, ..
++                }) => {
+                     #[cfg(feature = "leftmost_longest")]
+                     if leftmost_longest
+                         && apply_best_saves(
+@@ -1850,9 +2410,14 @@
+                         //       as we only care about the start of the match, but unfortunately this doesn't
+                         //       always return the correct start position, perhaps a bug in regex-automata
+                         let seek_input = Input::new(haystack.as_bytes()).span(ix..match_range.end);
+-                        match inner.search(&seek_input) {
++                        // Synsema: with the cache of the program, and paying for the stretch
++                        // it read up to the end of what it found.
++                        let found = inner.search_with(caches.meta(cache, inner), &seek_input);
++                        caches.searched_meta(cache, cache_limit);
++                        match found {
+                             None => return Ok(None),
+                             Some(m) => {
++                                spend(steps, stretch(m.end() - ix))?;
+                                 // Compute the next position to retry the seek from on backtrack:
+                                 // one codepoint past the start of this match (or past the end for
+                                 // zero-width matches) so we make progress.

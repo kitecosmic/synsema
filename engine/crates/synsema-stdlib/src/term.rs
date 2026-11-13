@@ -241,11 +241,17 @@ fn activate(want_paste: bool, want_kitty: bool) -> Result<Active, String> {
     Ok(*a)
 }
 
-fn install_panic_hook() {
+/// Antes de que un pánico termine el programa, la consola vuelve a como estaba. Un pánico que
+/// `backtrack_*` atrapa (v0.6.60) no lo termina: es un error de esa llamada y el programa sigue
+/// con su terminal abierta, así que por ése la consola no se toca. No depende de cuál de los dos
+/// hooks se instaló primero (`backtrack::panic_is_caught`).
+pub(crate) fn install_panic_hook() {
     PANIC_HOOK.get_or_init(|| {
         let prev = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
-            restore_all();
+            if !crate::backtrack::panic_is_caught() {
+                restore_all();
+            }
             prev(info);
         }));
     });

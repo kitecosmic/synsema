@@ -2248,6 +2248,11 @@ fn serve_builder(w: Arc<ServeWiring>) -> crate::engine::InterpBuilder {
 #[allow(clippy::too_many_arguments)]
 /// v0.6.47 (T1): el dueño de la corrida de una entrada de serve. Si el hilo se desenrolla antes de
 /// cerrarla, la cierra con corte (`specs/t1-diario-modelo.md`).
+///
+/// v0.6.60 (ronda 2, N-2): también es el dueño de los patrones de regex que la entrada compiló.
+/// Las cachés son del hilo y viven lo que una entrada: al terminar bien las suelta
+/// `reset_for_request`; si la entrada entra en pánico, el intérprete se descarta sin pasar por
+/// ahí y el hilo del pool sigue vivo, así que las suelta este `Drop`, que corre en los dos casos.
 struct RunOwner<'a> {
     swarm: &'a Arc<Swarm>,
     scope: Option<Arc<synsema_core::interpreter::RunCut>>,
@@ -2255,6 +2260,7 @@ struct RunOwner<'a> {
 
 impl Drop for RunOwner<'_> {
     fn drop(&mut self) {
+        synsema_core::pattern_cache::clear_thread_caches();
         if let Some(s) = self.scope.take() {
             self.swarm.close_run(&s, true);
             synsema_agents::blackboard::set_thread_scope(None);
@@ -5408,6 +5414,37 @@ mod tests {
         assert!(r.is_err());
         assert_eq!(swarm.blackboard.read("k", ""), None);
         assert!(synsema_agents::blackboard::thread_scope().is_none());
+    }
+
+    /// v0.6.60 (ronda 2, N-2): una entrada de serve que entra en pánico no deja en el hilo los
+    /// patrones de regex que compiló. El hilo del pool sigue vivo y atiende la entrada siguiente:
+    /// sin esto, esa entrada encontraba compilado lo que compiló la anterior.
+    #[test]
+    fn a_panicking_entry_drops_its_compiled_patterns() {
+        use synsema_core::pattern_cache::clear_thread_caches;
+        let swarm = Arc::new(Swarm::new());
+        // Una entrada que compila dos patrones y entra en pánico, con o sin dueño.
+        let entry = |owned: bool| {
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _owner = owned.then(|| RunOwner { swarm: &swarm, scope: None });
+                let mut interp = Interpreter::new();
+                let program = synsema_core::parser::parse_source(
+                    "let a be regex_find_all(\"ab1\", \"[a-z]+\")\nlet b be regex_find_all(\"ab1\", \"[0-9]+\")\n",
+                    "<n2>",
+                )
+                .expect("parse");
+                assert!(interp.execute(&program).is_ok());
+                panic!("bug del motor");
+            }));
+            assert!(r.is_err());
+        };
+        clear_thread_caches();
+        // sin dueño, los dos compilados quedan en el hilo (lo que se quiere evitar)…
+        entry(false);
+        assert_eq!(clear_thread_caches(), 2);
+        // …y con dueño se sueltan al desenrollar
+        entry(true);
+        assert_eq!(clear_thread_caches(), 0, "quedaron patrones compilados en el hilo");
     }
 
     /// v0.6.46 (backlog §10): un `deny` del host en la raíz de un `static` (o en todo su árbol)

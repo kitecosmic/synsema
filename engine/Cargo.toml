@@ -16,6 +16,10 @@ members = [
     "crates/synsema-wasm",
     "crates/synsema-wasm-web",
 ]
+# vendor/ tiene crates de terceros con un parche nuestro (hoy, fancy-regex): los toma por path la
+# crate que los usa (`[workspace.dependencies]`, abajo) y no son miembros (no se testean ni se
+# formatean con el motor).
+exclude = ["vendor"]
 
 [workspace.package]
 version = "0.1.0"
@@ -35,6 +39,15 @@ num-integer = "0.1"
 # Map ordenado (Python dict preserva orden de inserción) y regex (puro Rust, sin C).
 indexmap = "2"
 regex = "1"
+# v0.6.60: el motor de `regex` sin su fachada, para las `regex_*` (core, `linear_regex.rs`). La
+# crate `regex` guarda sus cachés de búsqueda adentro del compilado, donde nadie las mide; con el
+# compilado guardado entre llamadas hace falta la caché aparte (`meta::Regex::search_with`).
+# Estaba en el Cargo.lock como 0.4.14 (es de lo que está hecha `regex`); el fork de `fancy-regex`
+# pide 0.4.16 y cargo deja una sola 0.4.x en el build: queda en 0.4.18, que arregla regex#1354
+# (una búsqueda que no daba la coincidencia de más a la izquierda; cambia lo que dan `regex_*`
+# en esos patrones, y está en el CHANGELOG). Las features son las que `regex` enciende por
+# defecto, para que el motor sea el mismo aunque `regex` no esté en el build.
+regex-automata = { version = "0.4.16", default-features = false, features = ["std", "syntax", "meta", "nfa-pikevm", "nfa-backtrack", "hybrid", "dfa-onepass", "perf-inline", "perf-literal", "unicode"] }
 # Decimal exacto base-10 para dinero/finanzas (tipo Decimal). Puro Rust (96-bit,
 # 28-29 dígitos significativos), sin deps C → preserva el binario único estático.
 # `db-postgres` la enciende synsema-stdlib bajo su feature `native` (postgres-protocol
@@ -260,6 +273,20 @@ bech32 = "0.11"
 #                      rustls con provider aws-lc-sys) — el TLS de `wss://` lo pone ws.rs con
 #                      el MISMO rustls/ring + rustls-native-certs que http.rs.
 bip39 = { version = "2", default-features = false, features = ["std", "unicode-normalization", "zeroize"] }
+# v0.6.60 (texto para tokenizadores), las dos puro Rust y ya en el Cargo.lock:
+#   unicode-normalization : `nfc`/`nfd`/`nfkc`/`nfkd` (unicode_norm.rs). Es la que ya traía bip39.
+#                           Sus tablas son Unicode 17.0; un test fija la versión.
+#   fancy-regex           : el motor de `backtrack_*` (backtrack.rs), el mismo de tiktoken. Es el
+#                           código de `vendor/fancy-regex`: la 0.20.2 con el parche de Synsema
+#                           (presupuesto de pasos adentro de la VM, techo del compilado y de las
+#                           cachés de búsqueda; qué cambia, por qué y cómo se actualiza:
+#                           `vendor/fancy-regex/SYNSEMA.md`). Entra por path y sólo acá: en 0.x una
+#                           versión menor puede cambiar qué significa un patrón, y eso es un cambio
+#                           del lenguaje. Las otras dos del Cargo.lock vienen de crates.io tal cual
+#                           y no las toca el parche: 0.18.0 (candle-transformers) y 0.17.0
+#                           (tokenizers 0.23).
+unicode-normalization = "0.1.25"
+fancy-regex = { path = "vendor/fancy-regex" }
 # Batch 16 (Bitcoin): ripemd160 — la ÚNICA pieza de hash160 (= ripemd160(sha256(x)),
 # el hash de direcciones de Bitcoin) que faltaba en el árbol. RustCrypto puro-Rust,
 # misma familia que hmac/sha2/pbkdf2 ya presentes; CERO `*-sys`/C (G8).

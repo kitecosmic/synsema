@@ -6,6 +6,377 @@ Each says what changed, why, and what to write instead.
 
 Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the release date.
 
+## v0.6.60 — unreleased
+
+Text for tokenizers: what a BPE or WordPiece tokenizer written in Synsema was missing.
+
+**Language and engine.**
+- **Unicode normalization: `nfc(text)`, `nfd(text)`, `nfkc(text)`, `nfkd(text)`.** The four forms
+  of UAX #15, text in and text out, pure (no capability; also in wasm).
+  `nfc("e\u0301") == "\u00e9"` is `true`; `nfkc("\ufb01")` is `"fi"`; `nfd` splits a letter from
+  its accents, so `regex_replace(nfd(s), "\\p{Mn}", "")` strips them (what BERT does).
+  - **`==`, map keys and hashes still compare the bytes** — `"\u00e9" == "e\u0301"` is `false`, as
+    in Rust, Go, Zig and C. To make the two spellings of a text equal (a key, a `sha256`, a
+    comparison), normalize both with the same form.
+  - **Text only:** `nfc(bytes("x"))` → `nfc expects text, got bytes — decode it first:
+    nfc(decode(b))`; a number or a list → `nfc expects text, got number`.
+  - **The tables are Unicode 17.0.** For every character assigned in an older version the result
+    is the one that version gives (Unicode's stability policy); a character assigned since then
+    normalizes by its new rules: `nfkc("\ua7f1")` is `"S"` here and the character itself in
+    Python 3.12 (Unicode 15). A later Unicode version will be a line in this file.
+- **Regex with look-around: `backtrack_find_all(text, pattern)`, `backtrack_capture(text, pattern)`,
+  `backtrack_replace(text, pattern, replacement)`, `backtrack_matches(text, pattern)`.** The pairs
+  of `regex_find_all`, `regex_capture`, `regex_replace` and `matches` — same arguments, same shape
+  of result, same replacement template (`\1`, `\g<1>`, a literal `$`) — on an engine that
+  backtracks (the one `tiktoken` uses): look-ahead `(?=…)` `(?!…)`, look-behind `(?<=…)` `(?<!…)`,
+  backreferences `\1`, possessive repetitions `a++` `a*+` `a?+` and atomic groups `(?>…)`. Pure
+  (no capability; also in wasm). The split pattern of GPT-2 and of `cl100k_base` runs as written:
+  `backtrack_find_all("a   b", "\\s+(?!\\S)|\\s+")` → `["  ", " "]`.
+  - **A family of its own, not `regex_*` choosing an engine by the pattern:** the two engines read
+    the same text differently — `a++a` on `aaaa` matches in `regex_find_all` (a repetition of a
+    repetition) and does not in `backtrack_find_all` (a possessive one) — so a pattern must not
+    change meaning because a look-ahead was added to it. `regex_*` stay linear in time; reach for
+    `backtrack_*` when the pattern needs what only they have.
+  - **Every call has a step limit, `max_steps`,** so a pattern that does too much work on a text
+    is an error the program can catch and not a hang: `backtrack_find_all: step limit exceeded
+    (max_steps = 1048576) — the pattern did more work on this text than the limit allows; if a
+    repetition is tried again from every position of a long run (\d+(?![\d.]) reads a long number
+    once from each of its digits), say where a match may start ((?<!\d)\d+(?![\d.])); if it
+    backtracks (nested or ambiguous repetitions, look-arounds inside repetitions), make
+    repetitions possessive (a++, a*+) or atomic ((?>…)); if the work is what the pattern needs,
+    pass a higher max_steps`.
+    - **A step is work, not a backtrack:** one for each instruction the engine runs, and one more
+      for every 16 bytes of a stretch of text that an instruction matched or compared (a run of
+      `\w+`, the text of a backreference), walked back over (a look-behind of fixed length) or
+      skipped (the newlines before `\Z`), and for every 16 capture slots at the start of each
+      search. Both ways of doing too much run out of steps:
+      backtracking that grows exponentially (`(a+)+$(?<!x)`), and look-arounds nested in
+      repetitions, which do a lot of work between one backtrack and the next
+      (`(?:(?=(?:(?=[^x]*y)a)*+y)a)*+y` on 3 200 characters is the error of the limit; with a
+      `max_steps` high enough to let it finish, it runs for some 9 seconds).
+    - **The limit is exact and deterministic:** a call that needs `max_steps` steps or fewer never
+      fails, no call takes one step more, and the same call takes the same steps on every
+      platform. It never looks at the clock.
+    - **By default it is `max(1048576, (64 + the instructions of the compiled pattern) × the
+      bytes of the text)`;** `max_steps = N` (by name, an integer of 1 or more) sets it for one
+      call. A search that does not repeat work runs each instruction of the pattern at most once
+      at each position of the text, so the default grows with the pattern, as the work of
+      `regex_*` does: a lexer of 21 alternatives with look-arounds in each one compiles to 288
+      instructions and takes 97 steps per byte (with 64 per byte alone it would fail from 11 KB
+      of text). Tokenizer patterns take 4 to 8 steps per byte on prose with code and numbers
+      (`cl100k_base` 6.8 with 49 instructions, GPT-2 8.0 with 44, `o200k_base` 3.7 with 29).
+    - **What the default does not let through: a repetition that is read again from every
+      start.** An engine that backtracks tries a match from each position. When a repetition is
+      followed by something that fails at the end of a run, the run is read again from each of
+      its characters: `\d+(?![\d.])` on a number of 1 000 digits followed by a `.` takes 2.5
+      million steps, and with the default limit it is an error from runs of about 750 characters
+      (the same with `\w+(?![\w-])`, `\w+(?=:)|\d+`, `\w+(?=\s*=)\s*=`). It is quadratic work, in
+      this engine and in every one that backtracks, and making the repetition possessive does not
+      remove it (each start still reads the run: `\d++(?![\d.])` gets through a run of 4 000
+      and fails on one of 16 000). Saying where a match may start does: `(?<!\d)\d+(?![\d.])`
+      takes 13 steps per byte whatever the run. A look-ahead `(?=…)` that is the last thing in
+      the pattern does not have the problem (`\w+(?=:)` goes whole to the linear engine).
+    - **The default is not a boundary for a pattern someone else wrote.** It grows with the
+      pattern, so a pattern padded with alternatives that cost nothing raises it: with 16 KiB of
+      padding (10 893 instructions) around `\d+(?![\d.])`, the default lets a call on 1 MB of text
+      spend 11 500 million steps, about two minutes. A program that takes patterns from outside
+      passes its own `max_steps`.
+    - **It belongs to the call, not to each search:** a `backtrack_find_all` that finds a thousand
+      matches, each after a costly search, adds them up.
+    - **A pattern that uses nothing this family adds runs whole in the linear engine and takes no
+      steps** (but for the two shapes of the next point). Word boundaries are not something
+      this family adds: `\b`, `\B`, `\<` and `\>` go
+      to the linear engine too (`\bfoo\b` with `max_steps = 1` gives its matches). So does what is
+      left of a pattern whose only look-around is a look-ahead `(?=…)` at its end (`\w+(?=:)`),
+      except in `backtrack_matches`, where the end of the pattern is the end of the text. Any
+      other look-around runs in the backtracking engine and takes steps (`\w+(?!:)` and
+      `(?<= )foo` with `max_steps = 1` are the error of the limit).
+    - **What a pattern matches and captures does not depend on which of the two runs it.** The
+      two engines read two shapes differently, so those two always run in the backtracking
+      engine and take steps, also in a pattern with nothing else of this family:
+      - **A repetition with no upper bound that can match empty** (`(b?)*`, `(a*)+`,
+        `(?:a?|b)+`). When a time around matches nothing, this engine lets it through once and
+        the repetition ends there, as in Perl and PCRE; the linear engine never follows it, and
+        goes on to the next way through the body that matches text. So a group inside ends
+        empty here — `backtrack_capture("b", "(b?)*")` → `[""]` — and a body that tries an
+        empty way first gives a shorter match: `backtrack_find_all("ab", "(?:a?|b)+")` →
+        `["a", ""]`. The linear engine reads as it did: `regex_capture("b", "(b?)*")` →
+        `["b"]`, `regex_find_all("ab", "(?:a?|b)+")` → `["ab"]`. It is a shape that
+        backtracks: `(a*)*b` on 30 `a` without a `b` is the error of the limit, and so is
+        `backtrack_capture("b", "(b?)*", max_steps = 1)`.
+      - **An alternation that the linear engine would try in another order** (`a?a|a?b`,
+        `\s*\n|\s*x`, `\d+\.\d+|\d+e\d+`). When every branch starts with the same thing, the
+        linear engine takes that beginning out of the alternation (`a?(?:a|b)`). When the
+        beginning can end in more than one place, the branches are then not tried in the
+        order they are written in, and another one can win: `regex_find_all("ab", "a?a|a?b")`
+        → `["ab"]`, where the pattern as written gives `a` in Perl and in Python, and here:
+        `backtrack_find_all("ab", "a?a|a?b")` → `["a", "b"]`.
+
+      The same with a look-ahead or a look-behind anywhere in the pattern (`(b?)*(?=)`,
+      `(?<!x)(?:a?|b)+`, `(?:a?a|a?b)(?<!x)`). A counted repetition (`(b?){0,3}`) and one whose
+      body always matches text (`(?:a|b)*`) read the same in both engines and go to the linear
+      one. So does an alternation that the linear engine leaves in the order it is written
+      in: one with nothing that every branch starts with (`\w+|\d+`, `foo|ba+r`,
+      `foo\s+bar|baz\s+qux`), and one whose common beginning is seen to end in one place only
+      — an assertion, text, one character, or a fixed count of those (`\bfoo\b|\bba+r\b`,
+      `ax*|ay*`, `\d{2}a+|\d{2}b`). Which ones those are is not worked out from the shape of
+      the pattern: when a pattern with a `|` is compiled, what the linear engine would be
+      given is built once more and looked at (for an alternation of 2 000 words, 12 KB, that
+      is some 3 ms on top of some 9).
+  - **What the limit does not bound** is time that is not steps. There are three kinds:
+    - **A stretch of text that the engine reads and that does not match costs one step, however
+      long it is.** A pattern that at every position reads the rest of the text without finding
+      what it looks for takes quadratic time with few steps: `(?:(?![^x]*z)a)*+y` takes 3 seconds
+      on 64 KB of `a` followed by a `y`, and with 29 of those look-aheads at each position,
+      5.7 seconds on 16 KB; neither is an error. The time of a call is bounded by its steps
+      times the bytes of the text, not by its steps alone.
+    - **A pattern that goes whole to the linear engine takes no steps at all:** its time is the
+      one of `regex_*`, the pattern times the text. A literal of 8 000 `a` followed by `b(?=c)`,
+      on 1 MB of `a`, takes about 75 seconds with any `max_steps`; so does `regex_find_all` with
+      the literal alone.
+    - **A piece that the linear engine runs costs one step for every 16 bytes it reads, whatever
+      its tables cost to build.** 200 alternatives like `(?=[ab])[ab]*a[ab]{12}c`, each with an
+      ending of its own, on 40 KB of text: within the default limit, and 13.5 seconds.
+
+    Exponential work, and polynomial work by nesting, are cut. A program that takes patterns
+    from outside passes its own `max_steps` and does not take that as a bound on time.
+  - **A pattern that needs more than 16 MiB is an error:** `invalid regex pattern
+    '(a|b\\g<1>\\g<1>)': the compiled pattern, with the memory its searches need, is over 16 MiB:
+    a subroutine call (\g<1>) copies its group at every call, a counted repetition of a Unicode
+    class (\w{300}) is large, and capture groups multiply what a search needs (groups × size of
+    the pattern); write it so that it repeats less, capture less ((?:…) does not capture) or use
+    ASCII classes ([0-9A-Za-z_] for \w), or split it into several patterns`. `max_steps` does not
+    see it (compiling comes before any search). Compiling stops where the pattern goes over the
+    limit: the error comes in 25 to 170 ms. The three ways to get there:
+    - **A subroutine call.** The engine copies a group at each call to it, and when the call is
+      inside the group it calls, 19 levels deep. Measured before this limit existed, that pattern
+      of 15 bytes compiled to 649 MB, and with one more `\g<1>` it took all the memory there was
+      and the process aborted.
+    - **A counted repetition of a Unicode class.** `\w{235}` compiles and `\w{236}` does not
+      (`regex_*` have a limit of their own, lower: `\w{209}` compiles and `\w{210}` does not).
+    - **Capture groups.** To say where each group matched, the linear engine keeps a table that
+      measures the size of the pattern times its groups, and it needs it whatever the text. It
+      is counted when the pattern is compiled, so that a pattern that would ask for hundreds of
+      MB at its first search is an error before it: 35 groups `(\w)` compile and 36 do not; a
+      row of 60 fields `(\w+)` separated by commas does not, and the same row with `([0-9a-z]+)`
+      does (it counts under 1 MiB), as do 60 `(?:\w)` without groups. **`backtrack_*` are
+      stricter here than `regex_*`,** which compile all of those as they did and ask for the
+      table when they search (60 groups `(\w)`: 36 MB in a search with captures).
+
+    What is counted: the instructions of the pattern, each piece the linear engine runs and what
+    a search of each piece needs before it reads any text. That is 90 % or more of what the
+    process holds for the compiled pattern. The split patterns of `cl100k_base`, GPT-2 and
+    `o200k_base` count 0.37, 0.22 and 0.85 MiB; the lexer of 21 alternatives above, 0.28 MiB,
+    and one of 143 alternatives, 1.9 MiB. Compiling what fits takes up to some 160 ms, and 38 MiB
+    of memory while it compiles (`\w{235}`, the largest that fits).
+    - **A long list of words** with boundaries around it, `\b(?:w1|w2|…)\b`, is one piece for the
+      linear engine: 2 000 words count 0.36 MiB and take no steps. Between look-arounds,
+      `(?<!\w)(?:w1|w2|…)(?!\w)`, the words are alternatives of the backtracking engine, tried
+      one by one at every start: 1 400 steps per byte, within the default limit and slow (on
+      94 KB of text, 395 ms against 16 ms).
+  - **A pattern is at most 16 KiB:** `backtrack_find_all: the pattern is 20000 bytes long, and a
+    backtrack_* pattern may be at most 16384; split it into several patterns`. Reading a pattern
+    comes before compiling it, and neither limit above sees it: it takes memory in proportion to
+    the pattern, and so the length is bounded too.
+  - **A backreference written inside the group it names reads what the group matched the time
+    before,** as in Perl and PCRE: `backtrack_find_all("aaaa", "(a\\1?)+")` → `["aaaa"]`, and
+    `backtrack_capture("aaa", "(a\\1?)+")` → `["aa"]`. A conditional on the group written inside
+    it, `(?(1)…)`, asks whether the group has matched before, not whether it has started:
+    `backtrack_find_all("xacxab", "(?:x(a(?(1)b|c)))+")` → `["xacxab"]`. Where Perl and Python's
+    `regex` module disagree, this reads as `regex` does (`(a(?(1)b|c))+` on `acab` matches
+    `acab`; Perl, `ac`).
+  - **What a pattern keeps to search faster has a budget.** Each piece of a pattern that the
+    linear engine runs builds tables as it reads the text, and keeps them for the next search.
+    What they grow over what was counted when compiling is measured, per pattern and per thread:
+    over 16 MiB while a call runs they are dropped and built again as needed, and when the call
+    ends a pattern keeps them only if they are under 2 MiB. Results and steps are the same with
+    or without them.
+    - What it bounds: with 200 alternatives that each build tables of their own, one search of
+      40 KB had the process at 265 MB; with the budget its peak is 32 MB (the process holds up to
+      twice what is counted).
+    - What it costs: nothing that could be measured on a pattern that stays under it (the
+      tokenizer patterns, the lexers of 21 and of 143 alternatives). A pattern whose pieces need
+      more than the budget builds them again and again, and takes up to 1.9 times the time (those
+      200 alternatives: 13.5 seconds against 7.4).
+  - **The engine's backtrack stack is fixed (a million pending points).** A repetition that is not
+    possessive over more than a million characters fills it: `backtrack_find_all: more than
+    1000000 pending backtrack points — a repetition that is not possessive ran over a long stretch
+    of text, or look-behinds inside repetitions left their alternatives pending; make repetitions
+    possessive (a++, a*+) or atomic ((?>…))`.
+  - **Text only:** the text, the pattern and the replacement must be text
+    (`backtrack_find_all: the text must be text, got bytes — decode it first with decode(b)`).
+    `regex_*` convert what they get; these do not.
+  - **`\G` is rejected** (`\G (continue from the previous match) is not supported by backtrack_*`).
+  - **A quantifier on a quantifier is an error:** `a{2}{3}` → `invalid regex pattern 'a{2}{3}':
+    Parsing error at position 4: Target of repeat operator is invalid`, and so are `a*{2}`,
+    `a+{2}`, `a**` and `a+?+`, as in Perl and in Python. Write the group: `(?:a{2}){3}`. (The
+    engine underneath took a count after a quantifier as literal text: `a{2}{3}` matched `aa{3}`
+    and not `aaaaaa`. `regex_*` read it as a repetition of the repetition, as they did.) A brace
+    that is not a count stays literal text: `a{2}{x}`, `a{2}{3` without its `}`, and a brace
+    with a comment inside (`a{(?#c)2}` matches the text `a{2}`, as in Perl and Python; the
+    engine underneath read the count).
+  - **A count with its minimum over its maximum is an error:** `a{3,2}` → `invalid regex pattern
+    'a{3,2}': Parsing error at position 1: Repetition count has its minimum greater than its
+    maximum`, as in `regex_*`, PCRE and Python. (The engine underneath took it, and read it as
+    `a{3}` in one of its two engines and as `a{2}` in the other.)
+  - **A capture group in a look-behind of variable length is an error:** `(?<=(\d+));` → `invalid
+    regex pattern '(?<=(\\d+));': Error compiling regex: A look-behind of variable length has a
+    capture group or a subroutine call in it: use (?:...) if the group is only for grouping,
+    capture outside the look-behind, or give the look-behind one fixed length`. What such a group
+    would hold is not one thing. On `id: 12345;` it is `5` when the body is tried from the nearest
+    start (Java) and `12345` when the look-behind is read from right to left (JavaScript, .NET),
+    and the engine underneath gave one or the other by what else the body had. A subroutine call
+    in the look-behind (`\g<name>`) writes the group it calls, and is the same error.
+    - Capture outside the look-behind, before `\K`: `backtrack_capture("id: 12345;",
+      "(\\d+)\\K;")` → `["12345"]`, and `backtrack_find_all` of the same → `[";"]`.
+    - When the parentheses only group, `(?:…)`: `backtrack_find_all("abc", "(?<=(?:a|ab))c")` →
+      `["c"]`.
+    - Not an error: a look-behind of one fixed length, which has one start
+      (`backtrack_capture("cde", "(?<=(ab|cd))e")` → `["cd"]`); a negative one, which leaves no
+      groups (`backtrack_capture("cb ab", "(?<!(a+))b")` → `[nothing]`); and one with no group
+      in it (`(?<=a+)b`).
+  - **`(?U)` swaps greedy and lazy, and a possessive repetition stays greedy,** as in PCRE:
+    `backtrack_find_all("aaa", "(?U)a+")` → `["a", "a", "a"]`, with `(?U)a+?` → `["aaa"]`, and
+    with `(?U)a++` → `["aaa"]`. (The engine underneath made `(?U)a++` lazy and possessive at
+    once: three matches of one `a`.)
+  - **A group name goes on one group:** `(?:(?<n>a)|(?<n>b))\k<n>` → `invalid regex pattern '…':
+    the group name 'n' is on more than one group, and backtrack_* take one group per name (regex
+    engines disagree on what \k<n> reads otherwise); give each group its own name`. `regex_*`
+    reject it too. (The engine underneath takes the pattern, and its `\k<n>` reads only the last
+    group of that name: on `aa` it did not match.)
+  - **A group inside `{0}` is there and never matches:** `backtrack_capture("a", "a(b){0}")` →
+    `[nothing]`, as in Perl. (`regex_capture` of the same gives `["a"]`: its engine drops the
+    group.)
+  - **`backtrack_matches` does not rewrite the pattern to cover the whole text:** the engine
+    parses the pattern as written and puts it between the start and the end of the text. So an
+    unbalanced pattern is an error (`backtrack_matches("ab", "a)(b")`), a verbose pattern that
+    ends in a comment works (`backtrack_matches("a", "(?x)(?=a)a # an a")` is `true`), and
+    `\g<0>` — the whole pattern — is the pattern the program wrote:
+    `backtrack_matches("((a)(b))", "\\((?:[^()]|\\g<0>)*\\)")` is `true`. (Wrapped as `^(?:…)$`,
+    which is what `matches` does with its engine, `\g<0>` would call the anchors too.)
+  - **A repetition count that does not fit in 32 bits is an error:** `a{4294967296}` → `invalid
+    regex pattern 'a{4294967296}': Parsing error at position 2: Repetition count is too large (the
+    largest is 4294967295)`, on every platform, as in `regex_*`. (The engine underneath took it as
+    the literal text `a{4294967296}`, from 2^64 in the native binary and from 2^32 in wasm.) Only
+    when the braces close: `a{4294967296` without its `}` is literal text, as `a{2` is.
+  - **A case-insensitive backreference compares letter by letter,** as a literal under `(?i)`
+    does, and ends where its last letter does. Two letters that are the same without case can
+    take a different number of bytes (`ẞ` three and `ß` two):
+    `backtrack_find_all("STRAẞEstraße!", "(?i)(straẞe)\\1")` → `["STRAẞEstraße"]`, and
+    `backtrack_find_all("sſ", "(?i)(s)\\1")` → `["sſ"]`, as in Perl. `(?i-u)` is rejected: these
+    functions have no mode without Unicode.
+  - **A recursion more than 20 levels deep does not match there, and it is not an error.** It is
+    the limit of the engine (and of Oniguruma, where it comes from): `(a\g<1>?b)` on 25 `a` and
+    25 `b` matches the 20 and 20 in the middle, where Perl matches the 50, and
+    `backtrack_matches` of the same is `false`. Check that a match covers what it should, and
+    read deep structures with a parser (`json_decode`).
+  - **A panic inside the regex engine is an error of the call,** which `try` catches, and not the
+    end of the program: `backtrack_find_all: internal error in the regex engine (a bug, not your
+    program — please report it with the pattern and the text): …`. The ones that were found are
+    fixed; this is for the ones that were not. It prints nothing: the message of the engine,
+    which can quote the text it was reading, is in the error (with the file and line of the
+    engine where it happened, in parentheses at the end) and not on standard error. And it
+    leaves an open terminal (`term_open`) as it was: the console is put back for a panic that
+    ends the program, not for one the program goes on after. Not in wasm, where a panic is a
+    trap.
+  - **The engine is `fancy-regex` 0.20.2 with a Synsema patch** (`engine/vendor/fancy-regex`; its
+    `SYNSEMA.md` says what the patch changes and how to update it). Only `backtrack_*` use it:
+    the crates that read a `tokenizer.json` keep the version they ask for. What upstream does
+    not have: it counts backtracks, and counting work needs a counter inside its loop; its limit
+    on what it compiles counts instructions, not bytes or what a search needs; nothing bounds
+    what a pattern keeps to search; and it has no way to ask for the whole text without
+    rewriting the pattern. Where the patch changes what a pattern matches:
+    - a group that the pattern also calls as a subroutine holds one match of its own:
+      `backtrack_capture("((a)(b))", "(\\((?:[^()]|\\g<1>)*\\))")` gives `["((a)(b))"]`
+      (upstream: `(b))`, the start of one match of the group and the end of another, and a
+      panic when they cross);
+    - the case-insensitive backreference above (upstream compares a stretch of the same length
+      in bytes, and does not match `sſ`);
+    - repetitions are compiled as written: the pass that rewrites them, new upstream, changed
+      which group captures (`backtrack_capture("baaa", "b(a){1,3}\\n??(a){2,}")` gives
+      `["a", "a"]`; upstream, three groups for a pattern that has two). The part of that pass
+      that takes a final look-ahead out of the pattern stays;
+    - the repetition that can match empty and the alternation whose branches start alike, above
+      (upstream: `["b"]` or `[""]` for `(b?)*` on `b`, `ab` or `a` for `(?:a?|b)+` and for
+      `a?a|a?b` on `ab`, by what else the pattern has);
+    - a group that only holds a place does not move the number of the others. After a
+      `(?(DEFINE)…)` block: `backtrack_capture("a1", "(?(DEFINE)(?<d>\\d))(a)\\g<d>")` gives
+      `["1", "a"]` and `backtrack_capture("c", "(?(DEFINE)(?<n>a)(?<m>b))(c)")` gives
+      `[nothing, nothing, "c"]` (upstream: `["1", nothing]` and `["c"]`, because a group after
+      the block took the number of one inside it). And with a group under a `{0}` in a pattern
+      that ends in a look-ahead: `backtrack_capture("ab", "(x){0}(a)(?=b)")` gives
+      `[nothing, "a"]` (upstream: `["", nothing]`);
+    - a capture group or a subroutine call in a look-behind of variable length, above. Upstream
+      compiles it and reads the group in two ways, by what else the body has: `["3"]` (a group
+      that ends before the look-behind) or `["3.14"]` for `(?<== (\d+|\d+\.\d+));` on
+      `x = 3.14;`, and `["12345"]` or `["5"]` for `(?<=(\d+));` on `id: 12345;`;
+    - a negative look-behind with an empty group under a count:
+      `backtrack_find_all("cx", "(?<!c+(){2,}?)x")` gives `[]` (upstream: `["x"]`, a match with
+      a `c` before it);
+    - a conditional with two empty branches matches whatever its condition says:
+      `backtrack_find_all("b", "(?:|(a))(?(1)|)b")` gives `["b"]`, as in Perl and in Python
+      (upstream: `[]`; it read `(?(1)|)` as `(?(1))`, which goes on only if the group took
+      part);
+    - a quantifier on a quantifier, above (upstream: literal text for `a{2}{3}`, and lazy and
+      possessive at once for `a+?+`);
+    - a count with its minimum over its maximum, `(?U)` with a possessive repetition and a
+      comment inside the braces of a count, above.
+- **`to_list(bytes)` gives the bytes as a list of integers** (`to_list(bytes("h\u00f1"))` →
+  `[104, 195, 177]`); `bytes(list)` is the way back. It was a loop over `b[i]`. With an array it
+  does what it did; anything else → `to_list expects an array or bytes, got list`.
+- **`matches`, `find_all`, `capture`, `regex_find_all`, `regex_capture`, `regex_replace` keep their
+  compiled patterns.** A pattern was compiled on every call; now each thread keeps the last 32
+  (patterns up to 8 KiB), and so do `backtrack_*`. Results do not change by it (the one result
+  of `regex_*` that changes in this version is under **Breaking**).
+  - **They live for one unit of work.** In `serve`, a request (a cron tick, a socket handler)
+    starts with none and leaves none: it does not hold memory in its worker, and it does not tell
+    the next request, by how long a call takes, which patterns it used. In `run`, they live for
+    the whole run. An agent keeps its own while it runs (it has its own thread).
+  - **What it is for:** a loop of 20 000 calls with a small pattern on a small text takes 12 ms
+    with `regex_find_all` and 16 ms with `regex_capture`; in v0.6.59, which compiled the pattern
+    at every call, 1.8 and 6.1 seconds. On a text of 1 MB the two versions take the same.
+  - **How much they hold:** the two limits of the cache (32 patterns, 8 KiB each) measure the text
+    of the pattern, not what it compiles to: `\w{209}` is 7 bytes of pattern and 11 MB compiled.
+    What bounds the compiled pattern is each engine (`regex_*` reject `\w{210}`; `backtrack_*`,
+    what needs more than 16 MiB), and the process holds more than those limits count. Measured:
+    a thread that uses 32 different patterns at the limit holds about 670 MB with `regex_*` and
+    630 MB with `backtrack_*` while its unit of work lasts. That is the compiled patterns: of
+    what a pattern builds to search, it keeps between calls 2 MiB at most, in both families.
+    A tokenizer pattern is under 1 MiB.
+- **`matches` takes a verbose pattern that ends in a comment:** `matches("a", "(?x)a # c")` is
+  `true`. The comment swallowed the end of the wrapper that makes the pattern cover the whole
+  text, and the call was an error that showed the wrapped pattern. A valid pattern that no longer
+  fits once wrapped (it sits at the engine's nesting limit) says so: `invalid regex pattern '…':
+  the pattern is valid, but not once it is wrapped as ^(?:…)$ to cover the whole text: …`.
+- **`\p{…}` in both regex families use the Unicode 16.0 tables,** and normalization the 17.0 ones:
+  a character added in Unicode 17 normalizes by its rules, and for `\p{…}` it is still unassigned
+  (a new mark is not `\p{Mn}` yet).
+- **`recover` gets the whole message of an error, always.** It cut off the beginning of a
+  message that looked like a location (`file:line:column: `), and a message that quotes text of
+  the program can look like one: `regex_find_all(t, "(?:a)(?:b")` inside a `try` gave `regex
+  parse error: …` to `recover`, without the `invalid regex pattern '(?:a)(?:b': ` in front, and
+  `int("1:2:3: x")` gave `x" to an integer: …`. Nothing is cut any more: the one error that wrote
+  its own location in front of its message, a syntax error in a module loaded with `use`, keeps
+  it apart now (it still prints as `file:line:column: message` when nothing catches it).
+- **The error of a look-around or a backreference in `regex_*` names the family that has them:**
+  it adds the line `regex_* run in linear time and have no look-around or backreferences — use
+  backtrack_find_all, backtrack_capture, backtrack_replace or backtrack_matches`.
+
+**Breaking.**
+- **`matches` checks the pattern as written.** It wraps the pattern to cover the whole text
+  (`^(?:…)$`), and an unbalanced pattern that came out balanced once wrapped was accepted:
+  `matches("ab", "a)(b")` was `true`. It is now the error `regex_find_all` gives for the same
+  pattern (`invalid regex pattern 'a)(b': …`). The error of any invalid pattern in `matches` shows
+  the pattern the program wrote, not the wrapped one. A valid pattern gives what it gave.
+- **`regex_find_all`, `regex_capture` and `regex_replace` (and `find_all`, `capture`) give the
+  leftmost match in a case where they did not.** When two alternatives end in the same text
+  and the longer one starts further left, a search could give the shorter one:
+  `regex_find_all("zabb", ".abb|b")` was `["b", "b"]` and is `["zabb"]`;
+  `regex_replace("zabb", ".abb|b", "-")` was `za--` and is `-`. It was a bug of the engine
+  underneath (regex#1354): this version moves `regex-automata` from 0.4.14 to 0.4.18, which
+  has the fix and which the engine of `backtrack_*` asks for. On 120 000 random patterns and
+  texts the two versions give the same; `matches` does not change (it covers the whole text).
+
 ## v0.6.59 — 2026-11-11
 
 **Language and engine.**

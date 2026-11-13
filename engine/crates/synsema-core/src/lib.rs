@@ -33,9 +33,11 @@ pub mod loaded_modules;
 #[doc(hidden)]
 pub mod native_tier;
 pub mod math;
+pub mod linear_regex;
 pub mod matkernel;
 pub mod number;
 pub mod parser;
+pub mod pattern_cache;
 pub mod reflexes;
 pub mod resolve;
 pub mod rng;

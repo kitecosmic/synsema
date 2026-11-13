@@ -373,6 +373,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "bit-set"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "08807e080ed7f9d5433fa9b275196cfc35414f66a0c79d864dc51a0d825231a3"
+dependencies = [
+ "bit-vec",
+]
+
+[[package]]
+name = "bit-vec"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5e764a1d40d510daf35e07be9eb06e75770908c27d411ee6c92109c9840eaaf7"
+
+[[package]]
 name = "bitcoin_hashes"
 version = "0.14.101"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1096,6 +1111,15 @@ dependencies = [
  "pulp",
  "qd",
  "reborrow",
+]
+
+[[package]]
+name = "fancy-regex"
+version = "0.20.2"
+dependencies = [
+ "bit-set",
+ "regex-automata",
+ "regex-syntax",
 ]
 
 [[package]]
@@ -2427,9 +2451,9 @@ dependencies = [
 
 [[package]]
 name = "regex-automata"
-version = "0.4.14"
+version = "0.4.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6e1dd4122fc1595e8162618945476892eefca7b88c52820e74af6262213cae8f"
+checksum = "ad8553b9b26413251cbf30e620595c7a41b3887f03da04579c0e6b0d6a06b4b2"
 dependencies = [
  "aho-corasick",
  "memchr",
@@ -3079,6 +3103,7 @@ dependencies = [
  "num-traits",
  "pulp",
  "regex",
+ "regex-automata",
  "rust_decimal",
  "rustc-hash",
  "serde_json",
@@ -3124,6 +3149,7 @@ dependencies = [
  "ed25519-dalek",
  "ego-tree",
  "faer",
+ "fancy-regex",
  "flate2",
  "fontdb",
  "half",
@@ -3161,6 +3187,7 @@ dependencies = [
  "tiny-skia",
  "toml",
  "ttf-parser",
+ "unicode-normalization",
  "usvg",
  "windows-sys 0.52.0",
  "winreg",
