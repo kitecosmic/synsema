@@ -226,7 +226,8 @@ Text for tokenizers: what a BPE or WordPiece tokenizer written in Synsema was mi
     would hold is not one thing. On `id: 12345;` it is `5` when the body is tried from the nearest
     start (Java) and `12345` when the look-behind is read from right to left (JavaScript, .NET),
     and the engine underneath gave one or the other by what else the body had. A subroutine call
-    in the look-behind (`\g<name>`) writes the group it calls, and is the same error.
+    in the look-behind (`\g<name>`, `(?P>name)`) writes the group it calls, and is the same
+    error.
     - Capture outside the look-behind, before `\K`: `backtrack_capture("id: 12345;",
       "(\\d+)\\K;")` → `["12345"]`, and `backtrack_find_all` of the same → `[";"]`.
     - When the parentheses only group, `(?:…)`: `backtrack_find_all("abc", "(?<=(?:a|ab))c")` →
@@ -235,6 +236,16 @@ Text for tokenizers: what a BPE or WordPiece tokenizer written in Synsema was mi
       (`backtrack_capture("cde", "(?<=(ab|cd))e")` → `["cd"]`); a negative one, which leaves no
       groups (`backtrack_capture("cb ab", "(?<!(a+))b")` → `[nothing]`); and one with no group
       in it (`(?<=a+)b`).
+  - **`\K` inside a look-around is an error:** `(?<=\K\w)\w` → `invalid regex pattern
+    '(?<=\\K\\w)\\w': Error compiling regex: A look-around has \K in it, or calls a group that
+    has it: \K sets where the match starts, and what a look-around reads is not part of the
+    match; write \K outside the look-around`, as in Perl. The same for a `\K` in a group that
+    the look-around calls (`(?<k>a\Kb)(?=\g<k>)`). Outside a look-around `\K` does what it
+    did: `backtrack_find_all("ab ab", "a\\Kb")` → `["b", "b"]`, and
+    `backtrack_replace("ab ab", "a\\Kb", "-")` → `a- a-`. (The engine underneath takes it. From
+    inside a look-behind a match then started before the end of the one before it:
+    `(?<=\K\w)\w` on `abc` gave `ab` and `bc`, and `backtrack_replace` of the same was the
+    internal error described below.)
   - **`(?U)` swaps greedy and lazy, and a possessive repetition stays greedy,** as in PCRE:
     `backtrack_find_all("aaa", "(?U)a+")` → `["a", "a", "a"]`, with `(?U)a+?` → `["aaa"]`, and
     with `(?U)a++` → `["aaa"]`. (The engine underneath made `(?U)a++` lazy and possessive at
@@ -310,13 +321,22 @@ Text for tokenizers: what a BPE or WordPiece tokenizer written in Synsema was mi
       compiles it and reads the group in two ways, by what else the body has: `["3"]` (a group
       that ends before the look-behind) or `["3.14"]` for `(?<== (\d+|\d+\.\d+));` on
       `x = 3.14;`, and `["12345"]` or `["5"]` for `(?<=(\d+));` on `id: 12345;`;
+    - `\K` where a look-around would run it, above (upstream takes it: `["ab", "bc"]` for
+      `(?<=\K\w)\w` on `abc`; `["aaab"]` or `["ab"]` for `(?<=\Ka+)b` on `aaab`, by what else
+      the look-behind has; and an empty match for `a(?=bc\K)b` on `abc`);
+    - a relative subroutine call to the whole pattern, `\g<-1>` before any capture (or
+      `\g<-2>` after one), behaves like `\g<0>`: `x(?=y\g<-1>|z)` on `xyxz` finds both `x`s.
+      Upstream could move the final look-ahead out of the match and let the call overwrite
+      the match bounds. `a(?=(?<=\g<-1>.)|)` on `aa` is the look-behind error above, rather
+      than a match before its search position and an internal error in replacement;
     - a negative look-behind with an empty group under a count:
       `backtrack_find_all("cx", "(?<!c+(){2,}?)x")` gives `[]` (upstream: `["x"]`, a match with
       a `c` before it);
-    - a conditional with two empty branches matches whatever its condition says:
-      `backtrack_find_all("b", "(?:|(a))(?(1)|)b")` gives `["b"]`, as in Perl and in Python
-      (upstream: `[]`; it read `(?(1)|)` as `(?(1))`, which goes on only if the group took
-      part);
+    - a conditional written with its two branches empty, `(?(1)|)`, matches whatever its
+      condition says: `backtrack_find_all("b", "(?:|(a))(?(1)|)b")` gives `["b"]`, as in Perl
+      and in Python (upstream: `[]`; it read `(?(1)|)` as `(?(1))`, which goes on only if the
+      group took part). Without the `|` an empty branch is no branch, here and upstream:
+      `(?(1))`, and `(?x)(?(1) )`, are the condition alone;
     - a quantifier on a quantifier, above (upstream: literal text for `a{2}{3}`, and lazy and
       possessive at once for `a+?+`);
     - a count with its minimum over its maximum, `(?U)` with a possessive repetition and a

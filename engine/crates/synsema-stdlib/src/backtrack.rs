@@ -3114,6 +3114,8 @@ mod tests {
             // una llamada adentro, que escribe el grupo que llama (ronda 10, M-2)
             r"(?(DEFINE)(?<g>\w))(?<=\g<g>\d+)!",
             r"(?(DEFINE)(?<g>.))(?<=\g<g>x+)y",
+            // y con la escritura de Python de una llamada (ronda 11, N-2)
+            r"(?<g>a)(?<=(?P>g)b+)c",
             // un bloque DEFINE adentro tiene sus grupos
             "(?<=(?(DEFINE)(q))a+)b",
             // adentro de una repetición, de un look-ahead y de un look-behind negativo
@@ -3154,6 +3156,14 @@ mod tests {
         assert_eq!(find_all(phrase, r"(?<=(?:\w+\s?)+)!", 1_000).map(|v| v.len()), Ok(1));
         assert_eq!(groups(phrase, r"((?:\w+\s?)+)\K!"), opt(&[Some("hola mundo esto es una frase larga")]));
 
+        // Ronda 11, N-1: el chequeo está donde se compila un look-behind, así que uno que no
+        // se compila nunca (en una definición que nadie llama, o bajo un `{0}`) no es el error:
+        // tampoco corre. Si la definición se llama, o la cuenta puede ser una vez, lo es.
+        assert_eq!(all("abx", r"(?(DEFINE)(?<g>(?<=(a+))b))x"), ["x"]);
+        assert_eq!(all("abx", r"(?:(?<=(a+))b){0}x"), ["x"]);
+        assert_eq!(invalid(r"(?(DEFINE)(?<g>(?<=(a+))b))x\g<g>"), EXPECTED);
+        assert_eq!(invalid(r"(?:(?<=(a+))b){0,1}x"), EXPECTED);
+
         // Ronda 10, N-3: al buscar los comienzos de un look-behind que corre en la VM, un grupo
         // vacío bajo una cuenta no escribía nada y la cuenta quedaba pegada a lo de antes (para
         // `c+(){2,}?`, `c+{2,}`: los comienzos de `(?:c+){2,}`). En uno negativo eso es una
@@ -3164,22 +3174,175 @@ mod tests {
         assert_eq!(all("x", r"(?<!c+(){2,}?)x"), ["x"]);
     }
 
-    /// Ronda 10, B-1: una condición con las dos ramas vacías sigue siendo un si-entonces-si-no,
-    /// y coincide diga lo que diga la condición. La crate devolvía la condición sola, que es lo
-    /// que significa acá `(?(1))` sin ramas (seguir sólo si el grupo participó): `(?(1)|)`
-    /// fallaba cuando el grupo 1 no había participado. En Perl y en `re` de Python coincide.
+    /// Ronda 10, B-1: una condición escrita con sus dos ramas, `(?(1)|)`, es un si-entonces-si-no
+    /// también cuando las dos están vacías, y coincide diga lo que diga la condición. La crate
+    /// devolvía la condición sola, que es lo que significa acá `(?(1))` sin ramas (seguir sólo si
+    /// el grupo participó): `(?(1)|)` fallaba cuando el grupo 1 no había participado. En Perl y en
+    /// `re` de Python coincide.
+    ///
+    /// Ronda 11, B-1: lo que dice que hay dos ramas es la `|`. Sin ella, una rama vacía no es una
+    /// rama, se escriba lo que se escriba en su lugar (un blanco en modo `x`, un comentario,
+    /// `(?:)`): es la condición sola, como en la crate. El arreglo de la ronda 10 lo decidía por
+    /// la posición en el texto, y `(?x)(?(1) )` pasaba a coincidir siempre mientras `(?(1))` no.
     #[test]
     fn a_conditional_with_two_empty_branches_matches_whatever_the_condition_says() {
-        for pattern in ["(?:|(a))(?(1)|)b", "(?:|(a))(?(1)(?:)|(?:))b", "(?:|(?<n>a))(?(<n>)|)b"] {
+        for pattern in [
+            "(?:|(a))(?(1)|)b",
+            "(?:|(a))(?(1)(?:)|(?:))b",
+            "(?:|(?<n>a))(?(<n>)|)b",
+            "(?x)(?:|(a))(?(1) | )b",
+            "(?:|(a))(?(1)(?#nada)|)b",
+        ] {
             assert_eq!(all("b", pattern), ["b"], "{}", pattern);
             assert_eq!(all("ab", pattern), ["ab"], "{}", pattern);
         }
-        // sin ramas es otra cosa: seguir sólo si el grupo participó
+        // sin la `|` es otra cosa: seguir sólo si el grupo participó
+        for pattern in [
+            "(?:|(a))(?(1))b",
+            "(?x)(?:|(a))(?(1) )b",
+            "(?:|(a))(?(1)(?#nada))b",
+            "(?:|(a))(?(1)(?:))b",
+            "(?x)(?:|(?<n>a))(?(<n>) )b",
+        ] {
+            assert_eq!(all("b", pattern), Vec::<String>::new(), "{}", pattern);
+            assert_eq!(all("ab", pattern), ["ab"], "{}", pattern);
+        }
         assert_eq!(all("b", "(a)?(?(1))b"), Vec::<String>::new());
         assert_eq!(all("ab", "(a)?(?(1))b"), ["ab"]);
         // y con una rama escrita, lo de siempre
         assert_eq!(all("ax y", "(a)?(?(1)x|y)"), ["ax", "y"]);
         assert_eq!(all("a y", "(a)?(?(1)|y)"), ["a", "y"]);
+    }
+
+    /// Ronda 11, M-1 y M-2: `\K` donde un look-around lo correría es un error. `\K` escribe dónde
+    /// empieza la coincidencia (el grupo 0), y lo que lee un look-around no es parte de la
+    /// coincidencia. La crate lo dejaba escribir desde adentro:
+    ///
+    /// - en un look-behind, el comienzo queda antes de donde empezó la búsqueda, y por lo tanto
+    ///   antes del final de la coincidencia anterior: `(?<=\K\w)\w` sobre `abc` daba `ab` y `bc`,
+    ///   dos coincidencias que se pisan, y `backtrack_replace` de lo mismo cortaba un tramo del
+    ///   texto al revés (un pánico: el error interno);
+    /// - en uno de largo variable, además, el comienzo dependía de cómo se compilara el cuerpo
+    ///   (`(?<=\Ka+)b` sobre `aaab`: `aaab`, y `ab` con algo al lado que no cambia nada);
+    /// - en un look-ahead el comienzo queda después del final, y la coincidencia salía vacía.
+    ///
+    /// Perl lo rechaza. Es por la forma del patrón como está escrito (se mira antes del
+    /// optimizador, que saca de la raíz un `\K` y un look-ahead final): un `\K` adentro de un
+    /// look-around, o en un grupo que el look-around llama, por las llamadas que sean.
+    #[test]
+    fn keep_out_where_a_look_around_would_run_it_is_an_error() {
+        const EXPECTED: &str = "Error compiling regex: A look-around has \\K in it, or calls a group that has it: \\K \
+                                sets where the match starts, and what a look-around reads is not part of the match; \
+                                write \\K outside the look-around";
+        for pattern in [
+            // las filas del informe de la ronda 11: un look-behind de largo variable (por los
+            // dos caminos), uno de largo fijo, y con algo antes
+            r"(?<=\Ka+)b",
+            r"(?<=\Ka+(?:(?!)x)?)b",
+            r"(?<=\K\w)\w",
+            r"(?<=\K\w+)[xy]",
+            r"x(?<=\K\w+)y",
+            // los de upstream: en un look-behind, y en un look-ahead
+            r"(?<=a\Kb)c",
+            r"a(?=b\Kc)",
+            r"a(?=bc\K)b",
+            // uno negativo, donde lo que escribe no queda: es el mismo error
+            r"(?<!\Ka)b",
+            r"a(?!b\K)",
+            // más adentro: en una rama, en un grupo atómico, en un grupo de captura, en otro
+            // look-around, y con el look-behind bajo una repetición
+            r"(?=(?:a|\Kb))\w",
+            r"(?<=(?:x|(?>a\K)))b",
+            r"(?<=(a\K))b",
+            r"(?=(?<=\K))a",
+            r"(?:(?<=\Ka)b)+",
+            // en un grupo que el look-around llama: por nombre, por número, hacia adelante, con
+            // `(?P>…)`, a través de otra llamada, con dos grupos que se llaman entre sí, el
+            // patrón entero, y una definición
+            r"(?<k>a\Kb)(?=\g<k>)",
+            r"(a\K)(?<=\g<1>)b",
+            r"(?=\g<2>)(x)(a\Kb)",
+            r"(?<k>a\Kb)(?<=(?P>k))",
+            r"(?=\g<1>)(\g<2>)(a\K)",
+            r"(?=\g<1>)(a\g<2>?)(b\K\g<1>?)",
+            r"a\Kb|(?=c\g<0>)c",
+            r"(?(DEFINE)(?<d>x\K))a(?=\g<d>)",
+            // es por la forma: también en una definición que nadie llama
+            r"(?(DEFINE)(?<d>(?=a\K)))x",
+            // el número del grupo que se llama es el suyo, con grupos anidados, opcionales o
+            // de un bloque DEFINE antes (las mismas formas, llamando al grupo de al lado, están
+            // abajo y compilan)
+            r"(?=\g<2>)(a)(b\K)",
+            r"(?<x>a)(?<y>b\K)(?=\g<y>)",
+            r"((a)(b\K))(?=\g<1>)",
+            r"((a)(b\K))(?=\g<3>)",
+            r"(?(DEFINE)(?<d>x\K))(q)(?=\g<1>)",
+            r"(?=(z)?)(a)(b\K)(?=\g<3>)",
+        ] {
+            assert_eq!(invalid(pattern), EXPECTED, "{}", pattern);
+            assert_eq!(invalid_in_full(pattern), EXPECTED, "{}", pattern);
+        }
+        // las cuatro funciones: `backtrack_replace` daba el error interno
+        let expected = || Failure::InvalidPattern(EXPECTED.to_string());
+        assert_eq!(find_all("abc", r"(?<=\K\w)\w", DEFAULT), Err(expected()));
+        assert_eq!(capture("abc", r"(?<=\K\w)\w", DEFAULT), Err(expected()));
+        assert_eq!(replace("abc", r"(?<=\K\w)\w", "-", DEFAULT), Err(expected()));
+        assert_eq!(matches("abc", r"(?<=\K\w)\w", DEFAULT), Err(expected()));
+
+        // Un `\K` que ningún look-around corre sigue como estaba: en la raíz, en un grupo, en
+        // un grupo atómico, en una rama, bajo una repetición, y con un look-around al lado.
+        assert_eq!(all("ab ab", r"a\Kb"), ["b", "b"]);
+        assert_eq!(replace("ab ab", r"a\Kb", "-", DEFAULT), Ok(Some("a- a-".to_string())));
+        assert_eq!(matches("ab", r"a\Kb", DEFAULT), Ok(true));
+        assert_eq!(groups("id: 12345;", r"(\d+)\K;"), some(&["12345"]));
+        assert_eq!(all("abc", r"(a\Kb)c"), ["bc"]);
+        assert_eq!(all("ab", r"(?>a\K)b"), ["b"]);
+        assert_eq!(all("ac bc", r"(?:a\K|b)c"), ["c", "bc"]);
+        assert_eq!(all("aab", r"(?:a\K)+b"), ["b"]);
+        assert_eq!(all("ab", r"\Ka|b\K"), ["a", ""]);
+        assert_eq!(all("ab ac", r"a\K(?=b)"), [""]);
+        assert_eq!(all("xab ab", r"(?<=x)a\Kb"), ["b"]);
+        assert_eq!(all("ab", r"(?=a)a\Kb"), ["b"]);
+        assert_eq!(all("ab", r"a\Kb(?<!c)"), ["b"]);
+        // en un grupo que se llama, pero no desde un look-around
+        assert_eq!(all("abab", r"(a\Kb)\g<1>"), ["b"]);
+        // y un look-around que llama a un grupo sin `\K`, con otro grupo que sí lo tiene
+        assert_eq!(all("ab", r"(?=\g<1>)(a)(b\K)"), [""]);
+        assert_eq!(all("aba", r"(?<x>a)(?<y>b\K)(?=\g<x>)"), [""]);
+        assert_eq!(all("aba", r"((a)(b\K))(?=\g<2>)"), [""]);
+        assert_eq!(all("qq", r"(?(DEFINE)(?<d>x\K))(q)(?=\g<2>)"), ["q"]);
+        // `(?~…)` no es un look-around
+        assert_eq!(all("xzzy xaby", r"x(?~a\Kb)y"), ["xzzy"]);
+    }
+
+    /// Ronda 12: una llamada relativa al grupo 0 impide la reescritura del look-ahead
+    /// final. Antes copiaba el grupo 0 explícito en el look-around y cortaba al revés.
+    #[test]
+    fn relative_calls_to_the_whole_pattern_do_not_rewrite_group_zero() {
+        for call in [r"\g<-1>", r"\g'-1'", r"\g<0>"] {
+            let pattern = format!(r"x(?=y{call}|z)");
+            assert_eq!(all("xyxz", &pattern), ["x", "x"], "{pattern}");
+            assert_eq!(replace("xyxz", &pattern, "-", DEFAULT), Ok(Some("-y-z".to_string())));
+            assert_eq!(capture("xyxz", &pattern, DEFAULT), Ok(Some(vec![Some("x")])));
+            assert_eq!(matches("xyxz", &pattern, DEFAULT), Ok(false));
+            assert_eq!(all("xyxz!", &format!("{pattern}!")), Vec::<String>::new());
+            assert_eq!(all("abab", &format!(r"a(?=b(?:{call})?)")), ["a", "a"]);
+            for (text, pattern) in [
+                ("aa", format!(r"a(?=(?<={call}.)|)")),
+                ("abab", format!(r"ab(?=(?<={call}..)|)")),
+            ] {
+                let message = invalid(&pattern);
+                assert!(message.contains("A look-behind of variable length"));
+                let expected = || Failure::InvalidPattern(message.clone());
+                assert_eq!(find_all(text, &pattern, DEFAULT), Err(expected()));
+                assert_eq!(replace(text, &pattern, "-", DEFAULT), Err(expected()));
+                assert_eq!(capture(text, &pattern, DEFAULT), Err(expected()));
+                assert_eq!(matches(text, &pattern, DEFAULT), Err(expected()));
+            }
+            assert!(invalid(&format!(r"a\Kb(?=c|{call})")).contains("A look-around has \\K"));
+        }
+        assert_eq!(all("xyxz", r"()x(?=y\g<-2>|z)"), ["x", "x"]);
+        assert_eq!(all("aaa", r"(a)\g<-1>"), ["aa"]);
     }
 
     /// Ronda 6, M-2: una cuenta con el mínimo mayor que el máximo es un error. La crate la

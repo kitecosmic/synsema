@@ -959,6 +959,72 @@ fn collect_groups<'a>(
     }
 }
 
+/// Synsema: whether a look-around of the pattern can run a `\K`: one written in its body, or
+/// one in a group that its body calls, through any number of calls.
+///
+/// `\K` writes where the match starts (it is compiled as a save of slot 0), and what a
+/// look-around reads is not part of the match. Upstream lets it write from inside one. In a
+/// look-behind the start it writes is before the place the search began at, so the match
+/// starts before the end of the one before it (`(?<=\K\w)\w` on `abc` gave `ab` and `bc`), and
+/// with a body of variable size the start depends on which of the ways of compiling a
+/// look-behind runs it (`(?<=\Ka+)b` on `aaab`: `aaab` one way, `ab` another). In a look-ahead
+/// it is after the end, and the match came out empty. Perl rejects it.
+///
+/// It is asked of the tree as it was parsed, before the optimizer, which takes a `\K` and a
+/// final look-ahead at the root out of the pattern.
+pub(crate) fn look_around_runs_keep_out(tree: &ExprTree) -> bool {
+    fn keeps_out(expr: &Expr) -> bool {
+        expr.has_descendant_or_self(|expr| matches!(*expr, Expr::KeepOut))
+    }
+    if !keeps_out(&tree.expr) {
+        return false;
+    }
+    // The groups by their number, as the parser numbers them; group 0 is the whole pattern.
+    let mut groups = Map::new();
+    collect_groups(&tree.expr, &mut 1, &mut groups);
+    groups.insert(0, &tree.expr);
+    // The groups that can run a `\K`: the ones that have one, and the ones that call one of
+    // those. Each group is looked at once and each call is followed once, back from the group
+    // it calls to the group it is written in.
+    fn calls(expr: &Expr, targets: &mut Vec<usize>) {
+        if let Expr::SubroutineCall(target) = *expr {
+            targets.push(target);
+        }
+        for child in expr.children_iter() {
+            calls(child, targets);
+        }
+    }
+    let mut runs = BitSet::new();
+    let mut callers: Map<usize, Vec<usize>> = Map::new();
+    let mut pending = Vec::new();
+    for (&group, &body) in groups.iter() {
+        if keeps_out(body) {
+            runs.insert(group);
+            pending.push(group);
+        }
+        let mut targets = Vec::new();
+        calls(body, &mut targets);
+        for target in targets {
+            callers.entry(target).or_default().push(group);
+        }
+    }
+    while let Some(group) = pending.pop() {
+        for &caller in callers.get(&group).map_or(&[][..], |callers| &callers[..]) {
+            if runs.insert(caller) {
+                pending.push(caller);
+            }
+        }
+    }
+    tree.expr.has_descendant_or_self(|expr| match expr {
+        Expr::LookAround(body, _) => body.has_descendant_or_self(|expr| match *expr {
+            Expr::KeepOut => true,
+            Expr::SubroutineCall(target) => runs.contains(target),
+            _ => false,
+        }),
+        _ => false,
+    })
+}
+
 /// Context options for [`analyze`].
 #[derive(Debug, Clone, Default)]
 pub struct AnalyzeContext {

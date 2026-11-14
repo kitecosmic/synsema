@@ -68,7 +68,7 @@ mod to_hir;
 mod vm;
 
 use crate::analyze::can_compile_as_anchored;
-use crate::analyze::{analyze_for_linear, AnalyzeContext};
+use crate::analyze::{analyze_for_linear, look_around_runs_keep_out, AnalyzeContext};
 use crate::compile::{compile, CompileOptions};
 use crate::optimize::{optimize, OptimizeOptions};
 use crate::parse::{ExprTree, NamedGroups, Parser};
@@ -1552,6 +1552,11 @@ impl Regex {
 
     pub(crate) fn new_options(pattern: String, options: &RegexOptions) -> Result<Regex> {
         let mut tree = Expr::parse_tree_with_flags(&pattern, options.compute_flags())?;
+
+        // Synsema: a `\K` that a look-around would run is an error, in the pattern as written.
+        if look_around_runs_keep_out(&tree) {
+            return Err(CompileError::KeepOutInLookAround.into());
+        }
 
         // Synsema: `full_match`. The pattern was parsed as written; its tree goes between the
         // two assertions (see `RegexOptionsBuilder::full_match`).

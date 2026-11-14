@@ -103,7 +103,80 @@ diff -ru a/src/analyze.rs b/src/analyze.rs
              let mut recursion_stack = BitSet::new();
              if self.dfs_check_left_recursion(start_group, &mut visited, &mut recursion_stack)? {
                  // Found left recursion
-@@ -1033,6 +1064,120 @@
+@@ -928,6 +959,72 @@
+     }
+ }
+ 
++/// Synsema: whether a look-around of the pattern can run a `\K`: one written in its body, or
++/// one in a group that its body calls, through any number of calls.
++///
++/// `\K` writes where the match starts (it is compiled as a save of slot 0), and what a
++/// look-around reads is not part of the match. Upstream lets it write from inside one. In a
++/// look-behind the start it writes is before the place the search began at, so the match
++/// starts before the end of the one before it (`(?<=\K\w)\w` on `abc` gave `ab` and `bc`), and
++/// with a body of variable size the start depends on which of the ways of compiling a
++/// look-behind runs it (`(?<=\Ka+)b` on `aaab`: `aaab` one way, `ab` another). In a look-ahead
++/// it is after the end, and the match came out empty. Perl rejects it.
++///
++/// It is asked of the tree as it was parsed, before the optimizer, which takes a `\K` and a
++/// final look-ahead at the root out of the pattern.
++pub(crate) fn look_around_runs_keep_out(tree: &ExprTree) -> bool {
++    fn keeps_out(expr: &Expr) -> bool {
++        expr.has_descendant_or_self(|expr| matches!(*expr, Expr::KeepOut))
++    }
++    if !keeps_out(&tree.expr) {
++        return false;
++    }
++    // The groups by their number, as the parser numbers them; group 0 is the whole pattern.
++    let mut groups = Map::new();
++    collect_groups(&tree.expr, &mut 1, &mut groups);
++    groups.insert(0, &tree.expr);
++    // The groups that can run a `\K`: the ones that have one, and the ones that call one of
++    // those. Each group is looked at once and each call is followed once, back from the group
++    // it calls to the group it is written in.
++    fn calls(expr: &Expr, targets: &mut Vec<usize>) {
++        if let Expr::SubroutineCall(target) = *expr {
++            targets.push(target);
++        }
++        for child in expr.children_iter() {
++            calls(child, targets);
++        }
++    }
++    let mut runs = BitSet::new();
++    let mut callers: Map<usize, Vec<usize>> = Map::new();
++    let mut pending = Vec::new();
++    for (&group, &body) in groups.iter() {
++        if keeps_out(body) {
++            runs.insert(group);
++            pending.push(group);
++        }
++        let mut targets = Vec::new();
++        calls(body, &mut targets);
++        for target in targets {
++            callers.entry(target).or_default().push(group);
++        }
++    }
++    while let Some(group) = pending.pop() {
++        for &caller in callers.get(&group).map_or(&[][..], |callers| &callers[..]) {
++            if runs.insert(caller) {
++                pending.push(caller);
++            }
++        }
++    }
++    tree.expr.has_descendant_or_self(|expr| match expr {
++        Expr::LookAround(body, _) => body.has_descendant_or_self(|expr| match *expr {
++            Expr::KeepOut => true,
++            Expr::SubroutineCall(target) => runs.contains(target),
++            _ => false,
++        }),
++        _ => false,
++    })
++}
++
+ /// Context options for [`analyze`].
+ #[derive(Debug, Clone, Default)]
+ pub struct AnalyzeContext {
+@@ -1033,6 +1130,120 @@
      Ok(analyzed)
  }
  
@@ -1057,7 +1130,7 @@ diff -ru a/src/error.rs b/src/error.rs
      /// Pattern too deeply nested
      RecursionExceeded,
      /// Backslash without following character
-@@ -99,6 +103,20 @@
+@@ -99,6 +103,24 @@
      PatternCanNeverMatch,
      /// An unresolved AST node was encountered during analysis (internal error)
      UnresolvedAstNode(usize, String),
@@ -1075,10 +1148,14 @@ diff -ru a/src/error.rs b/src/error.rs
 +    /// or a subroutine call (which writes the group it calls), e.g. `(?<=(a|ab))c`. What such a
 +    /// group holds is not one thing (see `Compiler::compile_lookaround`).
 +    LookBehindWritesGroup,
++    /// Synsema: a look-around can run a `\K`: one written in it, or in a group it calls, e.g.
++    /// `(?<=\K\w)\w`. `\K` sets where the match starts, and what a look-around reads is not part
++    /// of the match (see `analyze::look_around_runs_keep_out`).
++    KeepOutInLookAround,
  }
  
  /// An error as the result of executing a regex.
-@@ -111,6 +129,9 @@
+@@ -111,6 +133,9 @@
      /// Configure using
      /// [`RegexBuilder::backtrack_limit`](struct.RegexBuilder.html#method.backtrack_limit).
      BacktrackLimitExceeded,
@@ -1088,7 +1165,7 @@ diff -ru a/src/error.rs b/src/error.rs
  }
  
  #[cfg(feature = "std")]
-@@ -124,6 +145,12 @@
+@@ -124,6 +149,12 @@
                  write!(f, "Opening parenthesis without closing parenthesis")
              }
              ParseError::InvalidRepeat => write!(f, "Invalid repeat syntax"),
@@ -1101,7 +1178,7 @@ diff -ru a/src/error.rs b/src/error.rs
              ParseError::RecursionExceeded => write!(f, "Pattern too deeply nested"),
              ParseError::TrailingBackslash => write!(f, "Backslash without following character"),
              ParseError::InvalidEscape(s) => write!(f, "Invalid escape: {}", s),
-@@ -191,6 +218,15 @@
+@@ -191,6 +222,21 @@
              CompileError::UnresolvedAstNode(ix, node) => {
                  write!(f, "Unresolved AST node encountered during analysis at position {}: {}", ix, node)
              }
@@ -1111,13 +1188,19 @@ diff -ru a/src/error.rs b/src/error.rs
 +                 use (?:...) if the group is only for grouping, capture outside the look-behind, \
 +                 or give the look-behind one fixed length"
 +            ),
++            CompileError::KeepOutInLookAround => write!(
++                f,
++                "A look-around has \\K in it, or calls a group that has it: \\K sets where the \
++                 match starts, and what a look-around reads is not part of the match; write \\K \
++                 outside the look-around"
++            ),
 +            CompileError::ProgramTooLarge { limit, .. } => {
 +                write!(f, "Compiled regex exceeds the size limit of {} bytes", limit)
 +            }
          }
      }
  }
-@@ -202,6 +238,7 @@
+@@ -202,6 +248,7 @@
              RuntimeError::BacktrackLimitExceeded => {
                  write!(f, "Max limit for backtracking count exceeded")
              }
@@ -1133,7 +1216,7 @@ diff -ru a/src/lib.rs b/src/lib.rs
  
  use crate::analyze::can_compile_as_anchored;
 -use crate::analyze::{analyze, AnalyzeContext};
-+use crate::analyze::{analyze_for_linear, AnalyzeContext};
++use crate::analyze::{analyze_for_linear, look_around_runs_keep_out, AnalyzeContext};
  use crate::compile::{compile, CompileOptions};
  use crate::optimize::{optimize, OptimizeOptions};
  use crate::parse::{ExprTree, NamedGroups, Parser};
@@ -1413,10 +1496,15 @@ diff -ru a/src/lib.rs b/src/lib.rs
      /// See [`RegexOptionsBuilder::leftmost_longest`]
      #[cfg(feature = "leftmost_longest")]
      pub fn leftmost_longest(&mut self, yes: bool) -> &mut Self {
-@@ -1393,6 +1553,17 @@
+@@ -1393,6 +1553,22 @@
      pub(crate) fn new_options(pattern: String, options: &RegexOptions) -> Result<Regex> {
          let mut tree = Expr::parse_tree_with_flags(&pattern, options.compute_flags())?;
  
++        // Synsema: a `\K` that a look-around would run is an error, in the pattern as written.
++        if look_around_runs_keep_out(&tree) {
++            return Err(CompileError::KeepOutInLookAround.into());
++        }
++
 +        // Synsema: `full_match`. The pattern was parsed as written; its tree goes between the
 +        // two assertions (see `RegexOptionsBuilder::full_match`).
 +        if options.full_match {
@@ -1431,7 +1519,7 @@ diff -ru a/src/lib.rs b/src/lib.rs
          let find_not_empty = options.hard_regex_runtime_options.find_not_empty;
          let disallow_empty_match_at_eof_after_newline = options
              .hard_regex_runtime_options
-@@ -1416,9 +1587,12 @@
+@@ -1416,9 +1592,12 @@
              // with a fixup of the capture groups. `find_not_empty` is passed through so
              // the KeepOut/trailing-lookahead rewrites (which would make the pattern
              // delegatable, and the Wrap path can't reject empty matches) are skipped.
@@ -1446,7 +1534,7 @@ diff -ru a/src/lib.rs b/src/lib.rs
              &tree,
              AnalyzeContext {
                  explicit_capture_group_0: requires_capture_group_fixup,
-@@ -1428,6 +1602,7 @@
+@@ -1428,6 +1607,7 @@
                  #[cfg(feature = "leftmost_longest")]
                  leftmost_longest,
              },
@@ -1454,7 +1542,7 @@ diff -ru a/src/lib.rs b/src/lib.rs
          )?;
  
          if find_not_empty && info.const_size && info.min_size == 0 {
-@@ -1448,10 +1623,11 @@
+@@ -1448,10 +1628,11 @@
                  bytes_mode: options.bytes_mode,
                  unicode: options.syntaxc.get_unicode()
                      && !matches!(options.bytes_mode, BytesMode::Ascii),
@@ -1467,7 +1555,7 @@ diff -ru a/src/lib.rs b/src/lib.rs
                  // The remaining fields (anchored, contains_subroutines, seek_filter,
                  // disallow_empty_match_at_eof_after_newline) are irrelevant for a plain
                  // delegate compile in the easy path and their defaults are correct.
-@@ -1472,10 +1648,35 @@
+@@ -1472,10 +1653,35 @@
              let utf8 = matches!(compile_options.bytes_mode, BytesMode::Unicode);
              let mut hir_ctx = to_hir::HirCtx::new(compile_options.unicode, utf8);
              hir_ctx.enable_preserve_zero_rep_captures();
@@ -1505,7 +1593,7 @@ diff -ru a/src/lib.rs b/src/lib.rs
              return Ok(Regex {
                  inner: RegexImpl::Wrap {
                      inner,
-@@ -1483,12 +1684,16 @@
+@@ -1483,12 +1689,16 @@
                      explicit_capture_group_0: requires_capture_group_fixup,
                      delegated_pattern: re_cooked,
                      zero_rep_groups: hir_ctx.into_zero_rep_groups(),
@@ -1523,7 +1611,7 @@ diff -ru a/src/lib.rs b/src/lib.rs
              &info,
              CompileOptions {
                  anchored: can_compile_as_anchored(&tree.expr),
-@@ -1498,13 +1703,17 @@
+@@ -1498,13 +1708,17 @@
                  bytes_mode: options.bytes_mode,
                  unicode: options.syntaxc.get_unicode()
                      && !matches!(options.bytes_mode, BytesMode::Ascii),
@@ -1542,7 +1630,7 @@ diff -ru a/src/lib.rs b/src/lib.rs
          Ok(Regex {
              inner: RegexImpl::Fancy {
                  prog: Arc::new(prog),
-@@ -1561,11 +1770,16 @@
+@@ -1561,11 +1775,16 @@
          input: RegexInput<'_, S>,
      ) -> Result<bool> {
          match &self.inner {
@@ -1561,7 +1649,7 @@ diff -ru a/src/lib.rs b/src/lib.rs
                  }
              }
              RegexImpl::Fancy { .. } => self.find_input_raw(&input, 0).map(|m| m.is_some()),
-@@ -1668,11 +1882,129 @@
+@@ -1668,11 +1887,129 @@
          self.find_input(RegexInput::new(input).from_pos(pos))
      }
  
@@ -1691,7 +1779,7 @@ diff -ru a/src/lib.rs b/src/lib.rs
          if input.is_done() {
              return Ok(None);
          }
-@@ -1680,27 +2012,36 @@
+@@ -1680,27 +2017,36 @@
              RegexImpl::Wrap {
                  inner,
                  explicit_capture_group_0,
@@ -1741,7 +1829,7 @@ diff -ru a/src/lib.rs b/src/lib.rs
                  Ok(result)
              }
              RegexImpl::Fancy { prog, options, .. } => {
-@@ -1721,7 +2062,7 @@
+@@ -1721,7 +2067,7 @@
                  }
                  // Span-only VM entry: nothing is moved out of the pooled
                  // scratch, so this path is allocation-free per call.
@@ -1750,7 +1838,7 @@ diff -ru a/src/lib.rs b/src/lib.rs
              }
          }
      }
-@@ -1875,6 +2216,16 @@
+@@ -1875,6 +2221,16 @@
          input: &RegexInput<'t, S>,
          option_flags: u32,
      ) -> Result<Option<Captures<'t, S>>> {
@@ -1767,7 +1855,7 @@ diff -ru a/src/lib.rs b/src/lib.rs
          if input.is_done() {
              return Ok(None);
          }
-@@ -1885,6 +2236,7 @@
+@@ -1885,6 +2241,7 @@
                  inner,
                  explicit_capture_group_0,
                  zero_rep_groups,
@@ -1775,7 +1863,7 @@ diff -ru a/src/lib.rs b/src/lib.rs
                  ..
              } => {
                  // find_not_empty patterns are always compiled as Fancy, so find_not_empty is
-@@ -1896,7 +2248,10 @@
+@@ -1896,7 +2253,10 @@
                  if input.is_anchored() {
                      delegated_input = delegated_input.anchored(RaAnchored::Yes);
                  }
@@ -1787,7 +1875,7 @@ diff -ru a/src/lib.rs b/src/lib.rs
                  Ok(locations.is_match().then_some(Captures {
                      inner: CapturesImpl::Wrap {
                          locations,
-@@ -1928,7 +2283,7 @@
+@@ -1928,7 +2288,7 @@
                          0
                      };
                  }
@@ -1796,7 +1884,7 @@ diff -ru a/src/lib.rs b/src/lib.rs
                  Ok(result.map(|mut saves| {
                      saves.truncate(n_groups * 2);
                      Captures {
-@@ -3183,8 +3538,23 @@
+@@ -3183,8 +3543,23 @@
                      buf.push(')');
                  }
              }
@@ -1854,7 +1942,19 @@ diff -ru a/src/optimize.rs b/src/optimize.rs
 diff -ru a/src/parse.rs b/src/parse.rs
 --- a/src/parse.rs
 +++ b/src/parse.rs
-@@ -177,9 +177,27 @@
+@@ -102,6 +102,11 @@
+         resolver.curr_group = 0;
+         resolver.resolve_capture_group_targets(&mut expr)?;
+ 
++        // Synsema: relative calls can resolve to group 0 too (`\g<-1>` before any
++        // capture). Mark recursion after resolution, before the optimizer can introduce
++        // an explicit group 0 and copy its writes into a look-around through that call.
++        p.self_recursive |= expr.has_descendant_or_self(|e| matches!(e, Expr::SubroutineCall(0)));
++
+         Ok(ExprTree {
+             expr,
+             backrefs: resolver.backrefs,
+@@ -177,8 +182,26 @@
                  b'{' => {
                      match self.parse_repeat(ix) {
                          Ok((next, lo, hi, fixed)) => {
@@ -1874,15 +1974,14 @@ diff -ru a/src/parse.rs b/src/parse.rs
 +                            }
                              ix = next - 1;
                              (lo, hi, true, fixed)
-                         }
++                        }
 +                        // Synsema: a count that does not fit is an error, not a literal `{`.
 +                        Err(e @ Error::ParseError(_, ParseError::RepeatCountTooLarge)) => {
 +                            return Err(e);
-+                        }
+                         }
                          Err(_) => {
                              // Invalid repeat syntax, which results in `{` being treated as a literal
-                             return Ok((ix, child));
-@@ -214,6 +232,8 @@
+@@ -214,6 +237,8 @@
                  greedy = false;
                  ix += 1;
              }
@@ -1891,7 +1990,7 @@ diff -ru a/src/parse.rs b/src/parse.rs
              greedy ^= self.flag(FLAG_SWAP_GREED);
              let mut atomic_group = false;
              if self.flag(FLAG_ONIGURUMA_MODE) {
-@@ -225,8 +245,21 @@
+@@ -225,8 +250,21 @@
                      atomic_group = true;
                  }
              } else if ix < self.re.len() && self.re.as_bytes()[ix] == b'+' {
@@ -1913,7 +2012,7 @@ diff -ru a/src/parse.rs b/src/parse.rs
              }
              if skip {
                  return Ok((ix, child));
-@@ -283,6 +316,27 @@
+@@ -283,6 +321,27 @@
          Ok((ix, repeat))
      }
  
@@ -1941,7 +2040,7 @@ diff -ru a/src/parse.rs b/src/parse.rs
      fn is_repeatable(&self, child: &Expr) -> bool {
          match child {
              Expr::LookAround(_, _) => false,
-@@ -298,23 +352,37 @@
+@@ -298,23 +357,37 @@
      }
  
      // ix, lo, hi, fixed (an interval with no comma, like `{3}`)
@@ -1983,7 +2082,7 @@ diff -ru a/src/parse.rs b/src/parse.rs
          if ix == self.re.len() {
              return Err(Error::ParseError(ix, ParseError::InvalidRepeat));
          }
-@@ -323,10 +391,17 @@
+@@ -323,10 +396,17 @@
          let hi = match bytes[ix] {
              b'}' => lo,
              b',' => {
@@ -2004,7 +2103,7 @@ diff -ru a/src/parse.rs b/src/parse.rs
                  } else if lo_omitted && self.flag(FLAG_ONIGURUMA_MODE) {
                      // Oniguruma needs at least one of the limits, so `{,}` is literal text
                      return Err(Error::ParseError(end, ParseError::InvalidRepeat));
-@@ -336,10 +411,13 @@
+@@ -336,9 +416,12 @@
              }
              _ => return Err(Error::ParseError(ix, ParseError::InvalidRepeat)),
          };
@@ -2012,40 +2111,42 @@ diff -ru a/src/parse.rs b/src/parse.rs
 +        let ix = self.whitespace_in_count(end)?; // past hi number
          if ix == self.re.len() || bytes[ix] != b'}' {
              return Err(Error::ParseError(ix, ParseError::InvalidRepeat));
-         }
++        }
 +        if let Some(at) = too_large {
 +            return Err(Error::ParseError(at, ParseError::RepeatCountTooLarge));
-+        }
+         }
          Ok((ix + 1, lo, hi, fixed))
      }
- 
-@@ -1284,16 +1362,17 @@
+@@ -1257,7 +1340,8 @@
+         // `(?(1)(?:a|b))` and `(?(1)a|b)` give the same `Expr::Alt`.
+         let (end, if_true) = self.parse_branch(next, depth)?;
+         let end = self.optional_whitespace(end)?;
+-        let (end, if_false) = if self.re[end..].starts_with('|') {
++        let has_else = self.re[end..].starts_with('|');
++        let (end, if_false) = if has_else {
+             self.parse_re(end + 1, depth)?
+         } else {
+             (end, Expr::Empty)
+@@ -1284,9 +1368,17 @@
          let inner_condition = condition;
  
          let after = self.check_for_close_paren(end)?;
-+        // Synsema: a conditional whose two branches are empty is still a conditional, and it
-+        // matches whatever the condition says. Upstream gave back the condition alone, which is
-+        // what `(?(1))` with no branches means here (go on only if the group matched): written
-+        // with its branches, `(?(1)|)` failed when group 1 had not taken part, and in Perl and
-+        // in Python it matches.
++        // Synsema: a conditional written with its two branches, `(?(1)|)`, is a conditional
++        // also when both are empty, and it matches whatever the condition says, as in Perl and
++        // in Python. Upstream gave back the condition alone whenever the two branches were
++        // empty, which is what `(?(1))` with no branches means here (go on only if the group
++        // matched): `(?(1)|)` failed when group 1 had not taken part. It is the `|` that says
++        // there are two branches. Without one, an empty branch is no branch, whatever is
++        // written in its place (a blank under `(?x)`, a comment, `(?:)`): the condition alone,
++        // as upstream.
          Ok((
              after,
 -            if if_true == Expr::Empty && if_false == Expr::Empty {
--                inner_condition
--            } else {
--                Expr::Conditional {
--                    condition: Box::new(inner_condition),
--                    true_branch: Box::new(if_true),
--                    false_branch: Box::new(if_false),
--                }
-+            Expr::Conditional {
-+                condition: Box::new(inner_condition),
-+                true_branch: Box::new(if_true),
-+                false_branch: Box::new(if_false),
-             },
-         ))
-     }
-@@ -1401,7 +1480,17 @@
++            if !has_else && if_true == Expr::Empty {
+                 inner_condition
+             } else {
+                 Expr::Conditional {
+@@ -1401,7 +1493,17 @@
          }
      }
  
@@ -2064,7 +2165,7 @@ diff -ru a/src/parse.rs b/src/parse.rs
          let bytes = self.re.as_bytes();
          loop {
              if ix == self.re.len() {
-@@ -1415,7 +1504,7 @@
+@@ -1415,7 +1517,7 @@
                      }
                  }
                  b' ' | b'\r' | b'\n' | b'\t' if self.flag(FLAG_IGNORE_SPACE) => ix += 1,
@@ -2073,7 +2174,7 @@ diff -ru a/src/parse.rs b/src/parse.rs
                      ix += 3;
                      loop {
                          if ix >= self.re.len() {
-@@ -1658,6 +1747,26 @@
+@@ -1658,6 +1760,26 @@
      }
  }
  
@@ -2100,7 +2201,22 @@ diff -ru a/src/parse.rs b/src/parse.rs
  // return (ix, value)
  pub(crate) fn parse_usize(s: &str, ix: usize) -> Option<(usize, usize)> {
      let mut end = ix;
-diff -ru a/src/seek.rs b/src/seek.rs
+@@ -4028,6 +4150,15 @@
+ 
+     #[test]
+     fn self_recursive_subroutine_call() {
++        for pattern in [r"hello\g<-1>?world", r"hello\g'-1'?world", r"()hello\g<-2>?world"] {
++            let tree = Expr::parse_tree(pattern).unwrap();
++            assert!(tree.self_recursive, "{pattern}");
++        }
++        for pattern in [r"(hello)\g<-1>", r"(hello)\g'-1'"] {
++            let tree = Expr::parse_tree(pattern).unwrap();
++            assert!(!tree.self_recursive, "{pattern}");
++        }
++
+         let tree = Expr::parse_tree(r"hello\g<0>?world").unwrap();
+         assert!(tree.self_recursive);
+         assert!(tree.numeric_capture_group_references);
 --- a/src/seek.rs
 +++ b/src/seek.rs
 @@ -285,6 +285,13 @@
@@ -2110,9 +2226,9 @@ diff -ru a/src/seek.rs b/src/seek.rs
 +            // Synsema: a quantifier needs something to repeat, and what it repeats can write
 +            // nothing here (an empty capture group, whose wrapper is dropped; a DEFINE block;
 +            // an anchor that is left out). Upstream wrote the quantifier all the same, and it
-+            // went to whatever came before: for `c+(){2}` the seek pattern was `c+{2}`, the
-+            // starts it gave were the ones of `(?:c+){2}`, and `(?<=c+(){2}…)` did not match
-+            // after one `c`.
++            // went to whatever came before: for `c+(){2,}?` the seek pattern was `c+{2,}?`,
++            // the starts it gave were the ones of `(?:c+){2,}?`, and `(?<!c+(){2,}?)x` matched
++            // the `x` of `cx`, which has a `c` before it.
 +            let before = buf.len();
              if !info.children.is_empty() {
                  build_seek_pattern_impl(

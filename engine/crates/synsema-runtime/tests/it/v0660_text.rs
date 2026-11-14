@@ -1418,6 +1418,94 @@ pub fn round10_a_conditional_with_two_empty_branches_matches_either_way() {
     );
 }
 
+/// Ronda 11, M-1 y M-2: `\K` donde un look-around lo correría (escrito adentro, o en un grupo
+/// que el look-around llama) es un error de patrón inválido en las cuatro funciones, y `try` lo
+/// atrapa. La crate lo dejaba escribir el comienzo de la coincidencia desde adentro:
+/// `backtrack_find_all("abc", "(?<=\\K\\w)\\w")` daba `["ab", "bc"]`, dos coincidencias que se
+/// pisan, y `backtrack_replace` de lo mismo era el error interno del motor.
+#[test]
+pub fn round11_keep_out_where_a_look_around_would_run_it_is_an_error() {
+    for pattern in [
+        r"(?<=\K\w)\w",
+        r"(?<=\Ka+)b",
+        r"(?<=\Ka+(?:(?!)x)?)b",
+        r"a(?=bc\K)b",
+        r"(?<!\Ka)b",
+        r"(?<k>a\Kb)(?=\g<k>)",
+    ] {
+        let want = format!(
+            "invalid regex pattern '{}': Error compiling regex: A look-around has \\K in it, or calls a group that has it: \
+             \\K sets where the match starts, and what a look-around reads is not part of the match; write \\K outside \
+             the look-around",
+            pattern.replace('\\', "\\\\")
+        );
+        let p = lit(pattern);
+        for call in [
+            format!("backtrack_find_all(\"abc\", {p})"),
+            format!("backtrack_capture(\"abc\", {p})"),
+            format!("backtrack_replace(\"abc\", {p}, \"-\")"),
+            format!("backtrack_matches(\"abc\", {p})"),
+            format!("backtrack_find_all(\"\", {p}, max_steps = 1)"),
+        ] {
+            let got = out(&format!("print({call})"));
+            assert!(got.starts_with("ERR: ") && got.ends_with(&want), "{}\n→ {}", call, got);
+            eq(&format!("try\n    print({call})\nrecover e\n    print(\"atrapado\")"), "atrapado");
+        }
+    }
+    // un `\K` que ningún look-around corre sigue como estaba
+    eq(
+        r#"print(backtrack_find_all("ab ab", "a\\Kb"), backtrack_replace("ab ab", "a\\Kb", "-"), backtrack_capture("abc", "(a\\Kb)c"), backtrack_matches("ab", "a\\Kb"))"#,
+        r#"["b", "b"] a- a- ["ab"] true"#,
+    );
+    // también en un grupo que se llama desde afuera de un look-around, y con un look-around que
+    // llama a otro grupo
+    eq(
+        r#"print(backtrack_find_all("abab", "(a\\Kb)\\g<1>"), backtrack_find_all("aba", "(?<x>a)(?<y>b\\K)(?=\\g<x>)"))"#,
+        r#"["b"] [""]"#,
+    );
+}
+
+/// Ronda 11, B-1: lo que dice que una condición tiene dos ramas es la `|`. Sin ella, una rama
+/// vacía no es una rama: `(?x)(?(1) )` y `(?(1)(?#c))` son `(?(1))`, que sigue sólo si el grupo
+/// participó. El arreglo de la ronda 10 lo decidía por la posición en el texto, y las dos
+/// coincidían siempre.
+#[test]
+pub fn round11_without_a_bar_an_empty_branch_of_a_conditional_is_no_branch() {
+    // daban `["b"]` las tres
+    eq(
+        r#"print(backtrack_find_all("b", "(?x)(?:|(a))(?(1) )b"), backtrack_find_all("b", "(?:|(a))(?(1)(?#nada))b"), backtrack_find_all("b", "(?:|(a))(?(1)(?:))b"))"#,
+        "[] [] []",
+    );
+    // con la `|`, coincide siempre; y sin ella, cuando el grupo participó
+    eq(
+        r#"print(backtrack_find_all("b", "(?x)(?:|(a))(?(1) | )b"), backtrack_find_all("ab", "(?x)(?:|(a))(?(1) )b"))"#,
+        r#"["b"] ["ab"]"#,
+    );
+}
+
+/// Ronda 12: las llamadas relativas al grupo 0 conservan los límites de la coincidencia.
+#[test]
+pub fn round12_relative_calls_to_group_zero_keep_the_match_bounds() {
+    eq(
+        r#"print(backtrack_find_all("xyxz", "x(?=y\\g<-1>|z)"), backtrack_replace("xyxz", "x(?=y\\g<-1>|z)", "-"), backtrack_capture("xyxz", "x(?=y\\g<-1>|z)"), backtrack_matches("xyxz", "x(?=y\\g<-1>|z)"))"#,
+        r#"["x", "x"] -y-z ["x"] false"#,
+    );
+    eq(
+        r#"print(backtrack_find_all("xyxz", "x(?=y\\g'-1'|z)"), backtrack_find_all("xyxz", "()x(?=y\\g<-2>|z)"))"#,
+        r#"["x", "x"] ["x", "x"]"#,
+    );
+    for call in [r"\\g<-1>", r"\\g'-1'", r"\\g<0>"] {
+        for invocation in [
+            format!(r#"backtrack_find_all("aa", "a(?=(?<={call}.)|)")"#),
+            format!(r#"backtrack_replace("aa", "a(?=(?<={call}.)|)", "-")"#),
+            format!(r#"backtrack_capture("aa", "a(?=(?<={call}.)|)")"#),
+            format!(r#"backtrack_matches("aa", "a(?=(?<={call}.)|)")"#),
+        ] {
+            err_has(&invocation, "A look-behind of variable length");
+        }
+    }
+}
+
 /// Ronda 6, M-2: una cuenta con el mínimo mayor que el máximo es un error de patrón inválido, en
 /// las cuatro funciones, y `try` lo atrapa. La crate la leía como `{3}` en un motor y como `{2}`
 /// en el otro (`a{3,2}` sobre `aaa`: `["aaa"]` suelto y `["aa"]` con un `(?<!x)` al lado), y en

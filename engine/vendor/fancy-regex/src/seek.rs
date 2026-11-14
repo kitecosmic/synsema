@@ -288,9 +288,9 @@ pub(crate) fn build_seek_pattern_impl<'a>(
             // Synsema: a quantifier needs something to repeat, and what it repeats can write
             // nothing here (an empty capture group, whose wrapper is dropped; a DEFINE block;
             // an anchor that is left out). Upstream wrote the quantifier all the same, and it
-            // went to whatever came before: for `c+(){2}` the seek pattern was `c+{2}`, the
-            // starts it gave were the ones of `(?:c+){2}`, and `(?<=c+(){2}…)` did not match
-            // after one `c`.
+            // went to whatever came before: for `c+(){2,}?` the seek pattern was `c+{2,}?`,
+            // the starts it gave were the ones of `(?:c+){2,}?`, and `(?<!c+(){2,}?)x` matched
+            // the `x` of `cx`, which has a `c` before it.
             let before = buf.len();
             if !info.children.is_empty() {
                 build_seek_pattern_impl(

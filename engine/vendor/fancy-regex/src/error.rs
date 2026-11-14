@@ -117,6 +117,10 @@ pub enum CompileError {
     /// or a subroutine call (which writes the group it calls), e.g. `(?<=(a|ab))c`. What such a
     /// group holds is not one thing (see `Compiler::compile_lookaround`).
     LookBehindWritesGroup,
+    /// Synsema: a look-around can run a `\K`: one written in it, or in a group it calls, e.g.
+    /// `(?<=\K\w)\w`. `\K` sets where the match starts, and what a look-around reads is not part
+    /// of the match (see `analyze::look_around_runs_keep_out`).
+    KeepOutInLookAround,
 }
 
 /// An error as the result of executing a regex.
@@ -223,6 +227,12 @@ impl fmt::Display for CompileError {
                 "A look-behind of variable length has a capture group or a subroutine call in it: \
                  use (?:...) if the group is only for grouping, capture outside the look-behind, \
                  or give the look-behind one fixed length"
+            ),
+            CompileError::KeepOutInLookAround => write!(
+                f,
+                "A look-around has \\K in it, or calls a group that has it: \\K sets where the \
+                 match starts, and what a look-around reads is not part of the match; write \\K \
+                 outside the look-around"
             ),
             CompileError::ProgramTooLarge { limit, .. } => {
                 write!(f, "Compiled regex exceeds the size limit of {} bytes", limit)

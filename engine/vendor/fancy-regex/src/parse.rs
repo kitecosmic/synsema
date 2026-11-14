@@ -102,6 +102,11 @@ impl<'a> Parser<'a> {
         resolver.curr_group = 0;
         resolver.resolve_capture_group_targets(&mut expr)?;
 
+        // Synsema: relative calls can resolve to group 0 too (`\g<-1>` before any
+        // capture). Mark recursion after resolution, before the optimizer can introduce
+        // an explicit group 0 and copy its writes into a look-around through that call.
+        p.self_recursive |= expr.has_descendant_or_self(|e| matches!(e, Expr::SubroutineCall(0)));
+
         Ok(ExprTree {
             expr,
             backrefs: resolver.backrefs,
@@ -1335,7 +1340,8 @@ impl<'a> Parser<'a> {
         // `(?(1)(?:a|b))` and `(?(1)a|b)` give the same `Expr::Alt`.
         let (end, if_true) = self.parse_branch(next, depth)?;
         let end = self.optional_whitespace(end)?;
-        let (end, if_false) = if self.re[end..].starts_with('|') {
+        let has_else = self.re[end..].starts_with('|');
+        let (end, if_false) = if has_else {
             self.parse_re(end + 1, depth)?
         } else {
             (end, Expr::Empty)
@@ -1362,17 +1368,24 @@ impl<'a> Parser<'a> {
         let inner_condition = condition;
 
         let after = self.check_for_close_paren(end)?;
-        // Synsema: a conditional whose two branches are empty is still a conditional, and it
-        // matches whatever the condition says. Upstream gave back the condition alone, which is
-        // what `(?(1))` with no branches means here (go on only if the group matched): written
-        // with its branches, `(?(1)|)` failed when group 1 had not taken part, and in Perl and
-        // in Python it matches.
+        // Synsema: a conditional written with its two branches, `(?(1)|)`, is a conditional
+        // also when both are empty, and it matches whatever the condition says, as in Perl and
+        // in Python. Upstream gave back the condition alone whenever the two branches were
+        // empty, which is what `(?(1))` with no branches means here (go on only if the group
+        // matched): `(?(1)|)` failed when group 1 had not taken part. It is the `|` that says
+        // there are two branches. Without one, an empty branch is no branch, whatever is
+        // written in its place (a blank under `(?x)`, a comment, `(?:)`): the condition alone,
+        // as upstream.
         Ok((
             after,
-            Expr::Conditional {
-                condition: Box::new(inner_condition),
-                true_branch: Box::new(if_true),
-                false_branch: Box::new(if_false),
+            if !has_else && if_true == Expr::Empty {
+                inner_condition
+            } else {
+                Expr::Conditional {
+                    condition: Box::new(inner_condition),
+                    true_branch: Box::new(if_true),
+                    false_branch: Box::new(if_false),
+                }
             },
         ))
     }
@@ -4137,6 +4150,15 @@ mod tests {
 
     #[test]
     fn self_recursive_subroutine_call() {
+        for pattern in [r"hello\g<-1>?world", r"hello\g'-1'?world", r"()hello\g<-2>?world"] {
+            let tree = Expr::parse_tree(pattern).unwrap();
+            assert!(tree.self_recursive, "{pattern}");
+        }
+        for pattern in [r"(hello)\g<-1>", r"(hello)\g'-1'"] {
+            let tree = Expr::parse_tree(pattern).unwrap();
+            assert!(!tree.self_recursive, "{pattern}");
+        }
+
         let tree = Expr::parse_tree(r"hello\g<0>?world").unwrap();
         assert!(tree.self_recursive);
         assert!(tree.numeric_capture_group_references);

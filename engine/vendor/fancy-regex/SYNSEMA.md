@@ -12,12 +12,12 @@ for 0.17.0, `candle-transformers` 0.11 for 0.18.0) get the ones of crates.io as 
 no `[patch.crates-io]`. In a 0.x crate a new minor version can change what a pattern means, and the
 patterns of a tokenizer were written for the version its crate asks for.
 
-The patch adds methods, five error variants (to enums that are `#[non_exhaustive]`) and options
+The patch adds methods, six error variants (to enums that are `#[non_exhaustive]`) and options
 that are off by default. In the hidden `internal` module, which upstream keeps for its own
 example, it adds fields to `CompileOptions` and `OptimizeOptions` (both have `Default`, and the
 example builds them with `..Default::default()`) and changes the type of one field of an
 instruction (`Delegate::inner`, item 2). With every option off, what a pattern matches is the same as upstream
-except in the twelve places listed under "What a pattern matches".
+except in the fourteen places listed under "What a pattern matches".
 
 ## Why a fork
 
@@ -440,12 +440,16 @@ Everything the patch adds is marked with a `Synsema:` comment. The whole patch i
     - With the patch it is an error, `CompileError::LookBehindWritesGroup`, raised at the top
       of `compile_lookaround`, before any of the three ways is chosen: a positive look-behind
       that is not of one fixed size and whose body has a capture group of its own (a DEFINE
-      block in it counts its groups) or a subroutine call (`writes_a_group`). The message says
+      block in it counts its groups) or a subroutine call, in any of its spellings (`\g<…>`,
+      `\g'…'`, `(?P>…)`; `writes_a_group`). The message says
       what to write: `(?:…)` if the group is only for grouping, the capture outside the
       look-behind (a group before `\K`), or a look-behind of one fixed size.
     - Not an error, and compiled as upstream compiles them: a look-behind of one fixed size
       (one start, so one thing its groups can hold), a negative one (no group of it is left)
       and one with no group and no call in it (it only has to say whether it matches).
+    - The check is where a look-behind is compiled. One that is never compiled (in a
+      definition that nothing calls, or under a `{0}`) is not an error, and never runs:
+      `(?(DEFINE)(?<g>(?<=(a+))b))x` compiles. Called, or under a `{0,1}`, it is the error.
     - *A quantifier in a seek pattern needs something to repeat* (`build_seek_pattern_impl`).
       The pattern that finds the starts of a look-behind that runs in the VM drops the wrapper
       of a capture group, and an empty group wrote nothing: for `c+(){2,}?` it was `c+{2,}?`,
@@ -456,19 +460,62 @@ Everything the patch adds is marked with a `Synsema:` comment. The whole patch i
       the seek pattern of a whole regex under upstream's `seek` option, which is off by default
       and which `backtrack.rs` does not turn on; what the change does there was not measured.
 
-16. **A conditional with two empty branches is still a conditional (`src/parse.rs`).** Audit
-    of round 10. `parse_conditional` gave back the condition alone when both branches were
-    empty, which is what `(?(1))` with no branches means in this crate (go on only if the
-    group took part). So `(?(1)|)`, which says "nothing if it did, nothing if it did not",
-    failed when group 1 had not taken part: `(?:|(a))(?(1)|)b` did not match `b`. In Perl and
-    in Python's `re` it does. Now the two branches are kept. `(?(1))` with no branches is as it
-    was.
+16. **A conditional written with two empty branches is still a conditional (`src/parse.rs`).**
+    Audits of rounds 10 and 11. `parse_conditional` gave back the condition alone when both
+    branches were empty, which is what `(?(1))` with no branches means in this crate (go on
+    only if the group took part). So `(?(1)|)`, which says "nothing if it did, nothing if it
+    did not", failed when group 1 had not taken part: `(?:|(a))(?(1)|)b` did not match `b`. In
+    Perl and in Python's `re` it does. Now it is the `|` that says there are two branches, and
+    with it the two are kept, empty or not. Without it nothing changes from upstream: an empty
+    branch is no branch, whatever is written in its place (`(?(1))`, a blank under `(?x)`, a
+    comment, `(?:)`), and the conditional is its condition alone. (Round 10 kept the two
+    branches whenever the parser had moved past the condition, so `(?x)(?(1) )` and
+    `(?(1)(?#c))` matched always and `(?(1))` did not.)
+
+17. **`\K` where a look-around would run it is an error (`src/analyze.rs`, `src/lib.rs`,
+    `src/error.rs`).** Audit of round 11.
+    - `\K` is compiled as a save of slot 0: it writes where the match starts. Upstream lets it
+      write from inside a look-around, and pins it in a test
+      (`keepout_in_lookarounds_match_in_correct_place`: `(?<=a\Kb)c` on `abc` is `bc`, and
+      `a(?=b\Kc)` is the empty text after the `a`).
+    - In a look-behind the start it writes is before the place the search began at, so a match
+      can start before the end of the one before it: `(?<=\K\w)\w` on `abc` gave `ab` and then
+      `bc`. `backtrack.rs` walks the matches taking them not to overlap, and its replace cut
+      the text between two of them backwards (a panic).
+    - With a body of variable size the start also depends on which of the ways of item 15
+      compiles the look-behind: `(?<=\Ka+)b` on `aaab` gave `aaab` (the body is a concatenation
+      whose hard child, the `\K`, is of fixed size: its easy pieces go to a reverse DFA, the
+      farthest start) and `ab` with a hard child of variable size next to it (the VM, the
+      nearest).
+    - In a look-ahead the start is after the end of the match, and the match came out empty.
+    - With the patch it is an error, `CompileError::KeepOutInLookAround`: a look-around whose
+      body has a `\K`, or calls a group that can run one, through any number of calls (the
+      whole pattern is group 0). Perl rejects `\K` in a look-around too. The message says to
+      write it outside.
+    - It is asked of the pattern as it was parsed (`look_around_runs_keep_out`, called from
+      `Regex::new_options` before the optimizer, which takes a `\K` and a final look-ahead at
+      the root out of the pattern), so it is by the form of the pattern: a look-around in a
+      definition that nothing calls is the error too. A negative look-around, where what `\K`
+      writes is never kept, is the same error.
+    - Not changed: a `\K` that no look-around runs, wherever it is written (at the root, in a
+      group, an atomic group, a branch, a repetition, a group that is called from outside a
+      look-around), and the absent operator `(?~…)`, which is not a look-around.
+
+18. **A relative call to the whole pattern prevents the group-0 rewrites (`src/parse.rs`).**
+    Audit of round 12. After resolving calls, any `SubroutineCall(0)` marks the tree as
+    self-recursive, also `\g<-1>` before any capture or `\g<-2>` after one. Upstream marked
+    only absolute calls. Without the mark, the optimizer hoisted a final look-ahead and a
+    call from inside it copied the new explicit group 0: `x(?=y\g<-1>|z)` on `xyxz` lost
+    the first `x`; `a(?=(?<=\g<-1>.)|)` on `aa` found `0..1` when searching from 1 and
+    `backtrack_replace` cut backwards. Both relative spellings (`\g<-1>`, `\g'-1'`) now
+    behave like `\g<0>`: the first pattern finds both `x`s and the second is the error of
+    item 15. A relative call to another group is unchanged.
 
 Nothing else changes: no `unsafe` (upstream has none either), no new dependency.
 
 ## What a pattern matches
 
-With every option of the patch off, twelve things differ from 0.20.2 as published:
+With every option of the patch off, fourteen things differ from 0.20.2 as published:
 
 | | 0.20.2 | this folder |
 |---|---|---|
@@ -483,7 +530,9 @@ With every option of the patch off, twelve things differ from 0.20.2 as publishe
 | A group after a DEFINE block; the groups around one under a `{0}` in a pattern that ends in a look-ahead (item 14) | the number of a group of the block; an empty text for the group under the `{0}` and nothing for the one after it | every group under its own number, and nothing for the ones that only hold a place |
 | A capture group or a subroutine call in a positive look-behind of variable size: `(?<=(a\|ab))c`, `(?<=(\d+));` (item 15) | compiles; the group is filled by a search anchored only at the start a reverse DFA gives, or from the nearest start with the body ending at the look-behind, by what the body has | an error |
 | A negative look-behind with an empty group under a count: `(?<!c+(){2,}?)x` on `cx` (item 15) | matches the `x`: the starts it looks for are the ones of `(?:c+){2,}?` | does not match |
-| A conditional with two empty branches: `(?(1)\|)` (item 16) | the condition alone: it fails when the group did not take part | matches either way |
+| A conditional written with two empty branches: `(?(1)\|)` (item 16) | the condition alone: it fails when the group did not take part | matches either way |
+| `\K` that a look-around would run: `(?<=\K\w)\w`, `a(?=b\Kc)` (item 17) | the start of the match is written from inside the look-around: before the end of the match before it, by the way the look-behind is compiled, or after the end of the match | an error |
+| A relative call that resolves to group 0 before a final look-ahead (item 18) | can rewrite the match bounds through the generated group 0 | preserves whole-pattern recursion, like an absolute call to 0 |
 
 `backtrack.rs` turns on `full_match` (for `backtrack_matches`), `optimize_repeats(false)`,
 `program_size_limit` and `search_cache_limit`, and searches with the `*_with_steps` methods.
@@ -497,9 +546,9 @@ run by the engine's CI (this folder is not a workspace member).
 
 ## Checks
 
-- The upstream test suite of 0.20.2 on these sources: 758 of its 780 tests pass (377 unit tests,
+- The upstream test suite of 0.20.2 on these sources: 757 of its 780 tests pass (377 unit tests,
   368 tests in 10 integration test files, of which the one of `leftmost_longest` has none
-  without its feature, and 35 doctests). The 22 that do not pin down what the patch changes:
+  without its feature, and 35 doctests). The 23 that do not pin down what the patch changes:
   - `backrefs_casei_unicode_fold_orbits` (`tests/matching.rs`), item 7: its last three
     assertions say that `(ſa)(?i:\1)` does not match `ſasab`, that `(å)(?i:\1)` does not match
     `å` followed by the Angstrom sign and that `(s)(?i:\1)` does not match `sſ`, "because the
@@ -532,15 +581,21 @@ run by the engine's CI (this folder is not a workspace member).
       `variable_hard_lookbehind_can_disable_skip_cache_capacity_check` and
       `word_boundary_inside_lookbehind_compiled_on_vm_with_backref`.
 
-    None of the 22 is of item 16 or of the seek pattern of item 15: no upstream test has a
-    conditional whose two branches are both empty, or an empty group under a count.
+  - `keepout_in_lookarounds_match_in_correct_place` (`tests/finding.rs`), item 17: it has a
+    `\K` inside a look-behind, a negative look-behind, a look-ahead and a negative
+    look-ahead (`(?<=a\Kb)c`, `a(?=b\Kc)`), and here each is
+    `CompileError::KeepOutInLookAround`. The tests of a `\K` outside a look-around
+    (`keepout_matches_in_correct_place`, the four `captures_with_keepout_…`) pass.
+
+  None of the 23 is of item 16 or of the seek pattern of item 15: no upstream test has a
+  conditional written with two empty branches, or an empty group under a count.
 
   To repeat it: copy the published package, replace its `src/` with this one, drop `benches/`,
   `examples/` and `criterion` from its manifest and run `cargo test --no-fail-fast`.
 - `patch -p1 < synsema.patch` on the published `src/` gives these sources, byte for byte.
 - Random patterns, comparing every match and every group. With the sources as they were after
-  round 8 (since then: the error of item 15, which stops a pattern before any search, the seek
-  pattern of the same item, and item 16):
+  round 8 (since then: the errors of items 15 and 17, which stop a pattern before any search,
+  the seek pattern of item 15, and item 16):
   - each pattern against four ways of writing it that match the same and send it to the other
     engine (a look-behind that always holds before it, after it and at the start of every
     group, and an empty look-ahead at its end, which the optimizer hoists): 96 000 patterns of
@@ -570,6 +625,15 @@ run by the engine's CI (this folder is not a workspace member).
     which can read past the position and not give it back. Before item 15, the same body with and without something
     hard next to it (`(?<=(?:P|(?!)\1))`) differed in 13 to 24 patterns in every 1 100.
 
+  - item 17 (round 11): each pattern of the first generator with a `\K` put in it at a random
+    place. In 6 seeds of 6 000, some 3 500 in each parse, and every one of them is the error
+    of item 17 in the three forms where a look-around would run the `\K`: as the body of a
+    look-behind, as the body of a look-ahead, and in a group that a look-ahead calls. As
+    written, some 270 in each seed are the error (the `\K` fell inside a look-around of the
+    pattern), and in the 3 050 or so that compile, every match starts at the place its
+    search began at or after it, and not after its own end. (Some 210 more in each seed run
+    out of the step limit of the probe and are not compared.)
+
   Run on the sources as they were after round 6, and not again since:
   - 240 000 and 180 000 patterns of the two generators (40 and 30 seeds), with no difference;
   - this folder with `optimize_repeats(false)` against itself with `optimize(false)`: none
@@ -584,7 +648,7 @@ run by the engine's CI (this folder is not a workspace member).
   generator, run on the patch as it was after round 5): in one the published crate leaves
   group 1 with its start after its end and panics when it is read (item 6); in two, only a
   group differs, and it is the group of item 10; 285 do not compile here with the error of item
-  11. It was not run again: what differs from upstream since then is what items 10 to 16 say,
+  11. It was not run again: what differs from upstream since then is what items 10 to 17 say,
   each with its cases.
 
   The probes are not in the repository; they are described in the design of v0.6.60 (rounds 4
@@ -608,12 +672,13 @@ run by the engine's CI (this folder is not a workspace member).
    `DelegateBuilder::build_delegate`, `compile`), the repetition count and the quantifier in the
    parser (`parse_repeat`, `parse_quantifier`, `optional_whitespace`), `optimize`,
    `Analyzer::visit` (the sizes and the repetition) with `check_left_recursion`, and for items
-   13 to 16: `analyze_for_linear` (new, after `analyze`) and its call in `new_options`, the
+   13 to 17: `analyze_for_linear` (new, after `analyze`) and its call in `new_options`, the
    arms of `expr_to_hir` for an alternation, a `{0}` and a DEFINE block, the DEFINE arm of
    `Expr::to_str`, `compile_delegates`, `CapturesImpl::get_span`, the look-behind arm of
    `compile_lookaround` (the error of item 15, with `writes_a_group`), the repetition arm of
-   `build_seek_pattern_impl`, and the end of `parse_conditional`. A new instruction that owns
-   memory goes in
+   `build_seek_pattern_impl`, the end of `parse_conditional`, and `look_around_runs_keep_out`
+   (new, after `collect_groups`) with its call at the top of `new_options`. A new instruction
+   that owns memory goes in
    `insn_bytes`; one that reads a stretch of the text pays for it with `spend(steps,
    stretch(…))`; one that searches with the linear engine gets its cache from `new_meta_cache` or
    `new_lazy_cache` when it is compiled (which is what counts it), takes it from `SearchCaches`
@@ -621,7 +686,7 @@ run by the engine's CI (this folder is not a workspace member).
    `compile_group`.
 3. Run the upstream suite and the differential probe against the new published version, without
    its optimizer and with it. What the probe finds in the published crate decides what stays in
-   the patch: items 6, 7, 8 and 10 to 16 are there for what 0.20.2 does. Item 13 is there for
+   the patch: items 6, 7, 8 and 10 to 17 are there for what 0.20.2 does. Item 13 is there for
    what `regex-syntax` 0.8.11 does too. It asks `regex-syntax` what it made of each
    alternation, so a version that factors in another way is followed; what has to be read
    again is `reordered`, which knows the three things `Hir::alternation` gives back today and
@@ -631,7 +696,8 @@ run by the engine's CI (this folder is not a workspace member).
    `groups_that_only_hold_a_place_do_not_move_the_others` is the one of item 14,
    `a_capture_group_in_a_look_behind_of_variable_length_is_an_error`, the one of item 15, and
    `a_conditional_with_two_empty_branches_matches_whatever_the_condition_says`, the one of
-   item 16. If upstream comes to read the groups of a look-behind of variable size in one way,
+   item 16, and `keep_out_where_a_look_around_would_run_it_is_an_error`, the one of item 17. If
+   upstream comes to read the groups of a look-behind of variable size in one way,
    whatever its body has, and at a cost that does not grow exponentially, the error of item 15
    can go.
 4. Regenerate `synsema.patch` (`diff -ru` of the published `src/` against this one) and update
@@ -643,7 +709,7 @@ run by the engine's CI (this folder is not a workspace member).
 
 If upstream adds a way to bound work (a step or instruction limit a caller can share between
 searches), the size of what it compiles and what its searches need, and fixes items 6 to 8 and
-10 to 16, this fork can go: `backtrack.rs` needs only the `*_with_steps` searches, `program_len`,
+10 to 17, this fork can go: `backtrack.rs` needs only the `*_with_steps` searches, `program_len`,
 `program_size_limit`, `search_cache_limit` with `trim_search_caches` (and the two counters its
 tests read, `fresh_search_cache_bytes` and `search_cache_drops`), `full_match` and
 `optimize_repeats`.

@@ -72,8 +72,10 @@ capture group, a case-insensitive backreference, a repetition that can
 match empty, an alternation and a conditional with two empty branches
 match, to the number a capture group gets after a DEFINE block or beside
 a repetition of zero times, and to how quantifiers and their counts are
-read; a capture group in a look-behind of variable length, which was
-read in more than one way, is an error. What changes and why is in
+read, and to recognizing relative calls to the whole pattern before
+rewriting match bounds; a capture group in a positive look-behind of variable length,
+which was read in more than one way, and a \K inside a look-around are
+errors. What changes and why is in
 engine/vendor/fancy-regex/SYNSEMA.md; the patch itself is
 engine/vendor/fancy-regex/synsema.patch. It is the engine of the
 backtrack_* builtins.
