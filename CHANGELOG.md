@@ -6,6 +6,22 @@ Each says what changed, why, and what to write instead.
 
 Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the release date.
 
+## v0.6.61 — unreleased
+
+- **Breaking: packages must declare `time`, `random` and `stdin`.** Put the
+  corresponding `require` inside the package's tasks. The package domain no longer inherits
+  the process-local exception of captokens and `sandbox under` for these three capabilities.
+  Program grants and host ceilings still apply; declaring a capability never grants it. Seeded generators and
+  explicit timestamps remain pure. `get` records these declarations and requires hash-bound
+  `--accept` when an update adds them.
+- Inside a package, `read_line()` checks `stdin` before reading input or emitting a prompt. Package printing
+  retains its previous behavior; `requires nothing` describes capability declarations,
+  not a guarantee of purity or full process isolation.
+- `get` rejects agent definitions and `spawn` throughout every packaged `.syn` file,
+  including unused tasks and branches, using the same validation as loading a package.
+- Clock-dependent authentication builtins name the package and missing `require time`
+  when its domain denies the clock.
+
 ## v0.6.60 — 2026-11-14
 
 Text for tokenizers: what a BPE or WordPiece tokenizer written in Synsema was missing.

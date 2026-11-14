@@ -1454,3 +1454,95 @@ fn m_r3_3_nested_template_blocks_count_toward_the_limit_in_a_program() {
         assert_eq!((code, out.trim()), (0, want), "{}", err);
     }
 }
+
+#[test]
+fn v0661_process_local_requires_are_written_checked_and_guard_updates() {
+    for cap in ["time", "random", "stdin"] {
+        let reg = Reg::start();
+        let id = format!("{}/tok", reg.base());
+        let v1 = says(&id, "0.1.0", "one");
+        let u = reg.publish("/tok/latest", &v1);
+        let p = Proj::new("v0661-update", modules(&[("tok", url(&u))]));
+        p.ok(&[]);
+        let before = p.text();
+        let v2 = Pkg::new(&id, "0.2.0", &format!("export task cual()\n    require {cap}\n    give \"two\"\n"));
+        reg.publish("/tok/latest", &v2);
+        let accept = format!("tok@{}", v2.hash());
+        assert_eq!(p.fails(&["--update", "tok"]), format!("get: tok 0.2.0 now requires {cap} (0.1.0 required nothing); nothing was changed. To accept: synsema get --update tok --accept {accept}"));
+        assert_eq!(p.text(), before);
+        p.ok(&["--update", "tok", "--accept", &accept]);
+        assert_eq!(p.json()["modules"]["tok"]["requires"], json!([cap]));
+        p.ok(&["--check"]);
+        assert_eq!(p.run("use \"tok\" as tok\nprint(tok.cual())\n").trim(), "two");
+        let fresh = Proj::new("v0661-first", modules(&[("tok", url(&u))]));
+        let report = fresh.ok(&[]);
+        assert!(report.contains(&format!("task cual: {cap}")), "{report}");
+        assert_eq!(fresh.json()["modules"]["tok"]["requires"], json!([cap]));
+        fresh.ok(&["--check"]);
+    }
+}
+
+#[test]
+fn v0661_get_rejects_agents_and_spawn_in_every_file_and_branch() {
+    for src in [
+        "agent a\n    print(1)\n",
+        "export task f()\n    spawn a\n",
+        "when false\n    spawn a\n",
+        "test \"dead\"\n    spawn a\n",
+    ] {
+        for extra in [false, true] {
+            let e = local(|id| {
+                if extra { says(id, "0.1.0", "ok").file("extra.syn", src) }
+                else { Pkg::new(id, "0.1.0", src) }
+            }, "v0661-agents");
+            assert!(e.contains("a package cannot define or spawn agents"), "{src}: {e}");
+            assert!(e.contains(if extra { "extra.syn:" } else { "m.syn:" }), "{e}");
+        }
+    }
+}
+
+#[test]
+fn v0661_stdin_is_denied_before_prompt_or_consumption_and_declared_reads_work() {
+    let reg = Reg::start();
+    let id = format!("{}/tok", reg.base());
+    for declared in [false, true] {
+        let declaration = if declared { "    require stdin\n" } else { "" };
+        let pkg = Pkg::new(&id, "0.1.0", &format!("export task leer()\n{declaration}    give read_line(\"pkg>\")\n"));
+        let u = reg.publish("/tok/current", &pkg);
+        let p = Proj::new("v0661-stdin", modules(&[("tok", url(&u))]));
+        p.ok(&[]);
+        let src = "require stdin\nuse \"tok\" as tok\ntry\n    print(tok.leer())\nrecover e\n    print(text(e))\nprint(read_line())\n";
+        std::fs::write(p.dir.join("p.syn"), src).unwrap();
+        let cache = p.cache.to_string_lossy().into_owned();
+        let (code, out, err) = synsema_env(&p.dir, &["run", "p.syn"], Some("first\nsecond\n"), &[("SYNSEMA_MODULE_CACHE", &cache)]);
+        assert_eq!(code, 0, "{err}");
+        if declared {
+            assert!(out.contains("pkg>first") && out.contains("second"), "{out}");
+        } else {
+            assert!(!out.contains("pkg>"), "prompt escaped: {out}");
+            assert!(out.contains("the package tok does not declare it") && out.contains("first") && !out.contains("second"), "{out}");
+        }
+        if declared {
+            let (code, out, err) = synsema_env(&p.dir, &["run", "--cap-set", "stdout,time", "p.syn"], Some("first\nsecond\n"), &[("SYNSEMA_MODULE_CACHE", &cache)]);
+            assert_eq!(code, 0, "{err}");
+            assert!(!out.contains("pkg>"), "host ceiling bypass: {out}");
+            assert!(out.contains("Capability not granted: stdin"), "{out}");
+        }
+    }
+}
+
+#[test]
+fn v0661_introspection_bus_stdout_and_exit_keep_their_documented_contract() {
+    let reg = Reg::start();
+    let id = format!("{}/tok", reg.base());
+    let pkg = Pkg::new(&id, "0.1.0", "export task argumentos()\n    give args()\nexport task recibo()\n    give receipt()\nexport task linaje()\n    give lineage()\nexport task bus()\n    give bus_publish(\"v0661-test\", 1)\nexport task imprime()\n    print(\"package-output\")\nexport task sale()\n    exit(9)\n");
+    let u = reg.publish("/tok/current", &pkg);
+    let p = Proj::new("v0661-existing", modules(&[("tok", url(&u))]));
+    p.ok(&[]);
+    assert_eq!(p.json()["modules"]["tok"]["requires"], json!([]));
+    std::fs::write(p.dir.join("p.syn"), "use \"tok\" as tok\nprint(tok.argumentos())\nassert_eq(get(tok.recibo(), \"validFrom\"), nothing)\nassert_eq(type_of(tok.linaje()), \"list\")\ntok.bus()\ntok.imprime()\ntok.sale()\nprint(\"after-exit\")\n").unwrap();
+    let cache = p.cache.to_string_lossy().into_owned();
+    let (code, out, err) = synsema_env(&p.dir, &["run", "p.syn", "--", "v0661-sentinel"], None, &[("SYNSEMA_MODULE_CACHE", &cache)]);
+    assert_eq!(code, 9, "{out}\n{err}");
+    assert!(out.contains("v0661-sentinel") && out.contains("package-output") && !out.contains("after-exit"), "{out}");
+}

@@ -1065,6 +1065,10 @@ fn check_package_syn_as(program: &crate::ast::Program, src: &str, name: &str, sh
     #[allow(clippy::too_many_arguments)]
     fn go(n: &Node, task: Option<&str>, in_test: bool, src: &str, name: &str, shown: &str, path: &str, get: bool) -> Result<(), String> {
         match &n.kind {
+            K::AgentDefinition { .. } | K::SpawnStatement { .. } => Err(format!(
+                "{}: {}:{}: a package cannot define or spawn agents",
+                name, path, n.location.line
+            )),
             K::RequireStatement { scope, bound_to, .. } => {
                 if in_test {
                     if get {
@@ -1200,6 +1204,25 @@ pub fn short_hash(h: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn v0661_agent_validation_is_shared_by_install_and_load() {
+        for src in [
+            "agent a\n    print(1)\n",
+            "export task f()\n    spawn a\n",
+            "when false\n    spawn a\n",
+            "test \"dead\"\n    spawn a\n",
+        ] {
+            let program = crate::parser::parse_source(src, "m.syn").unwrap();
+            let load = check_package_syn(&program, src, "pkg", "pkg:m.syn", "m.syn").unwrap_err();
+            let install = check_package_syn_get(&program, src, "pkg", "m.syn").unwrap_err();
+            assert!(load.contains("m.syn:") && load.contains("a package cannot define or spawn agents"), "{}", load);
+            assert_eq!(install, format!("get: {}", load));
+        }
+        let src = "export task f()\n    give 1\n";
+        let program = crate::parser::parse_source(src, "m.syn").unwrap();
+        assert!(check_package_syn_get(&program, src, "pkg", "m.syn").is_ok());
+    }
 
     /// N2 (ronda 1, N13): la carpeta del knob se muestra con los separadores del sistema.
     #[cfg(windows)]
