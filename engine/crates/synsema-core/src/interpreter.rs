@@ -21,7 +21,7 @@ use std::sync::Arc;
 
 use smallvec::{smallvec, SmallVec};
 use num_complex::Complex64;
-use regex::Regex;
+use crate::linear_regex::LinearRegex;
 
 use crate::ast::{BinOp, Node, NodeKind, Param, Program, UnOp};
 use crate::inline_vec::InlineVec;
@@ -5018,6 +5018,12 @@ impl Interpreter {
         // aparte de las etiquetas: cada request es su propia unidad de trabajo, y el costo que
         // `steps()` mide es el suyo, no el del vecino que le tocó el mismo worker.
         self.steps = 0;
+        // v0.6.60 (ronda 1, M-2 y N-2): los patrones de regex compilados son POR REQUEST. Las
+        // cachés son del hilo, y el worker reusa el hilo: sin esto, un patrón de 8 bytes dejaba
+        // 11 MB en el worker hasta que lo desalojaran 32 patrones nuevos (medido: 355 MB con la
+        // caché llena), y la request siguiente podía medir si la anterior había compilado un
+        // patrón —armado quizá con un dato privado— por lo que tarda la primera llamada.
+        crate::pattern_cache::clear_thread_caches();
         // El gate de stdout se re-consulta por request (el set de capabilities se
         // reconstruye afuera; el veredicto memoizado sería del request anterior).
         self.stdout_verdict = None;
@@ -5267,7 +5273,7 @@ impl Interpreter {
         if self.loading_modules.contains(&key) {
             return Err(err(format!("circular import: module '{}' is already being loaded", shown)));
         }
-        let program = parse_source(&source, &shown).map_err(|e| err(e.to_string()))?;
+        let program = parse_source(&source, &shown).map_err(module_syntax_error)?;
         note_loaded_module(&shown, &source, &program);
         check_protected_names(&program)?;
         for stmt in &program.statements {
@@ -8299,7 +8305,9 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
             Err(Control::Error(e)) => {
                 // N6 (ronda 4): los `set` que fallaron adentro del `try` no dejan sus entradas.
                 crate::arrays::drop_dead_places();
-                let msg = strip_loc_prefix(&e.to_string());
+                // El texto que liga `recover` es el mensaje, entero: la ubicación viaja en su
+                // campo y nunca escrita adelante (`module_syntax_error`).
+                let msg = e.message.clone();
                 let recover_env = Environment::child_scope(env, "recover");
                 let mut ev = syn_text(msg);
                 if let Some(l) = &try_seen {
@@ -9893,7 +9901,7 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
             return Ok((p, false));
         }
         MODULE_REPARSES.with(|c| c.set(c.get() + 1));
-        parse_source(source, name).map(|p| (std::sync::Arc::new(p), true)).map_err(|e| err(e.to_string()))
+        parse_source(source, name).map(|p| (std::sync::Arc::new(p), true)).map_err(module_syntax_error)
     }
 
     /// v0.6.58 (§6.1): el host cablea el dominio de los paquetes.
@@ -10809,8 +10817,8 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
     fn b_raise(&mut self, args: &[SynValue], loc: &SourceLocation) -> Result<SynValue, Control> {
         match args.first() {
             // La ubicación viaja con el error (sin ella el programa es indepurable:
-            // Un `raise` perdía `file:line:col`). `try/recover` la sigue quitando del texto
-            // que liga (`strip_loc_prefix`), así que el contrato del lenguaje no cambia.
+            // Un `raise` perdía `file:line:col`). `try/recover` liga el mensaje y no la
+            // ubicación, que va en su campo: el contrato del lenguaje no cambia.
             Some(v) => Err(err_at(raw_str(v), loc)),
             None => Err(err_at("raise expects a message", loc)),
         }
@@ -11593,7 +11601,7 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
         let text = raw_str(nth(args, 0)?);
         let pat = raw_str(nth(args, 1)?);
         let re = compile_re(&pat)?;
-        let out: Vec<SynValue> = re.find_iter(&text).map(|m| syn_text(m.as_str())).collect();
+        let out: Vec<SynValue> = re.find_all(&text).into_iter().map(syn_text).collect();
         Ok(syn_list(out))
     }
 
@@ -11603,18 +11611,14 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
         let text = raw_str(nth(args, 0)?);
         let pat = raw_str(nth(args, 1)?);
         let re = compile_re(&pat)?;
+        // `groups[0]` es la coincidencia entera; después, un lugar por grupo del patrón.
         match re.captures(&text) {
             None => Ok(SynValue::Nothing),
-            Some(caps) => {
-                let ngroups = re.captures_len() - 1;
-                if ngroups == 0 {
-                    return Ok(syn_list(vec![syn_text(caps.get(0).unwrap().as_str())]));
+            Some(groups) => {
+                if groups.len() == 1 {
+                    return Ok(syn_list(vec![syn_text(groups[0].unwrap_or(""))]));
                 }
-                Ok(syn_list(
-                    (1..=ngroups)
-                        .map(|i| caps.get(i).map(|m| syn_text(m.as_str())).unwrap_or(SynValue::Nothing))
-                        .collect(),
-                ))
+                Ok(syn_list(groups[1..].iter().map(|g| g.map(syn_text).unwrap_or(SynValue::Nothing)).collect()))
             }
         }
     }
@@ -11625,19 +11629,11 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
         let re = compile_re(&pat)?;
         match re.captures(&text) {
             None => Ok(SynValue::Nothing),
-            Some(caps) => {
-                let ngroups = re.captures_len() - 1;
-                if ngroups > 0 {
-                    let mut out = Vec::with_capacity(ngroups);
-                    for i in 1..=ngroups {
-                        match caps.get(i) {
-                            Some(m) => out.push(syn_text(m.as_str())),
-                            None => out.push(SynValue::Nothing),
-                        }
-                    }
-                    Ok(syn_list(out))
+            Some(groups) => {
+                if groups.len() > 1 {
+                    Ok(syn_list(groups[1..].iter().map(|g| g.map(syn_text).unwrap_or(SynValue::Nothing)).collect()))
                 } else {
-                    Ok(syn_text(caps.get(0).unwrap().as_str()))
+                    Ok(syn_text(groups[0].unwrap_or("")))
                 }
             }
         }
@@ -14175,21 +14171,50 @@ fn sort_cmp(a: &SynValue, b: &SynValue) -> Ordering {
     }
 }
 
-/// Quita el prefijo "file:line:col: " de un mensaje de error (como en try/recover).
-fn strip_loc_prefix(msg: &str) -> String {
-    if !msg.starts_with(' ') {
-        if let Some(idx) = msg.find(": ") {
-            let head = &msg[..idx];
-            if head.matches(':').count() >= 2 {
-                return msg[idx + 2..].to_string();
-            }
-        }
-    }
-    msg.to_string()
+/// El error de sintaxis de un módulo que se carga con `use`, con la ubicación **en su campo**.
+///
+/// Ningún error lleva la ubicación escrita adelante del mensaje: `recover` liga el mensaje tal
+/// cual, sin recortarle nada. Hasta v0.6.59 este error llegaba como un texto solo
+/// (`mod.syn:3:5: Unexpected token`) y `recover` le sacaba ese comienzo a **todo** mensaje que
+/// pareciera traerlo: uno que citaba un valor del programa con dos `:` perdía el principio
+/// (`invalid regex pattern '12:30:05: (': …` llegaba como `(': …`, y `int("1:2:3: x")` como
+/// `x" to an integer…`). El host ve lo mismo que antes: `Display` arma `archivo:línea:columna:
+/// mensaje` con el campo.
+#[cold]
+#[inline(never)]
+fn module_syntax_error(e: crate::parser::CompileError) -> Control {
+    let (message, location) = match e {
+        crate::parser::CompileError::Lex(e) => (e.message, e.location),
+        crate::parser::CompileError::Parse(e) => (e.message, e.location),
+    };
+    Control::Error(RuntimeError::at(message, location))
 }
 
-/// `repr()` de Python para un string (comillas simples por defecto).
-fn py_repr_str(s: &str) -> String {
+#[cfg(test)]
+mod module_syntax_error_tests {
+    use super::*;
+
+    #[test]
+    fn the_location_of_a_syntax_error_goes_in_its_field() {
+        // uno del parser y uno del lexer
+        for source in ["export task f()\n    give (1 +\n", "let s be \"sin cerrar\n"] {
+            let e = parse_source(source, "mod.syn").expect_err("no parsea");
+            let shown = e.to_string();
+            let Control::Error(r) = module_syntax_error(e) else { unreachable!() };
+            let loc = r.location.clone().expect("la ubicación va en el campo");
+            assert_eq!(&*loc.file, "mod.syn");
+            assert!(loc.line >= 1, "{}", loc.line);
+            // el mensaje no la trae escrita, y el host ve el mismo texto de siempre
+            assert!(!r.message.starts_with("mod.syn"), "{}", r.message);
+            assert_eq!(r.to_string(), shown);
+            assert_eq!(shown, format!("{}: {}", loc, r.message));
+        }
+    }
+}
+
+/// `repr()` de Python para un string (comillas simples por defecto). Pública desde v0.6.60: el
+/// error de patrón inválido de `backtrack_*` (stdlib) muestra el patrón igual que el de `regex_*`.
+pub fn py_repr_str(s: &str) -> String {
     let has_single = s.contains('\'');
     let has_double = s.contains('"');
     let quote = if has_single && !has_double { '"' } else { '\'' };
@@ -14212,20 +14237,309 @@ fn py_repr_str(s: &str) -> String {
     out
 }
 
-fn compile_re(pat: &str) -> Result<Regex, Control> {
-    Regex::new(pat).map_err(|e| err(format!("invalid regex pattern {}: {}", py_repr_str(pat), e)))
+thread_local! {
+    /// v0.6.60: los patrones de `regex_*` ya compilados (ver `pattern_cache.rs`).
+    ///
+    /// Cada compilado va con su caché de búsqueda (`LinearRegex`: el DFA perezoso, la PikeVM),
+    /// que queda para la llamada siguiente mientras sea chica: una búsqueda que tuviera que
+    /// armarla de nuevo pagaba 7 µs en lugar de 0,1. Una grande se suelta al terminar la llamada
+    /// (ronda 4, A-2): lo que retiene un patrón guardado tiene techo.
+    ///
+    /// El inicializador anota cómo se vacía: corre una vez por hilo, la primera vez que se usa.
+    static RE_CACHE: RefCell<crate::pattern_cache::PatternCache<Rc<LinearRegex>>> = {
+        crate::pattern_cache::register_cleaner(clear_re_cache);
+        RefCell::new(crate::pattern_cache::PatternCache::new())
+    };
+}
+
+fn clear_re_cache() -> usize {
+    RE_CACHE.with(|c| c.borrow_mut().clear())
+}
+
+/// El compilado de `pat`, de la caché del hilo o recién hecho.
+fn compile_re(pat: &str) -> Result<Rc<LinearRegex>, Control> {
+    RE_CACHE
+        .with(|c| {
+            c.borrow_mut()
+                .get_or_try_insert(pat, crate::pattern_cache::AS_WRITTEN, || LinearRegex::new(pat).map(Rc::new))
+        })
+        .map_err(|e| invalid_regex(pat, &e))
 }
 
 /// Compila para semántica `fullmatch` (todo el texto debe coincidir).
-fn compile_re_full(pat: &str) -> Result<Regex, Control> {
-    let wrapped = format!("^(?:{})$", pat);
-    Regex::new(&wrapped)
-        .map_err(|e| err(format!("invalid regex pattern {}: {}", py_repr_str(pat), e)))
+///
+/// v0.6.60: el patrón se valida primero tal como está escrito. Envuelto en `^(?:…)$`, uno
+/// desbalanceado podía compilar (`a)(b` → `^(?:a)(b)$`, y `matches("ab", "a)(b")` daba `true`), y
+/// el error de uno inválido mostraba el patrón envuelto, que el programa no escribió. La
+/// validación corre sólo cuando el compilado no está en la caché, y la clave de la caché es el
+/// patrón escrito con su variante propia: el compilado de un `^(?:a)(b)$` escrito a mano es otra
+/// entrada, y no le saltea la validación a `a)(b`. Cómo se envuelve (y el patrón verboso que
+/// termina en comentario): `pattern_cache::build_full_match`.
+fn compile_re_full(pat: &str) -> Result<Rc<LinearRegex>, Control> {
+    use crate::pattern_cache::{build_full_match, FullMatchError, FULL_MATCH, FULL_MATCH_DOES_NOT_FIT};
+    RE_CACHE
+        .with(|c| {
+            c.borrow_mut()
+                .get_or_try_insert(pat, FULL_MATCH, || build_full_match(pat, |p| LinearRegex::new(p).map(Rc::new)))
+        })
+        .map_err(|e| match e {
+            FullMatchError::Pattern(e) => invalid_regex(pat, &e),
+            FullMatchError::Wrapped(e) => invalid_regex(pat, &format!("{}{}", FULL_MATCH_DOES_NOT_FIT, e)),
+        })
+}
+
+/// Lo que le falta al motor lineal y tiene la familia `backtrack_*` (v0.6.60): el error lo dice.
+pub const REGEX_LINEAR_HINT: &str = "regex_* run in linear time and have no look-around or backreferences \
+                                     — use backtrack_find_all, backtrack_capture, backtrack_replace or backtrack_matches";
+
+#[cold]
+#[inline(never)]
+fn invalid_regex(pat: &str, detail: &str) -> Control {
+    let mut msg = format!("invalid regex pattern {}: {}", py_repr_str(pat), detail);
+    if detail.contains("look-around") || detail.contains("backreferences are not supported") {
+        msg.push('\n');
+        msg.push_str(REGEX_LINEAR_HINT);
+    }
+    err(msg)
+}
+
+#[cfg(test)]
+mod regex_cache_tests {
+    use super::*;
+
+    /// `Control` no es `Debug`: no hay `unwrap`.
+    fn ok(r: Result<Rc<LinearRegex>, Control>) -> Rc<LinearRegex> {
+        match r {
+            Ok(re) => re,
+            Err(Control::Error(e)) => panic!("{}", e.into_message()),
+            Err(_) => panic!("control inesperado"),
+        }
+    }
+    fn cached() -> usize {
+        RE_CACHE.with(|c| c.borrow().len())
+    }
+    fn message(pat: &str) -> String {
+        match compile_re(pat) {
+            Err(Control::Error(e)) => e.into_message(),
+            _ => panic!("{} tenía que ser un error", pat),
+        }
+    }
+
+    /// v0.6.60: un patrón se compila una vez por hilo. `matches` envuelve el patrón, así que su
+    /// compilado es otra entrada: no puede servirle el de `regex_find_all`.
+    /// La caché es del hilo: cada test corre en uno propio, así no depende de cómo los reparta
+    /// el arnés (con `--test-threads=1` pueden compartir hilo).
+    fn in_a_fresh_thread(f: fn()) {
+        std::thread::spawn(f).join().unwrap();
+    }
+
+    #[test]
+    fn a_pattern_is_compiled_once_and_the_full_match_is_another_entry() {
+        in_a_fresh_thread(compiled_once);
+    }
+    fn compiled_once() {
+        assert_eq!(cached(), 0);
+        for _ in 0..3 {
+            assert!(ok(compile_re("a+")).is_match("xaa"));
+        }
+        assert_eq!(cached(), 1);
+        assert!(ok(compile_re("a")).is_match("xa"));
+        assert!(!ok(compile_re_full("a")).is_match("xa"));
+        assert!(ok(compile_re_full("a")).is_match("a"));
+        assert!(ok(compile_re("a")).is_match("xa"));
+        assert_eq!(cached(), 3);
+        // un patrón que no compila no se guarda, y vuelve a dar su error
+        assert_eq!(message("("), message("("));
+        assert_eq!(cached(), 3);
+    }
+
+    #[test]
+    fn more_patterns_than_the_cache_holds_keep_their_own_meaning() {
+        in_a_fresh_thread(more_than_fit);
+    }
+    fn more_than_fit() {
+        for round in 0..2 {
+            for i in 0..(crate::pattern_cache::PATTERN_CACHE_ENTRIES + 8) {
+                let re = ok(compile_re(&format!("^n{}$", i)));
+                assert!(re.is_match(&format!("n{}", i)), "ronda {} patrón {}", round, i);
+                assert!(!re.is_match(&format!("n{}", i + 1)), "ronda {} patrón {}", round, i);
+            }
+        }
+        assert_eq!(cached(), crate::pattern_cache::PATTERN_CACHE_ENTRIES);
+    }
+
+    /// El error de lo que el motor lineal no tiene nombra la familia que sí; los demás no cambian.
+    #[test]
+    fn the_error_names_the_backtracking_family_only_when_it_helps() {
+        let look = message(r"\s+(?!\S)");
+        assert!(look.starts_with(r"invalid regex pattern '\\s+(?!\\S)': regex parse error:"), "{}", look);
+        assert!(look.contains("look-around, including look-ahead and look-behind, is not supported"), "{}", look);
+        assert!(look.ends_with(&format!("\n{}", REGEX_LINEAR_HINT)), "{}", look);
+        let back = message(r"(a)\1");
+        assert!(back.contains("backreferences are not supported"), "{}", back);
+        assert!(back.ends_with(&format!("\n{}", REGEX_LINEAR_HINT)), "{}", back);
+        let other = message("(");
+        assert!(other.contains("unclosed group") && !other.contains("backtrack_"), "{}", other);
+        // `matches` da el mismo aviso
+        match compile_re_full("(?=a)") {
+            Err(Control::Error(e)) => assert!(e.into_message().ends_with(REGEX_LINEAR_HINT)),
+            _ => panic!("tenía que ser un error"),
+        }
+    }
+
+    /// `matches` valida el patrón como está escrito: envuelto, `a)(b` compilaba.
+    #[test]
+    fn the_full_match_checks_the_pattern_as_written() {
+        fn full_message(pat: &str) -> String {
+            match compile_re_full(pat) {
+                Err(Control::Error(e)) => e.into_message(),
+                _ => panic!("{} tenía que ser un error", pat),
+            }
+        }
+        assert!(LinearRegex::new("^(?:a)(b)$").is_ok(), "envuelto compila: por eso se valida aparte");
+        let unbalanced = full_message("a)(b");
+        assert!(unbalanced.starts_with("invalid regex pattern 'a)(b': regex parse error:"), "{}", unbalanced);
+        assert!(unbalanced.contains("unopened group"), "{}", unbalanced);
+        // el error es el de `regex_find_all` con el mismo patrón: habla de lo que el programa escribió
+        assert_eq!(full_message("a)(b"), message("a)(b"));
+        assert_eq!(full_message("("), message("("));
+        assert!(!full_message("(").contains("^(?:"), "{}", full_message("("));
+        // un patrón válido sigue cubriendo todo el texto
+        assert!(ok(compile_re_full("a|b")).is_match("b"));
+        assert!(!ok(compile_re_full("a|b")).is_match("ab"));
+    }
+
+    fn full_message(pat: &str) -> String {
+        match compile_re_full(pat) {
+            Err(Control::Error(e)) => e.into_message(),
+            _ => panic!("{} tenía que ser un error", pat),
+        }
+    }
+
+    /// Ronda 4, A-2: de un patrón guardado, el hilo retiene el compilado y, de su caché de
+    /// búsqueda, a lo sumo `KEPT_SEARCH_CACHE_BYTES`. La tabla de la PikeVM de un patrón de 60
+    /// grupos (36 MB) no queda después de la llamada; la caché de un patrón chico sí, y sirve
+    /// para la llamada siguiente.
+    #[test]
+    fn a_cached_pattern_does_not_keep_a_large_search_cache() {
+        in_a_fresh_thread(|| {
+            use crate::pattern_cache::KEPT_SEARCH_CACHE_BYTES;
+            let text = format!("{} ", "a".repeat(100)).repeat(40);
+            let many_groups = r"(\w)".repeat(60);
+            for _ in 0..3 {
+                assert_eq!(ok(compile_re(&many_groups)).find_all(&text).len(), 40);
+                assert_eq!(ok(compile_re(&many_groups)).kept_cache_bytes(), 0);
+                assert_eq!(ok(compile_re(&many_groups)).captures(&text).map(|g| g.len()), Some(61));
+                assert_eq!(ok(compile_re(&many_groups)).kept_cache_bytes(), 0);
+            }
+            assert_eq!(ok(compile_re(r"\w+")).find_all(&text).len(), 40);
+            let kept = ok(compile_re(r"\w+")).kept_cache_bytes();
+            assert!(kept > 0 && kept <= KEPT_SEARCH_CACHE_BYTES, "{}", kept);
+            // Todo lo que el hilo tiene guardado entra en la cota.
+            let total: usize = RE_CACHE.with(|c| c.borrow().values().map(|re| re.kept_cache_bytes()).sum());
+            assert!(total <= 2 * KEPT_SEARCH_CACHE_BYTES, "{}", total);
+        });
+    }
+
+    /// Ronda 1, M-1: la caché presta el mismo compilado, no un clon. Un clon armaría su caché de
+    /// búsqueda de cero, y la llamada pagaba eso cada vez.
+    #[test]
+    fn the_cache_lends_the_same_compiled_pattern() {
+        in_a_fresh_thread(|| {
+            assert!(Rc::ptr_eq(&ok(compile_re("a+")), &ok(compile_re("a+"))));
+            assert!(Rc::ptr_eq(&ok(compile_re_full("a+")), &ok(compile_re_full("a+"))));
+            assert!(!Rc::ptr_eq(&ok(compile_re("a+")), &ok(compile_re_full("a+"))));
+        });
+    }
+
+    /// Ronda 1, B-1: la clave del compilado de `matches` es el patrón escrito. Con el texto
+    /// envuelto como clave, un `^(?:a)(b)$` escrito a mano dejaba en la caché el compilado que
+    /// `matches(t, "a)(b")` iba a buscar, y la validación no corría: el mismo programa daba un
+    /// error o `true` según lo que el hilo hubiera compilado antes.
+    #[test]
+    fn a_wrapped_pattern_written_by_hand_does_not_skip_the_check() {
+        in_a_fresh_thread(|| {
+            assert!(ok(compile_re("^(?:a)(b)$")).is_match("ab"));
+            assert!(full_message("a)(b").contains("unopened group"));
+            // y al revés: el compilado de `matches` no es el de `regex_find_all` del mismo texto
+            assert!(!ok(compile_re_full("a")).is_match("xa"));
+            assert!(ok(compile_re("a")).is_match("xa"));
+            assert!(!ok(compile_re_full("^(?:a)(b)$")).is_match("xab"));
+            assert_eq!(cached(), 4);
+        });
+    }
+
+    /// Ronda 1, B-2: en modo verboso un patrón que termina en comentario se comía el cierre del
+    /// envoltorio de `matches`, y un patrón válido daba un error que mostraba el envuelto.
+    #[test]
+    fn a_verbose_pattern_that_ends_in_a_comment_matches_in_full() {
+        in_a_fresh_thread(|| {
+            let re = ok(compile_re_full("(?x)a b # dos letras"));
+            assert!(re.is_match("ab"));
+            assert!(!re.is_match("ab\n") && !re.is_match("a b") && !re.is_match("xab") && !re.is_match("abx"));
+            // el mismo patrón sin envolver ya andaba
+            assert!(ok(compile_re("(?x)a b # dos letras")).is_match("xabx"));
+            // con el salto escrito por el programa da lo mismo
+            assert!(ok(compile_re_full("(?x)a b # dos letras\n")).is_match("ab"));
+            // fuera del modo verboso un `#` es un carácter: el patrón no gana un salto de línea
+            let plain = ok(compile_re_full("a#b"));
+            assert!(plain.is_match("a#b") && !plain.is_match("a#b\n"));
+            // un comentario en el medio, o el modo verboso apagado antes del final
+            assert!(ok(compile_re_full("(?x) a # uno\n b")).is_match("ab"));
+            assert!(ok(compile_re_full("(?x: a # uno\n)#")).is_match("a#"));
+            // un inválido con `#` sigue siendo el error de lo que el programa escribió
+            assert!(full_message("(?x)( # abre").contains("unclosed group"));
+            assert!(!full_message("(?x)( # abre").contains("^(?:"));
+        });
+    }
+
+    /// Un patrón válido que envuelto pasa del límite de anidamiento de la crate: el error dice
+    /// que es por el envoltorio (el detalle muestra el patrón envuelto, y sin la frase parecería
+    /// que el programa lo escribió).
+    #[test]
+    fn a_valid_pattern_that_does_not_fit_wrapped_says_so() {
+        in_a_fresh_thread(|| {
+            let nested = |d: usize| format!("{}a{}", "(?:".repeat(d), ")".repeat(d));
+            let edge = (1..400)
+                .find(|d| LinearRegex::new(&nested(*d)).is_ok() && LinearRegex::new(&format!("^(?:{})$", nested(*d))).is_err())
+                .expect("hay una profundidad que compila sola y envuelta no");
+            let pat = nested(edge);
+            assert!(ok(compile_re(&pat)).is_match("a"));
+            let msg = full_message(&pat);
+            let head = format!(
+                "invalid regex pattern {}: {}",
+                py_repr_str(&pat),
+                crate::pattern_cache::FULL_MATCH_DOES_NOT_FIT
+            );
+            assert!(msg.starts_with(&head), "{}", msg);
+            assert!(msg.contains("nest"), "{}", msg);
+            // un nivel menos entra
+            assert!(ok(compile_re_full(&nested(edge - 1))).is_match("a"));
+        });
+    }
+
+    /// Ronda 1, M-2 y N-2: `reset_for_request` suelta los compilados del hilo.
+    #[test]
+    fn the_end_of_a_request_drops_the_compiled_patterns() {
+        in_a_fresh_thread(|| {
+            let first = ok(compile_re("a+"));
+            ok(compile_re_full("b"));
+            assert_eq!(cached(), 2);
+            let mut interp = Interpreter::new();
+            interp.reset_for_request();
+            assert_eq!(cached(), 0);
+            // lo que la llamada en curso tenía en la mano sigue vivo, y el próximo es otro compilado
+            assert!(first.is_match("aa"));
+            assert!(!Rc::ptr_eq(&first, &ok(compile_re("a+"))));
+            assert_eq!(cached(), 1);
+        });
+    }
 }
 
 /// Traduce el reemplazo estilo Python (`\1`, `\g<n>`) al de Rust (`${1}`),
-/// escapando `$` literal como `$$`.
-fn translate_replacement(s: &str) -> String {
+/// escapando `$` literal como `$$`. Pública desde v0.6.60: `backtrack_replace` (stdlib) usa la
+/// misma plantilla que `regex_replace`.
+pub fn translate_replacement(s: &str) -> String {
     let mut out = String::new();
     let mut chars = s.chars().peekable();
     while let Some(c) = chars.next() {

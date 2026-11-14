@@ -567,6 +567,23 @@ jobs:
         # Corre aunque falle el del motor: cada lock dice lo suyo.
         if: always()
         run: cargo audit --file Cargo.lock
+      # v0.6.60: engine/vendor/fancy-regex is fancy-regex with a Synsema patch, and both locks take
+      # it by path. cargo audit skips a package that does not come from a registry (measured with
+      # 0.22.2: a known-vulnerable crate without `source` passes), so an advisory against the
+      # version the fork is based on would go unseen. This audits that version as published.
+      # (The other two fancy-regex in engine/Cargo.lock, 0.17.0 and 0.18.0, are what `tokenizers`
+      # 0.23 and `candle-transformers` 0.11 ask for: they come from the registry unpatched, and the
+      # audit of the lock above already covers them.)
+      - name: Audit (vendored fancy-regex, as the published version it is based on)
+        if: always()
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' engine/vendor/fancy-regex/Cargo.toml | head -1)
+          test -n "$version"
+          grep -q "^name = \"fancy-regex\"$" engine/vendor/fancy-regex/Cargo.toml
+          printf '%s\n' 'version = 3' '' '[[package]]' 'name = "fancy-regex"' "version = \"$version\"" \
+            'source = "registry+https://github.com/rust-lang/crates.io-index"' > "$RUNNER_TEMP/vendored.lock"
+          cat "$RUNNER_TEMP/vendored.lock"
+          cargo audit --file "$RUNNER_TEMP/vendored.lock"
 
   # Every Synsema program in the repository still LOADS. This is the gate that was missing when a
   # language rule stopped a program from loading and nobody noticed for a whole round: the engine's

@@ -44,6 +44,11 @@ pub const BUILTIN_KWARGS: &[(&str, &[&str])] = &[
     ("int", &["base", "fallback"]),
     ("json_decode", &["allow_nan"]),
     ("jsonl_decode", &["allow_nan"]),
+    // v0.6.60: el tope de pasos de retroceso de la llamada (synsema-stdlib/src/backtrack.rs).
+    ("backtrack_matches", &["max_steps"]),
+    ("backtrack_find_all", &["max_steps"]),
+    ("backtrack_capture", &["max_steps"]),
+    ("backtrack_replace", &["max_steps"]),
 ];
 
 /// `(mínimo, máximo)` de `name` en `BUILTIN_ARITY`, por hash (se consulta en cada llamada).

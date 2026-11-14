@@ -573,9 +573,15 @@ pub fn nd_to_list(a: &NdArray) -> SynValue {
     }
 }
 
+/// `to_list(array)`: listas anidadas de números (o `bool`). `to_list(bytes)` (v0.6.60): la lista
+/// de sus bytes como enteros 0..255; `bytes(lista)` es la inversa.
 pub fn to_list(args: &[SynValue]) -> Result<SynValue, Control> {
     arity(args, 1, "to_list")?;
-    Ok(nd_to_list(nd_arg(args, 0, "to_list")?))
+    match arg(args, 0)? {
+        SynValue::Array(a) => Ok(nd_to_list(a)),
+        SynValue::Bytes(b) => Ok(syn_list(b.iter().map(|x| syn_int(*x as i64)).collect())),
+        other => Err(err(format!("to_list expects an array or bytes, got {}", other.type_name()))),
+    }
 }
 
 pub fn reshape(args: &[SynValue]) -> Result<SynValue, Control> {

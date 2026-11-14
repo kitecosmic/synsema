@@ -60,3 +60,28 @@ DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
 THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+--------------------------------------------------------------------------
+fancy-regex (vendored, with a Synsema patch)
+--------------------------------------------------------------------------
+engine/vendor/fancy-regex contains the source of the fancy-regex crate,
+version 0.20.2 (https://github.com/fancy-regex/fancy-regex), with a patch
+by the Synsema project: a step budget for searches, a limit for the size
+of a compiled pattern and of its search caches, and fixes to what a
+capture group, a case-insensitive backreference, a repetition that can
+match empty, an alternation and a conditional with two empty branches
+match, to the number a capture group gets after a DEFINE block or beside
+a repetition of zero times, and to how quantifiers and their counts are
+read, and to recognizing relative calls to the whole pattern before
+rewriting match bounds; a capture group in a positive look-behind of variable length,
+which was read in more than one way, and a \K inside a look-around are
+errors. What changes and why is in
+engine/vendor/fancy-regex/SYNSEMA.md; the patch itself is
+engine/vendor/fancy-regex/synsema.patch. It is the engine of the
+backtrack_* builtins.
+
+fancy-regex is Copyright 2015 The Fancy Regex Authors and is distributed
+under the MIT license. The full license text and the list of authors are
+included verbatim at:
+engine/vendor/fancy-regex/LICENSE
+engine/vendor/fancy-regex/AUTHORS

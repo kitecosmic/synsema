@@ -29,6 +29,9 @@ num-traits.workspace = true
 num-integer.workspace = true
 indexmap.workspace = true
 regex.workspace = true
+# v0.6.60: las `regex_*` buscan con `regex_automata::meta` y la caché de búsqueda aparte
+# (`linear_regex.rs`); `regex` queda para los patrones fijos del propio motor.
+regex-automata.workspace = true
 # `codeintel` (synsema code): salida JSON determinista (preserve_order ya está en el workspace).
 serde_json.workspace = true
 # Tipo Decimal exacto (dinero/finanzas): rust_decimal, puro Rust, 96-bit.

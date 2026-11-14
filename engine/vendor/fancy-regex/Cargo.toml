@@ -1,0 +1,76 @@
+# fancy-regex 0.20.2 with the Synsema patch. Read SYNSEMA.md before touching anything here.
+#
+# This is not a member of any workspace. `synsema-stdlib` depends on this folder by path
+# (`engine/Cargo.toml`, `[workspace.dependencies]`); the other crates of the build that ask for
+# fancy-regex get the one of crates.io as published.
+#
+# The manifest keeps what upstream publishes for the library (features, dependencies) and drops
+# what the library does not need (tests, benches, examples and their dev-dependencies).
+
+[package]
+edition = "2021"
+rust-version = "1.66"
+name = "fancy-regex"
+version = "0.20.2"
+authors = [
+    "Raph Levien <raph@google.com>",
+    "Robin Stocker <robin@nibor.org>",
+    "Keith Hall <keith.hall@available.systems>",
+]
+build = false
+publish = false
+autolib = false
+autobins = false
+autoexamples = false
+autotests = false
+autobenches = false
+description = "An implementation of regexes, supporting a relatively rich set of features, including backreferences and look-around. Aims to be compatible with Oniguruma syntax when the relevant flag is set."
+license = "MIT"
+repository = "https://github.com/fancy-regex/fancy-regex"
+
+[features]
+default = [
+    "unicode",
+    "perf",
+    "std",
+    "variable-lookbehinds",
+]
+leftmost_longest = []
+perf = ["regex-automata/perf"]
+perf-dfa-full = ["regex-automata/dfa-build"]
+std = [
+    "regex-automata/std",
+    "regex-syntax/std",
+    "bit-set/std",
+]
+track_caller = []
+unicode = [
+    "regex-automata/unicode",
+    "regex-syntax/unicode",
+]
+variable-lookbehinds = ["regex-automata/dfa-search"]
+
+[lib]
+name = "fancy_regex"
+path = "src/lib.rs"
+
+[dependencies.bit-set]
+version = "0.8"
+default-features = false
+
+[dependencies.regex-automata]
+version = "0.4.16"
+features = [
+    "alloc",
+    "syntax",
+    "meta",
+    "nfa",
+    "dfa-onepass",
+    "dfa-search",
+    "hybrid",
+]
+default-features = false
+
+[dependencies.regex-syntax]
+version = "0.8"
+default-features = false

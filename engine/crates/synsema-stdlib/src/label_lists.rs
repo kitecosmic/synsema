@@ -199,4 +199,7 @@ pub const LABEL_PURE_BUILTINS: &[&str] = &[
     "timestamp", "to_timezone", "in_units", "add_days", "jsonl_encode", "jsonl_decode", "lineage", "parquet_read", "parquet_write",
     // v0.6.45 (B4): el esquema y los row groups de un Parquet, sin leer los datos.
     "parquet_info",
+    // v0.6.60: normalización Unicode y regex con retroceso (los pares de `matches` y `regex_*`).
+    "nfc", "nfd", "nfkc", "nfkd",
+    "backtrack_matches", "backtrack_find_all", "backtrack_capture", "backtrack_replace",
 ];
