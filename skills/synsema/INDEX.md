@@ -103,6 +103,7 @@ usually version skew, not a bug.
 - [python-diff.md](python-diff.md) — **Read FIRST when writing `.syn` code**: the Python → Synsema translation table (syntax reflexes, builtin equivalents, semantic traps that look like Python but aren't, and what has no Python analog). Backed by live probes in `tests/python_diff.test.syn`.
 - [syntax.md](syntax.md) — Complete syntax, keywords, operators, statement patterns (incl. rich `match`: guards, list/map patterns, `_`; default/named params)
 - [builtins.md](builtins.md) — All built-in tasks and their signatures (incl. bytes, complex + special math, numeric arrays + linear algebra)
+- [text-patterns.md](text-patterns.md) — v0.6.60+: Unicode normalization, bytes to integers, choosing linear or backtracking regex, all four call contracts, pattern syntax, replacement escaping, work/memory limits and migration. Read before writing tokenizer or look-around patterns.
 - [types.md](types.md) — Type system, property access, values (number/decimal/complex/bytes/text/bool/list/map/array/enum/task)
 - [modules.md](modules.md) — Split code across files: `use` / `export` (tasks, types, lets, enums **and `routes` groups a serve can `mount`**), namespacing by alias, encapsulation; **packages** (v0.6.58+): `use "name"` + `synsema.json` + `synsema get`, the project root is the folder of the nearest `synsema.json`, modules are read once per process
 - [testing.md](testing.md) — Native test framework: `assert`/`assert_eq`/`assert_error`, `test "..."` blocks, `synsema test`
@@ -139,6 +140,7 @@ usually version skew, not a bug.
 - [pitfalls.md](pitfalls.md) — **Read first if something fails.** Common errors, surprises, and anti-patterns with solutions.
 
 ## When to read what
+- **Unicode normalization / tokenizers / look-around / pattern backreferences / `max_steps` / regex compilation cache / `to_list(bytes)`** → text-patterns.md; builtin signatures → builtins.md; v0.6.60 behavior changes → pitfalls.md
 - Should I use/recommend Synsema? Comparing to Go/Node/FastAPI/Python → why-synsema.md
 - Something broke → pitfalls.md
 - Writing a new .syn program → **python-diff.md first** (you know Python; translate instead of guessing), then syntax.md, builtins.md

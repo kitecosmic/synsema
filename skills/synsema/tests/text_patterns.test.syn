@@ -1,0 +1,126 @@
+-- Text and pattern contracts introduced in engine v0.6.60. Pure, including WebAssembly.
+intent: "doc example: normalize Unicode and choose bounded pattern matching explicitly"
+
+print(backtrack_find_all("id: 12345;", "(?<=id: )\\d+"))
+
+test "four normalization forms and byte equality"
+    assert_eq(nfc("e\u0301"), "\u00e9")
+    assert_eq(nfd("\u00e9"), "e\u0301")
+    assert_eq(nfkc("\ufb01"), "fi")
+    assert_eq(nfkd("\ufb01\u00e9"), "fie\u0301")
+    assert("\u00e9" != "e\u0301")
+    assert_eq(sha256(nfc("\u00e9")), sha256(nfc("e\u0301")))
+    assert_eq(regex_replace(nfd("caf\u00e9"), "\\p{Mn}", ""), "cafe")
+    assert_eq(nfkc("\ua7f1"), "S")
+
+test "normalization requires text and bytes become unsigned integers"
+    assert_eq(nfc(decode(bytes("e\u0301"))), "\u00e9")
+    assert_error(() => nfc(bytes("x")))
+    assert_error(() => nfd(1))
+    assert_eq(to_list(bytes("h\u00f1")), [104, 195, 177])
+    assert_error(() => to_list("hi"))
+    assert_error(() => to_list([1, 2]))
+
+test "partial searches versus whole-text matching"
+    assert_eq(backtrack_find_all("id: 12345;", "(?<=id: )\\d+"), ["12345"])
+    assert(backtrack_matches("123", "\\d+"))
+    assert(not backtrack_matches("id: 123", "\\d+"))
+    assert_eq(backtrack_find_all("zzz", "a(?=b)"), [])
+    assert_eq(backtrack_capture("zzz", "a(?=b)"), nothing)
+    assert_eq(backtrack_replace("zzz", "a(?=b)", "-"), "zzz")
+    assert_eq(backtrack_find_all("ab", "a\\K(?=b)"), [""])
+
+test "captures are always a list and unmatched groups are nothing"
+    assert_eq(backtrack_capture("hello world", "w[a-z]+"), ["world"])
+    assert_eq(backtrack_capture("b", "(a)?(b)"), [nothing, "b"])
+    assert_eq(backtrack_capture("ab", "(?<left>a)(?P<right>b)"), ["a", "b"])
+    assert_eq(backtrack_find_all("a1b2", "([0-9])"), ["1", "2"])
+
+test "replacement templates use backslashes, not dollars"
+    assert_eq(backtrack_replace("ab ab", "(a)(b)", "\\2-\\g<1>-$"), "b-a-$ b-a-$")
+    assert_eq(backtrack_replace("ab", "(a)(b)", "$1"), "$1")
+    assert_eq(backtrack_replace("b", "(a)?b", "<\\1><\\g<99>>"), "<><>")
+
+test "literal backslash replacement escapes both the string and template"
+    assert_eq(backtrack_replace("a", "a", "\\\\"), "\\")
+
+test "choose the engine explicitly"
+    assert_eq(regex_find_all("aaaa", "a++a"), ["aaaa"])
+    assert_eq(backtrack_find_all("aaaa", "a++a"), [])
+    assert_eq(backtrack_find_all("aaa", "(?U)a++"), ["aaa"])
+    assert_eq(backtrack_find_all("ab", "a?a|a?b"), ["a", "b"])
+    assert_eq(backtrack_capture("b", "(b?)*"), [""])
+    assert_eq(backtrack_find_all("ab", "(?:a?|b)+"), ["a", ""])
+
+test "backreferences, atomic groups, flags and group calls"
+    assert_eq(backtrack_find_all("abab", "(ab)\\1"), ["abab"])
+    assert_eq(backtrack_find_all("AA", "(?i)(a)\\1"), ["AA"])
+    assert_eq(backtrack_find_all("abc", "(?>a)b(?=c)"), ["ab"])
+    assert_eq(backtrack_find_all("abab", "(ab)\\g<1>"), ["abab"])
+    assert_eq(backtrack_find_all("xyxz", "x(?=y\\g<-1>|z)"), ["x", "x"])
+    assert_eq(backtrack_find_all("xyxz", "x(?=y\\g'-1'|z)"), ["x", "x"])
+
+test "look-behind captures and keep-out have explicit boundaries"
+    assert_eq(backtrack_capture("cde", "(?<=(ab|cd))e"), ["cd"])
+    assert_eq(backtrack_capture("cb ab", "(?<!(a+))b"), [nothing])
+    assert_eq(backtrack_capture("id: 12345;", "(\\d+)\\K;"), ["12345"])
+    assert_eq(backtrack_find_all("id: 12345;", "(\\d+)\\K;"), [";"])
+    assert_error(() => backtrack_find_all("id: 12345;", "(?<=(\\d+));"))
+    assert_error(() => backtrack_find_all("abc", "(?<=\\K\\w)\\w"))
+    assert_error(() => backtrack_find_all("abc", "(?<k>a\\Kb)(?=\\g<k>)"))
+    assert_error(() => backtrack_replace("aa", "a(?=(?<=\\g<-1>.)|)", "-"))
+
+test "empty conditional branches and unsupported constructs"
+    assert_eq(backtrack_find_all("b", "(?:|(a))(?(1)|)b"), ["b"])
+    assert_eq(backtrack_find_all("b", "(?:|(a))(?(1))b"), [])
+    assert_eq(backtrack_find_all("b", "(?x)(?:|(a))(?(1) )b"), [])
+    assert_error(() => backtrack_find_all("ab", "\\G\\w"))
+    assert_error(() => backtrack_find_all("aaaaaa", "a{2}{3}"))
+    assert_error(() => backtrack_find_all("aaa", "a{3,2}"))
+    assert_error(() => backtrack_find_all("A", "(?i-u)a"))
+
+test "the budget is named and errors preserve their message"
+    assert_eq(backtrack_find_all("ab", "a(?=b)", max_steps = 1000), ["a"])
+    assert_eq(backtrack_find_all("foo", "\\bfoo\\b", max_steps = 1), ["foo"])
+    assert_error(() => backtrack_find_all("ab", "a(?!c)", max_steps = 1))
+    assert_error(() => backtrack_find_all("ab", "a(?=b)", max_steps = 0))
+    assert_error(() => backtrack_find_all(bytes("ab"), "a"))
+    try
+        backtrack_find_all("ab", "a(?!c)", max_steps = 1)
+    recover e
+        assert(contains(e, "backtrack_find_all: step limit exceeded"))
+    try
+        raise("source:12:3: keep the whole message")
+    recover e
+        assert_eq(e, "source:12:3: keep the whole message")
+
+test "linear-family fixes and the legacy capture shape"
+    assert_eq(regex_find_all("zabb", ".abb|b"), ["zabb"])
+    assert_eq(regex_replace("zabb", ".abb|b", "-"), "-")
+    assert(matches("a", "(?x)a # c"))
+    assert_error(() => matches("ab", "a)(b"))
+    assert_eq(regex_capture("world", "w[a-z]+"), ["world"])
+    assert_eq(capture("world", "w[a-z]+"), "world")
+
+
+test "named references, scoped flags, definitions and absent repeater"
+    assert_eq(backtrack_find_all("abab", "(?<g>ab)\\k<g>"), ["abab"])
+    assert_eq(backtrack_find_all("abab", "(?P<g>ab)(?P=g)"), ["abab"])
+    assert_eq(backtrack_find_all("ab", "(?(DEFINE)(?<g>ab))(?P>g)"), ["ab"])
+    assert_eq(backtrack_find_all("ab", "(?(DEFINE)(?<g>ab))\\g'g'"), ["ab"])
+    assert_eq(backtrack_find_all("A", "(?i:a)"), ["A"])
+    assert_eq(backtrack_find_all("xzzy xaby", "x(?~a\\Kb)y"), ["xzzy"])
+    assert_error(() => backtrack_find_all("a", "(?~|a)"))
+
+test "pattern length and compiled memory are separate from the step budget"
+    let long_pattern be join(apply(range(16385), (i) => "a"), "")
+    assert_error(() => backtrack_find_all("", long_pattern))
+    assert_error(() => backtrack_find_all("a", "\\w{300}", max_steps = 10000000))
+
+test "recursion depth fails to match rather than raising an error"
+    let a25 be join(apply(range(25), (i) => "a"), "")
+    let b25 be join(apply(range(25), (i) => "b"), "")
+    let a20 be join(apply(range(20), (i) => "a"), "")
+    let b20 be join(apply(range(20), (i) => "b"), "")
+    assert_eq(backtrack_find_all(a25 + b25, "(a\\g<1>?b)"), [a20 + b20])
+    assert(not backtrack_matches(a25 + b25, "(a\\g<1>?b)"))
