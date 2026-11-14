@@ -84,6 +84,9 @@ Also: the LLM words **`reason` / `decide` / `analyze` / `generate`** (like every
 | `range(n)` | `range(n)` → a real list (also `range(a, b, step)`) |
 | `print(...)` | `print(...)` (written immediately under `run`, v0.6.29+; text inside lists/maps prints quoted: `["1", 1]`) |
 | `re.fullmatch` / `re.findall` / `re.search(...).groups()` / `re.sub` | `matches(s, pat)` (FULL match) / `regex_find_all(s, pat)` / `regex_capture(s, pat)` (always a list, or `nothing`) / `regex_replace(s, pat, rep)` ([builtins.md](builtins.md)) |
+| `unicodedata.normalize(form, text)` | `nfc(text)` / `nfd(text)` / `nfkc(text)` / `nfkd(text)` (v0.6.60+, Unicode 17.0; no import). Equality/hashes/map keys still use bytes: normalize both values ([text-patterns.md](text-patterns.md)). |
+| `list(b"hi")` | `to_list(bytes("hi"))` → `[104, 105]` (v0.6.60+); this does not make `to_list` a generic iterable converter. |
+| `re` look-around/backreferences / third-party `regex` possessive or atomic forms | Explicit `backtrack_find_all` / `backtrack_capture` / `backtrack_replace` / `backtrack_matches`, with optional **named** `max_steps = N`. Not full Python/PCRE compatibility; see [text-patterns.md](text-patterns.md). |
 | `hmac.new(k, m, sha256).digest()` | `hmac(m, k)` → bytes (v0.6.29+) |
 | `open(p).read()` / `requests.get(url)` | `read_file(p)` + `require file(...)` / `fetch(url)` + `require net(host)` |
 | `requests.post(url, json=d)` / `r.json()` / `r.content` | `http_post(url, d)` (a map → JSON + Content-Type, v0.6.20+) / `json of r` (`nothing` if not JSON) / `http_bytes(...)` → `bytes of r` |

@@ -6,7 +6,7 @@ Each says what changed, why, and what to write instead.
 
 Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the release date.
 
-## v0.6.60 — unreleased
+## v0.6.60 — 2026-11-14
 
 Text for tokenizers: what a BPE or WordPiece tokenizer written in Synsema was missing.
 

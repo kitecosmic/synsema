@@ -189,6 +189,7 @@ usually version skew, not a bug.
 - [python-diff.md](python-diff.md) — **Read FIRST when writing `.syn` code**: the Python → Synsema translation table (syntax reflexes, builtin equivalents, semantic traps, what has no Python analog)
 - [syntax.md](syntax.md) — Complete syntax, keywords, operators, `match`, params
 - [builtins.md](builtins.md) — All built-in tasks + signatures (incl. `int`/`hex`, maps `get`/`items`/`merge`, `sort`, bytes, math, numeric arrays/linear algebra) and the **v0.6.29 rename table** (old names = deprecated aliases until v1.0)
+- [text-patterns.md](text-patterns.md) — v0.6.60+: Unicode normalization, bytes to integers, choosing linear or backtracking regex, all four call contracts, pattern syntax, replacement escaping, work/memory limits and migration. Read before writing tokenizer or look-around patterns.
 - [types.md](types.md) — Type system, property access, values (lists/maps have value semantics — copy-on-write — since v0.6.29)
 - [testing.md](testing.md) — Native test framework: `assert`/`assert_eq`/`assert_error`, `test "..."`
 - [code.md](code.md) — `synsema code`: outline/refs/routes/caps/check/search over a repo without reading whole files (CLI `--json` + the `synsema-code` MCP server)

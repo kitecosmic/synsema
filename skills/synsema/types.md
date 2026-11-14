@@ -118,3 +118,9 @@ Internally, all values are wrapped in SynValue which carries:
 - `[]` → false
 - `{}` → false
 - Everything else → true
+
+## Text normalization and byte conversion (v0.6.60+)
+
+Text equality, map keys and hashes do not normalize Unicode automatically. Use the same
+`nfc`/`nfd`/`nfkc`/`nfkd` form on both sides. `to_list(bytes_value)` returns byte integers,
+not characters; arrays retain their existing conversion. See [text-patterns.md](text-patterns.md).

@@ -2,7 +2,7 @@
 
 Read this FIRST if something fails. Each row is a real mistake that costs hours to debug.
 
-> **Just upgraded and something that worked now fails?** Start at *Upgrading to v0.6.58* (one SQL
+> **Just upgraded and something that worked now fails?** Start at *Upgrading to v0.6.60* (regex validation, leftmost search and whole caught messages), then *v0.6.59* (SQL transactions), then *Upgrading to v0.6.58* (one SQL
 > statement per call, nesting deeper than 1024 levels, recursions that stop earlier), then
 > *v0.6.57* (the last bits of `dot`, `compute` in the receipt), then *v0.6.56*
 > (`array_from_bytes(b, "f32")` gives an `f32` array, the lineage of arrays), then *v0.6.55* (`==` and
@@ -23,6 +23,23 @@ Read this FIRST if something fails. Each row is a real mistake that costs hours 
 > Behavioral surprises · Anti-patterns · Secrets & config
 > Coming from Python? The traps that LOOK like Python but aren't are also collected in
 > [python-diff.md](python-diff.md).
+
+## Upgrading to v0.6.60 — text and patterns
+
+| You see / need | What changed / what to write |
+|---|---|
+| Canonically equivalent text compares unequal, maps keep two keys, hashes differ | Equality is still by bytes. Normalize both with the same `nfc`/`nfd`/`nfkc`/`nfkd` form; Unicode 17.0 tables. Decode bytes first. |
+| Look-around or a pattern backreference rejected by `regex_*` | Use the corresponding `backtrack_*` call. The linear family does not automatically change engines. |
+| `backtrack_*: step limit exceeded` | Anchor possible starts; use possessive/atomic forms where correct; otherwise named `max_steps = N` (integer >= 1). It is a work budget, not a time limit. |
+| Capture/subroutine in a positive variable-length look-behind rejected | Use `(?:...)` for grouping, capture outside before `\K`, or make the look-behind fixed-length. |
+| `A look-around has \K in it, or calls a group that has it` | Move `\K` outside every look-around that could execute it, including through group calls. |
+| `matches("ab", "a)(b")` now errors | The written pattern is invalid; an accidental balance from full-match wrapping no longer hides it. Fix the parentheses. |
+| `.abb|b` on `zabb` gives `["zabb"]`, not `["b", "b"]` | The linear search now correctly selects the leftmost match. Replacement changes from `za--` to `-`. |
+| `recover e` has more text than before | v0.6.60 preserves the whole message instead of guessing and cutting a location-like prefix. Avoid matching the old truncated message. |
+| `to_list(bytes("h\u00f1"))` gives `[104,195,177]` | These are UTF-8 bytes, not character numbers. `split(text, "")` gives characters; arrays retain their existing conversion. |
+
+See [text-patterns.md](text-patterns.md) for the exact call results, syntax, replacement
+escaping, resource limits, cache lifetime and explicit differences from Perl/Python.
 
 ## Upgrading to v0.6.59 — what behaves differently
 
