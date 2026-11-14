@@ -863,3 +863,65 @@ fn n7_parsed_shares_the_bytes() {
     let (fbytes, _) = &table.parsed[fk];
     assert!(std::ptr::eq(fbytes.as_ptr(), fsrc.as_ptr()), "{}", fk);
 }
+
+/// v0.6.61: every process-local gate obeys the package domain, in every execution mode.
+#[test]
+pub fn v0661_process_local_package_table() {
+    let rows = [
+        ("time", "now()"),
+        ("time", "sleep(0)"),
+        ("random", "random()"),
+        ("random", "random_int(1, 6)"),
+        ("random", "random_bytes(16)"),
+        ("random", "token()"),
+        ("stdin", "read_line()"),
+        ("stdin", "term_open()"),
+        ("time", "totp(\"JBSWY3DPEHPK3PXP\")"),
+        ("time", "totp_verify(\"JBSWY3DPEHPK3PXP\", \"000000\")"),
+        ("time", "jwt_sign({}, \"key\")"),
+        ("time", "jwt_verify(jwt_sign({\"iat\": 1}, \"key\"), \"key\")"),
+        ("time", "captoken_mint({\"net\": \"api.example.com\"}, \"key\", {\"id\": \"fixed\"})"),
+        ("time", "captoken_verify(captoken_mint({\"net\": \"api.example.com\"}, \"key\", {\"now\": 1, \"id\": \"fixed\"}), \"key\")"),
+        ("time", "captoken_attenuate(captoken_mint({\"net\": \"api.example.com\"}, \"key\", {\"now\": 1, \"id\": \"fixed\"}), {\"net\": \"api.example.com\"}, {\"ttl\": 10})"),
+        ("time", "http_signature_verify({\"method\": \"GET\", \"url\": \"https://x/\", \"headers\": {}}, \"key\", {\"alg\": \"hmac-sha256\"})"),
+        ("time", "oidc_verify(\"invalid\", {\"iss\": \"https://issuer.example\", \"aud\": \"app\", \"jwks\": {\"keys\": []}})"),
+    ];
+    for (cap, expr) in rows {
+        let src = format!("export task f()\n    give {expr}\n");
+        let t = tok_tree("v0661-denied", &src);
+        let r = t.run("require random\nrequire stdin\nuse \"tok\" as tok\ntok.f()\n");
+        assert!(!r.success, "{expr}: {:?}", r.output);
+        let e = errors(&r);
+        assert!(e.contains("the package tok does not declare it") && e.contains(&format!("`require {cap}` inside its tasks")), "{expr}: {e}");
+        assert!(r.output.is_empty(), "{expr}: {:?}", r.output);
+        if cap != "stdin" {
+            // A relative TTL must narrow a live parent, not one fixed at Unix second 1.
+            let positive = if expr.starts_with("captoken_attenuate") { expr.replace("\"now\": 1", "\"now\": now()") } else { expr.to_string() };
+            let src = format!("export task f()\n    require {cap}\n    give {positive}\n");
+            let t = tok_tree("v0661-declared", &src);
+            let r = t.run("require random\nuse \"tok\" as tok\ntok.f()\nprint(\"restored\")\n");
+            assert!(r.success, "{expr}: {}", errors(&r));
+            assert_eq!(r.output.last().map(String::as_str), Some("restored"));
+        }
+    }
+    // An initializer cannot borrow its tasks' declared domain.
+    let t = tok_tree("v0661-top", "export task f()\n    require time\n    give now()\nexport let X be now()\n");
+    let r = t.run("use \"tok\" as tok\n");
+    assert!(!r.success && errors(&r).contains("the package tok does not declare it"), "{}", errors(&r));
+    // A callback and a parallel worker keep the package on their effective stack.
+    for body in ["give cb()", "give parallel_map((x) => cb(), [1])"] {
+        let t = tok_tree("v0661-callback", &format!("export task f(cb)\n    {body}\n"));
+        let r = t.run("use \"tok\" as tok\ntask cb()\n    give now()\ntok.f(cb)\n");
+        assert!(!r.success && errors(&r).contains("the package tok does not declare it"), "{body}: {}", errors(&r));
+    }
+    // Seeded forms and explicit timestamps are pure: two calls give identical values.
+    let src = "export task f()\n    let g be rng(42)\n    give [random(g), random_int(g, 1, 6), to_list(random_normal(g, [2])), to_list(random_uniform(g, [2])), totp(\"JBSWY3DPEHPK3PXP\", {\"at\": 1234567890}), jwt_sign({\"iat\": 1}, \"key\")]\n";
+    let t = tok_tree("v0661-pure", src);
+    let r = t.run("use \"tok\" as tok\nassert_eq(tok.f(), tok.f())\nprint(\"pure\")\n");
+    assert!(r.success, "{}", errors(&r));
+    assert_eq!(r.output, vec!["pure"]);
+    // A declaration is not a grant.
+    let t = tok_tree("v0661-no-grant", "export task f()\n    require random\n    give random()\n");
+    let r = t.run("use \"tok\" as tok\ntok.f()\n");
+    assert!(!r.success && errors(&r).contains("Capability not granted: random"), "{}", errors(&r));
+}

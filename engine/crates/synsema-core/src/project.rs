@@ -18,7 +18,7 @@ use std::sync::{Arc, OnceLock};
 
 /// La versión de este motor cuando el binario no es de un release (`cargo build`). Se sube al abrir
 /// la versión siguiente; `engine_version_is_not_behind_the_changelog` no deja que quede atrás.
-pub const DEV_VERSION: &str = "0.6.60";
+pub const DEV_VERSION: &str = "0.6.61";
 
 /// La versión del motor: la del release (`SYNSEMA_VERSION`, el tag, lo setea `release.yml`) o
 /// [`DEV_VERSION`] en un build de desarrollo (que cuenta como esa versión, §8).

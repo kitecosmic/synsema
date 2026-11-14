@@ -367,7 +367,18 @@ fn b_jwt_sign(args: &[SynValue], caps: &Rc<RefCell<CapabilitySet>>, loc: &synsem
     // regla que `jwt_verify`: leer el reloj exige la capability `time` (chequeo auditado); con
     // `iat` (y `exp`) explícitos no se toca el reloj y no hace falta `time`.
     let needs_clock = !payload.contains_key("iat") || expires_in.is_some();
-    if needs_clock && !clock_granted(caps, F) {
+    let has_clock = if needs_clock {
+        match clock_granted(caps, F) {
+            Ok(granted) => granted,
+            Err(e) => {
+                key.zeroize();
+                return Err(e);
+            }
+        }
+    } else {
+        true
+    };
+    if !has_clock {
         key.zeroize();
         return Err(err(format!(
             "{}: this needs the clock. Add `require time` to the program, or pass \"iat\" (and \"exp\") explicitly \
@@ -962,8 +973,16 @@ fn parse_jwt_verify_opts(v: Option<&SynValue>, who: &str) -> Result<JwtVerifyOpt
 /// iteración = un bit; 32 iteraciones daban la hora exacta) y en un enclave hace el veredicto no
 /// reproducible. Leer el reloj exige la capability `time` — la MISMA puerta que `now()` — y el
 /// chequeo queda en el audit como cualquier otro gate. Sin `time` y sin `now`: error del caller.
-pub(crate) fn clock_granted(caps: &Rc<RefCell<CapabilitySet>>, who: &str) -> bool {
-    caps.borrow_mut().check(&Capability::new(CapabilityType::Time, None), who)
+pub(crate) fn clock_granted(caps: &Rc<RefCell<CapabilitySet>>, who: &str) -> Result<bool, Control> {
+    use synsema_capabilities::model::{DelegationSource, DenyCause};
+    let requested = Capability::new(CapabilityType::Time, None);
+    match caps.borrow_mut().check_cause(&requested, who) {
+        Ok(()) => Ok(true),
+        Err(cause) if matches!(&cause, DenyCause::Delegated(d) if matches!(d.source, DelegationSource::Package(_))) => {
+            Err(err(CapabilitySet::denial_message(&requested, &cause)))
+        }
+        Err(_) => Ok(false),
+    }
 }
 
 /// El reloj del host para un builtin que NO recibió el instante explícito, con la MISMA puerta
@@ -972,7 +991,7 @@ pub(crate) fn clock_granted(caps: &Rc<RefCell<CapabilitySet>>, who: &str) -> boo
 /// Bajo `--deterministic` (o dentro de un enclave sin reloj confiable) ninguno puede ser un
 /// oráculo del reloj, y el veredicto es reproducible.
 pub(crate) fn clock_or_error(caps: &Rc<RefCell<CapabilitySet>>, who: &str, opt: &str) -> Result<i64, Control> {
-    if clock_granted(caps, who) {
+    if clock_granted(caps, who)? {
         Ok(unix_now())
     } else {
         Err(err(format!(
@@ -987,7 +1006,7 @@ fn ensure_clock(o: &JwtVerifyOpts, caps: &Rc<RefCell<CapabilitySet>>, who: &str)
     if o.now.is_some() {
         return Ok(());
     }
-    if clock_granted(caps, who) {
+    if clock_granted(caps, who)? {
         Ok(())
     } else {
         Err(err(format!(

@@ -132,6 +132,8 @@ pub const KNOWN_CAPABILITY_NAMES: &str = synsema_core::capscope::KNOWN_CAPABILIT
 /// HOST (`--cap-set`, `--deterministic`) y el programa (`require random`). Lo único que un
 /// emisor puede pedir sobre ellas es el caveat `deterministic` (sin reloj ni entropía), que
 /// es una restricción de ejecución, no autoridad — y va en `Delegation::deterministic`.
+/// El dominio de paquete gobierna time/random/stdin (v0.6.61); stdout conserva su contrato
+/// previo hasta la revisión separada de su gate memoizado.
 pub const PROCESS_LOCAL: &[CapabilityType] =
     &[CapabilityType::Stdout, CapabilityType::Stdin, CapabilityType::Time, CapabilityType::Random];
 
@@ -220,8 +222,13 @@ impl Delegation {
     /// ¿Este techo delegado cubre la capability? Mismo `covers()` que gatea los `require`
     /// (misma canonización, mismo glob): no hay una segunda lógica de scopes.
     pub fn covers(&self, cap: &Capability) -> bool {
-        if is_process_local(cap.ty) {
+        if is_process_local(cap.ty)
+            && (!matches!(self.source, DelegationSource::Package(_)) || cap.ty == CapabilityType::Stdout)
+        {
             return !(self.deterministic && matches!(cap.ty, CapabilityType::Time | CapabilityType::Random));
+        }
+        if self.deterministic && matches!(cap.ty, CapabilityType::Time | CapabilityType::Random) {
+            return false;
         }
         self.layers()
             .all(|layer| layer.iter().any(|allowed| allowed.covers(cap)) || Capability::layer_covers_split(layer.iter(), cap))
@@ -1840,7 +1847,10 @@ impl CapabilitySet {
                     requested
                 ),
                 DelegationSource::Package(name) => {
-                    format!("Capability not granted: {} — the package {} does not declare it", requested, name)
+                    format!(
+                        "Capability not granted: {} — the package {} does not declare it; add `{}` inside its tasks",
+                        requested, name, Self::require_line(requested)
+                    )
                 }
             },
             DenyCause::IsolatedArea(area) => format!(
@@ -3100,6 +3110,46 @@ mod tee_tests {
 #[cfg(test)]
 mod delegated_ceiling_tests {
     use super::*;
+
+    #[test]
+    fn v0661_package_has_no_process_local_exception() {
+        for ty in PROCESS_LOCAL {
+            let requested = Capability::new(*ty, None);
+            let empty = Delegation::package("pure", vec![]);
+            if *ty == CapabilityType::Stdout {
+                assert!(empty.covers(&requested));
+                continue;
+            }
+            assert!(!empty.covers(&requested), "{:?}", ty);
+            assert!(Delegation::package("declared", vec![requested.clone()]).covers(&requested));
+            for d in [Delegation::block(vec![]), Delegation::token("t", vec![], false), Delegation::caller(vec![])] {
+                assert!(d.covers(&requested), "{:?} {:?}", d.source, ty);
+            }
+            let mut cs = CapabilitySet::new("program");
+            cs.grant(requested.clone());
+            cs.push_delegation(empty);
+            let cause = cs.check_cause(&requested, "probe").unwrap_err();
+            assert!(matches!(&cause, DenyCause::Delegated(d) if matches!(&d.source, DelegationSource::Package(n) if n == "pure")));
+            let message = CapabilitySet::denial_message(&requested, &cause);
+            assert!(message.contains("the package pure does not declare it"), "{}", message);
+            assert!(message.contains(&format!("`require {}` inside its tasks", ty.wire_name())), "{}", message);
+        }
+    }
+
+    #[test]
+    fn v0661_package_layers_host_and_determinism_only_subtract() {
+        let time = Capability::new(CapabilityType::Time, None);
+        let package = Delegation::package("clock", vec![time.clone()]);
+        assert!(!package.clone().with_earlier(vec![vec![]]).covers(&time));
+        let mut deterministic = package.clone();
+        deterministic.deterministic = true;
+        assert!(!deterministic.covers(&time));
+        let mut cs = CapabilitySet::new("program");
+        cs.ceiling = Some(Rc::new(vec![]));
+        cs.grant_ambient(time.clone());
+        cs.push_delegation(package);
+        assert!(cs.check_cause(&time, "now()").is_err());
+    }
 
     fn cap(name: &str, scope: Option<&str>) -> Capability {
         Capability::new(capability_type_from_name(name).unwrap(), scope.map(|s| s.to_string()))

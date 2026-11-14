@@ -2199,8 +2199,22 @@ pub fn register_secure_builtins(interp: &Interpreter, caps: Rc<RefCell<Capabilit
     // (fetch vive ahora en synsema-stdlib/http.rs: cliente HTTP real, gateado por net —
     // junto con http/http_get/http_post/http_put/http_delete. El stub "capa 6" se removió.)
 
+    // v0.6.61: a package cannot consume the program's stdin without declaring it.
+    // Keep the entry program's legacy read_line behavior; term_open already gates stdin.
+    {
+        let caps = caps.clone();
+        interp.register_builtin(
+            "read_line",
+            -1,
+            Rc::new(move |i, args, loc| {
+                if i.package_in_stack().is_some() {
+                    require(&caps, Capability::new(CapabilityType::Stdin, None), "read_line()")?;
+                }
+                i.b_read_line(args, loc)
+            }),
+        );
+    }
     // -- Builtins de time (todos requieren la capability `time`; UTC) --
-
     // now() → timestamp unix (float).
     {
         let caps = caps.clone();

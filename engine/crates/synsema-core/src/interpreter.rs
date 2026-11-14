@@ -11512,7 +11512,8 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
     /// newline antes de leer. Devuelve el texto sin el `\n`/`\r\n` final; `nothing` en EOF.
     /// Lee stdin crudo → funciona con TTY y con entrada redirigida/pipe (a diferencia de
     /// `ask`, que es un backend de decisión humana).
-    fn b_read_line(&mut self, args: &[SynValue], loc: &SourceLocation) -> Result<SynValue, Control> {
+    /// Hosts with capabilities wrap this implementation with the stdin gate before calling it.
+    pub fn b_read_line(&mut self, args: &[SynValue], loc: &SourceLocation) -> Result<SynValue, Control> {
         use std::io::Write;
         // Drena la salida pendiente (respuesta del turno previo) ANTES del prompt, para
         // que un REPL sea interactivo de verdad (DE-018) sin requerir flush() explícito.
