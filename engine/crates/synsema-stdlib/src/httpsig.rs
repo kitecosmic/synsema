@@ -659,6 +659,23 @@ mod tests {
         Rc::new(RefCell::new(CapabilitySet::new("deterministic")))
     }
 
+    #[test]
+    fn v0661_http_sign_clock_names_the_package() {
+        use synsema_capabilities::model::{Capability, CapabilityType, Delegation};
+        let caps = caps_with_time();
+        let sign = Capability::new(CapabilityType::Sign, Some("v0661-key".into()));
+        caps.borrow_mut().grant(sign.clone());
+        caps.borrow_mut().push_delegation(Delegation::package("signer", vec![sign]));
+        let req = map(vec![("method", text("GET")), ("url", text("https://x/"))]);
+        let key = synsema_core::types::syn_secret_bytes("v0661-key", b"test-key".to_vec());
+        let loc = SourceLocation { file: "t".into(), line: 1, column: 1, offset: 0 };
+        let opts = map(vec![("alg", text("hmac-sha256"))]);
+        let e = err_of(b_http_sign(&[req.clone(), key.clone(), opts], &loc, &caps));
+        assert!(e.contains("the package signer does not declare it") && e.contains("`require time` inside its tasks"), "{}", e);
+        let explicit = map(vec![("alg", text("hmac-sha256")), ("created", syn_int(123))]);
+        assert!(b_http_sign(&[req, key, explicit], &loc, &caps).is_ok());
+    }
+
     /// M12 : la ventana anti-replay se mide contra un reloj → sin `opts.now` exige
     /// `time`; y `created` lo elige el atacante y se chequea ANTES de verificar la firma, así que
     /// `created = i64::MIN` paniqueaba el proceso entero (la instancia más grave de la clase M6).

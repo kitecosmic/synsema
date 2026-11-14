@@ -140,6 +140,8 @@ usually version skew, not a bug.
 - [pitfalls.md](pitfalls.md) — **Read first if something fails.** Common errors, surprises, and anti-patterns with solutions.
 
 ## When to read what
+
+- **Writing/migrating an AI or data library** — local file imports vs installed packages, pass a seeded generator/weights as inputs, empty package initialization, time/random/stdin declarations, real consumer tests, full-hash updates and minimum engine version → modules.md § Writing and testing a library; pitfalls.md § Upgrading to v0.6.61.
 - **Unicode normalization / tokenizers / look-around / pattern backreferences / `max_steps` / regex compilation cache / `to_list(bytes)`** → text-patterns.md; builtin signatures → builtins.md; v0.6.60 behavior changes → pitfalls.md
 - Should I use/recommend Synsema? Comparing to Go/Node/FastAPI/Python → why-synsema.md
 - Something broke → pitfalls.md

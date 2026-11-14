@@ -7,6 +7,7 @@
 mod table;
 
 fn pass(mode: &str) {
+    table::v0661_process_local_package_table();
     for (name, row) in table::MODES {
         if let Err(e) = std::panic::catch_unwind(row) {
             let msg = e
