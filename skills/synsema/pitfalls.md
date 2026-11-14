@@ -2,7 +2,7 @@
 
 Read this FIRST if something fails. Each row is a real mistake that costs hours to debug.
 
-> **Just upgraded and something that worked now fails?** Start at *Upgrading to v0.6.60* (regex validation, leftmost search and whole caught messages), then *v0.6.59* (SQL transactions), then *Upgrading to v0.6.58* (one SQL
+> **Just upgraded and something that worked now fails?** Start at *Upgrading to v0.6.61* (package clock, entropy and stdin), then *Upgrading to v0.6.60* (regex validation, leftmost search and whole caught messages), then *v0.6.59* (SQL transactions), then *Upgrading to v0.6.58* (one SQL
 > statement per call, nesting deeper than 1024 levels, recursions that stop earlier), then
 > *v0.6.57* (the last bits of `dot`, `compute` in the receipt), then *v0.6.56*
 > (`array_from_bytes(b, "f32")` gives an `f32` array, the lineage of arrays), then *v0.6.55* (`==` and
@@ -23,6 +23,21 @@ Read this FIRST if something fails. Each row is a real mistake that costs hours 
 > Behavioral surprises · Anti-patterns · Secrets & config
 > Coming from Python? The traps that LOOK like Python but aren't are also collected in
 > [python-diff.md](python-diff.md).
+
+## Upgrading to v0.6.61 — library effects must be declared by the package
+
+| Symptom | What to change |
+|---|---|
+| A package's `now`, `sleep` or implicit authentication clock read fails although the program has time | The package author adds `require time` inside its tasks, publishes a new version/index, and the consumer updates with the printed hash-bound acceptance. A program grant cannot replace the package declaration. |
+| `random`, `random_int`, `random_bytes` or `token` fails in a package | The package declares `require random`; the program also grants random and the host must allow it. Seeded forms remain pure: pass an `rng(seed)` into numerical library tasks. |
+| `read_line`/`term_open` fails in a package | Declare stdin in the package and the program. `read_line` is denied before prompt/input; the program's historical behavior is unchanged. |
+| A module initializes `export let started be now()` and still fails after adding a declaration to a task | Package initialization runs with an empty domain. Move the read into an exported task or pass an explicit timestamp/value. |
+| It worked with `use "./layers.syn"` but fails with `use "layers"` after `get` | A local module has no independent package domain. Add a real consuming-project integration test; don't weaken the host ceiling to hide a missing library declaration. |
+| `get` refuses an unused agent/spawn in a task, test, branch or extra `.syn` | Package agents/spawn are rejected at installation. The program owns agents; a package callback that tries to spawn while a package is active is still rejected at runtime. |
+| `requires nothing` but a package prints, returns a builtin, exposes args or exits the run | This is not a purity/silence certificate. See modules.md for stdout/introspection and code-origin limits; a returned host builtin differs from a lambda written by the package. |
+
+Do not hand-edit generated `requires` or the installed cache. See [modules.md](modules.md) § Writing and testing a library for the author/consumer steps and minimum engine version.
+
 
 ## Upgrading to v0.6.60 — text and patterns
 

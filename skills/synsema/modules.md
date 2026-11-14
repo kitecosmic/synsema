@@ -608,10 +608,33 @@ with dependents is better published on a host you control.
 
 ### Inside a package — it only uses what it declares, and only if the program granted it
 
+Function values retain their code's origin: `give now` returns the host builtin, while `give () => now()` returns a lambda written in the package. Calling that builtin later from the program runs outside the package; the returned lambda keeps the package domain. Passing a caller-owned function through a package does not change its origin.
+
+**v0.6.61 (breaking):** packages declare `require time`, `require random` and
+`require stdin` inside their tasks, just like other capabilities. `now()`/`sleep()` need
+`time`; unseeded randomness needs `random`; `read_line()` and `term_open()` need `stdin`.
+`get` records these declarations and an update adding one needs the hash-bound `--accept`.
+Seeded generators and explicit timestamps do not read the host clock or entropy.
+`read_line()` from a package is checked before the prompt or input consumption, including
+callbacks and workers. A declaration still needs the program's grant and the host's ceiling.
+
+`stdout` keeps its previous behavior pending its own version: package printing is still
+allowed. `requires nothing` lists capability declarations; it is **not a certificate of
+purity, silence or full process isolation**. Existing introspection (`args`, `lineage`,
+`receipt`), event-bus operations and `exit` keep their contracts. `receipt` omits its time
+when the package cannot read the clock. Captokens and `sandbox under` retain their
+process-local exception; their `deterministic` caveat still denies clock and entropy.
+
+`get` rejects agent definitions and `spawn` in all packaged `.syn` files, including
+unused branches and extra files. Runtime guards also reject a program callback attempting
+to spawn an agent while a package is on the stack.
+
 Every task and lambda written in a package runs with **the package's `requires` (the union of every
 `require` in it) ∩ what is in force** — the program's grants, the host ceiling, a `sandbox`, a
 captoken — by any path: a direct call, a callback, a lambda it returned and the program calls later,
 a `parallel_map` worker. Entering a package only subtracts.
+
+The table shows error prefixes; package denials also say which `require` to add inside its tasks.
 
 | the package | the program | result |
 |---|---|---|
@@ -660,6 +683,47 @@ name. A package template sees the builtins and the package, never the program's 
   `template not found: shell.html`: the program does not see the package's files; the package
   exposes a task that renders.
 - `get` refuses a literal `render("x.html")` whose file is not in the index (above).
+
+### Writing and testing a library
+
+The import form determines the boundary:
+
+| Import | Permissions during a normal call |
+|---|---|
+| `use "./layers.syn"` | A file module of your program. It has no separate package domain; it runs under the current caller's permissions and any active restrictions. |
+| `use "layers"` through `synsema.json` | Package tasks/lambdas are restricted by the package declaration as well as the program and host. |
+| `use "trusted:tools"` | Host-loaded policy, with its own declared permissions and trusted ceiling. It can have more authority than its caller; it is not a package installed by `get`. |
+
+**Initialization has an empty package domain.** A `require time` in a task does not permit `export let started be now()` at the top level. Move the read into a task and call it from the application, or receive the timestamp as an argument. `stdout` and the introspection limits described above still apply; this is not a promise of a completely silent import.
+
+For numerical libraries, receive a generator instead of reading ambient entropy:
+
+```syn
+export task make_weights(g, dimensions)
+    give random_normal(g, dimensions)
+```
+
+The consuming application can call `layers.make_weights(rng(42), [4, 8])`; the package needs no `random` declaration for this seeded form. Create generators in the request/worker that owns them, or use `rng_spawn` for worker streams: do not export a top-level generator and assume it can be shared across requests or workers. These generators are not for secrets.
+
+If the operation deliberately produces OS randomness, declare that effect where it is used:
+
+```syn
+export task fresh_nonce()
+    require random
+    give token()
+```
+
+The application also declares `require random`. The declaration in the package only describes the effect; it grants nothing. For stdin, both the consuming program and the package declare `require stdin`. A host ceiling or `--deterministic` can still deny a declared effect.
+
+Large weights/checkpoints are application inputs, not hidden installation assets. The application can load them with its own file/network permissions and pass the values to the library. An explicit loader task inside the library must declare its file/network permissions. Data-file paths resolve against the process's current folder, not the package folder; package templates have their separate rule above.
+
+Before publishing or migrating a library:
+
+1. Declare its effects inside tasks; do not put `require` at module top level or edit the generated `requires` metadata to simulate permission.
+2. Publish a new package version and regenerate its file hashes/index when its source changes. Do not edit the installed cache or overwrite a pinned release.
+3. In a consuming project, run `synsema get --update layers`, review additions, and use the exact full-hash `--accept` command it prints; then `synsema get --check`.
+4. Test through `use "layers"` after installation, not only `use "./layers.syn"`: local-module tests do not exercise the package domain. Also test the program/host denying an effect and pure seeded/explicit-time alternatives.
+5. If the application relies on the v0.6.61 clock/entropy/stdin boundary, set its `synsema.json` minimum to `"synsema": "0.6.61"`. `get --check` validates the cache and declarations; it is not proof that every task will execute successfully.
 
 ### Publishing a package
 
