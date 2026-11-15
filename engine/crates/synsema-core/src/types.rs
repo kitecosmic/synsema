@@ -35,7 +35,7 @@ pub type ListRef = synsema_heap::Shared<SynList>;
 pub use synsema_heap::{Obj, ObjSlice};
 pub type BytesRef = synsema_heap::ObjSlice<u8>;
 pub use crate::synlist::SynList;
-use crate::synlist::{list_read, list_values};
+use crate::synlist::list_read;
 pub use crate::synmap::{Key, MapObj, MapRef, SynMap};
 
 #[derive(Clone)]
@@ -116,6 +116,17 @@ pub enum ServerValue {
     /// y los nombres repetidos son válidos (`Set-Cookie` múltiple los requiere:
     /// cada par se emite como línea propia). (Tanda web-auth, ítem A)
     WithHeaders { inner: Box<SynValue>, headers: Vec<(String, String)> },
+}
+
+impl Drop for ServerValue {
+    fn drop(&mut self) {
+        match self {
+            Self::Envelope { value, .. } => crate::value_drop::slot(value),
+            Self::Content(value) | Self::WithHeaders { inner: value, .. } => crate::value_drop::slot(value),
+            // Node's map has its own iterative release; the other variants have no values.
+            _ => {}
+        }
+    }
 }
 
 impl ServerValue {
@@ -281,13 +292,54 @@ impl SynValue {
         }
     }
 
+    // Only compound values carry a depth. Keep scalar/array equality in the
+    // original two-argument entry, including its ndarray monomorphizations.
+    fn equals_at(&self, other: &SynValue, depth: usize) -> bool {
+        match (self, other) {
+            (SynValue::Private(a), b) => a.value.equals_next(b, depth),
+            (a, SynValue::Private(b)) => a.equals_next(&b.value, depth),
+            (SynValue::List(a), SynValue::List(b)) => {
+                let (a, b) = (list_read(a), list_read(b));
+                a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| x.equals_next(y, depth))
+            }
+            (SynValue::Map(a), SynValue::Map(b)) => {
+                let (a, b) = (a.borrow(), b.borrow());
+                a.len() == b.len() && a.iter().all(|(k, v)| b.get(k).is_some_and(|w| v.equals_next(w, depth)))
+            }
+            (SynValue::Server(a), SynValue::Server(b)) => match (&**a, &**b) {
+                (ServerValue::Envelope { status: sa, value: a }, ServerValue::Envelope { status: sb, value: b }) => {
+                    sa == sb && a.equals_next(b, depth)
+                }
+                (ServerValue::Node(a), ServerValue::Node(b)) => {
+                    let (a, b) = (a.borrow(), b.borrow());
+                    a.len() == b.len() && a.iter().all(|(k, v)| b.get(k).is_some_and(|w| v.equals_next(w, depth)))
+                }
+                (ServerValue::Content(a), ServerValue::Content(b)) => a.equals_next(b, depth),
+                (ServerValue::WithHeaders { inner: a, headers: ha }, ServerValue::WithHeaders { inner: b, headers: hb }) => {
+                    ha == hb && a.equals_next(b, depth)
+                }
+                _ => self.syn_equals(other),
+            },
+            _ => self.syn_equals(other),
+        }
+    }
+
+    fn equals_next(&self, other: &SynValue, depth: usize) -> bool {
+        if depth == crate::value_eq::INLINE_DEPTH {
+            crate::value_eq::deep(self, other, false, &mut false)
+        } else {
+            self.equals_at(other, depth + 1)
+        }
+    }
+
     /// Igualdad por valor (operador `==`/`!=`, `match`, `contains`).
     pub fn syn_equals(&self, other: &SynValue) -> bool {
+        let depth = 0;
         match (self, other) {
             // Private: compara los valores internos (el operador `==` ya sale privado por
             // `exec_binary`; acá sólo importa que match/contains/unique vean el valor).
-            (SynValue::Private(a), b) => a.value.syn_equals(b),
-            (a, SynValue::Private(b)) => a.syn_equals(&b.value),
+            (SynValue::Private(a), b) => a.value.equals_next(b, depth),
+            (a, SynValue::Private(b)) => a.equals_next(&b.value, depth),
             // Secret: igualdad en **tiempo constante** (no filtra por timing, §5).
             // Comparar dos plaintexts internamente no los expone a user-space.
             (SynValue::Secret(a), SynValue::Secret(b)) => {
@@ -306,13 +358,13 @@ impl SynValue {
             (SynValue::Nothing, SynValue::Nothing) => true,
             (SynValue::List(a), SynValue::List(b)) => {
                 let (a, b) = (list_read(a), list_read(b));
-                a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| x.syn_equals(y))
+                a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| x.equals_next(y, depth))
             }
             (SynValue::Map(a), SynValue::Map(b)) => {
                 let (a, b) = (a.borrow(), b.borrow());
                 a.len() == b.len()
                     && a.iter()
-                        .all(|(k, v)| b.get(k).is_some_and(|w| v.syn_equals(w)))
+                        .all(|(k, v)| b.get(k).is_some_and(|w| v.equals_next(w, depth)))
             }
             // Igualdad de valores del servidor (estructural). Un Server NUNCA es
             // igual a un map plano (en el oráculo difieren en metadata).
@@ -328,13 +380,13 @@ impl SynValue {
                 (
                     ServerValue::Envelope { status: s1, value: v1 },
                     ServerValue::Envelope { status: s2, value: v2 },
-                ) => s1 == s2 && v1.syn_equals(v2),
+                ) => s1 == s2 && v1.equals_next(v2, depth),
                 (ServerValue::Node(m1), ServerValue::Node(m2)) => {
                     let (m1, m2) = (m1.borrow(), m2.borrow());
                     m1.len() == m2.len()
-                        && m1.iter().all(|(k, v)| m2.get(k).is_some_and(|w| v.syn_equals(w)))
+                        && m1.iter().all(|(k, v)| m2.get(k).is_some_and(|w| v.equals_next(w, depth)))
                 }
-                (ServerValue::Content(a), ServerValue::Content(b)) => a.syn_equals(b),
+                (ServerValue::Content(a), ServerValue::Content(b)) => a.equals_next(b, depth),
                 (ServerValue::Paged(a), ServerValue::Paged(b)) => Rc::ptr_eq(a, b),
                 (
                     ServerValue::Redirect { location: l1, status: s1 },
@@ -343,7 +395,7 @@ impl SynValue {
                 (
                     ServerValue::WithHeaders { inner: i1, headers: h1 },
                     ServerValue::WithHeaders { inner: i2, headers: h2 },
-                ) => h1 == h2 && i1.syn_equals(i2),
+                ) => h1 == h2 && i1.equals_next(i2, depth),
                 _ => false,
             },
             // `bytes` sólo es igual a `bytes` (byte-a-byte). Nunca igual a text ni a
@@ -387,18 +439,8 @@ impl fmt::Display for SynValue {
             // Dentro de un contenedor el texto va entre comillas (v0.6.29): `["1", 1]`
             // ya no se muestra igual que `[1, 1]`. Arriba de todo, `print("x")` sigue
             // mostrando el texto tal cual.
-            SynValue::List(l) => {
-                let parts: Vec<String> = list_read(l).iter().map(|v| v.nested_repr()).collect();
-                write!(f, "[{}]", parts.join(", "))
-            }
-            SynValue::Map(m) => {
-                let parts: Vec<String> = m
-                    .borrow()
-                    .iter()
-                    .map(|(k, v)| format!("{}: {}", k, v.nested_repr()))
-                    .collect();
-                write!(f, "{{{}}}", parts.join(", "))
-            }
+            SynValue::List(l) => crate::value_fmt::list(l, f, 0),
+            SynValue::Map(m) => crate::value_fmt::map(m, f, 0),
             SynValue::Task(t) => {
                 let names: Vec<&str> = t.parameters.iter().map(|p| &*p.name).collect();
                 write!(f, "task {}({})", t.name, names.join(", "))
@@ -417,22 +459,16 @@ impl fmt::Display for SynValue {
                     bytes_display(body), content_type, status
                 ),
                 ServerValue::Envelope { status, value } => {
-                    write!(f, "{{status: {}, value: {}}}", status, value)
+                    crate::value_fmt::envelope(*status, value, f, 0)
                 }
-                ServerValue::Node(m) => {
-                    let parts: Vec<String> =
-                        m.borrow().iter().map(|(k, v)| format!("{}: {}", k, v.nested_repr())).collect();
-                    write!(f, "{{{}}}", parts.join(", "))
-                }
-                ServerValue::Content(inner) => write!(f, "{}", inner),
+                ServerValue::Node(m) => crate::value_fmt::map(m, f, 0),
+                ServerValue::Content(inner) => crate::value_fmt::next(inner, f, 0, false),
                 ServerValue::Paged(_) => write!(f, "{{paged}}"),
                 ServerValue::Redirect { location, status } => {
                     write!(f, "{{redirect: {}, status: {}}}", location, status)
                 }
                 ServerValue::WithHeaders { inner, headers } => {
-                    let hs: Vec<String> =
-                        headers.iter().map(|(k, v)| format!("{}: {}", k, v)).collect();
-                    write!(f, "{{value: {}, headers: {{{}}}}}", inner, hs.join(", "))
+                    crate::value_fmt::with_headers(inner, headers, f, 0)
                 }
             },
             // Redacción de fondo: `secret(NAME)`, nunca el plaintext. Esto sella por
@@ -494,15 +530,7 @@ fn display_with<T>(a: &ArrayD<T>, elem: impl Fn(&T) -> String + Copy) -> String 
         let shape: Vec<String> = a.shape().iter().map(|d| d.to_string()).collect();
         return format!("array(shape=[{}], {} elements)", shape.join(", "), a.len());
     }
-    fn rec<T>(a: &ndarray::ArrayViewD<T>, elem: impl Fn(&T) -> String + Copy) -> String {
-        if a.ndim() == 0 {
-            elem(a.first().unwrap())
-        } else {
-            let parts: Vec<String> = a.outer_iter().map(|s| rec(&s, elem)).collect();
-            format!("[{}]", parts.join(", "))
-        }
-    }
-    rec(&a.view(), elem)
+    crate::value_fmt::array(a, elem)
 }
 
 /// Float al estilo del lenguaje pero recortando un `.0` final (como el repr de Python
@@ -755,7 +783,7 @@ impl SendArray {
 // agentes), alineado con el plan.
 
 /// Valor owned y thread-safe (snapshot de un `SynValue`).
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Debug, PartialEq)]
 pub enum SendValue {
     Number(Number),
     Text(String),
@@ -787,15 +815,18 @@ pub enum SendValue {
 
 /// Snapshot de un `SynValue` a `SendValue` (deep copy). Task/Builtin no cruzan: se
 /// degradan a su texto (no se comparten closures entre hilos).
-pub fn to_send(v: &SynValue) -> SendValue {
+pub fn to_send(v: &SynValue) -> SendValue { to_send_at(v, 0) }
+
+pub(crate) fn to_send_at(v: &SynValue, depth: usize) -> SendValue {
+    if depth == 32 { return crate::value_send::to_deep(v); }
     match v {
         SynValue::Number(n) => SendValue::Number(n.clone()),
         SynValue::Text(s) => SendValue::Text(s.to_string()),
         SynValue::Bool(b) => SendValue::Bool(*b),
         SynValue::Nothing => SendValue::Nothing,
-        SynValue::List(l) => SendValue::List(list_values(&l).iter().map(to_send).collect()),
+        SynValue::List(l) => SendValue::List((0..l.borrow().len()).map(|i| to_send_at(&l.borrow().get(i).unwrap(), depth + 1)).collect()),
         SynValue::Map(m) => {
-            SendValue::Map(m.borrow().iter().map(|(k, v)| (k.to_string(), to_send(v))).collect())
+            SendValue::Map(m.borrow().iter().map(|(k, v)| (k.to_string(), to_send_at(v, depth + 1))).collect())
         }
         SynValue::Builtin(b) => match crate::rng::snapshot(b) {
             // Snapshot de GLOBALES (serve, workers): un generador de nivel superior no cruza como
@@ -820,16 +851,16 @@ pub fn to_send(v: &SynValue) -> SendValue {
             ]),
             ServerValue::Envelope { status, value } => SendValue::Map(vec![
                 ("status".to_string(), SendValue::Number(Number::Int(*status))),
-                ("value".to_string(), to_send(value)),
+                ("value".to_string(), to_send_at(value, depth + 1)),
             ]),
             ServerValue::Node(m) => {
-                SendValue::Map(m.borrow().iter().map(|(k, v)| (k.to_string(), to_send(v))).collect())
+                SendValue::Map(m.borrow().iter().map(|(k, v)| (k.to_string(), to_send_at(v, depth + 1))).collect())
             }
-            ServerValue::Content(inner) => to_send(inner),
+            ServerValue::Content(inner) => to_send_at(inner, depth + 1),
             ServerValue::Paged(_) => SendValue::Text("{paged}".to_string()),
             // El blackboard snapshotea el valor envuelto; los headers son metadata
             // del transporte HTTP y no cruzan.
-            ServerValue::WithHeaders { inner, .. } => to_send(inner),
+            ServerValue::WithHeaders { inner, .. } => to_send_at(inner, depth + 1),
             ServerValue::Redirect { location, status } => SendValue::Map(vec![
                 ("redirect".to_string(), SendValue::Text(location.clone())),
                 ("status".to_string(), SendValue::Number(Number::Int(*status))),
@@ -860,23 +891,26 @@ pub fn to_send(v: &SynValue) -> SendValue {
         // reemplazaba por el texto `private(app)`.
         SynValue::Private(p) => SendValue::Private(
             p.label.iter().map(|s| s.to_string()).collect(),
-            Box::new(to_send(&p.value)),
+            Box::new(to_send_at(&p.value, depth + 1)),
         ),
     }
 }
 
 /// Reconstruye un `SynValue` (nuevo) desde un `SendValue`.
-pub fn from_send(v: &SendValue) -> SynValue {
+pub fn from_send(v: &SendValue) -> SynValue { from_send_at(v, 0) }
+
+pub(crate) fn from_send_at(v: &SendValue, depth: usize) -> SynValue {
+    if depth == 32 { return crate::value_send::from_deep(v); }
     match v {
         SendValue::Number(n) => SynValue::Number(n.clone()),
         SendValue::Text(s) => syn_text(s.as_str()),
         SendValue::Bool(b) => SynValue::Bool(*b),
         SendValue::Nothing => SynValue::Nothing,
-        SendValue::List(items) => syn_list(items.iter().map(from_send).collect()),
+        SendValue::List(items) => syn_list(items.iter().map(|v| from_send_at(v, depth + 1)).collect()),
         SendValue::Map(pairs) => {
             let mut m = SynMap::new();
             for (k, v) in pairs {
-                m.insert(k.clone(), from_send(v));
+                m.insert(k.clone(), from_send_at(v, depth + 1));
             }
             syn_map(m)
         }
@@ -888,7 +922,7 @@ pub fn from_send(v: &SendValue) -> SynValue {
         // dedupea, descarta vacíos) y `mark` respeta los invariantes de la variante (nunca
         // privado de privado, nunca etiqueta vacía, nunca privado de secret).
         SendValue::Private(principals, inner) => {
-            crate::labels::mark(from_send(inner), crate::labels::label_from(principals))
+            crate::labels::mark(from_send_at(inner, depth + 1), crate::labels::label_from(principals))
         }
         SendValue::Time(t) => SynValue::Time(crate::types::Obj::new(t.clone())),
         SendValue::Rng(Some(g), name) => crate::rng::restore((**g).clone(), name.clone()),
@@ -898,7 +932,12 @@ pub fn from_send(v: &SendValue) -> SynValue {
 
 impl fmt::Display for SendValue {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
+        crate::value_send::display(self, f)
+    }
+}
+
+pub(crate) fn send_leaf_display(value: &SendValue, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match value {
             SendValue::Nothing => write!(f, "nothing"),
             // T5: se REDACTA, igual que `SynValue::Private` (un Display accidental no filtra).
             SendValue::Private(l, _) => write!(f, "private({})", l.join(",")),
@@ -907,15 +946,7 @@ impl fmt::Display for SendValue {
             SendValue::Time(t) => write!(f, "{}", t),
             SendValue::Rng(_, name) => write!(f, "builtin:{}", name),
             SendValue::Text(s) => write!(f, "{}", s),
-            SendValue::List(items) => {
-                let parts: Vec<String> = items.iter().map(|v| v.to_string()).collect();
-                write!(f, "[{}]", parts.join(", "))
-            }
-            SendValue::Map(pairs) => {
-                let parts: Vec<String> =
-                    pairs.iter().map(|(k, v)| format!("{}: {}", k, v)).collect();
-                write!(f, "{{{}}}", parts.join(", "))
-            }
+            SendValue::List(_) | SendValue::Map(_) => unreachable!("structural display uses value_send"),
             // Espeja el repr hex de `SynValue::Bytes` (mismo `bytes(<hex>)`).
             SendValue::Bytes(b) => write!(f, "{}", bytes_display(b)),
             // Mismo formato `re±imi` que `SynValue::Complex`.
@@ -924,4 +955,3 @@ impl fmt::Display for SendValue {
             SendValue::Array(shape, data) => write!(f, "{}", nd_display(&data.to_nd(shape))),
         }
     }
-}

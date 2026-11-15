@@ -4783,8 +4783,8 @@ impl Interpreter {
     /// directo a su ventana (lo de `vm_call` + `vm_enter_regframe`, sin `Environment` ni `Vec` por
     /// llamada) y, si tiene código nativo, entra ahí. Si no, `call_value` como siempre. Lo observable
     /// es lo de `call_value_named` (la VM no corre con etiquetas: `vm_code_for`): la profundidad con
-    /// el mismo tope, aridad permisiva (los de más se sueltan antes de los defaults, que se evalúan
-    /// en el `closure_env`) y el `give` es el valor. Deja `args` vacíos.
+    /// el mismo tope, argumentos de protocolo sobrantes permitidos, obligatorios faltantes
+    /// rechazados antes de los defaults en `closure_env`, y `give` como valor. Deja `args` vacíos.
     pub(super) fn call_fast(&mut self, f: &SynValue, args: &mut [SynValue], loc: &SourceLocation) -> Result<SynValue, Control> {
         if let SynValue::Task(t) = f {
             if let Some(code) = self.vm_code_for(t) {
@@ -4796,7 +4796,7 @@ impl Interpreter {
                     if t.mark != self.cur_pkg {
                         return self.call_fast_foreign(f, args, loc);
                     }
-                    return self.vm_call_rust(t, code, args);
+                    return self.vm_call_rust(t, code, args, loc);
                 }
             }
         }
@@ -4845,7 +4845,10 @@ impl Interpreter {
     }
 
     /// `call_fast` a un cuerpo con frame en registros.
-    fn vm_call_rust(&mut self, t: &Rc<SynTaskValue>, code: &Rc<Chunk>, args: &mut [SynValue]) -> Result<SynValue, Control> {
+    fn vm_call_rust(&mut self, t: &Rc<SynTaskValue>, code: &Rc<Chunk>, args: &mut [SynValue], loc: &SourceLocation) -> Result<SynValue, Control> {
+        if args.len() < t.parameters.len() {
+            check_internal_task_arity(t, args.len(), loc)?;
+        }
         self.recursion_depth += 1;
         if self.recursion_depth > MAX_RECURSION {
             self.recursion_depth -= 1;

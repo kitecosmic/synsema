@@ -30,6 +30,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::hash::{BuildHasher, Hash, Hasher};
 use std::ops::{Deref, DerefMut};
+use std::mem::ManuallyDrop;
 use synsema_heap::{Obj, WeakObj};
 use std::sync::OnceLock;
 
@@ -451,10 +452,41 @@ fn own(n: &mut Obj<Node>) -> &mut Node {
 /// un valor ([`MapObj`]) y `[SynValue; 0]` en uno que se está armando ([`SynMap`]).
 /// `repr(C)` con sólo estos dos campos: lo pide `tail_object!` (y lo verifica al compilar).
 #[repr(C)]
-pub struct MapBody<S: ?Sized> {
+pub struct MapBody<S: ?Sized + AsMut<[SynValue]>> {
     /// `None`: vacío.
     layout: Option<Obj<Node>>,
-    vals: S,
+    // Same layout as S. Resource-owning slots become a valid Nothing before
+    // release; scalars without resources can retain their valid representation.
+    // The compiler must not drop this already released tail a second time.
+    // No zombie values or unsafe ManuallyDrop::drop/take are used.
+    vals: ManuallyDrop<S>,
+}
+
+impl<S: ?Sized + AsMut<[SynValue]>> Drop for MapBody<S> {
+    fn drop(&mut self) {
+        crate::value_drop::map_slots(self.vals.as_mut());
+        // Keep an empty builder and the common shaped record out of the cold
+        // layout-unwrapping frame. Their metadata retains its normal destructor.
+        if matches!(self.layout.as_deref(), Some(Node::Grown { .. } | Node::Dict(_))) {
+            release_layout(self.layout.take().expect("layout"));
+        }
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn release_layout(layout: Obj<Node>) {
+    if let Ok(mut node) = Obj::try_unwrap(layout) {
+        match &mut node {
+            Node::Grown { extra, .. } => {
+                for value in extra { crate::value_drop::slot(value); }
+            }
+            Node::Dict(values) => {
+                for value in values.values_mut() { crate::value_drop::slot(value); }
+            }
+            Node::Shape(_) => {}
+        }
+    }
 }
 
 /// El mapa de un valor de Synsema (ver el módulo).
@@ -561,7 +593,7 @@ pub fn map_from_pairs(pairs: &mut Vec<(Key, SynValue)>) -> MapRef {
 impl SynMap {
     #[inline]
     pub fn new() -> SynMap {
-        MapBody { layout: None, vals: [] }
+        MapBody { layout: None, vals: ManuallyDrop::new([]) }
     }
     /// Con lugar para `n` claves sin volver a pedir memoria.
     pub fn with_capacity(n: usize) -> SynMap {
@@ -572,7 +604,7 @@ impl SynMap {
         } else {
             Some(Obj::new(Node::Grown { shape: root(), extra: Vec::with_capacity(n) }))
         };
-        MapBody { layout, vals: [] }
+        MapBody { layout, vals: ManuallyDrop::new([]) }
     }
     /// El mapa como valor: un malloc con los valores en línea (la forma ya está armada).
     pub fn into_ref(mut self) -> MapRef {
@@ -592,7 +624,7 @@ impl SynMap {
             Ok(Node::Shape(_)) => new_body(None, std::iter::empty(), 0),
             // Lo de un solo mapa es único; si no lo fuera, se copia.
             Err(n) if matches!(*n, Node::Shape(_)) => new_body(None, std::iter::empty(), 0),
-            Err(n) => SynMap { layout: Some(clone_layout(&n)), vals: [] }.into_ref(),
+            Err(n) => SynMap { layout: Some(clone_layout(&n)), vals: ManuallyDrop::new([]) }.into_ref(),
         }
     }
 }
@@ -606,7 +638,7 @@ impl Default for SynMap {
 
 impl Clone for SynMap {
     fn clone(&self) -> SynMap {
-        MapBody { layout: self.layout.as_ref().map(clone_layout), vals: [] }
+        MapBody { layout: self.layout.as_ref().map(clone_layout), vals: ManuallyDrop::new([]) }
     }
 }
 
@@ -670,7 +702,7 @@ impl MapObj {
             }
             Some(Node::Dict(d)) => Some(Obj::new(Node::Dict(d.clone()))),
         };
-        MapBody { layout, vals: [] }
+        MapBody { layout, vals: ManuallyDrop::new([]) }
     }
     /// Reemplaza todo el contenido por el de `m` (los lugares en línea se quedan).
     pub fn replace_with(&mut self, m: SynMap) {

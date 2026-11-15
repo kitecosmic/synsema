@@ -151,7 +151,6 @@
 //! Los sumideros de I/O que el host no registre tampoco se comprueban: el host tiene
 //! `check_flow`, `strip_deep` e `Interpreter::pc_label` para hacerlo en su borde.
 
-use crate::synlist::{list_values};
 use crate::types::{MapObj, SynMap};
 use std::fmt;
 use std::rc::Rc;
@@ -469,43 +468,68 @@ pub fn label_deep(v: &SynValue) -> Label {
     acc
 }
 
-fn deep_into(v: &SynValue, acc: &mut Label) {
+// The visitor sees a borrowed child BEFORE a continuation retains its owner.
+// In particular, testing strong_count must not observe a traversal-made alias.
+fn child<R>(v: &SynValue, index: usize, f: impl FnOnce(&SynValue, Option<&str>, Option<usize>) -> R) -> Option<R> {
     match v {
-        SynValue::Private(p) => {
-            *acc = union(acc, &p.label);
-            deep_into(&p.value, acc);
-        }
         SynValue::List(l) => {
-            for x in list_values(&l).iter() {
-                deep_into(x, acc);
-            }
+            let b = l.borrow();
+            b.as_values()?.get(index).map(|v| f(v, None, Some(index)))
         }
-        SynValue::Map(m) => {
-            for x in m.borrow().values() {
-                deep_into(x, acc);
-            }
-        }
+        SynValue::Map(m) => m.borrow().get_index(index).map(|(k, v)| f(v, Some(k.as_str()), None)),
+        SynValue::Private(p) if index == 0 => Some(f(&p.value, None, None)),
         SynValue::Server(s) => match &**s {
-            ServerValue::Envelope { value, .. } => deep_into(value, acc),
-            ServerValue::Node(m) => {
-                for x in m.borrow().values() {
-                    deep_into(x, acc);
-                }
-            }
-            ServerValue::Content(inner) => deep_into(inner, acc),
-            ServerValue::WithHeaders { inner, .. } => deep_into(inner, acc),
-            ServerValue::Raw { .. }
-            | ServerValue::RawBytes { .. }
-            | ServerValue::Redirect { .. }
-            | ServerValue::Paged(_) => {}
+            ServerValue::Node(m) => m.borrow().get_index(index).map(|(k, v)| f(v, Some(k.as_str()), None)),
+            ServerValue::Envelope { value, .. } if index == 0 => Some(f(value, Some("value"), None)),
+            ServerValue::Content(v) | ServerValue::WithHeaders { inner: v, .. } if index == 0 => Some(f(v, None, None)),
+            _ => None,
         },
-        _ => {}
+        _ => None,
     }
+}
+
+fn walk(v: &SynValue, visit: &mut impl FnMut(&SynValue) -> bool, depth: usize) -> bool {
+    if !visit(v) { return false; }
+    if depth == 32 { return walk_tail(v, visit); }
+    let mut index = 0;
+    while let Some(ok) = child(v, index, |v, _, _| walk(v, visit, depth + 1)) {
+        if !ok { return false; }
+        index += 1;
+    }
+    true
+}
+
+#[cold]
+#[inline(never)]
+fn walk_tail(v: &SynValue, visit: &mut impl FnMut(&SynValue) -> bool) -> bool {
+    let mut stack = vec![(v.clone(), 0)];
+    while let Some((v, index)) = stack.last_mut() {
+        let next = child(v, *index, |v, _, _| {
+            if !visit(v) { return Err(()); }
+            // Only retain a child when it has descendants. Numeric lists remain unboxed.
+            Ok(child(v, 0, |_, _, _| ()).map(|_| v.clone()))
+        });
+        *index += 1;
+        match next {
+            Some(Err(())) => return false,
+            Some(Ok(Some(v))) => stack.push((v, 0)),
+            Some(Ok(None)) => {},
+            None => { stack.pop(); },
+        }
+    }
+    true
+}
+
+fn deep_into(v: &SynValue, acc: &mut Label) {
+    walk(v, &mut |v| {
+        if let SynValue::Private(p) = v { *acc = union(acc, &p.label); }
+        true
+    }, 0);
 }
 
 /// ¿Hay alguna etiqueta en el valor (a cualquier profundidad)?
 pub fn has_label_deep(v: &SynValue) -> bool {
-    !label_deep(v).is_empty()
+    !walk(v, &mut |v| !matches!(v, SynValue::Private(p) if !p.label.is_empty()), 0)
 }
 
 /// Envuelve `v` con `label` (o une, si `v` ya es privado). Etiqueta vacía → devuelve `v`
@@ -565,52 +589,136 @@ pub fn mark_owned(v: &SynValue, label: Label) -> SynValue {
 /// ¿Algún contenedor del subárbol tiene más de un dueño? Si no, envolverlo no puede fabricar
 /// un alias escribible y la copia de `mark_owned` se saltea (M5: era ~4,5× más lento).
 fn is_aliased(v: &SynValue) -> bool {
-    match v {
-        SynValue::List(l) => crate::types::ListRef::strong_count(l) > 1 || list_values(&l).iter().any(is_aliased),
-        SynValue::Map(m) => crate::types::MapRef::strong_count(m) > 1 || m.borrow().values().any(is_aliased),
-        SynValue::Private(p) => is_aliased(&p.value),
-        // Los valores del servidor llevan `Rc`/`Box` opacos: conservador.
-        SynValue::Server(_) => true,
-        _ => false,
-    }
+    !walk(v, &mut |v| match v {
+        SynValue::List(l) => crate::types::ListRef::strong_count(l) <= 1,
+        SynValue::Map(m) => crate::types::MapRef::strong_count(m) <= 1,
+        SynValue::Server(_) => false,
+        _ => true,
+    }, 0)
 }
 
 /// Copia en profundidad un valor (listas, mapas y valores del servidor se reconstruyen; los
 /// escalares y los `Rc` inmutables se comparten). Corta todo aliasing con el original.
 pub fn deep_copy(v: &SynValue) -> SynValue {
+    copy_walk(v, false, 0).0
+}
+
+// Rebuild only a changed branch when stripping. Clean siblings are shared, and
+// no subtree is scanned again to decide whether its parent needs rebuilding.
+fn rebuild(v: &SynValue, mut values: Vec<SynValue>, strip: bool) -> SynValue {
     match v {
-        SynValue::List(l) => syn_list(list_values(&l).iter().map(deep_copy).collect()),
+        SynValue::List(_) => syn_list(values),
         SynValue::Map(m) => {
-            let mut out = SynMap::with_capacity(m.borrow().len());
-            for (k, x) in m.borrow().iter() {
-                out.insert(k.clone(), deep_copy(x));
+            let m = m.borrow();
+            let mut out = SynMap::with_capacity(m.len());
+            for (index, value) in values.into_iter().enumerate() {
+                out.insert(m.get_index(index).unwrap().0.clone(), value);
             }
             syn_map(out)
         }
         SynValue::Private(p) => {
-            labelled(deep_copy(&p.value), p.label.clone())
+            let value = values.pop().unwrap();
+            if strip { value } else { labelled(value, p.label.clone()) }
         }
-        SynValue::Server(s) => match &**s {
-            ServerValue::Envelope { status, value } => {
-                SynValue::Server(crate::types::Obj::new(ServerValue::Envelope { status: *status, value: deep_copy(value) }))
-            }
-            ServerValue::Node(m) => {
-                let mut out = SynMap::with_capacity(m.borrow().len());
-                for (k, x) in m.borrow().iter() {
-                    out.insert(k.clone(), deep_copy(x));
+        SynValue::Server(s) => {
+            let out = match &**s {
+                ServerValue::Envelope { status, .. } => ServerValue::Envelope { status: *status, value: values.pop().unwrap() },
+                ServerValue::Node(m) => {
+                    let m = m.borrow();
+                    let mut out = SynMap::with_capacity(m.len());
+                    for (index, value) in values.into_iter().enumerate() {
+                        out.insert(m.get_index(index).unwrap().0.clone(), value);
+                    }
+                    ServerValue::Node(out.into_ref())
                 }
-                SynValue::Server(crate::types::Obj::new(ServerValue::Node(out.into_ref())))
+                ServerValue::Content(_) => ServerValue::Content(Box::new(values.pop().unwrap())),
+                ServerValue::WithHeaders { headers, .. } => ServerValue::WithHeaders { inner: Box::new(values.pop().unwrap()), headers: headers.clone() },
+                _ => return v.clone(),
+            };
+            SynValue::Server(crate::types::Obj::new(out))
+        }
+        _ => v.clone(),
+    }
+}
+
+fn copy_leaf(v: &SynValue, strip: bool) -> Option<(SynValue, bool)> {
+    if let SynValue::List(l) = v {
+        let b = l.borrow();
+        if b.as_values().is_none() {
+            return Some((if strip { v.clone() } else { crate::types::syn_list_of(b.clone()) }, false));
+        }
+    }
+    if matches!(v, SynValue::List(_) | SynValue::Map(_) | SynValue::Private(_)) {
+        return None;
+    }
+    if let SynValue::Server(s) = v {
+        if matches!(&**s, ServerValue::Envelope { .. } | ServerValue::Node(_) | ServerValue::Content(_) | ServerValue::WithHeaders { .. }) {
+            return None;
+        }
+    }
+    Some((v.clone(), false))
+}
+
+fn append_copy(v: &SynValue, index: usize, out: &mut Option<Vec<SynValue>>, value: SynValue, changed: bool) {
+    if changed && out.is_none() {
+        let mut prefix = Vec::new();
+        for i in 0..index { prefix.push(child(v, i, |v, _, _| v.clone()).unwrap()); }
+        *out = Some(prefix);
+    }
+    if let Some(out) = out { out.push(value); }
+}
+
+fn copy_walk(v: &SynValue, strip: bool, depth: usize) -> (SynValue, bool) {
+    if let Some(value) = copy_leaf(v, strip) { return value; }
+    if depth == 32 { return copy_tail(v, strip); }
+    let mut out = if strip { None } else { Some(Vec::new()) };
+    let mut index = 0;
+    let mut changed = strip && matches!(v, SynValue::Private(_));
+    while let Some((value, dirty)) = child(v, index, |v, _, _| copy_walk(v, strip, depth + 1)) {
+        append_copy(v, index, &mut out, value, dirty || changed);
+        changed |= dirty;
+        index += 1;
+    }
+    (out.map_or_else(|| v.clone(), |out| rebuild(v, out, strip)), changed)
+}
+
+struct CopyFrame {
+    value: SynValue,
+    index: usize,
+    out: Option<Vec<SynValue>>,
+    changed: bool,
+}
+
+impl CopyFrame {
+    fn new(v: &SynValue, strip: bool) -> Self {
+        Self { value: v.clone(), index: 0, out: if strip { None } else { Some(Vec::new()) }, changed: strip && matches!(v, SynValue::Private(_)) }
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn copy_tail(v: &SynValue, strip: bool) -> (SynValue, bool) {
+    let mut stack = vec![CopyFrame::new(v, strip)];
+    loop {
+        let frame = stack.last_mut().unwrap();
+        match child(&frame.value, frame.index, |v, _, _| {
+            copy_leaf(v, strip).map_or_else(|| Err(CopyFrame::new(v, strip)), Ok)
+        }) {
+            Some(Err(next)) => { stack.push(next); continue; }
+            Some(Ok((value, dirty))) => {
+                append_copy(&frame.value, frame.index, &mut frame.out, value, dirty || frame.changed);
+                frame.changed |= dirty;
+                frame.index += 1;
             }
-            ServerValue::Content(inner) => {
-                SynValue::Server(crate::types::Obj::new(ServerValue::Content(Box::new(deep_copy(inner)))))
+            None => {
+                let frame = stack.pop().unwrap();
+                let value = frame.out.map_or_else(|| frame.value.clone(), |out| rebuild(&frame.value, out, strip));
+                let Some(parent) = stack.last_mut() else { return (value, frame.changed); };
+                append_copy(&parent.value, parent.index, &mut parent.out, value, frame.changed || parent.changed);
+                parent.changed |= frame.changed;
+                parent.index += 1;
             }
-            ServerValue::WithHeaders { inner, headers } => SynValue::Server(crate::types::Obj::new(ServerValue::WithHeaders {
-                inner: Box::new(deep_copy(inner)),
-                headers: headers.clone(),
-            })),
-            _ => v.clone(),
-        },
-        other => other.clone(),
+        }
     }
 }
 
@@ -627,43 +735,8 @@ pub fn unwrap(v: &SynValue) -> &SynValue {
 /// `check_flow` y va a serializar. Los contenedores sin etiquetas dentro se comparten
 /// (mismo `Rc`), sólo se reconstruyen los que contienen algo privado.
 pub fn strip_deep(v: &SynValue) -> SynValue {
-    if !has_label_deep(v) {
-        return v.clone();
-    }
-    match v {
-        SynValue::Private(p) => strip_deep(&p.value),
-        SynValue::List(l) => syn_list(list_values(&l).iter().map(strip_deep).collect()),
-        SynValue::Map(m) => {
-            let mut out = SynMap::with_capacity(m.borrow().len());
-            for (k, x) in m.borrow().iter() {
-                out.insert(k.clone(), strip_deep(x));
-            }
-            syn_map(out)
-        }
-        SynValue::Server(s) => match &**s {
-            ServerValue::Envelope { status, value } => SynValue::Server(crate::types::Obj::new(ServerValue::Envelope {
-                status: *status,
-                value: strip_deep(value),
-            })),
-            ServerValue::Node(m) => {
-                let mut out = SynMap::with_capacity(m.borrow().len());
-                for (k, x) in m.borrow().iter() {
-                    out.insert(k.clone(), strip_deep(x));
-                }
-                SynValue::Server(crate::types::Obj::new(ServerValue::Node(out.into_ref())))
-            }
-            ServerValue::Content(inner) => {
-                SynValue::Server(crate::types::Obj::new(ServerValue::Content(Box::new(strip_deep(inner)))))
-            }
-            ServerValue::WithHeaders { inner, headers } => SynValue::Server(crate::types::Obj::new(ServerValue::WithHeaders {
-                inner: Box::new(strip_deep(inner)),
-                headers: headers.clone(),
-            })),
-            // Sin valores anidados: no puede tener etiquetas (has_label_deep ya lo dijo).
-            _ => v.clone(),
-        },
-        other => other.clone(),
-    }
+    if !ANY_PRIVATE.load(Ordering::Relaxed) { return v.clone(); }
+    copy_walk(v, true, 0).0
 }
 
 /// Comprueba que todo lo privado dentro de `v` sea aceptable por un sumidero que acepta a
@@ -681,17 +754,18 @@ pub fn check_flow(v: &SynValue, accepted: &[&str], path: &str) -> Result<(), Lab
     }
     let acc = label_from(accepted);
     let mut p = String::from(path);
-    check_into(v, &acc, &mut p, &empty())
+    check_into(v, &acc, &mut p, &empty(), 0)
 }
 
-fn check_into(v: &SynValue, accepted: &Label, path: &mut String, ctx: &Label) -> Result<(), LabelViolation> {
+fn check_into(v: &SynValue, accepted: &Label, path: &mut String, ctx: &Label, depth: usize) -> Result<(), LabelViolation> {
+    if depth == 32 { return check_tail(v, accepted, path, ctx); }
     match v {
         SynValue::Private(p) => {
             let eff = union(ctx, &p.label);
             if !subset(&eff, accepted) {
                 return Err(LabelViolation { path: path.clone(), label: eff, accepted: accepted.clone() });
             }
-            check_into(&p.value, accepted, path, &eff)
+            check_into(&p.value, accepted, path, &eff, depth + 1)
         }
         SynValue::List(l) => {
             // Una lista sin caja (enteros/floats) no tiene nada privado; leerla con
@@ -701,24 +775,24 @@ fn check_into(v: &SynValue, accepted: &Label, path: &mut String, ctx: &Label) ->
             for (i, x) in xs.iter().enumerate() {
                 let n = path.len();
                 path.push_str(&format!("[{}]", i));
-                let r = check_into(x, accepted, path, ctx);
+                let r = check_into(x, accepted, path, ctx, depth + 1);
                 path.truncate(n);
                 r?;
             }
             Ok(())
         }
-        SynValue::Map(m) => check_map(&m.borrow(), accepted, path, ctx),
+        SynValue::Map(m) => check_map(&m.borrow(), accepted, path, ctx, depth),
         SynValue::Server(s) => match &**s {
             ServerValue::Envelope { value, .. } => {
                 let n = path.len();
                 path.push_str(".value");
-                let r = check_into(value, accepted, path, ctx);
+                let r = check_into(value, accepted, path, ctx, depth + 1);
                 path.truncate(n);
                 r
             }
-            ServerValue::Node(m) => check_map(&m.borrow(), accepted, path, ctx),
+            ServerValue::Node(m) => check_map(&m.borrow(), accepted, path, ctx, depth),
             ServerValue::Content(inner) | ServerValue::WithHeaders { inner, .. } => {
-                check_into(inner, accepted, path, ctx)
+                check_into(inner, accepted, path, ctx, depth + 1)
             }
             _ => Ok(()),
         },
@@ -726,20 +800,46 @@ fn check_into(v: &SynValue, accepted: &Label, path: &mut String, ctx: &Label) ->
     }
 }
 
+#[cold]
+#[inline(never)]
+fn check_tail(v: &SynValue, accepted: &Label, path: &mut String, ctx: &Label) -> Result<(), LabelViolation> {
+    fn effective(v: &SynValue, accepted: &Label, path: &str, ctx: &Label) -> Result<Label, LabelViolation> {
+        if let SynValue::Private(p) = v {
+            let eff = union(ctx, &p.label);
+            if !subset(&eff, accepted) {
+                return Err(LabelViolation { path: path.to_owned(), label: eff, accepted: accepted.clone() });
+            }
+            Ok(eff)
+        } else { Ok(ctx.clone()) }
+    }
+    let base = path.len();
+    let ctx = effective(v, accepted, path, ctx)?;
+    let mut stack = vec![(v.clone(), 0, base, ctx)];
+    while let Some((v, index, length, ctx)) = stack.last_mut() {
+        path.truncate(*length);
+        let next = child(v, *index, |v, key, index| {
+            use std::fmt::Write;
+            if let Some(index) = index { write!(path, "[{}]", index).unwrap(); }
+            else if let Some(key) = key {
+                path.push('.'); path.push_str(key);
+            }
+            let ctx = effective(v, accepted, path, ctx)?;
+            Ok((v.clone(), 0, path.len(), ctx))
+        });
+        *index += 1;
+        match next {
+            Some(Ok(next)) => stack.push(next),
+            Some(Err(e)) => { path.truncate(base); return Err(e); }
+            None => { stack.pop(); },
+        }
+    }
+    path.truncate(base);
+    Ok(())
+}
+
 /// ¿Hay algún valor privado en lo que `check_into` recorre? Sin caminos ni reservas.
 fn holds_private(v: &SynValue) -> bool {
-    match v {
-        SynValue::Private(_) => true,
-        SynValue::List(l) => l.borrow().as_values().is_some_and(|xs| xs.iter().any(holds_private)),
-        SynValue::Map(m) => m.borrow().iter().any(|(_, x)| holds_private(x)),
-        SynValue::Server(s) => match &**s {
-            ServerValue::Envelope { value, .. } => holds_private(value),
-            ServerValue::Node(m) => m.borrow().iter().any(|(_, x)| holds_private(x)),
-            ServerValue::Content(inner) | ServerValue::WithHeaders { inner, .. } => holds_private(inner),
-            _ => false,
-        },
-        _ => false,
-    }
+    !walk(v, &mut |v| !matches!(v, SynValue::Private(_)), 0)
 }
 
 fn check_map(
@@ -747,12 +847,13 @@ fn check_map(
     accepted: &Label,
     path: &mut String,
     ctx: &Label,
+    depth: usize,
 ) -> Result<(), LabelViolation> {
     for (k, x) in m.iter() {
         let n = path.len();
         path.push('.');
         path.push_str(k);
-        let r = check_into(x, accepted, path, ctx);
+        let r = check_into(x, accepted, path, ctx, depth + 1);
         path.truncate(n);
         r?;
     }
@@ -801,6 +902,115 @@ mod tests {
         assert_eq!(i.run_scope().redaction(), "app");
         let other = crate::interpreter::Interpreter::new();
         assert_eq!(other.run_scope().redaction(), "", "otra corrida no lo ve");
+    }
+
+    fn nested(mut v: SynValue, depth: usize, maps: bool) -> SynValue {
+        for _ in 0..depth {
+            v = if maps {
+                let mut m = SynMap::new(); m.insert("", v); syn_map(m)
+            } else { syn_list(vec![v]) };
+        }
+        v
+    }
+
+    #[test]
+    fn deep_copy_labels_strip_and_paths() {
+        for maps in [false, true] {
+            for depth in [0, 31, 32, 33, 1000, 50000] {
+                let v = nested(mark(syn_int(7), l(&["b"])), depth, maps);
+                assert_eq!(label_display_raw(&label_deep(&v)), "b");
+                assert!(has_label_deep(&v));
+                let copied = deep_copy(&v);
+                assert!(!is_aliased(&copied), "copy must sever every mutable alias");
+                assert!(copied.syn_equals(&v));
+                assert_eq!(label_display_raw(&label_deep(&copied)), "b");
+                let clean = strip_deep(&v);
+                assert!(!has_label_deep(&clean));
+                assert!(!holds_private(&clean));
+                assert!(clean.syn_equals(&v));
+                let e = check_flow(&v, &[], "root").unwrap_err();
+                assert_eq!(e.path, format!("root{}", if maps { "." } else { "[0]" }.repeat(depth)));
+                assert!(check_flow(&v, &["b"], "root").is_ok());
+                let wrapped = mark(v, l(&["a"]));
+                let e = check_flow(&wrapped, &["a"], "root").unwrap_err();
+                assert_eq!(label_display_raw(&e.label), "a,b");
+            }
+        }
+    }
+
+    #[test]
+    fn deep_alias_observation_and_clean_branch_identity() {
+        let v = nested(syn_int(7), 50000, false);
+        assert!(!is_aliased(&v), "the traversal must not fabricate an alias");
+        let leaf = syn_list(vec![syn_int(9)]);
+        let v = nested(leaf.clone(), 50000, true);
+        assert!(is_aliased(&v), "a deep genuine alias must be found");
+        let private = mark_owned(&v, l(&["owner"]));
+        assert!(private.syn_equals(&v));
+        let clean = syn_list(vec![syn_int(2)]);
+        let tree = syn_list(vec![clean.clone(), nested(mark(syn_int(1), l(&["x"])), 1000, false)]);
+        let stripped = strip_deep(&tree);
+        let SynValue::List(xs) = stripped else { panic!() };
+        let b = xs.borrow();
+        let SynValue::List(branch) = &b.as_values().unwrap()[0] else { panic!() };
+        let SynValue::List(original) = &clean else { panic!() };
+        assert!(crate::types::ListRef::ptr_eq(original, branch));
+        let numeric = crate::types::syn_list_of(crate::synlist::SynList::from_ints(vec![1, 2]));
+        let _ = label_deep(&numeric);
+        let _ = strip_deep(&numeric);
+        let copy = deep_copy(&numeric);
+        for v in [&numeric, &copy] {
+            let SynValue::List(l) = v else { panic!() };
+            assert!(l.borrow().as_values().is_none());
+        }
+        let (SynValue::List(a), SynValue::List(b)) = (&numeric, &copy) else { panic!() };
+        assert!(!crate::types::ListRef::ptr_eq(a, b));
+    }
+
+    #[test]
+    fn deep_server_copy_strip_and_first_violation() {
+        use crate::types::Obj;
+        let mut v = mark(syn_int(7), l(&["deep"]));
+        for i in 0..50000 {
+            v = SynValue::Server(Obj::new(match i % 4 {
+                0 => { ServerValue::Envelope { status: 201, value: v } },
+                1 => { let mut m = SynMap::new(); m.insert("", v); ServerValue::Node(m.into_ref()) },
+                2 => ServerValue::Content(Box::new(v)),
+                _ => ServerValue::WithHeaders { inner: Box::new(v), headers: vec![("x".into(), "y".into())] },
+            }));
+        }
+        let copy = deep_copy(&v);
+        assert!(copy.syn_equals(&v));
+        let clean = strip_deep(&v);
+        assert!(!has_label_deep(&clean));
+        // The wrappers were built from the leaf outward; reverse the path segments.
+        let e = check_flow(&v, &[], "r").unwrap_err();
+        assert_eq!(e.path, format!("r{}", "..value".repeat(12500)));
+        assert!(check_flow(&v, &["deep"], "r").is_ok());
+        let mut map = SynMap::new();
+        map.insert("first", mark(syn_int(1), l(&["first"])));
+        map.insert("second", v);
+        let e = check_flow(&syn_map(map), &[], "r").unwrap_err();
+        assert_eq!(e.path, "r.first");
+        assert_eq!(label_display_raw(&e.label), "first");
+    }
+
+    #[test]
+    fn labels_million_with_normal_drop() {
+        std::thread::Builder::new().stack_size(64 * 1024 * 1024).spawn(|| {
+            let v = nested(mark(syn_int(7), l(&["owner"])), 1_000_000, false);
+            assert!(has_label_deep(&v));
+            assert_eq!(label_display_raw(&label_deep(&v)), "owner");
+            let copy = deep_copy(&v);
+            assert!(copy.syn_equals(&v));
+            drop(copy);
+            let clean = strip_deep(&v);
+            assert!(!has_label_deep(&clean));
+            drop(clean);
+            assert!(check_flow(&v, &["owner"], "r").is_ok());
+            let e = check_flow(&v, &[], "r").unwrap_err();
+            assert_eq!(e.path.len(), 3_000_001);
+        }).unwrap().join().unwrap();
     }
 
     fn l(names: &[&str]) -> Label {

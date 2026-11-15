@@ -6684,7 +6684,10 @@ impl Interpreter {
                         v = self.exec_call_with_first(name, arguments, v, env, loc)?;
                     } else {
                         let func = self.exec(t, env)?;
-                        v = self.call_value(func, vec![v], loc)?;
+                        // A bare pipe keeps its permissive task arity. The stricter
+                        // callback rule applies to builtins and host calls, not `v |> f`.
+                        let mut args = vec![(None, v)];
+                        v = self.call_value_named(func, &mut args, loc)?;
                     }
                 }
                 Ok(v)
@@ -9638,6 +9641,28 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
         args: Vec<SynValue>,
         loc: &SourceLocation,
     ) -> Result<SynValue, Control> {
+        if self.labels {
+            if let SynValue::Private(p) = &func {
+                // The callable itself selected the private task. Keep a missing-arity
+                // error under that label even when this entry came directly from a host.
+                self.note_seen(&p.label);
+                if let SynValue::Task(task) = &p.value {
+                    if args.len() < task.parameters.len() {
+                        if let Err(Control::Error(mut e)) = check_internal_task_arity(task, args.len(), loc) {
+                            let label = labels::union(&self.pc_label(), &p.label);
+                            e.from_private_pc = true;
+                            e.redact_label = self.safe_label(&label);
+                            return Err(Control::Error(e));
+                        }
+                    }
+                }
+            }
+        }
+        if let SynValue::Task(task) = &func {
+            if args.len() < task.parameters.len() {
+                check_internal_task_arity(task, args.len(), loc)?;
+            }
+        }
         let mut named: CallArgs = args.into_iter().map(|v| (None, v)).collect();
         self.call_value_named(func, &mut named, loc)
     }
@@ -9671,19 +9696,24 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
         self.recursion_depth > MAX_RECURSION || crate::stack::short(0)
     }
 
-    /// v0.6.58 (M-r4-1, B-r4-3): corre `f` con `w` niveles más en el guardián de recursión (ver
-    /// [`node_weight`] y [`template_weight`]); si no entran, el error de siempre.
+    /// Guarda espacio para `w` unidades de pila antes de correr `f` (ver
+    /// [`node_weight`] y [`template_weight`]). Un hilo nativo registrado comprueba
+    /// la pila real; sin registro el peso se cuenta conservadoramente.
     #[inline(never)]
     pub(crate) fn with_stack_weight<T>(&mut self, w: usize, f: impl FnOnce(&mut Self) -> Result<T, Control>) -> Result<T, Control> {
         if w == 0 {
             return f(self);
         }
-        if self.recursion_depth + w > MAX_RECURSION || crate::stack::short(w) {
+        // A registered native thread can measure its remaining stack directly. The weight
+        // estimates stack bytes for the next body; it is not another source-level call.
+        // Unregistered threads (including wasm) retain the conservative count.
+        let counted = self.recursion_cap == MAX_RECURSION;
+        if (counted && self.recursion_depth.saturating_add(w) > MAX_RECURSION) || crate::stack::short(w) {
             return Err(err("maximum recursion depth exceeded"));
         }
-        self.recursion_depth += w;
+        if counted { self.recursion_depth += w; }
         let r = f(self);
-        self.recursion_depth = self.recursion_depth.saturating_sub(w);
+        if counted { self.recursion_depth = self.recursion_depth.saturating_sub(w); }
         r
     }
 
@@ -13788,6 +13818,14 @@ fn check_task_arity(
     Ok(())
 }
 
+/// Internal callbacks may pass extra protocol arguments. A required parameter that
+/// the protocol did not supply must still fail before defaults or the body run.
+#[cold]
+#[inline(never)]
+fn check_internal_task_arity(t: &SynTaskValue, given: usize, loc: &SourceLocation) -> Result<(), Control> {
+    check_task_arity(t, given.min(t.parameters.len()), |_| false, loc)
+}
+
 /// v0.6.46 (C6): la aridad de una llamada a una task falló; si además vino un nombre que la task no
 /// tiene, ése es el error (`page(limt = 1)` decía que faltaba `limit`). Lo llaman los que llaman a
 /// `check_call_arity`, que tienen `func` y `args` vivos de todos modos: hacerlo adentro alargaba su
@@ -14035,10 +14073,7 @@ fn order_class(v: &SynValue) -> Option<&'static str> {
     }
 }
 
-/// Orden TOTAL del lenguaje (v0.6.29, DATOS-1): números exactos (entero vs float sin pasar
-/// por f64), texto por punto de código, `false < true`, bytes y listas lexicográficos.
-/// Llamar sólo después de `check_orderable` (clases compatibles).
-pub(crate) fn total_cmp(a: &SynValue, b: &SynValue) -> Ordering {
+fn scalar_order(a: &SynValue, b: &SynValue) -> Ordering {
     let (a, b) = (labels::unwrap(a), labels::unwrap(b));
     match (missing_rank(a), missing_rank(b)) {
         (0, 0) => {}
@@ -14050,32 +14085,46 @@ pub(crate) fn total_cmp(a: &SynValue, b: &SynValue) -> Ordering {
         (SynValue::Bool(x), SynValue::Bool(y)) => x.cmp(y),
         (SynValue::Bytes(x), SynValue::Bytes(y)) => x.as_ref().cmp(y.as_ref()),
         (SynValue::Time(x), SynValue::Time(y)) => crate::temporal::cmp(x, y).unwrap_or(Ordering::Equal),
-        (SynValue::List(x), SynValue::List(y)) => {
-            let (x, y) = (crate::synlist::list_read(x), crate::synlist::list_read(y));
-            for (p, q) in x.iter().zip(y.iter()) {
-                let c = total_cmp(p, q);
-                if c != Ordering::Equal {
-                    return c;
-                }
-            }
-            x.len().cmp(&y.len())
-        }
         _ => Ordering::Equal,
     }
 }
 
-/// Comparación para ordenar con dirección: los faltantes quedan al final en ambas.
-fn order_for(a: &SynValue, b: &SynValue, desc: bool) -> Ordering {
-    let (ma, mb) = (missing_rank(a), missing_rank(b));
-    if ma != 0 || mb != 0 {
-        return ma.cmp(&mb);
+// One lexicographic descent: each position is compared once. The second result
+// records only decimal/float pairs that this comparison actually reached.
+fn compare_order(a: &SynValue, b: &SynValue, detect_clash: bool) -> (Ordering, bool) {
+    let (a, b) = (labels::unwrap(a), labels::unwrap(b));
+    if !matches!((a, b), (SynValue::List(_), SynValue::List(_))) {
+        return (scalar_order(a, b), detect_clash && order_leaf_clash(a, b));
     }
-    let c = total_cmp(a, b);
-    if desc {
-        c.reverse()
-    } else {
-        c
+    let mut clash = false;
+    let mut stack = vec![(a.clone(), b.clone(), 0usize)];
+    while let Some((left, right, index)) = stack.last_mut() {
+        let (SynValue::List(x), SynValue::List(y)) = (labels::unwrap(left), labels::unwrap(right)) else { unreachable!() };
+        let (nx, ny) = (x.borrow().len(), y.borrow().len());
+        if *index == nx.min(ny) {
+            let ord = nx.cmp(&ny);
+            if ord != Ordering::Equal { return (ord, clash); }
+            stack.pop();
+            continue;
+        }
+        let (a, b) = (x.borrow().get(*index).unwrap(), y.borrow().get(*index).unwrap());
+        *index += 1;
+        let (a, b) = (labels::unwrap(&a), labels::unwrap(&b));
+        if matches!((a, b), (SynValue::List(_), SynValue::List(_))) {
+            stack.push((a.clone(), b.clone(), 0));
+        } else {
+            clash |= detect_clash && order_leaf_clash(a, b);
+            let ord = scalar_order(a, b);
+            if ord != Ordering::Equal { return (ord, clash); }
+        }
     }
+    (Ordering::Equal, clash)
+}
+
+fn order_leaf_clash(a: &SynValue, b: &SynValue) -> bool {
+    let is_dec = |v: &SynValue| matches!(v, SynValue::Number(n) if n.is_decimal());
+    let is_flt = |v: &SynValue| matches!(v, SynValue::Number(Number::Float(x)) if !x.is_nan());
+    (is_dec(a) && is_flt(b)) || (is_flt(a) && is_dec(b))
 }
 
 /// Error claro si los valores no se pueden ordenar juntos (texto con números, mapas…),
@@ -14087,41 +14136,16 @@ fn pattern_eq(value: &SynValue, p: &SynValue) -> Result<bool, Control> {
     crate::tabular::strict_equals(value, p).map_err(|_| err(format!("match: {}", MIX_DECIMAL_FLOAT)))
 }
 
-/// ¿Comparar `a` con `b` para ordenar junta un decimal con un float? Como `<`: en listas, sólo
-/// las posiciones que la comparación lexicográfica llega a mirar (hasta la primera distinta).
-/// `sort([[1d, 1.5], [2d, 2.5]])` nunca compara un decimal con un float; `[[1.5d], [1.0]]` sí.
-fn order_clash(a: &SynValue, b: &SynValue) -> bool {
-    match (labels::unwrap(a), labels::unwrap(b)) {
-        (SynValue::List(x), SynValue::List(y)) => {
-            let (x, y) = (crate::synlist::list_read(x), crate::synlist::list_read(y));
-            for (p, q) in x.iter().zip(y.iter()) {
-                if order_clash(p, q) {
-                    return true;
-                }
-                if order_for(p, q, false) != Ordering::Equal {
-                    return false;
-                }
-            }
-            false
-        }
-        (a, b) => {
-            let is_dec = |v: &SynValue| matches!(v, SynValue::Number(n) if n.is_decimal());
-            let is_flt = |v: &SynValue| matches!(v, SynValue::Number(Number::Float(x)) if !x.is_nan());
-            (is_dec(a) && is_flt(b)) || (is_flt(a) && is_dec(b))
-        }
-    }
-}
-
-/// Ordena con `order_for`, cortando con el error de `<` si una comparación real junta un decimal
-/// con un float.
+/// Ordena con una sola comparación lexicográfica por par; un decimal/float sólo
+/// provoca error si el comparador alcanzó esa posición.
 fn sort_checked<T>(items: &mut [T], key: impl Fn(&T) -> &SynValue, desc: bool, who: &str) -> Result<(), Control> {
     let clash = std::cell::Cell::new(false);
     items.sort_by(|a, b| {
         let (a, b) = (key(a), key(b));
-        if !clash.get() && order_clash(a, b) {
-            clash.set(true);
-        }
-        order_for(a, b, desc)
+        let (ord, mixed) = compare_order(a, b, !clash.get());
+        if mixed { clash.set(true); }
+        if missing_rank(a) != 0 || missing_rank(b) != 0 { ord }
+        else if desc { ord.reverse() } else { ord }
     });
     if clash.get() {
         return Err(err(format!("{}: {}", who, MIX_DECIMAL_FLOAT)));
@@ -16216,5 +16240,57 @@ mod run_body_tests {
             }
         });
         assert!(names.contains(&"new".to_string()), "el cuerpo limpio no vio el rename: {:?}", names);
+    }
+}
+
+#[cfg(test)]
+mod deep_order_tests {
+    use super::*;
+    use crate::types::{syn_float, syn_int, syn_list};
+
+    fn nested(mut v: SynValue, n: usize) -> SynValue {
+        for _ in 0..n { v = syn_list(vec![v]); }
+        v
+    }
+
+    #[test]
+    fn deep_sort_compares_each_position_once_and_keeps_decimal_rule() {
+        let one = nested(syn_int(1), 50_000);
+        let two = nested(syn_int(2), 50_000);
+        assert_eq!(compare_order(&one, &two, true), (Ordering::Less, false));
+        assert_eq!(compare_order(&two, &one, false).0, Ordering::Greater);
+        let mut values = vec![two, one];
+        assert!(sort_checked(&mut values, |v| v, false, "sort").is_ok());
+        assert_eq!(compare_order(&values[0], &values[1], false).0, Ordering::Less);
+        let decimal = SynValue::Number(Number::Decimal(rust_decimal::Decimal::new(15, 1)));
+        let lhs = syn_list(vec![syn_int(1), decimal.clone()]);
+        let rhs = syn_list(vec![syn_int(2), syn_float(1.5)]);
+        assert_eq!(compare_order(&lhs, &rhs, true), (Ordering::Less, false));
+        let rhs = syn_list(vec![syn_int(1), syn_float(1.5)]);
+        assert!(compare_order(&lhs, &rhs, true).1);
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod stack_weight_tests {
+    use super::*;
+
+    #[test]
+    fn native_weight_checks_stack_without_spending_call_depth() {
+        let conservative = std::thread::spawn(|| {
+            let mut interpreter = Interpreter::new();
+            interpreter.recursion_depth = MAX_RECURSION - 1;
+            interpreter.with_stack_weight(2, |_| Ok(())).is_err()
+        }).join().unwrap();
+        assert!(conservative);
+
+        let registered = std::thread::Builder::new().stack_size(64 * 1024 * 1024).spawn(|| {
+            crate::stack::enter_thread(64 * 1024 * 1024);
+            let mut interpreter = Interpreter::new();
+            interpreter.recursion_depth = MAX_RECURSION - 1;
+            assert!(interpreter.with_stack_weight(500, |_| Ok(())).is_err());
+            interpreter.with_stack_weight(2, |i| Ok(i.recursion_depth)).ok().expect("registered stack has room")
+        }).unwrap().join().unwrap();
+        assert_eq!(registered, MAX_RECURSION - 1);
     }
 }

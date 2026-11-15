@@ -74,8 +74,8 @@ fn assert_ne_basic() {
 
 #[test]
 fn assert_error_passes_when_fn_raises() {
-    // lambda que indexa fuera de rango (con x = nothing por aridad permisiva) → error.
-    ok("assert_error((x) => x[100])");
+    // lambda que indexa fuera de rango → error del cuerpo.
+    ok("assert_error(() => [1][100])");
     // error explícito de tipo
     ok("assert_error(() => bytes(true))");
 }
@@ -89,7 +89,7 @@ fn assert_error_fails_when_no_error() {
 fn assert_error_give_is_not_an_error() {
     // Una lambda hace `give` (su cuerpo SIEMPRE es un give implícito); eso NO es un error
     // → assert_error DEBE fallar, no pasar por accidente.
-    fails_with("let f be (x) => 42\nassert_error(f)", "expected an error, but none was raised");
+    fails_with("let f be () => 42\nassert_error(f)", "expected an error, but none was raised");
 }
 
 #[test]

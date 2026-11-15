@@ -316,17 +316,29 @@ pub(crate) fn strict_equals(a: &SynValue, b: &SynValue) -> Result<bool, ()> {
 /// `false` en la primera diferencia real; una posición decimal/float cuenta como "igual por
 /// ahora" y marca `clash`.
 fn equals_walk(a: &SynValue, b: &SynValue, clash: &mut bool) -> bool {
+    equals_walk_at(a, b, clash, 0)
+}
+
+fn equals_next(a: &SynValue, b: &SynValue, clash: &mut bool, depth: usize) -> bool {
+    if depth == crate::value_eq::INLINE_DEPTH {
+        crate::value_eq::deep(a, b, true, clash)
+    } else {
+        equals_walk_at(a, b, clash, depth + 1)
+    }
+}
+
+fn equals_walk_at(a: &SynValue, b: &SynValue, clash: &mut bool, depth: usize) -> bool {
     let (a, b) = (crate::labels::unwrap(a), crate::labels::unwrap(b));
     match (a, b) {
         (SynValue::List(x), SynValue::List(y)) => {
             let (x, y) = (list_values(x), list_values(y));
-            x.len() == y.len() && x.iter().zip(y.iter()).all(|(p, q)| equals_walk(p, q, clash))
+            x.len() == y.len() && x.iter().zip(y.iter()).all(|(p, q)| equals_next(p, q, clash, depth))
         }
         (SynValue::Map(x), SynValue::Map(y)) => {
             let (x, y) = (x.borrow(), y.borrow());
             x.len() == y.len()
                 && !x.keys().any(|k| !y.contains_key(k))
-                && x.iter().all(|(k, p)| equals_walk(p, &y[k.as_str()], clash))
+                && x.iter().all(|(k, p)| equals_next(p, &y[k.as_str()], clash, depth))
         }
         _ if dec_float_clash(a, b) => {
             *clash = true;

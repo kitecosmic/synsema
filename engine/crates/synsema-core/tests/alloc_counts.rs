@@ -89,6 +89,9 @@ fn heap_allocations_per_construct() {
     // creaba otra vez la clave del entorno (F1.5).)
     let while_cases: &[(&str, &str, &str, u64)] = &[
         ("bucle base", "", "", 0),
+        ("igualdad escalar", "let a be 1\nlet b be 1\n", "    set x to a == b\n", 0),
+        ("igualdad lista superficial", "let a be [1, 2]\nlet b be [1, 2]\n", "    set x to a == b\n", 0),
+        ("igualdad mapa superficial", "let a be {\"x\": 1}\nlet b be {\"x\": 1}\n", "    set x to a == b\n", 0),
         ("expresión: variable", "", "    x\n", 0),
         ("set x to 5", "", "    set x to 5\n", 0),
         ("let y be 5", "", "    let y be 5\n", 0),

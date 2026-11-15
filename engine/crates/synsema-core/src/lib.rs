@@ -67,4 +67,8 @@ pub mod tokens;
 #[cfg(target_arch = "wasm32")]
 pub mod wasm_limits;
 pub mod types;
+mod value_eq;
+mod value_drop;
+mod value_fmt;
+mod value_send;
 pub mod waiting;
