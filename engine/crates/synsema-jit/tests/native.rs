@@ -53,6 +53,50 @@ fn a_native_loop_writes_a_list_parameter_with_value_semantics() {
     assert!(after.osr > before.osr, "la escritura en el parámetro no entró al nivel nativo: {:?} → {:?}", before, after);
 }
 
+#[test]
+fn a_native_loop_writes_a_map_parameter_with_value_semantics() {
+    synsema_jit::install();
+    let before = native_tier::stats();
+    let r = run_source(
+        concat!(
+            "task count(m, n)\n",
+            "    each i in range(0, n)\n",
+            "        set m[i % 3] to get(m, i % 3, 0) + 1\n",
+            "    give m\n",
+            "let original be {\"0\": 4}\n",
+            "let changed be count(original, 20000)\n",
+            "print(changed[0], original[0], length(keys(changed)))\n",
+        ),
+        "map_param_native.syn",
+    );
+    assert!(r.success, "{:?}", r.errors);
+    assert_eq!(r.output, vec!["6671 4 3"]);
+    let after = native_tier::stats();
+    assert!(after.osr > before.osr, "la escritura en el mapa parámetro no entró al nivel nativo: {:?} → {:?}", before, after);
+}
+
+#[test]
+fn a_native_loop_appends_to_a_list_parameter_with_value_semantics() {
+    synsema_jit::install();
+    let before = native_tier::stats();
+    let r = run_source(
+        concat!(
+            "task grow(xs, n)\n",
+            "    each i in range(0, n)\n",
+            "        set xs to append(xs, i)\n",
+            "    give xs\n",
+            "let original be [0, \"keep\"]\n",
+            "let changed be grow(original, 20000)\n",
+            "print(length(changed), length(original), changed[20001])\n",
+        ),
+        "list_param_append_native.syn",
+    );
+    assert!(r.success, "{:?}", r.errors);
+    assert_eq!(r.output, vec!["20002 2 19999"]);
+    let after = native_tier::stats();
+    assert!(after.osr > before.osr, "append sobre el parámetro no entró al nivel nativo: {:?} → {:?}", before, after);
+}
+
 /// v0.6.63: una local de la task sigue siendo la misma variable tras el `while` nativo.
 #[test]
 fn a_native_while_writes_a_task_local_list() {

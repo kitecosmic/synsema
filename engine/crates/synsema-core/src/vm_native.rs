@@ -654,8 +654,9 @@ fn seen(v: Option<&SynValue>) -> NSeen {
 
 /// F4.8d: la variable raíz de una escritura de un bucle: una global del entorno del bucle (`Ok`, su
 /// nombre: con valor, que no sea una task ni un builtin; el entorno no puede ser un módulo, que
-/// sincroniza sus exportaciones), un lugar de la ventana (`Err(k)`) o un parámetro de la task
-/// (`Err(PARAM | r)`, que vive en un registro). `None`: no se baja.
+/// sincroniza sus exportaciones), una local de la task resuelta a ese mismo slot del entorno,
+/// un lugar de la ventana (`Err(k)`) o un parámetro de la task (`Err(PARAM | r)`, que vive en un
+/// registro). `None`: no se baja.
 fn loop_root(c: &Chunk, root: Root, env: &Rc<RefCell<Environment>>, own: &impl Fn(&str) -> Option<Option<SynValue>>, module: bool) -> Option<Result<Arc<str>, u16>> {
     match root {
         Root::Win(k) => Some(Err(k)),

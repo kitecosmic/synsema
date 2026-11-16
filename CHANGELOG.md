@@ -19,12 +19,17 @@ Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the rele
   guard's corpus: a map read −77 %, a map write −47 %, a map counter −59 %.
 - Native loops inside a task can write a list received as a parameter or held in a task
   local. The write keeps value semantics: a caller's list remains unchanged when the
-  task updates its parameter. The differential oracle and native tests cover both roots.
+  task updates its parameter. The differential oracle and native tests cover list and
+  map parameters, a task local, and `append` through a parameter. CI measured
+  `j_list_param|jit` at 49,780,240 instructions (−69.54 %) and `j_list_while|jit` at
+  48,855,846 (−80.32 %). The VM's `j_list_while` row also fell 17.07 % because the
+  setup `each` no longer reuses the `while` index name; that part is not credited to JIT.
 - The performance guard's corpus gains seven probes for the native tier (maps, a
   list written through a parameter, `set lista[k]` inside a `while`, the cost of
   entering a compiled task, and the BPE's hot loop). **The anchor
-  (`engine/perf/baseline.json`) was re-measured by CI with those rows**; the
-  existing rows moved by at most +0.25 %, and no row is above the budget.
+  (`engine/perf/baseline.json`) was re-measured by CI with those rows and again after
+  the parameter/local write change**; across all 120 rows, the largest increase
+  over the previous anchor was +0.045 %, below the +0.3 % budget.
 
 ## v0.6.62 — 2026-11-15
 
