@@ -2,7 +2,7 @@
 
 Read this FIRST if something fails. Each row is a real mistake that costs hours to debug.
 
-> **Just upgraded and something that worked now fails?** Start at *Upgrading to v0.6.61* (package clock, entropy and stdin), then *Upgrading to v0.6.60* (regex validation, leftmost search and whole caught messages), then *v0.6.59* (SQL transactions), then *Upgrading to v0.6.58* (one SQL
+> **Just upgraded and something that worked now fails?** Start at *Upgrading to v0.6.62* (callback arguments and deep values), then *Upgrading to v0.6.61* (package clock, entropy and stdin), then *Upgrading to v0.6.60* (regex validation, leftmost search and whole caught messages), then *v0.6.59* (SQL transactions), then *Upgrading to v0.6.58* (one SQL
 > statement per call, nesting deeper than 1024 levels, recursions that stop earlier), then
 > *v0.6.57* (the last bits of `dot`, `compute` in the receipt), then *v0.6.56*
 > (`array_from_bytes(b, "f32")` gives an `f32` array, the lineage of arrays), then *v0.6.55* (`==` and
@@ -23,6 +23,17 @@ Read this FIRST if something fails. Each row is a real mistake that costs hours 
 > Behavioral surprises · Anti-patterns · Secrets & config
 > Coming from Python? The traps that LOOK like Python but aren't are also collected in
 > [python-diff.md](python-diff.md).
+
+## Upgrading to v0.6.62 — callbacks and deeply nested values
+
+| Symptom or task | What to write |
+|---|---|
+| A callback used by `apply`, `where`, `reduce`, a route, cron or `errors with` now says a required task argument is missing | The caller supplies only its documented inputs. Remove an unused callback parameter or give it a default (`task f(value, optional = nothing)`). An explicit `nothing` counts as an argument; an empty collection does not invoke its callback. Tasks may still ignore extra protocol inputs. |
+| A deeply nested list/map used to overflow the native stack during `==`, `text`, JSON conversion, sorting, label checks or worker snapshots | Upgrade the engine to v0.6.62. These operations now continue on the heap; you do not need to flatten the value merely to compare, print, encode or send it. The meaning of equality and redaction is unchanged. |
+| `json_decode` rejects deeply nested input text | Its separate parser depth limit still applies. Validate or reshape the incoming JSON before decoding. |
+| A recursive task reaches its call limit | Data depth and task recursion are different. Rewrite the task as an iterative walk with a list of pending nodes; v0.6.62 does not remove the task call limit. |
+
+See [syntax.md](syntax.md) for task parameters and recursion, [builtins.md](builtins.md) for callback and JSON contracts, and [labels.md](labels.md) for private data.
 
 ## Upgrading to v0.6.61 — library effects must be declared by the package
 

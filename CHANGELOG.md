@@ -6,7 +6,7 @@ Each says what changed, why, and what to write instead.
 
 Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the release date.
 
-## v0.6.62 — unreleased
+## v0.6.62 — 2026-11-15
 
 - Deep list, map and server-value equality continues on the heap after a bounded
   recursive prefix, including the language's decimal/float conflict checks. This
