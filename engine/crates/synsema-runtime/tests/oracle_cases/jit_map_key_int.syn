@@ -1,0 +1,19 @@
+-- v0.6.63: el contador con clave entera corre en nativo y usa la misma clave textual.
+let counts be {}
+each i in range(0, 20000)
+    set counts[i % 3] to get(counts, i % 3, 0) + 1
+print(counts["1"], counts[1], length(keys(counts)))
+
+-- Claves negativas y booleanas, y copia al escribir un mapa compartido.
+let m be {"1": 4, "-7": 8, "true": 3, "nothing": 5}
+let alias be m
+set m[1] to m[1] + 1
+print(m["1"], alias[1], m[-7], get(m, true, 0), get(m, nothing, 0), keys(m))
+
+-- La task recibe el mismo valor, pero su escritura copia antes de cambiarlo.
+task bump(xs)
+    set xs[1] to xs[1] + 5
+    give xs
+let original be [10, 20, 30]
+let changed be bump(original)
+print(changed[1], original[1])

@@ -8,6 +8,27 @@ use synsema_core::interpreter::{run_source, Control, Interpreter};
 use synsema_core::native_tier;
 use synsema_core::parser::parse_source;
 
+/// v0.6.63: las claves enteras de un mapa deben permanecer en el nivel nativo
+/// y conservar su representación textual.
+#[test]
+fn integer_map_keys_stay_native_and_preserve_values() {
+    synsema_jit::install();
+    let before = native_tier::stats();
+    let r = run_source(
+        concat!(
+            "let m be {}\n",
+            "each i in range(0, 20000)\n",
+            "    set m[i % 3] to get(m, i % 3, 0) + 1\n",
+            "print(m[\"1\"], m[1], length(keys(m)))\n",
+        ),
+        "integer_map_keys.syn",
+    );
+    assert!(r.success, "{:?}", r.errors);
+    assert_eq!(r.output, vec!["6667 6667 3"]);
+    let after = native_tier::stats();
+    assert!(after.osr > before.osr, "el bucle no entró al código nativo: {:?} → {:?}", before, after);
+}
+
 #[test]
 fn a_hot_recursive_task_runs_native() {
     synsema_jit::install();
