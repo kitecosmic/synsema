@@ -44,9 +44,9 @@ Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the rele
   library's 10 tests pass. A snapshot in `engine/perf/fixtures/bpe/` and
   `engine/perf/bpe_compare.py` reproduce full training against the same pure
   Python algorithm. On two 100,000-character corpora at vocabulary 512, the
-  previous packed-key library took 4.21 and 5.29 s; the optimized library took
-  3.24 and 4.12 s (about 22% faster), with all 256 merges identical. Python
-  took about 1.47 and 1.85 s on those corpora. At vocabulary 1024, all 768
+  previous packed-key library took about 4.2 and 5.3 s; the optimized library
+  took about 3.3 and 4.1 s (about 22% faster), with all 256 merges identical.
+  Python took about 1.5 and 1.9 s on those corpora. At vocabulary 1024, all 768
   merges also match. The original report corpus is unavailable here.
 - Full BPE training remains in the VM: an eager native probe entered no complete
   tasks (`entries=0`, one OSR region). The long-list fusion microbenchmark above
