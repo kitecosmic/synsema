@@ -6,6 +6,18 @@ Each says what changed, why, and what to write instead.
 
 Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the release date.
 
+## v0.6.63 — en curso
+
+- `get(m, k, default)` looks up a text key without copying it: the key is the text
+  as it is, and only a value that is not text is converted (to its `Display`). Before,
+  every call allocated and copied the key — 100,000 times in a word-count loop.
+- `split(text, sep)` splits the text without copying it whole into a `String` first.
+- The performance guard's corpus gains seven probes for the native tier (maps, a
+  list written through a parameter, `set lista[k]` inside a `while`, the cost of
+  entering a compiled task, and the BPE's hot loop). **The anchor
+  (`engine/perf/baseline.json`) was re-measured by CI with those rows**; the
+  existing rows moved by at most +0.25 %, and no row is above the budget.
+
 ## v0.6.62 — 2026-11-15
 
 - Deep list, map and server-value equality continues on the heap after a bounded
