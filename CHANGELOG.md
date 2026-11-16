@@ -6,7 +6,7 @@ Each says what changed, why, and what to write instead.
 
 Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the release date.
 
-## v0.6.63 — en curso
+## v0.6.63 — 2026-11-16
 
 - `get(m, k, default)` looks up a text key without copying it: the key is the text
   as it is, and only a value that is not text is converted (to its `Display`). Before,
@@ -37,6 +37,22 @@ Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the rele
 - VM map reads and writes with integer keys now format the decimal key in a
   stack buffer. This preserves the text key and insertion order while avoiding
   temporary allocations on the BPE pair-counting path.
+- The external byte-level BPE tokenizer keeps the same learned merges with
+  packed integer pair keys. Its `fusionar` returns the existing list when the
+  selected pair is absent; training also keeps token lists and their frequencies
+  in separate lists instead of rebuilding a map per word after each merge. The
+  library's 10 tests pass. A snapshot in `engine/perf/fixtures/bpe/` and
+  `engine/perf/bpe_compare.py` reproduce full training against the same pure
+  Python algorithm. On two 100,000-character corpora at vocabulary 512, the
+  previous packed-key library took 4.21 and 5.29 s; the optimized library took
+  3.24 and 4.12 s (about 22% faster), with all 256 merges identical. Python
+  took about 1.47 and 1.85 s on those corpora. At vocabulary 1024, all 768
+  merges also match. The original report corpus is unavailable here.
+- Full BPE training remains in the VM: an eager native probe entered no complete
+  tasks (`entries=0`, one OSR region). The long-list fusion microbenchmark above
+  measures a useful native loop but does not predict this workload of many short
+  calls. BPE is still about 2.2 times slower than Python on the reproducible
+  corpora; this release does not claim that the engine exceeds Python on BPE.
 
 ## v0.6.62 — 2026-11-15
 

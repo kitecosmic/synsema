@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Compare the external Synsema BPE library with the same algorithm in Python.
 
-Example: python engine/perf/bpe_compare.py --bin engine/target/release/synsema.exe \
-    --library C:/path/to/tokenizador --corpus CHANGELOG.md
+Example: python engine/perf/bpe_compare.py --bin engine/target/release/synsema.exe --repeat 3
+Use --library to compare a separate copy of the tokenizer.
 Only the first 100,000 Unicode characters are used. Requires the `regex` Python package.
 """
 
@@ -82,8 +82,8 @@ def synsema_bpe(binary: Path, library: Path, text: str, vocab: int, jitless: boo
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--bin", type=Path, required=True)
-    ap.add_argument("--library", type=Path, required=True)
-    ap.add_argument("--corpus", type=Path, required=True)
+    ap.add_argument("--library", type=Path, default=Path(__file__).parent / "fixtures" / "bpe")
+    ap.add_argument("--corpus", type=Path, default=Path(__file__).parents[2] / "CHANGELOG.md")
     ap.add_argument("--chars", type=int, default=100_000)
     ap.add_argument("--vocab", type=int, default=512)
     ap.add_argument("--repeat", type=int, default=1, help="report the median of independent runs")

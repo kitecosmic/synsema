@@ -1,0 +1,280 @@
+-- tokenizador: BPE a nivel de bytes (como el de GPT-2), uno por caracteres, y el
+-- vocabulario de un modelo existente en el formato de tiktoken (v0.2.0, Synsema >= 0.6.60).
+-- Puro: no pide ninguna capability. Quien lo usa decide de dónde sale el texto
+-- y dónde se guarda el modelo (el modelo es un mapa: json_encode lo serializa).
+--
+--   use "./tokenizador.syn" as tok
+--   let m be tok.entrenar(texto, 512)
+--   let ids be tok.codificar(m, "hola")
+--   tok.decodificar(m, ids) == "hola"
+--
+-- Con el vocabulario de un modelo (da los mismos ids que tiktoken):
+--   let m be tok.desde_tiktoken(read_file("cl100k_base.tiktoken"), tok.PATRON_CL100K)
+--   tok.codificar(m, "Hola,  mundo!")
+--
+-- Normalizar antes de codificar (BERT usa NFD, Llama y SentencePiece NFKC):
+--   let m2 be tok.con_forma(m, "nfkc")
+
+export let VERSION be "0.2.0"
+
+-- El corte de `cl100k_base` (GPT-3.5 y GPT-4), tal cual lo trae tiktoken. Usa look-ahead
+-- y repeticiones posesivas: va con `backtrack_find_all`.
+export let PATRON_CL100K be "'(?i:[sdmt]|ll|ve|re)|[^\\r\\n\\p{L}\\p{N}]?+\\p{L}++|\\p{N}{1,3}+| ?[^\\s\\p{L}\\p{N}]++[\\r\\n]*+|\\s++$|\\s*[\\r\\n]|\\s+(?!\\S)|\\s"
+-- El de GPT-2 (r50k, p50k).
+export let PATRON_GPT2 be "'s|'t|'re|'ve|'m|'ll|'d| ?\\p{L}+| ?\\p{N}+| ?[^\\s\\p{L}\\p{N}]+|\\s+(?!\\S)|\\s+"
+
+-- Corta el texto antes de fusionar, para que una fusión nunca cruce de una
+-- palabra a otra: letras con su espacio adelante, números, signos, espacios.
+-- Cubre todo carácter, así que juntar los trozos devuelve el texto exacto.
+let PATRON be " ?\\p{L}+| ?\\p{N}+| ?[^\\s\\p{L}\\p{N}]+|\\s+"
+
+task a_bytes(texto)
+    give to_list(bytes(texto))
+
+-- HEX[b] es el byte b en hex ("00" … "ff"): las piezas del vocabulario de tiktoken se
+-- guardan así, porque un token puede no ser UTF-8 válido y juntar dos piezas es sumar textos.
+task tabla_hex()
+    let t be []
+    each b in range(0, 256)
+        set t to append(t, decode(bytes([b]), "hex"))
+    give t
+
+let HEX be tabla_hex()
+
+task clave(a, b)
+    give text(a) + "," + text(b)
+
+-- Reemplaza cada par (a, b) seguido por `nuevo`, de izquierda a derecha.
+task fusionar(ids, a, b, nuevo)
+    let n be length(ids)
+    let i be 0
+    -- La mayoría de los trozos no contiene el par ganador de esta ronda.
+    -- Conservar su lista evita copiarla y llamar a append por cada byte.
+    while i < n - 1 and (ids[i] != a or ids[i + 1] != b)
+        set i to i + 1
+    when i >= n - 1
+        give ids
+    let salida be []
+    set i to 0
+    while i < n
+        when i < n - 1 and ids[i] == a and ids[i + 1] == b
+            set salida to append(salida, nuevo)
+            set i to i + 2
+        otherwise
+            set salida to append(salida, ids[i])
+            set i to i + 1
+    give salida
+
+-- La forma de normalización Unicode que pide `forma` ("nfc", "nfd", "nfkc", "nfkd").
+export task normalizar(texto, forma)
+    when forma == "nfc"
+        give nfc(texto)
+    when forma == "nfd"
+        give nfd(texto)
+    when forma == "nfkc"
+        give nfkc(texto)
+    when forma == "nfkd"
+        give nfkd(texto)
+    raise("forma tiene que ser \"nfc\", \"nfd\", \"nfkc\" o \"nfkd\", llegó " + json_encode(forma))
+
+-- Saca las tildes y demás marcas, como el tokenizador de BERT: descompone (NFD) y quita las marcas.
+export task sin_marcas(texto)
+    give regex_replace(nfd(texto), "\\p{Mn}", "")
+
+-- El mismo modelo, que además normaliza el texto con `forma` antes de codificar.
+export task con_forma(modelo, forma)
+    normalizar("", forma)
+    let m be {}
+    each e in items(modelo)
+        set m[e.key] to e.value
+    set m["forma"] to forma
+    give m
+
+-- Entrena un BPE hasta `tam_vocab` tokens (los 256 bytes + una fusión por token
+-- nuevo). Se detiene antes si ya no queda ningún par que aparezca dos veces.
+-- Determinista: en un empate gana el par que apareció primero en el texto.
+export task entrenar(texto, tam_vocab)
+    when tam_vocab < 256
+        raise("tam_vocab tiene que ser al menos 256 (un token por byte), llegó " + text(tam_vocab))
+    -- cada trozo distinto una sola vez, con cuántas veces aparece
+    let veces be {}
+    each trozo in regex_find_all(texto, PATRON)
+        set veces[trozo] to get(veces, trozo, 0) + 1
+    let palabras be []
+    let frecuencias be []
+    each e in items(veces)
+        set palabras to append(palabras, a_bytes(e.key))
+        set frecuencias to append(frecuencias, e.value)
+    let fusiones be []
+    let nuevo be 256
+    while nuevo < tam_vocab
+        let cuentas be {}
+        each j in range(0, length(palabras))
+            let ids be palabras[j]
+            let n be frecuencias[j]
+            each i in range(0, length(ids) - 1)
+                let k be ids[i] * tam_vocab + ids[i + 1]
+                set cuentas[k] to get(cuentas, k, 0) + n
+        let mejor be nothing
+        let mejor_n be 1
+        each c in items(cuentas)
+            when c.value > mejor_n
+                set mejor to c.key
+                set mejor_n to c.value
+        when mejor == nothing
+            stop
+        let packed be int(mejor)
+        let a be packed // tam_vocab
+        let b be packed % tam_vocab
+        set fusiones to append(fusiones, [a, b])
+        let siguientes be []
+        each ids in palabras
+            set siguientes to append(siguientes, fusionar(ids, a, b, nuevo))
+        set palabras to siguientes
+        set nuevo to nuevo + 1
+    give {"tipo": "bpe", "version": VERSION, "fusiones": fusiones}
+
+-- Un tokenizador por caracteres: un id por cada carácter distinto del texto.
+export task caracteres(texto)
+    give {"tipo": "caracteres", "version": VERSION, "simbolos": sort(unique(split(texto, "")))}
+
+-- Carga un vocabulario en el formato de tiktoken: una línea por token, con el token en
+-- base64, un espacio y su rango (que es también su id). `patron` es el corte del modelo
+-- (PATRON_CL100K, PATRON_GPT2).
+export task desde_tiktoken(vocabulario, patron)
+    let rangos be {}
+    let tokens be {}
+    each linea in split(vocabulario, "\n")
+        let l be trim(linea)
+        when l != ""
+            let partes be split(l, " ")
+            when length(partes) != 2
+                raise("línea que no es `<base64> <rango>`: " + json_encode(l))
+            let h be decode(bytes(partes[0], "base64"), "hex")
+            let id be int(partes[1])
+            set rangos[h] to id
+            set tokens[text(id)] to h
+    -- un patrón inválido es un error acá, no en la primera llamada a codificar
+    backtrack_find_all("", patron)
+    give {"tipo": "rangos", "version": VERSION, "patron": patron, "rangos": rangos, "tokens": tokens}
+
+-- Los ids de un trozo con un vocabulario por rangos, como tiktoken: si el trozo entero es
+-- un token, ese; si no, se parte en bytes y se junta cada vez el par vecino de menor rango.
+task ids_por_rango(rangos, trozo)
+    let b be bytes(trozo)
+    let entero be get(rangos, decode(b, "hex"), nothing)
+    when entero != nothing
+        give [entero]
+    let piezas be apply(to_list(b), (x) => HEX[x])
+    let seguir be true
+    while seguir and length(piezas) >= 2
+        let mejor be nothing
+        let donde be 0
+        each i in range(0, length(piezas) - 1)
+            let r be get(rangos, piezas[i] + piezas[i + 1], nothing)
+            when r != nothing and (mejor == nothing or r < mejor)
+                set mejor to r
+                set donde to i
+        when mejor == nothing
+            set seguir to false
+        otherwise
+            set piezas to slice(piezas, 0, donde) + [piezas[donde] + piezas[donde + 1]] + slice(piezas, donde + 2)
+    let ids be []
+    each p in piezas
+        when not (p in rangos)
+            raise("el byte 0x" + p + " no está en el vocabulario")
+        set ids to append(ids, rangos[p])
+    give ids
+
+export task tam_vocab(modelo)
+    when modelo.tipo == "caracteres"
+        give length(modelo.simbolos)
+    when modelo.tipo == "rangos"
+        give length(keys(modelo.rangos))
+    give 256 + length(modelo.fusiones)
+
+export task codificar(modelo, texto_crudo)
+    let texto be texto_crudo
+    let forma be get(modelo, "forma", nothing)
+    when forma != nothing
+        set texto to normalizar(texto_crudo, forma)
+    when modelo.tipo == "rangos"
+        let rangos be modelo.rangos
+        let vistos be {}
+        let ids be []
+        each trozo in backtrack_find_all(texto, modelo.patron)
+            when not (trozo in vistos)
+                set vistos[trozo] to ids_por_rango(rangos, trozo)
+            each id in vistos[trozo]
+                set ids to append(ids, id)
+        give ids
+    when modelo.tipo == "caracteres"
+        let ids_de be {}
+        each i in range(0, length(modelo.simbolos))
+            set ids_de[modelo.simbolos[i]] to i
+        let salida be []
+        each c in split(texto, "")
+            when not (c in ids_de)
+                raise("el carácter " + json_encode(c) + " no está en el vocabulario")
+            set salida to append(salida, ids_de[c])
+        give salida
+    -- BPE: en cada trozo, aplicar primero la fusión que se aprendió antes
+    let rango be {}
+    each i in range(0, length(modelo.fusiones))
+        set rango[clave(modelo.fusiones[i][0], modelo.fusiones[i][1])] to i
+    let ya_vistos be {}
+    let salida be []
+    each trozo in regex_find_all(texto, PATRON)
+        when trozo in ya_vistos
+            set salida to salida + ya_vistos[trozo]
+        otherwise
+            let ids be a_bytes(trozo)
+            let seguir be true
+            while seguir and length(ids) >= 2
+                let mejor be nothing
+                each i in range(0, length(ids) - 1)
+                    let r be get(rango, clave(ids[i], ids[i + 1]), nothing)
+                    when r != nothing and (mejor == nothing or r < mejor)
+                        set mejor to r
+                when mejor == nothing
+                    set seguir to false
+                otherwise
+                    let par be modelo.fusiones[mejor]
+                    set ids to fusionar(ids, par[0], par[1], 256 + mejor)
+            set ya_vistos[trozo] to ids
+            set salida to salida + ids
+    give salida
+
+export task decodificar(modelo, ids)
+    when modelo.tipo == "caracteres"
+        let partes be []
+        each i in ids
+            set partes to append(partes, modelo.simbolos[i])
+        give join(partes, "")
+    when modelo.tipo == "rangos"
+        let partes be []
+        each i in ids
+            let h be get(modelo.tokens, text(i), nothing)
+            when h == nothing
+                raise("el id " + text(i) + " no está en el vocabulario")
+            set partes to append(partes, h)
+        give decode(bytes(join(partes, ""), "hex"))
+    -- los bytes de cada token: los 256 primeros son ellos mismos, cada fusión es la suma de sus dos
+    let vocab be []
+    each i in range(0, 256)
+        set vocab to append(vocab, [i])
+    each par in modelo.fusiones
+        set vocab to append(vocab, vocab[par[0]] + vocab[par[1]])
+    let todos be []
+    each i in ids
+        set todos to todos + vocab[i]
+    give decode(bytes(todos))
+
+-- Cómo se ve cada token, para inspeccionar el vocabulario aprendido.
+export task token_texto(modelo, id)
+    when modelo.tipo == "caracteres"
+        give modelo.simbolos[id]
+    when modelo.tipo == "rangos"
+        -- un token puede ser un pedazo de un carácter: se muestra con U+FFFD donde no cierra
+        give decode(bytes(modelo.tokens[text(id)], "hex"), "utf8_lossy")
+    give decodificar(modelo, [id])
