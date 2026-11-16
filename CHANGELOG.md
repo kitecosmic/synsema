@@ -34,6 +34,9 @@ Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the rele
   the parameter/local write change and the repeated fusion loop**; across all
   123 rows, the largest increase over the previous anchor was +0.044 %, below
   the +0.3 % budget.
+- VM map reads and writes with integer keys now format the decimal key in a
+  stack buffer. This preserves the text key and insertion order while avoiding
+  temporary allocations on the BPE pair-counting path.
 
 ## v0.6.62 — 2026-11-15
 

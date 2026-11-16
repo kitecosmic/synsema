@@ -10895,6 +10895,10 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
             // (a su `Display`). Antes cada llamada hacía `to_string()` y reservaba memoria,
             // aunque la clave ya fuera texto: en un bucle de conteo son una reserva por vuelta.
             SynValue::Map(m) => {
+                if let SynValue::Number(Number::Int(i)) = &args[1] {
+                    let mut buf = [0u8; 20];
+                    return Ok(m.borrow().get(int_digits(*i, &mut buf)).cloned().unwrap_or(default));
+                }
                 let key = key_str(&args[1]);
                 Ok(m.borrow().get(key.as_ref()).cloned().unwrap_or(default))
             }
