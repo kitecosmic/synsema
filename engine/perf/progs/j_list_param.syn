@@ -1,0 +1,11 @@
+-- v0.6.63: escribir en una lista recibida como parámetro.
+-- Sonda de `proyectos/datos/reportes/sondas_19/jit3.syn` (el caso `param`).
+task param(c, n)
+    each i in range(0, n)
+        set c[i % 300] to c[i % 300] + 1
+    give c
+let c be []
+each i in range(0, 300)
+    set c to append(c, 0)
+let r be param(c, 100000)
+print("check " + text(r[7]))

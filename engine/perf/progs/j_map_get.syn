@@ -1,0 +1,10 @@
+-- v0.6.63: mapas en el nivel nativo (lectura con clave entera).
+-- Sonda de `proyectos/datos/reportes/sondas_19/mapa.syn`, con el tamaño del corpus de perf-guard.
+-- La fila `j_map_get|jit` del ancla es la que la versión tiene que mover.
+let c be {}
+each i in range(0, 300)
+    set c[i] to i + 1
+let x be 0
+each i in range(0, 100000)
+    set x to x + get(c, i % 300, 0)
+print("check " + text(x))

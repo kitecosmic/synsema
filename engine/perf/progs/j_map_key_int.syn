@@ -1,0 +1,6 @@
+-- v0.6.63: el hash de una clave entera (el par que más usa el BPE).
+-- Sonda de `proyectos/datos/reportes/sondas_19/claves.syn`.
+let c be {}
+each i in range(0, 100000)
+    set c[i % 300] to get(c, i % 300, 0) + 1
+print("check " + text(length(keys(c)) * 1000 + c[7]))

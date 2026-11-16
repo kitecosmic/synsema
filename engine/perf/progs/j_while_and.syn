@@ -1,0 +1,17 @@
+-- v0.6.63: el bucle caliente del BPE (`while` + `and` + `append`).
+-- Sonda de `proyectos/datos/reportes/sondas_19/fus.syn` y `fus2.syn`.
+task fusionar(ids, a, b, nuevo)
+    let salida be []
+    let i be 0
+    let n be length(ids)
+    while i < n
+        when i < n - 1 and ids[i] == a and ids[i + 1] == b
+            set salida to append(salida, nuevo)
+            set i to i + 2
+        otherwise
+            set salida to append(salida, ids[i])
+            set i to i + 1
+    give salida
+let ids be range(0, 4000)
+let r be fusionar(ids, 300, 301, 999)
+print("check " + text(length(r)))
