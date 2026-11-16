@@ -12,8 +12,22 @@ print(m["1"], alias[1], m[-7], get(m, true, 0), get(m, nothing, 0), keys(m))
 
 -- La task recibe el mismo valor, pero su escritura copia antes de cambiarlo.
 task bump(xs)
-    set xs[1] to xs[1] + 5
+    each i in range(0, 2000)
+        set xs[0] to xs[0] + 1
     give xs
-let original be [10, 20, 30]
+let original be [10, "keep"]
 let changed be bump(original)
-print(changed[1], original[1])
+print(changed[0], original[0])
+
+-- Una local sobrevive al while; el each de preparación usa otro nombre.
+task local_count(n)
+    let xs be []
+    each fill_i in range(0, 20)
+        set xs to append(xs, 0)
+    let i be 0
+    while i < n
+        set xs[i % 20] to xs[i % 20] + 1
+        set i to i + 1
+    give xs
+let counted be local_count(2000)
+print(counted[7], length(counted))

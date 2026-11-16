@@ -17,6 +17,9 @@ Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the rele
   in the tree-walker. Before, an integer key was a miss: the native code left to the
   virtual machine on every read and write, and the unit was discarded. Measured on the
   guard's corpus: a map read −77 %, a map write −47 %, a map counter −59 %.
+- Native loops inside a task can write a list received as a parameter or held in a task
+  local. The write keeps value semantics: a caller's list remains unchanged when the
+  task updates its parameter. The differential oracle and native tests cover both roots.
 - The performance guard's corpus gains seven probes for the native tier (maps, a
   list written through a parameter, `set lista[k]` inside a `while`, the cost of
   entering a compiled task, and the BPE's hot loop). **The anchor

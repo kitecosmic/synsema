@@ -215,8 +215,8 @@ pub enum NIns {
     /// La VM todavía no especializó esta instrucción (`Binary`: una rama que nunca corrió): se sale
     /// acá. Lleva lo que la VM va a leer y escribir.
     Trap { dst: Reg, a: NOpnd, b: NOpnd },
-    /// F4.8d (sólo en un bucle): `PathRoot` sobre una variable del bucle (`root`: su lugar, una global
-    /// o de la ventana): la variable única, y `c` es el cursor del camino (su dirección).
+    /// F4.8d (sólo en un bucle): `PathRoot` sobre una variable del bucle (`root`: su lugar, una global,
+    /// de la ventana o un parámetro de la task): la variable única, y `c` es el cursor del camino.
     PathRoot { c: Reg, root: NOpnd },
     /// F4.8d: `PathStep`: el cursor pasa al lugar de adentro, único (`idx: None`: la clave del sitio).
     PathStep { c: Reg, idx: Option<NOpnd>, site: u32 },
