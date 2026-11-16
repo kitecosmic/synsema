@@ -171,6 +171,21 @@ test "get and split look up and cut exactly what the text says (v0.6.63)"
     assert_eq(split(12345, "2"), ["1", "345"])
     assert_eq(split("a--b", "--"), ["a", "b"])
 
+test "a map key is text: an integer key is its decimal text (v0.6.63)"
+    -- The key of a map is text: `m[1]` and `m["1"]` are the same key (and the same key the
+    -- native tier uses, since v0.6.63).
+    let m be {}
+    set m[1] to "uno"
+    set m["1"] to "otro"
+    assert_eq(m[1], "otro")
+    assert_eq(get(m, 1, "no"), "otro")
+    assert_eq(get(m, "1", "no"), "otro")
+    assert_eq(length(keys(m)), 1)
+    set m[-7] to "negativo"
+    assert_eq(get(m, -7, "no"), "negativo")
+    assert_eq(get(m, true, "no"), "no")
+    assert_eq(get(m, 1.5, "no"), "no")
+
 test "string methods are plain tasks"
     assert_eq(upper("hola"), "HOLA")
     assert_eq(split("a,b,c", ","), ["a", "b", "c"])

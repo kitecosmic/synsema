@@ -432,21 +432,51 @@ impl SiteIc {
 /// F4.8d2: `get(obj, idx, …)` como `b_get` en lo que hace sin errores: un mapa con una clave de texto
 /// (`to_string` de un texto es el texto) o una lista con un `Int` (negativos desde el final); si no
 /// está, `ABSENT`. Lo demás (otra clave, otra colección: la VM da el resultado o el error), `MISS`.
-pub fn get_item(obj: &SynValue, idx_tag: i64, idx_bits: i64, idx: Option<&SynValue>) -> NPeek {
+///
+/// v0.6.63: un mapa acepta también una clave **entera** (es su texto decimal, como en el
+/// tree-walker: `b_get` hace `to_string()` de la clave). Antes era un `MISS`: el nivel nativo
+/// salía a la VM en cada lectura de un mapa con clave entera (y la unidad se descartaba).
+pub fn get_item(obj: &SynValue, idx_tag: i64, idx_bits: i64, idx: Option<&SynValue>, buf: &mut [u8; 20]) -> NPeek {
     let absent = NPeek { tag: TAG_ABSENT, bits: 0, ptr: std::ptr::null() };
-    match (obj, idx) {
-        (SynValue::List(l), _) if idx_tag == TAG_INT => {
+    match obj {
+        SynValue::List(l) if idx_tag == TAG_INT => {
             let items = l.borrow();
             match crate::interpreter::resolve_index(idx_bits, items.len()) {
                 Some(j) => peek_elem(&items, j),
                 None => absent,
             }
         }
-        (SynValue::Map(m), Some(SynValue::Text(t))) => match m.borrow().get(t) {
-            Some(v) => peek(v),
-            None => absent,
-        },
+        SynValue::Map(m) => {
+            let Some(key) = map_key(idx_tag, idx_bits, idx, buf) else { return NPeek::MISS };
+            match m.borrow().get(key) {
+                Some(v) => peek(v),
+                None => absent,
+            }
+        }
         _ => NPeek::MISS,
+    }
+}
+
+/// La clave de un mapa a partir de un índice: el texto del índice.
+///
+/// v0.6.63: un mapa tiene claves de **texto** (`Key(SynText)`, `synmap.rs:41`): un índice entero
+/// es su texto decimal (`m[1]` y `m["1"]` son la misma clave), que es lo mismo que hace el
+/// tree-walker (`b_get` y `set_leaf_index` hacen `to_string()` de la clave). El entero se escribe
+/// en `buf` (la pila del que llama) y la clave se presta de ahí: sin reservar memoria y sin
+/// cambiar el tamaño del valor de retorno.
+///
+/// Lo que no es texto ni entero (un float, un valor con caja) sale a la VM, que lo resuelve como
+/// siempre: su `Display` necesita memoria propia y el nivel nativo no la pide.
+fn map_key<'a>(tag: i64, bits: i64, idx: Option<&'a SynValue>, buf: &'a mut [u8; 20]) -> Option<&'a str> {
+    match idx {
+        Some(SynValue::Text(t)) => Some(t.as_str()),
+        Some(_) => None,
+        None => match tag {
+            TAG_INT => Some(crate::interpreter::int_digits(bits, buf)),
+            TAG_BOOL => Some(if bits != 0 { "true" } else { "false" }),
+            TAG_NOTHING => Some("nothing"),
+            _ => None,
+        },
     }
 }
 
@@ -533,18 +563,20 @@ pub fn path_root(slot: &mut SynValue) -> bool {
 
 /// La clave de un paso o de la hoja sobre un mapa: la del sitio (`.campo`, o un índice de texto
 /// constante) o el texto del índice.
-fn path_key<'a>(site: &'a SiteIc, idx: Option<&'a SynValue>) -> Option<&'a str> {
-    match (&site.key, idx) {
-        (Some(k), _) => Some(k),
-        (None, Some(SynValue::Text(t))) => Some(t),
-        _ => None,
+///
+/// v0.6.63: el texto del índice puede ser el **decimal de un entero** (la clave de un mapa es
+/// texto); antes, un índice entero en un mapa era `None` y el nivel nativo salía a la VM.
+fn path_key<'a>(site: &'a SiteIc, tag: i64, bits: i64, idx: Option<&'a SynValue>, buf: &'a mut [u8; 20]) -> Option<&'a str> {
+    match &site.key {
+        Some(k) => Some(&**k),
+        None => map_key(tag, bits, idx, buf),
     }
 }
 
 /// `PathStep`: el lugar de adentro de `parent` (una lista con un `Int` en rango, o un mapa que no es
 /// de un módulo con la clave puesta), único (`make_unique`); su dirección. Vale hasta la próxima
 /// escritura del mismo contenedor.
-pub fn path_step(parent: &SynValue, idx_tag: i64, idx_bits: i64, idx: Option<&SynValue>, site: &SiteIc) -> Option<*mut SynValue> {
+pub fn path_step(parent: &SynValue, idx_tag: i64, idx_bits: i64, idx: Option<&SynValue>, site: &SiteIc, buf: &mut [u8; 20]) -> Option<*mut SynValue> {
     match parent {
         SynValue::List(l) if idx_tag == TAG_INT => {
             // (Entrar a un elemento para escribir adentro: sólo en una lista de valores; una sin caja
@@ -559,8 +591,9 @@ pub fn path_step(parent: &SynValue, idx_tag: i64, idx_bits: i64, idx: Option<&Sy
             crate::interpreter::make_unique(s);
             Some(std::ptr::from_mut(s))
         }
-        SynValue::Map(m) if idx_tag != TAG_INT && crate::interpreter::module_env_of_map(m).is_none() => {
-            let key = path_key(site, idx)?;
+        // v0.6.63: el índice de un mapa puede ser un entero (su texto decimal es la clave).
+        SynValue::Map(m) if crate::interpreter::module_env_of_map(m).is_none() => {
+            let key = path_key(site, idx_tag, idx_bits, idx, buf)?;
             let mut b = m.borrow_mut();
             let s = if site.prop { b.get_cached_mut(key, &site.ic) } else { b.get_cached_key_mut(key, &site.ic) }?;
             crate::interpreter::make_unique(s);
@@ -572,7 +605,7 @@ pub fn path_step(parent: &SynValue, idx_tag: i64, idx_bits: i64, idx: Option<&Sy
 
 /// `PathSet` (la hoja): en una lista con un `Int` en rango, o en un mapa que no es de un módulo con
 /// la clave ya puesta, `v` reemplaza lo que había.
-pub fn path_set(parent: &SynValue, idx_tag: i64, idx_bits: i64, idx: Option<&SynValue>, site: &SiteIc, v: SynValue) -> bool {
+pub fn path_set(parent: &SynValue, idx_tag: i64, idx_bits: i64, idx: Option<&SynValue>, site: &SiteIc, v: SynValue, buf: &mut [u8; 20]) -> bool {
     match parent {
         SynValue::List(l) if idx_tag == TAG_INT => {
             let mut items = l.borrow_mut();
@@ -584,8 +617,9 @@ pub fn path_set(parent: &SynValue, idx_tag: i64, idx_bits: i64, idx: Option<&Syn
                 None => false,
             }
         }
-        SynValue::Map(m) if idx_tag != TAG_INT && crate::interpreter::module_env_of_map(m).is_none() => {
-            let Some(key) = path_key(site, idx) else { return false };
+        // v0.6.63: el índice de un mapa puede ser un entero (su texto decimal es la clave).
+        SynValue::Map(m) if crate::interpreter::module_env_of_map(m).is_none() => {
+            let Some(key) = path_key(site, idx_tag, idx_bits, idx, buf) else { return false };
             let mut b = m.borrow_mut();
             let s = if site.prop { b.get_cached_mut(key, &site.ic) } else { b.get_cached_key_mut(key, &site.ic) };
             match s {
