@@ -152,6 +152,10 @@ name("a", param2 = 20)                -- named arg (any order; like `spawn ... w
 -- called f(1, 2, 3) → "task 'f' takes 1 argument, got 3"). Lambdas too.
 -- A misspelled named argument lists the real ones (v0.6.46+): f(limt = 1) →
 -- "unknown parameter 'limt' — did you mean 'limit'?; the parameters are: limit, offset".
+-- v0.6.62+: builtins and hosts also check required parameters when they call a task
+-- (apply/where/reduce callbacks, routes, cron and error handlers). A callback that
+-- expects more inputs than its caller supplies now errors; give unused parameters
+-- defaults or remove them. Extra route/protocol inputs may still be ignored by tasks.
 
 task estado(id: text, items: bool = false)   -- types on parameters (v0.6.46+)
     give id
@@ -317,8 +321,11 @@ task tree_sum(root)
     give total
 ```
 
-Data has its own limit, not the 3000 calls: see [pitfalls.md](pitfalls.md) § Behavioral surprises
-(very deep nested lists).
+The 3000-call budget applies to task calls, not to the depth of values. Since v0.6.62,
+equality, formatting, JSON conversion, label checks and worker snapshots of deeply nested
+lists/maps use bounded stack depth. `json_decode` still limits the depth of incoming text;
+the parser still limits source-code nesting to 1024 levels. See [pitfalls.md](pitfalls.md)
+§ Upgrading to v0.6.62.
 
 ## Flat syntax (.fsyn files)
 ```

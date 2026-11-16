@@ -75,10 +75,10 @@ fn a_mask_crosses_a_snapshot_with_its_dtype() {
     let back = from_send(&to_send(&f));
     assert_eq!(dtype(&back), "f64");
     assert!(back.syn_equals(&f));
-    if let SendValue::Array(_, d) = to_send(&m) {
+    if let SendValue::Array(_, d) = &to_send(&m) {
         assert_eq!((d.len(), d.byte_len()), (4, 4));
     }
-    if let SendValue::Array(_, d) = to_send(&f) {
+    if let SendValue::Array(_, d) = &to_send(&f) {
         assert_eq!((d.len(), d.byte_len()), (3, 24));
     }
 }

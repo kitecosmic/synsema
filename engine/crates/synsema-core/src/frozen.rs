@@ -97,10 +97,11 @@ fn permanent(v: &SynValue) -> bool {
 /// ¿Se puede congelar para siempre todo lo que alcanza `v`? (Lo ya congelado para siempre, sí; lo
 /// congelado con alcance, no: se descongelaría mientras otro hilo lo sigue leyendo.)
 pub fn freezable(v: &SynValue) -> bool {
-    can(v, &mut HashSet::new(), false)
+    can(v, &mut HashSet::new(), false, 0)
 }
 
-fn can(v: &SynValue, seen: &mut HashSet<usize>, scoped_ok: bool) -> bool {
+fn can(v: &SynValue, seen: &mut HashSet<usize>, scoped_ok: bool, depth: usize) -> bool {
+    if depth == 32 { return can_tail(v, seen, scoped_ok); }
     match v {
         SynValue::Number(_) | SynValue::Bool(_) | SynValue::Nothing | SynValue::Complex(_) => true,
         SynValue::Text(t) => scoped_ok || !t.is_scoped(),
@@ -121,19 +122,19 @@ fn can(v: &SynValue, seen: &mut HashSet<usize>, scoped_ok: bool) -> bool {
                 return false;
             }
             let b = l.borrow();
-            b.as_values().is_none_or(|vs| vs.iter().all(|x| can(x, seen, scoped_ok)))
+            b.as_values().is_none_or(|vs| vs.iter().all(|x| can(x, seen, scoped_ok, depth + 1)))
         }
-        SynValue::Map(m) => can_map(m, seen, scoped_ok),
+        SynValue::Map(m) => can_map(m, seen, scoped_ok, depth),
         SynValue::Server(s) => {
             if !scoped_ok && Obj::is_scoped(s) {
                 return false;
             }
             match &**s {
                 ServerValue::Raw { .. } | ServerValue::RawBytes { .. } | ServerValue::Redirect { .. } => true,
-                ServerValue::Envelope { value, .. } => can(value, seen, scoped_ok),
-                ServerValue::Node(m) => can_map(m, seen, scoped_ok),
-                ServerValue::Content(b) => can(b, seen, scoped_ok),
-                ServerValue::WithHeaders { inner, .. } => can(inner, seen, scoped_ok),
+                ServerValue::Envelope { value, .. } => can(value, seen, scoped_ok, depth + 1),
+                ServerValue::Node(m) => can_map(m, seen, scoped_ok, depth),
+                ServerValue::Content(b) => can(b, seen, scoped_ok, depth + 1),
+                ServerValue::WithHeaders { inner, .. } => can(inner, seen, scoped_ok, depth + 1),
                 ServerValue::Paged(_) => false,
             }
         }
@@ -141,28 +142,95 @@ fn can(v: &SynValue, seen: &mut HashSet<usize>, scoped_ok: bool) -> bool {
     }
 }
 
-fn can_map(m: &MapRef, seen: &mut HashSet<usize>, scoped_ok: bool) -> bool {
+fn can_map(m: &MapRef, seen: &mut HashSet<usize>, scoped_ok: bool, depth: usize) -> bool {
+    match can_map_head(m, seen, scoped_ok) {
+        Ok(false) => true,
+        Err(()) => false,
+        Ok(true) => m.borrow().values().all(|x| can(x, seen, scoped_ok, depth + 1)),
+    }
+}
+
+fn can_map_head(m: &MapRef, seen: &mut HashSet<usize>, scoped_ok: bool) -> Result<bool, ()> {
     if !scoped_ok && MapRef::is_scoped(m) {
-        return false;
+        return Err(());
     }
     if MapRef::is_frozen(m) || !seen.insert(MapRef::as_ptr(m).cast::<()>() as usize) {
-        return true;
+        return Ok(false);
     }
     // La vista de un módulo (`use … as m`) se escribe en el lugar (`set m.X[k]`): no se congela.
     if crate::interpreter::module_env_of_map(m).is_some() {
-        return false;
+        return Err(());
     }
     if m.try_borrow_mut().is_err() {
-        return false;
+        return Err(());
     }
     let b = m.borrow();
     // Un mapa propio puede compartir la forma y las claves con mapas congelados CON ALCANCE (los de un
     // `parallel_map` de afuera): esas partes se descongelan al terminar, así que el mapa no puede
     // pasar a la región permanente (auditoría de R2).
     if !scoped_ok && (b.keys().any(|k| k.text().is_scoped()) || crate::synmap::layout_scoped(&b)) {
-        return false;
+        return Err(());
     }
-    b.values().all(|x| can(x, seen, scoped_ok))
+    Ok(true)
+}
+
+// A single borrowed child, never a queue containing all siblings.
+fn freeze_child<R>(v: &SynValue, index: usize, f: impl FnOnce(&SynValue, Option<&SynText>) -> R) -> Option<R> {
+    match v {
+        SynValue::List(l) => l.borrow().as_values()?.get(index).map(|v| f(v, None)),
+        SynValue::Map(m) => m.borrow().get_index(index).map(|(k, v)| f(v, Some(k.text()))),
+        SynValue::Server(s) => match &**s {
+            ServerValue::Node(m) => m.borrow().get_index(index).map(|(k, v)| f(v, Some(k.text()))),
+            ServerValue::Envelope { value, .. } if index == 0 => Some(f(value, None)),
+            ServerValue::Content(v) | ServerValue::WithHeaders { inner: v, .. } if index == 0 => Some(f(v, None)),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+// Ok(true) descends, Ok(false) is complete, Err rejects the whole value.
+fn can_head(v: &SynValue, seen: &mut HashSet<usize>, scoped_ok: bool) -> Result<bool, ()> {
+    match v {
+        SynValue::List(l) => {
+            if !scoped_ok && ListRef::is_scoped(l) { return Err(()); }
+            if ListRef::is_frozen(l) || !seen.insert(ListRef::as_ptr(l) as usize) { return Ok(false); }
+            if l.try_borrow_mut().is_err() { return Err(()); }
+            Ok(true)
+        }
+        SynValue::Map(m) => can_map_head(m, seen, scoped_ok),
+        SynValue::Server(s) => {
+            if !scoped_ok && Obj::is_scoped(s) { return Err(()); }
+            match &**s {
+                ServerValue::Paged(_) => Err(()),
+                ServerValue::Node(m) => can_map_head(m, seen, scoped_ok),
+                _ => Ok(true),
+            }
+        }
+        _ => if can(v, seen, scoped_ok, 0) { Ok(false) } else { Err(()) },
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn can_tail(v: &SynValue, seen: &mut HashSet<usize>, scoped_ok: bool) -> bool {
+    match can_head(v, seen, scoped_ok) {
+        Ok(false) => return true,
+        Err(()) => return false,
+        Ok(true) => {},
+    }
+    let mut stack = vec![(v.clone(), 0)];
+    while let Some((v, index)) = stack.last_mut() {
+        let next = freeze_child(v, *index, |v, _| can_head(v, seen, scoped_ok).map(|descend| descend.then(|| v.clone())));
+        *index += 1;
+        match next {
+            Some(Err(())) => return false,
+            Some(Ok(Some(v))) => stack.push((v, 0)),
+            Some(Ok(None)) => {},
+            None => { stack.pop(); },
+        }
+    }
+    true
 }
 
 /// Lo que un congelado con alcance volvió inmortal (objetos del montón y textos), para devolverles
@@ -227,7 +295,10 @@ impl Marker<'_> {
 
 /// Vuelve inmortal todo lo que alcanza `v` (ya verificado con `freezable`). Lo ya inmortal se salta:
 /// un subárbol compartido se recorre una vez.
-fn mark(v: &SynValue, mk: &mut Marker) {
+fn mark(v: &SynValue, mk: &mut Marker) { mark_at(v, mk, 0); }
+
+fn mark_at(v: &SynValue, mk: &mut Marker, depth: usize) {
+    if depth == 32 { return mark_tail(v, mk); }
     match v {
         SynValue::Text(t) => mk.text(t),
         SynValue::Bytes(b) => mk.bytes(b),
@@ -239,20 +310,20 @@ fn mark(v: &SynValue, mk: &mut Marker) {
                 return;
             }
             if let Some(vs) = l.borrow().as_values() {
-                vs.iter().for_each(|x| mark(x, mk));
+                vs.iter().for_each(|x| mark_at(x, mk, depth + 1));
             }
             mk.list(l);
         }
-        SynValue::Map(m) => mark_map(m, mk),
+        SynValue::Map(m) => mark_map(m, mk, depth),
         SynValue::Server(s) => {
             if Obj::is_frozen(s) {
                 return;
             }
             match &**s {
-                ServerValue::Envelope { value, .. } => mark(value, mk),
-                ServerValue::Node(m) => mark_map(m, mk),
-                ServerValue::Content(b) => mark(b, mk),
-                ServerValue::WithHeaders { inner, .. } => mark(inner, mk),
+                ServerValue::Envelope { value, .. } => mark_at(value, mk, depth + 1),
+                ServerValue::Node(m) => mark_map(m, mk, depth),
+                ServerValue::Content(b) => mark_at(b, mk, depth + 1),
+                ServerValue::WithHeaders { inner, .. } => mark_at(inner, mk, depth + 1),
                 ServerValue::Raw { .. } | ServerValue::RawBytes { .. } | ServerValue::Redirect { .. } => {}
                 ServerValue::Paged(_) => unreachable!("freezable lo rechaza"),
             }
@@ -263,7 +334,7 @@ fn mark(v: &SynValue, mk: &mut Marker) {
     }
 }
 
-fn mark_map(m: &MapRef, mk: &mut Marker) {
+fn mark_map(m: &MapRef, mk: &mut Marker, depth: usize) {
     if MapRef::is_frozen(m) {
         return;
     }
@@ -271,11 +342,81 @@ fn mark_map(m: &MapRef, mk: &mut Marker) {
         let b = m.borrow();
         for (k, x) in b.iter() {
             mk.text(k.text());
-            mark(x, mk);
+            mark_at(x, mk, depth + 1);
         }
         crate::synmap::freeze_layout(&b, mk);
     }
     mk.map(m);
+}
+
+fn needs_mark(v: &SynValue) -> bool {
+    match v {
+        SynValue::List(l) => !ListRef::is_frozen(l),
+        SynValue::Map(m) => !MapRef::is_frozen(m),
+        SynValue::Server(s) => !Obj::is_frozen(s),
+        _ => false,
+    }
+}
+
+fn finish_map(m: &MapRef, mk: &mut Marker) {
+    if MapRef::is_frozen(m) { return; }
+    crate::synmap::freeze_layout(&m.borrow(), mk);
+    mk.map(m);
+}
+
+fn finish_mark(v: &SynValue, mk: &mut Marker) {
+    match v {
+        SynValue::List(l) => mk.list(l),
+        SynValue::Map(m) => finish_map(m, mk),
+        SynValue::Server(s) => {
+            if let ServerValue::Node(m) = &**s { finish_map(m, mk); }
+            mk.obj(s);
+        }
+        _ => mark_at(v, mk, 0),
+    }
+}
+
+fn prepare_mark(v: &SynValue, mk: &mut Marker) -> bool {
+    if !needs_mark(v) {
+        if !matches!(v, SynValue::List(_) | SynValue::Map(_) | SynValue::Server(_)) { finish_mark(v, mk); }
+        return false;
+    }
+    // A fresh Server node may wrap a map frozen by an earlier alias. Preserve
+    // mark_map's O(1) skip rather than revisiting every child of that shared map.
+    if let SynValue::Server(s) = v {
+        if matches!(&**s, ServerValue::Node(m) if MapRef::is_frozen(m)) {
+            mk.obj(s);
+            return false;
+        }
+    }
+    true
+}
+
+#[cold]
+#[inline(never)]
+fn mark_tail(v: &SynValue, mk: &mut Marker) {
+    if !prepare_mark(v, mk) { return; }
+    let mut stack = vec![(v.clone(), 0)];
+    loop {
+        let (current, index) = stack.last_mut().unwrap();
+        let next = freeze_child(current, *index, |v, key| {
+            if let Some(key) = key { mk.text(key); }
+            if prepare_mark(v, mk) { Some(v.clone()) } else { None }
+        });
+        *index += 1;
+        match next {
+            Some(Some(v)) => stack.push((v, 0)),
+            Some(None) => {},
+            None => {
+                // The retained owner must be gone when FreezeLog records strong_count.
+                // Otherwise thaw would restore the traversal's extra reference as a leak.
+                drop(stack.pop().unwrap());
+                if let Some((parent, index)) = stack.last() {
+                    freeze_child(parent, index - 1, |v, _| finish_mark(v, mk)).unwrap();
+                } else { finish_mark(v, mk); return; }
+            }
+        }
+    }
 }
 
 /// Valores que se congelan sólo mientras corren unos hilos (R2.3, ver el módulo).
@@ -318,7 +459,7 @@ impl ScopedFreeze {
     pub fn add(&mut self, v: SynValue) -> Result<usize, SynValue> {
         // Lo congelado con alcance por un `run` de más afuera sirve tal cual: este `run` termina antes
         // (corre dentro de un hilo de aquél), así que no se descongela mientras éste lo lee.
-        if !can(&v, &mut HashSet::new(), true) {
+        if !can(&v, &mut HashSet::new(), true, 0) {
             return Err(v);
         }
         self.values.push(v);
@@ -396,5 +537,114 @@ impl ScopedFreeze {
             }
         }
         Ok(out)
+    }
+}
+#[cfg(test)]
+mod deep_tests {
+    use super::*;
+    use crate::types::{syn_int, syn_list, syn_map, SynMap};
+
+    fn nested(mut v: SynValue, depth: usize, maps: bool) -> SynValue {
+        for i in 0..depth {
+            v = if maps {
+                let mut m = SynMap::new(); m.insert("a long shared key for thaw", v);
+                if i % 2 == 0 { SynValue::Server(Obj::new(ServerValue::Node(m.into_ref()))) } else { syn_map(m) }
+            } else { syn_list(vec![v]) };
+        }
+        v
+    }
+
+    fn assert_marked(v: &SynValue) {
+        fn check(v: &SynValue) {
+            match v {
+                SynValue::List(l) => assert!(ListRef::is_frozen(l)),
+                SynValue::Map(m) => assert!(MapRef::is_frozen(m)),
+                SynValue::Server(s) => {
+                    assert!(Obj::is_frozen(s));
+                    if let ServerValue::Node(m) = &**s { assert!(MapRef::is_frozen(m)); }
+                }
+                _ => {},
+            }
+        }
+        check(v);
+        let mut stack = vec![(v.clone(), 0)];
+        while let Some((v, index)) = stack.last_mut() {
+            let next = freeze_child(v, *index, |v, _| { check(v); v.clone() });
+            *index += 1;
+            if let Some(v) = next { stack.push((v, 0)); } else { stack.pop(); }
+        }
+    }
+
+    #[test]
+    fn deep_scoped_freeze_restores_counts_after_workers_and_panic() {
+        for maps in [false, true] {
+            for depth in [31, 32, 33, 1000, 50000] {
+                let leaf = syn_list(vec![syn_int(7)]);
+                let SynValue::List(l) = &leaf else { unreachable!() };
+                let weak = ListRef::downgrade(l);
+                let v = nested(leaf, depth, maps);
+                assert!(freezable(&v));
+                for panic_worker in [false, true] {
+                    let mut scope = ScopedFreeze::new();
+                    let index = scope.add(v.clone()).unwrap();
+                    scope.add(v.clone()).unwrap();
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        scope.run(2, 64 * 1024 * 1024, |ctx, i| {
+                            let v = ctx.get(index);
+                            assert_marked(&v);
+                            assert!(!permanent(&v)); // scoped values never escape as permanent
+                            if panic_worker && i == 1 { panic!("worker failure"); }
+                            assert!(!crate::labels::has_label_deep(&v));
+                            true
+                        })
+                    }));
+                    assert_eq!(result.is_err(), panic_worker);
+                    let leaf = weak.upgrade().unwrap();
+                    assert_eq!(ListRef::strong_count(&leaf), 2, "continuation references must not enter ThawLog");
+                    assert!(!ListRef::is_frozen(&leaf));
+                }
+                drop(v);
+                assert!(weak.upgrade().is_none(), "thaw must allow normal deep release");
+            }
+        }
+    }
+
+    #[test]
+    fn deep_freeze_rejects_private_and_rolls_back_partial_mark() {
+        let private = nested(crate::labels::mark(syn_int(1), crate::labels::label_from(&["p"])), 50000, true);
+        assert!(!freezable(&private));
+        let first = nested(syn_list(vec![syn_int(1)]), 50000, false);
+        let second = syn_map(SynMap::new());
+        let SynValue::Map(m) = &second else { unreachable!() };
+        let held = m.borrow_mut();
+        let values = syn_list(vec![first.clone(), second.clone()]);
+        assert!(!freezable(&values));
+        // Exercise the unwind guard itself after a partial deep mark, even though add
+        // normally rejects the borrowed second branch before any marking starts.
+        let scope = ScopedFreeze { values: vec![values] };
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| scope.run(0, 64 * 1024 * 1024, |_, _| ()))).is_err());
+        drop(held);
+        let SynValue::List(l) = &first else { unreachable!() };
+        assert!(!ListRef::is_frozen(l));
+        assert_eq!(ListRef::strong_count(l), 1);
+        assert!(freezable(&first));
+    }
+
+    #[test]
+    fn million_scoped_lists_complete_and_release() {
+        std::thread::Builder::new().stack_size(64 * 1024 * 1024).spawn(|| {
+            let leaf = syn_list(vec![syn_int(7)]);
+            let SynValue::List(l) = &leaf else { unreachable!() };
+            let weak = ListRef::downgrade(l);
+            let v = nested(leaf, 1_000_000, false);
+            let mut scope = ScopedFreeze::new();
+            let index = scope.add(v).unwrap();
+            assert_eq!(scope.run(2, 64 * 1024 * 1024, |ctx, _| {
+                let v = ctx.get(index);
+                assert!(!crate::labels::has_label_deep(&v));
+                true
+            }).unwrap(), vec![true, true]);
+            assert!(weak.upgrade().is_none());
+        }).unwrap().join().unwrap();
     }
 }

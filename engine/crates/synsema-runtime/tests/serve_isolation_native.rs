@@ -50,8 +50,9 @@ serve on {p}
             set nums to append(nums, i)
             set rows[0].name to "hot"
             set cfg.limits[1] to i
-            set trail to trail + "."
             set counter to counter + 1
+        each i in range(0, 5000)
+            set trail to trail + "."
         give {{"t": length(tags), "n": length(nums), "c": counter, "l": length(trail), "k": cfg.limits[1], "r": rows[0].name}}
     route "GET /get"
         give {{"t": length(tags), "n": length(nums), "c": counter, "l": length(trail), "k": cfg.limits[1], "r": rows[0].name}}

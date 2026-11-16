@@ -6,7 +6,6 @@
 //! snapshot del entorno → ejecutar especulativamente → rollback (restaura) /
 //! commit (descarta) / fork (N branches independientes) + choose_and_apply.
 
-use synsema_core::synlist::{list_values};
 use synsema_core::types::SynMap;
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -19,18 +18,67 @@ use synsema_core::types::SynValue;
 /// Copia profunda de un valor (list/map → nuevos Rc; el resto clona). Espeja el
 /// `deepcopy` de Python (con fallback a clonar tasks/builtins).
 fn deep_copy(v: &SynValue) -> SynValue {
+    copy_at(v, 0)
+}
+
+fn copy_child<R>(v: &SynValue, index: usize, f: impl FnOnce(&SynValue) -> R) -> Option<R> {
+    match v {
+        SynValue::List(l) => l.borrow().as_values()?.get(index).map(f),
+        SynValue::Map(m) => m.borrow().get_index(index).map(|(_, v)| f(v)),
+        _ => None,
+    }
+}
+
+fn copy_leaf(v: &SynValue) -> Option<SynValue> {
     match v {
         SynValue::List(l) => {
-            SynValue::List(synsema_core::types::ListRef::new(list_values(&l).iter().map(deep_copy).collect()))
+            let b = l.borrow();
+            b.as_values().is_none().then(|| synsema_core::types::syn_list_of(b.clone()))
         }
+        SynValue::Map(_) => None,
+        _ => Some(v.clone()),
+    }
+}
+
+fn rebuild(v: &SynValue, values: Vec<SynValue>) -> SynValue {
+    match v {
+        SynValue::List(_) => synsema_core::types::syn_list(values),
         SynValue::Map(m) => {
-            let mut nm = SynMap::new();
-            for (k, val) in m.borrow().iter() {
-                nm.insert(k.clone(), deep_copy(val));
+            let m = m.borrow();
+            let mut out = SynMap::with_capacity(m.len());
+            for (index, value) in values.into_iter().enumerate() {
+                out.insert(m.get_index(index).unwrap().0.clone(), value);
             }
-            SynValue::Map(nm.into_ref())
+            synsema_core::types::syn_map(out)
         }
-        other => other.clone(),
+        _ => unreachable!(),
+    }
+}
+
+fn copy_at(v: &SynValue, depth: usize) -> SynValue {
+    if let Some(v) = copy_leaf(v) { return v; }
+    if depth == 32 { return copy_tail(v); }
+    let mut out = Vec::new();
+    while let Some(v) = copy_child(v, out.len(), |v| copy_at(v, depth + 1)) { out.push(v); }
+    rebuild(v, out)
+}
+
+#[cold]
+#[inline(never)]
+fn copy_tail(v: &SynValue) -> SynValue {
+    let mut stack = vec![(v.clone(), Vec::new())];
+    loop {
+        let (v, out) = stack.last_mut().unwrap();
+        match copy_child(v, out.len(), |v| copy_leaf(v).ok_or_else(|| v.clone())) {
+            Some(Ok(v)) => out.push(v),
+            Some(Err(v)) => stack.push((v, Vec::new())),
+            None => {
+                let (v, out) = stack.pop().unwrap();
+                let v = rebuild(&v, out);
+                if let Some((_, out)) = stack.last_mut() { out.push(v); }
+                else { return v; }
+            }
+        }
     }
 }
 
@@ -217,5 +265,67 @@ mod tests {
         assert_eq!(results[1].0.to_string(), "b");
         spec.choose_and_apply(&env, &results, 1);
         assert_eq!(env_get_int(&env, "x"), Some(200));
+    }
+}
+
+#[cfg(test)]
+mod deep_tests {
+    use super::*;
+    use synsema_core::{labels, types::{syn_int, syn_list, syn_map, Obj, ServerValue}};
+
+    #[test]
+    fn speculative_copy_is_deep_only_for_lists_and_maps() {
+        for maps in [false, true] {
+            let mut v = syn_int(7);
+            for _ in 0..50000 {
+                v = if maps { let mut m = SynMap::new(); m.insert("x", v); syn_map(m) }
+                    else { syn_list(vec![v]) };
+            }
+            let copy = deep_copy(&v);
+            assert!(copy.syn_equals(&v));
+            let env = Environment::root("deep snapshot");
+            env.borrow_mut().bindings.insert("x", v.clone());
+            let snapshot = EnvironmentSnapshot::new(&env);
+            env.borrow_mut().bindings.insert("x", syn_int(99));
+            snapshot.restore(&env);
+            let restored = synsema_core::interpreter::env_get(&env, "x").unwrap();
+            assert!(restored.syn_equals(&v));
+            match (&restored, &v) {
+                (SynValue::List(a), SynValue::List(b)) => assert!(!synsema_core::types::ListRef::ptr_eq(a, b)),
+                (SynValue::Map(a), SynValue::Map(b)) => assert!(!synsema_core::types::MapRef::ptr_eq(a, b)),
+                _ => panic!(),
+            }
+
+            match (&v, &copy) {
+                (SynValue::List(a), SynValue::List(b)) => assert!(!synsema_core::types::ListRef::ptr_eq(a, b)),
+                (SynValue::Map(a), SynValue::Map(b)) => assert!(!synsema_core::types::MapRef::ptr_eq(a, b)),
+                _ => panic!(),
+            }
+            let (mut left, mut right) = (v.clone(), copy.clone());
+            for _ in 0..100 {
+                match (&left, &right) {
+                    (SynValue::List(a), SynValue::List(b)) => {
+                        assert!(!synsema_core::types::ListRef::ptr_eq(a, b));
+                        let pair = (a.borrow().get(0).unwrap(), b.borrow().get(0).unwrap());
+                        (left, right) = pair;
+                    }
+                    (SynValue::Map(a), SynValue::Map(b)) => {
+                        assert!(!synsema_core::types::MapRef::ptr_eq(a, b));
+                        let pair = (a.borrow().get("x").unwrap().clone(), b.borrow().get("x").unwrap().clone());
+                        (left, right) = pair;
+                    }
+                    _ => panic!(),
+                }
+            }
+            for opaque in [labels::mark(v.clone(), labels::label_from(&["p"])),
+                           SynValue::Server(Obj::new(ServerValue::Content(Box::new(v))))] {
+                let copy = deep_copy(&opaque);
+                match (&opaque, &copy) {
+                    (SynValue::Private(a), SynValue::Private(b)) => assert!(Obj::ptr_eq(a, b)),
+                    (SynValue::Server(a), SynValue::Server(b)) => assert!(Obj::ptr_eq(a, b)),
+                    _ => panic!(),
+                }
+            }
+        }
     }
 }

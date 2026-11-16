@@ -6,6 +6,35 @@ Each says what changed, why, and what to write instead.
 
 Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the release date.
 
+## v0.6.62 — 2026-11-15
+
+- Deep list, map and server-value equality continues on the heap after a bounded
+  recursive prefix, including the language's decimal/float conflict checks. This
+  avoids stack overflow from data depth while preserving existing equality rules.
+- Releasing deeply nested lists, maps and server wrappers also uses heap
+  continuations, without changing shared children or boxing numeric lists.
+
+- Text formatting writes deeply nested values directly to one output buffer,
+  preserving nested escapes, private/secret redaction and array element order.
+- Deep copies, label collection, label removal and sink checks use bounded stack
+  depth. Removing labels shares clean branches and no longer rescans each subtree.
+  Speculative snapshots retain their distinct list/map-only copy policy.
+- Scoped freezing and owned worker snapshots continue on the heap for deep data,
+  including snapshot cloning, display, reconstruction and release. Thaw restores
+  the original reference counts after workers finish or panic.
+- JSON validation, encoding and conversion continue on the heap for deep data,
+  including content nodes and high rank arrays. The separate `json_decode` input
+  depth limit is unchanged. Sorting deeply nested lists compares each position
+  once per comparison and still reports decimal/float conflicts only when reached.
+- Native registered threads check their remaining stack for heavy task bodies
+  while counting actual task calls toward the recursion limit. Threads without
+  stack registration retain the conservative weighted limit.
+- **Breaking: a callback invoked by a builtin or host fails if a required task
+  parameter is missing.** Give the parameter a default, or change the callback
+  to declare only the arguments it uses. Extra protocol arguments remain allowed
+  for tasks; an explicit `nothing` counts as an argument. Empty collections do
+  not invoke their callback.
+
 ## v0.6.61 — 2026-11-14
 
 - **Breaking: packages must declare `time`, `random` and `stdin`.** Put the

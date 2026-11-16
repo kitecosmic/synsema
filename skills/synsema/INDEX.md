@@ -149,7 +149,7 @@ usually version skew, not a bug.
 - Splitting the program across files / importing (`use`/`export`, `export routes` + `mount`) → modules.md
 - **Using someone else's code** — `use "name"`, `synsema.json`, `synsema get` (`--check`, `--update`, `--accept`), `module … is not downloaded`, MVS + `indirect`, the cache (`SYNSEMA_MODULE_CACHE`), publishing a package → modules.md § Packages; what a package may do → capabilities.md § Packages run attenuated; a package's templates → frontend.md; `pip install`/`requirements.txt` → python-diff.md
 - **Ship a project with packages in one binary / in wasm / in the Vela guest** (`synsema build` from the project folder, `--dir` for wasip1, the bundle in `SYNSEMA.APPSLOT2`) → deploy.md § `build` with a project and packages, deploy.md § WebAssembly, guests.md; the packages in a receipt (`modules`) → attestation.md
-- **Deep recursion / deep nesting** (how far a recursive task goes, why `--labels`/`try` stop it earlier, the 1024-level limit) → syntax.md § Limits: nesting and recursion
+- **Deep recursion / deep nesting** (task call limits versus deep data; v0.6.62 equality, formatting, JSON and worker snapshots; `json_decode` input limit) → syntax.md § Limits: nesting and recursion; pitfalls.md § Upgrading to v0.6.62
 - Writing tests / asserting behavior → testing.md
 - Navigating a Synsema repo as an agent (what's in a file, where a task is used, the route table, missing capabilities) → code.md
 - Data that must not leave (enclave/TEE, multi-tenant, confidential deployment) → labels.md

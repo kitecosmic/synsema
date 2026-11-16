@@ -64,46 +64,45 @@ pub(crate) fn reject_code_with(
     path: &str,
     secret_remedy: &dyn Fn(&str) -> String,
 ) -> Result<(), Control> {
-    match v {
-        SynValue::Task(_) | SynValue::Builtin(_) => Err(err(format!(
-            "{}: {} is {}, not data — JSON cannot hold code; store what it computes, or leave it out",
-            who,
-            path,
-            synsema_core::rng::code_noun(v)
-        ))),
-        // v0.6.46 (E2, D8): un secret no se serializa a texto. Antes salía `"[redacted]"`: nunca
-        // filtraba el material, pero el programa recibía un marcador que podía mandar como si fuera
-        // el dato (el mismo principio de HB4; como `secrecy` en Rust, que no serializa un secreto
-        // sin un opt-in). El único borde que lo pone es el motor, en el socket.
-        SynValue::Secret(s) => Err(err(format!(
-            "{}: {} is secret({}), and a secret is never written as text — {}",
-            who,
-            path,
-            s.name(),
-            secret_remedy(s.name())
-        ))),
-        SynValue::List(l) => {
-            // Una lista sin caja tiene números, no código: leerla con `list_values` la pasaba a
-            // valores para siempre (×3 de memoria) antes de escribir nada.
-            let b = l.borrow();
-            let Some(xs) = b.as_values() else { return Ok(()) };
-            for (i, x) in xs.iter().enumerate() {
-                if matches!(x, SynValue::Task(_) | SynValue::Builtin(_) | SynValue::Secret(_) | SynValue::List(_) | SynValue::Map(_)) {
-                    reject_code_with(x, who, &format!("{}[{}]", path, i), secret_remedy)?;
-                }
-            }
-            Ok(())
+    // Keep one path buffer and one frame per ancestor. In particular, a million
+    // clean levels do not allocate a million increasingly long path strings.
+    let mut path_buf = path.to_owned();
+    let mut stack = vec![(v.clone(), 0usize, path_buf.len())];
+    while let Some((value, index, prefix_len)) = stack.last_mut() {
+        path_buf.truncate(*prefix_len);
+        match value {
+            SynValue::Task(_) | SynValue::Builtin(_) => return Err(err(format!(
+                "{}: {} is {}, not data — JSON cannot hold code; store what it computes, or leave it out",
+                who, path_buf, synsema_core::rng::code_noun(value)
+            ))),
+            SynValue::Secret(secret) => return Err(err(format!(
+                "{}: {} is secret({}), and a secret is never written as text — {}",
+                who, path_buf, secret.name(), secret_remedy(secret.name())
+            ))),
+            _ => {}
         }
-        SynValue::Map(m) => {
-            for (k, x) in m.borrow().iter() {
-                if matches!(x, SynValue::Task(_) | SynValue::Builtin(_) | SynValue::Secret(_) | SynValue::List(_) | SynValue::Map(_)) {
-                    reject_code_with(x, who, &format!("{}[{:?}]", path, k), secret_remedy)?;
-                }
+        let next = match value {
+            SynValue::List(l) => {
+                let b = l.borrow();
+                b.as_values().and_then(|xs| xs.get(*index)).map(|x| {
+                    let suffix = format!("[{}]", *index);
+                    (x.clone(), suffix)
+                })
             }
-            Ok(())
-        }
-        _ => Ok(()),
+            SynValue::Map(m) => m.borrow().get_index(*index).map(|(k, x)| {
+                (x.clone(), format!("[{:?}]", k))
+            }),
+            _ => None,
+        };
+        *index += 1;
+        if let Some((next, suffix)) = next {
+            if matches!(next, SynValue::Task(_) | SynValue::Builtin(_) | SynValue::Secret(_) | SynValue::List(_) | SynValue::Map(_)) {
+                path_buf.push_str(&suffix);
+                stack.push((next, 0, path_buf.len()));
+            }
+        } else { stack.pop(); }
     }
+    Ok(())
 }
 
 /// Los builtins JSON del lenguaje (puros, SIN capability — como text/bytes/decode).
@@ -247,7 +246,6 @@ pub fn register_json_builtins(interp: &Interpreter) {
 
 /// Árbol JSON para la salida. Controlamos el formateo nosotros (no serde) para
 /// igualar exactamente a `json.dumps`.
-#[derive(Clone, Debug)]
 pub enum Json {
     Null,
     Bool(bool),
@@ -258,6 +256,117 @@ pub enum Json {
     Str(String),
     Array(Vec<Json>),
     Object(Vec<(String, Json)>),
+}
+
+impl std::fmt::Debug for Json {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        enum Part<'a> { Value(&'a Json), Text(&'static str), Key(&'a str) }
+        let mut stack = vec![Part::Value(self)];
+        while let Some(part) = stack.pop() {
+            match part {
+                Part::Text(s) => f.write_str(s)?,
+                Part::Key(s) => write!(f, "{s:?}")?,
+                Part::Value(value) => match value {
+                    Json::Null => f.write_str("Null")?,
+                    Json::Bool(v) => write!(f, "Bool({v:?})")?,
+                    Json::Int(v) => write!(f, "Int({v:?})")?,
+                    Json::Float(v) => write!(f, "Float({v:?})")?,
+                    Json::BigInt(v) => write!(f, "BigInt({v:?})")?,
+                    Json::Str(v) => write!(f, "Str({v:?})")?,
+                    Json::Array(items) => {
+                        stack.push(Part::Text("])"));
+                        for (i, item) in items.iter().enumerate().rev() {
+                            stack.push(Part::Value(item));
+                            if i > 0 { stack.push(Part::Text(", ")); }
+                        }
+                        stack.push(Part::Text("Array(["));
+                    }
+                    Json::Object(items) => {
+                        stack.push(Part::Text("])"));
+                        for (i, (key, value)) in items.iter().enumerate().rev() {
+                            stack.push(Part::Text(")"));
+                            stack.push(Part::Value(value));
+                            stack.push(Part::Text(", "));
+                            stack.push(Part::Key(key));
+                            stack.push(Part::Text("("));
+                            if i > 0 { stack.push(Part::Text(", ")); }
+                        }
+                        stack.push(Part::Text("Object(["));
+                    }
+                },
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Clone for Json {
+    fn clone(&self) -> Self {
+        fn leaf(v: &Json) -> Option<Json> {
+            Some(match v {
+                Json::Null => Json::Null,
+                Json::Bool(v) => Json::Bool(*v),
+                Json::Int(v) => Json::Int(*v),
+                Json::Float(v) => Json::Float(*v),
+                Json::BigInt(v) => Json::BigInt(v.clone()),
+                Json::Str(v) => Json::Str(v.clone()),
+                Json::Array(_) | Json::Object(_) => return None,
+            })
+        }
+        if let Some(v) = leaf(self) { return v; }
+        let mut stack = vec![(self, Vec::new())];
+        loop {
+            let (value, out) = stack.last_mut().unwrap();
+            let child = match value {
+                Json::Array(items) => items.get(out.len()),
+                Json::Object(items) => items.get(out.len()).map(|(_, v)| v),
+                _ => unreachable!(),
+            };
+            if let Some(child) = child {
+                if let Some(child) = leaf(child) { out.push(child); }
+                else { stack.push((child, Vec::new())); }
+            } else {
+                let (value, out) = stack.pop().unwrap();
+                let value = match value {
+                    Json::Array(_) => Json::Array(out),
+                    Json::Object(items) => Json::Object(items.iter().map(|(k, _)| k.clone()).zip(out).collect()),
+                    _ => unreachable!(),
+                };
+                if let Some((_, out)) = stack.last_mut() { out.push(value); }
+                else { return value; }
+            }
+        }
+    }
+}
+
+enum JsonDropFrame {
+    Array(std::vec::IntoIter<Json>),
+    Object(std::vec::IntoIter<(String, Json)>),
+}
+
+fn take_json_children(value: &mut Json) -> Option<JsonDropFrame> {
+    match value {
+        Json::Array(items) if !items.is_empty() => Some(JsonDropFrame::Array(std::mem::take(items).into_iter())),
+        Json::Object(items) if !items.is_empty() => Some(JsonDropFrame::Object(std::mem::take(items).into_iter())),
+        _ => None,
+    }
+}
+
+impl Drop for Json {
+    fn drop(&mut self) {
+        let Some(first) = take_json_children(self) else { return; };
+        let mut stack = vec![first];
+        while let Some(frame) = stack.last_mut() {
+            let next = match frame {
+                JsonDropFrame::Array(items) => items.next(),
+                JsonDropFrame::Object(items) => items.next().map(|(_, value)| value),
+            };
+            match next {
+                Some(mut value) => if let Some(children) = take_json_children(&mut value) { stack.push(children); },
+                None => { stack.pop(); },
+            }
+        }
+    }
 }
 
 pub fn obj(pairs: Vec<(&str, Json)>) -> Json {
@@ -304,34 +413,36 @@ fn json_escape_str(s: &str, out: &mut String) {
 }
 
 fn dumps_into(j: &Json, out: &mut String) {
-    match j {
-        Json::Null => out.push_str("null"),
-        Json::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
-        Json::Int(i) => push_int(*i, out),
-        Json::BigInt(s) => out.push_str(s),
-        Json::Float(f) => push_float(*f, out),
-        Json::Str(s) => json_escape_str(s, out),
-        Json::Array(items) => {
-            out.push('[');
-            for (i, it) in items.iter().enumerate() {
-                if i > 0 {
-                    out.push_str(", ");
+    enum Frame<'a> { Value(&'a Json), Array(&'a [Json], usize), Object(&'a [(String, Json)], usize) }
+    let mut stack = vec![Frame::Value(j)];
+    while let Some(frame) = stack.pop() {
+        match frame {
+            Frame::Value(Json::Null) => out.push_str("null"),
+            Frame::Value(Json::Bool(b)) => out.push_str(if *b { "true" } else { "false" }),
+            Frame::Value(Json::Int(i)) => push_int(*i, out),
+            Frame::Value(Json::BigInt(s)) => out.push_str(s),
+            Frame::Value(Json::Float(f)) => push_float(*f, out),
+            Frame::Value(Json::Str(s)) => json_escape_str(s, out),
+            Frame::Value(Json::Array(items)) => { out.push('['); stack.push(Frame::Array(items, 0)); }
+            Frame::Value(Json::Object(items)) => { out.push('{'); stack.push(Frame::Object(items, 0)); }
+            Frame::Array(items, i) => {
+                if i == items.len() { out.push(']'); }
+                else {
+                    if i > 0 { out.push_str(", "); }
+                    stack.push(Frame::Array(items, i + 1));
+                    stack.push(Frame::Value(&items[i]));
                 }
-                dumps_into(it, out);
             }
-            out.push(']');
-        }
-        Json::Object(pairs) => {
-            out.push('{');
-            for (i, (k, v)) in pairs.iter().enumerate() {
-                if i > 0 {
-                    out.push_str(", ");
+            Frame::Object(items, i) => {
+                if i == items.len() { out.push('}'); }
+                else {
+                    if i > 0 { out.push_str(", "); }
+                    json_escape_str(&items[i].0, out);
+                    out.push_str(": ");
+                    stack.push(Frame::Object(items, i + 1));
+                    stack.push(Frame::Value(&items[i].1));
                 }
-                json_escape_str(k, out);
-                out.push_str(": ");
-                dumps_into(v, out);
             }
-            out.push('}');
         }
     }
 }
@@ -383,67 +494,119 @@ pub fn dumps_syn(v: &SynValue) -> String {
 }
 
 pub fn dumps_syn_into(v: &SynValue, out: &mut String) {
-    match v {
-        SynValue::Nothing => out.push_str("null"),
-        SynValue::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
-        SynValue::Number(Number::Int(i)) => push_int(*i, out),
-        SynValue::Number(Number::Float(f)) => push_float(*f, out),
-        SynValue::Text(s) => json_escape_str(s, out),
-        SynValue::List(l) => {
-            // Una lista sin caja se escribe desde sus números: sin copiarla ni pasarla a valores.
-            out.push('[');
-            let b = l.borrow();
-            if let Some(xs) = b.as_ints() {
-                for (i, x) in xs.iter().enumerate() {
-                    if i > 0 {
-                        out.push_str(", ");
-                    }
-                    push_int(*x, out);
-                }
-            } else if let Some(xs) = b.as_floats() {
-                for (i, x) in xs.iter().enumerate() {
-                    if i > 0 {
-                        out.push_str(", ");
-                    }
-                    push_float(*x, out);
-                }
-            } else {
-                for (i, it) in b.as_values().into_iter().flatten().enumerate() {
-                    if i > 0 {
-                        out.push_str(", ");
-                    }
-                    dumps_syn_into(it, out);
+    enum Frame { Value(SynValue), List(synsema_core::types::ListRef, usize), Map(synsema_core::types::MapRef, usize) }
+    let mut stack = vec![Frame::Value(v.clone())];
+    while let Some(frame) = stack.pop() {
+        match frame {
+            Frame::Value(SynValue::Nothing) => out.push_str("null"),
+            Frame::Value(SynValue::Bool(b)) => out.push_str(if b { "true" } else { "false" }),
+            Frame::Value(SynValue::Number(Number::Int(i))) => push_int(i, out),
+            Frame::Value(SynValue::Number(Number::Float(f))) => push_float(f, out),
+            Frame::Value(SynValue::Text(s)) => json_escape_str(&s, out),
+            Frame::Value(SynValue::List(l)) => { out.push('['); stack.push(Frame::List(l, 0)); }
+            Frame::Value(SynValue::Map(m)) => { out.push('{'); stack.push(Frame::Map(m, 0)); }
+            Frame::Value(other) => dumps_into(&syn_to_json(&other), out),
+            Frame::List(l, index) => {
+                let b = l.borrow();
+                if index == b.len() { out.push(']'); continue; }
+                if index > 0 { out.push_str(", "); }
+                if let Some(xs) = b.as_ints() {
+                    push_int(xs[index], out);
+                    stack.push(Frame::List(l.clone(), index + 1));
+                } else if let Some(xs) = b.as_floats() {
+                    push_float(xs[index], out);
+                    stack.push(Frame::List(l.clone(), index + 1));
+                } else {
+                    let value = b.as_values().unwrap()[index].clone();
+                    stack.push(Frame::List(l.clone(), index + 1));
+                    stack.push(Frame::Value(value));
                 }
             }
-            out.push(']');
-        }
-        SynValue::Map(m) => {
-            out.push('{');
-            for (i, (k, x)) in m.borrow().iter().enumerate() {
-                if i > 0 {
-                    out.push_str(", ");
-                }
-                json_escape_str(k.as_str(), out);
+            Frame::Map(m, index) => {
+                let b = m.borrow();
+                let Some((key, value)) = b.get_index(index) else { out.push('}'); continue; };
+                if index > 0 { out.push_str(", "); }
+                json_escape_str(key.as_str(), out);
                 out.push_str(": ");
-                dumps_syn_into(x, out);
+                let value = value.clone();
+                stack.push(Frame::Map(m.clone(), index + 1));
+                stack.push(Frame::Value(value));
             }
-            out.push('}');
         }
-        _ => dumps_into(&syn_to_json(v), out),
     }
 }
 
 /// `array` (Batch 5) → lista JSON anidada (row-major); el caso 0-D es un número.
 fn array_view_to_json<T: Copy>(a: &ndarray::ArrayViewD<T>, elem: fn(T) -> Json) -> Json {
-    if a.ndim() == 0 {
-        elem(*a.first().unwrap())
-    } else {
-        Json::Array(a.outer_iter().map(|s| array_view_to_json(&s, elem)).collect())
+    if a.ndim() == 0 { return elem(*a.first().unwrap()); }
+    let mut stack = vec![(a.clone(), 0usize, Vec::new())];
+    loop {
+        if stack.last().unwrap().1 == stack.last().unwrap().0.shape()[0] {
+            let (_, _, values) = stack.pop().unwrap();
+            let result = Json::Array(values);
+            if let Some((_, _, parent)) = stack.last_mut() { parent.push(result); }
+            else { return result; }
+            continue;
+        }
+        let child = {
+            let (view, index, _) = stack.last_mut().unwrap();
+            let child = view.clone().index_axis_move(ndarray::Axis(0), *index).into_dyn();
+            *index += 1;
+            child
+        };
+        if child.ndim() == 0 { stack.last_mut().unwrap().2.push(elem(*child.first().unwrap())); }
+        else { stack.push((child, 0, Vec::new())); }
     }
 }
 
 /// SynValue → árbol JSON (como `syn_to_json` del oráculo).
 pub fn syn_to_json(v: &SynValue) -> Json {
+    fn branch(v: &SynValue) -> bool {
+        matches!(v, SynValue::List(_) | SynValue::Map(_)) ||
+            matches!(v, SynValue::Server(s) if matches!(&**s, ServerValue::Envelope { .. } | ServerValue::WithHeaders { .. }))
+    }
+    fn child(v: &SynValue, i: usize) -> Option<SynValue> {
+        match v {
+            SynValue::List(l) => l.borrow().get(i),
+            SynValue::Map(m) => m.borrow().get_index(i).map(|(_, v)| v.clone()),
+            SynValue::Server(s) if i == 0 => match &**s {
+                ServerValue::Envelope { value, .. } => Some(value.clone()),
+                ServerValue::WithHeaders { inner, .. } => Some((**inner).clone()),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+    fn rebuild(v: &SynValue, mut out: Vec<Json>) -> Json {
+        match v {
+            SynValue::List(_) => Json::Array(out),
+            SynValue::Map(m) => Json::Object(m.borrow().iter().map(|(k, _)| k.to_string()).zip(out).collect()),
+            SynValue::Server(s) => match &**s {
+                ServerValue::Envelope { status, .. } => obj(vec![("status", Json::Int(*status)), ("value", out.pop().unwrap())]),
+                ServerValue::WithHeaders { .. } => out.pop().unwrap(),
+                _ => unreachable!(),
+            },
+            _ => unreachable!(),
+        }
+    }
+    if !branch(v) { return syn_to_json_leaf(v); }
+    let mut stack = vec![(v.clone(), Vec::new())];
+    loop {
+        let (value, out) = stack.last_mut().unwrap();
+        match child(value, out.len()) {
+            Some(next) if branch(&next) => stack.push((next, Vec::new())),
+            Some(next) => out.push(syn_to_json_leaf(&next)),
+            None => {
+                let (value, out) = stack.pop().unwrap();
+                let value = rebuild(&value, out);
+                if let Some((_, out)) = stack.last_mut() { out.push(value); }
+                else { return value; }
+            }
+        }
+    }
+}
+
+fn syn_to_json_leaf(v: &SynValue) -> Json {
     match v {
         SynValue::Nothing => Json::Null,
         // v0.6.29: fecha / instante / duración → su texto ISO 8601 (lo que lee cualquier API).
@@ -540,14 +703,16 @@ pub fn syn_to_json(v: &SynValue) -> Json {
 /// aproxima por "float entero de magnitud ≥ 2^63")? Entonces vale la pena re-parsear exacto.
 pub fn has_wide_int(v: &serde_json::Value) -> bool {
     use serde_json::Value as V;
-    match v {
-        V::Number(n) => {
-            !n.is_i64() && !n.is_u64() && n.as_f64().is_some_and(|f| f.fract() == 0.0 && f.abs() >= 9.2e18)
+    let mut stack = vec![v];
+    while let Some(value) = stack.pop() {
+        match value {
+            V::Number(n) if !n.is_i64() && !n.is_u64() && n.as_f64().is_some_and(|f| f.fract() == 0.0 && f.abs() >= 9.2e18) => return true,
+            V::Array(a) => stack.extend(a.iter()),
+            V::Object(o) => stack.extend(o.values()),
+            _ => {},
         }
-        V::Array(a) => a.iter().any(has_wide_int),
-        V::Object(o) => o.values().any(has_wide_int),
-        _ => false,
     }
+    false
 }
 
 pub fn json_to_syn(v: &serde_json::Value) -> SynValue {
@@ -673,38 +838,66 @@ pub(crate) fn meta_to_json(meta: Option<&SynValue>) -> Json {
     }
 }
 
-fn item_to_json(item: &SynValue) -> Json {
-    if is_node(item) {
-        node_to_json(item)
-    } else {
-        syn_to_json(item)
+pub(crate) fn node_to_json(node: &SynValue) -> Json {
+    struct Frame {
+        node: SynValue,
+        kind: String,
+        children: Vec<SynValue>,
+        values: Vec<Json>,
+    }
+    fn frame(node: &SynValue) -> Frame {
+        let kind = node_str(node, "kind");
+        let children = match kind.as_str() {
+            "page" | "section" => list_field(node, "nodes").into_iter().filter(is_node).collect(),
+            "list" | "ordered_list" => list_field(node, "items"),
+            _ => Vec::new(),
+        };
+        Frame { node: node.clone(), kind, children, values: Vec::new() }
+    }
+    let mut stack = vec![frame(node)];
+    loop {
+        let current = stack.last_mut().unwrap();
+        if current.values.len() < current.children.len() {
+            let child = current.children[current.values.len()].clone();
+            if is_node(&child) {
+                stack.push(frame(&child));
+            } else if let SynValue::Server(server) = &child {
+                if let ServerValue::Content(inner) = &**server {
+                    stack.push(frame(inner));
+                } else {
+                    current.values.push(syn_to_json(&child));
+                }
+            } else {
+                current.values.push(syn_to_json(&child));
+            }
+            continue;
+        }
+        let Frame { node, kind, values, .. } = stack.pop().unwrap();
+        let converted = node_to_json_fields(&node, kind, values);
+        if let Some(parent) = stack.last_mut() { parent.values.push(converted); }
+        else { return converted; }
     }
 }
 
-pub(crate) fn node_to_json(node: &SynValue) -> Json {
-    let kind = node_str(node, "kind");
+fn node_to_json_fields(node: &SynValue, kind: String, children: Vec<Json>) -> Json {
     match kind.as_str() {
         "page" => obj(vec![
             ("type", Json::Str("page".into())),
             ("meta", meta_to_json(node_field(node, "meta").as_ref())),
             (
                 "nodes",
-                Json::Array(
-                    list_field(node, "nodes").iter().filter(|n| is_node(n)).map(node_to_json).collect(),
-                ),
+                Json::Array(children),
             ),
         ]),
         "list" | "ordered_list" => obj(vec![
             ("type", Json::Str(kind.clone())),
-            ("items", Json::Array(list_field(node, "items").iter().map(item_to_json).collect())),
+            ("items", Json::Array(children)),
         ]),
         "section" => obj(vec![
             ("type", Json::Str("section".into())),
             (
                 "nodes",
-                Json::Array(
-                    list_field(node, "nodes").iter().filter(|n| is_node(n)).map(node_to_json).collect(),
-                ),
+                Json::Array(children),
             ),
         ]),
         // chart() (Batch 8/10): datos estructurados por kind — el agente obtiene
@@ -755,6 +948,124 @@ mod tests {
     use super::*;
     use synsema_core::tokens::SourceLocation;
     use synsema_core::types::syn_text;
+
+    #[test]
+    fn high_rank_array_json_keeps_logical_order() {
+        let shape = vec![1usize; 10_000];
+        let array = ndarray::ArrayD::from_shape_vec(ndarray::IxDyn(&shape), vec![7.0f64]).unwrap();
+        let tree = array_view_to_json(&array.view(), Json::Float);
+        let out = dumps(&tree);
+        assert_eq!(out.len(), 20_003);
+        assert_eq!(out.as_bytes()[10_000], b'7');
+    }
+
+    #[test]
+    fn deep_syn_to_json_preserves_nested_maps_and_envelopes() {
+        use synsema_core::types::{syn_int, syn_list, syn_map, Obj, SynMap};
+        let mut value = syn_int(7);
+        for i in 0..50_000 {
+            value = match i % 3 {
+                0 => syn_list(vec![value]),
+                1 => { let mut map = SynMap::new(); map.insert("k", value); syn_map(map) },
+                _ => SynValue::Server(Obj::new(ServerValue::Envelope { status: 201, value })),
+            };
+        }
+        let converted = syn_to_json(&value);
+        assert_eq!(dumps(&converted), dumps_syn(&value));
+        drop(converted);
+    }
+
+    #[test]
+    fn deep_content_nodes_encode_and_release() {
+        use synsema_core::types::syn_list;
+        let mut node = make_node("text", vec![("text", syn_text("end"))]);
+        for depth in 0..50_000 {
+            let kind = if depth % 2 == 0 { "section" } else { "list" };
+            let field = if depth % 2 == 0 { "nodes" } else { "items" };
+            node = make_node(kind, vec![(field, syn_list(vec![node]))]);
+        }
+        let converted = node_to_json(&node);
+        let output = dumps(&converted);
+        assert!(output.contains("\"text\": \"end\""));
+        assert_eq!(output.matches("\"type\"").count(), 50_001);
+        let content = SynValue::Server(synsema_core::types::Obj::new(ServerValue::Content(Box::new(node))));
+        assert_eq!(dumps(&syn_to_json(&content)), output);
+    }
+
+    #[test]
+    fn paged_json_materializes_deep_rows() {
+        use synsema_core::types::{syn_int, syn_list, Obj};
+        let mut row = syn_int(3);
+        for _ in 0..50_000 { row = syn_list(vec![row]); }
+        let paged = SynValue::Server(Obj::new(ServerValue::Paged(std::rc::Rc::new(move |_, _| Ok((vec![row.clone()], 1))))));
+        let out = dumps(&syn_to_json(&paged));
+        assert_eq!(out.len(), 100_003);
+        assert_eq!(out.as_bytes()[50_001], b'3');
+    }
+
+    #[test]
+    fn content_items_inside_node_lists_stay_iterative() {
+        use synsema_core::types::{syn_list, Obj};
+        let mut item = make_node("text", vec![("text", syn_text("end"))]);
+        for _ in 0..20_000 {
+            let wrapped = SynValue::Server(Obj::new(ServerValue::Content(Box::new(item))));
+            item = make_node("list", vec![("items", syn_list(vec![wrapped]))]);
+        }
+        let out = dumps(&node_to_json(&item));
+        assert_eq!(out.matches("\"type\"").count(), 20_001);
+        assert!(out.contains("\"text\": \"end\""));
+    }
+
+    #[test]
+    fn json_debug_keeps_derived_shape_at_depth() {
+        let shallow = Json::Object(vec![("a".into(), Json::Array(vec![Json::Int(1), Json::Null]))]);
+        assert_eq!(format!("{shallow:?}"), "Object([(\"a\", Array([Int(1), Null]))])");
+        let mut deep = Json::Null;
+        for _ in 0..50_000 { deep = Json::Array(vec![deep]); }
+        let rendered = format!("{deep:?}");
+        assert!(rendered.starts_with("Array([Array(["));
+        assert!(rendered.contains("Null"));
+    }
+
+    #[test]
+    fn deep_json_tree_writes_and_releases_normally() {
+        std::thread::Builder::new().stack_size(64 * 1024 * 1024).spawn(|| {
+            let mut tree = Json::Int(7);
+            for _ in 0..100_000 { tree = Json::Array(vec![tree]); }
+            let copy = tree.clone();
+            let output = dumps(&copy);
+            assert_eq!(output.len(), 200_001);
+            assert_eq!(output.as_bytes()[100_000], b'7');
+            drop(tree);
+            drop(copy);
+        }).unwrap().join().unwrap();
+    }
+
+    #[test]
+    fn deep_encode_is_linear_and_preserves_first_rejection() {
+        use synsema_core::types::{syn_int, syn_list, syn_map, SynMap};
+        let mut value = syn_int(7);
+        for _ in 0..100_000 { value = syn_list(vec![value]); }
+        assert!(reject_code(&value, "json_encode", "the value").is_ok());
+        let json = dumps_syn(&value);
+        assert_eq!(json.len(), 200_001);
+        assert_eq!(json.as_bytes()[0], b'[');
+        assert_eq!(json.as_bytes()[100_000], b'7');
+        let mut map = SynMap::new();
+        map.insert("deep", value);
+        map.insert("later", syn_int(8));
+        let value = syn_map(map);
+        assert_eq!(dumps_syn(&value).len(), 200_023);
+        let task = synsema_core::interpreter::Interpreter::new();
+        let p = synsema_core::parser::parse_source("task f()\n    give 1\n", "json.syn").unwrap();
+        let mut task = task;
+        assert!(task.execute(&p).is_ok());
+        let mut code = synsema_core::interpreter::env_get(&task.global_env, "f").unwrap();
+        for _ in 0..1000 { code = syn_list(vec![code]); }
+        let error = reject_code(&code, "json_encode", "the value").err().unwrap();
+        let Control::Error(error) = error else { panic!("expected error"); };
+        assert!(error.message.contains("not data"));
+    }
 
     /// v0.6.49 (B4): `[serve]` y "response/SSE body" sólo bajo serve; fuera de serve el aviso dice lo
     /// que pasó sin nombrar un servidor que no existe.

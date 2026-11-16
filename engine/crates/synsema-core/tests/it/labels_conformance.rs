@@ -51,6 +51,15 @@ fn run_err(source: &str) -> String {
     }
 }
 
+#[test]
+fn private_callback_arity_failure_keeps_the_callable_label() {
+    let (interp, result) = run_for_program("let f be private((a, b) => b, \"app\")\nlet r be apply(f, [1])\n");
+    let Err(Control::Error(error)) = result else { panic!("missing callback parameter must fail") };
+    assert!(error.is_fatal_for_labels());
+    assert_eq!(interp.output.len(), 1);
+    assert!(!error.to_string().contains("missing argument 'b'"));
+}
+
 /// Etiqueta (profunda) de una variable global, como `a,b`.
 fn label_of(interp: &Interpreter, name: &str) -> String {
     let v = env_get(&interp.global_env, name).unwrap_or_else(|| panic!("sin variable {}", name));

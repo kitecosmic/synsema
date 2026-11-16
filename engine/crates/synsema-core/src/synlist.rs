@@ -15,6 +15,14 @@ use crate::types::{ListRef, SynValue};
 #[derive(Clone)]
 pub struct SynList(Repr);
 
+impl Drop for SynList {
+    fn drop(&mut self) {
+        if let Repr::Values(values) = &mut self.0 {
+            crate::value_drop::list_values(std::mem::take(values));
+        }
+    }
+}
+
 /// Un elemento sin copiarlo: el valor donde vive, o el número sin caja.
 pub enum Elem<'a> {
     Value(&'a SynValue),
@@ -163,8 +171,8 @@ impl SynList {
     }
 
     /// Los elementos como valores (sin copiar si ya lo son).
-    pub fn into_vec(self) -> Vec<SynValue> {
-        match self.0 {
+    pub fn into_vec(mut self) -> Vec<SynValue> {
+        match std::mem::replace(&mut self.0, Repr::Values(Vec::new())) {
             Repr::Values(v) => v,
             r => boxed(r),
         }

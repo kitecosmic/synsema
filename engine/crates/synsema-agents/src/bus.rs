@@ -178,21 +178,51 @@ impl Subscriber {
 }
 
 /// Tamaño aproximado del payload (para la cota en bytes).
-pub fn send_size(v: &SendValue) -> usize {
+pub fn send_size(v: &SendValue) -> usize { size_at(v, 0) }
+
+fn size_at(v: &SendValue, depth: usize) -> usize {
+    if depth == 32 { return size_tail(v); }
     match v {
         SendValue::Number(_) => 16,
         SendValue::Text(s) => s.len(),
         SendValue::Bool(_) | SendValue::Nothing => 1,
-        SendValue::List(l) => l.iter().map(send_size).sum::<usize>() + 8,
-        SendValue::Map(m) => m.iter().map(|(k, v)| k.len() + send_size(v)).sum::<usize>() + 8,
+        SendValue::List(l) => l.iter().map(|v| size_at(v, depth + 1)).sum::<usize>() + 8,
+        SendValue::Map(m) => m.iter().map(|(k, v)| k.len() + size_at(v, depth + 1)).sum::<usize>() + 8,
         SendValue::Bytes(b) => b.len(),
         SendValue::Complex(_, _) => 16,
         SendValue::Array(_, d) => d.byte_len() + 8,
         SendValue::Time(_) => 24,
         SendValue::Rng(_, name) => 96 + name.len(),
         // El envoltorio con etiqueta pesa lo que pesa su valor, más los principales.
-        SendValue::Private(l, inner) => send_size(inner) + l.iter().map(|s| s.len()).sum::<usize>(),
+        SendValue::Private(l, inner) => size_at(inner, depth + 1) + l.iter().map(|s| s.len()).sum::<usize>(),
     }
+}
+
+#[cold]
+#[inline(never)]
+fn size_tail(v: &SendValue) -> usize {
+    fn head(v: &SendValue) -> usize {
+        match v {
+            SendValue::List(_) => 8,
+            SendValue::Map(m) => 8 + m.iter().map(|(k, _)| k.len()).sum::<usize>(),
+            SendValue::Private(l, _) => l.iter().map(|s| s.len()).sum(),
+            _ => size_at(v, 0),
+        }
+    }
+    let mut total = head(v);
+    let mut stack = vec![(v, 0)];
+    while let Some((v, i)) = stack.last_mut() {
+        let child = match *v {
+            SendValue::List(v) => v.get(*i),
+            SendValue::Map(v) => v.get(*i).map(|(_, v)| v),
+            SendValue::Private(_, v) if *i == 0 => Some(&**v),
+            _ => None,
+        };
+        *i += 1;
+        if let Some(v) = child { total += head(v); stack.push((v, 0)); }
+        else { stack.pop(); }
+    }
+    total
 }
 
 pub struct SubscribeOpts {
@@ -400,5 +430,23 @@ mod tests {
         let ev = s.recv_timeout(Duration::from_secs(5), &|| false).unwrap().unwrap();
         assert_eq!(ev.topic, "t");
         assert!(t0.elapsed() < Duration::from_secs(2));
+    }
+}
+
+#[cfg(test)]
+mod deep_size_tests {
+    use super::*;
+    #[test]
+    fn owned_payload_size_is_deep_and_exact() {
+        let mut v = SendValue::Nothing;
+        let mut expected = 1;
+        for i in 0..1_000_000 {
+            v = match i % 3 {
+                0 => { expected += 8; SendValue::List(vec![v]) },
+                1 => { expected += 9; SendValue::Map(vec![("k".into(), v)]) },
+                _ => { expected += 1; SendValue::Private(vec!["p".into()], Box::new(v)) },
+            };
+        }
+        assert_eq!(send_size(&v), expected);
     }
 }

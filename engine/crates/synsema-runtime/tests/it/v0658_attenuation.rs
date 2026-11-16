@@ -5,7 +5,7 @@
 //! es del proceso: una sola carpeta para todo el binario, con el mismo valor en cada test.
 
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 use synsema_core::modtable::{sha256_hex, tree_hash};
 use synsema_runtime::engine::run_source;
@@ -22,6 +22,7 @@ fn cache() -> &'static Path {
 
 /// Un paquete en el caché; devuelve su hash. `deps` es el objeto `modules` del índice (o vacío).
 fn publish(id: &str, version: &str, main: &str, files: &[(&str, &str)], deps: &str) -> String {
+    static PUBLISH_LOCK: Mutex<()> = Mutex::new(());
     let cache = cache();
     let entries: Vec<String> =
         files.iter().map(|(p, c)| format!("{{\"path\": \"{}\", \"sha256\": \"{}\"}}", p, sha256_hex(c.as_bytes()))).collect();
@@ -39,10 +40,15 @@ fn publish(id: &str, version: &str, main: &str, files: &[(&str, &str)], deps: &s
         shas.iter().map(|(p, s)| (p.as_str(), s.as_str())).chain(std::iter::once(("synsema.json", index_sha.as_str()))),
     );
     let dir = cache.join(hash.replacen(':', "-", 1));
-    std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(dir.join("synsema.json"), &index).unwrap();
-    for (p, c) in files {
-        std::fs::write(dir.join(p), c).unwrap();
+    // Several tests publish the same hash concurrently. A reader may start as soon as
+    // its publish returns, so never rewrite an already published cache tree.
+    let _guard = PUBLISH_LOCK.lock().unwrap();
+    if !dir.exists() {
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("synsema.json"), &index).unwrap();
+        for (p, c) in files {
+            std::fs::write(dir.join(p), c).unwrap();
+        }
     }
     hash
 }

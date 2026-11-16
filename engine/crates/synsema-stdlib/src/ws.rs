@@ -2998,23 +2998,55 @@ fn bus_of(reg: &Registry, fname: &str) -> Result<Arc<Bus>, Control> {
 /// Conversión ESTRICTA a `SendValue` para publicar: una task, un builtin o un secret no
 /// cruzan el bus (nunca degradados a texto en silencio — el suscriptor recibiría basura
 /// o un secret redactado sin saberlo).
-fn to_send_strict(v: &SynValue, fname: &str) -> Result<SendValue, Control> {
+fn to_send_strict(v: &SynValue, fname: &str) -> Result<SendValue, Control> { strict_at(v, fname, 0) }
+
+fn strict_at(v: &SynValue, fname: &str, depth: usize) -> Result<SendValue, Control> {
+    if depth == 32 { return strict_tail(v, fname); }
     match v {
         SynValue::Task(_) | SynValue::Builtin(_) => {
             Err(err(format!("{}: cannot publish a task on the bus (publish data: text/number/bool/list/map/bytes)", fname)))
         }
         SynValue::Secret(_) => Err(err(format!("{}: cannot publish a secret on the bus", fname))),
         SynValue::List(l) => Ok(SendValue::List(
-            list_values(&l).iter().map(|x| to_send_strict(x, fname)).collect::<Result<Vec<_>, _>>()?,
+            (0..l.borrow().len()).map(|i| strict_at(&l.borrow().get(i).unwrap(), fname, depth + 1)).collect::<Result<Vec<_>, _>>()?,
         )),
         SynValue::Map(m) => Ok(SendValue::Map(
             m.borrow()
                 .iter()
-                .map(|(k, x)| to_send_strict(x, fname).map(|sv| (k.to_string(), sv)))
+                .map(|(k, x)| strict_at(x, fname, depth + 1).map(|sv| (k.to_string(), sv)))
                 .collect::<Result<Vec<_>, _>>()?,
         )),
         other => Ok(synsema_core::types::to_send(other)),
     }
+}
+
+#[cold]
+#[inline(never)]
+fn strict_tail(v: &SynValue, fname: &str) -> Result<SendValue, Control> {
+    // Validation has the original strict policy: only lists/maps are traversed;
+    // server/private wrappers retain to_send's existing snapshot policy.
+    fn check(v: &SynValue, fname: &str) -> Result<(), Control> {
+        match v {
+            SynValue::Task(_) | SynValue::Builtin(_) => Err(err(format!("{}: cannot publish a task on the bus (publish data: text/number/bool/list/map/bytes)", fname))),
+            SynValue::Secret(_) => Err(err(format!("{}: cannot publish a secret on the bus", fname))),
+            _ => Ok(()),
+        }
+    }
+    check(v, fname)?;
+    let mut stack = vec![(v.clone(), 0)];
+    while let Some((v, i)) = stack.last_mut() {
+        let next = match v {
+            SynValue::List(l) => l.borrow().get(*i),
+            SynValue::Map(m) => m.borrow().get_index(*i).map(|(_, v)| v.clone()),
+            _ => None,
+        };
+        *i += 1;
+        if let Some(v) = next {
+            check(&v, fname)?;
+            if matches!(v, SynValue::List(_) | SynValue::Map(_)) { stack.push((v, 0)); }
+        } else { stack.pop(); }
+    }
+    Ok(synsema_core::types::to_send(v))
 }
 
 fn topic_arg(v: Option<&SynValue>, fname: &str) -> Result<String, Control> {
@@ -3609,5 +3641,23 @@ mod v0654_reconnect_layers {
         }));
         assert!(r.is_err());
         assert!(caps.borrow().delegations().is_empty(), "las capas quedaron puestas");
+    }
+}
+
+#[cfg(test)]
+mod deep_send_tests {
+    use super::*;
+    #[test]
+    fn strict_bus_conversion_rejects_a_deep_task_and_preserves_data() {
+        let mut v = syn_int(7);
+        for _ in 0..50000 { v = synsema_core::types::syn_list(vec![v]); }
+        let Ok(owned) = to_send_strict(&v, "bus_publish") else { panic!("valid deep data must cross"); };
+        assert!(synsema_core::types::from_send(&owned).syn_equals(&v));
+        let mut i = Interpreter::new();
+        let p = synsema_core::parser::parse_source("task f()\n    give 1\n", "deep.syn").unwrap();
+        assert!(i.execute(&p).is_ok());
+        let mut v = synsema_core::interpreter::env_get(&i.global_env, "f").unwrap();
+        for _ in 0..50000 { v = synsema_core::types::syn_list(vec![v]); }
+        assert!(to_send_strict(&v, "bus_publish").is_err());
     }
 }

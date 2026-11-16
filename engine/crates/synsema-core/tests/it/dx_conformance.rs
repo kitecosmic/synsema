@@ -5,7 +5,10 @@
 //! intérprete — el REPL y `run --explain` ven exactamente estos builtins (G-4: un solo
 //! punto de registro, `Interpreter::register`).
 
-use synsema_core::interpreter::run_source;
+use synsema_core::interpreter::{env_get, run_source, Control, Interpreter};
+use synsema_core::parser::parse_source;
+use synsema_core::tokens::SourceLocation;
+use synsema_core::types::{syn_int, SynValue};
 
 fn out(source: &str) -> Vec<String> {
     let r = run_source(source, "<test>");
@@ -46,6 +49,33 @@ fn dual_order_apply() {
         "text(apply([1, 2, 3], (x) => x * 2))",
         "[2, 4, 6]",
     );
+}
+
+#[test]
+fn internal_callbacks_reject_missing_required_arguments_only_when_invoked() {
+    fails_with("print(apply((a, b) => b, [1, 2]))", "missing argument 'b'");
+    fails_with("print(where([1], (a, b) => true))", "missing argument 'b'");
+    fails_with("print(reduce([1, 2], (acc, x, extra) => extra, 0))", "missing argument 'extra'");
+    fails_with("print(sort_by([2, 1], (a, b) => a))", "missing argument 'b'");
+    shows("text(apply(() => 7, [1, 2]))", "[7, 7]");
+    assert_eq!(out("task plus_default(a, b = 9)\n    give a + b\nprint(text(apply(plus_default, [1, 2])))\n"), vec!["[10, 11]"]);
+    shows("text(apply((a, b) => b, []))", "[]");
+}
+
+#[test]
+fn host_callback_arity_fails_before_body_and_recovers_on_next_call() {
+    let program = parse_source("let hit be 0\ntask f(a, b)\n    set hit to hit + 1\n    give a + b\n", "<host>").expect("source");
+    let mut interp = Interpreter::new();
+    assert!(interp.execute(&program).is_ok());
+    let func = env_get(&interp.global_env, "f").expect("task");
+    let loc = SourceLocation { file: "<host>".into(), line: 0, column: 0, offset: 0 };
+    let error = interp.call_callback(func.clone(), vec![syn_int(2)], &loc);
+    let Err(Control::Error(error)) = error else { panic!("required argument was omitted") };
+    assert!(error.to_string().contains("missing argument 'b'"));
+    assert_eq!(env_get(&interp.global_env, "hit").unwrap().to_string(), "0");
+    let result = interp.call_task(func, vec![syn_int(2), syn_int(3)]);
+    assert!(matches!(result, Ok(SynValue::Number(_))));
+    assert_eq!(env_get(&interp.global_env, "hit").unwrap().to_string(), "1");
 }
 
 #[test]
