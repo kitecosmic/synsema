@@ -1,0 +1,20 @@
+-- BPE: el while con when/otherwise y append da los mismos pasos en referencia y JIT.
+-- Tamaño corto para que el oráculo no exceda su límite de 20 segundos.
+task fusionar(ids, a, b, nuevo)
+    let salida be []
+    let i be 0
+    let n be length(ids)
+    while i < n
+        when i < n - 1 and ids[i] == a and ids[i + 1] == b
+            set salida to append(salida, nuevo)
+            set i to i + 2
+        otherwise
+            set salida to append(salida, ids[i])
+            set i to i + 1
+    give salida
+let ids be range(0, 1000)
+let total be 0
+each pass in range(0, 10)
+    set total to total + length(fusionar(ids, 300, 301, 999))
+print(total)
+
