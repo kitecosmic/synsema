@@ -1,8 +1,8 @@
 {
  "budget_pct": 0.3,
  "meta": {
-  "commit": "6c9b716",
-  "runner": "ubuntu24 20261111.127.1",
+  "commit": "0cd9527",
+  "runner": "ubuntu24 20261111.370.1",
   "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
   "valgrind": "valgrind-3.22.0"
  },
@@ -44,7 +44,7 @@
     "<cranelift_codegen::verifier::Verifier>::run": 561427,
     "<cranelift_codegen::verifier::Verifier>::verify_value": 29733,
     "<cranelift_frontend::frontend::FuncInstBuilder as cranelift_codegen::ir::builder::InstBuilderBase>::build": 23439,
-    "<hashbrown::map::HashMap<&str, (usize, core::option::Option<usize>), std::hash::random::RandomState> as core::iter::traits::collect::Extend<(&str, (usize, core::option::Option<usize>))>>::extend::<core::iter::adapters::map::Map<core::slice::iter::Iter<(&str, usize, core::option::Option<usize>)>, synsema_core::builtin_arity::arity_of::{closure#0}::{closure#0}>>": 23773,
+    "<hashbrown::map::HashMap<&str, (usize, core::option::Option<usize>), std::hash::random::RandomState> as core::iter::traits::collect::Extend<(&str, (usize, core::option::Option<usize>))>>::extend::<core::iter::adapters::map::Map<core::slice::iter::Iter<(&str, usize, core::option::Option<usize>)>, synsema_core::builtin_arity::arity_of::{closure#0}::{closure#0}>>": 23635,
     "<hashbrown::map::HashMap<alloc::sync::Arc<str>, u32, rustc_hash::FxBuildHasher>>::insert": 24842,
     "<hashbrown::raw::RawTable<(alloc::sync::Arc<str>, u32)>>::reserve_rehash::<hashbrown::map::make_hasher<alloc::sync::Arc<str>, u32, rustc_hash::FxBuildHasher>::{closure#0}>": 25973,
     "<regalloc2::ion::data_structures::Env<cranelift_codegen::machinst::vcode::VCode<cranelift_codegen::isa::x64::lower::isle::generated_code::MInst>>>::compute_requirement": 23616,
@@ -85,13 +85,13 @@
     "do_lookup_x": 87879,
     "free": 151864,
     "malloc": 207799,
-    "malloc_consolidate": 80452,
+    "malloc_consolidate": 80420,
     "realloc": 43260,
     "strcmp": 24567,
     "synsema_core::interpreter::vm::native::native_args": 55944,
-    "unlink_chunk.isra.0": 46434
+    "unlink_chunk.isra.0": 46416
    },
-   "total": 17988221
+   "total": 17988202
   },
   "a_args0|ref": {
    "fns": {
@@ -117,7 +117,7 @@
     "<synsema_core::number::Number>::checked_add": 5130000,
     "<synsema_core::number::Number>::partial_cmp_num": 1800020,
     "<synsema_core::types::SynValue as core::clone::Clone>::clone": 7200060,
-    "__memcmp_avx2_movbe": 6327065,
+    "__memcmp_avx2_movbe": 6327043,
     "__memcpy_avx_unaligned_erms": 13894080,
     "_dl_relocate_object": 640035,
     "_int_free": 9840675,
@@ -130,7 +130,7 @@
     "synsema_core::interpreter::env_update": 15390000,
     "synsema_core::temporal::binop": 2430000
    },
-   "total": 489231345
+   "total": 489231477
   },
   "a_args0|vm": {
    "fns": {
@@ -144,13 +144,13 @@
     "<synsema_core::interpreter::Interpreter>::vm_call": 32220104,
     "<synsema_core::number::Number as core::clone::Clone>::clone": 15120432,
     "<synsema_core::types::SynValue as core::clone::Clone>::clone": 9000116,
-    "__memcmp_avx2_movbe": 1827348,
+    "__memcmp_avx2_movbe": 1827260,
     "_dl_relocate_object": 640035,
     "_int_malloc": 170003,
     "core::ptr::drop_glue::<[synsema_core::interpreter::EachItems]>": 2340026,
     "core::ptr::drop_glue::<synsema_core::types::SynValue>": 25564752
    },
-   "total": 308320030
+   "total": 308319512
   },
   "a_args1|jit": {
    "fns": {
@@ -210,17 +210,17 @@
     "<synsema_core::number::Number as core::clone::Clone>::clone": 192528,
     "<synsema_core::types::SynValue as core::clone::Clone>::clone": 110496,
     "<synsema_jit::abi::Compiled as synsema_core::native_tier::NativeCode>::call": 79997,
-    "???": 7679471,
+    "???": 7679473,
     "____strtoul_l_internal": 25072,
-    "__memcmp_avx2_movbe": 53478,
-    "__memcpy_avx_unaligned_erms": 227545,
+    "__memcmp_avx2_movbe": 53608,
+    "__memcpy_avx_unaligned_erms": 227556,
     "__vfscanf_internal": 53688,
     "_dl_lookup_symbol_x": 47557,
     "_dl_relocate_object": 640035,
     "_int_free": 300563,
     "_int_free_merge_chunk": 50365,
     "_int_malloc": 336439,
-    "_int_realloc": 33185,
+    "_int_realloc": 33170,
     "core::iter::adapters::chain::and_then_or_clear::<core::iter::adapters::chain::Chain<core::iter::adapters::copied::Copied<core::slice::iter::Iter<cranelift_codegen::ir::entities::Value>>, core::iter::adapters::flatten::FlatMap<core::slice::iter::Iter<cranelift_codegen::ir::instructions::BlockCall>, core::iter::adapters::filter_map::FilterMap<core::iter::adapters::map::Map<core::slice::iter::Iter<cranelift_codegen::ir::entities::Value>, <cranelift_codegen::ir::instructions::BlockCall>::args::{closure#0}>, <cranelift_codegen::ir::dfg::DataFlowGraph>::inst_values::{closure#0}::{closure#0}>, <cranelift_codegen::ir::dfg::DataFlowGraph>::inst_values::{closure#0}>>, cranelift_codegen::ir::entities::Value, <core::iter::adapters::chain::Chain<core::iter::adapters::copied::Copied<core::slice::iter::Iter<cranelift_codegen::ir::entities::Value>>, core::iter::adapters::flatten::FlatMap<core::slice::iter::Iter<cranelift_codegen::ir::instructions::BlockCall>, core::iter::adapters::filter_map::FilterMap<core::iter::adapters::map::Map<core::slice::iter::Iter<cranelift_codegen::ir::entities::Value>, <cranelift_codegen::ir::instructions::BlockCall>::args::{closure#0}>, <cranelift_codegen::ir::dfg::DataFlowGraph>::inst_values::{closure#0}::{closure#0}>, <cranelift_codegen::ir::dfg::DataFlowGraph>::inst_values::{closure#0}>> as core::iter::traits::iterator::Iterator>::next>": 75964,
     "core::ptr::drop_glue::<synsema_core::types::SynValue>": 341103,
     "cranelift_codegen::alias_analysis::classify": 31910,
@@ -235,7 +235,7 @@
     "strcmp": 24567,
     "synsema_core::interpreter::vm::native::native_args": 70929
    },
-   "total": 19159010
+   "total": 19159056
   },
   "a_args1|ref": {
    "fns": {
@@ -265,7 +265,7 @@
     "<synsema_core::number::Number>::checked_add": 5130000,
     "<synsema_core::number::Number>::partial_cmp_num": 1800020,
     "<synsema_core::types::SynValue as core::clone::Clone>::clone": 7200060,
-    "__memcmp_avx2_movbe": 6326900,
+    "__memcmp_avx2_movbe": 6326878,
     "__memcpy_avx_unaligned_erms": 13895789,
     "_dl_relocate_object": 640035,
     "_int_free": 19563714,
@@ -278,7 +278,7 @@
     "synsema_core::interpreter::env_update": 15390000,
     "synsema_core::temporal::binop": 2430000
    },
-   "total": 596534251
+   "total": 596534329
   },
   "a_args1|vm": {
    "fns": {
@@ -293,12 +293,12 @@
     "<synsema_core::interpreter::Interpreter>::vm_call": 32220104,
     "<synsema_core::number::Number as core::clone::Clone>::clone": 19440528,
     "<synsema_core::types::SynValue as core::clone::Clone>::clone": 10800116,
-    "__memcmp_avx2_movbe": 1827188,
+    "__memcmp_avx2_movbe": 1827144,
     "_dl_relocate_object": 640035,
     "core::ptr::drop_glue::<[synsema_core::interpreter::EachItems]>": 2340026,
     "core::ptr::drop_glue::<synsema_core::types::SynValue>": 31504804
    },
-   "total": 349928733
+   "total": 349928608
   },
   "a_args4|jit": {
    "fns": {
@@ -357,7 +357,7 @@
     "<synsema_core::types::SynValue as core::clone::Clone>::clone": 170496,
     "<synsema_jit::abi::Compiled as synsema_core::native_tier::NativeCode>::call": 79997,
     "???": 8038582,
-    "__memcmp_avx2_movbe": 54598,
+    "__memcmp_avx2_movbe": 54555,
     "__memcpy_avx_unaligned_erms": 240904,
     "__vfscanf_internal": 53688,
     "_dl_lookup_symbol_x": 47557,
@@ -376,14 +376,14 @@
     "do_lookup_x": 87879,
     "free": 165514,
     "malloc": 223888,
-    "malloc_consolidate": 86458,
+    "malloc_consolidate": 86426,
     "realloc": 53632,
     "synsema_core::interpreter::vm::native::arg_word": 83916,
     "synsema_core::interpreter::vm::native::native_args": 103896,
-    "synsema_jit::lower::build": 30270,
-    "unlink_chunk.isra.0": 50688
+    "synsema_jit::lower::build": 30256,
+    "unlink_chunk.isra.0": 50685
    },
-   "total": 21483604
+   "total": 21483694
   },
   "a_args4|ref": {
    "fns": {
@@ -413,8 +413,8 @@
     "<synsema_core::number::Number>::checked_add": 5130000,
     "<synsema_core::number::Number>::partial_cmp_num": 1800020,
     "<synsema_core::types::SynValue as core::clone::Clone>::clone": 7200060,
-    "__memcmp_avx2_movbe": 30086939,
-    "__memcpy_avx_unaligned_erms": 13901259,
+    "__memcmp_avx2_movbe": 30086895,
+    "__memcpy_avx_unaligned_erms": 13901248,
     "_dl_relocate_object": 640035,
     "_int_free": 19569508,
     "core::ptr::drop_glue::<synsema_core::interpreter::Bindings>": 17280080,
@@ -426,7 +426,7 @@
     "synsema_core::interpreter::env_update": 15390000,
     "synsema_core::temporal::binop": 2430000
    },
-   "total": 821585572
+   "total": 821585608
   },
   "a_args4|vm": {
    "fns": {
@@ -441,12 +441,12 @@
     "<synsema_core::interpreter::Interpreter>::vm_call": 32220104,
     "<synsema_core::number::Number as core::clone::Clone>::clone": 32400816,
     "<synsema_core::types::SynValue as core::clone::Clone>::clone": 16200116,
-    "__memcmp_avx2_movbe": 1827680,
+    "__memcmp_avx2_movbe": 1827636,
     "_dl_relocate_object": 640035,
     "core::ptr::drop_glue::<[synsema_core::interpreter::EachItems]>": 2340026,
     "core::ptr::drop_glue::<synsema_core::types::SynValue>": 49324960
    },
-   "total": 459431896
+   "total": 459431769
   },
   "a_name64|jit": {
    "fns": {
@@ -484,7 +484,7 @@
     "<cranelift_codegen::verifier::Verifier>::run": 561427,
     "<cranelift_codegen::verifier::Verifier>::verify_value": 29733,
     "<cranelift_frontend::frontend::FuncInstBuilder as cranelift_codegen::ir::builder::InstBuilderBase>::build": 23439,
-    "<hashbrown::map::HashMap<&str, (usize, core::option::Option<usize>), std::hash::random::RandomState> as core::iter::traits::collect::Extend<(&str, (usize, core::option::Option<usize>))>>::extend::<core::iter::adapters::map::Map<core::slice::iter::Iter<(&str, usize, core::option::Option<usize>)>, synsema_core::builtin_arity::arity_of::{closure#0}::{closure#0}>>": 23654,
+    "<hashbrown::map::HashMap<&str, (usize, core::option::Option<usize>), std::hash::random::RandomState> as core::iter::traits::collect::Extend<(&str, (usize, core::option::Option<usize>))>>::extend::<core::iter::adapters::map::Map<core::slice::iter::Iter<(&str, usize, core::option::Option<usize>)>, synsema_core::builtin_arity::arity_of::{closure#0}::{closure#0}>>": 23541,
     "<hashbrown::map::HashMap<alloc::sync::Arc<str>, u32, rustc_hash::FxBuildHasher>>::insert": 24834,
     "<hashbrown::raw::RawTable<(alloc::sync::Arc<str>, u32)>>::reserve_rehash::<hashbrown::map::make_hasher<alloc::sync::Arc<str>, u32, rustc_hash::FxBuildHasher>::{closure#0}>": 25973,
     "<regalloc2::ion::data_structures::Env<cranelift_codegen::machinst::vcode::VCode<cranelift_codegen::isa::x64::lower::isle::generated_code::MInst>>>::compute_requirement": 23616,
@@ -506,7 +506,7 @@
     "<synsema_jit::abi::Compiled as synsema_core::native_tier::NativeCode>::call": 79997,
     "???": 7321417,
     "____strtoul_l_internal": 25072,
-    "__memcmp_avx2_movbe": 67002,
+    "__memcmp_avx2_movbe": 66958,
     "__memcpy_avx_unaligned_erms": 218697,
     "__vfscanf_internal": 53688,
     "_dl_lookup_symbol_x": 47557,
@@ -525,13 +525,13 @@
     "do_lookup_x": 87879,
     "free": 151864,
     "malloc": 207571,
-    "malloc_consolidate": 79364,
+    "malloc_consolidate": 79358,
     "realloc": 43193,
     "strcmp": 24567,
     "synsema_core::interpreter::vm::native::native_args": 55944,
-    "unlink_chunk.isra.0": 46029
+    "unlink_chunk.isra.0": 46035
    },
-   "total": 18004744
+   "total": 18004528
   },
   "a_name64|ref": {
    "fns": {
@@ -557,7 +557,7 @@
     "<synsema_core::number::Number>::checked_add": 5130000,
     "<synsema_core::number::Number>::partial_cmp_num": 1800020,
     "<synsema_core::types::SynValue as core::clone::Clone>::clone": 7200060,
-    "__memcmp_avx2_movbe": 7587010,
+    "__memcmp_avx2_movbe": 7586967,
     "__memcpy_avx_unaligned_erms": 13893997,
     "_dl_relocate_object": 640035,
     "_int_free": 9840806,
@@ -570,7 +570,7 @@
     "synsema_core::interpreter::env_update": 15390000,
     "synsema_core::temporal::binop": 2430000
    },
-   "total": 493921292
+   "total": 493920886
   },
   "a_name64|vm": {
    "fns": {
@@ -584,13 +584,13 @@
     "<synsema_core::interpreter::Interpreter>::vm_call": 32220104,
     "<synsema_core::number::Number as core::clone::Clone>::clone": 15120432,
     "<synsema_core::types::SynValue as core::clone::Clone>::clone": 9000116,
-    "__memcmp_avx2_movbe": 3087203,
+    "__memcmp_avx2_movbe": 3087225,
     "_dl_relocate_object": 640035,
     "_int_malloc": 170374,
     "core::ptr::drop_glue::<[synsema_core::interpreter::EachItems]>": 2340026,
     "core::ptr::drop_glue::<synsema_core::types::SynValue>": 25564752
    },
-   "total": 309588520
+   "total": 309588805
   },
   "c_base|jit": {
    "fns": {
@@ -625,7 +625,7 @@
     "<cranelift_codegen::verifier::Verifier>::encodable_as_bb": 12332,
     "<cranelift_codegen::verifier::Verifier>::run": 216502,
     "<cranelift_codegen::verifier::Verifier>::verify_value": 11271,
-    "<hashbrown::map::HashMap<&str, (usize, core::option::Option<usize>), std::hash::random::RandomState> as core::iter::traits::collect::Extend<(&str, (usize, core::option::Option<usize>))>>::extend::<core::iter::adapters::map::Map<core::slice::iter::Iter<(&str, usize, core::option::Option<usize>)>, synsema_core::builtin_arity::arity_of::{closure#0}::{closure#0}>>": 23707,
+    "<hashbrown::map::HashMap<&str, (usize, core::option::Option<usize>), std::hash::random::RandomState> as core::iter::traits::collect::Extend<(&str, (usize, core::option::Option<usize>))>>::extend::<core::iter::adapters::map::Map<core::slice::iter::Iter<(&str, usize, core::option::Option<usize>)>, synsema_core::builtin_arity::arity_of::{closure#0}::{closure#0}>>": 23602,
     "<hashbrown::map::HashMap<alloc::sync::Arc<str>, u32, rustc_hash::FxBuildHasher>>::insert": 24708,
     "<hashbrown::raw::RawTable<(alloc::sync::Arc<str>, u32)>>::reserve_rehash::<hashbrown::map::make_hasher<alloc::sync::Arc<str>, u32, rustc_hash::FxBuildHasher>::{closure#0}>": 25973,
     "<regalloc2::ion::data_structures::Env<cranelift_codegen::machinst::vcode::VCode<cranelift_codegen::isa::x64::lower::isle::generated_code::MInst>>>::init": 120900,
@@ -672,10 +672,10 @@
     "malloc": 138780,
     "realloc": 25761,
     "strcmp": 24567,
-    "synsema_core::builtin_arity::arity_of": 13389,
-    "synsema_jit::lower::build": 8918
+    "synsema_core::builtin_arity::arity_of": 13312,
+    "synsema_jit::lower::build": 8933
    },
-   "total": 6627700
+   "total": 6627574
   },
   "c_base|ref": {
    "fns": {
@@ -693,7 +693,7 @@
     "<synsema_core::number::Number>::checked_add": 5130000,
     "<synsema_core::number::Number>::partial_cmp_num": 1800020,
     "<synsema_core::types::SynValue as core::clone::Clone>::clone": 2700045,
-    "__memcmp_avx2_movbe": 2726758,
+    "__memcmp_avx2_movbe": 2726736,
     "_dl_relocate_object": 640035,
     "_int_free": 110029,
     "_int_malloc": 150291,
@@ -704,7 +704,7 @@
     "synsema_core::interpreter::env_update": 5130000,
     "synsema_core::temporal::binop": 2430000
    },
-   "total": 173073073
+   "total": 173072572
   },
   "c_base|vm": {
    "fns": {
@@ -724,7 +724,7 @@
     "free": 58958,
     "malloc": 92579
    },
-   "total": 96711807
+   "total": 96711823
   },
   "c_builtin_abs|jit": {
    "fns": {
@@ -761,7 +761,7 @@
     "<cranelift_codegen::verifier::Verifier>::run": 390359,
     "<cranelift_codegen::verifier::Verifier>::verify_value": 20791,
     "<cranelift_frontend::frontend::FuncInstBuilder as cranelift_codegen::ir::builder::InstBuilderBase>::build": 16016,
-    "<hashbrown::map::HashMap<&str, (usize, core::option::Option<usize>), std::hash::random::RandomState> as core::iter::traits::collect::Extend<(&str, (usize, core::option::Option<usize>))>>::extend::<core::iter::adapters::map::Map<core::slice::iter::Iter<(&str, usize, core::option::Option<usize>)>, synsema_core::builtin_arity::arity_of::{closure#0}::{closure#0}>>": 23668,
+    "<hashbrown::map::HashMap<&str, (usize, core::option::Option<usize>), std::hash::random::RandomState> as core::iter::traits::collect::Extend<(&str, (usize, core::option::Option<usize>))>>::extend::<core::iter::adapters::map::Map<core::slice::iter::Iter<(&str, usize, core::option::Option<usize>)>, synsema_core::builtin_arity::arity_of::{closure#0}::{closure#0}>>": 23523,
     "<hashbrown::map::HashMap<alloc::sync::Arc<str>, u32, rustc_hash::FxBuildHasher>>::insert": 24708,
     "<hashbrown::raw::RawTable<(alloc::sync::Arc<str>, u32)>>::reserve_rehash::<hashbrown::map::make_hasher<alloc::sync::Arc<str>, u32, rustc_hash::FxBuildHasher>::{closure#0}>": 25973,
     "<regalloc2::ion::data_structures::Env<cranelift_codegen::machinst::vcode::VCode<cranelift_codegen::isa::x64::lower::isle::generated_code::MInst>>>::init": 197385,
@@ -785,7 +785,7 @@
     "<synsema_core::types::SynValue as core::clone::Clone>::clone": 65413,
     "???": 2938294,
     "____strtoul_l_internal": 25072,
-    "__memcmp_avx2_movbe": 50492,
+    "__memcmp_avx2_movbe": 50448,
     "__memcpy_avx_unaligned_erms": 94605,
     "__vfscanf_internal": 53688,
     "_dl_lookup_symbol_x": 47557,
@@ -809,7 +809,7 @@
     "synsema_core::math::abs": 51000,
     "synsema_core::math::num": 19000
    },
-   "total": 10580552
+   "total": 10580476
   },
   "c_builtin_abs|ref": {
    "fns": {
@@ -835,7 +835,7 @@
     "<synsema_core::number::Number>::checked_add": 5130000,
     "<synsema_core::number::Number>::partial_cmp_num": 1800020,
     "<synsema_core::types::SynValue as core::clone::Clone>::clone": 5850045,
-    "__memcmp_avx2_movbe": 6236901,
+    "__memcmp_avx2_movbe": 6236857,
     "_dl_relocate_object": 640035,
     "_int_free": 4974575,
     "core::ptr::drop_glue::<synsema_core::types::SynValue>": 21694447,
@@ -848,7 +848,7 @@
     "synsema_core::math::num": 1710000,
     "synsema_core::temporal::binop": 2430000
    },
-   "total": 334028098
+   "total": 334027919
   },
   "c_builtin_abs|vm": {
    "fns": {
@@ -862,7 +862,7 @@
     "<synsema_core::interpreter::Interpreter>::vm_call_builtin": 17369807,
     "<synsema_core::number::Number as core::clone::Clone>::clone": 12960384,
     "<synsema_core::types::SynValue as core::clone::Clone>::clone": 5850101,
-    "__memcmp_avx2_movbe": 1737129,
+    "__memcmp_avx2_movbe": 1737108,
     "_dl_relocate_object": 640035,
     "_int_free": 121323,
     "_int_malloc": 163261,
@@ -870,7 +870,7 @@
     "synsema_core::math::abs": 4590000,
     "synsema_core::math::num": 1710000
    },
-   "total": 200167811
+   "total": 200167668
   },
   "c_call4|jit": {
    "fns": {
@@ -910,7 +910,7 @@
     "<cranelift_codegen::verifier::Verifier>::run": 613416,
     "<cranelift_codegen::verifier::Verifier>::verify_value": 31841,
     "<cranelift_frontend::frontend::FuncInstBuilder as cranelift_codegen::ir::builder::InstBuilderBase>::build": 24918,
-    "<hashbrown::map::HashMap<&str, (usize, core::option::Option<usize>), std::hash::random::RandomState> as core::iter::traits::collect::Extend<(&str, (usize, core::option::Option<usize>))>>::extend::<core::iter::adapters::map::Map<core::slice::iter::Iter<(&str, usize, core::option::Option<usize>)>, synsema_core::builtin_arity::arity_of::{closure#0}::{closure#0}>>": 23619,
+    "<hashbrown::map::HashMap<&str, (usize, core::option::Option<usize>), std::hash::random::RandomState> as core::iter::traits::collect::Extend<(&str, (usize, core::option::Option<usize>))>>::extend::<core::iter::adapters::map::Map<core::slice::iter::Iter<(&str, usize, core::option::Option<usize>)>, synsema_core::builtin_arity::arity_of::{closure#0}::{closure#0}>>": 23683,
     "<hashbrown::map::HashMap<alloc::sync::Arc<str>, u32, rustc_hash::FxBuildHasher>>::insert": 24842,
     "<hashbrown::raw::RawTable<(alloc::sync::Arc<str>, u32)>>::reserve_rehash::<hashbrown::map::make_hasher<alloc::sync::Arc<str>, u32, rustc_hash::FxBuildHasher>::{closure#0}>": 25973,
     "<regalloc2::ion::data_structures::Env<cranelift_codegen::machinst::vcode::VCode<cranelift_codegen::isa::x64::lower::isle::generated_code::MInst>>>::compute_requirement": 23019,
@@ -949,13 +949,13 @@
     "do_lookup_x": 87879,
     "free": 151669,
     "malloc": 207845,
-    "malloc_consolidate": 82430,
+    "malloc_consolidate": 82454,
     "realloc": 47939,
     "strcmp": 24567,
     "synsema_jit::lower::build": 25566,
-    "unlink_chunk.isra.0": 47174
+    "unlink_chunk.isra.0": 47180
    },
-   "total": 15965221
+   "total": 15965337
   },
   "c_call4|ref": {
    "fns": {
@@ -985,7 +985,7 @@
     "<synsema_core::number::Number>::checked_add": 5130000,
     "<synsema_core::number::Number>::partial_cmp_num": 1800020,
     "<synsema_core::types::SynValue as core::clone::Clone>::clone": 4950060,
-    "__memcmp_avx2_movbe": 9926781,
+    "__memcmp_avx2_movbe": 9926793,
     "__memcpy_avx_unaligned_erms": 6966615,
     "_dl_relocate_object": 640035,
     "_int_free": 9843228,
@@ -998,7 +998,7 @@
     "synsema_core::interpreter::env_update": 10260000,
     "synsema_core::temporal::binop": 2430000
    },
-   "total": 490873127
+   "total": 490873101
   },
   "c_call4|vm": {
    "fns": {
@@ -1013,13 +1013,13 @@
     "<synsema_core::interpreter::Interpreter>::vm_call": 16110104,
     "<synsema_core::number::Number as core::clone::Clone>::clone": 19440624,
     "<synsema_core::types::SynValue as core::clone::Clone>::clone": 9450116,
-    "__memcmp_avx2_movbe": 927232,
+    "__memcmp_avx2_movbe": 927188,
     "_dl_relocate_object": 640035,
     "_int_malloc": 173993,
     "core::ptr::drop_glue::<[synsema_core::interpreter::EachItems]>": 1170026,
     "core::ptr::drop_glue::<synsema_core::types::SynValue>": 28714884
    },
-   "total": 278105835
+   "total": 278106213
   },
   "c_depth16|jit": {
    "fns": {
@@ -1049,7 +1049,7 @@
     "<cranelift_codegen::machinst::vcode::VCode<cranelift_codegen::isa::x64::lower::isle::generated_code::MInst>>::emit": 27421,
     "<cranelift_codegen::verifier::Verifier>::encodable_as_bb": 15318,
     "<cranelift_codegen::verifier::Verifier>::run": 256101,
-    "<hashbrown::map::HashMap<&str, (usize, core::option::Option<usize>), std::hash::random::RandomState> as core::iter::traits::collect::Extend<(&str, (usize, core::option::Option<usize>))>>::extend::<core::iter::adapters::map::Map<core::slice::iter::Iter<(&str, usize, core::option::Option<usize>)>, synsema_core::builtin_arity::arity_of::{closure#0}::{closure#0}>>": 23611,
+    "<hashbrown::map::HashMap<&str, (usize, core::option::Option<usize>), std::hash::random::RandomState> as core::iter::traits::collect::Extend<(&str, (usize, core::option::Option<usize>))>>::extend::<core::iter::adapters::map::Map<core::slice::iter::Iter<(&str, usize, core::option::Option<usize>)>, synsema_core::builtin_arity::arity_of::{closure#0}::{closure#0}>>": 23630,
     "<hashbrown::map::HashMap<alloc::sync::Arc<str>, u32, rustc_hash::FxBuildHasher>>::insert": 24601,
     "<hashbrown::raw::RawTable<(alloc::sync::Arc<str>, u32)>>::reserve_rehash::<hashbrown::map::make_hasher<alloc::sync::Arc<str>, u32, rustc_hash::FxBuildHasher>::{closure#0}>": 25973,
     "<regalloc2::ion::data_structures::Env<cranelift_codegen::machinst::vcode::VCode<cranelift_codegen::isa::x64::lower::isle::generated_code::MInst>>>::init": 137919,
@@ -1072,10 +1072,10 @@
     "<synsema_core::types::SynValue as core::clone::Clone>::clone": 90596,
     "<synsema_jit::lower::Func>::liveness": 350005,
     "<synsema_jit::lower::Func>::uses_defs": 46414,
-    "???": 2494381,
+    "???": 2494395,
     "____strtoul_l_internal": 25072,
-    "__memcmp_avx2_movbe": 42243,
-    "__memcpy_avx_unaligned_erms": 157935,
+    "__memcmp_avx2_movbe": 42181,
+    "__memcpy_avx_unaligned_erms": 158012,
     "__vfscanf_internal": 53688,
     "_dl_lookup_symbol_x": 47557,
     "_dl_relocate_object": 640035,
@@ -1083,7 +1083,7 @@
     "_int_free_maybe_consolidate": 38288,
     "_int_free_merge_chunk": 103332,
     "_int_malloc": 564430,
-    "_int_realloc": 37480,
+    "_int_realloc": 37375,
     "calloc": 50290,
     "check_match": 16425,
     "core::iter::adapters::chain::and_then_or_clear::<core::iter::adapters::chain::Chain<core::iter::adapters::copied::Copied<core::slice::iter::Iter<cranelift_codegen::ir::entities::Value>>, core::iter::adapters::flatten::FlatMap<core::slice::iter::Iter<cranelift_codegen::ir::instructions::BlockCall>, core::iter::adapters::filter_map::FilterMap<core::iter::adapters::map::Map<core::slice::iter::Iter<cranelift_codegen::ir::entities::Value>, <cranelift_codegen::ir::instructions::BlockCall>::args::{closure#0}>, <cranelift_codegen::ir::dfg::DataFlowGraph>::inst_values::{closure#0}::{closure#0}>, <cranelift_codegen::ir::dfg::DataFlowGraph>::inst_values::{closure#0}>>, cranelift_codegen::ir::entities::Value, <core::iter::adapters::chain::Chain<core::iter::adapters::copied::Copied<core::slice::iter::Iter<cranelift_codegen::ir::entities::Value>>, core::iter::adapters::flatten::FlatMap<core::slice::iter::Iter<cranelift_codegen::ir::instructions::BlockCall>, core::iter::adapters::filter_map::FilterMap<core::iter::adapters::map::Map<core::slice::iter::Iter<cranelift_codegen::ir::entities::Value>, <cranelift_codegen::ir::instructions::BlockCall>::args::{closure#0}>, <cranelift_codegen::ir::dfg::DataFlowGraph>::inst_values::{closure#0}::{closure#0}>, <cranelift_codegen::ir::dfg::DataFlowGraph>::inst_values::{closure#0}>> as core::iter::traits::iterator::Iterator>::next>": 32776,
@@ -1099,12 +1099,12 @@
     "strcmp": 24567,
     "synsema_core::ast_api::children": 20055,
     "synsema_core::ast_api::walk": 23380,
-    "synsema_core::builtin_arity::arity_of": 13573,
-    "synsema_jit::lower::build": 55832,
+    "synsema_core::builtin_arity::arity_of": 13587,
+    "synsema_jit::lower::build": 55860,
     "synsema_jit::lower::frame_values::<synsema_jit::lower::build::{closure#38}>": 24564,
     "unlink_chunk.isra.0": 39240
    },
-   "total": 11544356
+   "total": 11544361
   },
   "c_depth16|ref": {
    "fns": {
@@ -1121,14 +1121,14 @@
     "<synsema_core::number::Number>::checked_add": 5130000,
     "<synsema_core::number::Number>::partial_cmp_num": 1800020,
     "<synsema_core::types::SynValue as core::clone::Clone>::clone": 9900215,
-    "__memcmp_avx2_movbe": 19827693,
+    "__memcmp_avx2_movbe": 19827715,
     "_dl_relocate_object": 640035,
     "core::ptr::drop_glue::<synsema_core::types::SynValue>": 34026081,
     "synsema_core::interpreter::env_get": 168480112,
     "synsema_core::interpreter::env_update": 25650000,
     "synsema_core::temporal::binop": 2430000
    },
-   "total": 848890042
+   "total": 848890322
   },
   "c_depth16|vm": {
    "fns": {
@@ -1145,7 +1145,7 @@
     "free": 140624,
     "malloc": 216827
    },
-   "total": 208829056
+   "total": 208829403
   },
   "c_each_empty|jit": {
    "fns": {
@@ -1179,7 +1179,7 @@
     "<cranelift_codegen::verifier::Verifier>::encodable_as_bb": 12994,
     "<cranelift_codegen::verifier::Verifier>::run": 236023,
     "<cranelift_codegen::verifier::Verifier>::verify_value": 12818,
-    "<hashbrown::map::HashMap<&str, (usize, core::option::Option<usize>), std::hash::random::RandomState> as core::iter::traits::collect::Extend<(&str, (usize, core::option::Option<usize>))>>::extend::<core::iter::adapters::map::Map<core::slice::iter::Iter<(&str, usize, core::option::Option<usize>)>, synsema_core::builtin_arity::arity_of::{closure#0}::{closure#0}>>": 23626,
+    "<hashbrown::map::HashMap<&str, (usize, core::option::Option<usize>), std::hash::random::RandomState> as core::iter::traits::collect::Extend<(&str, (usize, core::option::Option<usize>))>>::extend::<core::iter::adapters::map::Map<core::slice::iter::Iter<(&str, usize, core::option::Option<usize>)>, synsema_core::builtin_arity::arity_of::{closure#0}::{closure#0}>>": 23539,
     "<hashbrown::map::HashMap<alloc::sync::Arc<str>, u32, rustc_hash::FxBuildHasher>>::insert": 24601,
     "<hashbrown::raw::RawTable<(alloc::sync::Arc<str>, u32)>>::reserve_rehash::<hashbrown::map::make_hasher<alloc::sync::Arc<str>, u32, rustc_hash::FxBuildHasher>::{closure#0}>": 25973,
     "<regalloc2::ion::data_structures::Env<cranelift_codegen::machinst::vcode::VCode<cranelift_codegen::isa::x64::lower::isle::generated_code::MInst>>>::add_liverange_to_vreg": 10264,
@@ -1204,7 +1204,7 @@
     "<synsema_jit::lower::Func>::liveness": 12899,
     "???": 2048184,
     "____strtoul_l_internal": 25072,
-    "__memcmp_avx2_movbe": 30320,
+    "__memcmp_avx2_movbe": 30364,
     "__memcpy_avx_unaligned_erms": 72156,
     "__vfscanf_internal": 53688,
     "_dl_check_map_versions": 11549,
@@ -1228,9 +1228,9 @@
     "malloc": 137799,
     "realloc": 29752,
     "strcmp": 24567,
-    "synsema_core::builtin_arity::arity_of": 13339
+    "synsema_core::builtin_arity::arity_of": 13527
    },
-   "total": 6882150
+   "total": 6882354
   },
   "c_each_empty|ref": {
    "fns": {
@@ -1252,7 +1252,7 @@
     "<synsema_core::interpreter::Interpreter>::release_frame": 1710000,
     "<synsema_core::number::Number as core::clone::Clone>::clone": 4320192,
     "<synsema_core::types::SynValue as core::clone::Clone>::clone": 900040,
-    "__memcmp_avx2_movbe": 1826809,
+    "__memcmp_avx2_movbe": 1826787,
     "__memcpy_avx_unaligned_erms": 7678466,
     "_dl_relocate_object": 640035,
     "_int_free": 4968825,
@@ -1264,12 +1264,12 @@
     "malloc": 4138977,
     "synsema_core::interpreter::env_update": 7020000
    },
-   "total": 122042499
+   "total": 122042758
   },
   "c_each_empty|vm": {
    "fns": {
     "<core::hash::sip::Hasher<core::hash::sip::Sip13Rounds> as core::hash::Hasher>::write": 48568,
-    "<hashbrown::map::HashMap<&str, (usize, core::option::Option<usize>), std::hash::random::RandomState> as core::iter::traits::collect::Extend<(&str, (usize, core::option::Option<usize>))>>::extend::<core::iter::adapters::map::Map<core::slice::iter::Iter<(&str, usize, core::option::Option<usize>)>, synsema_core::builtin_arity::arity_of::{closure#0}::{closure#0}>>": 23557,
+    "<hashbrown::map::HashMap<&str, (usize, core::option::Option<usize>), std::hash::random::RandomState> as core::iter::traits::collect::Extend<(&str, (usize, core::option::Option<usize>))>>::extend::<core::iter::adapters::map::Map<core::slice::iter::Iter<(&str, usize, core::option::Option<usize>)>, synsema_core::builtin_arity::arity_of::{closure#0}::{closure#0}>>": 23614,
     "<hashbrown::map::HashMap<alloc::sync::Arc<str>, u32, rustc_hash::FxBuildHasher>>::insert": 24601,
     "<hashbrown::raw::RawTable<(alloc::sync::Arc<str>, u32)>>::reserve_rehash::<hashbrown::map::make_hasher<alloc::sync::Arc<str>, u32, rustc_hash::FxBuildHasher>::{closure#0}>": 25973,
     "<std::hash::random::RandomState as core::hash::BuildHasher>::hash_one::<&alloc::string::String>": 30674,
@@ -1280,7 +1280,7 @@
     "<synsema_core::number::Number as core::clone::Clone>::clone": 4320411,
     "<synsema_core::types::SynValue as core::clone::Clone>::clone": 1800086,
     "____strtoul_l_internal": 25072,
-    "__memcmp_avx2_movbe": 26914,
+    "__memcmp_avx2_movbe": 26892,
     "__memcpy_avx_unaligned_erms": 29897,
     "__vfscanf_internal": 53688,
     "_dl_lookup_symbol_x": 47557,
@@ -1293,7 +1293,7 @@
     "malloc": 92623,
     "strcmp": 24567
    },
-   "total": 46227892
+   "total": 46227900
   },
   "c_lit_txt5|jit": {
    "fns": {
@@ -1311,7 +1311,7 @@
     "free": 67234,
     "malloc": 104726
    },
-   "total": 120982530
+   "total": 120982510
   },
   "c_lit_txt5|ref": {
    "fns": {
@@ -1329,7 +1329,7 @@
     "<synsema_core::number::Number>::checked_add": 5130000,
     "<synsema_core::number::Number>::partial_cmp_num": 1800020,
     "<synsema_core::types::SynValue as core::clone::Clone>::clone": 4140045,
-    "__memcmp_avx2_movbe": 3626722,
+    "__memcmp_avx2_movbe": 3626788,
     "__memcpy_avx_unaligned_erms": 1380661,
     "_dl_relocate_object": 640035,
     "_int_free": 112503,
@@ -1340,7 +1340,7 @@
     "synsema_core::temporal::binop": 2430000,
     "synsema_core::types::syn_text::<&str>": 2700030
    },
-   "total": 217103315
+   "total": 217103387
   },
   "c_lit_txt5|vm": {
    "fns": {
@@ -1358,7 +1358,7 @@
     "free": 60479,
     "malloc": 94686
    },
-   "total": 120856539
+   "total": 120856736
   },
   "d_idx4|jit": {
    "fns": {
@@ -1417,16 +1417,16 @@
     "<synsema_core::number::Number as core::clone::Clone>::clone": 360840,
     "<synsema_core::types::SynValue as core::clone::Clone>::clone": 222665,
     "<synsema_heap::Shared<synsema_core::synlist::SynList>>::borrow": 60000,
-    "???": 7744467,
-    "__memcmp_avx2_movbe": 34825,
-    "__memcpy_avx_unaligned_erms": 157417,
+    "???": 7744451,
+    "__memcmp_avx2_movbe": 34810,
+    "__memcpy_avx_unaligned_erms": 157054,
     "__vfscanf_internal": 53688,
     "_dl_lookup_symbol_x": 47557,
     "_dl_relocate_object": 640035,
-    "_int_free": 267780,
-    "_int_free_merge_chunk": 45942,
-    "_int_malloc": 330053,
-    "_int_realloc": 30988,
+    "_int_free": 266738,
+    "_int_free_merge_chunk": 46032,
+    "_int_malloc": 327749,
+    "_int_realloc": 30914,
     "core::iter::adapters::chain::and_then_or_clear::<core::iter::adapters::chain::Chain<core::iter::adapters::copied::Copied<core::slice::iter::Iter<cranelift_codegen::ir::entities::Value>>, core::iter::adapters::flatten::FlatMap<core::slice::iter::Iter<cranelift_codegen::ir::instructions::BlockCall>, core::iter::adapters::filter_map::FilterMap<core::iter::adapters::map::Map<core::slice::iter::Iter<cranelift_codegen::ir::entities::Value>, <cranelift_codegen::ir::instructions::BlockCall>::args::{closure#0}>, <cranelift_codegen::ir::dfg::DataFlowGraph>::inst_values::{closure#0}::{closure#0}>, <cranelift_codegen::ir::dfg::DataFlowGraph>::inst_values::{closure#0}>>, cranelift_codegen::ir::entities::Value, <core::iter::adapters::chain::Chain<core::iter::adapters::copied::Copied<core::slice::iter::Iter<cranelift_codegen::ir::entities::Value>>, core::iter::adapters::flatten::FlatMap<core::slice::iter::Iter<cranelift_codegen::ir::instructions::BlockCall>, core::iter::adapters::filter_map::FilterMap<core::iter::adapters::map::Map<core::slice::iter::Iter<cranelift_codegen::ir::entities::Value>, <cranelift_codegen::ir::instructions::BlockCall>::args::{closure#0}>, <cranelift_codegen::ir::dfg::DataFlowGraph>::inst_values::{closure#0}::{closure#0}>, <cranelift_codegen::ir::dfg::DataFlowGraph>::inst_values::{closure#0}>> as core::iter::traits::iterator::Iterator>::next>": 94552,
     "core::ptr::drop_glue::<synsema_core::types::SynValue>": 519379,
     "cranelift_codegen::alias_analysis::classify": 38748,
@@ -1436,14 +1436,14 @@
     "cranelift_codegen::remove_constant_phis::do_remove_constant_phis": 38203,
     "do_lookup_x": 87879,
     "free": 136225,
-    "malloc": 189302,
-    "malloc_consolidate": 82955,
+    "malloc": 189402,
+    "malloc_consolidate": 81135,
     "realloc": 44836,
     "synsema_jit::abi::synsema_jit_index": 30260000,
-    "synsema_jit::lower::check_pointers": 70285,
-    "unlink_chunk.isra.0": 47562
+    "synsema_jit::lower::check_pointers": 70181,
+    "unlink_chunk.isra.0": 47616
    },
-   "total": 51110221
+   "total": 51104475
   },
   "d_idx4|ref": {
    "fns": {
@@ -1462,7 +1462,7 @@
     "<synsema_core::number::Number>::partial_cmp_num": 1800020,
     "<synsema_core::number::Number>::to_i64_trunc": 6480000,
     "<synsema_core::types::SynValue as core::clone::Clone>::clone": 16380063,
-    "__memcmp_avx2_movbe": 13167024,
+    "__memcmp_avx2_movbe": 13167046,
     "_dl_relocate_object": 640035,
     "core::ptr::drop_glue::<synsema_core::types::SynValue>": 48424491,
     "synsema_core::interpreter::env_get": 30240112,
@@ -1471,7 +1471,7 @@
     "synsema_core::synlist::list_values": 11160000,
     "synsema_core::temporal::binop": 2430000
    },
-   "total": 556994838
+   "total": 556994890
   },
   "d_idx4|vm": {
    "fns": {
@@ -1485,7 +1485,7 @@
     "_dl_relocate_object": 640035,
     "core::ptr::drop_glue::<synsema_core::types::SynValue>": 46264978
    },
-   "total": 392824511
+   "total": 392824577
   },
   "d_let4|jit": {
    "fns": {
@@ -1522,7 +1522,7 @@
     "<cranelift_codegen::verifier::Verifier>::run": 324639,
     "<cranelift_codegen::verifier::Verifier>::verify_value": 16915,
     "<cranelift_frontend::frontend::FuncInstBuilder as cranelift_codegen::ir::builder::InstBuilderBase>::build": 13726,
-    "<hashbrown::map::HashMap<&str, (usize, core::option::Option<usize>), std::hash::random::RandomState> as core::iter::traits::collect::Extend<(&str, (usize, core::option::Option<usize>))>>::extend::<core::iter::adapters::map::Map<core::slice::iter::Iter<(&str, usize, core::option::Option<usize>)>, synsema_core::builtin_arity::arity_of::{closure#0}::{closure#0}>>": 23701,
+    "<hashbrown::map::HashMap<&str, (usize, core::option::Option<usize>), std::hash::random::RandomState> as core::iter::traits::collect::Extend<(&str, (usize, core::option::Option<usize>))>>::extend::<core::iter::adapters::map::Map<core::slice::iter::Iter<(&str, usize, core::option::Option<usize>)>, synsema_core::builtin_arity::arity_of::{closure#0}::{closure#0}>>": 23715,
     "<hashbrown::map::HashMap<alloc::sync::Arc<str>, u32, rustc_hash::FxBuildHasher>>::insert": 24815,
     "<hashbrown::raw::RawTable<(alloc::sync::Arc<str>, u32)>>::reserve_rehash::<hashbrown::map::make_hasher<alloc::sync::Arc<str>, u32, rustc_hash::FxBuildHasher>::{closure#0}>": 25973,
     "<regalloc2::ion::data_structures::Env<cranelift_codegen::machinst::vcode::VCode<cranelift_codegen::isa::x64::lower::isle::generated_code::MInst>>>::init": 171975,
@@ -1545,7 +1545,7 @@
     "<synsema_core::types::SynValue as core::clone::Clone>::clone": 110421,
     "???": 2582243,
     "____strtoul_l_internal": 25072,
-    "__memcmp_avx2_movbe": 71375,
+    "__memcmp_avx2_movbe": 71286,
     "__memcpy_avx_unaligned_erms": 89048,
     "__vfscanf_internal": 53688,
     "_dl_lookup_symbol_x": 47557,
@@ -1553,7 +1553,7 @@
     "_int_free": 218320,
     "_int_free_maybe_consolidate": 13992,
     "_int_free_merge_chunk": 38067,
-    "_int_malloc": 264445,
+    "_int_malloc": 264621,
     "_int_realloc": 23210,
     "check_match": 16425,
     "core::iter::adapters::chain::and_then_or_clear::<core::iter::adapters::chain::Chain<core::iter::adapters::copied::Copied<core::slice::iter::Iter<cranelift_codegen::ir::entities::Value>>, core::iter::adapters::flatten::FlatMap<core::slice::iter::Iter<cranelift_codegen::ir::instructions::BlockCall>, core::iter::adapters::filter_map::FilterMap<core::iter::adapters::map::Map<core::slice::iter::Iter<cranelift_codegen::ir::entities::Value>, <cranelift_codegen::ir::instructions::BlockCall>::args::{closure#0}>, <cranelift_codegen::ir::dfg::DataFlowGraph>::inst_values::{closure#0}::{closure#0}>, <cranelift_codegen::ir::dfg::DataFlowGraph>::inst_values::{closure#0}>>, cranelift_codegen::ir::entities::Value, <core::iter::adapters::chain::Chain<core::iter::adapters::copied::Copied<core::slice::iter::Iter<cranelift_codegen::ir::entities::Value>>, core::iter::adapters::flatten::FlatMap<core::slice::iter::Iter<cranelift_codegen::ir::instructions::BlockCall>, core::iter::adapters::filter_map::FilterMap<core::iter::adapters::map::Map<core::slice::iter::Iter<cranelift_codegen::ir::entities::Value>, <cranelift_codegen::ir::instructions::BlockCall>::args::{closure#0}>, <cranelift_codegen::ir::dfg::DataFlowGraph>::inst_values::{closure#0}::{closure#0}>, <cranelift_codegen::ir::dfg::DataFlowGraph>::inst_values::{closure#0}>> as core::iter::traits::iterator::Iterator>::next>": 40262,
@@ -1564,13 +1564,13 @@
     "cranelift_codegen::remove_constant_phis::do_remove_constant_phis": 15035,
     "do_lookup_x": 87879,
     "free": 110524,
-    "malloc": 156001,
+    "malloc": 156051,
     "realloc": 33634,
     "strcmp": 24567,
-    "synsema_core::builtin_arity::arity_of": 13613,
+    "synsema_core::builtin_arity::arity_of": 13384,
     "synsema_jit::lower::build": 13957
    },
-   "total": 10319296
+   "total": 10319295
   },
   "d_let4|ref": {
    "fns": {
@@ -1588,7 +1588,7 @@
     "<synsema_core::number::Number>::checked_add": 5130000,
     "<synsema_core::number::Number>::partial_cmp_num": 1800020,
     "<synsema_core::types::SynValue as core::clone::Clone>::clone": 6300045,
-    "__memcmp_avx2_movbe": 6326795,
+    "__memcmp_avx2_movbe": 6326883,
     "_dl_relocate_object": 640035,
     "core::ptr::drop_glue::<synsema_core::types::SynValue>": 34024447,
     "synsema_core::interpreter::env_get": 10080112,
@@ -1596,7 +1596,7 @@
     "synsema_core::interpreter::env_update": 5130000,
     "synsema_core::temporal::binop": 2430000
    },
-   "total": 327577651
+   "total": 327577843
   },
   "d_let4|vm": {
    "fns": {
@@ -1614,7 +1614,7 @@
     "_int_malloc": 165562,
     "core::ptr::drop_glue::<synsema_core::types::SynValue>": 21784774
    },
-   "total": 242589610
+   "total": 242589867
   },
   "d_prop4|jit": {
    "fns": {
@@ -1673,15 +1673,15 @@
     "<synsema_core::types::SynValue as core::clone::Clone>::clone": 182635,
     "???": 6676465,
     "____strtoul_l_internal": 25072,
-    "__memcmp_avx2_movbe": 34726,
-    "__memcpy_avx_unaligned_erms": 149504,
+    "__memcmp_avx2_movbe": 34863,
+    "__memcpy_avx_unaligned_erms": 149403,
     "__vfscanf_internal": 53688,
     "_dl_lookup_symbol_x": 47557,
     "_dl_relocate_object": 640035,
-    "_int_free": 264827,
-    "_int_free_merge_chunk": 45585,
-    "_int_malloc": 322391,
-    "_int_realloc": 31049,
+    "_int_free": 264830,
+    "_int_free_merge_chunk": 46066,
+    "_int_malloc": 322777,
+    "_int_realloc": 31045,
     "core::iter::adapters::chain::and_then_or_clear::<core::iter::adapters::chain::Chain<core::iter::adapters::copied::Copied<core::slice::iter::Iter<cranelift_codegen::ir::entities::Value>>, core::iter::adapters::flatten::FlatMap<core::slice::iter::Iter<cranelift_codegen::ir::instructions::BlockCall>, core::iter::adapters::filter_map::FilterMap<core::iter::adapters::map::Map<core::slice::iter::Iter<cranelift_codegen::ir::entities::Value>, <cranelift_codegen::ir::instructions::BlockCall>::args::{closure#0}>, <cranelift_codegen::ir::dfg::DataFlowGraph>::inst_values::{closure#0}::{closure#0}>, <cranelift_codegen::ir::dfg::DataFlowGraph>::inst_values::{closure#0}>>, cranelift_codegen::ir::entities::Value, <core::iter::adapters::chain::Chain<core::iter::adapters::copied::Copied<core::slice::iter::Iter<cranelift_codegen::ir::entities::Value>>, core::iter::adapters::flatten::FlatMap<core::slice::iter::Iter<cranelift_codegen::ir::instructions::BlockCall>, core::iter::adapters::filter_map::FilterMap<core::iter::adapters::map::Map<core::slice::iter::Iter<cranelift_codegen::ir::entities::Value>, <cranelift_codegen::ir::instructions::BlockCall>::args::{closure#0}>, <cranelift_codegen::ir::dfg::DataFlowGraph>::inst_values::{closure#0}::{closure#0}>, <cranelift_codegen::ir::dfg::DataFlowGraph>::inst_values::{closure#0}>> as core::iter::traits::iterator::Iterator>::next>": 90760,
     "core::ptr::drop_glue::<synsema_core::types::SynValue>": 443204,
     "cranelift_codegen::alias_analysis::classify": 37236,
@@ -1693,13 +1693,13 @@
     "do_lookup_x": 87879,
     "free": 134392,
     "malloc": 186753,
-    "malloc_consolidate": 81488,
+    "malloc_consolidate": 80971,
     "realloc": 44878,
     "synsema_jit::abi::synsema_jit_prop": 28123996,
-    "synsema_jit::lower::check_pointers": 67728,
-    "unlink_chunk.isra.0": 46242
+    "synsema_jit::lower::check_pointers": 67813,
+    "unlink_chunk.isra.0": 46395
    },
-   "total": 46983635
+   "total": 46984651
   },
   "d_prop4|ref": {
    "fns": {
@@ -1726,7 +1726,7 @@
     "synsema_core::interpreter::env_update": 25650000,
     "synsema_core::temporal::binop": 2430000
    },
-   "total": 508012331
+   "total": 508012243
   },
   "d_prop4|vm": {
    "fns": {
@@ -1739,7 +1739,7 @@
     "_int_malloc": 177617,
     "core::ptr::drop_glue::<synsema_core::types::SynValue>": 39424803
    },
-   "total": 330521419
+   "total": 330521476
   },
   "d_set4|jit": {
    "fns": {
@@ -1778,7 +1778,7 @@
     "<cranelift_codegen::verifier::Verifier>::run": 301231,
     "<cranelift_codegen::verifier::Verifier>::verify_value": 15878,
     "<cranelift_frontend::frontend::FuncInstBuilder as cranelift_codegen::ir::builder::InstBuilderBase>::build": 12564,
-    "<hashbrown::map::HashMap<&str, (usize, core::option::Option<usize>), std::hash::random::RandomState> as core::iter::traits::collect::Extend<(&str, (usize, core::option::Option<usize>))>>::extend::<core::iter::adapters::map::Map<core::slice::iter::Iter<(&str, usize, core::option::Option<usize>)>, synsema_core::builtin_arity::arity_of::{closure#0}::{closure#0}>>": 23725,
+    "<hashbrown::map::HashMap<&str, (usize, core::option::Option<usize>), std::hash::random::RandomState> as core::iter::traits::collect::Extend<(&str, (usize, core::option::Option<usize>))>>::extend::<core::iter::adapters::map::Map<core::slice::iter::Iter<(&str, usize, core::option::Option<usize>)>, synsema_core::builtin_arity::arity_of::{closure#0}::{closure#0}>>": 23530,
     "<hashbrown::map::HashMap<alloc::sync::Arc<str>, u32, rustc_hash::FxBuildHasher>>::insert": 24708,
     "<hashbrown::raw::RawTable<(alloc::sync::Arc<str>, u32)>>::reserve_rehash::<hashbrown::map::make_hasher<alloc::sync::Arc<str>, u32, rustc_hash::FxBuildHasher>::{closure#0}>": 25973,
     "<regalloc2::ion::data_structures::Env<cranelift_codegen::machinst::vcode::VCode<cranelift_codegen::isa::x64::lower::isle::generated_code::MInst>>>::init": 163508,
@@ -1799,7 +1799,7 @@
     "<synsema_core::types::SynValue as core::clone::Clone>::clone": 110421,
     "???": 2582255,
     "____strtoul_l_internal": 25072,
-    "__memcmp_avx2_movbe": 31332,
+    "__memcmp_avx2_movbe": 31288,
     "__memcpy_avx_unaligned_erms": 87984,
     "__vfscanf_internal": 53688,
     "_dl_lookup_symbol_x": 47557,
@@ -1821,10 +1821,10 @@
     "malloc": 155681,
     "realloc": 33307,
     "strcmp": 24567,
-    "synsema_core::builtin_arity::arity_of": 13619,
-    "synsema_jit::lower::build": 13512
+    "synsema_core::builtin_arity::arity_of": 13504,
+    "synsema_jit::lower::build": 13510
    },
-   "total": 9806582
+   "total": 9806337
   },
   "d_set4|ref": {
    "fns": {
@@ -1841,14 +1841,14 @@
     "<synsema_core::number::Number>::checked_add": 5130000,
     "<synsema_core::number::Number>::partial_cmp_num": 1800020,
     "<synsema_core::types::SynValue as core::clone::Clone>::clone": 6300045,
-    "__memcmp_avx2_movbe": 6326884,
+    "__memcmp_avx2_movbe": 6326949,
     "_dl_relocate_object": 640035,
     "core::ptr::drop_glue::<synsema_core::types::SynValue>": 34024447,
     "synsema_core::interpreter::env_get": 10080112,
     "synsema_core::interpreter::env_update": 25650000,
     "synsema_core::temporal::binop": 2430000
    },
-   "total": 350624626
+   "total": 350624470
   },
   "d_set4|vm": {
    "fns": {
@@ -1863,7 +1863,7 @@
     "_int_malloc": 165421,
     "core::ptr::drop_glue::<synsema_core::types::SynValue>": 21784774
    },
-   "total": 208398133
+   "total": 208398176
   },
   "fib|jit": {
    "fns": {
@@ -1903,7 +1903,7 @@
     "<cranelift_codegen::verifier::Verifier>::run": 488749,
     "<cranelift_codegen::verifier::Verifier>::verify_value": 26214,
     "<cranelift_frontend::frontend::FuncInstBuilder as cranelift_codegen::ir::builder::InstBuilderBase>::build": 21466,
-    "<hashbrown::map::HashMap<&str, (usize, core::option::Option<usize>), std::hash::random::RandomState> as core::iter::traits::collect::Extend<(&str, (usize, core::option::Option<usize>))>>::extend::<core::iter::adapters::map::Map<core::slice::iter::Iter<(&str, usize, core::option::Option<usize>)>, synsema_core::builtin_arity::arity_of::{closure#0}::{closure#0}>>": 23669,
+    "<hashbrown::map::HashMap<&str, (usize, core::option::Option<usize>), std::hash::random::RandomState> as core::iter::traits::collect::Extend<(&str, (usize, core::option::Option<usize>))>>::extend::<core::iter::adapters::map::Map<core::slice::iter::Iter<(&str, usize, core::option::Option<usize>)>, synsema_core::builtin_arity::arity_of::{closure#0}::{closure#0}>>": 23659,
     "<hashbrown::map::HashMap<alloc::sync::Arc<str>, u32, rustc_hash::FxBuildHasher>>::insert": 24601,
     "<hashbrown::raw::RawTable<(alloc::sync::Arc<str>, u32)>>::reserve_rehash::<hashbrown::map::make_hasher<alloc::sync::Arc<str>, u32, rustc_hash::FxBuildHasher>::{closure#0}>": 25973,
     "<regalloc2::ion::data_structures::Env<cranelift_codegen::machinst::vcode::VCode<cranelift_codegen::isa::x64::lower::isle::generated_code::MInst>>>::compute_requirement": 23890,
@@ -1925,7 +1925,7 @@
     "<synsema_core::interpreter::Interpreter>::vm_call": 192516,
     "???": 3013890,
     "____strtoul_l_internal": 25072,
-    "__memcmp_avx2_movbe": 50759,
+    "__memcmp_avx2_movbe": 50737,
     "__memcpy_avx_unaligned_erms": 142237,
     "__vfscanf_internal": 53688,
     "_dl_lookup_symbol_x": 47557,
@@ -1943,12 +1943,12 @@
     "do_lookup_x": 87879,
     "free": 113738,
     "malloc": 163900,
-    "malloc_consolidate": 71084,
+    "malloc_consolidate": 71108,
     "realloc": 39889,
     "strcmp": 24567,
-    "unlink_chunk.isra.0": 41763
+    "unlink_chunk.isra.0": 41769
    },
-   "total": 11068361
+   "total": 11068034
   },
   "fib|ref": {
    "fns": {
@@ -1980,7 +1980,7 @@
     "<synsema_core::number::Number>::checked_sub": 3266784,
     "<synsema_core::number::Number>::partial_cmp_num": 1146260,
     "<synsema_core::types::SynValue as core::clone::Clone>::clone": 2292545,
-    "__memcmp_avx2_movbe": 2548908,
+    "__memcmp_avx2_movbe": 2548930,
     "__memcpy_avx_unaligned_erms": 4438722,
     "_dl_relocate_object": 640035,
     "_int_free": 6338911,
@@ -1995,7 +1995,7 @@
     "synsema_core::interpreter::truth": 974321,
     "synsema_core::temporal::binop": 2321136
    },
-   "total": 207555539
+   "total": 207555821
   },
   "fib|vm": {
    "fns": {
@@ -2011,7 +2011,7 @@
     "<synsema_core::interpreter::Interpreter>::vm_call": 11032884,
     "<synsema_core::number::Number as core::clone::Clone>::clone": 688128,
     "<synsema_core::types::SynValue as core::clone::Clone>::clone": 1146365,
-    "__memcmp_avx2_movbe": 1116184,
+    "__memcmp_avx2_movbe": 1116162,
     "__vfscanf_internal": 53688,
     "_dl_lookup_symbol_x": 47557,
     "_dl_relocate_object": 640035,
@@ -2023,7 +2023,7 @@
     "free": 64473,
     "malloc": 100088
    },
-   "total": 84395683
+   "total": 84396049
   },
   "j_list_param|jit": {
    "fns": {
@@ -2049,7 +2049,7 @@
     "malloc": 134694,
     "synsema_core::interpreter::make_unique_n": 3711139
    },
-   "total": 163419294
+   "total": 163419698
   },
   "j_list_param|ref": {
    "fns": {
@@ -2077,7 +2077,7 @@
     "<synsema_core::number::Number>::checked_modulo": 14600000,
     "<synsema_core::number::Number>::to_i64_trunc": 3600090,
     "<synsema_core::types::SynValue as core::clone::Clone>::clone": 9421500,
-    "__memcmp_avx2_movbe": 8053967,
+    "__memcmp_avx2_movbe": 8053945,
     "__memcpy_avx_unaligned_erms": 8632223,
     "_dl_relocate_object": 640035,
     "_int_free": 5625789,
@@ -2095,7 +2095,7 @@
     "synsema_core::synlist::list_values_mut": 2200000,
     "synsema_core::temporal::binop": 2700000
    },
-   "total": 418367742
+   "total": 418367394
   },
   "j_list_param|vm": {
    "fns": {
@@ -2121,7 +2121,7 @@
     "malloc": 124562,
     "synsema_core::interpreter::make_unique_n": 3711139
    },
-   "total": 163286497
+   "total": 163286529
   },
   "j_list_while|jit": {
    "fns": {
@@ -2139,7 +2139,7 @@
     "<synsema_core::types::SynValue as core::clone::Clone>::clone": 6626380,
     "<synsema_heap::Shared<synsema_core::synlist::SynList>>::borrow": 1500015,
     "<synsema_heap::Shared<synsema_core::synlist::SynList>>::borrow_mut": 700000,
-    "__memcmp_avx2_movbe": 3087575,
+    "__memcmp_avx2_movbe": 3087597,
     "_dl_relocate_object": 640035,
     "_int_free": 191010,
     "_int_malloc": 221550,
@@ -2148,7 +2148,7 @@
     "synsema_core::interpreter::env_get": 5703360,
     "synsema_core::interpreter::make_unique_n": 3711100
    },
-   "total": 248205609
+   "total": 248206089
   },
   "j_list_while|ref": {
    "fns": {
@@ -2169,7 +2169,7 @@
     "<synsema_core::number::Number>::partial_cmp_num": 2000020,
     "<synsema_core::number::Number>::to_i64_trunc": 3600054,
     "<synsema_core::types::SynValue as core::clone::Clone>::clone": 13418487,
-    "__memcmp_avx2_movbe": 22057629,
+    "__memcmp_avx2_movbe": 22057652,
     "_dl_relocate_object": 640035,
     "core::ptr::drop_glue::<synsema_core::types::SynValue>": 43753983,
     "synsema_core::interpreter::env_get": 39255672,
@@ -2182,7 +2182,7 @@
     "synsema_core::synlist::list_values_mut": 2200000,
     "synsema_core::temporal::binop": 5400000
    },
-   "total": 536373842
+   "total": 536374143
   },
   "j_list_while|vm": {
    "fns": {
@@ -2200,7 +2200,7 @@
     "<synsema_core::types::SynValue as core::clone::Clone>::clone": 6626380,
     "<synsema_heap::Shared<synsema_core::synlist::SynList>>::borrow": 1500015,
     "<synsema_heap::Shared<synsema_core::synlist::SynList>>::borrow_mut": 700000,
-    "__memcmp_avx2_movbe": 3087176,
+    "__memcmp_avx2_movbe": 3087132,
     "_dl_relocate_object": 640035,
     "_int_free": 179041,
     "_int_malloc": 205564,
@@ -2209,53 +2209,92 @@
     "synsema_core::interpreter::env_get": 5703360,
     "synsema_core::interpreter::make_unique_n": 3711100
    },
-   "total": 248084604
+   "total": 248084438
   },
   "j_map_get|jit": {
    "fns": {
-    "<&i64 as core::fmt::Display>::fmt": 200600,
-    "<&synsema_core::number::Number as core::fmt::Display>::fmt": 200600,
-    "<alloc::raw_vec::RawVecInner<_>>::reserve::do_reserve_and_handle::<alloc::alloc::Global>": 3225167,
-    "<alloc::raw_vec::RawVecInner>::finish_grow": 4558481,
-    "<alloc::string::String as core::fmt::Write>::write_str": 3511219,
-    "<core::fmt::Formatter>::pad_integral": 5215756,
-    "<core::fmt::Formatter>::pad_integral::write_prefix": 2106363,
+    "<alloc::collections::btree::map::BTreeMap<regalloc2::ion::data_structures::LiveRangeKey, regalloc2::ion::data_structures::LiveRangeIndex>>::insert": 41854,
+    "<alloc::raw_vec::RawVecInner<_>>::reserve::do_reserve_and_handle::<alloc::alloc::Global>": 57167,
+    "<alloc::raw_vec::RawVecInner>::finish_grow": 102041,
+    "<alloc::string::String as core::fmt::Write>::write_str": 46219,
+    "<core::fmt::Formatter>::pad_integral": 67756,
     "<core::hash::sip::Hasher<core::hash::sip::Sip13Rounds> as core::hash::Hasher>::write": 7145103,
+    "<cranelift_codegen::context::Context>::optimize": 43145,
+    "<cranelift_codegen::dominator_tree::DominatorTree>::compute": 48108,
+    "<cranelift_codegen::egraph::EgraphPass>::run": 98661,
+    "<cranelift_codegen::egraph::OptimizeCtx>::insert_pure_enode": 61782,
     "<cranelift_codegen::egraph::elaborate::Elaborator>::elaborate": 189215,
+    "<cranelift_codegen::ir::dfg::DataFlowGraph>::compute_result_type": 156099,
+    "<cranelift_codegen::ir::dfg::DataFlowGraph>::ctrl_typevar": 96993,
+    "<cranelift_codegen::ir::dfg::DataFlowGraph>::inst_results": 83712,
+    "<cranelift_codegen::ir::dfg::DataFlowGraph>::inst_values": 100645,
+    "<cranelift_codegen::ir::dfg::DataFlowGraph>::make_inst_results": 43129,
+    "<cranelift_codegen::ir::dfg::DataFlowGraph>::non_tail_call_or_try_call_signature": 124952,
+    "<cranelift_codegen::ir::dfg::DataFlowGraph>::remove_block_param": 44969,
     "<cranelift_codegen::ir::dfg::DataFlowGraph>::value_def": 227643,
+    "<cranelift_codegen::ir::instructions::InstructionData>::analyze_call": 71735,
+    "<cranelift_codegen::ir::instructions::InstructionData>::arguments": 43332,
+    "<cranelift_codegen::ir::instructions::OperandConstraint>::resolve": 61482,
+    "<cranelift_codegen::ir::instructions::ValueTypeSet>::contains": 70639,
+    "<cranelift_codegen::machinst::vcode::VCode<cranelift_codegen::isa::x64::lower::isle::generated_code::MInst> as regalloc2::Function>::inst_operands": 101660,
+    "<cranelift_codegen::machinst::vcode::VCode<cranelift_codegen::isa::x64::lower::isle::generated_code::MInst>>::emit": 75233,
+    "<cranelift_codegen::verifier::Verifier>::encodable_as_bb": 45232,
     "<cranelift_codegen::verifier::Verifier>::run": 867812,
-    "<i64 as core::fmt::Display>::fmt": 4856880,
-    "<i64 as num_integer::Integer>::mod_floor": 3098946,
-    "<indexmap::inner::Core<synsema_core::synmap::Key, synsema_core::types::SynValue>>::get_index_of::<str>": 7637517,
+    "<cranelift_codegen::verifier::Verifier>::verify_value": 46835,
+    "<cranelift_frontend::ssa::SSABuilder>::use_var_nonlocal": 41612,
+    "<hashbrown::map::HashMap<regalloc2::ion::data_structures::LiveBundleIndex, (), core::hash::BuildHasherDefault<rustc_hash::FxHasher>>>::insert": 45957,
+    "<i64 as core::fmt::Display>::fmt": 62640,
+    "<indexmap::inner::Core<synsema_core::synmap::Key, synsema_core::types::SynValue>>::get_index_of::<str>": 7636504,
     "<indexmap::map::IndexMap<synsema_core::synmap::Key, synsema_core::types::SynValue, synsema_core::synmap::KeyHasher>>::get_full::<str>": 4200000,
     "<regalloc2::ion::data_structures::Env<cranelift_codegen::machinst::vcode::VCode<cranelift_codegen::isa::x64::lower::isle::generated_code::MInst>>>::init": 385535,
+    "<regalloc2::ion::data_structures::Env<cranelift_codegen::machinst::vcode::VCode<cranelift_codegen::isa::x64::lower::isle::generated_code::MInst>>>::insert_use_into_liverange": 43408,
+    "<regalloc2::ion::data_structures::Env<cranelift_codegen::machinst::vcode::VCode<cranelift_codegen::isa::x64::lower::isle::generated_code::MInst>>>::recompute_bundle_properties": 42505,
     "<regalloc2::ion::data_structures::Env<cranelift_codegen::machinst::vcode::VCode<cranelift_codegen::isa::x64::lower::isle::generated_code::MInst>>>::run": 300336,
     "<regalloc2::ion::data_structures::Env<cranelift_codegen::machinst::vcode::VCode<cranelift_codegen::isa::x64::lower::isle::generated_code::MInst>>>::try_to_allocate_bundle_to_reg": 234467,
-    "<smallvec::SmallVec<[synsema_core::types::SynValue; 4]> as core::ops::drop::Drop>::drop": 3900050,
-    "<synsema_core::interpreter::Bindings>::get_cached": 4098643,
-    "<synsema_core::interpreter::EachItems>::next_item": 3709941,
-    "<synsema_core::interpreter::Interpreter>::dispatch_builtin": 5000100,
-    "<synsema_core::interpreter::Interpreter>::opnd": 8726265,
-    "<synsema_core::interpreter::Interpreter>::register_builtins::{closure#35}": 10100000,
-    "<synsema_core::interpreter::Interpreter>::run_chunk_from": 110817062,
-    "<synsema_core::interpreter::Interpreter>::vm_call_builtin": 24699753,
-    "<synsema_core::number::Number as core::clone::Clone>::clone": 12013785,
-    "<synsema_core::number::Number as core::fmt::Display>::fmt": 3209600,
+    "<regalloc2::ion::reg_traversal::RegTraversalIter>::new": 56086,
+    "<synsema_core::interpreter::BuiltinTask>::new::<&str>": 122256,
+    "<synsema_core::interpreter::EachItems>::next_item": 48131,
+    "<synsema_core::interpreter::Interpreter>::dispatch_builtin": 50100,
+    "<synsema_core::interpreter::Interpreter>::opnd": 114651,
+    "<synsema_core::interpreter::Interpreter>::register_builtins::{closure#35}": 101000,
+    "<synsema_core::interpreter::Interpreter>::run_chunk_from": 1247886,
+    "<synsema_core::interpreter::Interpreter>::vm_call_builtin": 246753,
+    "<synsema_core::interpreter::Interpreter>::vm_path_root": 43200,
+    "<synsema_core::interpreter::Interpreter>::vm_path_set": 50100,
+    "<synsema_core::number::Number as core::clone::Clone>::clone": 135369,
+    "<synsema_core::number::Number as core::fmt::Display>::fmt": 41600,
     "<synsema_core::synmap::KeyHasher as core::hash::BuildHasher>::hash_one::<&str>": 9830772,
+    "<synsema_core::synmap::KeyHasher as core::hash::BuildHasher>::hash_one::<&synsema_core::synmap::Key>": 79994,
     "<synsema_core::synmap::MapBody<[synsema_core::types::SynValue]>>::get_full": 2600000,
-    "<synsema_core::types::SynValue as core::clone::Clone>::clone": 8313128,
-    "<synsema_core::types::SynValue as core::fmt::Display>::fmt": 3610836,
-    "__memcmp_avx2_movbe": 3912557,
-    "__memcpy_avx_unaligned_erms": 1966592,
+    "<synsema_core::types::SynValue as core::clone::Clone>::clone": 94887,
+    "<synsema_core::types::SynValue as core::fmt::Display>::fmt": 46836,
+    "???": 8812661,
+    "__memcmp_avx2_movbe": 2042152,
+    "__memcpy_avx_unaligned_erms": 183733,
+    "__vfscanf_internal": 53688,
+    "_dl_lookup_symbol_x": 47557,
     "_dl_relocate_object": 640035,
-    "_int_free": 5709870,
-    "_int_malloc": 373797,
-    "core::fmt::write": 12237589,
-    "core::ptr::drop_glue::<synsema_core::types::SynValue>": 27443586,
-    "free": 4058736,
-    "malloc": 4415410
+    "_int_free": 355415,
+    "_int_free_merge_chunk": 55938,
+    "_int_malloc": 375506,
+    "core::fmt::write": 159589,
+    "core::iter::adapters::chain::and_then_or_clear::<core::iter::adapters::chain::Chain<core::iter::adapters::copied::Copied<core::slice::iter::Iter<cranelift_codegen::ir::entities::Value>>, core::iter::adapters::flatten::FlatMap<core::slice::iter::Iter<cranelift_codegen::ir::instructions::BlockCall>, core::iter::adapters::filter_map::FilterMap<core::iter::adapters::map::Map<core::slice::iter::Iter<cranelift_codegen::ir::entities::Value>, <cranelift_codegen::ir::instructions::BlockCall>::args::{closure#0}>, <cranelift_codegen::ir::dfg::DataFlowGraph>::inst_values::{closure#0}::{closure#0}>, <cranelift_codegen::ir::dfg::DataFlowGraph>::inst_values::{closure#0}>>, cranelift_codegen::ir::entities::Value, <core::iter::adapters::chain::Chain<core::iter::adapters::copied::Copied<core::slice::iter::Iter<cranelift_codegen::ir::entities::Value>>, core::iter::adapters::flatten::FlatMap<core::slice::iter::Iter<cranelift_codegen::ir::instructions::BlockCall>, core::iter::adapters::filter_map::FilterMap<core::iter::adapters::map::Map<core::slice::iter::Iter<cranelift_codegen::ir::entities::Value>, <cranelift_codegen::ir::instructions::BlockCall>::args::{closure#0}>, <cranelift_codegen::ir::dfg::DataFlowGraph>::inst_values::{closure#0}::{closure#0}>, <cranelift_codegen::ir::dfg::DataFlowGraph>::inst_values::{closure#0}>> as core::iter::traits::iterator::Iterator>::next>": 105816,
+    "core::ptr::drop_glue::<synsema_core::types::SynValue>": 317060,
+    "core::str::converts::from_utf8": 5343540,
+    "cranelift_codegen::alias_analysis::classify": 46297,
+    "cranelift_codegen::ir::dfg::resolve_aliases": 57430,
+    "cranelift_codegen::machinst::compile::compile::<cranelift_codegen::isa::x64::X64Backend>": 87998,
+    "do_lookup_x": 87879,
+    "free": 191496,
+    "malloc": 250235,
+    "malloc_consolidate": 86355,
+    "realloc": 53925,
+    "synsema_core::interpreter::int_digits": 5309831,
+    "synsema_jit::abi::synsema_jit_get": 8415000,
+    "synsema_jit::lower::check_pointers": 74175,
+    "unlink_chunk.isra.0": 52422
    },
-   "total": 325598928
+   "total": 74531705
   },
   "j_map_get|ref": {
    "fns": {
@@ -2269,7 +2308,7 @@
     "<core::fmt::Formatter>::pad_integral::write_prefix": 2106300,
     "<core::hash::sip::Hasher<core::hash::sip::Sip13Rounds> as core::hash::Hasher>::write": 7123164,
     "<i64 as core::fmt::Display>::fmt": 4856880,
-    "<indexmap::inner::Core<synsema_core::synmap::Key, synsema_core::types::SynValue>>::get_index_of::<str>": 7612455,
+    "<indexmap::inner::Core<synsema_core::synmap::Key, synsema_core::types::SynValue>>::get_index_of::<str>": 7637059,
     "<indexmap::map::IndexMap<synsema_core::synmap::Key, synsema_core::types::SynValue, synsema_core::synmap::KeyHasher>>::get_full::<str>": 4200000,
     "<smallvec::SmallVec<[synsema_core::types::SynValue; 4]> as core::ops::drop::Drop>::drop": 3900114,
     "<synsema_core::ast::BinOp>::as_str": 702100,
@@ -2300,7 +2339,7 @@
     "<synsema_core::synmap::MapBody<[synsema_core::types::SynValue]>>::get_full": 2600000,
     "<synsema_core::types::SynValue as core::clone::Clone>::clone": 8319898,
     "<synsema_core::types::SynValue as core::fmt::Display>::fmt": 3610836,
-    "__memcmp_avx2_movbe": 10864352,
+    "__memcmp_avx2_movbe": 10871572,
     "__memcpy_avx_unaligned_erms": 10369159,
     "_dl_relocate_object": 640035,
     "_int_free": 16377918,
@@ -2314,7 +2353,7 @@
     "synsema_core::interpreter::env_update": 7800000,
     "synsema_core::temporal::binop": 2708100
    },
-   "total": 548354720
+   "total": 548388099
   },
   "j_map_get|vm": {
    "fns": {
@@ -2328,7 +2367,7 @@
     "<core::hash::sip::Hasher<core::hash::sip::Sip13Rounds> as core::hash::Hasher>::write": 7125906,
     "<i64 as core::fmt::Display>::fmt": 4856880,
     "<i64 as num_integer::Integer>::mod_floor": 3099969,
-    "<indexmap::inner::Core<synsema_core::synmap::Key, synsema_core::types::SynValue>>::get_index_of::<str>": 7637137,
+    "<indexmap::inner::Core<synsema_core::synmap::Key, synsema_core::types::SynValue>>::get_index_of::<str>": 7622187,
     "<indexmap::map::IndexMap<synsema_core::synmap::Key, synsema_core::types::SynValue, synsema_core::synmap::KeyHasher>>::get_full::<str>": 4200000,
     "<smallvec::SmallVec<[synsema_core::types::SynValue; 4]> as core::ops::drop::Drop>::drop": 3900050,
     "<synsema_core::interpreter::Bindings>::get_cached": 4099996,
@@ -2344,7 +2383,7 @@
     "<synsema_core::synmap::MapBody<[synsema_core::types::SynValue]>>::get_full": 2600000,
     "<synsema_core::types::SynValue as core::clone::Clone>::clone": 8311604,
     "<synsema_core::types::SynValue as core::fmt::Display>::fmt": 3610836,
-    "__memcmp_avx2_movbe": 3902691,
+    "__memcmp_avx2_movbe": 3894852,
     "__memcpy_avx_unaligned_erms": 1849782,
     "_dl_relocate_object": 640035,
     "_int_free": 5574561,
@@ -2354,62 +2393,68 @@
     "free": 3991102,
     "malloc": 4335369
    },
-   "total": 318189841
+   "total": 318165606
   },
   "j_map_key_int|jit": {
    "fns": {
-    "<&i64 as core::fmt::Display>::fmt": 400002,
-    "<&synsema_core::number::Number as core::fmt::Display>::fmt": 400002,
-    "<alloc::raw_vec::RawVecInner<_>>::reserve::do_reserve_and_handle::<alloc::alloc::Global>": 6416564,
-    "<alloc::raw_vec::RawVecInner>::finish_grow": 9049270,
-    "<alloc::string::String as core::fmt::Write>::write_str": 7000719,
-    "<core::fmt::Formatter>::pad_integral": 10400208,
-    "<core::fmt::Formatter>::pad_integral::write_prefix": 4200084,
-    "<core::hash::sip::Hasher<core::hash::sip::Sip13Rounds> as core::hash::Hasher>::write": 14123908,
+    "<alloc::raw_vec::RawVecInner>::finish_grow": 137830,
+    "<core::fmt::Formatter>::pad_integral": 104208,
+    "<core::hash::sip::Hasher<core::hash::sip::Sip13Rounds> as core::hash::Hasher>::write": 21053908,
+    "<cranelift_codegen::egraph::EgraphPass>::run": 150593,
+    "<cranelift_codegen::egraph::OptimizeCtx>::insert_pure_enode": 101097,
     "<cranelift_codegen::egraph::elaborate::Elaborator>::elaborate": 248326,
     "<cranelift_codegen::ir::dfg::DataFlowGraph>::compute_result_type": 238766,
+    "<cranelift_codegen::ir::dfg::DataFlowGraph>::ctrl_typevar": 150986,
+    "<cranelift_codegen::ir::dfg::DataFlowGraph>::inst_results": 127457,
+    "<cranelift_codegen::ir::dfg::DataFlowGraph>::inst_values": 150820,
+    "<cranelift_codegen::ir::dfg::DataFlowGraph>::non_tail_call_or_try_call_signature": 192828,
     "<cranelift_codegen::ir::dfg::DataFlowGraph>::value_def": 321345,
+    "<cranelift_codegen::ir::instructions::InstructionData>::analyze_call": 110174,
+    "<cranelift_codegen::ir::instructions::ValueTypeSet>::contains": 105789,
+    "<cranelift_codegen::machinst::vcode::VCode<cranelift_codegen::isa::x64::lower::isle::generated_code::MInst> as regalloc2::Function>::inst_operands": 135762,
+    "<cranelift_codegen::machinst::vcode::VCode<cranelift_codegen::isa::x64::lower::isle::generated_code::MInst>>::emit": 103562,
     "<cranelift_codegen::verifier::Verifier>::run": 1300794,
-    "<i64 as core::fmt::Display>::fmt": 9684743,
-    "<i64 as num_integer::Integer>::mod_floor": 6198915,
-    "<indexmap::inner::Core<synsema_core::synmap::Key, synsema_core::types::SynValue>>::get_index_of::<str>": 15228274,
-    "<indexmap::map::IndexMap<synsema_core::synmap::Key, synsema_core::types::SynValue, synsema_core::synmap::KeyHasher>>::get_full::<str>": 4195986,
+    "<i64 as core::fmt::Display>::fmt": 96263,
+    "<indexmap::inner::Core<synsema_core::synmap::Key, synsema_core::types::SynValue>>::get_index_of::<str>": 22748254,
+    "<indexmap::map::IndexMap<synsema_core::synmap::Key, synsema_core::types::SynValue, synsema_core::synmap::KeyHasher>>::get_full::<str>": 8353986,
     "<indexmap::map::IndexMap<synsema_core::synmap::Key, synsema_core::types::SynValue, synsema_core::synmap::KeyHasher>>::get_mut::<str>": 3896577,
     "<regalloc2::ion::data_structures::Env<cranelift_codegen::machinst::vcode::VCode<cranelift_codegen::isa::x64::lower::isle::generated_code::MInst>>>::init": 513267,
     "<regalloc2::ion::data_structures::Env<cranelift_codegen::machinst::vcode::VCode<cranelift_codegen::isa::x64::lower::isle::generated_code::MInst>>>::run": 446960,
     "<regalloc2::ion::data_structures::Env<cranelift_codegen::machinst::vcode::VCode<cranelift_codegen::isa::x64::lower::isle::generated_code::MInst>>>::try_to_allocate_bundle_to_reg": 421468,
-    "<smallvec::SmallVec<[synsema_core::types::SynValue; 4]> as core::ops::drop::Drop>::drop": 3900100,
     "<std::thread::local::LocalKey<core::cell::RefCell<synsema_core::interpreter::ModuleRegistry>>>::with::<synsema_core::interpreter::module_env_of_map::{closure#0}, core::option::Option<alloc::rc::Rc<core::cell::RefCell<synsema_core::interpreter::Environment>>>>": 4400005,
-    "<synsema_core::interpreter::EachItems>::next_item": 3698810,
-    "<synsema_core::interpreter::Interpreter>::dispatch_builtin": 5000200,
-    "<synsema_core::interpreter::Interpreter>::free_start": 2200000,
-    "<synsema_core::interpreter::Interpreter>::opnd": 13199400,
-    "<synsema_core::interpreter::Interpreter>::register_builtins::{closure#35}": 10097900,
-    "<synsema_core::interpreter::Interpreter>::run_chunk_from": 100909268,
-    "<synsema_core::interpreter::Interpreter>::vm_call_builtin": 24699753,
-    "<synsema_core::interpreter::Interpreter>::vm_path_root": 14400000,
-    "<synsema_core::interpreter::Interpreter>::vm_path_set": 16700000,
-    "<synsema_core::number::Number as core::clone::Clone>::clone": 9592854,
-    "<synsema_core::number::Number as core::fmt::Display>::fmt": 6400032,
-    "<synsema_core::synmap::KeyHasher as core::hash::BuildHasher>::hash_one::<&str>": 19600588,
+    "<synsema_core::interpreter::BuiltinTask>::new::<&str>": 122256,
+    "<synsema_core::interpreter::Interpreter>::opnd": 132786,
+    "<synsema_core::interpreter::Interpreter>::register_builtins::{closure#35}": 98900,
+    "<synsema_core::interpreter::Interpreter>::run_chunk_from": 1035030,
+    "<synsema_core::interpreter::Interpreter>::vm_call_builtin": 246753,
+    "<synsema_core::interpreter::Interpreter>::vm_path_root": 144000,
+    "<synsema_core::interpreter::Interpreter>::vm_path_set": 167000,
+    "<synsema_core::synmap::KeyHasher as core::hash::BuildHasher>::hash_one::<&str>": 29302588,
+    "<synsema_core::synmap::MapBody<[synsema_core::types::SynValue]>>::get_cached_mut_slow": 3465000,
+    "<synsema_core::synmap::MapBody<[synsema_core::types::SynValue]>>::get_cached_slow": 7011180,
     "<synsema_core::synmap::MapBody<[synsema_core::types::SynValue]>>::get_full": 2600335,
-    "<synsema_core::synmap::MapBody<[synsema_core::types::SynValue]>>::set": 4802748,
-    "<synsema_core::types::SynValue as core::clone::Clone>::clone": 9097975,
-    "<synsema_core::types::SynValue as core::fmt::Display>::fmt": 7200072,
-    "__memcmp_avx2_movbe": 6114184,
-    "__memcpy_avx_unaligned_erms": 3821901,
+    "???": 11881821,
+    "__memcmp_avx2_movbe": 8036695,
+    "__memcpy_avx_unaligned_erms": 263205,
     "_dl_relocate_object": 640035,
-    "_int_free": 11112258,
-    "_int_malloc": 413071,
-    "core::fmt::write": 24401111,
-    "core::ptr::drop_glue::<synsema_core::types::SynValue>": 32299756,
-    "free": 7957956,
-    "malloc": 8618240,
+    "_int_free": 411689,
+    "_int_malloc": 414353,
+    "core::fmt::write": 245111,
+    "core::iter::adapters::chain::and_then_or_clear::<core::iter::adapters::chain::Chain<core::iter::adapters::copied::Copied<core::slice::iter::Iter<cranelift_codegen::ir::entities::Value>>, core::iter::adapters::flatten::FlatMap<core::slice::iter::Iter<cranelift_codegen::ir::instructions::BlockCall>, core::iter::adapters::filter_map::FilterMap<core::iter::adapters::map::Map<core::slice::iter::Iter<cranelift_codegen::ir::entities::Value>, <cranelift_codegen::ir::instructions::BlockCall>::args::{closure#0}>, <cranelift_codegen::ir::dfg::DataFlowGraph>::inst_values::{closure#0}::{closure#0}>, <cranelift_codegen::ir::dfg::DataFlowGraph>::inst_values::{closure#0}>>, cranelift_codegen::ir::entities::Value, <core::iter::adapters::chain::Chain<core::iter::adapters::copied::Copied<core::slice::iter::Iter<cranelift_codegen::ir::entities::Value>>, core::iter::adapters::flatten::FlatMap<core::slice::iter::Iter<cranelift_codegen::ir::instructions::BlockCall>, core::iter::adapters::filter_map::FilterMap<core::iter::adapters::map::Map<core::slice::iter::Iter<cranelift_codegen::ir::entities::Value>, <cranelift_codegen::ir::instructions::BlockCall>::args::{closure#0}>, <cranelift_codegen::ir::dfg::DataFlowGraph>::inst_values::{closure#0}::{closure#0}>, <cranelift_codegen::ir::dfg::DataFlowGraph>::inst_values::{closure#0}>> as core::iter::traits::iterator::Iterator>::next>": 154946,
+    "core::ptr::drop_glue::<synsema_core::types::SynValue>": 2203892,
+    "core::str::converts::from_utf8": 10685871,
+    "cranelift_codegen::machinst::compile::compile::<cranelift_codegen::isa::x64::X64Backend>": 118668,
+    "free": 229716,
+    "malloc": 295065,
+    "synsema_core::interpreter::int_digits": 10619503,
     "synsema_core::interpreter::make_unique_n": 3700000,
-    "synsema_core::interpreter::set_leaf_index": 9399400,
-    "synsema_core::synmap::own": 1699983
+    "synsema_core::synmap::own": 1699983,
+    "synsema_jit::abi::synsema_jit_get": 8415000,
+    "synsema_jit::abi::synsema_jit_path_root": 2772000,
+    "synsema_jit::abi::synsema_jit_path_set": 12375000,
+    "synsema_jit::lower::check_pointers": 108141
    },
-   "total": 470974990
+   "total": 191730320
   },
   "j_map_key_int|ref": {
    "fns": {
@@ -2425,7 +2470,7 @@
     "<core::fmt::Formatter>::pad_integral::write_prefix": 4200021,
     "<core::hash::sip::Hasher<core::hash::sip::Sip13Rounds> as core::hash::Hasher>::write": 14101225,
     "<i64 as core::fmt::Display>::fmt": 9684743,
-    "<indexmap::inner::Core<synsema_core::synmap::Key, synsema_core::types::SynValue>>::get_index_of::<str>": 15237814,
+    "<indexmap::inner::Core<synsema_core::synmap::Key, synsema_core::types::SynValue>>::get_index_of::<str>": 15238582,
     "<indexmap::map::IndexMap<synsema_core::synmap::Key, synsema_core::types::SynValue, synsema_core::synmap::KeyHasher>>::get_full::<str>": 4195986,
     "<indexmap::map::IndexMap<synsema_core::synmap::Key, synsema_core::types::SynValue, synsema_core::synmap::KeyHasher>>::get_mut::<str>": 3896577,
     "<smallvec::SmallVec<[synsema_core::types::SynValue; 4]> as core::ops::drop::Drop>::drop": 3900132,
@@ -2460,7 +2505,7 @@
     "<synsema_core::synmap::MapBody<[synsema_core::types::SynValue]>>::set": 4802748,
     "<synsema_core::types::SynValue as core::clone::Clone>::clone": 11897139,
     "<synsema_core::types::SynValue as core::fmt::Display>::fmt": 7200072,
-    "__memcmp_avx2_movbe": 14133694,
+    "__memcmp_avx2_movbe": 14138669,
     "__memcpy_avx_unaligned_erms": 12131301,
     "_dl_relocate_object": 640035,
     "_int_free": 21742870,
@@ -2477,7 +2522,7 @@
     "synsema_core::synmap::own": 1699983,
     "synsema_core::temporal::binop": 2700054
    },
-   "total": 747072916
+   "total": 747080251
   },
   "j_map_key_int|vm": {
    "fns": {
@@ -2491,7 +2536,7 @@
     "<core::hash::sip::Hasher<core::hash::sip::Sip13Rounds> as core::hash::Hasher>::write": 14103146,
     "<i64 as core::fmt::Display>::fmt": 9684743,
     "<i64 as num_integer::Integer>::mod_floor": 6199938,
-    "<indexmap::inner::Core<synsema_core::synmap::Key, synsema_core::types::SynValue>>::get_index_of::<str>": 15208934,
+    "<indexmap::inner::Core<synsema_core::synmap::Key, synsema_core::types::SynValue>>::get_index_of::<str>": 15179020,
     "<indexmap::map::IndexMap<synsema_core::synmap::Key, synsema_core::types::SynValue, synsema_core::synmap::KeyHasher>>::get_full::<str>": 4195986,
     "<indexmap::map::IndexMap<synsema_core::synmap::Key, synsema_core::types::SynValue, synsema_core::synmap::KeyHasher>>::get_mut::<str>": 3896577,
     "<smallvec::SmallVec<[synsema_core::types::SynValue; 4]> as core::ops::drop::Drop>::drop": 3900100,
@@ -2512,7 +2557,7 @@
     "<synsema_core::synmap::MapBody<[synsema_core::types::SynValue]>>::set": 4802748,
     "<synsema_core::types::SynValue as core::clone::Clone>::clone": 9097245,
     "<synsema_core::types::SynValue as core::fmt::Display>::fmt": 7200072,
-    "__memcmp_avx2_movbe": 6107504,
+    "__memcmp_avx2_movbe": 6089424,
     "__memcpy_avx_unaligned_erms": 3634289,
     "_dl_relocate_object": 640035,
     "_int_free": 10953264,
@@ -2524,57 +2569,61 @@
     "synsema_core::interpreter::set_leaf_index": 9399400,
     "synsema_core::synmap::own": 1699983
    },
-   "total": 460325503
+   "total": 460278313
   },
   "j_map_set|jit": {
    "fns": {
-    "<&i64 as core::fmt::Display>::fmt": 200002,
-    "<&synsema_core::number::Number as core::fmt::Display>::fmt": 200002,
-    "<alloc::raw_vec::RawVecInner<_>>::reserve::do_reserve_and_handle::<alloc::alloc::Global>": 3213272,
-    "<alloc::raw_vec::RawVecInner>::finish_grow": 4540252,
-    "<alloc::string::String as core::fmt::Write>::write_str": 3500719,
-    "<core::fmt::Formatter>::pad_integral": 5200208,
-    "<core::fmt::Formatter>::pad_integral::write_prefix": 2100084,
-    "<core::hash::sip::Hasher<core::hash::sip::Sip13Rounds> as core::hash::Hasher>::write": 7120079,
+    "<alloc::raw_vec::RawVecInner>::finish_grow": 83812,
+    "<core::hash::sip::Hasher<core::hash::sip::Sip13Rounds> as core::hash::Hasher>::write": 14050079,
+    "<cranelift_codegen::egraph::EgraphPass>::run": 79494,
+    "<cranelift_codegen::egraph::OptimizeCtx>::insert_pure_enode": 69009,
     "<cranelift_codegen::egraph::elaborate::Elaborator>::elaborate": 131482,
     "<cranelift_codegen::ir::dfg::DataFlowGraph>::compute_result_type": 122410,
+    "<cranelift_codegen::ir::dfg::DataFlowGraph>::ctrl_typevar": 76862,
+    "<cranelift_codegen::ir::dfg::DataFlowGraph>::inst_results": 65646,
+    "<cranelift_codegen::ir::dfg::DataFlowGraph>::inst_values": 77574,
+    "<cranelift_codegen::ir::dfg::DataFlowGraph>::non_tail_call_or_try_call_signature": 99700,
     "<cranelift_codegen::ir::dfg::DataFlowGraph>::value_def": 161011,
+    "<cranelift_codegen::machinst::vcode::VCode<cranelift_codegen::isa::x64::lower::isle::generated_code::MInst> as regalloc2::Function>::inst_operands": 70686,
     "<cranelift_codegen::verifier::Verifier>::run": 669235,
-    "<i64 as core::fmt::Display>::fmt": 4842391,
-    "<i64 as num_integer::Integer>::mod_floor": 3098946,
-    "<indexmap::inner::Core<synsema_core::synmap::Key, synsema_core::types::SynValue>>::get_index_of::<str>": 7643323,
+    "<indexmap::inner::Core<synsema_core::synmap::Key, synsema_core::types::SynValue>>::get_index_of::<str>": 15186740,
+    "<indexmap::map::IndexMap<synsema_core::synmap::Key, synsema_core::types::SynValue, synsema_core::synmap::KeyHasher>>::get_full::<str>": 4158042,
     "<indexmap::map::IndexMap<synsema_core::synmap::Key, synsema_core::types::SynValue, synsema_core::synmap::KeyHasher>>::get_mut::<str>": 3896577,
     "<regalloc2::ion::data_structures::Env<cranelift_codegen::machinst::vcode::VCode<cranelift_codegen::isa::x64::lower::isle::generated_code::MInst>>>::init": 280695,
     "<regalloc2::ion::data_structures::Env<cranelift_codegen::machinst::vcode::VCode<cranelift_codegen::isa::x64::lower::isle::generated_code::MInst>>>::run": 192077,
     "<regalloc2::ion::data_structures::Env<cranelift_codegen::machinst::vcode::VCode<cranelift_codegen::isa::x64::lower::isle::generated_code::MInst>>>::try_to_allocate_bundle_to_reg": 145375,
     "<std::thread::local::LocalKey<core::cell::RefCell<synsema_core::interpreter::ModuleRegistry>>>::with::<synsema_core::interpreter::module_env_of_map::{closure#0}, core::option::Option<alloc::rc::Rc<core::cell::RefCell<synsema_core::interpreter::Environment>>>>": 4400005,
     "<synsema_core::interpreter::BuiltinTask>::new::<&str>": 122256,
-    "<synsema_core::interpreter::EachItems>::next_item": 3698810,
-    "<synsema_core::interpreter::Interpreter>::free_start": 2199274,
-    "<synsema_core::interpreter::Interpreter>::opnd": 13499127,
-    "<synsema_core::interpreter::Interpreter>::run_chunk_from": 43316742,
-    "<synsema_core::interpreter::Interpreter>::vm_path_root": 14395248,
-    "<synsema_core::interpreter::Interpreter>::vm_path_set": 16700000,
-    "<synsema_core::number::Number as core::clone::Clone>::clone": 4799763,
-    "<synsema_core::number::Number as core::fmt::Display>::fmt": 3200032,
-    "<synsema_core::synmap::KeyHasher as core::hash::BuildHasher>::hash_one::<&str>": 9801470,
-    "<synsema_core::synmap::MapBody<[synsema_core::types::SynValue]>>::set": 4802748,
-    "<synsema_core::types::SynValue as core::clone::Clone>::clone": 3800376,
-    "<synsema_core::types::SynValue as core::fmt::Display>::fmt": 3600072,
-    "__memcmp_avx2_movbe": 2032505,
-    "__memcpy_avx_unaligned_erms": 1930084,
+    "<synsema_core::interpreter::Interpreter>::opnd": 135612,
+    "<synsema_core::interpreter::Interpreter>::run_chunk_from": 459178,
+    "<synsema_core::interpreter::Interpreter>::vm_path_root": 144000,
+    "<synsema_core::interpreter::Interpreter>::vm_path_set": 167000,
+    "<synsema_core::synmap::KeyHasher as core::hash::BuildHasher>::hash_one::<&str>": 19503470,
+    "<synsema_core::synmap::KeyHasher as core::hash::BuildHasher>::hash_one::<&synsema_core::synmap::Key>": 79994,
+    "<synsema_core::synmap::MapBody<[synsema_core::types::SynValue]>>::get_cached_mut_slow": 3465000,
+    "<synsema_core::synmap::MapBody<[synsema_core::types::SynValue]>>::get_cached_slow": 7011180,
+    "???": 6535502,
+    "__memcmp_avx2_movbe": 6480912,
+    "__memcpy_avx_unaligned_erms": 146815,
     "_dl_relocate_object": 640035,
-    "_int_free": 5669883,
-    "_int_malloc": 343819,
-    "core::fmt::write": 12201111,
-    "core::ptr::drop_glue::<synsema_core::types::SynValue>": 13905248,
-    "free": 4036701,
-    "malloc": 4390622,
+    "_int_free": 315483,
+    "_int_malloc": 344843,
+    "core::fmt::write": 123111,
+    "core::iter::adapters::chain::and_then_or_clear::<core::iter::adapters::chain::Chain<core::iter::adapters::copied::Copied<core::slice::iter::Iter<cranelift_codegen::ir::entities::Value>>, core::iter::adapters::flatten::FlatMap<core::slice::iter::Iter<cranelift_codegen::ir::instructions::BlockCall>, core::iter::adapters::filter_map::FilterMap<core::iter::adapters::map::Map<core::slice::iter::Iter<cranelift_codegen::ir::entities::Value>, <cranelift_codegen::ir::instructions::BlockCall>::args::{closure#0}>, <cranelift_codegen::ir::dfg::DataFlowGraph>::inst_values::{closure#0}::{closure#0}>, <cranelift_codegen::ir::dfg::DataFlowGraph>::inst_values::{closure#0}>>, cranelift_codegen::ir::entities::Value, <core::iter::adapters::chain::Chain<core::iter::adapters::copied::Copied<core::slice::iter::Iter<cranelift_codegen::ir::entities::Value>>, core::iter::adapters::flatten::FlatMap<core::slice::iter::Iter<cranelift_codegen::ir::instructions::BlockCall>, core::iter::adapters::filter_map::FilterMap<core::iter::adapters::map::Map<core::slice::iter::Iter<cranelift_codegen::ir::entities::Value>, <cranelift_codegen::ir::instructions::BlockCall>::args::{closure#0}>, <cranelift_codegen::ir::dfg::DataFlowGraph>::inst_values::{closure#0}::{closure#0}>, <cranelift_codegen::ir::dfg::DataFlowGraph>::inst_values::{closure#0}>> as core::iter::traits::iterator::Iterator>::next>": 79958,
+    "core::ptr::drop_glue::<synsema_core::types::SynValue>": 2025309,
+    "core::str::converts::from_utf8": 5343127,
+    "do_lookup_x": 87879,
+    "free": 169461,
+    "malloc": 225494,
+    "malloc_consolidate": 79224,
+    "synsema_core::interpreter::int_digits": 5309803,
     "synsema_core::interpreter::make_unique_n": 3700000,
-    "synsema_core::interpreter::set_leaf_index": 9399400,
-    "synsema_core::synmap::own": 1699983
+    "synsema_core::interpreter::set_leaf_index": 93400,
+    "synsema_core::synmap::own": 1699983,
+    "synsema_jit::abi::synsema_jit_path_root": 2772000,
+    "synsema_jit::abi::synsema_jit_path_set": 12375000
    },
-   "total": 240090876
+   "total": 127737056
   },
   "j_map_set|ref": {
    "fns": {
@@ -2590,7 +2639,7 @@
     "<core::fmt::Formatter>::pad_integral::write_prefix": 2100021,
     "<core::hash::sip::Hasher<core::hash::sip::Sip13Rounds> as core::hash::Hasher>::write": 7102164,
     "<i64 as core::fmt::Display>::fmt": 4842391,
-    "<indexmap::inner::Core<synsema_core::synmap::Key, synsema_core::types::SynValue>>::get_index_of::<str>": 7590026,
+    "<indexmap::inner::Core<synsema_core::synmap::Key, synsema_core::types::SynValue>>::get_index_of::<str>": 7633783,
     "<indexmap::map::IndexMap<synsema_core::synmap::Key, synsema_core::types::SynValue, synsema_core::synmap::KeyHasher>>::get_mut::<str>": 3896577,
     "<std::thread::local::LocalKey<core::cell::RefCell<synsema_core::interpreter::ModuleRegistry>>>::with::<synsema_core::interpreter::module_env_of_map::{closure#0}, core::option::Option<alloc::rc::Rc<core::cell::RefCell<synsema_core::interpreter::Environment>>>>": 4400027,
     "<synsema_core::interpreter::Bindings>::find": 44819041,
@@ -2615,7 +2664,7 @@
     "<synsema_core::synmap::MapBody<[synsema_core::types::SynValue]>>::set": 4802748,
     "<synsema_core::types::SynValue as core::clone::Clone>::clone": 6600139,
     "<synsema_core::types::SynValue as core::fmt::Display>::fmt": 3600072,
-    "__memcmp_avx2_movbe": 8003832,
+    "__memcmp_avx2_movbe": 8020752,
     "__memcpy_avx_unaligned_erms": 10334269,
     "_dl_relocate_object": 640035,
     "_int_free": 10937085,
@@ -2631,7 +2680,7 @@
     "synsema_core::interpreter::set_root_identifier": 2900000,
     "synsema_core::synmap::own": 1699983
    },
-   "total": 372037126
+   "total": 372096927
   },
   "j_map_set|vm": {
    "fns": {
@@ -2645,7 +2694,7 @@
     "<core::hash::sip::Hasher<core::hash::sip::Sip13Rounds> as core::hash::Hasher>::write": 7103811,
     "<i64 as core::fmt::Display>::fmt": 4842391,
     "<i64 as num_integer::Integer>::mod_floor": 3099969,
-    "<indexmap::inner::Core<synsema_core::synmap::Key, synsema_core::types::SynValue>>::get_index_of::<str>": 7613967,
+    "<indexmap::inner::Core<synsema_core::synmap::Key, synsema_core::types::SynValue>>::get_index_of::<str>": 7633630,
     "<indexmap::map::IndexMap<synsema_core::synmap::Key, synsema_core::types::SynValue, synsema_core::synmap::KeyHasher>>::get_mut::<str>": 3896577,
     "<std::thread::local::LocalKey<core::cell::RefCell<synsema_core::interpreter::ModuleRegistry>>>::with::<synsema_core::interpreter::module_env_of_map::{closure#0}, core::option::Option<alloc::rc::Rc<core::cell::RefCell<synsema_core::interpreter::Environment>>>>": 4400005,
     "<synsema_core::interpreter::BuiltinTask>::new::<&str>": 122256,
@@ -2661,7 +2710,7 @@
     "<synsema_core::synmap::MapBody<[synsema_core::types::SynValue]>>::set": 4802748,
     "<synsema_core::types::SynValue as core::clone::Clone>::clone": 3800215,
     "<synsema_core::types::SynValue as core::fmt::Display>::fmt": 3600072,
-    "__memcmp_avx2_movbe": 2014297,
+    "__memcmp_avx2_movbe": 2028899,
     "__memcpy_avx_unaligned_erms": 1836767,
     "_dl_relocate_object": 640035,
     "_int_free": 5546440,
@@ -2674,7 +2723,7 @@
     "synsema_core::interpreter::set_leaf_index": 9399400,
     "synsema_core::synmap::own": 1699983
    },
-   "total": 234360295
+   "total": 234395093
   },
   "j_task_enter|jit": {
    "fns": {
@@ -2734,7 +2783,7 @@
     "<synsema_core::types::SynValue as core::clone::Clone>::clone": 120066,
     "<synsema_jit::abi::Compiled as synsema_core::native_tier::NativeCode>::call": 74536,
     "???": 7159949,
-    "__memcmp_avx2_movbe": 103331,
+    "__memcmp_avx2_movbe": 103309,
     "__memcpy_avx_unaligned_erms": 546674,
     "_dl_relocate_object": 640035,
     "_int_free": 709816,
@@ -2752,14 +2801,14 @@
     "do_lookup_x": 87879,
     "free": 402993,
     "malloc": 496377,
-    "malloc_consolidate": 113737,
+    "malloc_consolidate": 113777,
     "realloc": 124131,
     "synsema_jit::abi::nval": 114265,
     "synsema_jit::abi::synsema_jit_deopt": 78408,
-    "synsema_jit::lower::build": 74588,
+    "synsema_jit::lower::build": 74574,
     "unlink_chunk.isra.0": 79435
    },
-   "total": 34815420
+   "total": 34815152
   },
   "j_task_enter|ref": {
    "fns": {
@@ -2796,7 +2845,7 @@
     "<synsema_core::synlist::SynList>::to_vec": 275055,
     "<synsema_core::types::SynValue as core::clone::Clone>::clone": 4900080,
     "<synsema_heap::Shared<synsema_core::synlist::SynList>>::drop_slow": 215043,
-    "__memcmp_avx2_movbe": 11262051,
+    "__memcmp_avx2_movbe": 11262073,
     "__memcpy_avx_unaligned_erms": 12550190,
     "_dl_relocate_object": 640035,
     "_int_free": 10395811,
@@ -2810,7 +2859,7 @@
     "synsema_core::interpreter::num_to_i64": 280056,
     "synsema_core::temporal::binop": 4185000
    },
-   "total": 419564320
+   "total": 419564676
   },
   "j_task_enter|vm": {
    "fns": {
@@ -2831,7 +2880,7 @@
     "<synsema_core::number::Number as core::clone::Clone>::clone": 4440774,
     "<synsema_core::number::Number>::to_i64_trunc": 180036,
     "<synsema_core::types::SynValue as core::clone::Clone>::clone": 2000156,
-    "__memcmp_avx2_movbe": 312618,
+    "__memcmp_avx2_movbe": 312596,
     "_dl_relocate_object": 640035,
     "_int_free": 153748,
     "_int_malloc": 200298,
@@ -2843,7 +2892,7 @@
     "synsema_core::interpreter::num_to_i64": 280056,
     "synsema_core::interpreter::range_spec": 180036
    },
-   "total": 137149889
+   "total": 137149829
   },
   "j_while_and|jit": {
    "fns": {
@@ -2901,14 +2950,14 @@
     "<synsema_core::synlist::SynList>::push": 124000,
     "<synsema_core::types::SynValue as core::clone::Clone>::clone": 148506,
     "<synsema_jit::lower::Func>::kinds::{closure#1}": 94997,
-    "???": 425086,
-    "__memcmp_avx2_movbe": 103513,
-    "__memcpy_avx_unaligned_erms": 595197,
+    "???": 425082,
+    "__memcmp_avx2_movbe": 103522,
+    "__memcpy_avx_unaligned_erms": 595175,
     "__memset_avx2_unaligned_erms": 81472,
     "_dl_relocate_object": 640035,
-    "_int_free": 442820,
-    "_int_free_merge_chunk": 90875,
-    "_int_malloc": 530124,
+    "_int_free": 442736,
+    "_int_free_merge_chunk": 90914,
+    "_int_malloc": 530186,
     "core::iter::adapters::chain::and_then_or_clear::<core::iter::adapters::chain::Chain<core::iter::adapters::copied::Copied<core::slice::iter::Iter<cranelift_codegen::ir::entities::Value>>, core::iter::adapters::flatten::FlatMap<core::slice::iter::Iter<cranelift_codegen::ir::instructions::BlockCall>, core::iter::adapters::filter_map::FilterMap<core::iter::adapters::map::Map<core::slice::iter::Iter<cranelift_codegen::ir::entities::Value>, <cranelift_codegen::ir::instructions::BlockCall>::args::{closure#0}>, <cranelift_codegen::ir::dfg::DataFlowGraph>::inst_values::{closure#0}::{closure#0}>, <cranelift_codegen::ir::dfg::DataFlowGraph>::inst_values::{closure#0}>>, cranelift_codegen::ir::entities::Value, <core::iter::adapters::chain::Chain<core::iter::adapters::copied::Copied<core::slice::iter::Iter<cranelift_codegen::ir::entities::Value>>, core::iter::adapters::flatten::FlatMap<core::slice::iter::Iter<cranelift_codegen::ir::instructions::BlockCall>, core::iter::adapters::filter_map::FilterMap<core::iter::adapters::map::Map<core::slice::iter::Iter<cranelift_codegen::ir::entities::Value>, <cranelift_codegen::ir::instructions::BlockCall>::args::{closure#0}>, <cranelift_codegen::ir::dfg::DataFlowGraph>::inst_values::{closure#0}::{closure#0}>, <cranelift_codegen::ir::dfg::DataFlowGraph>::inst_values::{closure#0}>> as core::iter::traits::iterator::Iterator>::next>": 330216,
     "core::ptr::drop_glue::<synsema_core::types::SynValue>": 472308,
     "cranelift_codegen::alias_analysis::classify": 143623,
@@ -2919,16 +2968,16 @@
     "cranelift_codegen::remove_constant_phis::do_remove_constant_phis": 91247,
     "do_lookup_x": 87879,
     "free": 232248,
-    "malloc": 311734,
-    "malloc_consolidate": 104172,
-    "realloc": 86063,
+    "malloc": 311834,
+    "malloc_consolidate": 103924,
+    "realloc": 85996,
     "synsema_core::interpreter::make_unique_n": 147889,
     "synsema_jit::abi::synsema_jit_append": 215928,
     "synsema_jit::abi::synsema_jit_index": 419790,
-    "synsema_jit::lower::build": 82009,
-    "synsema_jit::lower::check_pointers": 220730
+    "synsema_jit::lower::build": 82093,
+    "synsema_jit::lower::check_pointers": 220161
    },
-   "total": 31059217
+   "total": 31058778
   },
   "j_while_and|ref": {
    "fns": {
@@ -2963,7 +3012,7 @@
     "<synsema_core::types::SynValue as core::clone::Clone>::clone": 828036,
     "<synsema_core::types::SynValue>::syn_equals": 139965,
     "<synsema_heap::Shared<synsema_core::synlist::SynList>>::drop_slow": 172047,
-    "__memcmp_avx2_movbe": 1665671,
+    "__memcmp_avx2_movbe": 1665692,
     "__memcpy_avx_unaligned_erms": 80320883,
     "_dl_relocate_object": 640035,
     "_int_free": 948846,
@@ -2975,7 +3024,7 @@
     "do_lookup_x": 87879,
     "free": 559960,
     "malloc": 761504,
-    "malloc_consolidate": 62651,
+    "malloc_consolidate": 62641,
     "realloc": 449720,
     "synsema_core::interpreter::check_call_arity": 324407,
     "synsema_core::interpreter::env_get": 2783944,
@@ -2988,14 +3037,14 @@
     "synsema_core::temporal::binop": 215973,
     "unlink_chunk.isra.0": 255618
    },
-   "total": 121264836
+   "total": 121264957
   },
   "j_while_and|vm": {
    "fns": {
     "<alloc::raw_vec::RawVecInner>::finish_grow": 16171,
     "<alloc::string::String as core::iter::traits::collect::FromIterator<&char>>::from_iter::<core::slice::iter::Iter<char>>": 8898,
     "<core::hash::sip::Hasher<core::hash::sip::Sip13Rounds> as core::hash::Hasher>::write": 55887,
-    "<hashbrown::map::HashMap<&str, (usize, core::option::Option<usize>), std::hash::random::RandomState> as core::iter::traits::collect::Extend<(&str, (usize, core::option::Option<usize>))>>::extend::<core::iter::adapters::map::Map<core::slice::iter::Iter<(&str, usize, core::option::Option<usize>)>, synsema_core::builtin_arity::arity_of::{closure#0}::{closure#0}>>": 23731,
+    "<hashbrown::map::HashMap<&str, (usize, core::option::Option<usize>), std::hash::random::RandomState> as core::iter::traits::collect::Extend<(&str, (usize, core::option::Option<usize>))>>::extend::<core::iter::adapters::map::Map<core::slice::iter::Iter<(&str, usize, core::option::Option<usize>)>, synsema_core::builtin_arity::arity_of::{closure#0}::{closure#0}>>": 23676,
     "<hashbrown::map::HashMap<alloc::sync::Arc<str>, u32, rustc_hash::FxBuildHasher>>::insert": 24804,
     "<hashbrown::raw::RawTable<(alloc::sync::Arc<str>, u32)>>::reserve_rehash::<hashbrown::map::make_hasher<alloc::sync::Arc<str>, u32, rustc_hash::FxBuildHasher>::{closure#0}>": 25973,
     "<std::hash::random::RandomState as core::hash::BuildHasher>::hash_one::<&alloc::string::String>": 31458,
@@ -3022,8 +3071,8 @@
     "<synsema_core::types::SynValue as core::clone::Clone>::clone": 592227,
     "<synsema_heap::Shared<synsema_core::synlist::SynList>>::borrow": 119955,
     "____strtoul_l_internal": 25072,
-    "__memcmp_avx2_movbe": 247666,
-    "__memcpy_avx_unaligned_erms": 65329,
+    "__memcmp_avx2_movbe": 247695,
+    "__memcpy_avx_unaligned_erms": 65351,
     "__vfscanf_internal": 53688,
     "_dl_check_map_versions": 11549,
     "_dl_lookup_symbol_x": 47557,
@@ -3032,22 +3081,22 @@
     "_int_free_maybe_consolidate": 10456,
     "_int_free_merge_chunk": 27821,
     "_int_malloc": 234075,
-    "_int_realloc": 15149,
+    "_int_realloc": 15119,
     "check_match": 16425,
     "core::ptr::drop_glue::<synsema_core::types::SynValue>": 1641479,
     "do_lookup_x": 87879,
     "free": 97498,
     "malloc": 144806,
-    "malloc_consolidate": 68482,
+    "malloc_consolidate": 68512,
     "realloc": 21828,
     "strcmp": 24567,
     "synsema_core::ast_api::children": 20433,
     "synsema_core::ast_api::walk": 23786,
-    "synsema_core::builtin_arity::arity_of": 13662,
+    "synsema_core::builtin_arity::arity_of": 13643,
     "synsema_core::interpreter::make_unique_n": 147889,
     "unlink_chunk.isra.0": 35730
    },
-   "total": 16545843
+   "total": 16545797
   },
   "loop_each|jit": {
    "fns": {
@@ -3086,7 +3135,7 @@
     "<cranelift_codegen::verifier::Verifier>::verify_value": 24633,
     "<cranelift_frontend::frontend::FuncInstBuilder as cranelift_codegen::ir::builder::InstBuilderBase>::build": 17803,
     "<cranelift_frontend::ssa::SSABuilder>::use_var_nonlocal": 16447,
-    "<hashbrown::map::HashMap<&str, (usize, core::option::Option<usize>), std::hash::random::RandomState> as core::iter::traits::collect::Extend<(&str, (usize, core::option::Option<usize>))>>::extend::<core::iter::adapters::map::Map<core::slice::iter::Iter<(&str, usize, core::option::Option<usize>)>, synsema_core::builtin_arity::arity_of::{closure#0}::{closure#0}>>": 23611,
+    "<hashbrown::map::HashMap<&str, (usize, core::option::Option<usize>), std::hash::random::RandomState> as core::iter::traits::collect::Extend<(&str, (usize, core::option::Option<usize>))>>::extend::<core::iter::adapters::map::Map<core::slice::iter::Iter<(&str, usize, core::option::Option<usize>)>, synsema_core::builtin_arity::arity_of::{closure#0}::{closure#0}>>": 23523,
     "<hashbrown::map::HashMap<alloc::sync::Arc<str>, u32, rustc_hash::FxBuildHasher>>::insert": 24663,
     "<hashbrown::raw::RawTable<(alloc::sync::Arc<str>, u32)>>::reserve_rehash::<hashbrown::map::make_hasher<alloc::sync::Arc<str>, u32, rustc_hash::FxBuildHasher>::{closure#0}>": 25973,
     "<i64 as num_integer::Integer>::mod_floor": 30969,
@@ -3110,7 +3159,7 @@
     "<synsema_core::types::SynValue as core::clone::Clone>::clone": 20232,
     "???": 9752351,
     "____strtoul_l_internal": 25072,
-    "__memcmp_avx2_movbe": 32347,
+    "__memcmp_avx2_movbe": 32325,
     "__memcpy_avx_unaligned_erms": 88835,
     "__vfscanf_internal": 53688,
     "_dl_lookup_symbol_x": 47557,
@@ -3132,7 +3181,7 @@
     "realloc": 37097,
     "strcmp": 24567
    },
-   "total": 16648832
+   "total": 16648830
   },
   "loop_each|ref": {
    "fns": {
@@ -3158,7 +3207,7 @@
     "<synsema_core::number::Number>::checked_add": 11400000,
     "<synsema_core::number::Number>::checked_modulo": 14600000,
     "<synsema_core::types::SynValue as core::clone::Clone>::clone": 6000050,
-    "__memcmp_avx2_movbe": 9627334,
+    "__memcmp_avx2_movbe": 9627268,
     "__memcpy_avx_unaligned_erms": 15605545,
     "_dl_relocate_object": 640035,
     "_int_free": 10911564,
@@ -3170,7 +3219,7 @@
     "synsema_core::interpreter::env_update": 15600000,
     "synsema_core::temporal::binop": 5400000
    },
-   "total": 510974565
+   "total": 510974358
   },
   "loop_each|vm": {
    "fns": {
@@ -3187,7 +3236,7 @@
     "_int_malloc": 164763,
     "core::ptr::drop_glue::<synsema_core::types::SynValue>": 21804805
    },
-   "total": 212472691
+   "total": 212472424
   },
   "loop|jit": {
    "fns": {
@@ -3226,7 +3275,7 @@
     "<cranelift_codegen::verifier::Verifier>::verify_is_address": 15801,
     "<cranelift_codegen::verifier::Verifier>::verify_value": 25449,
     "<cranelift_frontend::frontend::FuncInstBuilder as cranelift_codegen::ir::builder::InstBuilderBase>::build": 19257,
-    "<hashbrown::map::HashMap<&str, (usize, core::option::Option<usize>), std::hash::random::RandomState> as core::iter::traits::collect::Extend<(&str, (usize, core::option::Option<usize>))>>::extend::<core::iter::adapters::map::Map<core::slice::iter::Iter<(&str, usize, core::option::Option<usize>)>, synsema_core::builtin_arity::arity_of::{closure#0}::{closure#0}>>": 23694,
+    "<hashbrown::map::HashMap<&str, (usize, core::option::Option<usize>), std::hash::random::RandomState> as core::iter::traits::collect::Extend<(&str, (usize, core::option::Option<usize>))>>::extend::<core::iter::adapters::map::Map<core::slice::iter::Iter<(&str, usize, core::option::Option<usize>)>, synsema_core::builtin_arity::arity_of::{closure#0}::{closure#0}>>": 23734,
     "<hashbrown::map::HashMap<alloc::sync::Arc<str>, u32, rustc_hash::FxBuildHasher>>::insert": 24770,
     "<hashbrown::raw::RawTable<(alloc::sync::Arc<str>, u32)>>::reserve_rehash::<hashbrown::map::make_hasher<alloc::sync::Arc<str>, u32, rustc_hash::FxBuildHasher>::{closure#0}>": 25973,
     "<i64 as num_integer::Integer>::mod_floor": 30969,
@@ -3248,7 +3297,7 @@
     "<synsema_core::types::SynValue as core::clone::Clone>::clone": 60425,
     "???": 8757310,
     "____strtoul_l_internal": 25072,
-    "__memcmp_avx2_movbe": 32108,
+    "__memcmp_avx2_movbe": 32086,
     "__memcpy_avx_unaligned_erms": 100357,
     "__vfscanf_internal": 53688,
     "_dl_lookup_symbol_x": 47557,
@@ -3270,9 +3319,9 @@
     "malloc": 156779,
     "realloc": 35479,
     "strcmp": 24567,
-    "synsema_jit::lower::build": 17416
+    "synsema_jit::lower::build": 17387
    },
-   "total": 16745688
+   "total": 16746085
   },
   "loop|ref": {
    "fns": {
@@ -3290,14 +3339,14 @@
     "<synsema_core::number::Number>::checked_modulo": 14600000,
     "<synsema_core::number::Number>::partial_cmp_num": 4000020,
     "<synsema_core::types::SynValue as core::clone::Clone>::clone": 12000055,
-    "__memcmp_avx2_movbe": 15627227,
+    "__memcmp_avx2_movbe": 15627206,
     "_dl_relocate_object": 640035,
     "core::ptr::drop_glue::<synsema_core::types::SynValue>": 59604450,
     "synsema_core::interpreter::env_get": 44800168,
     "synsema_core::interpreter::env_update": 22800000,
     "synsema_core::temporal::binop": 10800000
    },
-   "total": 721218740
+   "total": 721218818
   },
   "loop|vm": {
    "fns": {
@@ -3310,7 +3359,7 @@
     "_dl_relocate_object": 640035,
     "core::ptr::drop_glue::<synsema_core::types::SynValue>": 39804793
    },
-   "total": 423086252
+   "total": 423086337
   },
   "o_eq|jit": {
    "fns": {
@@ -3347,7 +3396,7 @@
     "<cranelift_codegen::verifier::Verifier>::run": 334483,
     "<cranelift_codegen::verifier::Verifier>::verify_value": 18020,
     "<cranelift_frontend::frontend::FuncInstBuilder as cranelift_codegen::ir::builder::InstBuilderBase>::build": 13674,
-    "<hashbrown::map::HashMap<&str, (usize, core::option::Option<usize>), std::hash::random::RandomState> as core::iter::traits::collect::Extend<(&str, (usize, core::option::Option<usize>))>>::extend::<core::iter::adapters::map::Map<core::slice::iter::Iter<(&str, usize, core::option::Option<usize>)>, synsema_core::builtin_arity::arity_of::{closure#0}::{closure#0}>>": 23755,
+    "<hashbrown::map::HashMap<&str, (usize, core::option::Option<usize>), std::hash::random::RandomState> as core::iter::traits::collect::Extend<(&str, (usize, core::option::Option<usize>))>>::extend::<core::iter::adapters::map::Map<core::slice::iter::Iter<(&str, usize, core::option::Option<usize>)>, synsema_core::builtin_arity::arity_of::{closure#0}::{closure#0}>>": 23563,
     "<hashbrown::map::HashMap<alloc::sync::Arc<str>, u32, rustc_hash::FxBuildHasher>>::insert": 24815,
     "<hashbrown::raw::RawTable<(alloc::sync::Arc<str>, u32)>>::reserve_rehash::<hashbrown::map::make_hasher<alloc::sync::Arc<str>, u32, rustc_hash::FxBuildHasher>::{closure#0}>": 25973,
     "<regalloc2::ion::data_structures::Env<cranelift_codegen::machinst::vcode::VCode<cranelift_codegen::isa::x64::lower::isle::generated_code::MInst>>>::init": 180494,
@@ -3369,7 +3418,7 @@
     "<synsema_jit::lower::Func>::liveness": 16408,
     "???": 2760277,
     "____strtoul_l_internal": 25072,
-    "__memcmp_avx2_movbe": 32517,
+    "__memcmp_avx2_movbe": 32467,
     "__memcpy_avx_unaligned_erms": 93537,
     "__vfscanf_internal": 53688,
     "_dl_lookup_symbol_x": 47557,
@@ -3392,10 +3441,10 @@
     "malloc": 167793,
     "realloc": 35026,
     "strcmp": 24567,
-    "synsema_core::builtin_arity::arity_of": 13556,
-    "synsema_jit::lower::build": 16144
+    "synsema_core::builtin_arity::arity_of": 13539,
+    "synsema_jit::lower::build": 16158
    },
-   "total": 11298898
+   "total": 11298737
   },
   "o_eq|ref": {
    "fns": {
@@ -3414,7 +3463,7 @@
     "<synsema_core::number::Number>::partial_cmp_num": 1800020,
     "<synsema_core::types::SynValue as core::clone::Clone>::clone": 10980058,
     "<synsema_core::types::SynValue>::syn_equals": 12600000,
-    "__memcmp_avx2_movbe": 9926988,
+    "__memcmp_avx2_movbe": 9927016,
     "_dl_relocate_object": 640035,
     "core::ptr::drop_glue::<synsema_core::types::SynValue>": 44104475,
     "synsema_core::interpreter::env_get": 30240112,
@@ -3423,7 +3472,7 @@
     "synsema_core::tabular::equals_walk_at": 14760000,
     "synsema_core::temporal::binop": 2430000
    },
-   "total": 567759826
+   "total": 567759855
   },
   "o_eq|vm": {
    "fns": {
@@ -3436,7 +3485,7 @@
     "_int_malloc": 173691,
     "core::ptr::drop_glue::<synsema_core::types::SynValue>": 30064948
    },
-   "total": 296309556
+   "total": 296309380
   },
   "o_lt|jit": {
    "fns": {
@@ -3473,7 +3522,7 @@
     "<cranelift_codegen::verifier::Verifier>::run": 334483,
     "<cranelift_codegen::verifier::Verifier>::verify_value": 18020,
     "<cranelift_frontend::frontend::FuncInstBuilder as cranelift_codegen::ir::builder::InstBuilderBase>::build": 13674,
-    "<hashbrown::map::HashMap<&str, (usize, core::option::Option<usize>), std::hash::random::RandomState> as core::iter::traits::collect::Extend<(&str, (usize, core::option::Option<usize>))>>::extend::<core::iter::adapters::map::Map<core::slice::iter::Iter<(&str, usize, core::option::Option<usize>)>, synsema_core::builtin_arity::arity_of::{closure#0}::{closure#0}>>": 23578,
+    "<hashbrown::map::HashMap<&str, (usize, core::option::Option<usize>), std::hash::random::RandomState> as core::iter::traits::collect::Extend<(&str, (usize, core::option::Option<usize>))>>::extend::<core::iter::adapters::map::Map<core::slice::iter::Iter<(&str, usize, core::option::Option<usize>)>, synsema_core::builtin_arity::arity_of::{closure#0}::{closure#0}>>": 23687,
     "<hashbrown::map::HashMap<alloc::sync::Arc<str>, u32, rustc_hash::FxBuildHasher>>::insert": 24815,
     "<hashbrown::raw::RawTable<(alloc::sync::Arc<str>, u32)>>::reserve_rehash::<hashbrown::map::make_hasher<alloc::sync::Arc<str>, u32, rustc_hash::FxBuildHasher>::{closure#0}>": 25973,
     "<regalloc2::ion::data_structures::Env<cranelift_codegen::machinst::vcode::VCode<cranelift_codegen::isa::x64::lower::isle::generated_code::MInst>>>::init": 183574,
@@ -3519,9 +3568,9 @@
     "malloc": 167958,
     "realloc": 35135,
     "strcmp": 24567,
-    "synsema_jit::lower::build": 16186
+    "synsema_jit::lower::build": 16158
    },
-   "total": 11310999
+   "total": 11311017
   },
   "o_lt|ref": {
    "fns": {
@@ -3538,14 +3587,14 @@
     "<synsema_core::number::Number>::checked_add": 5130000,
     "<synsema_core::number::Number>::partial_cmp_num": 9000020,
     "<synsema_core::types::SynValue as core::clone::Clone>::clone": 10980058,
-    "__memcmp_avx2_movbe": 9927003,
+    "__memcmp_avx2_movbe": 9926959,
     "_dl_relocate_object": 640035,
     "core::ptr::drop_glue::<synsema_core::types::SynValue>": 44104475,
     "synsema_core::interpreter::env_get": 30240112,
     "synsema_core::interpreter::env_update": 25650000,
     "synsema_core::temporal::binop": 2430000
    },
-   "total": 535359958
+   "total": 535359767
   },
   "o_lt|vm": {
    "fns": {
@@ -3558,7 +3607,7 @@
     "_int_malloc": 173691,
     "core::ptr::drop_glue::<synsema_core::types::SynValue>": 30064948
    },
-   "total": 296308956
+   "total": 296309086
   },
   "o_plus|jit": {
    "fns": {
@@ -3599,7 +3648,7 @@
     "<cranelift_codegen::verifier::Verifier>::run": 355090,
     "<cranelift_codegen::verifier::Verifier>::typecheck_block_call": 15892,
     "<cranelift_codegen::verifier::Verifier>::verify_value": 19312,
-    "<hashbrown::map::HashMap<&str, (usize, core::option::Option<usize>), std::hash::random::RandomState> as core::iter::traits::collect::Extend<(&str, (usize, core::option::Option<usize>))>>::extend::<core::iter::adapters::map::Map<core::slice::iter::Iter<(&str, usize, core::option::Option<usize>)>, synsema_core::builtin_arity::arity_of::{closure#0}::{closure#0}>>": 23620,
+    "<hashbrown::map::HashMap<&str, (usize, core::option::Option<usize>), std::hash::random::RandomState> as core::iter::traits::collect::Extend<(&str, (usize, core::option::Option<usize>))>>::extend::<core::iter::adapters::map::Map<core::slice::iter::Iter<(&str, usize, core::option::Option<usize>)>, synsema_core::builtin_arity::arity_of::{closure#0}::{closure#0}>>": 23791,
     "<hashbrown::map::HashMap<alloc::sync::Arc<str>, u32, rustc_hash::FxBuildHasher>>::insert": 24815,
     "<hashbrown::raw::RawTable<(alloc::sync::Arc<str>, u32)>>::reserve_rehash::<hashbrown::map::make_hasher<alloc::sync::Arc<str>, u32, rustc_hash::FxBuildHasher>::{closure#0}>": 25973,
     "<regalloc2::ion::data_structures::Env<cranelift_codegen::machinst::vcode::VCode<cranelift_codegen::isa::x64::lower::isle::generated_code::MInst>>>::init": 191036,
@@ -3620,7 +3669,7 @@
     "<synsema_jit::lower::Func>::liveness": 16408,
     "???": 4273297,
     "____strtoul_l_internal": 25072,
-    "__memcmp_avx2_movbe": 32778,
+    "__memcmp_avx2_movbe": 32760,
     "__memcpy_avx_unaligned_erms": 102152,
     "__vfscanf_internal": 53688,
     "_dl_lookup_symbol_x": 47557,
@@ -3641,9 +3690,9 @@
     "malloc": 172715,
     "realloc": 35638,
     "strcmp": 24567,
-    "synsema_jit::lower::build": 17717
+    "synsema_jit::lower::build": 17716
    },
-   "total": 13266463
+   "total": 13266698
   },
   "o_plus|ref": {
    "fns": {
@@ -3660,14 +3709,14 @@
     "<synsema_core::number::Number>::checked_add": 25650000,
     "<synsema_core::number::Number>::partial_cmp_num": 1800020,
     "<synsema_core::types::SynValue as core::clone::Clone>::clone": 9900058,
-    "__memcmp_avx2_movbe": 9927005,
+    "__memcmp_avx2_movbe": 9926983,
     "_dl_relocate_object": 640035,
     "core::ptr::drop_glue::<synsema_core::types::SynValue>": 47704475,
     "synsema_core::interpreter::env_get": 30240112,
     "synsema_core::interpreter::env_update": 25650000,
     "synsema_core::temporal::binop": 12150000
    },
-   "total": 578915608
+   "total": 578915672
   },
   "o_plus|vm": {
    "fns": {
@@ -3680,7 +3729,7 @@
     "_int_malloc": 173160,
     "core::ptr::drop_glue::<synsema_core::types::SynValue>": 33664948
    },
-   "total": 305305591
+   "total": 305305576
   },
   "p_pkg_loop|jit": {
    "fns": {
@@ -3719,7 +3768,7 @@
     "<cranelift_codegen::verifier::Verifier>::verify_value": 25228,
     "<cranelift_frontend::frontend::FuncInstBuilder as cranelift_codegen::ir::builder::InstBuilderBase>::build": 18204,
     "<cranelift_frontend::ssa::SSABuilder>::use_var_nonlocal": 17163,
-    "<hashbrown::map::HashMap<&str, (usize, core::option::Option<usize>), std::hash::random::RandomState> as core::iter::traits::collect::Extend<(&str, (usize, core::option::Option<usize>))>>::extend::<core::iter::adapters::map::Map<core::slice::iter::Iter<(&str, usize, core::option::Option<usize>)>, synsema_core::builtin_arity::arity_of::{closure#0}::{closure#0}>>": 23766,
+    "<hashbrown::map::HashMap<&str, (usize, core::option::Option<usize>), std::hash::random::RandomState> as core::iter::traits::collect::Extend<(&str, (usize, core::option::Option<usize>))>>::extend::<core::iter::adapters::map::Map<core::slice::iter::Iter<(&str, usize, core::option::Option<usize>)>, synsema_core::builtin_arity::arity_of::{closure#0}::{closure#0}>>": 23667,
     "<hashbrown::map::HashMap<alloc::sync::Arc<str>, u32, rustc_hash::FxBuildHasher>>::insert": 49095,
     "<hashbrown::raw::RawTable<(alloc::sync::Arc<str>, u32)>>::reserve_rehash::<hashbrown::map::make_hasher<alloc::sync::Arc<str>, u32, rustc_hash::FxBuildHasher>::{closure#0}>": 51946,
     "<i64 as num_integer::Integer>::mod_floor": 30969,
@@ -3743,7 +3792,7 @@
     "<synsema_jit::lower::Func>::liveness": 19314,
     "???": 10548555,
     "____strtoul_l_internal": 25072,
-    "__memcmp_avx2_movbe": 33680,
+    "__memcmp_avx2_movbe": 33725,
     "__memcpy_avx_unaligned_erms": 101605,
     "__vfscanf_internal": 53688,
     "_dl_lookup_symbol_x": 47557,
@@ -3765,7 +3814,7 @@
     "sha2::sha256::compress256": 31813,
     "strcmp": 24567
    },
-   "total": 17782676
+   "total": 17782238
   },
   "p_pkg_loop|ref": {
    "fns": {
@@ -3792,7 +3841,7 @@
     "<synsema_core::number::Number>::checked_modulo": 14600000,
     "<synsema_core::number::Number>::checked_mul": 11400000,
     "<synsema_core::types::SynValue as core::clone::Clone>::clone": 6003689,
-    "__memcmp_avx2_movbe": 14028577,
+    "__memcmp_avx2_movbe": 14028599,
     "__memcpy_avx_unaligned_erms": 15614510,
     "_dl_relocate_object": 640035,
     "_int_free": 10936815,
@@ -3804,7 +3853,7 @@
     "synsema_core::interpreter::env_update": 15600000,
     "synsema_core::temporal::binop": 10800000
    },
-   "total": 597322739
+   "total": 597323066
   },
   "p_pkg_loop|vm": {
    "fns": {
@@ -3822,7 +3871,7 @@
     "do_lookup_x": 87879,
     "malloc": 116578
    },
-   "total": 171243215
+   "total": 171242953
   },
   "s_arrays_small|jit": {
    "fns": {
@@ -3850,8 +3899,8 @@
     "<synsema_core::number::Number>::to_f64": 920184,
     "<synsema_core::types::SynValue as core::clone::Clone>::clone": 2240492,
     "<synsema_heap::Obj<synsema_core::types::NdArray>>::drop_slow": 1880062,
-    "__memcmp_avx2_movbe": 3071602,
-    "__memcpy_avx_unaligned_erms": 4608984,
+    "__memcmp_avx2_movbe": 3071581,
+    "__memcpy_avx_unaligned_erms": 4608962,
     "__memset_avx2_unaligned_erms": 1880622,
     "_dl_relocate_object": 640035,
     "_int_free": 12193326,
@@ -3870,7 +3919,7 @@
     "synsema_core::arrays::elem_operand": 1280000,
     "synsema_core::arrays::scalar_op": 1520000
    },
-   "total": 180856481
+   "total": 180856511
   },
   "s_arrays_small|ref": {
    "fns": {
@@ -3909,12 +3958,12 @@
     "<synsema_core::number::Number>::to_f64": 920184,
     "<synsema_core::types::SynValue as core::clone::Clone>::clone": 2920116,
     "<synsema_heap::Obj<synsema_core::types::NdArray>>::drop_slow": 1880062,
-    "__memcmp_avx2_movbe": 8107385,
+    "__memcmp_avx2_movbe": 8067416,
     "__memcpy_avx_unaligned_erms": 6303643,
     "__memset_avx2_unaligned_erms": 1880384,
     "_dl_relocate_object": 640035,
     "_int_free": 13217639,
-    "_int_malloc": 3536629,
+    "_int_malloc": 3536570,
     "calloc": 4400796,
     "core::ptr::drop_glue::<ndarray::zip::Zip<(ndarray::ArrayBase<ndarray::ViewRepr<&f64>, ndarray::dimension::dim::Dim<ndarray::dimension::dynindeximpl::IxDynImpl>>, ndarray::ArrayBase<ndarray::ViewRepr<&f64>, ndarray::dimension::dim::Dim<ndarray::dimension::dynindeximpl::IxDynImpl>>, ndarray::ArrayBase<ndarray::RawViewRepr<*mut bool>, ndarray::dimension::dim::Dim<ndarray::dimension::dynindeximpl::IxDynImpl>>), ndarray::dimension::dim::Dim<ndarray::dimension::dynindeximpl::IxDynImpl>>>": 360000,
     "core::ptr::drop_glue::<synsema_core::interpreter::Bindings>": 1920080,
@@ -3934,7 +3983,7 @@
     "synsema_core::interpreter::env_update": 1560000,
     "synsema_core::temporal::binop": 540000
    },
-   "total": 226723482
+   "total": 226683547
   },
   "s_arrays_small|vm": {
    "fns": {
@@ -3962,9 +4011,9 @@
     "<synsema_core::number::Number>::to_f64": 920184,
     "<synsema_core::types::SynValue as core::clone::Clone>::clone": 2240236,
     "<synsema_heap::Obj<synsema_core::types::NdArray>>::drop_slow": 1880062,
-    "__memcmp_avx2_movbe": 3121727,
-    "__memcpy_avx_unaligned_erms": 4606804,
-    "__memset_avx2_unaligned_erms": 1880530,
+    "__memcmp_avx2_movbe": 3121683,
+    "__memcpy_avx_unaligned_erms": 4606782,
+    "__memset_avx2_unaligned_erms": 1880514,
     "_dl_relocate_object": 640035,
     "_int_free": 12749078,
     "_int_malloc": 4473697,
@@ -3982,7 +4031,7 @@
     "synsema_core::arrays::elem_operand": 1280000,
     "synsema_core::arrays::scalar_op": 1520000
    },
-   "total": 182213618
+   "total": 182213432
   },
   "s_csv|jit": {
    "fns": {
@@ -4036,13 +4085,13 @@
     "<synsema_heap::SharedTail<synsema_core::synmap::MapBody<[synsema_core::types::SynValue]>>>::borrow": 500020,
     "<synsema_heap::SharedTail<synsema_core::synmap::MapBody<[synsema_core::types::SynValue]>>>::drop_slow": 5650173,
     "<synsema_text::SynText>::push_str": 1750070,
-    "???": 2233768,
-    "__memcmp_avx2_movbe": 3363609,
-    "__memcpy_avx_unaligned_erms": 5163698,
+    "???": 2233766,
+    "__memcmp_avx2_movbe": 3363654,
+    "__memcpy_avx_unaligned_erms": 5164180,
     "_dl_relocate_object": 640035,
-    "_int_free": 4509138,
-    "_int_malloc": 7401041,
-    "alloc_perturb": 207656,
+    "_int_free": 4509152,
+    "_int_malloc": 7402466,
+    "alloc_perturb": 207608,
     "core::fmt::write": 6100989,
     "core::iter::adapters::chain::and_then_or_clear::<core::iter::adapters::chain::Chain<core::iter::adapters::copied::Copied<core::slice::iter::Iter<cranelift_codegen::ir::entities::Value>>, core::iter::adapters::flatten::FlatMap<core::slice::iter::Iter<cranelift_codegen::ir::instructions::BlockCall>, core::iter::adapters::filter_map::FilterMap<core::iter::adapters::map::Map<core::slice::iter::Iter<cranelift_codegen::ir::entities::Value>, <cranelift_codegen::ir::instructions::BlockCall>::args::{closure#0}>, <cranelift_codegen::ir::dfg::DataFlowGraph>::inst_values::{closure#0}::{closure#0}>, <cranelift_codegen::ir::dfg::DataFlowGraph>::inst_values::{closure#0}>>, cranelift_codegen::ir::entities::Value, <core::iter::adapters::chain::Chain<core::iter::adapters::copied::Copied<core::slice::iter::Iter<cranelift_codegen::ir::entities::Value>>, core::iter::adapters::flatten::FlatMap<core::slice::iter::Iter<cranelift_codegen::ir::instructions::BlockCall>, core::iter::adapters::filter_map::FilterMap<core::iter::adapters::map::Map<core::slice::iter::Iter<cranelift_codegen::ir::entities::Value>, <cranelift_codegen::ir::instructions::BlockCall>::args::{closure#0}>, <cranelift_codegen::ir::dfg::DataFlowGraph>::inst_values::{closure#0}::{closure#0}>, <cranelift_codegen::ir::dfg::DataFlowGraph>::inst_values::{closure#0}>> as core::iter::traits::iterator::Iterator>::next>": 122358,
     "core::ptr::drop_glue::<[synsema_core::interpreter::EachItems]>": 325071,
@@ -4051,8 +4100,8 @@
     "core::ptr::drop_glue::<synsema_core::types::SynValue>": 10196778,
     "core::str::converts::from_utf8": 1614313,
     "free": 2104696,
-    "malloc": 3713336,
-    "malloc_consolidate": 2790629,
+    "malloc": 3713211,
+    "malloc_consolidate": 2790236,
     "synsema_core::csv::csv_encode": 4275228,
     "synsema_core::csv::csv_encode::{closure#0}": 9675744,
     "synsema_core::csv::csv_encode::{closure#1}": 4875000,
@@ -4064,9 +4113,9 @@
     "synsema_core::synmap::new_body::<alloc::vec::drain::Drain<synsema_core::types::SynValue>>": 3400000,
     "synsema_jit::abi::synsema_jit_list_elem": 1296000,
     "synsema_jit::abi::synsema_jit_prop": 3791998,
-    "unlink_chunk.isra.0": 1254015
+    "unlink_chunk.isra.0": 1254168
    },
-   "total": 215034659
+   "total": 215036943
   },
   "s_csv|ref": {
    "fns": {
@@ -4125,7 +4174,7 @@
     "<synsema_core::types::SynValue as core::clone::Clone>::clone": 4300328,
     "<synsema_heap::SharedTail<synsema_core::synmap::MapBody<[synsema_core::types::SynValue]>>>::drop_slow": 5650179,
     "<synsema_text::SynText>::push_str": 1750070,
-    "__memcmp_avx2_movbe": 6703825,
+    "__memcmp_avx2_movbe": 6903804,
     "__memcpy_avx_unaligned_erms": 10446883,
     "_dl_relocate_object": 640035,
     "_int_free": 13814603,
@@ -4151,7 +4200,7 @@
     "synsema_core::temporal::binop": 1350027,
     "synsema_core::types::syn_text::<&str>": 3000180
    },
-   "total": 365540809
+   "total": 365740555
   },
   "s_csv|vm": {
    "fns": {
@@ -4194,7 +4243,7 @@
     "<synsema_heap::SharedTail<synsema_core::synmap::MapBody<[synsema_core::types::SynValue]>>>::borrow": 500020,
     "<synsema_heap::SharedTail<synsema_core::synmap::MapBody<[synsema_core::types::SynValue]>>>::drop_slow": 5650173,
     "<synsema_text::SynText>::push_str": 1750070,
-    "__memcmp_avx2_movbe": 3354798,
+    "__memcmp_avx2_movbe": 3354711,
     "__memcpy_avx_unaligned_erms": 5000488,
     "_dl_relocate_object": 640035,
     "_int_free": 4379919,
@@ -4218,7 +4267,7 @@
     "synsema_core::interpreter::vm::native::native_args": 452997,
     "synsema_core::synmap::new_body::<alloc::vec::drain::Drain<synsema_core::types::SynValue>>": 3400000
    },
-   "total": 230776198
+   "total": 230775867
   },
   "s_each_list|jit": {
    "fns": {
@@ -4277,16 +4326,16 @@
     "<synsema_core::number::Number as core::clone::Clone>::clone": 40754,
     "<synsema_core::synlist::SynList>::push": 1550037,
     "<synsema_jit::abi::Session as synsema_core::native_tier::NativeSession>::call": 4950000,
-    "???": 10198823,
-    "__memcmp_avx2_movbe": 36616,
-    "__memcpy_avx_unaligned_erms": 303429,
+    "???": 10198811,
+    "__memcmp_avx2_movbe": 36683,
+    "__memcpy_avx_unaligned_erms": 303033,
     "__vfscanf_internal": 53688,
     "_dl_lookup_symbol_x": 47557,
     "_dl_relocate_object": 640035,
-    "_int_free": 310491,
-    "_int_free_merge_chunk": 59145,
-    "_int_malloc": 388125,
-    "_int_realloc": 42732,
+    "_int_free": 310668,
+    "_int_free_merge_chunk": 59687,
+    "_int_malloc": 388788,
+    "_int_realloc": 42882,
     "core::iter::adapters::chain::and_then_or_clear::<core::iter::adapters::chain::Chain<core::iter::adapters::copied::Copied<core::slice::iter::Iter<cranelift_codegen::ir::entities::Value>>, core::iter::adapters::flatten::FlatMap<core::slice::iter::Iter<cranelift_codegen::ir::instructions::BlockCall>, core::iter::adapters::filter_map::FilterMap<core::iter::adapters::map::Map<core::slice::iter::Iter<cranelift_codegen::ir::entities::Value>, <cranelift_codegen::ir::instructions::BlockCall>::args::{closure#0}>, <cranelift_codegen::ir::dfg::DataFlowGraph>::inst_values::{closure#0}::{closure#0}>, <cranelift_codegen::ir::dfg::DataFlowGraph>::inst_values::{closure#0}>>, cranelift_codegen::ir::entities::Value, <core::iter::adapters::chain::Chain<core::iter::adapters::copied::Copied<core::slice::iter::Iter<cranelift_codegen::ir::entities::Value>>, core::iter::adapters::flatten::FlatMap<core::slice::iter::Iter<cranelift_codegen::ir::instructions::BlockCall>, core::iter::adapters::filter_map::FilterMap<core::iter::adapters::map::Map<core::slice::iter::Iter<cranelift_codegen::ir::entities::Value>, <cranelift_codegen::ir::instructions::BlockCall>::args::{closure#0}>, <cranelift_codegen::ir::dfg::DataFlowGraph>::inst_values::{closure#0}::{closure#0}>, <cranelift_codegen::ir::dfg::DataFlowGraph>::inst_values::{closure#0}>> as core::iter::traits::iterator::Iterator>::next>": 103160,
     "core::ptr::drop_glue::<synsema_core::types::SynValue>": 5370229,
     "cranelift_codegen::alias_analysis::classify": 43461,
@@ -4294,16 +4343,16 @@
     "cranelift_codegen::machinst::compile::compile::<cranelift_codegen::isa::x64::X64Backend>": 89430,
     "do_lookup_x": 87879,
     "free": 156619,
-    "malloc": 214022,
-    "malloc_consolidate": 85512,
-    "realloc": 62031,
+    "malloc": 214197,
+    "malloc_consolidate": 85727,
+    "realloc": 62098,
     "synsema_core::interpreter::vm::native::arg_word": 2079021,
     "synsema_jit::abi::nval": 1485174,
     "synsema_jit::abi::synsema_jit_list_elem": 4257000,
-    "synsema_jit::lower::check_pointers": 57480,
-    "unlink_chunk.isra.0": 53459
+    "synsema_jit::lower::check_pointers": 57405,
+    "unlink_chunk.isra.0": 54147
    },
-   "total": 68077661
+   "total": 68080261
   },
   "s_each_list|ref": {
    "fns": {
@@ -4339,7 +4388,7 @@
     "<synsema_core::synlist::SynList>::push": 1550037,
     "<synsema_core::types::SynValue as core::clone::Clone>::clone": 5500240,
     "<synsema_core::types::SynValue>::syn_equals": 7000000,
-    "__memcmp_avx2_movbe": 3628129,
+    "__memcmp_avx2_movbe": 3628151,
     "__memcpy_avx_unaligned_erms": 16241625,
     "_dl_relocate_object": 640035,
     "_int_free": 21739352,
@@ -4354,7 +4403,7 @@
     "synsema_core::tabular::equals_walk_at": 8200000,
     "synsema_core::temporal::binop": 900045
    },
-   "total": 532069869
+   "total": 532070055
   },
   "s_each_list|vm": {
    "fns": {
@@ -4382,7 +4431,7 @@
     "malloc": 117198,
     "synsema_core::interpreter::vm::native::native_args": 1802997
    },
-   "total": 195383056
+   "total": 195383248
   },
   "s_matrix_list|jit": {
    "fns": {
@@ -4446,28 +4495,28 @@
     "<synsema_core::synlist::SynList>::push": 152160,
     "<synsema_core::types::SynValue as core::clone::Clone>::clone": 447432,
     "<synsema_jit::lower::Func>::liveness": 232106,
-    "???": 12203820,
-    "__memcmp_avx2_movbe": 206041,
-    "__memcpy_avx_unaligned_erms": 917775,
+    "???": 12203824,
+    "__memcmp_avx2_movbe": 206135,
+    "__memcpy_avx_unaligned_erms": 917128,
     "_dl_relocate_object": 640035,
-    "_int_free": 935881,
-    "_int_free_merge_chunk": 134718,
-    "_int_malloc": 817508,
+    "_int_free": 935376,
+    "_int_free_merge_chunk": 134972,
+    "_int_malloc": 820537,
     "core::iter::adapters::chain::and_then_or_clear::<core::iter::adapters::chain::Chain<core::iter::adapters::copied::Copied<core::slice::iter::Iter<cranelift_codegen::ir::entities::Value>>, core::iter::adapters::flatten::FlatMap<core::slice::iter::Iter<cranelift_codegen::ir::instructions::BlockCall>, core::iter::adapters::filter_map::FilterMap<core::iter::adapters::map::Map<core::slice::iter::Iter<cranelift_codegen::ir::entities::Value>, <cranelift_codegen::ir::instructions::BlockCall>::args::{closure#0}>, <cranelift_codegen::ir::dfg::DataFlowGraph>::inst_values::{closure#0}::{closure#0}>, <cranelift_codegen::ir::dfg::DataFlowGraph>::inst_values::{closure#0}>>, cranelift_codegen::ir::entities::Value, <core::iter::adapters::chain::Chain<core::iter::adapters::copied::Copied<core::slice::iter::Iter<cranelift_codegen::ir::entities::Value>>, core::iter::adapters::flatten::FlatMap<core::slice::iter::Iter<cranelift_codegen::ir::instructions::BlockCall>, core::iter::adapters::filter_map::FilterMap<core::iter::adapters::map::Map<core::slice::iter::Iter<cranelift_codegen::ir::entities::Value>, <cranelift_codegen::ir::instructions::BlockCall>::args::{closure#0}>, <cranelift_codegen::ir::dfg::DataFlowGraph>::inst_values::{closure#0}::{closure#0}>, <cranelift_codegen::ir::dfg::DataFlowGraph>::inst_values::{closure#0}>> as core::iter::traits::iterator::Iterator>::next>": 404832,
     "core::ptr::drop_glue::<synsema_core::types::SynValue>": 2204265,
     "cranelift_codegen::alias_analysis::classify": 180293,
     "cranelift_codegen::ir::dfg::resolve_aliases": 230724,
     "cranelift_codegen::machinst::compile::compile::<cranelift_codegen::isa::x64::X64Backend>": 339945,
     "free": 534033,
-    "malloc": 654074,
-    "malloc_consolidate": 152868,
-    "realloc": 183250,
+    "malloc": 654024,
+    "malloc_consolidate": 151945,
+    "realloc": 183451,
     "synsema_core::interpreter::with_fallback::{closure#0}": 133632,
     "synsema_jit::abi::nval": 272489,
     "synsema_jit::abi::synsema_jit_index": 23671748,
-    "synsema_jit::lower::check_pointers": 270973
+    "synsema_jit::lower::check_pointers": 270675
    },
-   "total": 90674255
+   "total": 90675491
   },
   "s_matrix_list|ref": {
    "fns": {
@@ -4503,7 +4552,7 @@
     "<synsema_core::number::Number>::to_f64": 10386432,
     "<synsema_core::number::Number>::to_i64_trunc": 6061068,
     "<synsema_core::types::SynValue as core::clone::Clone>::clone": 14104791,
-    "__memcmp_avx2_movbe": 19419971,
+    "__memcmp_avx2_movbe": 19419993,
     "__memcpy_avx_unaligned_erms": 9291604,
     "_dl_relocate_object": 640035,
     "_int_free": 8050174,
@@ -4520,7 +4569,7 @@
     "synsema_core::temporal::binop": 6158592,
     "synsema_core::value_drop::drain": 790272
    },
-   "total": 586167234
+   "total": 586167295
   },
   "s_matrix_list|vm": {
    "fns": {
@@ -4545,7 +4594,7 @@
     "<synsema_core::synlist::SynList>::push": 152160,
     "<synsema_core::types::SynValue as core::clone::Clone>::clone": 10672533,
     "<synsema_heap::Shared<synsema_core::synlist::SynList>>::borrow": 4977360,
-    "__memcmp_avx2_movbe": 213805,
+    "__memcmp_avx2_movbe": 213871,
     "_dl_relocate_object": 640035,
     "_int_free": 300013,
     "_int_malloc": 334855,
@@ -4556,7 +4605,7 @@
     "synsema_core::interpreter::num_to_i64": 137256,
     "synsema_core::interpreter::with_fallback::{closure#0}": 133632
    },
-   "total": 242930467
+   "total": 242930494
   },
   "s_nbody_chico|jit": {
    "fns": {
@@ -4619,10 +4668,10 @@
     "<synsema_core::number::Number as core::clone::Clone>::clone": 3328669,
     "<synsema_core::types::SynValue as core::clone::Clone>::clone": 3692421,
     "<synsema_jit::lower::Func>::liveness": 2715382,
-    "???": 9209302,
-    "__memcpy_avx_unaligned_erms": 11634893,
-    "_int_free": 4901317,
-    "_int_malloc": 4613793,
+    "???": 9209310,
+    "__memcpy_avx_unaligned_erms": 11332739,
+    "_int_free": 4900330,
+    "_int_malloc": 4593251,
     "core::iter::adapters::chain::and_then_or_clear::<core::iter::adapters::chain::Chain<core::iter::adapters::copied::Copied<core::slice::iter::Iter<cranelift_codegen::ir::entities::Value>>, core::iter::adapters::flatten::FlatMap<core::slice::iter::Iter<cranelift_codegen::ir::instructions::BlockCall>, core::iter::adapters::filter_map::FilterMap<core::iter::adapters::map::Map<core::slice::iter::Iter<cranelift_codegen::ir::entities::Value>, <cranelift_codegen::ir::instructions::BlockCall>::args::{closure#0}>, <cranelift_codegen::ir::dfg::DataFlowGraph>::inst_values::{closure#0}::{closure#0}>, <cranelift_codegen::ir::dfg::DataFlowGraph>::inst_values::{closure#0}>>, cranelift_codegen::ir::entities::Value, <core::iter::adapters::chain::Chain<core::iter::adapters::copied::Copied<core::slice::iter::Iter<cranelift_codegen::ir::entities::Value>>, core::iter::adapters::flatten::FlatMap<core::slice::iter::Iter<cranelift_codegen::ir::instructions::BlockCall>, core::iter::adapters::filter_map::FilterMap<core::iter::adapters::map::Map<core::slice::iter::Iter<cranelift_codegen::ir::entities::Value>, <cranelift_codegen::ir::instructions::BlockCall>::args::{closure#0}>, <cranelift_codegen::ir::dfg::DataFlowGraph>::inst_values::{closure#0}::{closure#0}>, <cranelift_codegen::ir::dfg::DataFlowGraph>::inst_values::{closure#0}>> as core::iter::traits::iterator::Iterator>::next>": 5760458,
     "core::ptr::drop_glue::<synsema_core::types::SynValue>": 10302082,
     "cranelift_codegen::alias_analysis::classify": 2429456,
@@ -4632,16 +4681,16 @@
     "cranelift_codegen::machinst::compile::compile::<cranelift_codegen::isa::x64::X64Backend>": 5153599,
     "cranelift_codegen::machinst::lower::compute_use_states": 1977207,
     "free": 2891449,
-    "malloc": 3422238,
+    "malloc": 3422363,
     "synsema_core::interpreter::make_unique_n": 5550222,
     "synsema_jit::abi::synsema_jit_index": 10528800,
-    "synsema_jit::abi::synsema_jit_path_set": 6373170,
-    "synsema_jit::abi::synsema_jit_path_step": 3214800,
+    "synsema_jit::abi::synsema_jit_path_set": 6429570,
+    "synsema_jit::abi::synsema_jit_path_step": 3609600,
     "synsema_jit::abi::synsema_jit_prop": 10528766,
-    "synsema_jit::lower::build": 1796936,
-    "synsema_jit::lower::check_pointers": 3370498
+    "synsema_jit::lower::build": 1797222,
+    "synsema_jit::lower::check_pointers": 3368793
    },
-   "total": 559911003
+   "total": 560042120
   },
   "s_nbody_chico|ref": {
    "fns": {
@@ -4690,7 +4739,7 @@
     "<synsema_core::synmap::MapBody<[synsema_core::types::SynValue]>>::set": 3825153,
     "<synsema_core::synmap::Shape>::position": 22347522,
     "<synsema_core::types::SynValue as core::clone::Clone>::clone": 18602616,
-    "__memcmp_avx2_movbe": 38627448,
+    "__memcmp_avx2_movbe": 38627455,
     "__memcpy_avx_unaligned_erms": 1924413,
     "_dl_relocate_object": 640035,
     "_int_free": 3940669,
@@ -4710,7 +4759,7 @@
     "synsema_core::synlist::list_values_mut": 1650066,
     "synsema_core::temporal::binop": 7430643
    },
-   "total": 695076151
+   "total": 695075708
   },
   "s_nbody_chico|vm": {
    "fns": {
@@ -4735,7 +4784,7 @@
     "<synsema_core::number::Number>::to_i64_trunc": 252360,
     "<synsema_core::types::SynValue as core::clone::Clone>::clone": 14522514,
     "<synsema_heap::Shared<synsema_core::synlist::SynList>>::borrow": 2550225,
-    "__memcmp_avx2_movbe": 521053,
+    "__memcmp_avx2_movbe": 521118,
     "__memcpy_avx_unaligned_erms": 351915,
     "_dl_relocate_object": 640035,
     "_int_free": 670506,
@@ -4751,7 +4800,7 @@
     "synsema_core::math::sqrt": 320320,
     "synsema_core::synlist::list_values_mut": 1650066
    },
-   "total": 291632003
+   "total": 291632071
   },
   "s_records|jit": {
    "fns": {
@@ -4793,7 +4842,7 @@
     "synsema_jit::abi::nval": 885015,
     "synsema_jit::abi::synsema_jit_prop": 4661078
    },
-   "total": 141942181
+   "total": 141942340
   },
   "s_records|ref": {
    "fns": {
@@ -4835,7 +4884,7 @@
     "<synsema_core::synmap::Shape>::position": 7440066,
     "<synsema_core::types::SynValue as core::clone::Clone>::clone": 6960254,
     "<synsema_heap::SharedTail<synsema_core::synmap::MapBody<[synsema_core::types::SynValue]>>>::drop_slow": 5880002,
-    "__memcmp_avx2_movbe": 4708618,
+    "__memcmp_avx2_movbe": 4708727,
     "__memcpy_avx_unaligned_erms": 11264788,
     "_dl_relocate_object": 640035,
     "_int_free": 31105742,
@@ -4851,7 +4900,7 @@
     "synsema_core::temporal::binop": 3240027,
     "synsema_core::types::syn_text::<&str>": 3600060
    },
-   "total": 458120908
+   "total": 458121125
   },
   "s_records|vm": {
    "fns": {
@@ -4881,7 +4930,7 @@
     "malloc": 4320244,
     "synsema_core::interpreter::vm::native::native_args": 2165994
    },
-   "total": 185141647
+   "total": 185141928
   },
   "s_sort|jit": {
    "fns": {
@@ -4939,16 +4988,16 @@
     "<synsema_core::synlist::SynList>::push": 155031,
     "<synsema_core::types::SynValue as core::clone::Clone>::clone": 99620,
     "<synsema_jit::lower::Func>::liveness": 38214,
-    "???": 353603,
-    "__memcmp_avx2_movbe": 74436,
-    "__memcpy_avx_unaligned_erms": 268634,
+    "???": 353613,
+    "__memcmp_avx2_movbe": 74458,
+    "__memcpy_avx_unaligned_erms": 268863,
     "__vfscanf_internal": 53688,
     "_dl_lookup_symbol_x": 47557,
     "_dl_relocate_object": 640035,
-    "_int_free": 286953,
-    "_int_free_merge_chunk": 54091,
-    "_int_malloc": 365582,
-    "_int_realloc": 35301,
+    "_int_free": 287348,
+    "_int_free_merge_chunk": 54230,
+    "_int_malloc": 368332,
+    "_int_realloc": 35379,
     "core::iter::adapters::chain::and_then_or_clear::<core::iter::adapters::chain::Chain<core::iter::adapters::copied::Copied<core::slice::iter::Iter<cranelift_codegen::ir::entities::Value>>, core::iter::adapters::flatten::FlatMap<core::slice::iter::Iter<cranelift_codegen::ir::instructions::BlockCall>, core::iter::adapters::filter_map::FilterMap<core::iter::adapters::map::Map<core::slice::iter::Iter<cranelift_codegen::ir::entities::Value>, <cranelift_codegen::ir::instructions::BlockCall>::args::{closure#0}>, <cranelift_codegen::ir::dfg::DataFlowGraph>::inst_values::{closure#0}::{closure#0}>, <cranelift_codegen::ir::dfg::DataFlowGraph>::inst_values::{closure#0}>>, cranelift_codegen::ir::entities::Value, <core::iter::adapters::chain::Chain<core::iter::adapters::copied::Copied<core::slice::iter::Iter<cranelift_codegen::ir::entities::Value>>, core::iter::adapters::flatten::FlatMap<core::slice::iter::Iter<cranelift_codegen::ir::instructions::BlockCall>, core::iter::adapters::filter_map::FilterMap<core::iter::adapters::map::Map<core::slice::iter::Iter<cranelift_codegen::ir::entities::Value>, <cranelift_codegen::ir::instructions::BlockCall>::args::{closure#0}>, <cranelift_codegen::ir::dfg::DataFlowGraph>::inst_values::{closure#0}::{closure#0}>, <cranelift_codegen::ir::dfg::DataFlowGraph>::inst_values::{closure#0}>> as core::iter::traits::iterator::Iterator>::next>": 98052,
     "core::ptr::drop_glue::<synsema_core::types::SynValue>": 346006,
     "core::slice::sort::unstable::quicksort::quicksort::<i64, <i64 as core::cmp::PartialOrd>::lt>": 576115,
@@ -4958,15 +5007,15 @@
     "cranelift_codegen::machinst::lower::compute_use_states": 35791,
     "do_lookup_x": 87879,
     "free": 145476,
-    "malloc": 200137,
-    "malloc_consolidate": 81102,
+    "malloc": 200037,
+    "malloc_consolidate": 81668,
     "realloc": 50982,
     "synsema_core::interpreter::make_unique_n": 184963,
     "synsema_jit::abi::synsema_jit_append": 288000,
-    "synsema_jit::lower::check_pointers": 68119,
-    "unlink_chunk.isra.0": 50982
+    "synsema_jit::lower::check_pointers": 68188,
+    "unlink_chunk.isra.0": 51591
    },
-   "total": 13566887
+   "total": 13572067
   },
   "s_sort|ref": {
    "fns": {
@@ -5001,14 +5050,14 @@
     "<synsema_core::synlist::SynList>::push": 165005,
     "<synsema_core::types::SynValue as core::clone::Clone>::clone": 455248,
     "<synsema_heap::Shared<synsema_core::synlist::SynList>>::drop_slow": 215133,
-    "__memcmp_avx2_movbe": 722304,
-    "__memcpy_avx_unaligned_erms": 167348085,
+    "__memcmp_avx2_movbe": 722347,
+    "__memcpy_avx_unaligned_erms": 167348074,
     "_dl_relocate_object": 640035,
     "_int_free": 1429190,
     "_int_free_maybe_consolidate": 288617,
     "_int_free_merge_chunk": 637764,
     "_int_malloc": 2407707,
-    "_int_realloc": 389989,
+    "_int_realloc": 390004,
     "core::ptr::drop_glue::<synsema_core::interpreter::Bindings>": 405080,
     "core::ptr::drop_glue::<synsema_core::types::SynValue>": 1464907,
     "core::slice::sort::unstable::quicksort::quicksort::<i64, <i64 as core::cmp::PartialOrd>::lt>": 576115,
@@ -5021,13 +5070,13 @@
     "synsema_core::temporal::binop": 135081,
     "unlink_chunk.isra.0": 435501
    },
-   "total": 201733572
+   "total": 201733695
   },
   "s_sort|vm": {
    "fns": {
     "<alloc::raw_vec::RawVecInner>::finish_grow": 10244,
     "<core::hash::sip::Hasher<core::hash::sip::Sip13Rounds> as core::hash::Hasher>::write": 51436,
-    "<hashbrown::map::HashMap<&str, (usize, core::option::Option<usize>), std::hash::random::RandomState> as core::iter::traits::collect::Extend<(&str, (usize, core::option::Option<usize>))>>::extend::<core::iter::adapters::map::Map<core::slice::iter::Iter<(&str, usize, core::option::Option<usize>)>, synsema_core::builtin_arity::arity_of::{closure#0}::{closure#0}>>": 23668,
+    "<hashbrown::map::HashMap<&str, (usize, core::option::Option<usize>), std::hash::random::RandomState> as core::iter::traits::collect::Extend<(&str, (usize, core::option::Option<usize>))>>::extend::<core::iter::adapters::map::Map<core::slice::iter::Iter<(&str, usize, core::option::Option<usize>)>, synsema_core::builtin_arity::arity_of::{closure#0}::{closure#0}>>": 23578,
     "<hashbrown::map::HashMap<alloc::sync::Arc<str>, u32, rustc_hash::FxBuildHasher>>::insert": 24922,
     "<hashbrown::raw::RawTable<(alloc::sync::Arc<str>, u32)>>::reserve_rehash::<hashbrown::map::make_hasher<alloc::sync::Arc<str>, u32, rustc_hash::FxBuildHasher>::{closure#0}>": 25973,
     "<i64 as num_integer::Integer>::mod_floor": 159968,
@@ -5072,7 +5121,7 @@
     "do_lookup_x": 87879,
     "free": 77803,
     "malloc": 118482,
-    "malloc_consolidate": 57233,
+    "malloc_consolidate": 57223,
     "realloc": 14416,
     "strcmp": 24567,
     "synsema_core::ast_api::children": 12362,
@@ -5081,7 +5130,7 @@
     "synsema_core::interpreter::make_unique_n": 184963,
     "unlink_chunk.isra.0": 29760
    },
-   "total": 14692976
+   "total": 14692885
   },
   "s_spectral|jit": {
    "fns": {
@@ -5143,12 +5192,12 @@
     "<synsema_core::interpreter::Interpreter>::vm_put_values": 2179436,
     "<synsema_core::number::Number as core::clone::Clone>::clone": 397463,
     "<synsema_core::types::SynValue as core::clone::Clone>::clone": 471778,
-    "???": 10336497,
-    "__memcmp_avx2_movbe": 285000,
-    "__memcpy_avx_unaligned_erms": 2188918,
+    "???": 10336445,
+    "__memcmp_avx2_movbe": 285124,
+    "__memcpy_avx_unaligned_erms": 2168217,
     "_dl_relocate_object": 640035,
-    "_int_free": 1727737,
-    "_int_malloc": 1412770,
+    "_int_free": 1728277,
+    "_int_malloc": 1419628,
     "core::iter::adapters::chain::and_then_or_clear::<core::iter::adapters::chain::Chain<core::iter::adapters::copied::Copied<core::slice::iter::Iter<cranelift_codegen::ir::entities::Value>>, core::iter::adapters::flatten::FlatMap<core::slice::iter::Iter<cranelift_codegen::ir::instructions::BlockCall>, core::iter::adapters::filter_map::FilterMap<core::iter::adapters::map::Map<core::slice::iter::Iter<cranelift_codegen::ir::entities::Value>, <cranelift_codegen::ir::instructions::BlockCall>::args::{closure#0}>, <cranelift_codegen::ir::dfg::DataFlowGraph>::inst_values::{closure#0}::{closure#0}>, <cranelift_codegen::ir::dfg::DataFlowGraph>::inst_values::{closure#0}>>, cranelift_codegen::ir::entities::Value, <core::iter::adapters::chain::Chain<core::iter::adapters::copied::Copied<core::slice::iter::Iter<cranelift_codegen::ir::entities::Value>>, core::iter::adapters::flatten::FlatMap<core::slice::iter::Iter<cranelift_codegen::ir::instructions::BlockCall>, core::iter::adapters::filter_map::FilterMap<core::iter::adapters::map::Map<core::slice::iter::Iter<cranelift_codegen::ir::entities::Value>, <cranelift_codegen::ir::instructions::BlockCall>::args::{closure#0}>, <cranelift_codegen::ir::dfg::DataFlowGraph>::inst_values::{closure#0}::{closure#0}>, <cranelift_codegen::ir::dfg::DataFlowGraph>::inst_values::{closure#0}>> as core::iter::traits::iterator::Iterator>::next>": 1073528,
     "core::ptr::drop_glue::<synsema_core::types::SynValue>": 2182656,
     "cranelift_assembler_x64::mem::emit_modrm_sib_disp::<cranelift_codegen::isa::x64::inst::args::Gpr, cranelift_codegen::isa::x64::inst::external::AsmCodeSink>": 266365,
@@ -5159,14 +5208,14 @@
     "cranelift_codegen::machinst::lower::compute_use_states": 340526,
     "cranelift_codegen::remove_constant_phis::do_remove_constant_phis": 309752,
     "free": 1018215,
-    "malloc": 1238856,
-    "realloc": 284881,
+    "malloc": 1239781,
+    "realloc": 285015,
     "synsema_jit::abi::nval": 565958,
     "synsema_jit::abi::synsema_jit_index": 6530720,
-    "synsema_jit::lower::build": 260646,
-    "synsema_jit::lower::check_pointers": 673671
+    "synsema_jit::lower::build": 260631,
+    "synsema_jit::lower::check_pointers": 673851
    },
-   "total": 123020779
+   "total": 123015900
   },
   "s_spectral|ref": {
    "fns": {
@@ -5197,7 +5246,7 @@
     "<synsema_core::number::Number>::to_f64": 23009269,
     "<synsema_core::number::Number>::to_i64_trunc": 1877148,
     "<synsema_core::types::SynValue as core::clone::Clone>::clone": 11026366,
-    "__memcmp_avx2_movbe": 18951501,
+    "__memcmp_avx2_movbe": 18951523,
     "__memcpy_avx_unaligned_erms": 8183890,
     "_dl_relocate_object": 640035,
     "_int_free": 6804224,
@@ -5212,7 +5261,7 @@
     "synsema_core::synlist::list_values": 3107963,
     "synsema_core::temporal::binop": 24305427
    },
-   "total": 776370307
+   "total": 776370523
   },
   "s_spectral|vm": {
    "fns": {
@@ -5227,7 +5276,7 @@
     "<synsema_core::number::Number as core::clone::Clone>::clone": 5007383,
     "<synsema_core::types::SynValue as core::clone::Clone>::clone": 4060046,
     "<synsema_heap::Shared<synsema_core::synlist::SynList>>::borrow": 1503000,
-    "__memcmp_avx2_movbe": 233910,
+    "__memcmp_avx2_movbe": 233994,
     "__memcpy_avx_unaligned_erms": 147716,
     "_dl_relocate_object": 640035,
     "_int_free": 334846,
@@ -5237,7 +5286,7 @@
     "malloc": 241430,
     "synsema_core::interpreter::num_to_i64": 114408
    },
-   "total": 216078982
+   "total": 216079447
   },
   "s_text_concat|jit": {
    "fns": {
@@ -5258,7 +5307,7 @@
     "<synsema_core::number::Number as core::clone::Clone>::clone": 480241,
     "<synsema_core::types::SynValue as core::clone::Clone>::clone": 2140170,
     "<synsema_text::SynText>::push_str": 2260387,
-    "__memcmp_avx2_movbe": 407966,
+    "__memcmp_avx2_movbe": 408002,
     "__memcpy_avx_unaligned_erms": 1030705,
     "__vfscanf_internal": 53688,
     "_dl_lookup_symbol_x": 47557,
@@ -5271,12 +5320,12 @@
     "do_lookup_x": 87879,
     "free": 73245,
     "malloc": 113523,
-    "malloc_consolidate": 59125,
+    "malloc_consolidate": 59105,
     "synsema_core::interpreter::int_digits": 1603493,
     "synsema_core::interpreter::text_add_piece": 960024,
     "unlink_chunk.isra.0": 29979
    },
-   "total": 58362403
+   "total": 58362694
   },
   "s_text_concat|ref": {
    "fns": {
@@ -5295,7 +5344,7 @@
     "<synsema_core::interpreter::Interpreter>::register_builtins::{closure#6}": 780039,
     "<synsema_core::types::SynValue as core::clone::Clone>::clone": 1380028,
     "<synsema_text::SynText>::push_str": 3479548,
-    "__memcmp_avx2_movbe": 1407127,
+    "__memcmp_avx2_movbe": 1407171,
     "__memcpy_avx_unaligned_erms": 1366665107,
     "_int_free": 3991397,
     "_int_free_maybe_consolidate": 1481754,
@@ -5315,7 +5364,7 @@
     "synsema_core::interpreter::text_add_piece": 960024,
     "unlink_chunk.isra.0": 1160619
    },
-   "total": 1461978544
+   "total": 1461978828
   },
   "s_text_concat|vm": {
    "fns": {
@@ -5336,7 +5385,7 @@
     "<synsema_core::number::Number as core::clone::Clone>::clone": 480241,
     "<synsema_core::types::SynValue as core::clone::Clone>::clone": 2140022,
     "<synsema_text::SynText>::push_str": 2260387,
-    "__memcmp_avx2_movbe": 407413,
+    "__memcmp_avx2_movbe": 407478,
     "__memcpy_avx_unaligned_erms": 1027868,
     "__vfscanf_internal": 53688,
     "_dl_lookup_symbol_x": 47557,
@@ -5353,7 +5402,7 @@
     "synsema_core::interpreter::int_digits": 1603493,
     "synsema_core::interpreter::text_add_piece": 960024
    },
-   "total": 58223745
+   "total": 58224135
   },
   "s_text_join|jit": {
    "fns": {
@@ -5378,7 +5427,7 @@
     "<synsema_core::synlist::SynList>::push": 3000000,
     "<synsema_core::types::SynValue as core::clone::Clone>::clone": 4100272,
     "<synsema_text::SynText>::push_str": 7000070,
-    "__memcmp_avx2_movbe": 1927917,
+    "__memcmp_avx2_movbe": 1927896,
     "__memcpy_avx_unaligned_erms": 5230294,
     "_dl_relocate_object": 640035,
     "_int_free": 138070,
@@ -5391,7 +5440,7 @@
     "synsema_core::interpreter::text_add_piece": 2400024,
     "synsema_core::interpreter::vm::native::native_args": 1802997
    },
-   "total": 241306230
+   "total": 241306375
   },
   "s_text_join|ref": {
    "fns": {
@@ -5429,7 +5478,7 @@
     "<synsema_core::synlist::SynList>::push": 3000000,
     "<synsema_core::types::SynValue as core::clone::Clone>::clone": 4000205,
     "<synsema_text::SynText>::push_str": 7000070,
-    "__memcmp_avx2_movbe": 2927638,
+    "__memcmp_avx2_movbe": 2927550,
     "__memcpy_avx_unaligned_erms": 14528151,
     "_dl_relocate_object": 640035,
     "_int_free": 21727857,
@@ -5445,7 +5494,7 @@
     "synsema_core::interpreter::text_add_piece": 2400024,
     "synsema_core::types::syn_text::<&str>": 3000060
    },
-   "total": 369902623
+   "total": 369902938
   },
   "s_text_join|vm": {
    "fns": {
@@ -5470,7 +5519,7 @@
     "<synsema_core::synlist::SynList>::push": 3000000,
     "<synsema_core::types::SynValue as core::clone::Clone>::clone": 4100257,
     "<synsema_text::SynText>::push_str": 7000070,
-    "__memcmp_avx2_movbe": 1927915,
+    "__memcmp_avx2_movbe": 1927871,
     "__memcpy_avx_unaligned_erms": 5230291,
     "_dl_relocate_object": 640035,
     "_int_free": 137962,
@@ -5483,7 +5532,7 @@
     "synsema_core::interpreter::text_add_piece": 2400024,
     "synsema_core::interpreter::vm::native::native_args": 1802997
    },
-   "total": 241305513
+   "total": 241305924
   },
   "s_words|jit": {
    "fns": {
@@ -5496,10 +5545,10 @@
     "<cranelift_codegen::verifier::Verifier>::run": 1260310,
     "<hashbrown::raw::RawTable<usize>>::reserve_rehash::<indexmap::inner::get_hash<synsema_core::synmap::Key, synsema_core::types::SynValue>::{closure#0}>": 281792,
     "<i64 as num_integer::Integer>::mod_floor": 3099969,
-    "<indexmap::inner::Core<synsema_core::synmap::Key, synsema_core::types::SynValue>>::get_index_of::<str>": 22461444,
+    "<indexmap::inner::Core<synsema_core::synmap::Key, synsema_core::types::SynValue>>::get_index_of::<str>": 22425819,
     "<indexmap::map::IndexMap<synsema_core::synmap::Key, synsema_core::types::SynValue, synsema_core::synmap::KeyHasher>>::get_full::<str>": 8297828,
     "<indexmap::map::IndexMap<synsema_core::synmap::Key, synsema_core::types::SynValue, synsema_core::synmap::KeyHasher>>::get_mut::<str>": 3858953,
-    "<indexmap::map::IndexMap<synsema_core::synmap::Key, synsema_core::types::SynValue, synsema_core::synmap::KeyHasher>>::insert_full": 685877,
+    "<indexmap::map::IndexMap<synsema_core::synmap::Key, synsema_core::types::SynValue, synsema_core::synmap::KeyHasher>>::insert_full": 685206,
     "<regalloc2::ion::data_structures::Env<cranelift_codegen::machinst::vcode::VCode<cranelift_codegen::isa::x64::lower::isle::generated_code::MInst>>>::init": 515086,
     "<regalloc2::ion::data_structures::Env<cranelift_codegen::machinst::vcode::VCode<cranelift_codegen::isa::x64::lower::isle::generated_code::MInst>>>::run": 537818,
     "<regalloc2::ion::data_structures::Env<cranelift_codegen::machinst::vcode::VCode<cranelift_codegen::isa::x64::lower::isle::generated_code::MInst>>>::try_to_allocate_bundle_to_reg": 574076,
@@ -5527,28 +5576,28 @@
     "<synsema_core::synmap::MapBody<[synsema_core::types::SynValue]>>::set_value_key": 248186,
     "<synsema_core::types::SynValue as core::clone::Clone>::clone": 6100599,
     "<synsema_text::SynText>::push_str": 7000100,
-    "???": 11489933,
-    "__memcmp_avx2_movbe": 9015145,
-    "__memcpy_avx_unaligned_erms": 9883593,
+    "???": 11489947,
+    "__memcmp_avx2_movbe": 9001928,
+    "__memcpy_avx_unaligned_erms": 9883789,
     "_dl_relocate_object": 640035,
-    "_int_free": 339811,
-    "_int_malloc": 463523,
+    "_int_free": 340166,
+    "_int_malloc": 461927,
     "core::ptr::drop_glue::<[synsema_core::interpreter::EachItems]>": 1300076,
     "core::ptr::drop_glue::<synsema_core::types::SynValue>": 28151940,
     "core::str::converts::from_utf8": 5776346,
-    "malloc": 234138,
+    "malloc": 233963,
     "synsema_core::interpreter::int_digits": 7068232,
     "synsema_core::interpreter::make_unique_n": 3700000,
     "synsema_core::interpreter::text_add_piece": 2400024,
     "synsema_core::interpreter::vm::native::native_args": 1802997,
     "synsema_core::synmap::own": 1699983,
-    "synsema_jit::abi::synsema_jit_get": 7360952,
+    "synsema_jit::abi::synsema_jit_get": 7760955,
     "synsema_jit::abi::synsema_jit_home_local": 2870998,
     "synsema_jit::abi::synsema_jit_list_elem": 5049000,
     "synsema_jit::abi::synsema_jit_path_root": 2772000,
-    "synsema_jit::abi::synsema_jit_path_set": 11706018
+    "synsema_jit::abi::synsema_jit_path_set": 11805018
    },
-   "total": 448265895
+   "total": 448715522
   },
   "s_words|ref": {
    "fns": {
@@ -5559,10 +5608,10 @@
     "<alloc::vec::drain::Drain<(core::option::Option<alloc::string::String>, synsema_core::types::SynValue)> as core::ops::drop::Drop>::drop": 9000240,
     "<core::hash::sip::Hasher<core::hash::sip::Sip13Rounds> as core::hash::Hasher>::write": 13613960,
     "<core::iter::adapters::map::Map<core::str::iter::Split<&str>, synsema_core::types::syn_text<&str>> as core::iter::traits::iterator::Iterator>::next": 14678177,
-    "<indexmap::inner::Core<synsema_core::synmap::Key, synsema_core::types::SynValue>>::get_index_of::<str>": 14977412,
+    "<indexmap::inner::Core<synsema_core::synmap::Key, synsema_core::types::SynValue>>::get_index_of::<str>": 14971750,
     "<indexmap::map::IndexMap<synsema_core::synmap::Key, synsema_core::types::SynValue, synsema_core::synmap::KeyHasher>>::get_full::<str>": 4148956,
     "<indexmap::map::IndexMap<synsema_core::synmap::Key, synsema_core::types::SynValue, synsema_core::synmap::KeyHasher>>::get_mut::<str>": 3858953,
-    "<indexmap::map::IndexMap<synsema_core::synmap::Key, synsema_core::types::SynValue, synsema_core::synmap::KeyHasher>>::insert_full": 684563,
+    "<indexmap::map::IndexMap<synsema_core::synmap::Key, synsema_core::types::SynValue, synsema_core::synmap::KeyHasher>>::insert_full": 687019,
     "<smallvec::SmallVec<[synsema_core::types::SynValue; 4]> as core::ops::drop::Drop>::drop": 6400228,
     "<std::thread::local::LocalKey<core::cell::RefCell<synsema_core::interpreter::ModuleRegistry>>>::with::<synsema_core::interpreter::module_env_of_map::{closure#0}, core::option::Option<alloc::rc::Rc<core::cell::RefCell<synsema_core::interpreter::Environment>>>>": 4400027,
     "<synsema_core::ast::BinOp>::as_str": 1400014,
@@ -5605,7 +5654,7 @@
     "<synsema_core::synmap::MapBody<[synsema_core::types::SynValue]>>::get_full": 2600335,
     "<synsema_core::types::SynValue as core::clone::Clone>::clone": 18650269,
     "<synsema_text::SynText>::push_str": 7000100,
-    "__memcmp_avx2_movbe": 16240292,
+    "__memcmp_avx2_movbe": 16235049,
     "__memcpy_avx_unaligned_erms": 26647346,
     "_dl_relocate_object": 640035,
     "_int_free": 32568935,
@@ -5625,7 +5674,7 @@
     "synsema_core::temporal::binop": 5400054,
     "synsema_core::types::syn_text::<&str>": 3000120
    },
-   "total": 1008996328
+   "total": 1008987848
   },
   "s_words|vm": {
    "fns": {
@@ -5634,10 +5683,10 @@
     "<core::hash::sip::Hasher<core::hash::sip::Sip13Rounds> as core::hash::Hasher>::write": 20217570,
     "<core::iter::adapters::map::Map<core::str::iter::Split<&str>, synsema_core::types::syn_text<&str>> as core::iter::traits::iterator::Iterator>::next": 14678177,
     "<i64 as num_integer::Integer>::mod_floor": 3099969,
-    "<indexmap::inner::Core<synsema_core::synmap::Key, synsema_core::types::SynValue>>::get_index_of::<str>": 22451481,
+    "<indexmap::inner::Core<synsema_core::synmap::Key, synsema_core::types::SynValue>>::get_index_of::<str>": 22414443,
     "<indexmap::map::IndexMap<synsema_core::synmap::Key, synsema_core::types::SynValue, synsema_core::synmap::KeyHasher>>::get_full::<str>": 8297828,
     "<indexmap::map::IndexMap<synsema_core::synmap::Key, synsema_core::types::SynValue, synsema_core::synmap::KeyHasher>>::get_mut::<str>": 3858953,
-    "<indexmap::map::IndexMap<synsema_core::synmap::Key, synsema_core::types::SynValue, synsema_core::synmap::KeyHasher>>::insert_full": 687902,
+    "<indexmap::map::IndexMap<synsema_core::synmap::Key, synsema_core::types::SynValue, synsema_core::synmap::KeyHasher>>::insert_full": 684296,
     "<smallvec::SmallVec<[synsema_core::types::SynValue; 4]> as core::ops::drop::Drop>::drop": 6400228,
     "<std::thread::local::LocalKey<core::cell::RefCell<synsema_core::interpreter::ModuleRegistry>>>::with::<synsema_core::interpreter::module_env_of_map::{closure#0}, core::option::Option<alloc::rc::Rc<core::cell::RefCell<synsema_core::interpreter::Environment>>>>": 4510071,
     "<synsema_core::interpreter::EachItems>::next_item": 5400043,
@@ -5668,7 +5717,7 @@
     "<synsema_core::types::SynValue as core::clone::Clone>::clone": 16950403,
     "<synsema_heap::SharedTail<synsema_core::synmap::MapBody<[synsema_core::types::SynValue]>>>::borrow_mut": 1000000,
     "<synsema_text::SynText>::push_str": 7000100,
-    "__memcmp_avx2_movbe": 10639149,
+    "__memcmp_avx2_movbe": 10629580,
     "__memcpy_avx_unaligned_erms": 9769213,
     "_dl_relocate_object": 640035,
     "core::ptr::drop_glue::<[synsema_core::interpreter::EachItems]>": 1300076,
@@ -5681,7 +5730,7 @@
     "synsema_core::interpreter::vm::native::native_args": 1802997,
     "synsema_core::synmap::own": 1699983
    },
-   "total": 625931627
+   "total": 625881759
   },
   "t_template|jit": {
    "fns": {
@@ -5713,7 +5762,7 @@
     "<synsema_text::SynText>::dealloc_last": 1075455,
     "<synsema_text::SynText>::heap_from": 2729805,
     "<synsema_text::SynText>::push_str": 5995000,
-    "__memcmp_avx2_movbe": 1168092,
+    "__memcmp_avx2_movbe": 1168070,
     "__memcpy_avx_unaligned_erms": 10988937,
     "_dl_relocate_object": 640035,
     "_int_free": 22199229,
@@ -5728,7 +5777,7 @@
     "synsema_core::interpreter::text_add_piece": 2880000,
     "synsema_core::types::syn_text::<alloc::string::String>": 5660020
    },
-   "total": 458338398
+   "total": 458338323
   },
   "t_template|ref": {
    "fns": {
@@ -5774,12 +5823,12 @@
     "<synsema_text::SynText>::dealloc_last": 1075455,
     "<synsema_text::SynText>::heap_from": 2729805,
     "<synsema_text::SynText>::push_str": 5995000,
-    "__memcmp_avx2_movbe": 9087013,
-    "__memcpy_avx_unaligned_erms": 19143818,
+    "__memcmp_avx2_movbe": 9087035,
+    "__memcpy_avx_unaligned_erms": 19143829,
     "_dl_relocate_object": 640035,
-    "_int_free": 28654037,
-    "_int_malloc": 6280830,
-    "_int_realloc": 5393911,
+    "_int_free": 28654121,
+    "_int_malloc": 6280962,
+    "_int_realloc": 5393916,
     "alloc::fmt::format::format_inner": 20160630,
     "core::fmt::write": 34320852,
     "core::ptr::drop_glue::<synsema_core::interpreter::Bindings>": 5160080,
@@ -5796,7 +5845,7 @@
     "synsema_core::types::syn_text::<&str>": 5400000,
     "synsema_core::types::syn_text::<alloc::string::String>": 5660020
    },
-   "total": 592946513
+   "total": 592946790
   },
   "t_template|vm": {
    "fns": {
@@ -5828,7 +5877,7 @@
     "<synsema_text::SynText>::dealloc_last": 1075455,
     "<synsema_text::SynText>::heap_from": 2729805,
     "<synsema_text::SynText>::push_str": 5995000,
-    "__memcmp_avx2_movbe": 1167566,
+    "__memcmp_avx2_movbe": 1167610,
     "__memcpy_avx_unaligned_erms": 10986961,
     "_dl_relocate_object": 640035,
     "_int_free": 22185591,
@@ -5843,7 +5892,7 @@
     "synsema_core::interpreter::text_add_piece": 2880000,
     "synsema_core::types::syn_text::<alloc::string::String>": 5660020
    },
-   "total": 458168768
+   "total": 458168982
   }
  }
 }

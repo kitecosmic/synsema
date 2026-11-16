@@ -12,6 +12,11 @@ Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the rele
   as it is, and only a value that is not text is converted (to its `Display`). Before,
   every call allocated and copied the key — 100,000 times in a word-count loop.
 - `split(text, sep)` splits the text without copying it whole into a `String` first.
+- The native tier understands an **integer key** on a map: a map's key is text, so an
+  integer key is its decimal text (`m[1]` and `m["1"]` are the same key), exactly as
+  in the tree-walker. Before, an integer key was a miss: the native code left to the
+  virtual machine on every read and write, and the unit was discarded. Measured on the
+  guard's corpus: a map read −77 %, a map write −47 %, a map counter −59 %.
 - The performance guard's corpus gains seven probes for the native tier (maps, a
   list written through a parameter, `set lista[k]` inside a `while`, the cost of
   entering a compiled task, and the BPE's hot loop). **The anchor
