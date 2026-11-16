@@ -10,6 +10,7 @@ import argparse
 from collections import Counter
 import json
 from pathlib import Path
+from statistics import median
 import subprocess
 import tempfile
 from time import perf_counter
@@ -85,14 +86,24 @@ def main() -> None:
     ap.add_argument("--corpus", type=Path, required=True)
     ap.add_argument("--chars", type=int, default=100_000)
     ap.add_argument("--vocab", type=int, default=512)
+    ap.add_argument("--repeat", type=int, default=1, help="report the median of independent runs")
     args = ap.parse_args()
+    if args.repeat < 1:
+        ap.error("--repeat must be positive")
     text = args.corpus.read_text(encoding="utf-8")[:args.chars]
-    expected, phases = python_bpe(text, args.vocab)
-    native, native_s = synsema_bpe(args.bin.resolve(), args.library.resolve(), text, args.vocab, False)
-    vm, vm_s = synsema_bpe(args.bin.resolve(), args.library.resolve(), text, args.vocab, True)
-    if native != expected or vm != expected:
-        raise AssertionError(f"merges differ: Python={len(expected)} Synsema={len(native)} VM={len(vm)}")
+    measurements = []
+    for _ in range(args.repeat):
+        expected, phases = python_bpe(text, args.vocab)
+        native, native_s = synsema_bpe(args.bin.resolve(), args.library.resolve(), text, args.vocab, False)
+        vm, vm_s = synsema_bpe(args.bin.resolve(), args.library.resolve(), text, args.vocab, True)
+        if native != expected or vm != expected:
+            raise AssertionError(f"merges differ: Python={len(expected)} Synsema={len(native)} VM={len(vm)}")
+        measurements.append((phases, native_s, vm_s))
+    phases = {k: median(row[0][k] for row in measurements) for k in phases}
+    native_s = median(row[1] for row in measurements)
+    vm_s = median(row[2] for row in measurements)
     print(json.dumps({"chars": len(text), "merges": len(expected), "equivalent": True,
+                      "repeat": args.repeat,
                       "python_s": round(sum(phases.values()), 3),
                       "python_phases_s": {k: round(v, 3) for k, v in phases.items()},
                       "synsema_s": round(native_s, 3), "jitless_s": round(vm_s, 3)}))
