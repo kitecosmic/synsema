@@ -26,7 +26,10 @@ Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the rele
   setup `each` no longer reuses the `while` index name; that part is not credited to JIT.
 - The performance guard's corpus gains seven probes for the native tier (maps, a
   list written through a parameter, `set lista[k]` inside a `while`, the cost of
-  entering a compiled task, and the BPE's hot loop). **The anchor
+  entering a compiled task, and the BPE's hot loop), plus a probe that repeats
+  the BPE's `fusionar` loop to measure amortized compilation. Locally, that loop
+  takes 210.1 M instructions with JIT versus 1,377.2 M in the VM (6.6× fewer).
+  **The anchor
   (`engine/perf/baseline.json`) was re-measured by CI with those rows and again after
   the parameter/local write change**; across all 120 rows, the largest increase
   over the previous anchor was +0.045 %, below the +0.3 % budget.
