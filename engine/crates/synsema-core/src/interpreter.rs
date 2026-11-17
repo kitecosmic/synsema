@@ -10891,13 +10891,26 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
         }
         let default = args.get(2).cloned().unwrap_or(SynValue::Nothing);
         match &args[0] {
-            SynValue::Map(m) => Ok(m.borrow().get(&args[1].to_string()).cloned().unwrap_or(default)),
+            // v0.6.63: la clave es el texto tal cual; sólo un valor que no es texto se convierte
+            // (a su `Display`). Antes cada llamada hacía `to_string()` y reservaba memoria,
+            // aunque la clave ya fuera texto: en un bucle de conteo son una reserva por vuelta.
+            SynValue::Map(m) => {
+                if let SynValue::Number(Number::Int(i)) = &args[1] {
+                    let mut buf = [0u8; 20];
+                    return Ok(m.borrow().get(int_digits(*i, &mut buf)).cloned().unwrap_or(default));
+                }
+                let key = key_str(&args[1]);
+                Ok(m.borrow().get(key.as_ref()).cloned().unwrap_or(default))
+            }
             SynValue::List(l) => {
                 let i = num_to_i64(&args[1])?;
                 let items = list_values(&l);
                 Ok(resolve_index(i, items.len()).map(|j| items[j].clone()).unwrap_or(default))
             }
-            SynValue::Server(sv) => Ok(sv.get_field(&args[1].to_string()).unwrap_or(default)),
+            SynValue::Server(sv) => {
+                let key = key_str(&args[1]);
+                Ok(sv.get_field(key.as_ref()).unwrap_or(default))
+            }
             other => Err(err(format!("get() reads a map or a list, got {}", other.type_name()))),
         }
     }
@@ -11059,7 +11072,13 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
     }
 
     fn b_split(&mut self, args: &[SynValue], _loc: &SourceLocation) -> Result<SynValue, Control> {
-        let text = raw_str(nth(args, 0)?);
+        // v0.6.63: el texto se parte **sin copiarlo entero** a un `String` (antes: una copia del
+        // documento entero, que en el conteo de palabras del BPE son cientos de kilobytes por
+        // llamada). Un valor que no es texto se sigue copiando (es su `Display`).
+        let text = match nth(args, 0)? {
+            SynValue::Text(t) => std::borrow::Cow::Borrowed(t.as_str()),
+            other => std::borrow::Cow::Owned(raw_str(other)),
+        };
         let sep = raw_str(nth(args, 1)?);
         if sep.is_empty() {
             // v0.6.20 — separador vacío = los caracteres del texto (scalars Unicode), como
@@ -11067,7 +11086,7 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
             let chars: Vec<SynValue> = text.chars().map(|c| syn_text(c.to_string())).collect();
             return Ok(syn_list(chars));
         }
-        let parts: Vec<SynValue> = text.split(&sep).map(syn_text).collect();
+        let parts: Vec<SynValue> = text.split(sep.as_str()).map(syn_text).collect();
         Ok(syn_list(parts))
     }
 
@@ -11097,6 +11116,12 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                         cap += t.as_str().len();
                     }
                 }
+                // v0.6.63: se sigue armando en un `String` y copiando al `SynText` al final. Se
+                // probó armarlo directo en el `SynText` (una sola reserva): con la medición de
+                // instrucciones, `SynText::push_str` cuesta ~78 instrucciones por parte (es una
+                // función de otro crate, con su puntero al header) contra ~20 del `String`, y la
+                // copia final del texto entero eran 15.000 instrucciones de 242 millones: la copia
+                // no era el problema. Queda el `String`.
                 let mut out = String::with_capacity(cap);
                 for (i, v) in items.iter().enumerate() {
                     if i > 0 {
@@ -13510,6 +13535,18 @@ fn raw_str(v: &SynValue) -> String {
         SynValue::Bool(b) => if *b { "True" } else { "False" }.to_string(),
         SynValue::Nothing => "None".to_string(),
         other => other.to_string(),
+    }
+}
+
+/// La clave de una búsqueda en un mapa: el texto **tal cual**, o el `Display` del valor (un entero
+/// es su texto decimal, y por eso `m[1]` y `m["1"]` son la misma clave).
+///
+/// v0.6.63: el texto se presta; sólo un valor que no es texto reserva memoria para su clave.
+/// Antes, cada llamada de `get` hacía `to_string()` sobre la clave: una reserva por llamada.
+fn key_str(v: &SynValue) -> std::borrow::Cow<'_, str> {
+    match v {
+        SynValue::Text(t) => std::borrow::Cow::Borrowed(t.as_str()),
+        other => std::borrow::Cow::Owned(other.to_string()),
     }
 }
 

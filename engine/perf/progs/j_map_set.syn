@@ -1,0 +1,6 @@
+-- v0.6.63: mapas en el nivel nativo (escritura con clave entera).
+-- Sonda de `proyectos/datos/reportes/sondas_19/mapa.syn`.
+let c be {}
+each i in range(0, 100000)
+    set c[i % 300] to i
+print("check " + text(length(keys(c)) * 1000 + c[7]))

@@ -1,0 +1,11 @@
+-- v0.6.63: el costo de entrar a una task compilada.
+-- Sonda de `proyectos/datos/reportes/sondas_19/jit2.syn`: la task entra, corre y sale, muchas veces.
+task suma(n)
+    let x be 0
+    each i in range(0, n)
+        set x to x + i % 7
+    give x
+let x be 0
+each i in range(0, 5000)
+    set x to x + suma(30)
+print("check " + text(x))

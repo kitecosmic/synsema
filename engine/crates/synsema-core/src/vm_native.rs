@@ -654,10 +654,20 @@ fn seen(v: Option<&SynValue>) -> NSeen {
 
 /// F4.8d: la variable raíz de una escritura de un bucle: una global del entorno del bucle (`Ok`, su
 /// nombre: con valor, que no sea una task ni un builtin; el entorno no puede ser un módulo, que
-/// sincroniza sus exportaciones) o un lugar de la ventana (`Err`). `None`: no se baja.
-fn loop_root(c: &Chunk, root: Root, own: &impl Fn(&str) -> Option<Option<SynValue>>, module: bool) -> Option<Result<Arc<str>, u16>> {
+/// sincroniza sus exportaciones), una local de la task resuelta a ese mismo slot del entorno,
+/// un lugar de la ventana (`Err(k)`) o un parámetro de la task (`Err(PARAM | r)`, que vive en un
+/// registro). `None`: no se baja.
+fn loop_root(c: &Chunk, root: Root, env: &Rc<RefCell<Environment>>, own: &impl Fn(&str) -> Option<Option<SynValue>>, module: bool) -> Option<Result<Arc<str>, u16>> {
     match root {
         Root::Win(k) => Some(Err(k)),
+        Root::Param(r) => Some(Err(PARAM | r)),
+        Root::Local(k) if !module => {
+            let e = env.borrow();
+            if k as usize >= e.bindings.len_names() || matches!(e.bindings.slot(k as usize), None | Some(SynValue::Task(_) | SynValue::Builtin(_))) {
+                return None;
+            }
+            Some(Ok(e.bindings.slot_name(k as usize)))
+        }
         Root::Free { name, .. } if !module => {
             let nm = &c.names[name as usize];
             match own(nm) {
@@ -667,6 +677,10 @@ fn loop_root(c: &Chunk, root: Root, own: &impl Fn(&str) -> Option<Option<SynValu
         }
         _ => None,
     }
+}
+
+fn loop_root_opnd(k: u16) -> NOpnd {
+    if k & PARAM != 0 { NOpnd::Copy(k & !PARAM) } else { NOpnd::Local(k) }
 }
 
 /// F4.8d: el índice de un paso o de la hoja de un `set` con camino: un texto constante va como la
@@ -946,20 +960,20 @@ fn view_loop(c: &Chunk, env: &Rc<RefCell<Environment>>, head: usize, back: usize
             }
             // F4.8d: `set <camino> to v` y `set P to append(P, e)` sobre una variable del bucle (una
             // global de su entorno, que no sea de un módulo, o una de la ventana).
-            Ins::PathRoot { c: cr, desc } => match loop_root(c, c.paths[desc as usize].root, &own_w, module) {
+            Ins::PathRoot { c: cr, desc } => match loop_root(c, c.paths[desc as usize].root, env, &own_w, module) {
                 Some(Ok(nm)) => {
                     written.push(nm.clone());
                     Some(NIns::PathRoot { c: cr, root: NOpnd::Global(global(&nm)) })
                 }
-                Some(Err(k)) => Some(NIns::PathRoot { c: cr, root: NOpnd::Local(k) }),
+                Some(Err(k)) => Some(NIns::PathRoot { c: cr, root: loop_root_opnd(k) }),
                 None => None,
             },
-            Ins::AppendInPlace { dst, func, args, site } => match c.sites[site as usize].append.and_then(|r| loop_root(c, r, &own_w, module)) {
+            Ins::AppendInPlace { dst, func, args, site } => match c.sites[site as usize].append.and_then(|r| loop_root(c, r, env, &own_w, module)) {
                 Some(Ok(nm)) => {
                     written.push(nm.clone());
                     Some(NIns::AppendPush { dst, func, args, root: NOpnd::Global(global(&nm)) })
                 }
-                Some(Err(k)) => Some(NIns::AppendPush { dst, func, args, root: NOpnd::Local(k) }),
+                Some(Err(k)) => Some(NIns::AppendPush { dst, func, args, root: loop_root_opnd(k) }),
                 None => None,
             },
             Ins::PathStep { c: cr, idx, key, .. } => {

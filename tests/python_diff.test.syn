@@ -155,6 +155,37 @@ test "m[k] on a missing key errors; get(m, k, default) is dict.get"
     assert_eq(get({"a": 1}, "b"), nothing)
     assert_eq(get({"a": 1}, "b", 0), 0)
 
+test "get and split look up and cut exactly what the text says (v0.6.63)"
+    -- La clave de un mapa es su texto: un entero busca su texto decimal, y `m[1]` y `m["1"]`
+    -- son la misma clave. Un texto se busca tal cual (nada de comillas).
+    assert_eq(get({"1": 2}, 1), 2)
+    assert_eq(get({"1.0": 2}, 1.0), 2)
+    assert_eq(get({"true": 2}, true), 2)
+    assert_eq(get({"a": 1}, "a"), 1)
+    assert_eq(get({"a": 1}, "b", 7), 7)
+    assert_eq(get([10, 20], 1), 20)
+    -- `split` parte el texto sin cambiarlo: un número es su `Display`, el separador vacío son los
+    -- caracteres.
+    assert_eq(split("a,b,c", ","), ["a", "b", "c"])
+    assert_eq(split("abc", ""), ["a", "b", "c"])
+    assert_eq(split(12345, "2"), ["1", "345"])
+    assert_eq(split("a--b", "--"), ["a", "b"])
+
+test "a map key is text: an integer key is its decimal text (v0.6.63)"
+    -- The key of a map is text: `m[1]` and `m["1"]` are the same key (and the same key the
+    -- native tier uses, since v0.6.63).
+    let m be {}
+    set m[1] to "uno"
+    set m["1"] to "otro"
+    assert_eq(m[1], "otro")
+    assert_eq(get(m, 1, "no"), "otro")
+    assert_eq(get(m, "1", "no"), "otro")
+    assert_eq(length(keys(m)), 1)
+    set m[-7] to "negativo"
+    assert_eq(get(m, -7, "no"), "negativo")
+    assert_eq(get(m, true, "no"), "no")
+    assert_eq(get(m, 1.5, "no"), "no")
+
 test "string methods are plain tasks"
     assert_eq(upper("hola"), "HOLA")
     assert_eq(split("a,b,c", ","), ["a", "b", "c"])

@@ -1,0 +1,13 @@
+-- v0.6.63: `set lista[k]` dentro de un `while`.
+-- Sonda de `proyectos/datos/reportes/sondas_19/jit3.syn` (el caso `local_while`).
+task local_while(n)
+    let c be []
+    each fill_i in range(0, 300)
+        set c to append(c, 0)
+    let i be 0
+    while i < n
+        set c[i % 300] to c[i % 300] + 1
+        set i to i + 1
+    give c
+let r be local_while(100000)
+print("check " + text(r[7]))

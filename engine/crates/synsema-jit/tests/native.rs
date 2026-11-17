@@ -8,6 +8,120 @@ use synsema_core::interpreter::{run_source, Control, Interpreter};
 use synsema_core::native_tier;
 use synsema_core::parser::parse_source;
 
+/// v0.6.63: las claves enteras de un mapa deben permanecer en el nivel nativo
+/// y conservar su representación textual.
+#[test]
+fn integer_map_keys_stay_native_and_preserve_values() {
+    synsema_jit::install();
+    let before = native_tier::stats();
+    let r = run_source(
+        concat!(
+            "let m be {}\n",
+            "each i in range(0, 20000)\n",
+            "    set m[i % 3] to get(m, i % 3, 0) + 1\n",
+            "print(m[\"1\"], m[1], length(keys(m)))\n",
+        ),
+        "integer_map_keys.syn",
+    );
+    assert!(r.success, "{:?}", r.errors);
+    assert_eq!(r.output, vec!["6667 6667 3"]);
+    let after = native_tier::stats();
+    assert!(after.osr > before.osr, "el bucle no entró al código nativo: {:?} → {:?}", before, after);
+}
+
+/// v0.6.63: la raíz de una escritura puede ser un parámetro de la task.
+/// La primera escritura separa el cuerpo compartido y deja el valor del caller intacto.
+#[test]
+fn a_native_loop_writes_a_list_parameter_with_value_semantics() {
+    synsema_jit::install();
+    let before = native_tier::stats();
+    let r = run_source(
+        concat!(
+            "task bump(xs, n)\n",
+            "    each i in range(0, n)\n",
+            "        set xs[0] to xs[0] + 1\n",
+            "    give xs\n",
+            "let original be [0, \"keep\"]\n",
+            "let changed be bump(original, 20000)\n",
+            "print(changed[0], original[0])\n",
+        ),
+        "list_param_native.syn",
+    );
+    assert!(r.success, "{:?}", r.errors);
+    assert_eq!(r.output, vec!["20000 0"]);
+    let after = native_tier::stats();
+    assert!(after.osr > before.osr, "la escritura en el parámetro no entró al nivel nativo: {:?} → {:?}", before, after);
+}
+
+#[test]
+fn a_native_loop_writes_a_map_parameter_with_value_semantics() {
+    synsema_jit::install();
+    let before = native_tier::stats();
+    let r = run_source(
+        concat!(
+            "task count(m, n)\n",
+            "    each i in range(0, n)\n",
+            "        set m[i % 3] to get(m, i % 3, 0) + 1\n",
+            "    give m\n",
+            "let original be {\"0\": 4}\n",
+            "let changed be count(original, 20000)\n",
+            "print(changed[0], original[0], length(keys(changed)))\n",
+        ),
+        "map_param_native.syn",
+    );
+    assert!(r.success, "{:?}", r.errors);
+    assert_eq!(r.output, vec!["6671 4 3"]);
+    let after = native_tier::stats();
+    assert!(after.osr > before.osr, "la escritura en el mapa parámetro no entró al nivel nativo: {:?} → {:?}", before, after);
+}
+
+#[test]
+fn a_native_loop_appends_to_a_list_parameter_with_value_semantics() {
+    synsema_jit::install();
+    let before = native_tier::stats();
+    let r = run_source(
+        concat!(
+            "task grow(xs, n)\n",
+            "    each i in range(0, n)\n",
+            "        set xs to append(xs, i)\n",
+            "    give xs\n",
+            "let original be [0, \"keep\"]\n",
+            "let changed be grow(original, 20000)\n",
+            "print(length(changed), length(original), changed[20001])\n",
+        ),
+        "list_param_append_native.syn",
+    );
+    assert!(r.success, "{:?}", r.errors);
+    assert_eq!(r.output, vec!["20002 2 19999"]);
+    let after = native_tier::stats();
+    assert!(after.osr > before.osr, "append sobre el parámetro no entró al nivel nativo: {:?} → {:?}", before, after);
+}
+
+/// v0.6.63: una local de la task sigue siendo la misma variable tras el `while` nativo.
+#[test]
+fn a_native_while_writes_a_task_local_list() {
+    synsema_jit::install();
+    let before = native_tier::stats();
+    let r = run_source(
+        concat!(
+            "task count(n)\n",
+            "    let xs be [0, \"keep\"]\n",
+            "    let i be 0\n",
+            "    while i < n\n",
+            "        set xs[0] to xs[0] + 1\n",
+            "        set i to i + 1\n",
+            "    give xs\n",
+            "let result be count(20000)\n",
+            "print(result[0], result[1])\n",
+        ),
+        "list_local_while_native.syn",
+    );
+    assert!(r.success, "{:?}", r.errors);
+    assert_eq!(r.output, vec!["20000 keep"]);
+    let after = native_tier::stats();
+    assert!(after.osr > before.osr, "la escritura en la local no entró al nivel nativo: {:?} → {:?}", before, after);
+}
+
 #[test]
 fn a_hot_recursive_task_runs_native() {
     synsema_jit::install();

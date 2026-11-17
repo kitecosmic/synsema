@@ -849,6 +849,10 @@ impl MapObj {
                 self.push_new(Key(s.clone()), v);
                 None
             }
+            SynValue::Number(crate::number::Number::Int(i)) => {
+                let mut buf = [0u8; 20];
+                self.set(crate::interpreter::int_digits(*i, &mut buf), v)
+            }
             other => self.set(&other.to_string(), v),
         }
     }

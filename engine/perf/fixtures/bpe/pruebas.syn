@@ -1,0 +1,70 @@
+-- Pruebas del tokenizador: synsema test pruebas.syn
+use "./tokenizador.syn" as tok
+
+let TEXTO be "el perro come. el perro duerme. la perra come y el gato duerme. ¡ñandú! 42 veces, 420 veces."
+
+test "BPE: decodificar(codificar(x)) devuelve x, también con tildes y emojis"
+    let m be tok.entrenar(TEXTO, 300)
+    each x in [TEXTO, "", "hola", "el perro ñandú 🐕 come", "  dos  espacios\nsalto"]
+        assert_eq(tok.decodificar(m, tok.codificar(m, x)), x)
+
+test "BPE: aprende las fusiones frecuentes y comprime"
+    let m be tok.entrenar(TEXTO, 300)
+    assert(tok.tam_vocab(m) > 256)
+    assert(length(tok.codificar(m, TEXTO)) < length(bytes(TEXTO)))
+    assert_eq(tok.token_texto(m, 256), "er")          -- perro, perra, duerme: el par más frecuente
+
+test "BPE: determinista, y el modelo sobrevive a JSON"
+    let a be tok.entrenar(TEXTO, 300)
+    let b be tok.entrenar(TEXTO, 300)
+    assert_eq(a, b)
+    let c be json_decode(json_encode(a))
+    assert_eq(tok.codificar(c, TEXTO), tok.codificar(a, TEXTO))
+
+test "BPE: sin fusiones es un tokenizador de bytes"
+    let m be tok.entrenar(TEXTO, 256)
+    assert_eq(tok.codificar(m, "añ"), [97, 195, 177])
+
+test "BPE: un vocabulario menor que 256 es un error"
+    assert_error(() => tok.entrenar(TEXTO, 100))
+
+test "caracteres: ida y vuelta, y un carácter desconocido es un error"
+    let m be tok.caracteres(TEXTO)
+    assert_eq(tok.decodificar(m, tok.codificar(m, "el gato")), "el gato")
+    assert_eq(tok.tam_vocab(m), length(unique(split(TEXTO, ""))))
+    assert_error(() => tok.codificar(m, "xyz"))
+
+test "tiktoken: el trozo entero si es un token; si no, se junta primero el par de menor rango"
+    -- a b c espacio, y dos fusiones: "bc" (rango 4) antes que "ab" (rango 5)
+    let m be tok.desde_tiktoken("YQ== 0\nYg== 1\nYw== 2\nIA== 3\nYmM= 4\nYWI= 5\n", tok.PATRON_CL100K)
+    assert_eq(tok.tam_vocab(m), 6)
+    assert_eq(tok.codificar(m, "ab"), [5])
+    assert_eq(tok.codificar(m, "abc"), [0, 4])           -- no [5, 2]: gana el rango, no la posición
+    assert_eq(tok.codificar(m, "ab cab"), [5, 3, 2, 5])
+    assert_eq(tok.codificar(m, ""), [])
+    each x in ["", "abc", "ab cab", "  c  b a", "cba abc"]
+        assert_eq(tok.decodificar(m, tok.codificar(m, x)), x)
+    assert_eq(tok.token_texto(m, 4), "bc")
+
+test "tiktoken: lo que no está en el vocabulario y un patrón inválido son errores"
+    let m be tok.desde_tiktoken("YQ== 0\r\nYg== 1\r\n", tok.PATRON_GPT2)
+    assert_eq(tok.codificar(m, "abba"), [0, 1, 1, 0])
+    assert_error(() => tok.codificar(m, "z"))
+    assert_error(() => tok.decodificar(m, [7]))
+    assert_error(() => tok.desde_tiktoken("YQ== 0", "("))
+    assert_error(() => tok.desde_tiktoken("YQ==", tok.PATRON_GPT2))
+
+test "el corte de cl100k y el de GPT-2 tratan distinto los espacios"
+    assert_eq(backtrack_find_all("a   b", tok.PATRON_GPT2), ["a", "  ", " b"])
+    assert_eq(backtrack_find_all("a   b 12345", tok.PATRON_CL100K), ["a", "  ", " b", " ", "123", "45"])
+
+test "normalización: dos escrituras del mismo texto dan los mismos ids"
+    let crudo be tok.caracteres("\u00e9a")
+    assert_error(() => tok.codificar(crudo, "e\u0301a"))
+    let m be tok.con_forma(crudo, "nfc")
+    assert_eq(tok.codificar(m, "e\u0301a"), tok.codificar(m, "\u00e9a"))
+    assert_eq(tok.codificar(m, "e\u0301a"), [1, 0])
+    assert_eq(tok.normalizar("\ufb01", "nfkc"), "fi")
+    assert_eq(length(tok.normalizar("\u00e9", "nfd")), 2)
+    assert_error(() => tok.con_forma(crudo, "nfx"))
+    assert_eq(tok.sin_marcas("\u00d1and\u00fa ping\u00fcino"), "Nandu pinguino")

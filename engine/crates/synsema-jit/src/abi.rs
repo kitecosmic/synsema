@@ -225,7 +225,12 @@ pub(crate) extern "C" fn synsema_jit_get(ctx: *mut Ctx, obj: *const SynValue, ta
         // SAFETY: como en `synsema_jit_index`.
         let (obj, idx) = unsafe { (obj.as_ref(), idx.as_ref()) };
         match obj {
-            Some(o) => native_tier::get_item(o, tag, bits, idx),
+            // v0.6.63: una clave entera es su texto decimal; el texto se arma en este búfer (la pila),
+            // sin reservar memoria.
+            Some(o) => {
+                let mut buf = [0u8; 20];
+                native_tier::get_item(o, tag, bits, idx, &mut buf)
+            }
             None => NPeek::MISS,
         }
     })
@@ -300,7 +305,11 @@ pub(crate) extern "C" fn synsema_jit_path_step(ctx: *mut Ctx, parent: *const Syn
         let c = unsafe { &*ctx };
         let (parent, idx) = unsafe { (parent.as_ref(), idx.as_ref()) };
         match (parent, c.site(site)) {
-            (Some(p), Some(s)) => native_tier::path_step(p, tag, bits, idx, s).map_or(0, |x| x as usize as i64),
+            // v0.6.63: una clave entera es su texto decimal; el texto se arma en este búfer (la pila).
+            (Some(p), Some(s)) => {
+                let mut buf = [0u8; 20];
+                native_tier::path_step(p, tag, bits, idx, s, &mut buf).map_or(0, |x| x as usize as i64)
+            }
             _ => 0,
         }
     })
@@ -325,7 +334,11 @@ pub(crate) extern "C" fn synsema_jit_path_set(
         let (parent, idx, vp) = unsafe { (parent.as_ref(), idx.as_ref(), v_ptr.as_ref()) };
         let Some(v) = native_tier::nvalue(v_tag, v_bits, vp) else { return 0 };
         match (parent, c.site(site)) {
-            (Some(p), Some(s)) => i64::from(native_tier::path_set(p, tag, bits, idx, s, v)),
+            // v0.6.63: una clave entera es su texto decimal; el texto se arma en este búfer (la pila).
+            (Some(p), Some(s)) => {
+                let mut buf = [0u8; 20];
+                i64::from(native_tier::path_set(p, tag, bits, idx, s, v, &mut buf))
+            }
             _ => 0,
         }
     })

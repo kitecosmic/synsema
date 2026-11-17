@@ -6,6 +6,54 @@ Each says what changed, why, and what to write instead.
 
 Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the release date.
 
+## v0.6.63 — 2026-11-16
+
+- `get(m, k, default)` looks up a text key without copying it: the key is the text
+  as it is, and only a value that is not text is converted (to its `Display`). Before,
+  every call allocated and copied the key — 100,000 times in a word-count loop.
+- `split(text, sep)` splits the text without copying it whole into a `String` first.
+- The native tier understands an **integer key** on a map: a map's key is text, so an
+  integer key is its decimal text (`m[1]` and `m["1"]` are the same key), exactly as
+  in the tree-walker. Before, an integer key was a miss: the native code left to the
+  virtual machine on every read and write, and the unit was discarded. Measured on the
+  guard's corpus: a map read −77 %, a map write −47 %, a map counter −59 %.
+- Native loops inside a task can write a list received as a parameter or held in a task
+  local. The write keeps value semantics: a caller's list remains unchanged when the
+  task updates its parameter. The differential oracle and native tests cover list and
+  map parameters, a task local, and `append` through a parameter. CI measured
+  `j_list_param|jit` at 49,780,240 instructions (−69.54 %) and `j_list_while|jit` at
+  48,855,846 (−80.32 %). The VM's `j_list_while` row also fell 17.07 % because the
+  setup `each` no longer reuses the `while` index name; that part is not credited to JIT.
+- The performance guard's corpus gains seven probes for the native tier (maps, a
+  list written through a parameter, `set lista[k]` inside a `while`, the cost of
+  entering a compiled task, and the BPE's hot loop), plus a probe that repeats
+  the BPE's `fusionar` loop to measure amortized compilation. CI measured that
+  loop at 210.1 M instructions with JIT versus 1,377.2 M in the VM (6.6× fewer).
+  **The anchor
+  (`engine/perf/baseline.json`) was re-measured by CI with those rows and again after
+  the parameter/local write change and the repeated fusion loop**; across all
+  123 rows, the largest increase over the previous anchor was +0.044 %, below
+  the +0.3 % budget.
+- VM map reads and writes with integer keys now format the decimal key in a
+  stack buffer. This preserves the text key and insertion order while avoiding
+  temporary allocations on the BPE pair-counting path.
+- The external byte-level BPE tokenizer keeps the same learned merges with
+  packed integer pair keys. Its `fusionar` returns the existing list when the
+  selected pair is absent; training also keeps token lists and their frequencies
+  in separate lists instead of rebuilding a map per word after each merge. The
+  library's 10 tests pass. A snapshot in `engine/perf/fixtures/bpe/` and
+  `engine/perf/bpe_compare.py` reproduce full training against the same pure
+  Python algorithm. On two 100,000-character corpora at vocabulary 512, the
+  previous packed-key library took about 4.2 and 5.3 s; the optimized library
+  took about 3.3 and 4.1 s (about 22% faster), with all 256 merges identical.
+  Python took about 1.5 and 1.9 s on those corpora. At vocabulary 1024, all 768
+  merges also match. The original report corpus is unavailable here.
+- Full BPE training remains in the VM: an eager native probe entered no complete
+  tasks (`entries=0`, one OSR region). The long-list fusion microbenchmark above
+  measures a useful native loop but does not predict this workload of many short
+  calls. BPE is still about 2.2 times slower than Python on the reproducible
+  corpora; this release does not claim that the engine exceeds Python on BPE.
+
 ## v0.6.62 — 2026-11-15
 
 - Deep list, map and server-value equality continues on the heap after a bounded
