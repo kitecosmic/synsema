@@ -841,13 +841,17 @@ write_file("./out/by_region.svg", chart_svg("bar", ranked, {"x": "region", "y": 
   and row groups without reading the data, and `parquet_read(bytes, {"columns": [...],
   "row_groups": [...], "limit": n})` reads only that part; v0.6.46+ `parquet_scan(path, opts?)`
   reads that part **straight from the disk** — only the footer and the pages of the columns and
-  row groups asked for, never the whole file — with `require file.read(path)`; see
+  row groups asked for, never the whole file — with `require file.read(path)`; v0.6.64+
+  `parquet_info_file(path)` reads the footer and per-column min/max/null counts, while
+  `read_file_bytes(path, {"offset": n, "length": m})` reads a raw byte range; see
   [dataviz.md](dataviz.md) § Parquet from disk), loose `.csv.gz`/`.json.gz` with
   `gunzip` (v0.6.45+), scraped pages with `html_select`/`html_text` (v0.6.45+). Bytes/text in and
   out; the disk is `read_file`/`read_file_bytes`/`write_file` with `file.read`/`file.write`.
 - **Tables:** `group_by` → `[{key, items}]`, `summarize` + `sum_of`/`mean_of`/`min_of`/`max_of`/
   `median_of`/`quantile_of`/`first_of`/`n_unique_of`/`count()`, `count_by`, `join` (inner/left/right/outer/semi/anti),
   `pivot`, `is_missing`/`count`/`count_missing`/`fill_missing`/`drop_missing`/`fill_nan`.
+- **Stable partition key** (v0.6.64+): `hash(value)` gives an exact 64-bit XXH3 integer with
+  canonical map/numeric keys. It is stable across runs and platforms, and is not a MAC.
 - **Reductions** (`sum`, `mean`, `median`, `std`, …): `nothing` skipped, NaN propagates, `axis =`
   on arrays, `std`/`var` sample (`ddof = 1`), decimals stay decimal.
 - **Dates:** `date` / `datetime` (IANA zone, DST-aware) / `duration` types; `truncate(d, "month")` to

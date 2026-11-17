@@ -777,10 +777,22 @@ fn binop_arrays_f64(a: &ArrayD<f64>, b: &ArrayD<f64>, op: &str) -> Result<SynVal
             let va = own(a);
             let vb = own(b);
             let out = match op {
-                "+" => va + vb,
-                "-" => va - vb,
-                "*" => va * vb,
-                "/" => va / vb,
+                // v0.6.64 (perf-guard): el operador de ndarray owned+owned con la misma forma cae en
+                // `zip_mut_with_same_shape`, cuyo `strides_equivalent` volvió a quedar fuera de línea
+                // (+0,39 % en `s_arrays_small`): el loop propio de slices es el mismo que hace ese
+                // fast path, sin el chequeo.
+                "+" | "-" | "*" | "/" => {
+                    let mut o = va;
+                    let bs = vb.as_slice_memory_order().unwrap();
+                    let os = o.as_slice_memory_order_mut().unwrap();
+                    match op {
+                        "+" => for (x, r) in os.iter_mut().zip(bs) { *x += *r; },
+                        "-" => for (x, r) in os.iter_mut().zip(bs) { *x -= *r; },
+                        "*" => for (x, r) in os.iter_mut().zip(bs) { *x *= *r; },
+                        _ => for (x, r) in os.iter_mut().zip(bs) { *x /= *r; },
+                    }
+                    o
+                }
                 _ => {
                     let mut o = va.clone();
                     ndarray::Zip::from(&mut o).and(&vb).for_each(|x, &y| *x = scalar_op(*x, y, op));

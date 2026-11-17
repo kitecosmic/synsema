@@ -81,6 +81,7 @@ pub const BUILTIN_ARITY: &[(&str, usize, Option<usize>)] = &[
     ("parquet_write", 1, Some(2)),
     ("parquet_read", 1, Some(2)),
     ("parquet_scan", 1, Some(2)),
+    ("read_file_bytes", 1, Some(2)),
     ("sum", 1, Some(2)),
     ("product", 1, Some(2)),
     ("mean", 1, Some(2)),

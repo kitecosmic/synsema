@@ -10,7 +10,7 @@
 
 use synsema_core::types::SynMap;
 use std::cell::RefCell;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::rc::Rc;
@@ -834,6 +834,91 @@ fn arg_i64(v: &SynValue) -> Result<i64, Control> {
     Ok(arg_f64(v)?.trunc() as i64)
 }
 
+/// Byte range, independent of `read_file`'s one-based line range.
+fn bytes_range(args: &[SynValue]) -> Result<Option<(u64, u64)>, Control> {
+    let Some(opts) = args.get(1) else { return Ok(None) };
+    let SynValue::Map(m) = opts else {
+        return Err(Control::Error(RuntimeError::new("read_file_bytes: options must be a map")));
+    };
+    let mut offset = None;
+    let mut length = None;
+    for (key, value) in m.borrow().iter() {
+        let n = match value {
+            SynValue::Number(synsema_core::number::Number::Int(n)) if *n >= 0 => *n as u64,
+            SynValue::Number(synsema_core::number::Number::Big(n)) => n.to_string().parse::<u64>().map_err(|_| {
+                Control::Error(RuntimeError::new(format!("read_file_bytes: {} must be a non-negative integer fitting u64", key)))
+            })?,
+            _ => return Err(Control::Error(RuntimeError::new(format!("read_file_bytes: {} must be a non-negative integer fitting u64", key)))),
+        };
+        match key.as_str() {
+            "offset" => offset = Some(n),
+            "length" => length = Some(n),
+            _ => return Err(Control::Error(RuntimeError::new(format!("read_file_bytes: unknown option {:?} (valid: offset, length)", key)))),
+        }
+    }
+    match (offset, length) {
+        (Some(o), Some(n)) => Ok(Some((o, n))),
+        _ => Err(Control::Error(RuntimeError::new("read_file_bytes: offset and length must be provided together"))),
+    }
+}
+
+fn bundled_bytes_range(bytes: &[u8], range: Option<(u64, u64)>) -> Vec<u8> {
+    match range {
+        None => bytes.to_vec(),
+        Some((offset, length)) => {
+            let start = offset.min(bytes.len() as u64) as usize;
+            let end = offset.saturating_add(length).min(bytes.len() as u64) as usize;
+            bytes[start..end].to_vec()
+        }
+    }
+}
+
+#[cfg(test)]
+mod v0664_bytes_tests {
+    use super::*;
+
+    #[test]
+    fn bundled_ranges_match_disk_range_semantics() {
+        let bytes = b"abcdef";
+        assert_eq!(bundled_bytes_range(bytes, None), bytes);
+        assert_eq!(bundled_bytes_range(bytes, Some((2, 3))), b"cde");
+        assert_eq!(bundled_bytes_range(bytes, Some((4, 99))), b"ef");
+        assert!(bundled_bytes_range(bytes, Some((6, 1))).is_empty());
+        assert!(bundled_bytes_range(bytes, Some((u64::MAX, u64::MAX))).is_empty());
+        assert!(bundled_bytes_range(bytes, Some((0, 0))).is_empty());
+    }
+
+    #[test]
+    fn pure_profile_reads_only_the_requested_bundle_range() {
+        use synsema_core::bundle::{Bundle, BundleMode, Manifest};
+        let manifest = Manifest {
+            format: 2,
+            engine: "v0.6.64".into(),
+            main: "main.syn".into(),
+            ceiling: None,
+            profile: "pure".into(),
+            built_at: "2026-11-17T00:00:00Z".into(),
+            mode: BundleMode::Run,
+            serve: None,
+            audit: None,
+            packages: Vec::new(),
+        };
+        let bundle = Bundle::new(manifest, vec![
+            ("main.syn".into(), b"print(1)".to_vec()),
+            ("data.bin".into(), b"abcdef".to_vec()),
+        ]).unwrap();
+        assert!(synsema_core::bundle::mount(bundle));
+        let mut interp = Interpreter::new();
+        register_pure_fs(&interp, "pure profile");
+        let program = synsema_core::parser::parse_source(
+            "print(decode(read_file_bytes(\"data.bin\", {\"offset\": 2, \"length\": 3})))",
+            "<bundle-test>",
+        ).unwrap();
+        assert!(interp.execute(&program).is_ok());
+        assert_eq!(interp.output, ["cde"]);
+    }
+}
+
 /// Escritura ATÓMICA: temp en el mismo dir (rename intra-FS, sin cross-device) + rename.
 /// Crea los dirs padre si faltan. Limpia el temp si el rename falla. Reusado por
 /// `write_file` y `edit_file`, con `path` ya chequeado con cada uno de `tys`.
@@ -1105,10 +1190,11 @@ pub fn register_pure_fs(interp: &Interpreter, hint: &'static str) {
             None => Err(no_fs("read_file", hint)),
         }
     }));
-    interp.register_builtin("read_file_bytes", 1, Rc::new(move |_i, args, _loc| {
+    interp.register_builtin("read_file_bytes", -1, Rc::new(move |_i, args, _loc| {
+        let range = bytes_range(args)?;
         let path = normalize_path(&raw_str(arg(args, 0)?));
         match synsema_core::bundle::get(&path) {
-            Some(bytes) => Ok(syn_bytes(bytes.to_vec())),
+            Some(bytes) => Ok(syn_bytes(bundled_bytes_range(bytes, range))),
             None => Err(no_fs("read_file_bytes", hint)),
         }
     }));
@@ -1568,14 +1654,23 @@ pub fn register_secure_builtins(interp: &Interpreter, caps: Rc<RefCell<Capabilit
         let caps = caps.clone();
         interp.register_builtin(
             "read_file_bytes",
-            1,
+            -1,
             Rc::new(move |_i, args, _loc| {
+                let range = bytes_range(args)?;
                 let path = match locate_for_read(&caps, &raw_str(arg(args, 0)?), "read_file_bytes()")? {
-                    Located::Bundled(_, bytes) => return Ok(syn_bytes(bytes.to_vec())),
+                    Located::Bundled(_, bytes) => return Ok(syn_bytes(bundled_bytes_range(bytes, range))),
                     Located::Disk(p) => p,
                 };
                 let mut b = Vec::new();
-                match open_read(&caps, &path, "read_file_bytes()")?.read_to_end(&mut b) {
+                let mut file = open_read(&caps, &path, "read_file_bytes()")?;
+                if let Some((offset, _)) = range {
+                    file.seek(SeekFrom::Start(offset)).map_err(|e| read_error(&path, &e))?;
+                }
+                let read = match range {
+                    Some((_, length)) => file.take(length).read_to_end(&mut b),
+                    None => file.read_to_end(&mut b),
+                };
+                match read {
                     Ok(_) => Ok(syn_bytes(b)),
                     Err(e) => Err(read_error(&path, &e)),
                 }

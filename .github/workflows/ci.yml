@@ -140,6 +140,8 @@ jobs:
       # y `dot` (sin FMA) da los mismos que en x86.
       - name: matmul threads and dot on aarch64 (synsema-core)
         run: cargo test --locked --manifest-path engine/Cargo.toml -p synsema-core --test it v0657_matmul -- --nocapture
+      - name: Portable hash vectors on macOS
+        run: cargo test --locked --manifest-path engine/Cargo.toml -p synsema-core --lib v0664_hash_equality_and_depth
       - name: Real .app on Apple Silicon (appended bundle keeps running; open + curl + shutdown)
         run: |
           set -euo pipefail
@@ -207,6 +209,8 @@ jobs:
           key: ${{ runner.os }}-${{ runner.arch }}-cargo-matmul-${{ hashFiles('engine/Cargo.lock') }}
       - name: matmul in the written order, threads, dot (synsema-core)
         run: cargo test --locked --manifest-path engine/Cargo.toml -p synsema-core --test it v0657_matmul -- --nocapture
+      - name: Portable hash vectors
+        run: cargo test --locked --manifest-path engine/Cargo.toml -p synsema-core --lib v0664_hash_equality_and_depth
 
   wasm:
     runs-on: ubuntu-26.04

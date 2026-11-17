@@ -6,6 +6,17 @@ Each says what changed, why, and what to write instead.
 
 Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the release date.
 
+## v0.6.64 — 2026-11-17
+
+- `read_file_bytes(path, {"offset": n, "length": m})` reads a zero-based byte range from disk or a bundled asset. The one-argument form still reads the whole file.
+- `parquet_info(bytes)` now includes each row group's column min, max and null count when trustworthy metadata exists. `parquet_info_file(path)` reads the same metadata from a path without loading data pages; it requires `file.read`.
+- `hash(value)` uses a versioned canonical encoding and XXH3-64, returning an exact non-negative integer for reproducible partitioning across platforms. It rejects secrets and values without a stable key; a labeled `private` value hashes to a labeled result (the label propagates — hashing never declassifies); it is not a cryptographic hash. Common scalar keys use a stack buffer; a local optimized 1 M-integer probe measured 28–34 ms versus 95–96 ms for `sha256(text(k))`.
+- `parallel_map` now skips preparing unrelated global tables and repeat generator scans for ordinary data. Scoped sharing recognizes numeric leaf maps without building a pointer set for every row. In a local optimized 1 M-row `summarize` probe with the same final result, 8 workers beat 1 thread in five consecutive runs (median 0.177 s vs 0.233 s; LTO disabled for this local build).
+- **The `perf-guard` anchor was re-measured on CI** (`engine/perf/baseline.json`, from this release's PR). Two rows move on purpose:
+  - `s_arrays_small` drops 0.85 % (jit), 0.85 % (vm) and 0.70 % (ref): the f64 array binop now runs the slice loop that ndarray's same-shape fast path runs, without its `strides_equivalent` check, which thin-LTO kept out of line (+0.39 % against the previous anchor).
+  - `s_csv` rises 0.43 % (jit) and 0.75 % (vm): the same compiler redistribution moves ~900 000 instructions into glibc's `__memcmp_avx2_movbe` and, on the VM, ~800 000 into `indexmap`'s text `get`; nothing in csv's own code grew. The same phenomenon was blessed in v0.6.55 (`s_text_join`, `__memcmp_avx2_movbe`) and v0.6.57 (`s_words`, indexmap).
+  - The `j_map_*` rows are 8–21 % below the previous anchor from an earlier release's map work; the guard only fails on increases, so it never showed. The new anchor includes them.
+
 ## v0.6.63 — 2026-11-16
 
 - `get(m, k, default)` looks up a text key without copying it: the key is the text

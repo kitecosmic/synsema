@@ -70,6 +70,17 @@ print(csv_encode(monthly))
 
 ## Parquet from disk — `parquet_scan` (v0.6.46+)
 
+From v0.6.64, inspect a large file with `parquet_info_file(path)`: it reads the footer, and each
+`row_groups[i].columns[j]` gives `name`, `min`, `max`, and `null_count`. A missing or unsafe bound
+is `nothing`; never skip a row group on a missing bound. `parquet_info(bytes)` has the same result
+for bytes already in memory. For raw files, `read_file_bytes(path, {"offset": 0, "length": 4096})`
+reads a byte range without loading the file.
+
+`hash(value)` (v0.6.64+) gives a portable XXH3-64 integer for reproducible partitioning. It
+normalizes equal group keys, including numeric equivalents and map order, and is not a MAC or a
+replacement for the process-seeded hash of internal tables. It refuses secrets and values with no
+stable key.
+
 `parquet_read(bytes)` needs the whole file in memory first (`read_file_bytes`). `parquet_scan(path,
 opts?)` reads the file **on disk by parts**: the footer (the metadata) and then only the pages of
 the columns and row groups it is asked for. A file of gigabytes with one column asked reads that
@@ -99,9 +110,9 @@ let first_group be parquet_scan("./data/events.parquet", {"row_groups": [0]})
   `parquet_read(b)` records only `bytes <n>`; `parquet_scan` records the path.
 - **Labels** — like `read_file`, a call under a branch decided by a private value is a
   `label_violation` (move it out of the branch).
-- **Not here:** the wasm build (no file system; `parquet_read` is not there either) and
-  `parquet_info`, which still takes bytes (`parquet_info(read_file_bytes(p))`; a path is an error
-  that says so). There is no streaming iterator: the rows asked for come back as one list, so
+- **Not here:** the wasm build (no file system; `parquet_read` is not there either).
+  `parquet_info` still takes bytes; use `parquet_info_file` for a path. There is no
+  streaming iterator: the rows asked for come back as one list, so
   bound a big read with `columns`/`row_groups`/`limit`.
 
 | Error | Fix |

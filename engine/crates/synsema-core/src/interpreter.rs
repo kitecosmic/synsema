@@ -4022,7 +4022,17 @@ impl Interpreter {
             }
         };
         let (what, payload): (String, Vec<u8>) = match source {
-            "read_file" | "read_file_bytes" | "list_dir" | "grep" | "parquet_read" | "parquet_scan" | "file_info" | "edit_file" => {
+            "read_file_bytes" if args.len() == 2 => {
+                let mut what = path_what(args.first());
+                if let Some(SynValue::Map(opts)) = args.get(1) {
+                    let opts = opts.borrow();
+                    if let (Some(offset), Some(length)) = (opts.get("offset"), opts.get("length")) {
+                        what.push_str(&format!(" [offset={} length={}]", offset, length));
+                    }
+                }
+                (what, bytes_of(result))
+            }
+            "read_file" | "read_file_bytes" | "list_dir" | "grep" | "parquet_read" | "parquet_scan" | "parquet_info_file" | "file_info" | "edit_file" => {
                 (path_what(args.first()), bytes_of(result))
             }
             "read_line" => ("stdin".to_string(), bytes_of(result)),
@@ -13372,6 +13382,11 @@ fn walk_free_names(t: &SynTaskValue) -> HashSet<String> {
         NodeKind::ObserveStatement { variable, .. } => {
             out.insert(variable.clone());
         }
+        NodeKind::ApproveStatement { then: Some(name), .. }
+        | NodeKind::ConfirmStatement { then: Some(name), .. }
+        | NodeKind::AskExpression { then: Some(name), .. } => {
+            out.insert(name.clone());
+        }
         _ => {}
     };
     for n in t.body.iter().chain(t.parameters.iter().filter_map(|p| p.default.as_ref())) {
@@ -13684,7 +13699,7 @@ fn seal_output(e: &LineageEntry) {
 /// `evm_send`) no es una entrada.
 pub const LINEAGE_SOURCES: &[&str] = &[
     // archivos y stdin
-    "read_file", "read_file_bytes", "read_line", "list_dir", "file_info", "grep", "parquet_read", "parquet_scan",
+    "read_file", "read_file_bytes", "read_line", "list_dir", "file_info", "grep", "parquet_read", "parquet_scan", "parquet_info_file",
     "term_recv", "watch_recv",
     // HTTP
     "http", "http_get", "http_post", "http_put", "http_delete", "http_bytes", "fetch",

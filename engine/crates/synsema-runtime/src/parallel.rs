@@ -47,7 +47,7 @@ use synsema_core::types::{from_send, syn_list, to_send, SendValue, SynValue};
 
 use crate::engine::{wire_common, MemoryCtx, INTERP_STACK_SIZE};
 use crate::serve::{
-    rebuild_global_val, rebuild_globals, snapshot_globals_scoped, snapshot_task, val_to_global_shared,
+    rebuild_global_val, rebuild_globals, snapshot_globals_scoped, snapshot_globals_scoped_selected, snapshot_task, val_to_global_shared,
     Bases, GlobalVal, ModuleRegistry,
 };
 use synsema_core::frozen::{ScopeCtx, ScopedFreeze};
@@ -88,6 +88,26 @@ enum TaskSnapshot {
     /// v0.6.50 (B): una task de una tool de confianza: en el worker, la tool reconstruida colgada de
     /// SU base de confianza y envuelta con SU hook (`GlobalVal::TrustedTask`).
     Trusted(GlobalVal),
+}
+
+/// A root-global task with only direct data dependencies needs those bindings, not every
+/// top-level table in the program. Keep the full snapshot whenever another callable could
+/// reach further globals, or when lexical/module/agent environments are involved.
+fn direct_data_globals(interp: &Interpreter, task: &synsema_core::types::SynTaskValue) -> Option<std::sync::Arc<std::collections::HashSet<String>>> {
+    if !Rc::ptr_eq(&task.closure_env, &interp.global_env) || !interp.agent_definitions.is_empty() {
+        return None;
+    }
+    let names = synsema_core::interpreter::task_free_names(task);
+    let env = interp.global_env.borrow();
+    for name in names.iter() {
+        let Some(value) = env.bindings.get(name) else { continue };
+        match value {
+            SynValue::Task(_) | SynValue::List(_) | SynValue::Map(_) | SynValue::Server(_) | SynValue::Private(_) => return None,
+            SynValue::Builtin(b) if !synsema_core::interpreter::is_own_builtin(name, b) => return None,
+            _ => {}
+        }
+    }
+    Some(names)
 }
 
 /// Intérprete worker fresco: builtins + caps heredadas + globales reconstruidos.
@@ -172,6 +192,17 @@ fn generators_in(v: &SynValue, out: &mut Vec<Rc<synsema_core::interpreter::Built
     }
 }
 
+fn repeated_generator(v: &SynValue, seen: &mut std::collections::HashSet<usize>) -> bool {
+    match v {
+        SynValue::Builtin(b) if synsema_core::rng::snapshot(b).is_some() => {
+            !seen.insert(Rc::as_ptr(b) as usize)
+        }
+        SynValue::List(l) => list_values(l).iter().any(|x| repeated_generator(x, seen)),
+        SynValue::Map(m) => m.borrow().values().any(|x| repeated_generator(x, seen)),
+        _ => false,
+    }
+}
+
 /// Corre `task` sobre `items` con concurrencia `limit`: `min(limit, items)` hilos que toman los
 /// items en orden (un contador), cada item en un intérprete sync fresco (modelo CSP). Resultados
 /// **en orden de entrada**; **fail-fast** con el error de menor índice. Semántica idéntica a `apply`
@@ -193,6 +224,7 @@ fn run_parallel(
     denied: Arc<Vec<Capability>>,
     task_snap: Arc<TaskSnapshot>,
     items: Vec<ItemVal>,
+    has_generators: bool,
     limit: usize,
     secure: bool,
     ceiling: Option<Arc<Vec<Capability>>>,
@@ -244,7 +276,7 @@ fn run_parallel(
                 ItemVal::Scoped(k) => ctx.get(*k),
                 ItemVal::Send(sv) => from_send(sv),
             };
-            let keep = item.clone();
+            let keep = has_generators.then(|| item.clone());
             let called = match sealed.as_ref().and_then(|(_, p)| p.as_ref()) {
                 Some(prefix) => synsema_core::sealed::with_stream(format!("{}:{}", prefix, i), || {
                     interp.call_task(task_value, vec![item])
@@ -255,7 +287,9 @@ fn run_parallel(
                 Ok(v) => {
                     // El estado final de los generadores del item, en orden de recorrido.
                     let mut gens = Vec::new();
-                    generators_in(&keep, &mut gens);
+                    if let Some(keep) = &keep {
+                        generators_in(keep, &mut gens);
+                    }
                     let states = gens.iter().filter_map(synsema_core::rng::snapshot).collect();
                     // El resultado vuelve como copia: nada de lo congelado sale del hilo.
                     *slots[i].lock().unwrap() = Some((to_send(&v), states, interp.take_lineage()));
@@ -342,28 +376,6 @@ pub(crate) fn register_parallel_builtins(
                 Some(SynValue::List(l)) => l.borrow().to_vec(),
                 _ => return Err(err("parallel_map: second argument must be a list")),
             };
-            // Un generador cruza a un worker como COPIA de su estado: el mismo generador en dos
-            // items daría la MISMA secuencia en los dos workers (numpy lo hace en silencio al
-            // copiarlo a otro proceso). Acá es error, con la forma correcta.
-            {
-                // A cualquier profundidad (el anidamiento de valores es finito: semántica de valor).
-                fn walk(v: &SynValue, seen: &mut std::collections::HashSet<usize>) -> bool {
-                    match v {
-                        SynValue::Builtin(b) if synsema_core::rng::snapshot(b).is_some() => {
-                            !seen.insert(Rc::as_ptr(b) as usize)
-                        }
-                        SynValue::List(l) => list_values(&l).iter().any(|x| walk(x, seen)),
-                        SynValue::Map(m) => m.borrow().values().any(|x| walk(x, seen)),
-                        _ => false,
-                    }
-                }
-                let mut seen = std::collections::HashSet::new();
-                if list.iter().any(|x| walk(x, &mut seen)) {
-                    return Err(err(
-                        "parallel_map: the same generator reaches more than one item — each worker would draw the same numbers; give each item its own: rng_spawn(g, length(items))",
-                    ));
-                }
-            }
             let limit = match args.get(2) {
                 Some(SynValue::Number(n)) => {
                     let v = num_i64(n);
@@ -378,6 +390,10 @@ pub(crate) fn register_parallel_builtins(
             // Las globales, el módulo de la task y los items se congelan con alcance (R2.3): los
             // hilos los leen sin copiarlos y vuelven a ser objetos comunes al terminar.
             let mut scope = ScopedFreeze::new();
+            let selected = match task {
+                SynValue::Task(t) => direct_data_globals(i, t),
+                _ => None,
+            };
             let task_snap = match task {
                 // DE-030 y ronda 2 (R2): la task con su cadena: su módulo entero (las hermanas) si es
                 // de un módulo, y los locales de quien la armó (`(x) => x * n` dentro de una task).
@@ -389,7 +405,10 @@ pub(crate) fn register_parallel_builtins(
                 SynValue::Builtin(b) => TaskSnapshot::Builtin(b.name.clone()),
                 _ => unreachable!(),
             };
-            let globals = snapshot_globals_scoped(i, &mut scope);
+            let globals = match selected.as_ref() {
+                Some(names) => snapshot_globals_scoped_selected(i, &mut scope, names),
+                None => snapshot_globals_scoped(i, &mut scope),
+            };
             let granted: Vec<Capability> = caps.borrow().granted.iter().cloned().collect();
             let denied: Vec<Capability> = caps.borrow().denied.iter().cloned().collect();
             // Techo del host: se snapshotea del set del padre y se propaga a cada worker
@@ -399,13 +418,23 @@ pub(crate) fn register_parallel_builtins(
             // T1: el sujeto del llamador (identidad + techo delegado + presupuestos) viaja a
             // cada worker junto con el techo del host.
             let subject = crate::subject::Subject::capture(i, &caps);
+            // A successfully scoped item cannot contain a Builtin (including an RNG).
+            // Scan only the fallback items for duplicate generator identities; this avoids
+            // walking every row twice for ordinary data tables.
+            let mut seen_generators = std::collections::HashSet::new();
             let items: Vec<ItemVal> = list
                 .iter()
                 .map(|v| match scope.add(v.clone()) {
-                    Ok(k) => ItemVal::Scoped(k),
-                    Err(v) => ItemVal::Send(to_send(&v)),
+                    Ok(k) => Ok(ItemVal::Scoped(k)),
+                    Err(v) => {
+                        if repeated_generator(&v, &mut seen_generators) {
+                            return Err(err("parallel_map: the same generator reaches more than one item — each worker would draw the same numbers; give each item its own: rng_spawn(g, length(items))"));
+                        }
+                        Ok(ItemVal::Send(to_send(&v)))
+                    }
                 })
-                .collect();
+                .collect::<Result<_, _>>()?;
+            let has_generators = !seen_generators.is_empty();
             match run_parallel(
                 scope,
                 globals,
@@ -413,6 +442,7 @@ pub(crate) fn register_parallel_builtins(
                 Arc::new(denied),
                 Arc::new(task_snap),
                 items,
+                has_generators,
                 limit,
                 secure,
                 ceiling,
@@ -431,11 +461,13 @@ pub(crate) fn register_parallel_builtins(
                     // Lo que cada worker avanzó de SUS generadores vuelve al padre (como con
                     // `apply`): `g` después de `parallel_map(w, [g])`, o los hijos de un
                     // `rng_spawn` usados otra vez, siguen la secuencia en vez de repetirla.
-                    for (item, (_, states, _)) in list.iter().zip(results.iter()) {
-                        let mut gens = Vec::new();
-                        generators_in(item, &mut gens);
-                        for (b, g) in gens.iter().zip(states.iter()) {
-                            synsema_core::rng::set_state(b, g.clone());
+                    if has_generators {
+                        for (item, (_, states, _)) in list.iter().zip(results.iter()) {
+                            let mut gens = Vec::new();
+                            generators_in(item, &mut gens);
+                            for (b, g) in gens.iter().zip(states.iter()) {
+                                synsema_core::rng::set_state(b, g.clone());
+                            }
                         }
                     }
                     Ok(syn_list(results.iter().map(|(v, _, _)| from_send(v)).collect()))
