@@ -85,6 +85,10 @@ fn permanent(v: &SynValue) -> bool {
         SynValue::Text(t) => t.is_inline() || t.is_permanent(),
         SynValue::Bytes(b) => BytesRef::is_permanent(b),
         SynValue::Array(a) => Obj::is_permanent(a),
+        // La tabla es inmutable por construcción (columns.rs: nada la muta después del
+        // `Obj::new`), así que el flag del Obj de afuera alcanza: los buffers compartidos no
+        // tienen escritura que congelar.
+        SynValue::Table(a) => Obj::is_permanent(a),
         SynValue::Time(t) => Obj::is_permanent(t),
         SynValue::Secret(s) => Obj::is_permanent(s),
         SynValue::List(l) => ListRef::is_permanent(l),
@@ -107,6 +111,8 @@ fn can(v: &SynValue, seen: &mut HashSet<usize>, scoped_ok: bool, depth: usize) -
         SynValue::Text(t) => scoped_ok || !t.is_scoped(),
         SynValue::Bytes(b) => scoped_ok || !BytesRef::is_scoped(b),
         SynValue::Array(a) => scoped_ok || !Obj::is_scoped(a),
+        // Inmutable por construcción (columns.rs): no hay nada adentro que revisar.
+        SynValue::Table(a) => scoped_ok || !Obj::is_scoped(a),
         SynValue::Time(t) => scoped_ok || !Obj::is_scoped(t),
         SynValue::Secret(s) => scoped_ok || !Obj::is_scoped(s),
         SynValue::List(l) => {
@@ -311,6 +317,9 @@ fn mark_at(v: &SynValue, mk: &mut Marker, depth: usize) {
         SynValue::Text(t) => mk.text(t),
         SynValue::Bytes(b) => mk.bytes(b),
         SynValue::Array(a) => mk.obj(a),
+        // O(1): el Obj de afuera; los buffers compartidos no se congelan porque nadie los
+        // muta (columns.rs).
+        SynValue::Table(a) => mk.obj(a),
         SynValue::Time(t) => mk.obj(t),
         SynValue::Secret(s) => mk.obj(s),
         SynValue::List(l) => {

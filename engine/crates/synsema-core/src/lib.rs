@@ -53,6 +53,8 @@ pub mod frozen;
 /// El montón propio (`Ref`/`RefMut` de listas y mapas, R1 de specs/modelo-memoria-regiones.md).
 pub use synsema_heap as heap;
 pub mod tabular;
+/// v0.6.65: el storage físico de una tabla por columnas (`specs/v0.6.65-tablas-diseno.md`).
+pub mod columns;
 pub mod temporal;
 pub mod route_meta;
 pub mod secret;

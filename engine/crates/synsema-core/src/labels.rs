@@ -478,6 +478,18 @@ fn child<R>(v: &SynValue, index: usize, f: impl FnOnce(&SynValue, Option<&str>, 
         }
         SynValue::Map(m) => m.borrow().get_index(index).map(|(k, v)| f(v, Some(k.as_str()), None)),
         SynValue::Private(p) if index == 0 => Some(f(&p.value, None, None)),
+        // Tabla (v0.6.65): sólo las columnas `Value` pueden contener un `Private` (los
+        // bloques primitivos no tienen dónde colgar una etiqueta); se recorren fila por fila
+        // con el camino `.col[row]`, el mismo que arma `check_into`.
+        SynValue::Table(t) => {
+            let nv = t.value_columns().len();
+            if nv == 0 {
+                return None;
+            }
+            let (row, pos) = (index / nv, index % nv);
+            let key = format!("{}[{}]", t.value_col_name(pos)?, row);
+            t.value_cell_ref(row, pos).map(|v| f(v, Some(&key), None))
+        }
         SynValue::Server(s) => match &**s {
             ServerValue::Node(m) => m.borrow().get_index(index).map(|(k, v)| f(v, Some(k.as_str()), None)),
             ServerValue::Envelope { value, .. } if index == 0 => Some(f(value, Some("value"), None)),
@@ -637,6 +649,9 @@ fn rebuild(v: &SynValue, mut values: Vec<SynValue>, strip: bool) -> SynValue {
             };
             SynValue::Server(crate::types::Obj::new(out))
         }
+        // Tabla (v0.6.65): las columnas `Value` reconstruidas salen en un `Obj` nuevo; las
+        // primitivas se comparten (columns.rs `rebuild_values`).
+        SynValue::Table(t) => SynValue::Table(crate::types::Obj::new(t.rebuild_values(values))),
         _ => v.clone(),
     }
 }
@@ -648,7 +663,7 @@ fn copy_leaf(v: &SynValue, strip: bool) -> Option<(SynValue, bool)> {
             return Some((if strip { v.clone() } else { crate::types::syn_list_of(b.clone()) }, false));
         }
     }
-    if matches!(v, SynValue::List(_) | SynValue::Map(_) | SynValue::Private(_)) {
+    if matches!(v, SynValue::List(_) | SynValue::Map(_) | SynValue::Private(_) | SynValue::Table(_)) {
         return None;
     }
     if let SynValue::Server(s) = v {
@@ -782,6 +797,25 @@ fn check_into(v: &SynValue, accepted: &Label, path: &mut String, ctx: &Label, de
             Ok(())
         }
         SynValue::Map(m) => check_map(&m.borrow(), accepted, path, ctx, depth),
+        // Tabla (v0.6.65): recorre las columnas `Value` (las primitivas no pueden llevar un
+        // `Private`) con el camino `.col[row]`.
+        SynValue::Table(t) => {
+            let mut r = Ok(());
+            t.for_each_value_cell(|row, col, x| {
+                let n = path.len();
+                path.push('.');
+                path.push_str(col);
+                path.push_str(&format!("[{}]", row));
+                let rr = check_into(x, accepted, path, ctx, depth + 1);
+                path.truncate(n);
+                let ok = rr.is_ok();
+                if r.is_ok() {
+                    r = rr;
+                }
+                ok
+            });
+            r
+        }
         SynValue::Server(s) => match &**s {
             ServerValue::Envelope { value, .. } => {
                 let n = path.len();

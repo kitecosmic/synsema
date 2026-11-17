@@ -56,7 +56,7 @@ pub(crate) fn next(
     if depth == INLINE_DEPTH
         && matches!(
             value,
-            SynValue::List(_) | SynValue::Map(_) | SynValue::Server(_)
+            SynValue::List(_) | SynValue::Map(_) | SynValue::Server(_) | SynValue::Table(_)
         )
     {
         return deep(value, f);
@@ -65,6 +65,7 @@ pub(crate) fn next(
     match value {
         SynValue::List(value) => list(value, f, depth),
         SynValue::Map(value) => map(value, f, depth),
+        SynValue::Table(value) => table(value, f, depth),
         SynValue::Server(value) => match &**value {
             ServerValue::Envelope { status, value } => envelope(*status, value, f, depth),
             ServerValue::Node(value) => map(value, f, depth),
@@ -115,6 +116,32 @@ pub(crate) fn map(value: &MapRef, f: &mut fmt::Formatter<'_>, depth: usize) -> f
     f.write_str("}")
 }
 
+/// Una tabla se muestra exactamente como la lista de sus filas (diseño §2): `[{"k": …}, …]`.
+pub(crate) fn table(
+    value: &crate::columns::ColumnTable,
+    f: &mut fmt::Formatter<'_>,
+    depth: usize,
+) -> fmt::Result {
+    f.write_str("[")?;
+    let schema = value.schema();
+    for row in 0..value.n_rows() {
+        if row != 0 {
+            f.write_str(", ")?;
+        }
+        f.write_str("{")?;
+        for (ci, key) in schema.iter().enumerate() {
+            if ci != 0 {
+                f.write_str(", ")?;
+            }
+            write!(f, "{key}: ")?;
+            let cell = value.cell(row, ci);
+            next(&cell, f, depth, true)?;
+        }
+        f.write_str("}")?;
+    }
+    f.write_str("]")
+}
+
 pub(crate) fn envelope(
     status: i64,
     value: &SynValue,
@@ -154,6 +181,9 @@ enum Frame {
     Map(MapRef, usize),
     Close(&'static str),
     Headers(Obj<ServerValue>),
+    /// Celdas de una tabla, fila por fila (el esquema va en el frame: no se recalcula por
+    /// celda).
+    Table(crate::columns::ColumnTable, Vec<crate::synmap::Key>, usize),
 }
 
 #[cold]
@@ -200,6 +230,27 @@ fn deep(value: &SynValue, f: &mut fmt::Formatter<'_>) -> fmt::Result {
                     f.write_str("}")?;
                 }
             }
+            Frame::Table(value, schema, pos) => {
+                let n_cols = schema.len();
+                let total = value.n_rows() * n_cols;
+                if pos >= total {
+                    f.write_str("}]")?;
+                    continue;
+                }
+                if pos % n_cols == 0 {
+                    if pos != 0 {
+                        f.write_str("}, ")?;
+                    }
+                    f.write_str("{")?;
+                } else {
+                    f.write_str(", ")?;
+                }
+                let (row, ci) = (pos / n_cols, pos % n_cols);
+                write!(f, "{}: ", &schema[ci])?;
+                let cell = value.cell(row, ci);
+                stack.push(Frame::Table(value, schema, pos + 1));
+                stack.push(Frame::Value(cell, true));
+            }
             Frame::Value(value, nested) => match &value {
                 SynValue::Text(value) if nested => quoted(value, f)?,
                 SynValue::List(value) => {
@@ -209,6 +260,15 @@ fn deep(value: &SynValue, f: &mut fmt::Formatter<'_>) -> fmt::Result {
                 SynValue::Map(value) => {
                     f.write_str("{")?;
                     stack.push(Frame::Map(value.clone(), 0));
+                }
+                SynValue::Table(value) => {
+                    let schema = value.schema();
+                    if value.n_rows() == 0 || schema.is_empty() {
+                        f.write_str("[]")?;
+                    } else {
+                        f.write_str("[")?;
+                        stack.push(Frame::Table((**value).clone(), schema, 0));
+                    }
                 }
                 SynValue::Server(server) => match &**server {
                     ServerValue::Envelope { status, value } => {

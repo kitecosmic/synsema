@@ -40,6 +40,10 @@ pub(crate) fn list_value(value: SynValue) {
         SynValue::Secret(v) => drop(v),
         SynValue::Bytes(v) => drop(v),
         SynValue::Array(v) => drop(v),
+        // La tabla suelta sus columnas `Value` por el destructor seguro de `ColumnData`
+        // (`columns.rs`: `map_slots` iterativo por celda); los bloques primitivos no tienen
+        // hijos. La tabla entera NUNCA necesita frame propio.
+        SynValue::Table(v) => drop(v),
         SynValue::Time(v) => drop(v),
         SynValue::Bool(_) | SynValue::Nothing | SynValue::Complex(_) => {}
     }
