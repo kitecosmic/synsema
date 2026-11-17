@@ -1438,7 +1438,7 @@ pub(crate) fn snapshot_globals_frozen(interp: &Interpreter) -> Arc<Vec<(String, 
 /// para una foto que se puede repetir y cuyos hilos viven libres (`cron_every`, también desde una
 /// ruta). Congelar ahí sería una fuga por foto; compartir lo permanente, no.
 pub(crate) fn snapshot_globals_shared(interp: &Interpreter) -> Arc<Vec<(String, GlobalVal)>> {
-    snapshot_globals_mode(interp, false, None, true)
+    snapshot_globals_mode(interp, false, None, true, None)
 }
 
 /// Las globales congelando los datos SÓLO mientras corren los hilos de `scope` (R2.3,
@@ -1451,12 +1451,22 @@ pub(crate) fn snapshot_globals_scoped(
     snapshot_globals_with(interp, false, Some(scope))
 }
 
+/// Fast path for a root-global parallel task whose direct dependencies are data only.
+/// The caller must fall back to the full snapshot for closures, modules and callable globals.
+pub(crate) fn snapshot_globals_scoped_selected(
+    interp: &Interpreter,
+    scope: &mut synsema_core::frozen::ScopedFreeze,
+    names: &HashSet<String>,
+) -> Arc<Vec<(String, GlobalVal)>> {
+    snapshot_globals_mode(interp, false, Some(scope), false, Some(names))
+}
+
 fn snapshot_globals_with(
     interp: &Interpreter,
     freeze: bool,
     scoped: Option<&mut synsema_core::frozen::ScopedFreeze>,
 ) -> Arc<Vec<(String, GlobalVal)>> {
-    snapshot_globals_mode(interp, freeze, scoped, false)
+    snapshot_globals_mode(interp, freeze, scoped, false, None)
 }
 
 fn snapshot_globals_mode(
@@ -1464,6 +1474,7 @@ fn snapshot_globals_mode(
     freeze: bool,
     scoped: Option<&mut synsema_core::frozen::ScopedFreeze>,
     share: bool,
+    only_names: Option<&HashSet<String>>,
 ) -> Arc<Vec<(String, GlobalVal)>> {
     let env = interp.global_env.borrow();
     let mut out: Vec<(String, GlobalVal)> = Vec::new();
@@ -1473,6 +1484,9 @@ fn snapshot_globals_mode(
     // el env inline) siempre se procesa antes que sus referencias.
     let mut state = SnapState { freeze, scoped, share, ..SnapState::default() };
     for (k, v) in env.bindings.iter() {
+        if only_names.is_some_and(|names| !names.contains(k.as_ref())) {
+            continue;
+        }
         // Ronda 3 (R3): sólo el builtin del lenguaje con su propio nombre lo vuelve a registrar
         // `wire_common`; un alias, un constructor o una task de confianza cruzan.
         if matches!(v, SynValue::Builtin(b) if synsema_core::interpreter::is_own_builtin(k, b)) {

@@ -5438,6 +5438,7 @@ dependencies = [
  "faer",
  "getrandom 0.2.17",
  "indexmap",
+ "itoa",
  "libm",
  "ndarray",
  "num-bigint 0.4.6",

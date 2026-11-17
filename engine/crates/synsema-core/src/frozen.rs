@@ -143,6 +143,14 @@ fn can(v: &SynValue, seen: &mut HashSet<usize>, scoped_ok: bool, depth: usize) -
 }
 
 fn can_map(m: &MapRef, seen: &mut HashSet<usize>, scoped_ok: bool, depth: usize) -> bool {
+    // A numeric leaf cannot contain a cycle, callable or mutable child. Avoid a
+    // HashSet entry per row in the common list-of-maps table representation.
+    if scoped_ok && !MapRef::is_frozen(m) && crate::interpreter::module_env_of_map(m).is_none() && m.try_borrow_mut().is_ok() {
+        let b = m.borrow();
+        if b.values().all(|v| matches!(v, SynValue::Number(_) | SynValue::Bool(_) | SynValue::Nothing | SynValue::Complex(_))) {
+            return true;
+        }
+    }
     match can_map_head(m, seen, scoped_ok) {
         Ok(false) => true,
         Err(()) => false,
@@ -543,6 +551,27 @@ impl ScopedFreeze {
 mod deep_tests {
     use super::*;
     use crate::types::{syn_int, syn_list, syn_map, SynMap};
+
+    #[test]
+    fn v0664_numeric_leaf_scoped_freeze_respects_borrows_and_thaws() {
+        let mut map = SynMap::new();
+        map.insert("k", syn_int(7));
+        let value = syn_map(map);
+        let SynValue::Map(handle) = &value else { unreachable!() };
+        let borrowed = handle.borrow_mut();
+        assert!(ScopedFreeze::new().add(value.clone()).is_err());
+        drop(borrowed);
+        let mut scope = ScopedFreeze::new();
+        let index = scope.add(value.clone()).unwrap();
+        scope.run(2, 64 * 1024 * 1024, |ctx, _| {
+            let SynValue::Map(m) = ctx.get(index) else { panic!("map") };
+            assert!(MapRef::is_frozen(&m));
+            assert_eq!(m.borrow().get("k").unwrap().to_string(), "7");
+        }).unwrap();
+        assert!(!MapRef::is_frozen(handle));
+        handle.borrow_mut().insert("k", syn_int(8));
+        assert_eq!(handle.borrow().get("k").unwrap().to_string(), "8");
+    }
 
     fn nested(mut v: SynValue, depth: usize, maps: bool) -> SynValue {
         for i in 0..depth {

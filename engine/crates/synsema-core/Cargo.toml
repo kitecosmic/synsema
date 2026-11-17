@@ -67,6 +67,7 @@ smallvec.workspace = true
 rustc-hash.workspace = true
 # v0.6.64: portable, versioned hash for partitioning; not the seeded table hasher.
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
+itoa = "1"
 
 [[example]]
 name = "vmprof"

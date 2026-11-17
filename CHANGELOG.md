@@ -10,8 +10,8 @@ Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the rele
 
 - `read_file_bytes(path, {"offset": n, "length": m})` reads a zero-based byte range from disk or a bundled asset. The one-argument form still reads the whole file.
 - `parquet_info(bytes)` now includes each row group's column min, max and null count when trustworthy metadata exists. `parquet_info_file(path)` reads the same metadata from a path without loading data pages; it requires `file.read`.
-- `hash(value)` uses a versioned canonical encoding and XXH3-64, returning an exact non-negative integer for reproducible partitioning across platforms. It rejects secrets and values without a stable key; it is not a cryptographic hash.
-- The existing `parallel_map` benchmark remains under investigation. Its scoped sharing avoids copying the row data, but the measured setup still dominates the 1 M row workload; the memory-model work is assigned separately under the version plan.
+- `hash(value)` uses a versioned canonical encoding and XXH3-64, returning an exact non-negative integer for reproducible partitioning across platforms. It rejects secrets and values without a stable key; it is not a cryptographic hash. Common scalar keys use a stack buffer; a local optimized 1 M-integer probe measured 28–34 ms versus 95–96 ms for `sha256(text(k))`.
+- `parallel_map` now skips preparing unrelated global tables and repeat generator scans for ordinary data. Scoped sharing recognizes numeric leaf maps without building a pointer set for every row. In a local optimized 1 M-row `summarize` probe with the same final result, 8 workers beat 1 thread in five consecutive runs (median 0.177 s vs 0.233 s; LTO disabled for this local build).
 
 ## v0.6.63 — 2026-11-16
 

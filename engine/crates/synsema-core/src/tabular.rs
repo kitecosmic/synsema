@@ -418,11 +418,54 @@ pub(crate) fn probe_key(v: &SynValue) -> String {
     out
 }
 
+/// The common scalar keys fit in one stack buffer. Keep the exact hash-v1 byte
+/// stream, while avoiding a String, traversal Vec and four incremental updates.
+fn stable_hash_short_scalar(v: &SynValue) -> Option<u64> {
+    const PREFIX: &[u8] = b"synsema:hash-v1\0";
+    let mut encoded = [0u8; 256];
+    encoded[..PREFIX.len()].copy_from_slice(PREFIX);
+    encoded[PREFIX.len()] = b'S';
+    let key_at = PREFIX.len() + 1 + 8;
+    let mut decimal = itoa::Buffer::new();
+    let key_len = match v {
+        SynValue::Number(Number::Int(n)) => {
+            let digits = decimal.format(*n).as_bytes();
+            encoded[key_at..key_at + 2].copy_from_slice(b"n:");
+            encoded[key_at + 2..key_at + 2 + digits.len()].copy_from_slice(digits);
+            encoded[key_at + 2 + digits.len()] = b';';
+            digits.len() + 3
+        }
+        SynValue::Bool(b) => {
+            encoded[key_at..key_at + 4].copy_from_slice(if *b { b"n:1;" } else { b"n:0;" });
+            4
+        }
+        SynValue::Nothing => {
+            encoded[key_at] = b'z';
+            1
+        }
+        SynValue::Text(t) if t.len() <= 200 => {
+            let digits = decimal.format(t.len()).as_bytes();
+            let size = 1 + digits.len() + 1 + t.len();
+            encoded[key_at] = b't';
+            encoded[key_at + 1..key_at + 1 + digits.len()].copy_from_slice(digits);
+            encoded[key_at + 1 + digits.len()] = b':';
+            encoded[key_at + 2 + digits.len()..key_at + size].copy_from_slice(t.as_bytes());
+            size
+        }
+        _ => return None,
+    };
+    encoded[PREFIX.len() + 1..key_at].copy_from_slice(&(key_len as u64).to_le_bytes());
+    Some(xxhash_rust::xxh3::xxh3_64_with_seed(&encoded[..key_at + key_len], 0))
+}
+
 /// Public hash-v1 for partitioning. The byte stream is independent of Rust's Hash trait,
 /// machine endianness and map insertion order. Never use this fixed hash for the internal
 /// hash tables that accept untrusted keys.
 pub fn stable_hash(v: &SynValue) -> Result<u64, String> {
     use xxhash_rust::xxh3::Xxh3;
+    if let Some(bits) = stable_hash_short_scalar(v) {
+        return Ok(bits);
+    }
     enum Step {
         Value(SynValue),
         List(crate::types::ListRef, usize),
@@ -1372,6 +1415,45 @@ pub fn mode(args: &[SynValue]) -> Result<SynValue, Control> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn v0664_short_hash_matches_canonical_stream() {
+        use xxhash_rust::xxh3::Xxh3;
+        let values = [
+            syn_int(i64::MIN), syn_int(-1), syn_int(0), syn_int(i64::MAX),
+            crate::types::syn_bool(true), SynValue::Nothing,
+            syn_text(""), syn_text("ñ🙂"), syn_text("x".repeat(199)),
+            syn_text("x".repeat(200)), syn_text("x".repeat(201)),
+        ];
+        for value in values {
+            let key = probe_key(&value);
+            let mut h = Xxh3::with_seed(0);
+            h.update(b"synsema:hash-v1\0");
+            h.update(b"S");
+            h.update(&(key.len() as u64).to_le_bytes());
+            h.update(key.as_bytes());
+            assert_eq!(stable_hash(&value).unwrap(), h.digest(), "{}", value.type_name());
+        }
+    }
+
+    #[test]
+    #[ignore = "manual 1M-key hash throughput probe; run in release with --ignored --nocapture"]
+    fn v0664_hash_speed_probe() {
+        use sha2::{Digest, Sha256};
+        use std::hint::black_box;
+        let start = std::time::Instant::now();
+        for i in 0..1_000_000 {
+            black_box(stable_hash(&syn_int(i % 1000)).unwrap());
+        }
+        let hash_time = start.elapsed();
+        let start = std::time::Instant::now();
+        for i in 0..1_000_000 {
+            let text = (i % 1000).to_string();
+            black_box(Sha256::digest(text.as_bytes()));
+        }
+        let sha_time = start.elapsed();
+        println!("HASH_PROBE stable={:?} sha256_text={:?}", hash_time, sha_time);
+    }
 
     #[test]
     fn v0664_hash_equality_and_depth() {
