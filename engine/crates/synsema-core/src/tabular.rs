@@ -418,6 +418,67 @@ pub(crate) fn probe_key(v: &SynValue) -> String {
     out
 }
 
+/// Public hash-v1 for partitioning. The byte stream is independent of Rust's Hash trait,
+/// machine endianness and map insertion order. Never use this fixed hash for the internal
+/// hash tables that accept untrusted keys.
+pub fn stable_hash(v: &SynValue) -> Result<u64, String> {
+    use xxhash_rust::xxh3::Xxh3;
+    enum Step {
+        Value(SynValue),
+        List(crate::types::ListRef, usize),
+        Map(crate::types::MapRef, Vec<String>, usize),
+    }
+    let mut h = Xxh3::with_seed(0);
+    h.update(b"synsema:hash-v1\0");
+    let mut stack = vec![Step::Value(v.clone())];
+    while let Some(step) = stack.pop() {
+        match step {
+            Step::Value(SynValue::List(l)) => {
+                let len = l.borrow().len();
+                h.update(b"L");
+                h.update(&(len as u64).to_le_bytes());
+                stack.push(Step::List(l, 0));
+            }
+            Step::Value(SynValue::Map(m)) => {
+                let mut keys: Vec<String> = m.borrow().keys().map(|k| k.to_string()).collect();
+                keys.sort();
+                h.update(b"M");
+                h.update(&(keys.len() as u64).to_le_bytes());
+                stack.push(Step::Map(m, keys, 0));
+            }
+            Step::Value(SynValue::Secret(_)) => return Err("hash: a secret cannot be hashed publicly".into()),
+            Step::Value(SynValue::Private(_)) => return Err("hash: private data cannot be hashed publicly".into()),
+            Step::Value(x @ (SynValue::Task(_) | SynValue::Builtin(_) | SynValue::Server(_))) => {
+                return Err(format!("hash: {} has no stable key", x.type_name()));
+            }
+            Step::Value(x) => {
+                let key = probe_key(&x);
+                h.update(b"S");
+                h.update(&(key.len() as u64).to_le_bytes());
+                h.update(key.as_bytes());
+            }
+            Step::List(l, at) => {
+                if at < l.borrow().len() {
+                    let child = l.borrow().get(at).expect("index checked");
+                    stack.push(Step::List(l, at + 1));
+                    stack.push(Step::Value(child));
+                }
+            }
+            Step::Map(m, keys, at) => {
+                if at < keys.len() {
+                    let key = &keys[at];
+                    h.update(&(key.len() as u64).to_le_bytes());
+                    h.update(key.as_bytes());
+                    let child = m.borrow().get(key).expect("key collected from map").clone();
+                    stack.push(Step::Map(m, keys, at + 1));
+                    stack.push(Step::Value(child));
+                }
+            }
+        }
+    }
+    Ok(h.digest())
+}
+
 /// La clave canónica de un valor para agrupar: dos valores que `==` iguala dan la misma
 /// cadena. Tipada y autodelimitada (el texto va con su largo), así el texto `"1"` y el
 /// número `1` no chocan; un mapa va con sus claves ordenadas (`==` no mira el orden); un
@@ -1311,6 +1372,35 @@ pub fn mode(args: &[SynValue]) -> Result<SynValue, Control> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn v0664_hash_equality_and_depth() {
+        assert_eq!(stable_hash(&syn_text("")).unwrap(), 17544574437371136113);
+        assert_eq!(stable_hash(&syn_int(1)).unwrap(), 2499702446636244821);
+        assert_eq!(stable_hash(&syn_text("abc")).unwrap(), 9148965910516304451);
+        assert_eq!(stable_hash(&syn_list(vec![syn_int(1), syn_text("a")])).unwrap(), 2394007918155086569);
+        let a = syn_list(vec![crate::types::syn_bool(true), syn_int(0)]);
+        let b = syn_list(vec![syn_float(1.0), syn_float(-0.0)]);
+        assert_eq!(stable_hash(&a).unwrap(), stable_hash(&b).unwrap());
+        let mut x = SynMap::new();
+        x.insert("a", syn_int(1));
+        x.insert("b", syn_text("x"));
+        let mut y = SynMap::new();
+        y.insert("b", syn_text("x"));
+        y.insert("a", syn_int(1));
+        let map_hash = stable_hash(&syn_map(x)).unwrap();
+        assert_eq!(map_hash, 4675122939934004889);
+        assert_eq!(stable_hash(&syn_float(1.5)).unwrap(), 8668890825885434388);
+        assert_eq!(map_hash, stable_hash(&syn_map(y)).unwrap());
+        assert_ne!(stable_hash(&syn_int(1)).unwrap(), stable_hash(&syn_text("1")).unwrap());
+        let mut deep = syn_int(1);
+        for _ in 0..10_000 { deep = syn_list(vec![deep]); }
+        assert!(stable_hash(&deep).is_ok());
+        assert!(stable_hash(&crate::types::syn_secret("K", "value")).unwrap_err().contains("secret"));
+        let mut nested = SynMap::new();
+        nested.insert("key", crate::types::syn_secret("K", "value"));
+        assert!(stable_hash(&syn_map(nested)).unwrap_err().contains("secret"));
+    }
 
     /// v0.6.55 (R3): `unique` y `groups` usan esta clave; una máscara y un array `f64` con los
     /// mismos 0/1 son valores distintos, y dos máscaras iguales, el mismo.

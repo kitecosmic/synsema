@@ -65,6 +65,8 @@ getrandom = "0.2"
 smallvec.workspace = true
 # El índice de nombres de un entorno con muchos bindings (F2a). Ya estaba en el árbol.
 rustc-hash.workspace = true
+# v0.6.64: portable, versioned hash for partitioning; not the seeded table hasher.
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
 
 [[example]]
 name = "vmprof"

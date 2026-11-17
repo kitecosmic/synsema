@@ -1321,15 +1321,68 @@ fn parquet_write(args: &[SynValue]) -> Result<SynValue, Control> {
 /// v0.6.45 (B4) — `parquet_info(bytes)` → `{rows, columns: [{name, type}], row_groups: [{rows,
 /// bytes}]}`: lo que hay en el archivo sin leer los datos, para decidir qué columnas y qué row groups
 /// pedir.
-fn parquet_info(args: &[SynValue]) -> Result<SynValue, Control> {
-    const F: &str = "parquet_info";
-    let data = match args.first() {
-        Some(SynValue::Bytes(b)) => bytes::Bytes::from(b.to_vec()),
-        Some(other) => return Err(err(format!("{}: expected the file's bytes (read_file_bytes(path)), got {}", F, other.type_name()))),
-        None => return Err(err("parquet_info(bytes)")),
+fn parquet_stat_value(s: &parquet::file::statistics::Statistics, col: &parquet::file::metadata::ColumnChunkMetaData, min: bool) -> SynValue {
+    use parquet::file::statistics::Statistics;
+    if s.is_min_max_deprecated() || !(if min { s.min_is_exact() } else { s.max_is_exact() }) {
+        return SynValue::Nothing;
+    }
+    let logical = col.column_descr().logical_type_ref();
+    let decimal = |value: BigInt, scale: i32, precision: i32| {
+        (precision > 0 && scale >= 0 && scale <= precision && precision <= 38)
+            .then(|| syn_number(Number::decimal_from_parts(value, scale as u32)))
     };
-    let reader = SerializedFileReader::new(data).map_err(|e| err(format!("{}: not a Parquet file: {}", F, e)))?;
-    let meta = reader.metadata();
+    let int32 = |value: i32| match logical {
+        None => Some(syn_int(value as i64)),
+        Some(LogicalType::Integer(t)) if t.is_signed => Some(syn_int(value as i64)),
+        Some(LogicalType::Integer(_)) => Some(syn_int(value as u32 as i64)),
+        Some(LogicalType::Date) => chrono::NaiveDate::from_ymd_opt(1970, 1, 1)
+            .and_then(|epoch| epoch.checked_add_signed(chrono::Duration::days(value as i64)))
+            .map(|day| SynValue::Time(synsema_core::types::Obj::new(Temporal::Date(day)))),
+        Some(LogicalType::Decimal(d)) => decimal(BigInt::from(value), d.scale, d.precision),
+        _ => None,
+    };
+    let int64 = |value: i64| match logical {
+        None => Some(syn_int(value)),
+        Some(LogicalType::Integer(t)) if t.is_signed => Some(syn_int(value)),
+        Some(LogicalType::Integer(_)) => Some(syn_number(Number::from_bigint(BigInt::from(value as u64)))),
+        Some(LogicalType::Decimal(d)) => decimal(BigInt::from(value), d.scale, d.precision),
+        Some(LogicalType::Timestamp(ts)) if ts.is_adjusted_to_u_t_c => {
+            let instant = match ts.unit {
+                TimeUnit::MILLIS => chrono::DateTime::from_timestamp_millis(value),
+                TimeUnit::MICROS => chrono::DateTime::from_timestamp_micros(value),
+                TimeUnit::NANOS => chrono::DateTime::from_timestamp(value.div_euclid(1_000_000_000), value.rem_euclid(1_000_000_000) as u32),
+                _ => None,
+            };
+            instant.map(|dt| SynValue::Time(synsema_core::types::Obj::new(Temporal::DateTime(dt.with_timezone(&synsema_core::temporal::UTC)))))
+        }
+        _ => None,
+    };
+    match s {
+        Statistics::Boolean(v) if logical.is_none() => (if min { v.min_opt() } else { v.max_opt() }).map(|x| syn_bool(*x)),
+        Statistics::Int32(v) => (if min { v.min_opt() } else { v.max_opt() }).and_then(|x| int32(*x)),
+        Statistics::Int64(v) => (if min { v.min_opt() } else { v.max_opt() }).and_then(|x| int64(*x)),
+        Statistics::Float(v) if logical.is_none() => (if min { v.min_opt() } else { v.max_opt() }).filter(|x| !x.is_nan()).map(|x| syn_float(*x as f64)),
+        Statistics::Double(v) if logical.is_none() => (if min { v.min_opt() } else { v.max_opt() }).filter(|x| !x.is_nan()).map(|x| syn_float(*x)),
+        Statistics::ByteArray(v) if matches!(logical, Some(LogicalType::String)) => {
+            (if min { v.min_opt() } else { v.max_opt() })
+                .and_then(|x| std::str::from_utf8(x.data()).ok())
+                .map(syn_text)
+        }
+        Statistics::ByteArray(v) if matches!(logical, Some(LogicalType::Decimal(_))) => {
+            let Some(LogicalType::Decimal(d)) = logical else { unreachable!() };
+            (if min { v.min_opt() } else { v.max_opt() })
+                .and_then(|x| decimal(BigInt::from_signed_bytes_be(x.data()), d.scale, d.precision))
+        }
+        Statistics::FixedLenByteArray(v) if matches!(logical, Some(LogicalType::Decimal(_))) => {
+            let Some(LogicalType::Decimal(d)) = logical else { unreachable!() };
+            (if min { v.min_opt() } else { v.max_opt() })
+                .and_then(|x| decimal(BigInt::from_signed_bytes_be(x.data()), d.scale, d.precision))
+        }
+        _ => None,
+    }.unwrap_or(SynValue::Nothing)
+}
+
+fn parquet_info_meta(meta: &parquet::file::metadata::ParquetMetaData) -> SynValue {
     let fmeta = meta.file_metadata();
     let mut cols = Vec::new();
     for f in fmeta.schema_descr().root_schema().get_fields() {
@@ -1351,13 +1404,55 @@ fn parquet_info(args: &[SynValue]) -> Result<SynValue, Control> {
         let mut m = SynMap::new();
         m.insert("rows", syn_int(rg.num_rows()));
         m.insert("bytes", syn_int(rg.total_byte_size()));
+        let mut chunks = Vec::new();
+        for col in rg.columns() {
+            let mut c = SynMap::new();
+            c.insert("name", syn_text(col.column_path().string()));
+            c.insert("path", syn_list(col.column_path().parts().iter().map(|part| syn_text(part.as_str())).collect()));
+            let stats = col.statistics();
+            c.insert("min", stats.map(|s| parquet_stat_value(s, col, true)).unwrap_or(SynValue::Nothing));
+            c.insert("max", stats.map(|s| parquet_stat_value(s, col, false)).unwrap_or(SynValue::Nothing));
+            c.insert("null_count", stats.and_then(|s| s.null_count_opt()).map(|n| syn_number(Number::from_bigint(BigInt::from(n)))).unwrap_or(SynValue::Nothing));
+            chunks.push(syn_map(c));
+        }
+        m.insert("columns", syn_list(chunks));
         rgs.push(syn_map(m));
     }
     let mut out = SynMap::new();
     out.insert("rows", syn_int(fmeta.num_rows()));
     out.insert("columns", syn_list(cols));
     out.insert("row_groups", syn_list(rgs));
-    Ok(syn_map(out))
+    syn_map(out)
+}
+
+fn parquet_info(args: &[SynValue]) -> Result<SynValue, Control> {
+    const F: &str = "parquet_info";
+    let data = match args.first() {
+        Some(SynValue::Bytes(b)) => bytes::Bytes::from(b.to_vec()),
+        Some(other) => return Err(err(format!("{}: expected the file's bytes (read_file_bytes(path)), got {}", F, other.type_name()))),
+        None => return Err(err("parquet_info(bytes)")),
+    };
+    let reader = SerializedFileReader::new(data).map_err(|e| err(format!("{}: not a Parquet file: {}", F, e)))?;
+    Ok(parquet_info_meta(reader.metadata()))
+}
+
+fn parquet_info_file(caps: &Rc<std::cell::RefCell<synsema_capabilities::model::CapabilitySet>>, args: &[SynValue]) -> Result<SynValue, Control> {
+    const F: &str = "parquet_info_file";
+    let raw = match args.first() {
+        Some(SynValue::Text(t)) => t.to_string(),
+        Some(other) => return Err(err(format!("{}: expected a path, got {}", F, other.type_name()))),
+        None => return Err(err("parquet_info_file(path)")),
+    };
+    match synsema_capabilities::secure::open_for_read(caps, &raw, "parquet_info_file()")? {
+        synsema_capabilities::secure::OpenedForRead::Bundled(_, b) => {
+            let reader = SerializedFileReader::new(bytes::Bytes::from_static(b)).map_err(|e| err(format!("{}: not a Parquet file: {}", F, e)))?;
+            Ok(parquet_info_meta(reader.metadata()))
+        }
+        synsema_capabilities::secure::OpenedForRead::Disk(_, file) => {
+            let reader = SerializedFileReader::new(file).map_err(|e| err(format!("{}: not a Parquet file: {}", F, e)))?;
+            Ok(parquet_info_meta(reader.metadata()))
+        }
+    }
 }
 
 fn text_list(v: &SynValue, f: &str, opt: &str) -> Result<Vec<String>, Control> {
@@ -1399,6 +1494,8 @@ pub fn register_parquet_builtins(interp: &Interpreter) {
 /// v0.6.46 (C4) — `parquet_scan` lee del disco: va con las capabilities, en el perfil nativo (como
 /// los archivos comprimidos), no en el puro que comparte el wasm.
 pub fn register_parquet_scan(interp: &Interpreter, caps: Rc<std::cell::RefCell<synsema_capabilities::model::CapabilitySet>>) {
+    let info_caps = caps.clone();
+    interp.register_builtin("parquet_info_file", 1, Rc::new(move |_i, a, _l| parquet_info_file(&info_caps, a)));
     interp.register_builtin("parquet_scan", -1, Rc::new(move |_i, a, _l| parquet_scan(&caps, a)));
 }
 
@@ -1548,6 +1645,10 @@ mod tests {
         let info = parquet_info(&[file.clone()]).ok().unwrap().to_string();
         assert!(info.contains("rows: 6"), "{}", info);
         assert_eq!(info.matches("rows: 2").count(), 3, "tres row groups de 2: {}", info);
+        for (lo, hi) in [(0, 1), (2, 3), (4, 5)] {
+            assert!(info.contains(&format!("min: {}, max: {}", lo, hi)), "{}", info);
+        }
+        assert_eq!(info.matches("null_count: 0").count(), 9, "{}", info);
         let only_a = rows(parquet_read(&[file.clone(), opts(&[("columns", syn_list(vec![syn_text("a")]))])]).ok().unwrap());
         assert_eq!(only_a.len(), 6);
         assert!(only_a.iter().all(|r| r.contains("a:") && !r.contains("b:")), "{:?}", only_a);
@@ -1571,5 +1672,101 @@ mod tests {
         };
         assert!(msg(parquet_read(&[file.clone(), opts(&[("columns", syn_list(vec![syn_text("zz")]))])])).contains("no column \"zz\""));
         assert!(msg(parquet_read(&[file, opts(&[("row_groups", syn_list(vec![syn_int(3)]))])])).contains("row group 3 does not exist — the file has 3 row groups, numbered 0 to 2"));
+    }
+
+    #[test]
+    fn v0664_absent_statistics_stay_absent() {
+        use parquet::data_type::Int64Type;
+        use parquet::file::properties::{EnabledStatistics, WriterProperties};
+        let schema = Arc::new(parquet::schema::parser::parse_message_type("message s { required int64 a; }").unwrap());
+        let props = Arc::new(WriterProperties::builder().set_statistics_enabled(EnabledStatistics::None).build());
+        let mut buf = Vec::new();
+        {
+            let mut writer = SerializedFileWriter::new(&mut buf, schema, props).unwrap();
+            let mut rg = writer.next_row_group().unwrap();
+            let mut col = rg.next_column().unwrap().unwrap();
+            col.typed::<Int64Type>().write_batch(&[1, 2], None, None).unwrap();
+            col.close().unwrap();
+            rg.close().unwrap();
+            writer.close().unwrap();
+        }
+        let info = parquet_info(&[syn_bytes(buf)]).ok().unwrap().to_string();
+        assert!(info.contains("min: nothing, max: nothing, null_count: nothing"), "{}", info);
+    }
+
+    #[test]
+    fn v0664_row_group_statistics_match_pyarrow() {
+        // Generated with pyarrow 26.0.1, 6 rows, row_group_size=3. Golden values are
+        // pq.read_metadata(path).row_group(i).column(j).statistics.{min,max,null_count}.
+        let bytes = include_bytes!("../tests/fixtures/v0664_stats.parquet");
+        let info = parquet_info(&[syn_bytes(bytes.to_vec())]).ok().unwrap();
+        fn field(v: &SynValue, k: &str) -> SynValue {
+            let SynValue::Map(m) = v else { panic!("expected map") };
+            m.borrow().get(k).unwrap().clone()
+        }
+        fn at(v: &SynValue, i: usize) -> SynValue {
+            let SynValue::List(l) = v else { panic!("expected list") };
+            l.borrow().get(i).unwrap()
+        }
+        let groups = field(&info, "row_groups");
+        for (group, expected) in [
+            [("k", "1", "3", "1"), ("v", "2.5", "4.0", "1"), ("name", "aa", "bb", "1")],
+            [("k", "5", "8", "0"), ("v", "8.25", "9.5", "1"), ("name", "cc", "ee", "0")],
+        ].into_iter().enumerate() {
+            let cols = field(&at(&groups, group), "columns");
+            for (j, (name, min, max, nulls)) in expected.into_iter().enumerate() {
+                let col = at(&cols, j);
+                assert_eq!(field(&col, "name").to_string(), name);
+                assert_eq!(field(&col, "min").to_string(), min);
+                assert_eq!(field(&col, "max").to_string(), max);
+                assert_eq!(field(&col, "null_count").to_string(), nulls);
+            }
+        }
+    }
+
+    #[test]
+    fn v0664_logical_statistics_match_pyarrow() {
+        // pyarrow 26.0.1: DATE, TIMESTAMP(UTC), DECIMAL(10,2) and UINT64.
+        let bytes = include_bytes!("../tests/fixtures/v0664_logical_stats.parquet");
+        let info = parquet_info(&[syn_bytes(bytes.to_vec())]).ok().unwrap();
+        let SynValue::Map(root) = info else { panic!("root") };
+        let groups = root.borrow().get("row_groups").unwrap().clone();
+        let SynValue::List(groups) = groups else { panic!("groups") };
+        for (i, days, when, dec, unsigned) in [
+            (0, ["2024-01-01", "2024-01-03"], ["2024-01-01", "2024-01-03"], ["1.20", "3.40"], ["9223372036854775808", "9223372036854775809"]),
+            (1, ["2024-02-01", "2024-02-02"], ["2024-02-01", "2024-02-02"], ["5.60", "7.80"], ["9223372036854775810", "9223372036854775811"]),
+        ] {
+            let SynValue::Map(group) = groups.borrow().get(i).unwrap() else { panic!("group") };
+            let SynValue::List(cols) = group.borrow().get("columns").unwrap().clone() else { panic!("columns") };
+            for (j, expected) in [days, when, dec, unsigned].into_iter().enumerate() {
+                let SynValue::Map(col) = cols.borrow().get(j).unwrap() else { panic!("column") };
+                for (key, prefix) in [("min", expected[0]), ("max", expected[1])] {
+                    let value = col.borrow().get(key).unwrap().clone();
+                    assert!(value.to_string().starts_with(prefix), "row group {} column {} {}: {}", i, j, key, value);
+                    if j < 2 { assert!(matches!(value, SynValue::Time(_))); }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn v0664_nested_column_paths_are_unambiguous() {
+        // Both leaves have the dotted display name "a.b" in PyArrow. The first
+        // is one top-level field; the second is field b inside struct a.
+        let bytes = include_bytes!("../tests/fixtures/v0664_paths.parquet");
+        let info = parquet_info(&[syn_bytes(bytes.to_vec())]).ok().unwrap();
+        let SynValue::Map(root) = info else { panic!("root") };
+        let SynValue::List(groups) = root.borrow().get("row_groups").unwrap().clone() else { panic!("groups") };
+        let SynValue::Map(group) = groups.borrow().get(0).unwrap() else { panic!("group") };
+        let SynValue::List(cols) = group.borrow().get("columns").unwrap().clone() else { panic!("columns") };
+        let mut paths = Vec::new();
+        for i in 0..2 {
+            let SynValue::Map(col) = cols.borrow().get(i).unwrap() else { panic!("column") };
+            assert_eq!(col.borrow().get("name").unwrap().to_string(), "a.b");
+            paths.push(col.borrow().get("path").unwrap().to_string());
+        }
+        assert_ne!(paths[0], paths[1]);
+        assert!(paths.contains(&"[\"a.b\"]".to_string()), "{:?}", paths);
+        assert!(paths.contains(&"[\"a\", \"b\"]".to_string()), "{:?}", paths);
     }
 }

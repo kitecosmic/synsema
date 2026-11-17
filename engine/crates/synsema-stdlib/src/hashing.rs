@@ -25,7 +25,8 @@ use sha2::{Digest, Sha256, Sha512, Sha512_256};
 use sha3::Keccak256;
 
 use synsema_core::interpreter::{Control, Interpreter, RuntimeError};
-use synsema_core::types::{syn_bytes, SynValue};
+use synsema_core::types::{syn_bytes, syn_number, SynValue};
+use synsema_core::number::Number;
 
 /// Bytes a hashear de `x`: bytes crudos o UTF-8 del texto. Error para `secret` (G6) y
 /// para cualquier otro tipo.
@@ -53,6 +54,12 @@ fn arg0(args: &[SynValue]) -> Result<&SynValue, Control> {
 /// Registra `sha256`/`sha512`/`keccak256`/`sha512_256`. Wired en `engine.rs` junto a
 /// los demás builtins de stdlib.
 pub fn register_hash_builtins(interp: &Interpreter) {
+    interp.register_builtin("hash", 1, Rc::new(|_i, args, _l| {
+        let value = arg0(args)?;
+        let bits = synsema_core::tabular::stable_hash(value)
+            .map_err(|message| Control::Error(RuntimeError::new(message)))?;
+        Ok(syn_number(Number::from_bigint(num_bigint::BigInt::from(bits))))
+    }));
     interp.register_builtin(
         "sha256",
         1,

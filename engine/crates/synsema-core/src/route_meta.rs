@@ -170,7 +170,7 @@ pub const BUILTIN_CAPS: &[(&str, &str)] = &[
     ("delete_file", "file.write"), ("delete_dir", "file.write"), ("make_dir", "file.write"),
     ("zip_extract", "file.write"), ("tar_extract", "file.write"),
     ("zip_create", "file.read"), ("tar_create", "file.read"), ("cwd", "file.read"),
-    ("parquet_scan", "file.read"),
+    ("parquet_scan", "file.read"), ("parquet_info_file", "file.read"),
     ("run", "exec"), ("proc_spawn", "exec"),
     // tiempo y azar
     ("now", "time"), ("sleep", "time"),

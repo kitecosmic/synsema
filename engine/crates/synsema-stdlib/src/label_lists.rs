@@ -22,7 +22,7 @@ pub const WASM_EXTRA_SINK_BUILTINS: &[&str] = &["sleep"];
 pub const LABEL_SINK_BUILTINS: &[&str] = &[
     // Archivos y procesos (synsema-capabilities/secure.rs, stdlib/proc.rs, watch.rs, term.rs)
     "write_file", "append_file", "edit_file", "delete_file", "delete_dir", "make_dir", "read_file", "read_file_bytes",
-    "list_dir", "file_exists", "file_info", "grep", "run", "run_program", "parquet_scan",
+    "list_dir", "file_exists", "file_info", "grep", "run", "run_program", "parquet_scan", "parquet_info_file",
     "proc_spawn", "proc_send", "proc_close_stdin", "proc_kill", "proc_resize", "proc_wait", "proc_close",
     "watch", "watch_close", "term_open", "term_write", "term_close", "shutdown",
     // Red (stdlib/http.rs, ws.rs, webpush.rs, oidc.rs, blockchain_*_rpc.rs). `http` (el verbo
@@ -147,7 +147,7 @@ pub const LABEL_PURE_BUILTINS: &[&str] = &[
     "det", "dot", "ecdh_keypair", "ecdh_public", "ecdh_shared_secret", "ecdsa_p256_verify", "ed25519_verify", "eig",
     "eip191_digest", "eip712_digest", "ends_with", "enumerate", "erf", "erfc", "eth_address", "exp", "eye",
     "factorial", "fail", "flatten", "float", "floor", "fmt", "full", "gamma", "gaussian_noise", "gcd",
-    "groth16_verify", "hash160", "histogram", "hkdf_sha256", "hmac_sha256", "http_signature_verify", "hypot",
+    "groth16_verify", "hash", "hash160", "histogram", "hkdf_sha256", "hmac_sha256", "http_signature_verify", "hypot",
     "identity", "imag", "index_of", "insert", "int_to_bytes", "int_to_bytes_le", "inv", "is_array", "is_bytes",
     "is_complex", "is_decimal", "is_finite", "is_infinite", "is_nan", "join", "json_decode", "json_encode",
     "json_for_script", "jwt_sign", "jwt_verify", "keccak256", "keys", "laplace_noise", "lcm", "length",

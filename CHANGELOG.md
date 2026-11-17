@@ -6,6 +6,13 @@ Each says what changed, why, and what to write instead.
 
 Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the release date.
 
+## v0.6.64 — in progress
+
+- `read_file_bytes(path, {"offset": n, "length": m})` reads a zero-based byte range from disk or a bundled asset. The one-argument form still reads the whole file.
+- `parquet_info(bytes)` now includes each row group's column min, max and null count when trustworthy metadata exists. `parquet_info_file(path)` reads the same metadata from a path without loading data pages; it requires `file.read`.
+- `hash(value)` uses a versioned canonical encoding and XXH3-64, returning an exact non-negative integer for reproducible partitioning across platforms. It rejects secrets and values without a stable key; it is not a cryptographic hash.
+- The existing `parallel_map` benchmark remains under investigation. Its scoped sharing avoids copying the row data, but the measured setup still dominates the 1 M row workload; the memory-model work is assigned separately under the version plan.
+
 ## v0.6.63 — 2026-11-16
 
 - `get(m, k, default)` looks up a text key without copying it: the key is the text
