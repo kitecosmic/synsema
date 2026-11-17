@@ -13382,6 +13382,11 @@ fn walk_free_names(t: &SynTaskValue) -> HashSet<String> {
         NodeKind::ObserveStatement { variable, .. } => {
             out.insert(variable.clone());
         }
+        NodeKind::ApproveStatement { then: Some(name), .. }
+        | NodeKind::ConfirmStatement { then: Some(name), .. }
+        | NodeKind::AskExpression { then: Some(name), .. } => {
+            out.insert(name.clone());
+        }
         _ => {}
     };
     for n in t.body.iter().chain(t.parameters.iter().filter_map(|p| p.default.as_ref())) {

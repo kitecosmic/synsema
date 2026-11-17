@@ -167,11 +167,11 @@ redis = { version = "0.32", default-features = false, features = ["tls-rustls"] 
 # `default-features = false`: fuera cuda/metal/accelerate/mkl (los backends van por
 # feature en candle); el backend CPU (gemm/pulp/rayon) es puro Rust.
 # candle-core y candle-transformers PINNEADAS a la misma versión (comparten tipos).
-candle-core = { version = "0.11", default-features = false }
-candle-transformers = { version = "0.11", default-features = false }
+candle-core = { version = "=0.11.1", default-features = false }
+candle-transformers = { version = "=0.11.1", default-features = false }
 # candle-nn: las capas (Linear, LayerNorm, Embedding) con las que se escriben las cabezas
 # de Laya. Ya entra al arbol por candle-transformers; se declara para poder usarla directo.
-candle-nn = { version = "0.11", default-features = false }
+candle-nn = { version = "=0.11.1", default-features = false }
 # matrixmultiply: el kernel de matmul del backend PROPIO (tanda I4). Puro Rust, con SIMD,
 # de bluss (ndarray) y ajeno a HuggingFace. Ya entraba al arbol; se declara para usarlo.
 matrixmultiply = { version = "0.3", default-features = false, features = ["std"] }
