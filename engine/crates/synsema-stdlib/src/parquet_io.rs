@@ -27,7 +27,7 @@ use num_bigint::BigInt;
 use parquet::basic::{Compression, LogicalType, Repetition, TimeUnit, Type as PhysicalType};
 use parquet::data_type::ByteArray;
 use parquet::file::properties::WriterProperties;
-use parquet::file::reader::{FileReader, SerializedFileReader};
+use parquet::file::reader::{ChunkReader, FileReader, SerializedFileReader};
 use parquet::file::writer::SerializedFileWriter;
 use parquet::record::Field;
 use parquet::schema::types::Type;
@@ -1425,6 +1425,11 @@ fn parquet_info_meta(meta: &parquet::file::metadata::ParquetMetaData) -> SynValu
     syn_map(out)
 }
 
+fn parquet_info_reader<R: ChunkReader + 'static>(data: R, source: &str) -> Result<SynValue, Control> {
+    let reader = SerializedFileReader::new(data).map_err(|e| err(format!("{}: not a Parquet file: {}", source, e)))?;
+    Ok(parquet_info_meta(reader.metadata()))
+}
+
 fn parquet_info(args: &[SynValue]) -> Result<SynValue, Control> {
     const F: &str = "parquet_info";
     let data = match args.first() {
@@ -1432,8 +1437,7 @@ fn parquet_info(args: &[SynValue]) -> Result<SynValue, Control> {
         Some(other) => return Err(err(format!("{}: expected the file's bytes (read_file_bytes(path)), got {}", F, other.type_name()))),
         None => return Err(err("parquet_info(bytes)")),
     };
-    let reader = SerializedFileReader::new(data).map_err(|e| err(format!("{}: not a Parquet file: {}", F, e)))?;
-    Ok(parquet_info_meta(reader.metadata()))
+    parquet_info_reader(data, F)
 }
 
 fn parquet_info_file(caps: &Rc<std::cell::RefCell<synsema_capabilities::model::CapabilitySet>>, args: &[SynValue]) -> Result<SynValue, Control> {
@@ -1445,12 +1449,10 @@ fn parquet_info_file(caps: &Rc<std::cell::RefCell<synsema_capabilities::model::C
     };
     match synsema_capabilities::secure::open_for_read(caps, &raw, "parquet_info_file()")? {
         synsema_capabilities::secure::OpenedForRead::Bundled(_, b) => {
-            let reader = SerializedFileReader::new(bytes::Bytes::from_static(b)).map_err(|e| err(format!("{}: not a Parquet file: {}", F, e)))?;
-            Ok(parquet_info_meta(reader.metadata()))
+            parquet_info_reader(bytes::Bytes::from_static(b), F)
         }
         synsema_capabilities::secure::OpenedForRead::Disk(_, file) => {
-            let reader = SerializedFileReader::new(file).map_err(|e| err(format!("{}: not a Parquet file: {}", F, e)))?;
-            Ok(parquet_info_meta(reader.metadata()))
+            parquet_info_reader(file, F)
         }
     }
 }
@@ -1768,5 +1770,65 @@ mod tests {
         assert_ne!(paths[0], paths[1]);
         assert!(paths.contains(&"[\"a.b\"]".to_string()), "{:?}", paths);
         assert!(paths.contains(&"[\"a\", \"b\"]".to_string()), "{:?}", paths);
+    }
+
+    #[test]
+    fn v0664_file_metadata_reads_only_the_footer() {
+        use parquet::file::reader::Length;
+        use std::io::{Read, Seek, SeekFrom, Write};
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        struct CountedFile {
+            file: std::fs::File,
+            bytes_read: Arc<AtomicU64>,
+        }
+        struct CountedRead<R> {
+            reader: R,
+            bytes_read: Arc<AtomicU64>,
+        }
+        impl<R: Read> Read for CountedRead<R> {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let n = self.reader.read(buf)?;
+                self.bytes_read.fetch_add(n as u64, Ordering::Relaxed);
+                Ok(n)
+            }
+        }
+        impl Length for CountedFile {
+            fn len(&self) -> u64 { self.file.metadata().unwrap().len() }
+        }
+        impl ChunkReader for CountedFile {
+            type T = CountedRead<std::io::BufReader<std::fs::File>>;
+            fn get_read(&self, start: u64) -> parquet::errors::Result<Self::T> {
+                let reader = self.file.get_read(start)?;
+                Ok(CountedRead { reader, bytes_read: self.bytes_read.clone() })
+            }
+            fn get_bytes(&self, start: u64, length: usize) -> parquet::errors::Result<bytes::Bytes> {
+                let mut file = self.file.try_clone()?;
+                file.seek(SeekFrom::Start(start))?;
+                let mut data = vec![0; length];
+                file.read_exact(&mut data)?;
+                self.bytes_read.fetch_add(length as u64, Ordering::Relaxed);
+                Ok(data.into())
+            }
+        }
+
+        let path = std::env::temp_dir().join(format!("synsema-v0664-footer-{}.parquet", std::process::id()));
+        let mut file = std::fs::File::create(&path).unwrap();
+        file.set_len(16 * 1024 * 1024).unwrap();
+        file.seek(SeekFrom::End(0)).unwrap();
+        file.write_all(include_bytes!("../tests/fixtures/v0664_stats.parquet")).unwrap();
+        drop(file);
+        let size = std::fs::metadata(&path).unwrap().len();
+        let count = Arc::new(AtomicU64::new(0));
+        let reader = CountedFile { file: std::fs::File::open(&path).unwrap(), bytes_read: count.clone() };
+        let info = match parquet_info_reader(reader, "parquet_info_file") {
+            Ok(v) => v,
+            Err(Control::Error(e)) => panic!("{e}"),
+            Err(_) => panic!("unexpected control flow"),
+        };
+        assert!(info.to_string().contains("rows: 6"));
+        let read = count.load(Ordering::Relaxed);
+        assert!(read < 128 * 1024, "read {} bytes from {}-byte file", read, size);
+        std::fs::remove_file(path).unwrap();
     }
 }

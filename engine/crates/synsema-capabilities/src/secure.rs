@@ -887,6 +887,36 @@ mod v0664_bytes_tests {
         assert!(bundled_bytes_range(bytes, Some((u64::MAX, u64::MAX))).is_empty());
         assert!(bundled_bytes_range(bytes, Some((0, 0))).is_empty());
     }
+
+    #[test]
+    fn pure_profile_reads_only_the_requested_bundle_range() {
+        use synsema_core::bundle::{Bundle, BundleMode, Manifest};
+        let manifest = Manifest {
+            format: 2,
+            engine: "v0.6.64".into(),
+            main: "main.syn".into(),
+            ceiling: None,
+            profile: "pure".into(),
+            built_at: "2026-11-17T00:00:00Z".into(),
+            mode: BundleMode::Run,
+            serve: None,
+            audit: None,
+            packages: Vec::new(),
+        };
+        let bundle = Bundle::new(manifest, vec![
+            ("main.syn".into(), b"print(1)".to_vec()),
+            ("data.bin".into(), b"abcdef".to_vec()),
+        ]).unwrap();
+        assert!(synsema_core::bundle::mount(bundle));
+        let mut interp = Interpreter::new();
+        register_pure_fs(&interp, "pure profile");
+        let program = synsema_core::parser::parse_source(
+            "print(decode(read_file_bytes(\"data.bin\", {\"offset\": 2, \"length\": 3})))",
+            "<bundle-test>",
+        ).unwrap();
+        assert!(interp.execute(&program).is_ok());
+        assert_eq!(interp.output, ["cde"]);
+    }
 }
 
 /// Escritura ATÓMICA: temp en el mismo dir (rename intra-FS, sin cross-device) + rename.
