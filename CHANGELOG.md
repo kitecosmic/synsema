@@ -6,7 +6,7 @@ Each says what changed, why, and what to write instead.
 
 Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the release date.
 
-## v0.6.64 — in progress
+## v0.6.64 — 2026-11-17
 
 - `read_file_bytes(path, {"offset": n, "length": m})` reads a zero-based byte range from disk or a bundled asset. The one-argument form still reads the whole file.
 - `parquet_info(bytes)` now includes each row group's column min, max and null count when trustworthy metadata exists. `parquet_info_file(path)` reads the same metadata from a path without loading data pages; it requires `file.read`.
