@@ -78,6 +78,7 @@ Also: the LLM words **`reason` / `decide` / `analyze` / `generate`** (like every
 | `functools.reduce(f, xs, init)` | `reduce(xs, f, init)` |
 | `xs.index(v)` (raises) | `index_of(xs, v)` → **`nothing`** when absent (not -1, no error); `v in xs` is the operator for membership |
 | `d.get(k, default)` / `d.pop(k)` / `{**a, **b}` | `get(m, k, default)` / `remove(m, k)` (new map) / `merge(a, b)` (new map, right wins) (v0.6.29+). `d.get("a")` → `Map has no key 'get' — … Synsema has no methods: get(m, key, default)` |
+| Tuple keys for pair counters, e.g. `counts[(left, right)]` | Pack bounded integer IDs: `key = left * base + right`; `get(counts, key, 0)` and `set counts[key] to value` | Synsema map keys are text; integer `key` aliases its decimal text form (v0.6.63 performance path). Require `0 <= right < base` and a product within the integer range. |
 | `d.keys()` / `d.values()` / `d.items()` | `keys(m)` / `values(m)` / `items(m)` → `[{key, value}, …]` (v0.6.29+) |
 | `json.dumps(x)` / `json.loads(s)` | `json_encode(x)` / `json_decode(s)` (pure, no import; a `secret` inside is an error since v0.6.46 — it is never written as text; big integers exact up to 4300 digits like Python's `int`, `1e400` → error instead of `inf`; a leading UTF-8 BOM is skipped; `NaN`/`Infinity` are an error unless `json_decode(s, allow_nan = true)` — Python's `json.loads` accepts them silently) |
 | `"%d" % x` / `"{}".format(x)` | `` `{x}` `` / `fmt("{x}", {"x": x})` | `%`-formatting → error `there is no %-formatting: use a template` |
