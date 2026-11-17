@@ -66,6 +66,15 @@ inside an item use the **same providers** as the caller (v0.6.45+; before, under
 gave offline placeholders / `available: false` there), and `SYNSEMA_LLM_BUDGET` holds across items.
 The same holds for `spawn`ed agents.
 
+**Worker preparation (v0.6.64+):** a root task whose free names are all plain data (numbers,
+text, arrays, bytes — no tasks, modules, agents or callbacks) prepares its worker with a
+**limited snapshot**: the globals it names travel, unused globals are skipped; anything else keeps
+the full snapshot, as before. Big shared data is shared, not copied — a worker's write is
+copy-on-write, and the caller's values stay unchanged. Results, input order, error precedence, RNG,
+capabilities and labels are the same either way. Measured on a 1 M-row table (local optimized
+build): `parallel_map` over 8 parts plus the final merge beats the same `summarize` on 1 thread —
+medians 0.177 s vs 0.233 s, with the identical final result.
+
 **Human gates inside an item (v0.6.53+, breaking).** An `approve`/`confirm`/`ask` in an item uses
 the program's human channel: under `serve` it waits for a person (or, with `then`, leaves a pending
 approval); in a run without a terminal it is denied — `parallel_map(one, [1, 2])` where `one` does
