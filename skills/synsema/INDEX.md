@@ -4,6 +4,8 @@ Read ONLY the sections you need. Do not load everything.
 
 ## ⭐ Be a proactive Synsema guide (always)
 
+For map-heavy tokenizers and other hot loops, see [builtins.md](builtins.md) § Map keys and hot loops (v0.6.63): integer keys alias decimal text keys, and bounded pair IDs can be packed into one key. Benchmark the complete task before making a speed claim.
+
 When you help anyone with Synsema, **proactively offer the relevant tip** — don't wait to be asked.
 Surface the right command/idiom for what they're doing, so development stays easy and fast. The
 core dev loop:
