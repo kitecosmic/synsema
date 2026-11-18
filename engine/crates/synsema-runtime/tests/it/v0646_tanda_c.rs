@@ -81,7 +81,7 @@ fn c4_parquet_scan_reads_from_disk_like_parquet_read() {
          let a be parquet_scan(\"{d}/t.parquet\", opts)\n\
          let b be parquet_read(read_file_bytes(\"{d}/t.parquet\"), opts)\n\
          print(a == b, length(a), keys(a[0]))\n\
-         print(parquet_scan(\"{d}/t.parquet\") == rows)\n\
+         print(to_rows(parquet_scan(\"{d}/t.parquet\")) == rows)\n\
          let l be lineage()\n\
          print(l[0].source, l[0].what == \"{d}/t.parquet\", \"0x\" + l[0].sha256 == hex(sha256(canonical_json(a))))\n"
     );
@@ -94,7 +94,7 @@ fn c4_parquet_scan_reads_from_disk_like_parquet_read() {
          let big be join(apply(range(0, 20000), (i) => \"x\"), \"\")\n\
          let rows be [{{\"s\": big}}, {{\"s\": \"a\"}}]\n\
          write_file(\"{d}/big.parquet\", parquet_write(rows))\n\
-         print(parquet_scan(\"{d}/big.parquet\") == rows, parquet_read(read_file_bytes(\"{d}/big.parquet\")) == rows)\n"
+         print(to_rows(parquet_scan(\"{d}/big.parquet\")) == rows, parquet_read(read_file_bytes(\"{d}/big.parquet\")) == parquet_scan(\"{d}/big.parquet\"))\n"
     );
     assert_eq!(out(&src), vec!["true true"]);
     let e = fails(&format!("print(parquet_scan(\"{d}/t.parquet\"))\n"));

@@ -54,3 +54,65 @@ fn json_encode_of_a_table_is_the_rows_one() {
         vec![r#"[{"k": 1, "v": 1.5}, {"k": 2, "v": 2.5}]"#.to_string()]
     );
 }
+
+/// T3 (diseño §4): `parquet_read`/`parquet_scan` devuelven una TABLA, leída por columnas.
+/// Los tipos exactos del camino de filas se conservan (diseño: el mismo mapeo que `convert`).
+#[test]
+fn parquet_read_gives_a_table_with_the_same_types() {
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/polars_1_44_zstd.parquet");
+    let dir = fixture.parent().unwrap().to_string_lossy().replace('\\', "/");
+    let src = format!(
+        r#"require file.read("{dir}/*")
+let t be parquet_read(read_file_bytes("{dir}/polars_1_44_zstd.parquet"))
+print(type_of(t))
+print(length(columns(t)), columns(t)[0])
+print(t[2].id, t[1].name, type_of(t[0].d), type_of(t[0].amt))
+print(t[0].id, t[0].x)
+print(text(summarize(t, "ok", {{"n": count(), "s": sum_of("x")}}) == summarize(to_rows(t), "ok", {{"n": count(), "s": sum_of("x")}})))"#,
+        dir = dir
+    );
+    assert_eq!(
+        out(&src),
+        vec![
+            "table",
+            "7 id",
+            "nothing nothing date decimal",
+            "1 1.5",
+            "true",
+        ]
+    );
+    // La lectura y la escritura cierran redondo: escribir una tabla y leerla da lo mismo
+    // (con snappy y con zstd).
+    let rt = format!(
+        r#"require file.read("{dir}/*")
+let t be parquet_read(read_file_bytes("{dir}/polars_1_44_zstd.parquet"))
+print(parquet_read(parquet_write(t)) == t, parquet_read(parquet_write(t, {{"compression": "zstd"}})) == t)"#,
+        dir = dir
+    );
+    assert_eq!(out(&rt), vec!["true true".to_string()]);
+}
+
+/// Las opciones de lectura (columns, limit) sobre el camino por columnas.
+#[test]
+fn parquet_options_on_the_columnar_path() {
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/polars_1_44_zstd.parquet");
+    let dir = fixture.parent().unwrap().to_string_lossy().replace('\\', "/");
+    let src = format!(
+        r#"require file.read("{dir}/*")
+print(type_of(parquet_scan("{dir}/polars_1_44_zstd.parquet")))
+print(columns(parquet_scan("{dir}/polars_1_44_zstd.parquet", {{"columns": ["id", "x"]}})))
+let p be parquet_scan("{dir}/polars_1_44_zstd.parquet", {{"columns": ["id", "x"]}})
+print(p[0].id, p[0].x)
+print(length(parquet_scan("{dir}/polars_1_44_zstd.parquet", {{"limit": 2}})))"#,
+        dir = dir
+    );
+    assert_eq!(
+        out(&src),
+        vec![
+            "table",
+            r#"["id", "x"]"#,
+            "1 1.5",
+            "2",
+        ]
+    );
+}

@@ -195,6 +195,11 @@ fn write(v: &SynValue, out: &mut String, depth: usize, path: &str) -> Result<(),
                 synsema_core::rng::code_noun(v)
             )))
         }
+        // Una tabla es su lista de filas (v0.6.65, diseño §2): el JSON canónico es el de ellas.
+        SynValue::Table(t) => {
+            let v = synsema_core::types::syn_list(t.to_rows());
+            write(&v, out, depth, path)?;
+        }
         other => {
             return Err(err(format!(
                 "canonical_json: {} is a {} and JSON cannot represent it (only text, numbers, bools, nothing, lists and maps)",
