@@ -186,17 +186,22 @@ fn list_generics_reject_a_table() {
 #[test]
 fn the_table_operations_accept_a_table() {
     let rows = ROWS;
-    // summarize da lo mismo sobre filas que sobre la tabla.
+    // summarize da lo mismo sobre filas que sobre la tabla (la tabla va por grupos
+    // sub-tabla y agregados por bloque).
     t(&format!(
         "summarize(table({}), \"k\", {{\"n\": count()}}) == summarize({}, \"k\", {{\"n\": count()}})",
         rows, rows
     ));
-    // group_by sobre una tabla: los grupos son listas de filas (T2b los pasa a sub-tablas,
-    // mismo tipo que la entrada; por ahora el despliegue de rows_arg manda).
+    // group_by sobre una tabla: los grupos son sub-tablas, mismo tipo que la entrada, y sus
+    // filas son las del grupo.
     shows(
         &format!("type_of(group_by(table({}), \"k\")[0].items)", rows),
-        "list",
+        "table",
     );
+    t(&format!(
+        "to_rows(group_by(table({}), \"k\")[0].items) == group_by({}, \"k\")[0].items",
+        rows, rows
+    ));
     // join / pivot / sort_by / fill_missing / drop_missing / where / count_by aceptan tabla.
     t(&format!(
         "join(table({}), table({}), \"k\") == join({}, {}, \"k\")",
@@ -216,6 +221,46 @@ fn the_table_operations_accept_a_table() {
         "length(where(table({}), (r) => r.v > 2.0)) == 2",
         rows
     ));
+}
+
+#[test]
+fn aggregations_over_blocks_match_the_row_path_exactly() {
+    // Los agregados tipados (sum/mean/min/max/median/count/n_unique) por bloque sobre la
+    // tabla dan exactamente lo que dan por filas; una lambda que recibe el grupo también
+    // anda (el grupo es una tabla).
+    let rows = ROWS;
+    for agg in ["sum_of(\"v\")", "mean_of(\"v\")", "min_of(\"v\")", "max_of(\"v\")", "median_of(\"v\")"] {
+        t(&format!(
+            "summarize(table({}), \"k\", {{\"a\": {}}}) == summarize({}, \"k\", {{\"a\": {}}})",
+            rows, agg, rows, agg
+        ));
+    }
+    t(&format!(
+        "summarize(table({}), \"k\", {{\"n\": count(), \"u\": n_unique_of(\"v\")}}) == summarize({}, \"k\", {{\"n\": count(), \"u\": n_unique_of(\"v\")}})",
+        rows, rows
+    ));
+    t(&format!(
+        "summarize(table({}), \"k\", {{\"m\": (g) => length(g)}}) == summarize({}, \"k\", {{\"m\": (g) => length(g)}})",
+        rows, rows
+    ));
+    // count_by por bloque.
+    t(&format!(
+        "count_by(table({}), \"k\") == count_by({}, \"k\")",
+        rows, rows
+    ));
+    shows(
+        &format!("text(count_by(table([{{\"k\": 1}}, {{\"k\": 1}}, {{\"k\": 2}}]), \"k\")[0].count)"),
+        "2",
+    );
+    // Nulos en la columna agregada: se saltean igual que por filas.
+    t(&format!(
+        "summarize(table([{{\"k\": 1, \"v\": nothing}}, {{\"k\": 1, \"v\": 4.0}}]), \"k\", {{\"a\": sum_of(\"v\")}}) == summarize([{{\"k\": 1, \"v\": nothing}}, {{\"k\": 1, \"v\": 4.0}}], \"k\", {{\"a\": sum_of(\"v\")}})"
+    ));
+    // Una columna de agregado que no está en la tabla: el mismo error que por filas.
+    fails_with(
+        &format!("summarize(table({}), \"k\", {{\"a\": sum_of(\"z\")}})", rows),
+        "no row has a column \"z\"",
+    );
 }
 
 #[test]

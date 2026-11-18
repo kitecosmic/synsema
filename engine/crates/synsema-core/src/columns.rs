@@ -172,6 +172,40 @@ impl ColumnTable {
         })
     }
 
+    /// Una sub-tabla con las filas `indices` (en ese orden), para los grupos de
+    /// `summarize`/`group_by`/`count_by`. Reúne los bloques (una copia de los datos del
+    /// grupo, sin materializar mapas por fila); los nulos siguen en su bitmap.
+    pub fn gather(&self, indices: &[usize]) -> ColumnTable {
+        let cols = self
+            .cols
+            .iter()
+            .map(|(k, data)| {
+                let gathered = match &**data {
+                    ColumnData::I64(v, nulls) => {
+                        ColumnData::I64(indices.iter().map(|&i| v[self.offset + i]).collect(), shift_nulls_gather(nulls, indices, |b, i| b.is_null(self.offset + i)))
+                    }
+                    ColumnData::F64(v, nulls) => {
+                        ColumnData::F64(indices.iter().map(|&i| v[self.offset + i]).collect(), shift_nulls_gather(nulls, indices, |b, i| b.is_null(self.offset + i)))
+                    }
+                    ColumnData::F32(v, nulls) => {
+                        ColumnData::F32(indices.iter().map(|&i| v[self.offset + i]).collect(), shift_nulls_gather(nulls, indices, |b, i| b.is_null(self.offset + i)))
+                    }
+                    ColumnData::Bool(v, nulls) => {
+                        ColumnData::Bool(indices.iter().map(|&i| v[self.offset + i]).collect(), shift_nulls_gather(nulls, indices, |b, i| b.is_null(self.offset + i)))
+                    }
+                    ColumnData::Text(v, nulls) => {
+                        ColumnData::Text(indices.iter().map(|&i| v[self.offset + i].clone()).collect(), shift_nulls_gather(nulls, indices, |b, i| b.is_null(self.offset + i)))
+                    }
+                    ColumnData::Value(cells) => {
+                        ColumnData::Value(indices.iter().map(|&i| cells[self.offset + i].clone()).collect())
+                    }
+                };
+                (k.clone(), Obj::new(gathered))
+            })
+            .collect();
+        ColumnTable { n_rows: indices.len(), offset: 0, cols }
+    }
+
     /// La celda `(fila, columna)` materializada (null → `nothing`).
     pub fn cell(&self, row: usize, col: usize) -> SynValue {
         debug_assert!(row < self.n_rows && col < self.cols.len());
@@ -590,6 +624,22 @@ fn shift_nulls(nulls: &Option<Bitmap>, offset: usize, len: usize) -> Option<Bitm
     let mut out = Bitmap::all_valid(len);
     for i in 0..len {
         if src.is_null(offset + i) {
+            out.set_null(i);
+        }
+    }
+    if out.null_count() == 0 { None } else { Some(out) }
+}
+
+/// El bitmap de un `gather`: los bits de las filas reunidas, en su orden.
+fn shift_nulls_gather(
+    nulls: &Option<Bitmap>,
+    indices: &[usize],
+    is_null: impl Fn(&Bitmap, usize) -> bool,
+) -> Option<Bitmap> {
+    let src = nulls.as_ref()?;
+    let mut out = Bitmap::all_valid(indices.len());
+    for (i, &row) in indices.iter().enumerate() {
+        if is_null(src, row) {
             out.set_null(i);
         }
     }

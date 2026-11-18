@@ -413,6 +413,113 @@ pub fn groups(
     Ok(out)
 }
 
+/// El error de una columna que no está en el esquema de una tabla (la forma de
+/// `check_column`, contra el esquema en vez de contra las filas).
+fn missing_column(t: &crate::columns::ColumnTable, col: &str, who: &str) -> Control {
+    let seen: Vec<String> = t.schema().iter().map(|k| format!("{:?}", k.as_str())).take(12).collect();
+    err(format!(
+        "{}: no row has a column {:?} (columns: {})",
+        who,
+        col,
+        seen.join(", ")
+    ))
+}
+
+/// Agrupa una TABLA (v0.6.65): el mismo orden e igualdad que `groups`, pero lee la clave del
+/// bloque (sin buscar en el mapa de cada fila) y los grupos salen como SUB-TABLAS
+/// (`gather`: una copia de los bloques del grupo, sin materializar mapas por fila). Es lo
+/// que consumen los agregadores con su camino por columna.
+fn groups_of_table(
+    interp: &mut Interpreter,
+    t: &crate::columns::ColumnTable,
+    spec: &KeySpec,
+    who: &str,
+) -> Result<Vec<(SynValue, SynValue)>, Control> {
+    // Las posiciones de las columnas clave, una vez.
+    let key_cols: Vec<usize> = match spec {
+        KeySpec::Column(c) => vec![t.col_index(c).ok_or_else(|| missing_column(t, c, who))?],
+        KeySpec::Columns(cs) => cs
+            .iter()
+            .map(|c| t.col_index(c).ok_or_else(|| missing_column(t, c, who)))
+            .collect::<Result<Vec<_>, _>>()?,
+        KeySpec::Func(_) => Vec::new(),
+    };
+    let mut out: Vec<(SynValue, Vec<usize>)> = Vec::new();
+    let mut index: std::collections::HashMap<GroupKey, usize> = std::collections::HashMap::new();
+    let mut mix = NumMix::default();
+    for r in 0..t.n_rows() {
+        // La clave del bloque: el valor se clona sólo si abre un grupo (la misma construcción
+        // de `groups`: una columna es el valor; varias, un mapa con sus nombres).
+        let (probe, k) = if !key_cols.is_empty() {
+            let k = match key_cols.len() {
+                1 => t.cell(r, key_cols[0]),
+                _ => {
+                    let mut m = SynMap::with_capacity(key_cols.len());
+                    for &ci in &key_cols {
+                        m.insert(t.schema()[ci].clone(), t.cell(r, ci));
+                    }
+                    syn_map(m)
+                }
+            };
+            if may_mix_numbers(&k) {
+                mix.check(&k, who)?;
+            }
+            (group_key(&k), Some(k))
+        } else {
+            let row = syn_map(t.row(r));
+            let k = key_of(interp, spec, &row, who)?;
+            if may_mix_numbers(&k) {
+                mix.check(&k, who)?;
+            }
+            (group_key(&k), Some(k))
+        };
+        match index.get(&probe) {
+            Some(&i) => out[i].1.push(r),
+            None => {
+                let k = k.unwrap_or_else(|| unreachable!("sin columna, la clave ya está"));
+                index.insert(probe, out.len());
+                out.push((k, vec![r]));
+            }
+        }
+    }
+    Ok(out
+        .into_iter()
+        .map(|(k, idxs)| (k, SynValue::Table(crate::types::Obj::new(t.gather(&idxs)))))
+        .collect())
+}
+
+/// Los valores no nulos de una columna de un GRUPO: por bloque si el grupo es una tabla
+/// (v0.6.65: sin materializar filas ni buscar claves), con el caché de forma si es una lista.
+fn group_column_values(group: &SynValue, col: &str, who: &str) -> Result<Vec<SynValue>, Control> {
+    match group {
+        SynValue::Table(t) => {
+            let Some(ci) = t.col_index(col) else { return Ok(Vec::new()) };
+            let mut out = Vec::with_capacity(t.n_rows());
+            for r in 0..t.n_rows() {
+                let v = t.cell(r, ci);
+                if !matches!(v, SynValue::Nothing) {
+                    out.push(v);
+                }
+            }
+            Ok(out)
+        }
+        _ => {
+            let rows = rows_arg(group, who)?;
+            let c = Column::new(col);
+            let mut out = Vec::with_capacity(rows.len());
+            for r in rows.iter() {
+                c.read(r, who, |v| {
+                    if !matches!(v, SynValue::Nothing) {
+                        out.push(v.clone());
+                    }
+                    Ok::<_, Control>(())
+                })??;
+            }
+            Ok(out)
+        }
+    }
+}
+
 /// Forma de texto para el índice rápido de `groups`: números iguales (`1`, `1.0`, `1d`)
 /// caen en el mismo balde; `syn_equals` decide igual.
 pub(crate) fn probe_key(v: &SynValue) -> String {
@@ -682,6 +789,11 @@ fn canon_number(n: &Number, out: &mut String) {
 
 /// `group_by(rows, key)` → `[{key, items}]` en orden de primera aparición.
 pub fn group_by(interp: &mut Interpreter, args: &[SynValue]) -> Result<SynValue, Control> {
+    // v0.6.65: sobre una tabla los grupos son sub-tablas (mismo tipo que la entrada).
+    if let Some(SynValue::Table(t)) = args.first() {
+        let key = args.get(1).ok_or_else(|| err("group_by(items, key) takes the items and a key (column, columns or function)"))?;
+        return group_by_table(interp, t, key);
+    }
     let (rows, spec) = match (args.first(), args.get(1)) {
         // Orden histórico `group_by(fn, lista)` también (como sort_by).
         (Some(f @ (SynValue::Task(_) | SynValue::Builtin(_))), Some(l @ SynValue::List(_))) => {
@@ -697,6 +809,23 @@ pub fn group_by(interp: &mut Interpreter, args: &[SynValue]) -> Result<SynValue,
                 let mut m = SynMap::new();
                 m.insert("key", k);
                 m.insert("items", syn_list(items));
+                syn_map(m)
+            })
+            .collect(),
+    ))
+}
+
+/// `group_by(table, key)` (v0.6.65): los grupos salen como sub-tablas, mismo tipo que la
+/// entrada (diseño §10).
+pub fn group_by_table(interp: &mut Interpreter, t: &crate::columns::ColumnTable, key: &SynValue) -> Result<SynValue, Control> {
+    let spec = key_spec(key, "group_by")?;
+    let gs = groups_of_table(interp, t, &spec, "group_by")?;
+    Ok(syn_list(
+        gs.into_iter()
+            .map(|(k, items)| {
+                let mut m = SynMap::new();
+                m.insert("key", k);
+                m.insert("items", items);
                 syn_map(m)
             })
             .collect(),
@@ -740,8 +869,30 @@ pub fn columns_builtin(args: &[SynValue]) -> Result<SynValue, Control> {
 /// `summarize(rows, by, aggs)` → filas: las columnas de la clave + un valor por agregado.
 /// `aggs` = mapa `nombre → función del grupo` (los `sum_of("col")`, `count()`, … de abajo o
 /// cualquier `(group) => …`).
-pub fn summarize(interp: &mut Interpreter, args: &[SynValue]) -> Result<SynValue, Control> {    const W: &str = "summarize";
-    let rows = rows_arg(args.first().ok_or_else(|| err("summarize(rows, by, aggs)"))?, W)?;
+/// `summarize(rows, by, aggs)` → filas: las columnas de la clave + un valor por agregado.
+/// `aggs` = mapa `nombre → función del grupo` (los `sum_of("col")`, `count()`, … de abajo o
+/// cualquier `(group) => …`). Sobre una tabla (v0.6.65) los grupos son sub-tablas y los
+/// agregados leen bloques (diseño §10).
+pub fn summarize(interp: &mut Interpreter, args: &[SynValue]) -> Result<SynValue, Control> {
+    const W: &str = "summarize";
+    let arg0 = args.first().ok_or_else(|| err("summarize(rows, by, aggs)"))?;
+    if let SynValue::Table(t) = arg0 {
+        let spec = key_spec(args.get(1).ok_or_else(|| err("summarize(rows, by, aggs): missing by"))?, W)?;
+        let aggs = match args.get(2) {
+            Some(SynValue::Map(m)) => m.borrow().to_map(),
+            Some(other) => return Err(err(format!("{}: aggs must be a map name → function, got {}", W, other.type_name()))),
+            None => return Err(err("summarize(rows, by, aggs): missing aggs")),
+        };
+        // Las columnas de los agregados, contra el esquema (el equivalente a `check_column`).
+        for c in agg_columns_of(&aggs) {
+            if t.col_index(&c).is_none() && t.n_rows() > 0 {
+                return Err(missing_column(t, &c, W));
+            }
+        }
+        let gs = groups_of_table(interp, t, &spec, W)?;
+        return in_table_op(|| summarize_groups(interp, &spec, &aggs, gs));
+    }
+    let rows = rows_arg(arg0, W)?;
     let spec = key_spec(args.get(1).ok_or_else(|| err("summarize(rows, by, aggs): missing by"))?, W)?;
     let aggs = match args.get(2) {
         Some(SynValue::Map(m)) => m.borrow().to_map(),
@@ -750,18 +901,38 @@ pub fn summarize(interp: &mut Interpreter, args: &[SynValue]) -> Result<SynValue
     };
     check_agg_columns(&rows, aggs.values())?;
     let gs = groups(interp, &rows, &spec, W)?;
+    let gs = gs.into_iter().map(|(k, items)| (k, syn_list(items))).collect();
     in_table_op(|| summarize_groups(interp, &spec, &aggs, gs))
+}
+
+/// Las columnas registradas de los agregados de un mapa de aggs (para validarlas contra el
+/// esquema de una tabla).
+fn agg_columns_of(aggs: &MapObj) -> Vec<String> {
+    let mut out = Vec::new();
+    for f in aggs.values() {
+        if let SynValue::Builtin(b) = f {
+            let found = AGG_COLS.with(|m| {
+                m.borrow().get(&(Rc::as_ptr(b) as usize)).and_then(|(w, col, kind)| {
+                    w.upgrade().filter(|t| Rc::ptr_eq(t, b)).map(|_| (col.clone(), *kind))
+                })
+            });
+            if let Some((col, _)) = found {
+                out.push(col);
+            }
+        }
+    }
+    out
 }
 
 fn summarize_groups(
     interp: &mut Interpreter,
     spec: &KeySpec,
     aggs: &MapObj,
-    gs: Vec<(SynValue, Vec<SynValue>)>,
+    gs: Vec<(SynValue, SynValue)>,
 ) -> Result<SynValue, Control> {
     const W: &str = "summarize";
     let mut out = Vec::with_capacity(gs.len());
-    for (k, items) in gs {
+    for (k, group) in gs {
         let mut row = SynMap::new();
         match (spec, &k) {
             (KeySpec::Column(c), _) => {
@@ -776,7 +947,6 @@ fn summarize_groups(
                 row.insert("key", k.clone());
             }
         }
-        let group = syn_list(items);
         for (name, f) in aggs.iter() {
             if row.contains_key(name) {
                 return Err(err(format!(
@@ -795,8 +965,26 @@ fn summarize_groups(
 }
 
 /// Números presentes de una columna del grupo: `nothing` se saltea; lo que no es número es
-/// error (una columna de texto no se suma).
+/// error (una columna de texto no se suma). Sobre una tabla (v0.6.65) lee el bloque, celda a
+/// celda, sin buscar en el mapa de cada fila.
 fn column_numbers(group: &SynValue, col: &str, who: &str) -> Result<Vec<Number>, Control> {
+    if let SynValue::Table(t) = group {
+        let Some(ci) = t.col_index(col) else { return Ok(Vec::new()) };
+        let mut out = Vec::with_capacity(t.n_rows());
+        for r in 0..t.n_rows() {
+            match t.cell(r, ci) {
+                SynValue::Nothing => {}
+                SynValue::Number(n) => out.push(n),
+                other => {
+                    return Err(err(format!(
+                        "{}: column {:?} has a {}, expected numbers",
+                        who, col, other.type_name()
+                    )))
+                }
+            }
+        }
+        return Ok(out);
+    }
     let SynValue::List(l) = group else {
         return Err(err(format!("{}: expected a list of rows (maps), got {}", who, group.type_name())));
     };
@@ -910,32 +1098,26 @@ pub fn aggregator(kind: &'static str, args: &[SynValue]) -> Result<SynValue, Con
             // Cuántas filas: el largo del grupo, sin copiarlo.
             "count" => match group {
                 SynValue::List(l) => Ok(syn_int(l.borrow().len() as i64)),
+                // v0.6.65: un grupo sub-tabla se cuenta por filas (sin materializar).
+                SynValue::Table(t) => Ok(syn_int(t.n_rows() as i64)),
                 other => Err(err(format!("{}: expected a list of rows (maps), got {}", who, other.type_name()))),
             },
             "first" => Ok(rows_arg(group, who)?.first().map(|r| row_get(r, &col, who)).transpose()?.unwrap_or(SynValue::Nothing)),
             "n_unique" => {
-                let rows = rows_arg(group, who)?;
+                let vals = group_column_values(group, &col, who)?;
                 let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
                 let mut mix = NumMix::default();
-                for r in &rows {
-                    let v = row_get(r, &col, who)?;
+                for v in &vals {
                     if !matches!(v, SynValue::Nothing) {
-                        mix.check(&v, "n_unique_of")?;
-                        seen.insert(probe_key(&v));
+                        mix.check(v, "n_unique_of")?;
+                        seen.insert(probe_key(v));
                     }
                 }
                 Ok(syn_int(seen.len() as i64))
             }
             // min/max aceptan lo mismo que `min`/`max`: números, textos o fechas.
             "min" | "max" => {
-                let rows = rows_arg(group, who)?;
-                let vals: Vec<SynValue> = rows
-                    .iter()
-                    .map(|r| row_get(r, &col, who))
-                    .collect::<Result<Vec<_>, _>>()?
-                    .into_iter()
-                    .filter(|v| !matches!(v, SynValue::Nothing))
-                    .collect();
+                let vals: Vec<SynValue> = group_column_values(group, &col, who)?;
                 if vals.is_empty() {
                     return Ok(SynValue::Nothing);
                 }
@@ -985,6 +1167,42 @@ pub fn aggregator(kind: &'static str, args: &[SynValue]) -> Result<SynValue, Con
 /// primera aparición) — el `value_counts` de pandas.
 pub fn count_by(interp: &mut Interpreter, args: &[SynValue]) -> Result<SynValue, Control> {
     const W: &str = "count_by";
+    // v0.6.65: sobre una tabla, grupos sub-tabla contados por filas (sin materializar).
+    if let Some(SynValue::Table(t)) = args.first() {
+        let spec = match args.get(1) {
+            Some(k) => key_spec(k, W)?,
+            None => KeySpec::Func(SynValue::Nothing),
+        };
+        if matches!(spec, KeySpec::Func(SynValue::Nothing)) {
+            // Sin clave: cuenta los valores mismos — en una tabla son sus filas.
+            return Ok(syn_list(vec![{
+                let mut m = SynMap::new();
+                m.insert("key", SynValue::Table(crate::types::Obj::new((**t).clone())));
+                m.insert("count", syn_int(t.n_rows() as i64));
+                syn_map(m)
+            }]));
+        }
+        let gs = groups_of_table(interp, t, &spec, W)?;
+        let mut counted: Vec<(SynValue, usize)> = gs
+            .into_iter()
+            .map(|(k, g)| (k, match g {
+                SynValue::Table(gt) => gt.n_rows(),
+                _ => 0,
+            }))
+            .collect();
+        counted.sort_by(|a, b| b.1.cmp(&a.1)); // estable: empates en orden de aparición
+        return Ok(syn_list(
+            counted
+                .into_iter()
+                .map(|(k, n)| {
+                    let mut m = SynMap::new();
+                    m.insert("key", k);
+                    m.insert("count", syn_int(n as i64));
+                    syn_map(m)
+                })
+                .collect(),
+        ));
+    }
     let rows = rows_arg(args.first().ok_or_else(|| err("count_by(items, key)"))?, W)?;
     let spec = match args.get(1) {
         Some(k) => key_spec(k, W)?,
