@@ -570,9 +570,14 @@ pub fn syn_to_json(v: &SynValue) -> Json {
             SynValue::List(l) => l.borrow().get(i),
             SynValue::Map(m) => m.borrow().get_index(i).map(|(_, v)| v.clone()),
             // Tabla (v0.6.65): los hijos son sus celdas, fila por fila; `rebuild` las
-            // vuelve objetos por fila (mismo JSON que `to_rows`).
+            // vuelve objetos por fila (mismo JSON que `to_rows`). `None` al terminar,
+            // como toda rama del recorrido.
             SynValue::Table(t) => {
                 let n_cols = t.n_cols().max(1);
+                let total = t.n_rows() * n_cols;
+                if i >= total {
+                    return None;
+                }
                 Some(t.cell(i / n_cols, i % n_cols))
             }
             SynValue::Server(s) if i == 0 => match &**s {

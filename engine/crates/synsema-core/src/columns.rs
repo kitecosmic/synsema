@@ -391,8 +391,10 @@ fn family_of(v: &SynValue) -> Option<Family> {
 
 fn degrade(f: Family, seen: Option<Family>) -> Family {
     match seen {
-        None | Some(Family::Mixed) => f,
+        // Sin valores todavía (o todo null): la primera familia gana.
+        None | Some(Family::AllNull) => f,
         Some(s) if s == f => s,
+        // Una vez mezclada, mezclada queda (la familia nueva NO resetea).
         _ => Family::Mixed,
     }
 }

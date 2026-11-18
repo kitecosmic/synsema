@@ -42,6 +42,7 @@ mod v0656_f32;
 mod v0658_attenuation;
 mod v0659_transactions;
 mod v0660_text;
+mod v0665_tables;
 mod llm_stream_e2e;
 mod llm_text_prompt;
 mod memory_declared;

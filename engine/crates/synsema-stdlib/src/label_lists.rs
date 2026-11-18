@@ -191,6 +191,8 @@ pub const LABEL_PURE_BUILTINS: &[&str] = &[
     "solana_tx_raw",
     // v0.6.29 (datos): tablas, faltantes, estadística, arrays, azar con semilla, fechas, JSONL,
     // linaje. Todos puros (el azar con semilla es determinista; las fechas no leen el reloj).
+    // v0.6.65: la tabla por columnas y sus conversiones, en la misma familia pura.
+    "table", "to_rows", "columns",
     "summarize", "count_by", "pivot", "count", "count_missing", "sum_of", "mean_of", "min_of", "max_of", "median_of",
     "first_of", "n_unique_of", "quantile_of", "is_missing", "fill_missing", "drop_missing", "fill_nan",
     "quantile", "concat", "stack", "argmin", "argmax", "cumsum", "diff", "cov", "corr", "lstsq",

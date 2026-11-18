@@ -1172,4 +1172,33 @@ mod tests {
         assert_eq!(e.path, "r[0]");
         assert_eq!(label_display_raw(&e.label), "a,b");
     }
+
+    /// v0.6.65: una tabla recorre igual que una lista de mapas — sólo las columnas `Value`
+    /// pueden contener un `Private` (los bloques primitivos no tienen dónde), y el camino
+    /// nombra la columna y la fila. `deep_copy` corta el aliasing conservando la etiqueta.
+    #[test]
+    fn a_table_cell_is_a_label_path() {
+        use crate::columns;
+        let mut r0 = SynMap::new();
+        r0.insert("k", syn_int(1));
+        r0.insert("v", mark(syn_int(5), l(&["app"])));
+        let mut r1 = SynMap::new();
+        r1.insert("k", syn_int(2));
+        r1.insert("v", syn_int(7));
+        let rows = vec![syn_map(r0), syn_map(r1)];
+        let table = SynValue::Table(crate::types::Obj::new(
+            columns::build_from_rows(&rows).expect("tabla de prueba"),
+        ));
+        // La celda privada hace la columna `Value`; el recorrido la ve.
+        assert_eq!(label_display_raw(&label_deep(&table)), "app");
+        assert!(has_label_deep(&table));
+        // El sumidero la encuentra con el camino `.v[0]`, y pasa si lo acepta.
+        let err = check_flow(&table, &[], "t").unwrap_err();
+        assert_eq!(err.path, "t.v[0]");
+        assert!(check_flow(&table, &["app"], "t").is_ok());
+        // deep_copy corta el aliasing y conserva la etiqueta.
+        let copy = deep_copy(&table);
+        assert_eq!(label_display_raw(&label_deep(&copy)), "app");
+        assert!(copy.syn_equals(&table));
+    }
 }

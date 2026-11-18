@@ -1167,6 +1167,11 @@ pub(crate) fn set_leaf_prop(obj: &SynValue, property_name: &str, value: SynValue
             m.borrow_mut().set(property_name, value.clone());
             Ok(value)
         }
+        // v0.6.65 (diseño §6): una tabla es inmutable; el error enseña el rodeo.
+        SynValue::Table(_) => Err(err_at(
+            "a table is immutable — convert it with to_rows(t), change the rows, and rebuild with table(rows)",
+            loc,
+        )),
         _ => Err(cannot_set(obj, "property", loc)),
     }
 }
@@ -1255,6 +1260,11 @@ pub(crate) fn set_leaf_index(
                 e
             })
         }
+        // v0.6.65 (diseño §6): una tabla es inmutable; el error enseña el rodeo.
+        SynValue::Table(_) => Err(err_at(
+            "a table is immutable — convert it with to_rows(t), change the rows, and rebuild with table(rows)",
+            target_loc,
+        )),
         _ => Err(cannot_set(obj, "index", loc)),
     }
 }
@@ -5856,6 +5866,10 @@ impl Interpreter {
         self.register("mode", 1, Rc::new(|_i, a, _l| crate::tabular::mode(a)));
         // DATOS-3/6/14: tablas como listas de mapas.
         self.register("summarize", 3, Rc::new(|i, a, _l| crate::tabular::summarize(i, a)));
+        // v0.6.65: la tabla por columnas y sus conversiones (diseño §4).
+        self.register("table", 1, Rc::new(|_i, a, _l| crate::tabular::table_builtin(a)));
+        self.register("to_rows", 1, Rc::new(|_i, a, _l| crate::tabular::to_rows_builtin(a)));
+        self.register("columns", 1, Rc::new(|_i, a, _l| crate::tabular::columns_builtin(a)));
         self.register("count_by", -1, Rc::new(|i, a, _l| crate::tabular::count_by(i, a)));
         self.register("pivot", -1, Rc::new(|i, a, _l| crate::tabular::pivot(i, a)));
         // `count()` es el agregado de `summarize` (filas del grupo); `count(xs)` cuenta los
@@ -9231,6 +9245,19 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                 _ => crate::arrays::index_by(a, &idx),
             }
             .map_err(|e| crate::arrays::located(e, loc)),
+            // `t[i]` (v0.6.65) → la fila i materializada, con el esquema completo (diseño §5);
+            // las claves ausentes en el origen salen como `nothing`.
+            SynValue::Table(t) => {
+                let i = num_to_i64(&idx)?;
+                let n = t.n_rows();
+                match resolve_index(i, n) {
+                    Some(j) => Ok(syn_map(t.row(j))),
+                    None => Err(err_at(
+                        format!("Index {} out of bounds (table with {} rows)", i, n),
+                        loc,
+                    )),
+                }
+            }
             _ => Err(err_at(format!("Cannot index into {}", obj.type_name()), loc)),
         };
         match plabel {
@@ -9309,6 +9336,13 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                 }
                 return crate::arrays::place_row(labels::unwrap(&parent), labels::unwrap(&idx)).map_err(|e| crate::arrays::located(e, loc));
             }
+            // v0.6.65 (diseño §6): una tabla es inmutable; el error enseña el rodeo.
+            SynValue::Table(_) => {
+                return Err(err_at(
+                    "a table is immutable — convert it with to_rows(t), change the rows, and rebuild with table(rows)",
+                    loc,
+                ));
+            }
             _ => {}
         }
         self.index_read(parent, idx, loc)
@@ -9326,6 +9360,13 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
             if let Some(slot) = m.borrow_mut().get_mut(property_name) {
                 make_unique(slot);
             }
+        }
+        // v0.6.65 (diseño §6): una tabla no tiene campos escribibles.
+        if matches!(labels::unwrap(&parent), SynValue::Table(_)) {
+            return Err(err_at(
+                "a table is immutable — convert it with to_rows(t), change the rows, and rebuild with table(rows)",
+                loc,
+            ));
         }
         self.property_read(parent, property_name, loc)
     }
@@ -10278,6 +10319,8 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
             // lo haría pasar por vacío.
             SynValue::Array(a) if a.ndim() == 0 => Err(err("length: a 0-d array has no length (it is a scalar) — use size(a), which is 1")),
             SynValue::Array(a) => Ok(syn_int(a.shape()[0] as i64)),
+            // v0.6.65: el largo de una tabla es su cantidad de filas (como `len(df)`).
+            SynValue::Table(t) => Ok(syn_int(t.n_rows() as i64)),
             _ => Err(err(format!("Cannot get length of {}", v.type_name()))),
         }
     }
@@ -11414,6 +11457,13 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                 let (s, e) = py_slice_range(a.shape()[0], start, end);
                 Ok(crate::arrays::slice_rows(a, s, e))
             }
+            // v0.6.65: una vista de la tabla que comparte los buffers (copia cero, diseño §3);
+            // la tabla es inmutable, así que la vista es siempre segura.
+            SynValue::Table(t) => {
+                let (s, e) = py_slice_range(t.n_rows(), start, end);
+                let view = t.slice(s, e).ok_or_else(|| err("Cannot slice a table"))?;
+                Ok(SynValue::Table(crate::types::Obj::new(view)))
+            }
             _ => Err(err(format!("Cannot slice {}", coll.type_name()))),
         }
     }
@@ -12146,8 +12196,22 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
         if let Some(SynValue::Array(a)) = args.first() {
             return crate::arrays::where_mask(a, nth(args, 1)?);
         }
-        let (pred, l) = self.dual_fn_rc(args, "where")?;
-        self.with_lambda(&pred, |it, lc| {
+        // v0.6.65 (diseño §10): una tabla se filtra a una tabla (mismo tipo que la entrada);
+        // el predicado corre por fila, así que las filas se despliegan una vez.
+        let table_in = matches!(args.first(), Some(SynValue::Table(_)))
+            || matches!(args.get(1), Some(SynValue::Table(_)));
+        let args: Vec<SynValue> = if table_in {
+            args.iter()
+                .map(|a| match a {
+                    SynValue::Table(t) => syn_list(t.to_rows()),
+                    other => other.clone(),
+                })
+                .collect()
+        } else {
+            args.to_vec()
+        };
+        let (pred, l) = self.dual_fn_rc(&args, "where")?;
+        let rows = self.with_lambda(&pred, |it, lc| {
             let mut out = SynList::new();
             for i in 0..l.borrow().len() {
                 let (item, r) = lc.item_keep(it, &l, i, loc)?;
@@ -12156,7 +12220,11 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                 }
             }
             Ok(crate::types::syn_list_of(out))
-        })
+        })?;
+        if table_in {
+            return crate::tabular::table_builtin(&[rows]);
+        }
+        Ok(rows)
     }
 
     fn b_collect(&mut self, args: &[SynValue], _loc: &SourceLocation) -> Result<SynValue, Control> {
@@ -12210,7 +12278,20 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
     }
 
     fn b_sort_by(&mut self, args: &[SynValue], loc: &SourceLocation) -> Result<SynValue, Control> {
-        let (key_func, l) = self.dual_fn_rc(args, "sort_by")?;
+        // v0.6.65 (diseño §10): una tabla se ordena a una tabla (mismo tipo que la entrada);
+        // la clave es una lambda por fila, así que el camino despliega las filas una vez.
+        let table_in = args.iter().take(2).any(|a| matches!(a, SynValue::Table(_)));
+        let args: Vec<SynValue> = if table_in {
+            args.iter()
+                .map(|a| match a {
+                    SynValue::Table(t) => syn_list(t.to_rows()),
+                    other => other.clone(),
+                })
+                .collect()
+        } else {
+            args.to_vec()
+        };
+        let (key_func, l) = self.dual_fn_rc(&args, "sort_by")?;
         let desc = desc_flag(args.get(2), "sort_by")?;
         let n = l.borrow().len();
         let mut keyed: Vec<(SynValue, SynValue)> = Vec::with_capacity(n);
@@ -12224,7 +12305,11 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
         let keys: Vec<SynValue> = keyed.iter().map(|(k, _)| k.clone()).collect();
         check_orderable(&keys, "sort_by")?;
         sort_checked(&mut keyed, |(k, _)| k, desc, "sort_by")?;
-        Ok(syn_list(keyed.into_iter().map(|(_, v)| v).collect()))
+        let rows = syn_list(keyed.into_iter().map(|(_, v)| v).collect());
+        if table_in {
+            return crate::tabular::table_builtin(&[rows]);
+        }
+        Ok(rows)
     }
 
     /// `sort(xs)` / `sort(xs, desc = true)`: orden total y estable de los valores mismos.

@@ -24,6 +24,9 @@ fn err(msg: impl Into<String>) -> Control {
 fn rows_arg(v: &SynValue, who: &str) -> Result<Vec<SynValue>, Control> {
     match v {
         SynValue::List(l) => Ok(l.borrow().to_vec()),
+        // Tabla (v0.6.65): se despliega una vez. Las operaciones que todavía no tienen
+        // camino por columnas andan igual (diseño §10: el camino rápido llega por operación).
+        SynValue::Table(t) => Ok(t.to_rows()),
         other => Err(err(format!("{}: expected a list of rows (maps), got {}", who, other.type_name()))),
     }
 }
@@ -470,6 +473,11 @@ pub fn stable_hash(v: &SynValue) -> Result<u64, String> {
         Value(SynValue),
         List(crate::types::ListRef, usize),
         Map(crate::types::MapRef, Vec<String>, usize),
+        /// Tabla (v0.6.65, diseño §2): cabecera + por celda el nombre de columna y su clave
+        /// canónica (`probe_key`, la misma canonización del agrupador, así dos tablas `==`
+        /// dan el mismo hash aunque el tipo físico de una columna cambie de representación
+        /// equivalente).
+        Table(crate::columns::ColumnTable, Vec<Key>, usize),
     }
     let mut h = Xxh3::with_seed(0);
     h.update(b"synsema:hash-v1\0");
@@ -488,6 +496,16 @@ pub fn stable_hash(v: &SynValue) -> Result<u64, String> {
                 h.update(b"M");
                 h.update(&(keys.len() as u64).to_le_bytes());
                 stack.push(Step::Map(m, keys, 0));
+            }
+            // Tabla (v0.6.65): cabecera con filas y columnas; las celdas van fila por fila
+            // con su nombre de columna (el esquema es parte del valor: dos tablas con
+            // columnas distintas nunca son `==`).
+            Step::Value(SynValue::Table(t)) => {
+                let schema = t.schema();
+                h.update(b"T");
+                h.update(&(t.n_rows() as u64).to_le_bytes());
+                h.update(&(schema.len() as u64).to_le_bytes());
+                stack.push(Step::Table((*t).clone(), schema, 0));
             }
             Step::Value(SynValue::Secret(_)) => return Err("hash: a secret cannot be hashed publicly".into()),
             Step::Value(SynValue::Private(_)) => return Err("hash: private data cannot be hashed publicly".into()),
@@ -515,6 +533,20 @@ pub fn stable_hash(v: &SynValue) -> Result<u64, String> {
                     let child = m.borrow().get(key).expect("key collected from map").clone();
                     stack.push(Step::Map(m, keys, at + 1));
                     stack.push(Step::Value(child));
+                }
+            }
+            Step::Table(t, schema, at) => {
+                let n_cols = schema.len();
+                let total = t.n_rows() * n_cols;
+                if at < total {
+                    let (row, ci) = (at / n_cols, at % n_cols);
+                    let key = schema[ci].as_str();
+                    h.update(&(key.len() as u64).to_le_bytes());
+                    h.update(key.as_bytes());
+                    let canon = probe_key(&t.cell(row, ci));
+                    h.update(&(canon.len() as u64).to_le_bytes());
+                    h.update(canon.as_bytes());
+                    stack.push(Step::Table(t, schema, at + 1));
                 }
             }
         }
@@ -671,11 +703,44 @@ pub fn group_by(interp: &mut Interpreter, args: &[SynValue]) -> Result<SynValue,
     ))
 }
 
+// --- Tabla por columnas (v0.6.65, diseño §4) ---
+
+/// `table(rows)`: arma una tabla por columnas desde una lista de mapas. Dos pasadas sin
+/// acumular celdas (`columns.rs`): la primera decide el esquema y el tipo físico de cada
+/// columna; la segunda llena los bloques.
+pub fn table_builtin(args: &[SynValue]) -> Result<SynValue, Control> {
+    const W: &str = "table";
+    let rows = rows_arg(args.first().ok_or_else(|| err("table(rows) takes a list of maps"))?, W)?;
+    crate::columns::build_from_rows(&rows)
+        .map(|t| SynValue::Table(crate::types::Obj::new(t)))
+        .map_err(err)
+}
+
+/// `to_rows(table)`: la lista de mapas de siempre, una por fila (con el esquema completo;
+/// las celdas nulas salen como `nothing`).
+pub fn to_rows_builtin(args: &[SynValue]) -> Result<SynValue, Control> {
+    match args.first() {
+        Some(SynValue::Table(t)) => Ok(syn_list(t.to_rows())),
+        Some(other) => Err(err(format!("to_rows: expected a table, got {}", other.type_name()))),
+        None => Err(err("to_rows(table) takes a table")),
+    }
+}
+
+/// `columns(table)`: el esquema, en orden de primera aparición.
+pub fn columns_builtin(args: &[SynValue]) -> Result<SynValue, Control> {
+    match args.first() {
+        Some(SynValue::Table(t)) => Ok(syn_list(
+            t.schema().into_iter().map(|k| syn_text(k.as_str())).collect(),
+        )),
+        Some(other) => Err(err(format!("columns: expected a table, got {}", other.type_name()))),
+        None => Err(err("columns(table) takes a table")),
+    }
+}
+
 /// `summarize(rows, by, aggs)` → filas: las columnas de la clave + un valor por agregado.
 /// `aggs` = mapa `nombre → función del grupo` (los `sum_of("col")`, `count()`, … de abajo o
 /// cualquier `(group) => …`).
-pub fn summarize(interp: &mut Interpreter, args: &[SynValue]) -> Result<SynValue, Control> {
-    const W: &str = "summarize";
+pub fn summarize(interp: &mut Interpreter, args: &[SynValue]) -> Result<SynValue, Control> {    const W: &str = "summarize";
     let rows = rows_arg(args.first().ok_or_else(|| err("summarize(rows, by, aggs)"))?, W)?;
     let spec = key_spec(args.get(1).ok_or_else(|| err("summarize(rows, by, aggs): missing by"))?, W)?;
     let aggs = match args.get(2) {

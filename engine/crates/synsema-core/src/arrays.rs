@@ -2332,6 +2332,12 @@ pub fn set_index(
     rooted: Rooted,
 ) -> Result<SynValue, Control> {
     let SynValue::Array(a) = obj else {
+        // v0.6.65 (diseño §6): una tabla es inmutable; el error enseña el rodeo.
+        if matches!(obj, SynValue::Table(_)) {
+            return Err(err(
+                "a table is immutable — convert it with to_rows(t), change the rows, and rebuild with table(rows)",
+            ));
+        }
         return Err(err(format!("Cannot set index on {}", obj.type_name())));
     };
     // Las entradas de ESTA escritura salen (y sus referencias con ellas); las de otra, no: un `set`
