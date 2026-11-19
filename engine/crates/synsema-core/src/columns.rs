@@ -734,3 +734,57 @@ fn shift_nulls_gather(
     }
     if out.null_count() == 0 { None } else { Some(out) }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{SynMap, SynValue};
+
+    fn row(pairs: &[(&str, SynValue)]) -> SynValue {
+        let mut m = SynMap::new();
+        for (k, v) in pairs {
+            m.insert(*k, v.clone());
+        }
+        crate::types::syn_map(m)
+    }
+
+    fn f(x: f64) -> SynValue {
+        SynValue::Number(crate::number::Number::Float(x))
+    }
+
+    fn i(x: i64) -> SynValue {
+        SynValue::Number(crate::number::Number::Int(x))
+    }
+
+    /// La receta "table-v1" del linaje ve los NULOS (un null no hashea como 0.0) y la
+    /// VENTANA (una vista hashea sus filas, no el buffer entero).
+    #[test]
+    fn table_v1_lineage_sees_nulls_and_windows() {
+        let a = build_from_rows(&[
+            row(&[("k", i(1)), ("v", SynValue::Nothing)]),
+            row(&[("k", i(2)), ("v", f(2.5))]),
+        ])
+        .expect("a");
+        let b = build_from_rows(&[
+            row(&[("k", i(1)), ("v", f(0.0))]),
+            row(&[("k", i(2)), ("v", f(2.5))]),
+        ])
+        .expect("b");
+        assert_ne!(a.lineage_sha256(), b.lineage_sha256(), "null ≠ 0.0");
+
+        let full = build_from_rows(&[
+            row(&[("k", i(1)), ("v", f(1.5))]),
+            row(&[("k", i(2)), ("v", f(2.5))]),
+            row(&[("k", i(3)), ("v", f(3.5))]),
+        ])
+        .expect("full");
+        let view = full.slice(1, 3).expect("vista");
+        let tail = build_from_rows(&[
+            row(&[("k", i(2)), ("v", f(2.5))]),
+            row(&[("k", i(3)), ("v", f(3.5))]),
+        ])
+        .expect("tail");
+        assert_eq!(view.lineage_sha256(), tail.lineage_sha256(), "la ventana, no el buffer");
+        assert_ne!(view.lineage_sha256(), full.lineage_sha256(), "1..3 ≠ tabla entera");
+    }
+}

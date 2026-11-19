@@ -853,10 +853,13 @@ fn columnar_plan<R: parquet::file::reader::ChunkReader + 'static>(
         // El espejo del lector de filas es el CONVERTED type (el lógico se refleja en él): un
         // `binary (UTF8)` legacy no tiene tipo lógico y es texto igual.
         let kind = match (c.physical_type(), c.converted_type()) {
+            // Convertidos INVÁLIDOS según el spec (TIME_MICROS es INT64, TIME_MILLIS es INT32):
+            // el lector de filas da su error (nyi) — el mismo trato que v0.6.64.
+            (PhysicalType::INT32, ConvertedType::TIME_MICROS)
+            | (PhysicalType::INT64, ConvertedType::TIME_MILLIS) => return None,
             (PhysicalType::BOOLEAN, _) => ReadKind::Bool,
             (PhysicalType::INT32, ConvertedType::DATE)
             | (PhysicalType::INT32, ConvertedType::TIME_MILLIS)
-            | (PhysicalType::INT32, ConvertedType::TIME_MICROS)
             | (PhysicalType::INT32, ConvertedType::DECIMAL) => ReadKind::Cells,
             (PhysicalType::INT32, _) => ReadKind::I64,
             (PhysicalType::INT64, ConvertedType::UINT_64)
@@ -1105,7 +1108,17 @@ fn read_table_columns<R: parquet::file::reader::ChunkReader + 'static>(
                 }
                 (ReadKind::I64, PhysicalType::INT32) => {
                     let Acc::I64(a) = &mut acc else { unreachable!() };
-                    done += read_batches!(rg, *leaf, Int32ColumnReader, take, a, |a: &mut BlockAcc<i64>, v: &i32| a.push_v(&(*v as i64)), F, name);
+                    // UINT_32 sobre INT32: el valor sale POSITIVO (el mismo que produce el
+                    // camino de filas con Field::UInt; i64 lo contiene, `(*v as u32) as i64`
+                    // es la conversión de valor). Los INT32 con signo siguen con signo.
+                    let unsigned = descr.converted_type() == ConvertedType::UINT_32;
+                    done += read_batches!(rg, *leaf, Int32ColumnReader, take, a, |a: &mut BlockAcc<i64>, v: &i32| {
+                        if unsigned {
+                            a.push_v(&((*v as u32) as i64))
+                        } else {
+                            a.push_v(&(*v as i64))
+                        }
+                    }, F, name);
                 }
                 (ReadKind::F64, PhysicalType::DOUBLE) => {
                     let Acc::F64(a) = &mut acc else { unreachable!() };

@@ -149,6 +149,10 @@ fn columns_stay_exact_no_matter_the_mix() {
     // Una columna mixta (int y float) NO se degrada: cada celda vuelve con su tipo.
     shows(r#"text(table([{"v": 1}, {"v": 2.5}])[0].v)"#, "1");
     shows(r#"text(table([{"v": 1}, {"v": 2.5}])[1].v)"#, "2.5");
+    // Tres filas con tres familias: mezclada queda (una familia nueva NO resetea a la
+    // columna tipada — la primera celda seguiría ahí).
+    shows(r#"text(table([{"v": "a"}, {"v": 1}, {"v": 2.5}])[0].v)"#, "a");
+    shows(r#"text(table([{"v": "a"}, {"v": 1}, {"v": 2.5}])[1].v)"#, "1");
     // Un decimal no se convierte en float: preserva su escala (el texto `1.50`, no `1.5`).
     shows(r#"text(table([{"d": 1.50d}])[0].d)"#, "1.50");
     // Un texto y un bool en columnas distintas.
@@ -252,10 +256,21 @@ fn aggregations_over_blocks_match_the_row_path_exactly() {
         &format!("text(count_by(table([{{\"k\": 1}}, {{\"k\": 1}}, {{\"k\": 2}}]), \"k\")[0].count)"),
         "2",
     );
-    // Nulos en la columna agregada: se saltean igual que por filas.
+    // Nulos en la columna agregada: se saltean igual que por filas (un null NO cuenta como
+    // 0 en el promedio ni en el mínimo — sum no lo ve, pero mean/min sí).
     t(&format!(
-        "summarize(table([{{\"k\": 1, \"v\": nothing}}, {{\"k\": 1, \"v\": 4.0}}]), \"k\", {{\"a\": sum_of(\"v\")}}) == summarize([{{\"k\": 1, \"v\": nothing}}, {{\"k\": 1, \"v\": 4.0}}], \"k\", {{\"a\": sum_of(\"v\")}})"
+        "summarize(table([{{\"k\": 1, \"v\": nothing}}, {{\"k\": 1, \"v\": 4.0}}]), \"k\", {{\"s\": sum_of(\"v\"), \"m\": mean_of(\"v\"), \"n\": min_of(\"v\")}}) == summarize([{{\"k\": 1, \"v\": nothing}}, {{\"k\": 1, \"v\": 4.0}}], \"k\", {{\"s\": sum_of(\"v\"), \"m\": mean_of(\"v\"), \"n\": min_of(\"v\")}})"
     ));
+    // count_by SIN clave sobre tabla: los valores son las filas distintas — lo mismo que
+    // sobre la lista (el value_counts de siempre; ronda 1 M1).
+    t(&format!("count_by(table({})) == count_by({})", rows, rows));
+    let dupes = r#"[{"k": 1, "v": 1.5}, {"k": 1, "v": 1.5}, {"k": 2, "v": 2.5}]"#;
+    t(&format!("count_by(table({dupes})) == count_by({dupes})"));
+    // Tabla VACÍA: `[]` en los tres, como el camino de filas (ronda 1 M2) — sin exigir la
+    // columna clave.
+    t("summarize(table([]), \"k\", {\"n\": count()}) == summarize([], \"k\", {\"n\": count()})");
+    t("group_by(table([]), \"k\") == group_by([], \"k\")");
+    t("count_by(table([]), \"k\") == count_by([], \"k\")");
     // Una columna de agregado que no está en la tabla: el mismo error que por filas.
     fails_with(
         &format!("summarize(table({}), \"k\", {{\"a\": sum_of(\"z\")}})", rows),

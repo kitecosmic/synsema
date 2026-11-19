@@ -146,3 +146,53 @@ print(length(parquet_scan("{dir}/polars_1_44_zstd.parquet", {{"limit": 2}})))"#,
         ]
     );
 }
+
+/// §7: las vistas (`slice`) cruzan el límite del `parallel_map` sin copiar y `summarize`
+/// DENTRO de cada worker da lo mismo que en el thread principal: cada parte igual a su
+/// `summarize` de acá, y la unión de las partes igual al `summarize` de la tabla entera
+/// (la misma clave vive en ambas partes: la unión tiene que re-sumar entre workers).
+#[test]
+fn table_views_cross_parallel_map_and_summarize_the_same() {
+    let rows = r#"[{"k": 1, "v": 1.5}, {"k": 1, "v": 2.5}, {"k": 2, "v": 3.5}, {"k": 2, "v": 4.5}]"#;
+    let agg = r#"summarize(slice(t, {a}, {b}), "k", {"n": count(), "s": sum_of("v")})"#;
+    let src = format!(
+        "let t be table({rows})\n\
+         let parts be [slice(t, 0, 2), slice(t, 2, 4)]\n\
+         let many be parallel_map((p) => summarize(p, \"k\", {{\"n\": count(), \"s\": sum_of(\"v\")}}), parts, 2)\n\
+         print(many[0] == {agg_a}, many[1] == {agg_b})\n\
+         let joined be summarize(flatten(many), \"k\", {{\"n\": sum_of(\"n\"), \"s\": sum_of(\"s\")}})\n\
+         let whole be summarize(t, \"k\", {{\"n\": count(), \"s\": sum_of(\"v\")}})\n\
+         print(joined == whole, length(joined))\n",
+        rows = rows,
+        agg_a = agg.replace("{a}", "0").replace("{b}", "2"),
+        agg_b = agg.replace("{a}", "2").replace("{b}", "4"),
+    );
+    assert_eq!(out(&src), vec!["true true", "true 2"]);
+}
+
+/// uint32 ≥ 2^31 (ronda 1, M3): el valor sale POSITIVO por columnas — el mismo que produce
+/// el camino de filas (Field::UInt → Int) — y un INT32 con signo sigue con signo.
+#[test]
+fn uint32_reads_positive_and_int32_stays_signed() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures")
+        .to_string_lossy()
+        .replace('\\', "/");
+    let src = format!(
+        r#"require file.read("{dir}/*")
+let u be parquet_read(read_file_bytes("{dir}/uint32.parquet"))
+let n be parquet_read(read_file_bytes("{dir}/int32_signed.parquet"))
+print(u[0].u, u[1].u, u[2].u, u[3].u)
+print(n[0].n, n[1].n, n[2].n, n[3].n)
+print(type_of(u[1].u), type_of(n[0].n))"#,
+        dir = dir
+    );
+    assert_eq!(
+        out(&src),
+        vec![
+            "1 2147483648 4294967295 nothing",
+            "-1 -2147483648 5 nothing",
+            "number number",
+        ]
+    );
+}

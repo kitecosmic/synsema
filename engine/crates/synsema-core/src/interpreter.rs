@@ -2311,10 +2311,6 @@ pub struct Interpreter {
     /// Bytes canónicos de un valor estructurado para el linaje (el stdlib instala
     /// `canonical_json`, RFC 8785): así cualquiera recalcula el hash de un resultado de SQL.
     pub lineage_canonical: Option<Rc<dyn Fn(&SynValue) -> Option<(Vec<u8>, &'static str)>>>,
-    /// v0.6.65: el linaje de una TABLA EN STREAMING por su receta propia ("table-v1",
-    /// columns.rs): sha256 columnar sin armar filas. Devuelve (hex, bytes consumidos,
-    /// encoding).
-    pub lineage_canonical_sha256: Option<Rc<dyn Fn(&SynValue) -> Option<(String, usize, &'static str)>>>,
     /// v0.6.42 (al final del struct a propósito: no corre los offsets de los campos calientes)
     /// — líneas de `eprint`/`log` retenidas para stderr. Sólo se usa con etiquetas
     /// encendidas (el mismo motivo que `output`: si la corrida muere por un flujo privado,
@@ -2426,6 +2422,11 @@ pub struct Interpreter {
     /// v0.6.58 (§6.1, G-1): los cruces que hizo el prólogo de un chunk de paquete en la VM:
     /// `(vm_frames.len(), base, lo guardado)` del frame que cruzó, de abajo arriba.
     pkg_frames: Vec<(usize, usize, PkgSaved)>,
+    /// v0.6.65: el linaje de una TABLA EN STREAMING por su receta propia ("table-v1",
+    /// columns.rs): sha256 columnar sin armar filas. Devuelve (hex, bytes consumidos,
+    /// encoding). Al final del struct a propósito (regla de migas §6: la tanda agrega una
+    /// variante a `SynValue`).
+    pub lineage_canonical_sha256: Option<Rc<dyn Fn(&SynValue) -> Option<(String, usize, &'static str)>>>,
 }
 
 /// v0.6.58 (§6.1): el dominio de un paquete al cruzar: `Some((marca, nombre, dominio))` lo apila

@@ -435,6 +435,11 @@ fn groups_of_table(
     spec: &KeySpec,
     who: &str,
 ) -> Result<Vec<(SynValue, SynValue)>, Control> {
+    // Tabla vacía: `[]` como el camino de filas (y el groupby de pandas) — sin exigir la
+    // columna clave (el guard del agregado de `summarize` ya es coherente con esto).
+    if t.n_rows() == 0 {
+        return Ok(Vec::new());
+    }
     // Las posiciones de las columnas clave, una vez.
     let key_cols: Vec<usize> = match spec {
         KeySpec::Column(c) => vec![t.col_index(c).ok_or_else(|| missing_column(t, c, who))?],
@@ -868,9 +873,6 @@ pub fn columns_builtin(args: &[SynValue]) -> Result<SynValue, Control> {
 
 /// `summarize(rows, by, aggs)` → filas: las columnas de la clave + un valor por agregado.
 /// `aggs` = mapa `nombre → función del grupo` (los `sum_of("col")`, `count()`, … de abajo o
-/// cualquier `(group) => …`).
-/// `summarize(rows, by, aggs)` → filas: las columnas de la clave + un valor por agregado.
-/// `aggs` = mapa `nombre → función del grupo` (los `sum_of("col")`, `count()`, … de abajo o
 /// cualquier `(group) => …`). Sobre una tabla (v0.6.65) los grupos son sub-tablas y los
 /// agregados leen bloques (diseño §10).
 pub fn summarize(interp: &mut Interpreter, args: &[SynValue]) -> Result<SynValue, Control> {
@@ -1167,43 +1169,45 @@ pub fn aggregator(kind: &'static str, args: &[SynValue]) -> Result<SynValue, Con
 /// primera aparición) — el `value_counts` de pandas.
 pub fn count_by(interp: &mut Interpreter, args: &[SynValue]) -> Result<SynValue, Control> {
     const W: &str = "count_by";
-    // v0.6.65: sobre una tabla, grupos sub-tabla contados por filas (sin materializar).
+    // v0.6.65: con clave, grupos sub-tabla contados por filas del bloque (sin materializar).
+    let mut from_table: Option<Vec<SynValue>> = None;
     if let Some(SynValue::Table(t)) = args.first() {
         let spec = match args.get(1) {
             Some(k) => key_spec(k, W)?,
             None => KeySpec::Func(SynValue::Nothing),
         };
         if matches!(spec, KeySpec::Func(SynValue::Nothing)) {
-            // Sin clave: cuenta los valores mismos — en una tabla son sus filas.
-            return Ok(syn_list(vec![{
-                let mut m = SynMap::new();
-                m.insert("key", SynValue::Table(crate::types::Obj::new((**t).clone())));
-                m.insert("count", syn_int(t.n_rows() as i64));
-                syn_map(m)
-            }]));
-        }
-        let gs = groups_of_table(interp, t, &spec, W)?;
-        let mut counted: Vec<(SynValue, usize)> = gs
-            .into_iter()
-            .map(|(k, g)| (k, match g {
-                SynValue::Table(gt) => gt.n_rows(),
-                _ => 0,
-            }))
-            .collect();
-        counted.sort_by(|a, b| b.1.cmp(&a.1)); // estable: empates en orden de aparición
-        return Ok(syn_list(
-            counted
+            // Sin clave: los valores son las FILAS DISTINTAS — el mismo resultado que sobre
+            // la lista (el value_counts de siempre). Este caso materializa filas una vez; el
+            // camino por bloques queda para el caso con clave.
+            from_table = Some((**t).to_rows());
+        } else {
+            let gs = groups_of_table(interp, t, &spec, W)?;
+            let mut counted: Vec<(SynValue, usize)> = gs
                 .into_iter()
-                .map(|(k, n)| {
-                    let mut m = SynMap::new();
-                    m.insert("key", k);
-                    m.insert("count", syn_int(n as i64));
-                    syn_map(m)
-                })
-                .collect(),
-        ));
+                .map(|(k, g)| (k, match g {
+                    SynValue::Table(gt) => gt.n_rows(),
+                    _ => 0,
+                }))
+                .collect();
+            counted.sort_by(|a, b| b.1.cmp(&a.1)); // estable: empates en orden de aparición
+            return Ok(syn_list(
+                counted
+                    .into_iter()
+                    .map(|(k, n)| {
+                        let mut m = SynMap::new();
+                        m.insert("key", k);
+                        m.insert("count", syn_int(n as i64));
+                        syn_map(m)
+                    })
+                    .collect(),
+            ));
+        }
     }
-    let rows = rows_arg(args.first().ok_or_else(|| err("count_by(items, key)"))?, W)?;
+    let rows = match from_table {
+        Some(rows) => rows,
+        None => rows_arg(args.first().ok_or_else(|| err("count_by(items, key)"))?, W)?,
+    };
     let spec = match args.get(1) {
         Some(k) => key_spec(k, W)?,
         None => KeySpec::Func(SynValue::Nothing),
