@@ -85,7 +85,20 @@ fn c4_parquet_scan_reads_from_disk_like_parquet_read() {
          let l be lineage()\n\
          print(l[0].source, l[0].what == \"{d}/t.parquet\", \"0x\" + l[0].sha256 == hex(sha256(canonical_json(a))))\n"
     );
-    assert_eq!(out(&src), vec!["true 7 [\"id\", \"x\"]", "true", "parquet_scan true true"]);
+    // v0.6.65: el linaje de una tabla se hashea por su receta propia "table-v1" (sha256
+    // columnar sobre los bloques; columns.rs), no sobre canonical_json de las filas — la
+    // misma lectura dos veces da el mismo hash, y el encoding lo dice.
+    let src2 = format!(
+        "require file.read(\"{d}/*\")\n\
+         let raw be read_file_bytes(\"{d}/t.parquet\")\n\
+         let a be parquet_scan(\"{d}/t.parquet\", {{\"columns\": [\"id\", \"x\"], \"limit\": 7}})\n\
+         let b be parquet_read(raw, {{\"columns\": [\"id\", \"x\"], \"limit\": 7}})\n\
+         let l be lineage()\n\
+         print(l[0].encoding, l[1].encoding == l[2].encoding, l[1].sha256 == l[2].sha256, length(l[1].sha256))\n",
+        d = d
+    );
+    assert_eq!(out(&src), vec!["true 7 [\"id\", \"x\"]", "true", "parquet_scan true false"]);
+    assert_eq!(out(&src2), vec!["bytes true true 64"]);
     // Un valor más grande que la ventana con la que se leen los encabezados (8 KiB). El encabezado
     // en sí, más grande que la ventana, lo prueba `a_page_header_larger_than_the_window_is_read_whole`
     // (stdlib): este crate escribe las estadísticas de página en el índice, no en el encabezado.

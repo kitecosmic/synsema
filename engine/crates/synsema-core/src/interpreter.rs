@@ -2311,6 +2311,10 @@ pub struct Interpreter {
     /// Bytes canónicos de un valor estructurado para el linaje (el stdlib instala
     /// `canonical_json`, RFC 8785): así cualquiera recalcula el hash de un resultado de SQL.
     pub lineage_canonical: Option<Rc<dyn Fn(&SynValue) -> Option<(Vec<u8>, &'static str)>>>,
+    /// v0.6.65: el linaje de una TABLA EN STREAMING por su receta propia ("table-v1",
+    /// columns.rs): sha256 columnar sin armar filas. Devuelve (hex, bytes consumidos,
+    /// encoding).
+    pub lineage_canonical_sha256: Option<Rc<dyn Fn(&SynValue) -> Option<(String, usize, &'static str)>>>,
     /// v0.6.42 (al final del struct a propósito: no corre los offsets de los campos calientes)
     /// — líneas de `eprint`/`log` retenidas para stderr. Sólo se usa con etiquetas
     /// encendidas (el mismo motivo que `output`: si la corrida muere por un flujo privado,
@@ -2718,6 +2722,7 @@ impl Interpreter {
             pending_kwargs: SynMap::new(),
             lineage: Vec::new(),
             lineage_canonical: None,
+            lineage_canonical_sha256: None,
         };
         interp.register_builtins();
         interp
@@ -3991,6 +3996,15 @@ impl Interpreter {
             return;
         }
         let canon = self.lineage_canonical.clone();
+        // v0.6.65: una tabla de RESULTADO se hashea en streaming (los mismos bytes que
+        // `canonical_json`, sin materializarlos): un parquet de 1M de filas no arma un String
+        // de 40 MB para hashearlo. El `payload` de esas entradas queda vacío: sólo se guardan
+        // el sha256 y el largo (que vienen del stream).
+        let table_hash: Option<(String, usize, &'static str)> = if matches!(crate::labels::unwrap(result), SynValue::Table(_)) {
+            self.lineage_canonical_sha256.as_ref().and_then(|f| f(result))
+        } else {
+            None
+        };
         // Qué bytes se hashean, y cómo recalcularlo (`encoding`): el texto (utf-8), los bytes
         // tal cual, o un valor estructurado como `canonical_json(x)` ("jcs"); si trae enteros
         // de más de 2^53 (que JCS no puede llevar), como `json_encode(x)` ("json").
@@ -4004,6 +4018,12 @@ impl Interpreter {
                 SynValue::Bytes(_) => {
                     enc_cell.set("bytes");
                     value_bytes(v)
+                }
+                // La tabla de resultado con hash en streaming: no se materializa (el sha256 y
+                // el largo vienen de `table_hash`); la codificación es la del canonical.
+                SynValue::Table(_) if table_hash.is_some() => {
+                    enc_cell.set("jcs");
+                    Vec::new()
                 }
                 other => match canon.as_ref().and_then(|f| f(other)) {
                     Some((b, enc)) => {
@@ -4101,9 +4121,9 @@ impl Interpreter {
         let entry = LineageEntry {
             source: source.to_string(),
             what,
-            sha256: sha256_hex(&payload),
-            bytes: payload.len(),
-            encoding,
+            sha256: table_hash.as_ref().map_or_else(|| sha256_hex(&payload), |(s, _, _)| s.clone()),
+            bytes: table_hash.as_ref().map_or_else(|| payload.len(), |(_, l, _)| *l),
+            encoding: table_hash.as_ref().map_or(encoding, |(_, _, e)| e.to_string()),
             salt,
             secrets,
         };

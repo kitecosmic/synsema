@@ -253,6 +253,95 @@ impl ColumnTable {
             .collect()
     }
 
+    /// El linaje de una tabla (v0.6.65): el sha256 de la receta **"table-v1"** — el CONTENIDO
+    /// por columnas, sin armar filas: `b"table-v1\0"`, filas y columnas en LE, y por columna
+    /// su nombre, su tipo físico (`columns.rs::kind`) y los valores de la ventana: primitivos
+    /// en LE, texto con largo LE + utf-8, bool 0/1, `Value` celda por celda con su clave
+    /// canónica de agrupar (`tabular::probe_key`; una celda nula o `nothing` es "z"), y los
+    /// nulos de cada bloque como cantidad LE + índices LE. Igual que la receta "ndarray" de
+    /// v0.6.56: el nombre cambia si la receta cambia (los recibos viejos quedan intactos) y
+    /// un tercero puede recomputarla con la definición de arriba. Devuelve (hex, bytes).
+    pub fn lineage_sha256(&self) -> (String, usize) {
+        use sha2::Digest;
+        let mut h = sha2::Sha256::new();
+        let mut total = 0usize;
+        macro_rules! feed {
+            ($b:expr) => {{
+                let b: &[u8] = $b;
+                h.update(b);
+                total += b.len();
+            }};
+        }
+        feed!(b"table-v1\0");
+        feed!(&self.n_rows.to_le_bytes());
+        feed!(&self.cols.len().to_le_bytes());
+        for (k, col) in &self.cols {
+            feed!(k.as_str().as_bytes());
+            feed!(b"\0");
+            feed!(col.kind().as_bytes());
+            feed!(b"\0");
+            let i0 = self.offset;
+            let i1 = self.offset + self.n_rows;
+            macro_rules! nulos {
+                ($nulls:expr) => {{
+                    let n = match $nulls {
+                        Some(b) => b.null_count(),
+                        None => 0,
+                    };
+                    feed!(&n.to_le_bytes());
+                    if let Some(b) = $nulls {
+                        for i in 0..self.n_rows {
+                            if b.is_null(i0 + i) {
+                                feed!(&i.to_le_bytes());
+                            }
+                        }
+                    }
+                }};
+            }
+            match &**col {
+                ColumnData::I64(v, nulls) => {
+                    nulos!(nulls);
+                    for x in &v[i0..i1] {
+                        feed!(&x.to_le_bytes());
+                    }
+                }
+                ColumnData::F64(v, nulls) => {
+                    nulos!(nulls);
+                    for x in &v[i0..i1] {
+                        feed!(&x.to_le_bytes());
+                    }
+                }
+                ColumnData::F32(v, nulls) => {
+                    nulos!(nulls);
+                    for x in &v[i0..i1] {
+                        feed!(&x.to_le_bytes());
+                    }
+                }
+                ColumnData::Bool(v, nulls) => {
+                    nulos!(nulls);
+                    for x in &v[i0..i1] {
+                        feed!(&[*x as u8]);
+                    }
+                }
+                ColumnData::Text(v, nulls) => {
+                    nulos!(nulls);
+                    for x in &v[i0..i1] {
+                        let b = x.as_str().as_bytes();
+                        feed!(&b.len().to_le_bytes());
+                        feed!(b);
+                    }
+                }
+                ColumnData::Value(cells) => {
+                    for cell in &cells[i0..i1] {
+                        let key = crate::tabular::probe_key(cell);
+                        feed!(key.as_bytes());
+                    }
+                }
+            }
+        }
+        (crate::bytesutil::hex_encode(&h.finalize()), total)
+    }
+
     // --- Recorrido de etiquetas (labels.rs): sólo las columnas `Value` pueden contener un
     // --- `Private`; los bloques primitivos no tienen dónde colgar una etiqueta.
 

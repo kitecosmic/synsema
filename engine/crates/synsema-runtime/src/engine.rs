@@ -689,11 +689,21 @@ pub(crate) fn wire_common_with_state(
         }
         match synsema_stdlib::canonical::canonical_json(v) {
             Ok(s) => Some((s.into_bytes(), "jcs")),
-            // JCS no lleva enteros de más de 2^53: el JSON exacto de `json_encode`.
             Err(_) => Some((
                 synsema_stdlib::json::dumps_syn(v).into_bytes(),
                 "json",
             )),
+        }
+    }));
+    // v0.6.65: el linaje de una tabla EN STREAMING por su receta propia "table-v1"
+    // (columns.rs): sha256 columnar, sin armar filas ni el String canónico.
+    interp.lineage_canonical_sha256 = Some(Rc::new(|v: &synsema_core::types::SynValue| {
+        match v {
+            synsema_core::types::SynValue::Table(t) => {
+                let (hex, len) = t.lineage_sha256();
+                Some((hex, len, "table-v1"))
+            }
+            _ => None,
         }
     }));
     synsema_stdlib::didkey::register_didkey_builtins(interp);

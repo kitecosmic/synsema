@@ -55,6 +55,36 @@ fn json_encode_of_a_table_is_the_rows_one() {
     );
 }
 
+/// La receta "table-v1" del linaje (columns.rs `lineage_sha256`): sensible a los nulos y a la
+/// ventana — una vista con offset NO hashea como la tabla entera.
+#[test]
+fn table_v1_hash_is_sensitive_to_nulls_and_windows() {
+    t(r#"hash(table([{"k": 1, "v": nothing}])) != hash(table([{"k": 1, "v": 0.0}]))"#);
+    t(r#"hash(slice(table([{"k": 1, "v": 1.5}, {"k": 2, "v": 2.5}, {"k": 3, "v": 3.5}]), 1, 3)) == hash(table([{"k": 2, "v": 2.5}, {"k": 3, "v": 3.5}]))"#);
+    t(r#"hash(slice(table([{"k": 1, "v": 1.5}, {"k": 2, "v": 2.5}, {"k": 3, "v": 3.5}]), 1, 3)) != hash(table([{"k": 1, "v": 1.5}, {"k": 2, "v": 2.5}, {"k": 3, "v": 3.5}]))"#);
+}
+
+/// Una columna anidada (listas) manda la lectura por el camino de filas (diseño §4: el
+/// fallback) y vuelve como tabla con sus listas intactas.
+#[test]
+fn parquet_nested_columns_fall_back_to_rows_as_a_table() {
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/parquet_nested_list.parquet");
+    let dir = fixture.parent().unwrap().to_string_lossy().replace('\\', "/");
+    let src = format!(
+        r#"require file.read("{dir}/*")
+let t be parquet_read(read_file_bytes("{dir}/parquet_nested_list.parquet"))
+print(type_of(t))
+print(t[0].tags, t[1].tags, t[2].tags)
+print(t[0].id, t[2].id)"#,
+        dir = dir
+    );
+    assert_eq!(
+        out(&src),
+        vec!["table", r#"["a", "b"] [] ["c"]"#, "1 3"]
+    );
+}
+
 /// T3 (diseño §4): `parquet_read`/`parquet_scan` devuelven una TABLA, leída por columnas.
 /// Los tipos exactos del camino de filas se conservan (diseño: el mismo mapeo que `convert`).
 #[test]

@@ -27,6 +27,9 @@ tokio = { version = "1", default-features = false, features = ["rt-multi-thread"
 # es sólo el adaptador entre el protocolo LLM y `synsema-infer`: este crate ya NO nombra a
 # candle ni a tokenizers (criterio C1 del spec).
 synsema-infer = { workspace = true, optional = true }
+# v0.6.65: el fallback "json" del hash de linaje en streaming (engine.rs) hashea los bytes de
+# `dumps_syn` cuando el valor no entra en JCS (enteros > 2^53).
+sha2 = { workspace = true }
 
 [features]
 # Provider LLM `local` (spec LLM-LOCAL F1): inferencia GGUF cuantizada embebida (candle,
