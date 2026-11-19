@@ -6,6 +6,45 @@ Each says what changed, why, and what to write instead.
 
 Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the release date.
 
+## v0.6.65 — tablas por columnas
+
+`parquet_read`, `parquet_scan`, `table(rows)` and the table operations now produce **tables**: a
+columnar layout (one typed block per column, Arrow-style validity bitmap) instead of a list of row
+maps. On the 1 M-row language fixture, `parquet_read` went from 1.24 s to 30 ms (parity with
+polars) and its memory from ~155 MB to 13–17 MB — below pandas' 24 MB for the same table.
+
+- **Breaking — reads return tables.** `parquet_read`/`parquet_scan` return a table, always. A
+  table prints, hashes and encodes JSON exactly like its row list, and `t[i]` materializes row *i*
+  with the full schema, so most read-only code keeps working — but it is not a list: `==` only
+  compares tables with tables (like arrays), `each(t, …)` is an error, and an index out of range
+  says "table with N rows". Write `to_rows(t)` where a real list is required.
+- **New builtins** (pure): `table(rows)` builds a table from a list of maps (two passes, no
+  transient copies; ragged keys fill with `nothing`), `to_rows(t)` converts back, `columns(t)` is
+  the schema in first-appearance order. `length(t)` is its row count; `slice(t, a, b)` is a
+  zero-copy view over the same buffers.
+- **Breaking — tables are immutable.** `set` on any path into a table errors with the message
+  that names the way out (`to_rows(t)`, change, `table(rows)`). Generic list builtins
+  (`transform`, `append`, …) reject tables with their usual message.
+- **Breaking — same-type grouping.** `summarize`, `group_by`, `count_by` over a table group by
+  reading the key from the column block and hand out each group as a **sub-table** (the same type
+  as the input); the aggregators (`sum_of`, `count`, …) read columns from the blocks, and lambdas
+  keep receiving the whole group. `sort_by` and `where` accept a table and return a table.
+  `join`, `pivot` and the remaining row operations accept tables by deploying rows once (correct,
+  not yet column-fast).
+- **Lineage of a table uses its own recipe** (`table-v1`): sha256 over the column blocks
+  (schema, physical kind, little-endian values, null counts and indices, `Value` cells via their
+  grouping key) — labeled, third-party recomputable, old receipts intact; hashing 1 M rows no
+  longer materializes a ~40 MB JSON string (that string was ~80 % of the old `parquet_read` time).
+  `hash(t)` keeps the columnar canonical encoding; two `==` tables hash equal, and a slice hashes
+  as its window.
+- Labels walk tables: only `Value` columns can carry a `private` cell (typed blocks cannot), and
+  sink checks name the path as `.col[row]`. Freezing a table marks one object (the buffers are
+  immutable by construction), so table views cross `parallel_map` without copying. Snapshots
+  (`serve` globals, agents) carry copied blocks. Nested Parquet columns (lists, groups), INT96 and
+  FIXED_LEN_BYTE_ARRAY fall back to the row reader, which also returns a table.
+- `parquet_write(rows_or_table, opts?)` accepts a table. `canonical_json(t)` renders the table as
+  its row list.
+
 ## v0.6.64 — 2026-11-17
 
 - `read_file_bytes(path, {"offset": n, "length": m})` reads a zero-based byte range from disk or a bundled asset. The one-argument form still reads the whole file.
