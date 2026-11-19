@@ -44,6 +44,17 @@ polars) and its memory from ~155 MB to 13–17 MB — below pandas' 24 MB for th
   FIXED_LEN_BYTE_ARRAY fall back to the row reader, which also returns a table.
 - `parquet_write(rows_or_table, opts?)` accepts a table. `canonical_json(t)` renders the table as
   its row list.
+- **The `perf-guard` anchor was re-measured on CI** (`engine/perf/baseline.json`, from this
+  release's PR). Five rows move: `o_lt`/`o_eq`/`c_builtin_abs` (jit, +0.90–0.97 %) pick up
+  glibc's `malloc_consolidate`/`unlink_chunk` once per process — the new `table`/`to_rows`/
+  `columns` builtins shift early allocations past a fastbin consolidation threshold;
+  `s_sort` (ref, +0.70 %) moves ~1.4 M instructions into glibc's `__memcpy_avx_unaligned_erms`,
+  and `j_map_key_int` (vm, +0.31 %) into `__memcmp_avx2_movbe` — plus the two-instruction tag
+  check in `set_leaf_index` that rejects tables in `set` (the immutability breaking above).
+  Nothing in the engine's own hot paths grew: the differential A/B against the merge of v0.6.64
+  was verified function by function (audit round 1), where `exec_binary` shrank 600k
+  instructions in `t_template` (vm). The same heap-layout phenomenon was blessed in v0.6.64
+  (`s_csv`) and in v0.6.55/v0.6.57.
 
 ## v0.6.64 — 2026-11-17
 
