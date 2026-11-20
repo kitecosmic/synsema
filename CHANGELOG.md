@@ -35,6 +35,13 @@ builtin that consumes a callback result.
   before using the result: masks, selections, counts and orders come out private (sinks redact as
   usual), and the type-naming error is withheld as a label violation. This predates v0.6.66 —
   v0.6.65 leaked the same way through `where`.
+- **The `perf-guard` anchor was re-measured on CI** (`engine/perf/baseline.json`, from this PR).
+  Four rows move on purpose: `s_each_list` +0.89 % (jit) and +0.31 % (vm) are the callback label
+  guard itself — about six instructions per callback result, the price of a captured private not
+  deciding in public; `a_args4` +0.50 % (jit) and `j_task_enter` +0.33 % (jit) come from
+  registering one more builtin (`column_mask`): `BuiltinTask::new` +550 instructions and the
+  glibc heap consolidation routes shift for everything the interpreter allocates after startup.
+  The other 119 rows measure within budget.
 
 ## v0.6.65 — 2026-11-19
 
