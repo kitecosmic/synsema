@@ -37,4 +37,5 @@ mod v0655_arrays;
 mod v0657_matmul;
 mod v0658_project;
 mod v0665_tables;
+mod v0666_filters;
 mod vm;

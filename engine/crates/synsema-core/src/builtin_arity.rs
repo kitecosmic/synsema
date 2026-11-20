@@ -32,6 +32,7 @@ pub const BUILTIN_KWARGS: &[(&str, &[&str])] = &[
     ("random_uniform", &["low", "high", "dtype"]),
     // v0.6.56: el tipo de elemento de un constructor.
     ("array", &["dtype"]),
+    ("column_mask", &["missing"]),
     ("zeros", &["dtype"]),
     ("ones", &["dtype"]),
     ("full", &["dtype"]),
@@ -70,6 +71,7 @@ pub const BUILTIN_ARITY: &[(&str, usize, Option<usize>)] = &[
     ("every", 1, Some(2)),
     ("count_where", 1, Some(2)),
     ("where", 2, Some(3)),
+    ("column_mask", 3, Some(4)),
     // v0.6.55 (ítems 4 y 8, en synsema-stdlib/src/ndarray_ops.rs).
     ("transpose", 1, Some(2)),
     ("array_to_bytes", 1, Some(2)),

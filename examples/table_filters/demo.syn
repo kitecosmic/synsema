@@ -1,0 +1,12 @@
+intent: "Filtrar una tabla con una librería Synsema sin convertirla a mapas por fila"
+
+use "./filter_lib.syn" as filters
+
+let trips be table([
+    {"id": 1, "distance": 0, "fare": 10},
+    {"id": 2, "distance": 3, "fare": nothing},
+    {"id": 3, "distance": 4, "fare": 20},
+    {"id": 4, "distance": 2, "fare": 1000}
+])
+let selected be filters.valid_trips(trips)
+print(length(selected), selected[0].id)

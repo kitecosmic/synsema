@@ -129,7 +129,7 @@ pub const LABEL_PURE_BUILTINS: &[&str] = &[
     // A los callbacks, y los sumideros que use el callee se comprueban ahí). `parallel_map` NO está acá: cruza
     // A otro intérprete, donde la etiqueta no llega
     "apply", "call", "call_tool", "chunk", "collect", "count_where", "every", "find_all", "find_first",
-    "fold", "group_by", "reduce", "some", "sort_by", "transform", "where", "zip_with",
+    "fold", "group_by", "reduce", "some", "sort_by", "transform", "where", "column_mask", "zip_with",
     // Plantillas y vocabulario de respuesta: construyen VALORES (el sumidero es la respuesta HTTP, en `serve.rs`)
     "binary", "chart", "chart_svg", "clear_cookie", "code", "content", "created", "heading", "html", "image",
     "link", "list", "not_found", "ok", "ordered_list", "page", "prose", "raw", "redirect", "render",

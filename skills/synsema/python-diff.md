@@ -120,7 +120,7 @@ converts back). Every operation takes either and returns the shape it got. Full 
 | `s.count()` / `s.isna().sum()` | `count(xs)` / `count_missing(xs)` | `count` counts the **present** values (not `nothing`), like pandas/SQL |
 | `df.dropna()` / `df.dropna(subset=["m"])` / `df.fillna(0)` / `df.fillna({"m": 0})` | `drop_missing(rows)` / `drop_missing(rows, "m")` / `fill_missing(rows, 0)` / `fill_missing(rows, {"m": 0})` | missing = `nothing`; NaN is separate: `fill_nan(xs, 0)`. The pandas names used as builtins (`dropna`, `fillna`, `isna`, `isnull`, `groupby`, `value_counts`, `read_csv`, `to_csv`) fail naming the Synsema one (`Undefined variable: 'dropna' — in Synsema: drop_missing(rows)`) |
 | `df.sort_values("t", ascending=False)` | `sort_by(rows, (r) => r.t, desc = true)` | stable; `nothing`/NaN last |
-| `df["c"]` / `df[df.x > 2]` | `collect(rows, "c")` / `where(rows, (r) => r.x > 2)` | — |
+| `df["c"]` / `df[df.x > 2]` | `collect(rows, "c")` / `where(rows, (r) => r.x > 2)` | on a `table` (v0.6.66+): `where(t, column_mask(t, "x", ">", 2))` — the mask reads the column block, no row maps |
 | `df.std()` / `statistics.stdev(xs)` | `std(xs)` | same answer: **sample** (`ddof = 1`) |
 | `np.std(xs)` / `np.var(xs)` | `std(xs, ddof = 0)` / `var(xs, ddof = 0)` | numpy defaults to population; Synsema to sample |
 | `np.nanmean(xs)` / `df.mean()` (skips NaN) | `mean(xs)` skips **`nothing`** | NaN propagates in Synsema — `fill_nan` or `where(xs, is_finite)` first |
