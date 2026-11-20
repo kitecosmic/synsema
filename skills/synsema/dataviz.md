@@ -72,6 +72,8 @@ print(csv_encode(monthly))
 `truncate(d, "month")` · `df.to_parquet(p)` → `write_file(p, parquet_write(a))` · `read_json(lines=True)` →
 `jsonl_decode`. (`a`/`t_or_rows` = a row list or a table — every operation takes either and returns the shape it got.) More in [python-diff.md](python-diff.md).
 
+For a large **table** (v0.6.66+), build a mask without row maps: `where(t, column_mask(t, "x", ">", 2))`. Combine conditions with `logical_and(column_mask(t, "x", ">", 2), column_mask(t, "kind", "==", "paid"))`. On nullable ordering columns, name `missing = "exclude"`; otherwise a missing cell raises the same error as scalar ordering. A library can package these operations in exported tasks (see `examples/table_filters/`). The mask filters after reading; `parquet_scan` still uses `columns` and `row_groups` for selective reading.
+
 ## Parquet from disk — `parquet_scan` (v0.6.46+)
 
 From v0.6.64, inspect a large file with `parquet_info_file(path)`: it reads the footer, and each

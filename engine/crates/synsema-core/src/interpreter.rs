@@ -5714,6 +5714,7 @@ impl Interpreter {
         // `on_chunk` con cada fragmento (F2); devuelve el texto completo. Mismo gate `llm`.
         self.register("llm_stream", 3, Rc::new(|i, a, l| i.b_llm_stream(a, l)));
         self.register("where", -1, Rc::new(|i, a, l| i.b_where(a, l)));
+        self.register("column_mask", -1, Rc::new(|i, a, l| i.b_column_mask(a, l)));
         self.register("collect", 2, Rc::new(|i, a, l| i.b_collect(a, l)));
         self.register("transform", -1, Rc::new(|i, a, l| i.b_transform(a, l)));
         self.register("reduce", -1, Rc::new(|i, a, l| i.b_reduce(a, l)));
@@ -11904,7 +11905,13 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
         };
         let mut keep = Vec::with_capacity(elems.len());
         for x in elems {
-            keep.push(pred_truth(&self.call_value(pred.clone(), vec![x], loc)?, "where", loc)?);
+            let r = self.call_value(pred.clone(), vec![x], loc)?;
+            // T5: lo que el callback devolvió se desenvuelve acá para decidir; su etiqueta
+            // pasa a `seen` o el builtin devuelve una decisión pública sobre un privado.
+            if let SynValue::Private(p) = &r {
+                self.note_seen(&p.label);
+            }
+            keep.push(pred_truth(&r, "where", loc)?);
         }
         fn pick<T: Copy>(x: &ndarray::ArrayD<T>, keep: &[bool]) -> ndarray::ArrayD<T> {
             let v: Vec<T> = x.iter().zip(keep).filter(|(_, k)| **k).map(|(v, _)| *v).collect();
@@ -12204,6 +12211,16 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
     }
 
     fn b_where(&mut self, args: &[SynValue], loc: &SourceLocation) -> Result<SynValue, Control> {
+        if let [SynValue::Table(t), SynValue::Array(a)] = args {
+            let crate::types::NdArray::Bool(mask) = &**a else {
+                return Err(err("where(table, mask) expects a bool array"));
+            };
+            if mask.ndim() != 1 || mask.len() != t.n_rows() {
+                return Err(err(format!("where: mask must be 1-D with {} elements, got shape {:?}", t.n_rows(), mask.shape())));
+            }
+            let bits: Vec<bool> = mask.iter().copied().collect();
+            return Ok(SynValue::Table(crate::types::Obj::new(t.filter_mask(&bits))));
+        }
         // v0.6.29 (DATOS-11): la máscara con nombre — los elementos que cumplen, como array 1-D.
         if let Some((pred, a)) = fn_and_array(args) {
             return self.where_array(pred, &a, loc);
@@ -12236,6 +12253,9 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
             let mut out = SynList::new();
             for i in 0..l.borrow().len() {
                 let (item, r) = lc.item_keep(it, &l, i, loc)?;
+                if let SynValue::Private(p) = &r {
+                    it.note_seen(&p.label);
+                }
                 if pred_truth(&r, "where", loc)? {
                     out.push(item);
                 }
@@ -12246,6 +12266,118 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
             return crate::tabular::table_builtin(&[rows]);
         }
         Ok(rows)
+    }
+
+    /// Máscara de una columna, sin construir un mapa por fila. El callback recibe sólo
+    /// la celda; los operadores nativos recorren el bloque físico cuando es numérico.
+    fn b_column_mask(&mut self, args: &[SynValue], loc: &SourceLocation) -> Result<SynValue, Control> {
+        use crate::ast::BinOp;
+        use crate::columns::ColumnData;
+        use crate::number::Number;
+        let t = match nth(args, 0)? {
+            SynValue::Table(t) => t,
+            other => return Err(err(format!("column_mask expects a table, got {}", other.type_name()))),
+        };
+        let name = match nth(args, 1)? {
+            SynValue::Text(s) => s.as_str(),
+            other => return Err(err(format!("column_mask: column name must be text, got {}", other.type_name()))),
+        };
+        let ci = t.col_index(name).ok_or_else(|| err(format!("column_mask: no column {:?}", name)))?;
+        let missing = self.kwarg("missing");
+        let spec = nth(args, 2)?;
+        let (op, value) = match spec {
+            SynValue::Text(s) => {
+                let op = match s.as_str() {
+                    "<" => Some(BinOp::Lt), "<=" => Some(BinOp::Le),
+                    ">" => Some(BinOp::Gt), ">=" => Some(BinOp::Ge),
+                    "==" => Some(BinOp::Eq), "!=" => Some(BinOp::Ne),
+                    "is_missing" | "is_present" => None,
+                    _ => return Err(err(format!("column_mask: unknown operator {:?}", s.as_str()))),
+                };
+                if op.is_none() && args.len() != 3 {
+                    return Err(err("column_mask: is_missing and is_present take no value"));
+                }
+                if op.is_some() && args.len() != 4 {
+                    return Err(err("column_mask: comparison needs a value"));
+                }
+                (op, args.get(3))
+            }
+            SynValue::Task(_) | SynValue::Builtin(_) if args.len() == 3 => (None, None),
+            SynValue::Task(_) | SynValue::Builtin(_) => return Err(err("column_mask: callback takes no value")),
+            other => return Err(err(format!("column_mask expects an operator or callback, got {}", other.type_name()))),
+        };
+        let exclude_missing = match &missing {
+            None => false,
+            Some(SynValue::Text(s)) if s.as_str() == "error" => false,
+            Some(SynValue::Text(s)) if s.as_str() == "exclude" => true,
+            Some(_) => return Err(err("column_mask: missing must be \"error\" or \"exclude\"")),
+        };
+        if exclude_missing && !matches!(op, Some(BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge)) {
+            return Err(err("column_mask: missing = \"exclude\" is only for ordering comparisons"));
+        }
+        if op.is_none() && missing.is_some() {
+            return Err(err("column_mask: missing is only for ordering comparisons"));
+        }
+        if matches!(op, Some(BinOp::Eq | BinOp::Ne)) && missing.is_some() {
+            return Err(err("column_mask: missing is only for ordering comparisons"));
+        }
+        let (data, offset, n) = t.column_window(ci);
+        let mut out = Vec::with_capacity(n);
+        for row in 0..n {
+            let absent = match data {
+                ColumnData::I64(_, nulls) | ColumnData::F64(_, nulls)
+                | ColumnData::F32(_, nulls) | ColumnData::Bool(_, nulls)
+                | ColumnData::Text(_, nulls) => nulls.as_ref().is_some_and(|b| b.is_null(offset + row)),
+                ColumnData::Value(v) => matches!(v[offset + row], SynValue::Nothing),
+            };
+            if let SynValue::Text(s) = spec {
+                if s.as_str() == "is_missing" { out.push(absent); continue; }
+                if s.as_str() == "is_present" { out.push(!absent); continue; }
+            }
+            if absent && exclude_missing { out.push(false); continue; }
+            let result = if let Some(op) = op {
+                let rhs = value.expect("checked arity");
+                // Fast path: Number conserva comparación exacta de int vs float (>2^53),
+                // sin crear SynValue por cada celda. Las demás clases usan el operador
+                // escalar para mantener los errores y las reglas de tipos.
+                let number = match data {
+                    ColumnData::I64(v, _) if !absent => Some(Number::Int(v[offset + row])),
+                    ColumnData::F64(v, _) if !absent => Some(Number::Float(v[offset + row])),
+                    ColumnData::F32(v, _) if !absent => Some(Number::Float(v[offset + row] as f64)),
+                    _ => None,
+                };
+                if let (Some(left), SynValue::Number(right)) = (number, rhs) {
+                    if Number::mixes_decimal_float(&left, right) {
+                        self.exec_binary(t.cell(row, ci), op, rhs.clone(), loc)?
+                    } else {
+                        let yes = match op {
+                            BinOp::Eq => left.num_eq(right),
+                            BinOp::Ne => !left.num_eq(right),
+                            _ => ord_op(left.partial_cmp_num(right), op),
+                        };
+                        syn_bool(yes)
+                    }
+                } else {
+                    self.exec_binary(t.cell(row, ci), op, rhs.clone(), loc)?
+                }
+            } else {
+                self.call_value(spec.clone(), vec![t.cell(row, ci)], loc)?
+            };
+            // El bool (o el error de tipo) puede traer la etiqueta de un privado que el
+            // callback devolvió capturado: registrarla antes de desenvolver, o la máscara
+            // y el mensaje de error salen públicos.
+            if self.labels {
+                let l = crate::labels::label_deep(&result);
+                if !l.is_empty() {
+                    self.note_seen(&l);
+                }
+            }
+            match crate::labels::unwrap(&result) {
+                SynValue::Bool(yes) => out.push(*yes),
+                other => return Err(err(format!("column_mask: predicate must return bool, got {}", other.type_name()))),
+            }
+        }
+        Ok(crate::types::syn_mask(ndarray::Array1::from_vec(out).into_dyn()))
     }
 
     fn b_collect(&mut self, args: &[SynValue], _loc: &SourceLocation) -> Result<SynValue, Control> {
@@ -12273,7 +12405,13 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
         for i in 0..n {
             let item = list_values(&l)[i].clone();
             let should = match &pred {
-                Some(p) => pred_truth(&self.call_fast(p, &mut [item.clone()], loc)?, "transform", loc)?,
+                Some(p) => {
+                    let r = self.call_fast(p, &mut [item.clone()], loc)?;
+                    if let SynValue::Private(pv) = &r {
+                        self.note_seen(&pv.label);
+                    }
+                    pred_truth(&r, "transform", loc)?
+                }
                 None => true,
             };
             if should {
@@ -12324,6 +12462,15 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
             Ok::<(), Control>(())
         })?;
         let keys: Vec<SynValue> = keyed.iter().map(|(k, _)| k.clone()).collect();
+        // Las claves salen del callback: una privada no puede decidir el orden en público.
+        if self.labels {
+            for (k, _) in &keyed {
+                let l = crate::labels::label_deep(k);
+                if !l.is_empty() {
+                    self.note_seen(&l);
+                }
+            }
+        }
         check_orderable(&keys, "sort_by")?;
         sort_checked(&mut keyed, |(k, _)| k, desc, "sort_by")?;
         let rows = syn_list(keyed.into_iter().map(|(_, v)| v).collect());
@@ -12377,6 +12524,9 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
         self.with_lambda(&pred, |it, lc| {
             for i in 0..l.borrow().len() {
                 let (item, r) = lc.item_keep(it, &l, i, loc)?;
+                if let SynValue::Private(p) = &r {
+                    it.note_seen(&p.label);
+                }
                 if pred_truth(&r, "find_first", loc)? {
                     return Ok(item);
                 }
@@ -12392,7 +12542,11 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
         let (pred, l) = self.dual_fn_rc(args, "every")?;
         self.with_lambda(&pred, |it, lc| {
             for i in 0..l.borrow().len() {
-                if !pred_truth(&lc.item(it, &l, i, loc)?, "every", loc)? {
+                let r = lc.item(it, &l, i, loc)?;
+                if let SynValue::Private(p) = &r {
+                    it.note_seen(&p.label);
+                }
+                if !pred_truth(&r, "every", loc)? {
                     return Ok(syn_bool(false));
                 }
             }
@@ -12407,7 +12561,11 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
         let (pred, l) = self.dual_fn_rc(args, "some")?;
         self.with_lambda(&pred, |it, lc| {
             for i in 0..l.borrow().len() {
-                if pred_truth(&lc.item(it, &l, i, loc)?, "some", loc)? {
+                let r = lc.item(it, &l, i, loc)?;
+                if let SynValue::Private(p) = &r {
+                    it.note_seen(&p.label);
+                }
+                if pred_truth(&r, "some", loc)? {
                     return Ok(syn_bool(true));
                 }
             }
@@ -12423,7 +12581,11 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
         self.with_lambda(&pred, |it, lc| {
             let mut count: i64 = 0;
             for i in 0..l.borrow().len() {
-                if pred_truth(&lc.item(it, &l, i, loc)?, "count_where", loc)? {
+                let r = lc.item(it, &l, i, loc)?;
+                if let SynValue::Private(p) = &r {
+                    it.note_seen(&p.label);
+                }
+                if pred_truth(&r, "count_where", loc)? {
                     count += 1;
                 }
             }
@@ -12526,7 +12688,11 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                     Some(x) => x.clone(),
                     None => break,
                 };
-                if pred_truth(&self.call_value(needle.clone(), vec![item], loc)?, "index_of", loc)? {
+                let r = self.call_value(needle.clone(), vec![item], loc)?;
+                if let SynValue::Private(p) = &r {
+                    self.note_seen(&p.label);
+                }
+                if pred_truth(&r, "index_of", loc)? {
                     return Ok(syn_int(i as i64));
                 }
                 i += 1;

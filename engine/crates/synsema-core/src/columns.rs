@@ -160,6 +160,10 @@ impl ColumnTable {
     pub fn col_index(&self, name: &str) -> Option<usize> {
         self.cols.iter().position(|(k, _)| k.as_str() == name)
     }
+    /// Bloque y ventana de una columna, para operaciones que no necesitan mapas de fila.
+    pub fn column_window(&self, ci: usize) -> (&ColumnData, usize, usize) {
+        (&self.cols[ci].1, self.offset, self.n_rows)
+    }
     /// La ventana `[from, to)` como vista que comparte buffers (copia cero).
     pub fn slice(&self, from: usize, to: usize) -> Option<ColumnTable> {
         if from > to || to > self.n_rows {
@@ -204,6 +208,14 @@ impl ColumnTable {
             })
             .collect();
         ColumnTable { n_rows: indices.len(), offset: 0, cols }
+    }
+
+    /// Selecciona posiciones sin desplegar filas. `gather` conserva el tipo físico y los
+    /// bitmaps, incluso cuando no se selecciona ninguna fila.
+    pub fn filter_mask(&self, mask: &[bool]) -> ColumnTable {
+        debug_assert_eq!(mask.len(), self.n_rows);
+        let indices: Vec<usize> = mask.iter().enumerate().filter_map(|(i, keep)| keep.then_some(i)).collect();
+        self.gather(&indices)
     }
 
     /// La celda `(fila, columna)` materializada (null → `nothing`).

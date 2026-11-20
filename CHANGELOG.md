@@ -6,6 +6,43 @@ Each says what changed, why, and what to write instead.
 
 Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the release date.
 
+## v0.6.66 — 2026-11-20
+
+Fast, composable table filtering, and a labels fix that closes a decision leak shared by every
+builtin that consumes a callback result.
+
+- **New builtins** (pure): `column_mask(t, "col", op, value)` builds a 1-D bool mask straight from
+  the column block, without row maps — operators `<`, `<=`, `>`, `>=`, `==`, `!=`, `is_missing`,
+  `is_present`; ordering a missing cell errors exactly like scalar Synsema unless you pass
+  `missing = "exclude"` (only accepted for the ordering operators). `column_mask(t, "col",
+  (cell) => …)` runs your predicate once per cell, in row order. `where(t, mask)` selects rows and
+  returns a table with the same schema, row order, physical column types and nulls (an
+  all-false mask keeps the schema with zero rows). A mask is positional: align it with the
+  table's row order.
+- **Why it's fast:** on the 3.53 M-row NYC taxi file, the read → filter → summarize pipeline went
+  from 17.2 s with `where(t, (row) => …)` (which materializes row maps) to 5.9 s with two masks
+  composed by `logical_and` (median of 3; peak RSS 3.6 GB → 2.6 GB). `where(t, (row) => …)` keeps
+  its row-callback behavior; it is simply no longer the only option. `examples/table_filters/`
+  ships a filter library written entirely in Synsema, imported by a demo app that runs native and
+  wasm.
+- **Labels — a callback that returns a captured private no longer decides in public.** A value
+  like `let flag be private(true, "app")` returned from a predicate rode inside the value, and the
+  builtins that unwrap callback results in Rust never registered its label: `where` (list and
+  table), `every`, `some`, `count_where`, `find_first`, `transform`'s predicate, `index_of`'s
+  callback needle, `sort_by`'s keys and the new `column_mask` produced public masks, counts,
+  verdicts and sort orders decided by private data, and a non-bool private return named its type
+  in the error ("predicate must return bool, got number"). Every site now records the label
+  before using the result: masks, selections, counts and orders come out private (sinks redact as
+  usual), and the type-naming error is withheld as a label violation. This predates v0.6.66 —
+  v0.6.65 leaked the same way through `where`.
+- **The `perf-guard` anchor was re-measured on CI** (`engine/perf/baseline.json`, from this PR).
+  Four rows move on purpose: `s_each_list` +0.89 % (jit) and +0.31 % (vm) are the callback label
+  guard itself — about six instructions per callback result, the price of a captured private not
+  deciding in public; `a_args4` +0.50 % (jit) and `j_task_enter` +0.33 % (jit) come from
+  registering one more builtin (`column_mask`): `BuiltinTask::new` +550 instructions and the
+  glibc heap consolidation routes shift for everything the interpreter allocates after startup.
+  The other 119 rows measure within budget.
+
 ## v0.6.65 — 2026-11-19
 
 `parquet_read`, `parquet_scan`, `table(rows)` and the table operations now produce **tables**: a
