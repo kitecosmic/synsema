@@ -3521,21 +3521,6 @@ impl Interpreter {
         Ok(labels::mark(r, l))
     }
 
-    /// La verdad de lo que devolvió un callback, REGISTRANDO lo que se desenvuelve (mismo
-    /// guard de `apply_array`/`quantify_array`): sin esto, un callback que devuelve un valor
-    /// privado capturado decide en público — la etiqueta viaja en el valor y ningún camino de
-    /// exec la anota, así que el `seen` acotado de `call_builtin_labelled` queda vacío.
-    #[inline]
-    fn pred_truth_seen(&mut self, v: &SynValue, who: &str, loc: &SourceLocation) -> Result<bool, Control> {
-        if self.labels {
-            let l = crate::labels::label_deep(v);
-            if !l.is_empty() {
-                self.note_seen(&l);
-            }
-        }
-        pred_truth(v, who, loc)
-    }
-
     /// Bajo una etiqueta de PC no vacía una línea de salida se redacta entera
     /// (`private(A,B)`): que una rama privada imprima o no es un canal de terminación que
     /// No se cubre; su CONTENIDO sí.
@@ -11921,7 +11906,12 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
         let mut keep = Vec::with_capacity(elems.len());
         for x in elems {
             let r = self.call_value(pred.clone(), vec![x], loc)?;
-            keep.push(self.pred_truth_seen(&r, "where", loc)?);
+            // T5: lo que el callback devolvió se desenvuelve acá para decidir; su etiqueta
+            // pasa a `seen` o el builtin devuelve una decisión pública sobre un privado.
+            if let SynValue::Private(p) = &r {
+                self.note_seen(&p.label);
+            }
+            keep.push(pred_truth(&r, "where", loc)?);
         }
         fn pick<T: Copy>(x: &ndarray::ArrayD<T>, keep: &[bool]) -> ndarray::ArrayD<T> {
             let v: Vec<T> = x.iter().zip(keep).filter(|(_, k)| **k).map(|(v, _)| *v).collect();
@@ -12263,7 +12253,10 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
             let mut out = SynList::new();
             for i in 0..l.borrow().len() {
                 let (item, r) = lc.item_keep(it, &l, i, loc)?;
-                if it.pred_truth_seen(&r, "where", loc)? {
+                if let SynValue::Private(p) = &r {
+                    it.note_seen(&p.label);
+                }
+                if pred_truth(&r, "where", loc)? {
                     out.push(item);
                 }
             }
@@ -12414,7 +12407,10 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
             let should = match &pred {
                 Some(p) => {
                     let r = self.call_fast(p, &mut [item.clone()], loc)?;
-                    self.pred_truth_seen(&r, "transform", loc)?
+                    if let SynValue::Private(pv) = &r {
+                        self.note_seen(&pv.label);
+                    }
+                    pred_truth(&r, "transform", loc)?
                 }
                 None => true,
             };
@@ -12528,7 +12524,10 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
         self.with_lambda(&pred, |it, lc| {
             for i in 0..l.borrow().len() {
                 let (item, r) = lc.item_keep(it, &l, i, loc)?;
-                if it.pred_truth_seen(&r, "find_first", loc)? {
+                if let SynValue::Private(p) = &r {
+                    it.note_seen(&p.label);
+                }
+                if pred_truth(&r, "find_first", loc)? {
                     return Ok(item);
                 }
             }
@@ -12544,7 +12543,10 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
         self.with_lambda(&pred, |it, lc| {
             for i in 0..l.borrow().len() {
                 let r = lc.item(it, &l, i, loc)?;
-                if !it.pred_truth_seen(&r, "every", loc)? {
+                if let SynValue::Private(p) = &r {
+                    it.note_seen(&p.label);
+                }
+                if !pred_truth(&r, "every", loc)? {
                     return Ok(syn_bool(false));
                 }
             }
@@ -12560,7 +12562,10 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
         self.with_lambda(&pred, |it, lc| {
             for i in 0..l.borrow().len() {
                 let r = lc.item(it, &l, i, loc)?;
-                if it.pred_truth_seen(&r, "some", loc)? {
+                if let SynValue::Private(p) = &r {
+                    it.note_seen(&p.label);
+                }
+                if pred_truth(&r, "some", loc)? {
                     return Ok(syn_bool(true));
                 }
             }
@@ -12577,7 +12582,10 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
             let mut count: i64 = 0;
             for i in 0..l.borrow().len() {
                 let r = lc.item(it, &l, i, loc)?;
-                if it.pred_truth_seen(&r, "count_where", loc)? {
+                if let SynValue::Private(p) = &r {
+                    it.note_seen(&p.label);
+                }
+                if pred_truth(&r, "count_where", loc)? {
                     count += 1;
                 }
             }
@@ -12681,7 +12689,10 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                     None => break,
                 };
                 let r = self.call_value(needle.clone(), vec![item], loc)?;
-                if self.pred_truth_seen(&r, "index_of", loc)? {
+                if let SynValue::Private(p) = &r {
+                    self.note_seen(&p.label);
+                }
+                if pred_truth(&r, "index_of", loc)? {
                     return Ok(syn_int(i as i64));
                 }
                 i += 1;
