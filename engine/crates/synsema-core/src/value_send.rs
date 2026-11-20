@@ -122,6 +122,9 @@ fn clone_leaf(v: &SendValue) -> SendValue {
         SendValue::Array(shape, data) => SendValue::Array(shape.clone(), data.clone()),
         SendValue::Time(v) => SendValue::Time(v.clone()),
         SendValue::Rng(v, name) => SendValue::Rng(v.clone(), name.clone()),
+        // Hoja estructural propia: la tabla clona sus bloques (Vec de Send), sin recorrer
+        // celdas.
+        SendValue::Table { n_rows, cols } => SendValue::Table { n_rows: *n_rows, cols: cols.clone() },
         _ => unreachable!(),
     }
 }
@@ -179,6 +182,18 @@ fn take_children(v: &mut SendValue) -> Option<DropFrame> {
     match v {
         SendValue::List(v) if !v.is_empty() => Some(DropFrame::List(std::mem::take(v).into_iter())),
         SendValue::Map(v) if !v.is_empty() => Some(DropFrame::Map(std::mem::take(v).into_iter())),
+        // Las columnas `Value` de una tabla: sus celdas se aplanan en una sola lista (el
+        // orden de la liberación no importa); los bloques primitivos sueltan solos sus Vec.
+        SendValue::Table { cols, .. } => {
+            let cells: Vec<SendValue> = std::mem::take(cols)
+                .into_iter()
+                .flat_map(|(_, col)| match col {
+                    types::SendColumn::Value(cells) => cells,
+                    _ => Vec::new(),
+                })
+                .collect();
+            if cells.is_empty() { None } else { Some(DropFrame::List(cells.into_iter())) }
+        }
         SendValue::Private(_, v) if !matches!(&**v, SendValue::Nothing) => Some(DropFrame::One(Some(std::mem::replace(&mut **v, SendValue::Nothing)))),
         _ => None,
     }

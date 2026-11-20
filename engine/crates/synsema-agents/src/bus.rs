@@ -20,7 +20,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-use synsema_core::types::SendValue;
+use synsema_core::types::{SendColumn, SendValue};
 
 /// Política al llenarse la cola del suscriptor.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -195,6 +195,23 @@ fn size_at(v: &SendValue, depth: usize) -> usize {
         SendValue::Rng(_, name) => 96 + name.len(),
         // El envoltorio con etiqueta pesa lo que pesa su valor, más los principales.
         SendValue::Private(l, inner) => size_at(inner, depth + 1) + l.iter().map(|s| s.len()).sum::<usize>(),
+        // Tabla (v0.6.65): sus bloques copiados, más el esquema y un bit de bitmap por celda
+        // por columna (aproximado; alcanza para la cota).
+        SendValue::Table { n_rows, cols } => {
+            let bitmaps = cols.len() * n_rows.div_ceil(8);
+            cols.iter().map(|(k, c)| k.len() + column_size(c, depth)).sum::<usize>() + bitmaps + 8
+        }
+    }
+}
+
+fn column_size(c: &SendColumn, depth: usize) -> usize {
+    match c {
+        SendColumn::I64(v, _) => v.len() * 8,
+        SendColumn::F64(v, _) => v.len() * 8,
+        SendColumn::F32(v, _) => v.len() * 4,
+        SendColumn::Bool(v, _) => v.len(),
+        SendColumn::Text(v, _) => v.iter().map(|s| s.len()).sum::<usize>(),
+        SendColumn::Value(cells) => cells.iter().map(|v| size_at(v, depth + 1)).sum::<usize>(),
     }
 }
 

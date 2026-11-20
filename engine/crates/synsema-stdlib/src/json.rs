@@ -562,13 +562,24 @@ fn array_view_to_json<T: Copy>(a: &ndarray::ArrayViewD<T>, elem: fn(T) -> Json) 
 /// SynValue → árbol JSON (como `syn_to_json` del oráculo).
 pub fn syn_to_json(v: &SynValue) -> Json {
     fn branch(v: &SynValue) -> bool {
-        matches!(v, SynValue::List(_) | SynValue::Map(_)) ||
+        matches!(v, SynValue::List(_) | SynValue::Map(_) | SynValue::Table(_)) ||
             matches!(v, SynValue::Server(s) if matches!(&**s, ServerValue::Envelope { .. } | ServerValue::WithHeaders { .. }))
     }
     fn child(v: &SynValue, i: usize) -> Option<SynValue> {
         match v {
             SynValue::List(l) => l.borrow().get(i),
             SynValue::Map(m) => m.borrow().get_index(i).map(|(_, v)| v.clone()),
+            // Tabla (v0.6.65): los hijos son sus celdas, fila por fila; `rebuild` las
+            // vuelve objetos por fila (mismo JSON que `to_rows`). `None` al terminar,
+            // como toda rama del recorrido.
+            SynValue::Table(t) => {
+                let n_cols = t.n_cols().max(1);
+                let total = t.n_rows() * n_cols;
+                if i >= total {
+                    return None;
+                }
+                Some(t.cell(i / n_cols, i % n_cols))
+            }
             SynValue::Server(s) if i == 0 => match &**s {
                 ServerValue::Envelope { value, .. } => Some(value.clone()),
                 ServerValue::WithHeaders { inner, .. } => Some((**inner).clone()),
@@ -581,6 +592,18 @@ pub fn syn_to_json(v: &SynValue) -> Json {
         match v {
             SynValue::List(_) => Json::Array(out),
             SynValue::Map(m) => Json::Object(m.borrow().iter().map(|(k, _)| k.to_string()).zip(out).collect()),
+            SynValue::Table(t) => {
+                let n_cols = t.n_cols().max(1);
+                Json::Array(
+                    out.chunks(n_cols)
+                        .map(|row| {
+                            Json::Object(
+                                t.schema().iter().map(|k| k.to_string()).zip(row.iter().cloned()).collect(),
+                            )
+                        })
+                        .collect(),
+                )
+            }
             SynValue::Server(s) => match &**s {
                 ServerValue::Envelope { status, .. } => obj(vec![("status", Json::Int(*status)), ("value", out.pop().unwrap())]),
                 ServerValue::WithHeaders { .. } => out.pop().unwrap(),
@@ -651,6 +674,9 @@ fn syn_to_json_leaf(v: &SynValue) -> Json {
             }
             synsema_core::types::NdArray::Bool(x) => array_view_to_json(&x.view(), Json::Bool),
         },
+        // Tabla (v0.6.65): como rama del recorrido nunca llega acá; si llega envuelta en
+        // algo que no la abre, convierte como sus filas (mismo JSON, diseño §2).
+        SynValue::Table(t) => syn_to_json(&synsema_core::types::syn_list(t.to_rows())),
         // `private` en un body serializado: fail-closed, como el secret. Como BUILTIN,
         // `json_encode` nunca ve un Private (el despacho etiquetado del intérprete le entrega
         // El valor sin etiquetas y envuelve el texto resultante con ellas). Llegar acá con un

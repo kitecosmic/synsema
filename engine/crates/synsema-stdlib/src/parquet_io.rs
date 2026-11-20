@@ -24,7 +24,7 @@ use std::sync::Arc;
 use indexmap::IndexMap;
 use num_bigint::BigInt;
 
-use parquet::basic::{Compression, LogicalType, Repetition, TimeUnit, Type as PhysicalType};
+use parquet::basic::{Compression, ConvertedType, LogicalType, Repetition, TimeUnit, Type as PhysicalType};
 use parquet::data_type::ByteArray;
 use parquet::file::properties::WriterProperties;
 use parquet::file::reader::{ChunkReader, FileReader, SerializedFileReader};
@@ -32,10 +32,12 @@ use parquet::file::writer::SerializedFileWriter;
 use parquet::record::Field;
 use parquet::schema::types::Type;
 
+use synsema_core::columns::ColumnData;
 use synsema_core::interpreter::{Control, Interpreter, RuntimeError};
 use synsema_core::number::Number;
 use synsema_core::temporal::Temporal;
 use synsema_core::types::{syn_bool, syn_bytes, syn_float, syn_int, syn_list, syn_map, syn_number, syn_text, SynValue};
+use synsema_core::types::SynText;
 
 /// Clave de los metadatos del archivo con la zona IANA de cada columna de datetimes.
 const TZ_KEY: &str = "synsema.timezones";
@@ -751,6 +753,16 @@ fn read_table<R: parquet::file::reader::ChunkReader + 'static>(
         Ok(syn_map(m))
     };
     let cap = limit.unwrap_or(u64::MAX);
+    // v0.6.65 (diseño §4): lectura por COLUMNAS. Si todas las columnas seleccionadas de primer
+    // nivel son planas (una hoja, sin repetición, sin los casos raros que convierte el lector
+    // de filas), el archivo se lee por bloques — sin armar un mapa por fila, que es donde se
+    // iba el tiempo de `parquet_read`. Listas, grupos, INT96 y FLOAT16 quedan en el camino de
+    // filas de abajo (raros y chicos).
+    if let Some(plan) = columnar_plan(&reader, &columns, &durs, &nanos, &time_nanos) {
+        return read_table_columns(
+            &reader, plan, &row_groups, limit, &nanos, &time_nanos, &durs, &zones, F,
+        );
+    }
     let mut out = Vec::new();
     let mut keys: Vec<Key> = Vec::new();
     match &row_groups {
@@ -776,7 +788,431 @@ fn read_table<R: parquet::file::reader::ChunkReader + 'static>(
             }
         }
     }
-    Ok(syn_list(out))
+    // v0.6.65: también el camino de filas (columnas anidadas, INT96…) devuelve una tabla:
+    // las filas se pliegan por columnas (diseño §4).
+    synsema_core::columns::build_from_rows(&out).map(|t| SynValue::Table(synsema_core::types::Obj::new(t))).map_err(err)
+}
+// =========================================================
+// Lectura por columnas (v0.6.65, diseño §4)
+// =========================================================
+
+/// Qué bloque se arma para cada columna: uno de los cinco primitivos, o celdas `SynValue`
+/// por conversión de campo (decimales, fechas, timestamps, bytes, duraciones).
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum ReadKind {
+    I64,
+    F64,
+    F32,
+    Bool,
+    Text,
+    Cells,
+}
+
+/// El plan de una lectura columnar: las columnas seleccionadas, en el orden del archivo, con
+/// el índice de su hoja en cada row group y su tipo de bloque.
+type ColPlan = Vec<(String, usize, ReadKind)>;
+
+/// El plan columnar de una lectura, si todas las columnas seleccionadas son planas: una sola
+/// hoja por columna de primer nivel, `max_rep_level == 0`, y sin los casos que sólo el lector
+/// de filas convierte (INT96, FIXED_LEN_BYTE_ARRAY: decimal viejo, FLOAT16, INTERVAL).
+fn columnar_plan<R: parquet::file::reader::ChunkReader + 'static>(
+    reader: &SerializedFileReader<R>,
+    columns: &Option<Vec<String>>,
+    durs: &std::collections::HashMap<String, i64>,
+    nanos: &std::collections::HashSet<String>,
+    time_nanos: &std::collections::HashSet<String>,
+) -> Option<ColPlan> {
+    let descr = reader.metadata().file_metadata().schema_descr();
+    // Hoja (índice) por columna de primer nivel; dos hojas bajo la misma raíz es un grupo o
+    // una lista: no es plana.
+    let mut leaf_of: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    let mut nested: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for (i, c) in descr.columns().iter().enumerate() {
+        let root = c.path().parts()[0].as_str();
+        if leaf_of.insert(root, i).is_some() {
+            nested.insert(root);
+        }
+        if c.max_rep_level() > 0 {
+            nested.insert(root);
+        }
+    }
+    let selected: Vec<&str> = descr
+        .root_schema()
+        .get_fields()
+        .iter()
+        .map(|f| f.name())
+        .filter(|n| columns.as_ref().map_or(true, |cs| cs.iter().any(|c| c == *n)))
+        .collect();
+    let mut plan: ColPlan = Vec::with_capacity(selected.len());
+    for name in selected {
+        if nested.contains(name) {
+            return None;
+        }
+        let Some(&leaf) = leaf_of.get(name) else { return None };
+        let c = &descr.columns()[leaf];
+        // El espejo del lector de filas es el CONVERTED type (el lógico se refleja en él): un
+        // `binary (UTF8)` legacy no tiene tipo lógico y es texto igual.
+        let kind = match (c.physical_type(), c.converted_type()) {
+            // Convertidos INVÁLIDOS según el spec (TIME_MICROS es INT64, TIME_MILLIS es INT32):
+            // el lector de filas da su error (nyi) — el mismo trato que v0.6.64.
+            (PhysicalType::INT32, ConvertedType::TIME_MICROS)
+            | (PhysicalType::INT64, ConvertedType::TIME_MILLIS) => return None,
+            (PhysicalType::BOOLEAN, _) => ReadKind::Bool,
+            (PhysicalType::INT32, ConvertedType::DATE)
+            | (PhysicalType::INT32, ConvertedType::TIME_MILLIS)
+            | (PhysicalType::INT32, ConvertedType::DECIMAL) => ReadKind::Cells,
+            (PhysicalType::INT32, _) => ReadKind::I64,
+            (PhysicalType::INT64, ConvertedType::UINT_64)
+            | (PhysicalType::INT64, ConvertedType::TIMESTAMP_MILLIS)
+            | (PhysicalType::INT64, ConvertedType::TIMESTAMP_MICROS)
+            | (PhysicalType::INT64, ConvertedType::TIME_MICROS)
+            | (PhysicalType::INT64, ConvertedType::DECIMAL) => ReadKind::Cells,
+            (PhysicalType::INT64, _) => {
+                // Un INT64 sin converted es un entero; una duration por metadato o un
+                // timestamp/TIME en NANOSEGUNDOS (que el converted no representa: quedan NONE
+                // con su tipo lógico) se convierten por celda.
+                if durs.contains_key(name) || nanos.contains(name) || time_nanos.contains(name) {
+                    ReadKind::Cells
+                } else {
+                    ReadKind::I64
+                }
+            }
+            (PhysicalType::FLOAT, _) => ReadKind::F32,
+            (PhysicalType::DOUBLE, _) => ReadKind::F64,
+            (PhysicalType::BYTE_ARRAY, ConvertedType::UTF8)
+            | (PhysicalType::BYTE_ARRAY, ConvertedType::ENUM)
+            | (PhysicalType::BYTE_ARRAY, ConvertedType::JSON) => ReadKind::Text,
+            (PhysicalType::BYTE_ARRAY, _) => ReadKind::Cells,
+            (PhysicalType::INT96, _) | (PhysicalType::FIXED_LEN_BYTE_ARRAY, _) => return None,
+        };
+        plan.push((name.to_string(), leaf, kind));
+    }
+    Some(plan)
+}
+
+/// Una celda `SynValue` desde un campo Parquet: la MISMA conversión del camino de filas
+/// (`convert`): timestamps en nanosegundos, TIME en nanosegundos, durations por metadato, y la
+/// zona IANA de la columna.
+#[allow(non_snake_case)]
+fn column_cell(
+    k: &str,
+    v: &Field,
+    nanos: &std::collections::HashSet<String>,
+    time_nanos: &std::collections::HashSet<String>,
+    durs: &std::collections::HashMap<String, i64>,
+    zones: &std::collections::HashMap<String, synsema_core::temporal::Zone>,
+    F: &str,
+) -> Result<SynValue, Control> {
+    let mut val = match (v, nanos.contains(k)) {
+        (Field::Long(ns), true) => {
+            let (secs, sub) = (ns.div_euclid(1_000_000_000), ns.rem_euclid(1_000_000_000) as u32);
+            match chrono::DateTime::from_timestamp(secs, sub) {
+                Some(dt) => SynValue::Time(synsema_core::types::Obj::new(Temporal::DateTime(dt.with_timezone(&synsema_core::temporal::UTC)))),
+                None => SynValue::Nothing,
+            }
+        }
+        (Field::Long(ns), false) if time_nanos.contains(k) => time_of_day(chrono::Duration::nanoseconds(*ns)),
+        (Field::Long(n), false) if durs.contains_key(k) => duration_of(*n, durs[k]).ok_or_else(|| {
+            err(format!("{}: column {:?}: {} is out of the range of a duration", F, k, n))
+        })?,
+        _ => field_to_syn(v),
+    };
+    if let (Some(tz), SynValue::Time(t)) = (zones.get(k), &val) {
+        if let Temporal::DateTime(dt) = &**t {
+            val = SynValue::Time(synsema_core::types::Obj::new(Temporal::DateTime(dt.with_timezone(tz))));
+        }
+    }
+    Ok(val)
+}
+
+/// Los valores de un bloque mientras se leen: el `vals` con un placeholder donde va un null y
+/// las posiciones de los nulls, para armar el bitmap al final.
+struct BlockAcc<T> {
+    vals: Vec<T>,
+    null_at: Vec<usize>,
+    len: usize,
+    placeholder: T,
+}
+
+impl<T: Clone> BlockAcc<T> {
+    fn new(placeholder: T) -> BlockAcc<T> {
+        BlockAcc { vals: Vec::new(), null_at: Vec::new(), len: 0, placeholder }
+    }
+    #[inline]
+    fn push_v(&mut self, v: &T) -> Result<(), Control> {
+        self.vals.push(v.clone());
+        self.len += 1;
+        Ok(())
+    }
+    #[inline]
+    fn push_null(&mut self) -> Result<(), Control> {
+        self.vals.push(self.placeholder.clone());
+        self.null_at.push(self.len);
+        self.len += 1;
+        Ok(())
+    }
+    /// El bloque y su bitmap (o `None` si todo es válido, como Arrow omite el buffer).
+    fn finish(self) -> (Vec<T>, Option<synsema_core::columns::Bitmap>) {
+        let nulls = if self.null_at.is_empty() {
+            None
+        } else {
+            let mut b = synsema_core::columns::Bitmap::all_valid(self.len);
+            for &i in &self.null_at {
+                b.set_null(i);
+            }
+            Some(b)
+        };
+        (self.vals, nulls)
+    }
+}
+
+/// Lee una columna por lotes de 8 192 filas de los row groups pedidos. `conv` arma cada valor
+/// del bloque; `push_null` marca el null. Devuelve las filas consumidas. (`read_records` de
+/// parquet 60: los valores llegan contiguos sin los nulos, con los niveles aparte.)
+macro_rules! read_batches {
+    ($rg:expr, $leaf:expr, $variant:ident, $take:expr, $acc:expr, $conv:expr, $F:expr, $name:expr) => {{
+        let cr = $rg.get_column_reader($leaf).map_err(|e| err(format!("{}: {}", $F, e)))?;
+        let ColumnReader::$variant(mut r) = cr else {
+            return Err(err(format!("{}: column {:?}: unexpected physical type", $F, $name)));
+        };
+        let max_def = $rg.metadata().column($leaf).column_descr().max_def_level();
+        let mut records = 0usize;
+        while records < $take {
+            let batch = ($take - records).min(8192);
+            if max_def > 0 {
+                let mut vals: Vec<_> = Vec::with_capacity(batch);
+                let mut defs: Vec<i16> = Vec::with_capacity(batch);
+                let (recs, _l, _v) = r
+                    .read_records(batch, Some(&mut defs), None, &mut vals)
+                    .map_err(|e| err(format!("{}: {}", $F, e)))?;
+                if recs == 0 && defs.is_empty() {
+                    break;
+                }
+                let mut vi = 0usize;
+                for lv in &defs {
+                    if *lv > 0 {
+                        let v = &vals[vi];
+                        vi += 1;
+                        ($conv)($acc, v)?;
+                    } else {
+                        ($acc).push_null()?;
+                    }
+                }
+                records += recs;
+            } else {
+                let mut vals: Vec<_> = Vec::with_capacity(batch);
+                let (recs, _l, _v) = r
+                    .read_records(batch, None, None, &mut vals)
+                    .map_err(|e| err(format!("{}: {}", $F, e)))?;
+                if recs == 0 {
+                    break;
+                }
+                for v in &vals {
+                    ($conv)($acc, &v)?;
+                }
+                records += recs;
+            }
+        }
+        records
+    }};
+}
+
+/// La lectura por columnas: por cada columna del plan, sus hojas en los row groups
+/// seleccionados, y los bloques (`ColumnData`) sin materializar mapas por fila. Es el camino
+/// de `parquet_read`/`parquet_scan` cuando todas las columnas son planas.
+#[allow(non_snake_case)]
+fn read_table_columns<R: parquet::file::reader::ChunkReader + 'static>(
+    reader: &SerializedFileReader<R>,
+    plan: ColPlan,
+    row_groups: &Option<Vec<usize>>,
+    limit: Option<u64>,
+    nanos: &std::collections::HashSet<String>,
+    time_nanos: &std::collections::HashSet<String>,
+    durs: &std::collections::HashMap<String, i64>,
+    zones: &std::collections::HashMap<String, synsema_core::temporal::Zone>,
+    F: &str,
+) -> Result<SynValue, Control> {
+    use parquet::column::reader::ColumnReader;
+    use parquet::data_type::Decimal;
+    let groups: Vec<usize> = match row_groups {
+        Some(rs) => rs.clone(),
+        None => (0..reader.metadata().num_row_groups()).collect(),
+    };
+    let budget = limit.unwrap_or(u64::MAX) as usize;
+
+    /// El acumulador del bloque de una columna (uno por tipo físico: no se unifican).
+    enum Acc {
+        I64(BlockAcc<i64>),
+        F64(BlockAcc<f64>),
+        F32(BlockAcc<f32>),
+        Bool(BlockAcc<bool>),
+        Text(BlockAcc<SynText>),
+        Cells(BlockAcc<SynValue>),
+    }
+    impl Acc {
+        fn into_data(self) -> ColumnData {
+            match self {
+                Acc::I64(a) => {
+                    let (v, n) = a.finish();
+                    ColumnData::I64(v, n)
+                }
+                Acc::F64(a) => {
+                    let (v, n) = a.finish();
+                    ColumnData::F64(v, n)
+                }
+                Acc::F32(a) => {
+                    let (v, n) = a.finish();
+                    ColumnData::F32(v, n)
+                }
+                Acc::Bool(a) => {
+                    let (v, n) = a.finish();
+                    ColumnData::Bool(v, n)
+                }
+                Acc::Text(a) => {
+                    let (v, n) = a.finish();
+                    ColumnData::Text(v, n)
+                }
+                // Las celdas `Value` llevan el null dentro (`Nothing`), sin bitmap.
+                Acc::Cells(a) => {
+                    let (v, _) = a.finish();
+                    ColumnData::Value(v)
+                }
+            }
+        }
+    }
+
+    let mut cols: Vec<(Key, synsema_core::types::Obj<ColumnData>)> = Vec::with_capacity(plan.len());
+    for (name, leaf, kind) in &plan {
+        let mut acc = match kind {
+            ReadKind::I64 => Acc::I64(BlockAcc::new(0)),
+            ReadKind::F64 => Acc::F64(BlockAcc::new(0.0)),
+            ReadKind::F32 => Acc::F32(BlockAcc::new(0.0)),
+            ReadKind::Bool => Acc::Bool(BlockAcc::new(false)),
+            ReadKind::Text => Acc::Text(BlockAcc::new(SynText::from(""))),
+            ReadKind::Cells => Acc::Cells(BlockAcc::new(SynValue::Nothing)),
+        };
+        let mut done = 0usize;
+        for &rg_i in &groups {
+            if done >= budget {
+                break;
+            }
+            let rg = reader.get_row_group(rg_i).map_err(|e| err(format!("{}: {}", F, e)))?;
+            let take = (rg.metadata().num_rows().max(0) as usize).min(budget - done);
+            let descr = rg.metadata().column(*leaf).column_descr();
+            // La conversión de cada valor crudo al bloque, por tipo físico y lógico. El plan
+            // garantiza la pareja; el brazo `_` es un error defensivo.
+            match (kind, descr.physical_type()) {
+                (ReadKind::I64, PhysicalType::INT64) => {
+                    let Acc::I64(a) = &mut acc else { unreachable!() };
+                    done += read_batches!(rg, *leaf, Int64ColumnReader, take, a, |a: &mut BlockAcc<i64>, v: &i64| a.push_v(v), F, name);
+                }
+                (ReadKind::I64, PhysicalType::INT32) => {
+                    let Acc::I64(a) = &mut acc else { unreachable!() };
+                    // UINT_32 sobre INT32: el valor sale POSITIVO (el mismo que produce el
+                    // camino de filas con Field::UInt; i64 lo contiene, `(*v as u32) as i64`
+                    // es la conversión de valor). Los INT32 con signo siguen con signo.
+                    let unsigned = descr.converted_type() == ConvertedType::UINT_32;
+                    done += read_batches!(rg, *leaf, Int32ColumnReader, take, a, |a: &mut BlockAcc<i64>, v: &i32| {
+                        if unsigned {
+                            a.push_v(&((*v as u32) as i64))
+                        } else {
+                            a.push_v(&(*v as i64))
+                        }
+                    }, F, name);
+                }
+                (ReadKind::F64, PhysicalType::DOUBLE) => {
+                    let Acc::F64(a) = &mut acc else { unreachable!() };
+                    done += read_batches!(rg, *leaf, DoubleColumnReader, take, a, |a: &mut BlockAcc<f64>, v: &f64| a.push_v(v), F, name);
+                }
+                (ReadKind::F32, PhysicalType::FLOAT) => {
+                    let Acc::F32(a) = &mut acc else { unreachable!() };
+                    done += read_batches!(rg, *leaf, FloatColumnReader, take, a, |a: &mut BlockAcc<f32>, v: &f32| a.push_v(v), F, name);
+                }
+                (ReadKind::Bool, PhysicalType::BOOLEAN) => {
+                    let Acc::Bool(a) = &mut acc else { unreachable!() };
+                    done += read_batches!(rg, *leaf, BoolColumnReader, take, a, |a: &mut BlockAcc<bool>, v: &bool| a.push_v(v), F, name);
+                }
+                (ReadKind::Text, PhysicalType::BYTE_ARRAY) => {
+                    let Acc::Text(a) = &mut acc else { unreachable!() };
+                    let conv = |a: &mut BlockAcc<SynText>, v: &ByteArray| -> Result<(), Control> {
+                        let s = v.as_utf8().map_err(|e| err(format!("{}: column {:?}: {}", F, name, e)))?;
+                        a.push_v(&SynText::from(s))
+                    };
+                    done += read_batches!(rg, *leaf, ByteArrayColumnReader, take, a, conv, F, name);
+                }
+                (ReadKind::Cells, PhysicalType::INT32) => {
+                    let Acc::Cells(a) = &mut acc else { unreachable!() };
+                    let conv = |a: &mut BlockAcc<SynValue>, v: &i32| -> Result<(), Control> {
+                        // El espejo de `Field::convert_int32`: el converted type manda.
+                        let f = match descr.converted_type() {
+                            ConvertedType::DATE => Field::Date(*v),
+                            ConvertedType::DECIMAL => {
+                                Field::Decimal(Decimal::from_i32(*v, descr.type_precision(), descr.type_scale()))
+                            }
+                            ConvertedType::TIME_MILLIS => Field::TimeMillis(*v),
+                            ConvertedType::TIME_MICROS => Field::TimeMicros(*v as i64),
+                            _ => Field::Int(*v),
+                        };
+                        let cell = column_cell(name, &f, nanos, time_nanos, durs, zones, F)?;
+                        a.push_v(&cell)
+                    };
+                    done += read_batches!(rg, *leaf, Int32ColumnReader, take, a, conv, F, name);
+                }
+                (ReadKind::Cells, PhysicalType::INT64) => {
+                    let Acc::Cells(a) = &mut acc else { unreachable!() };
+                    let conv = |a: &mut BlockAcc<SynValue>, v: &i64| -> Result<(), Control> {
+                        // El espejo de `Field::convert_int64`; TIMESTAMP/TIME en nanosegundos
+                        // salen como entero y los convierte `column_cell` (los sets de nanos).
+                        let f = match descr.converted_type() {
+                            ConvertedType::DECIMAL => {
+                                Field::Decimal(Decimal::from_i64(*v, descr.type_precision(), descr.type_scale()))
+                            }
+                            ConvertedType::TIMESTAMP_MILLIS => Field::TimestampMillis(*v),
+                            ConvertedType::TIMESTAMP_MICROS => Field::TimestampMicros(*v),
+                            ConvertedType::TIME_MICROS => Field::TimeMicros(*v),
+                            ConvertedType::TIME_MILLIS => Field::TimeMillis(*v as i32),
+                            ConvertedType::UINT_64 => Field::ULong(*v as u64),
+                            // Nanosegundos (converted NONE con su lógico): sale como entero y
+                            // lo convierte `column_cell` con los sets de nanos.
+                            _ => Field::Long(*v),
+                        };
+                        let cell = column_cell(name, &f, nanos, time_nanos, durs, zones, F)?;
+                        a.push_v(&cell)
+                    };
+                    done += read_batches!(rg, *leaf, Int64ColumnReader, take, a, conv, F, name);
+                }
+                (ReadKind::Cells, PhysicalType::BYTE_ARRAY) => {
+                    let Acc::Cells(a) = &mut acc else { unreachable!() };
+                    // El plan nunca manda acá una columna UTF8/ENUM/JSON (van por Text). Un
+                    // decimal en BYTE_ARRAY se convierte como decimal; bytes y BSON como
+                    // `bytes`.
+                    let conv = |a: &mut BlockAcc<SynValue>, v: &ByteArray| -> Result<(), Control> {
+                        let f = match descr.converted_type() {
+                            ConvertedType::DECIMAL => {
+                                Field::Decimal(Decimal::from_bytes(v.clone(), descr.type_precision(), descr.type_scale()))
+                            }
+                            _ => Field::Bytes(v.clone()),
+                        };
+                        let cell = column_cell(name, &f, nanos, time_nanos, durs, zones, F)?;
+                        a.push_v(&cell)
+                    };
+                    done += read_batches!(rg, *leaf, ByteArrayColumnReader, take, a, conv, F, name);
+                }
+                (kind, physical) => {
+                    return Err(err(format!(
+                        "{}: column {:?}: {:?} over {:?} cannot be read by columns",
+                        F, name, kind, physical
+                    )));
+                }
+            }
+        }
+        cols.push((Key::from(name.as_str()), synsema_core::types::Obj::new(acc.into_data())));
+    }
+    let mut t = synsema_core::columns::ColumnTable::new(cols).map_err(err)?;
+    if t.n_rows() > budget {
+        t = t.slice(0, budget).ok_or_else(|| err(format!("{}: bad limit", F)))?;
+    }
+    Ok(SynValue::Table(synsema_core::types::Obj::new(t)))
 }
 
 // =========================================================
@@ -1041,6 +1477,8 @@ fn parquet_write(args: &[SynValue]) -> Result<SynValue, Control> {
     const F: &str = "parquet_write";
     let rows = match args.first() {
         Some(SynValue::List(l)) => l.borrow().to_vec(),
+        // v0.6.65 (diseño §4): una tabla se escribe como sus filas; el escritor es el mismo.
+        Some(SynValue::Table(t)) => t.to_rows(),
         Some(other) => return Err(err(format!("{}: expected a list of rows (maps), got {}", F, other.type_name()))),
         None => return Err(err("parquet_write(rows, opts?)")),
     };
@@ -1351,7 +1789,6 @@ fn parquet_stat_value(s: &parquet::file::statistics::Statistics, col: &parquet::
                 TimeUnit::MILLIS => chrono::DateTime::from_timestamp_millis(value),
                 TimeUnit::MICROS => chrono::DateTime::from_timestamp_micros(value),
                 TimeUnit::NANOS => chrono::DateTime::from_timestamp(value.div_euclid(1_000_000_000), value.rem_euclid(1_000_000_000) as u32),
-                _ => None,
             };
             instant.map(|dt| SynValue::Time(synsema_core::types::Obj::new(Temporal::DateTime(dt.with_timezone(&synsema_core::temporal::UTC)))))
         }
@@ -1635,8 +2072,12 @@ mod tests {
     }
 
     fn rows(v: SynValue) -> Vec<String> {
-        let SynValue::List(l) = v else { panic!("esperaba una lista") };
-        let items = l.borrow().to_vec();
+        // v0.6.65: la lectura devuelve una tabla; las filas salen por `to_rows`.
+        let items = match v {
+            SynValue::List(l) => l.borrow().to_vec(),
+            SynValue::Table(t) => t.to_rows(),
+            other => panic!("esperaba una lista o una tabla, got {}", other.type_name()),
+        };
         items.iter().map(|r| r.to_string()).collect()
     }
 

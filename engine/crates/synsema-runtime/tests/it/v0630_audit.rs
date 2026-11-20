@@ -161,13 +161,13 @@ fn a6_request_json_matches_json_decode() {
 #[test]
 fn a7_parquet_durations_round_trip() {
     assert_eq!(
-        out("let rows be [{\"d\": duration(seconds = 5), \"n\": 1}, {\"d\": nothing, \"n\": 2}, {\"d\": duration(days = -2, seconds = 0.000007), \"n\": 3}]\nlet back be parquet_read(parquet_write(rows))\nprint(back == rows)\nprint(back[2][\"d\"])\nlet fine be [{\"d\": duration(seconds = 0.0000015)}]\nprint(parquet_read(parquet_write(fine)) == fine)\nprint(parquet_read(parquet_write([{\"n\": 7}])))"),
+        out("let rows be [{\"d\": duration(seconds = 5), \"n\": 1}, {\"d\": nothing, \"n\": 2}, {\"d\": duration(days = -2, seconds = 0.000007), \"n\": 3}]\nlet back be parquet_read(parquet_write(rows))\nprint(to_rows(back) == rows)\nprint(back[2][\"d\"])\nlet fine be [{\"d\": duration(seconds = 0.0000015)}]\nprint(to_rows(parquet_read(parquet_write(fine))) == fine)\nprint(parquet_read(parquet_write([{\"n\": 7}])))"),
         vec!["true", "-P1DT23H59M59.999993S", "true", "[{n: 7}]"]
     );
     // Escrito con pyarrow 25: columnas duration[s], [ms], [us], [ns] y un int64 común.
     let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures").to_string_lossy().replace('\\', "/");
     let r = run_program(
-        &format!("require file.read(\"{dir}/*\")\nlet rows be parquet_read(read_file_bytes(\"{dir}/parquet_duration_arrow.parquet\"))\neach r in rows\n    print(r)\nprint(parquet_read(parquet_write(rows)) == rows)\n"),
+        &format!("require file.read(\"{dir}/*\")\nlet rows be parquet_read(read_file_bytes(\"{dir}/parquet_duration_arrow.parquet\"))\neach r in to_rows(rows)\n    print(r)\nprint(parquet_read(parquet_write(rows)) == rows)\n"),
         "audit.syn",
     );
     assert!(r.success, "{:?}", r.errors);
@@ -373,7 +373,7 @@ fn d2_decimal_accepts_an_exponent() {
 // (Verificado con pyarrow 25, pandas y polars; acá, que la clave está y Synsema la relee.)
 #[test]
 fn parquet_writes_the_arrow_schema() {
-    let o = out("let rows be [{\"d\": duration(seconds = 90), \"w\": datetime(\"2026-01-03T10:00:00\", \"Europe/Madrid\"), \"n\": 1}]\nlet bin be parquet_write(rows)\nprint(contains(hex(bin), replace(hex(bytes(\"ARROW:schema\")), \"0x\", \"\")))\nprint(parquet_read(bin) == rows)");
+    let o = out("let rows be [{\"d\": duration(seconds = 90), \"w\": datetime(\"2026-01-03T10:00:00\", \"Europe/Madrid\"), \"n\": 1}]\nlet bin be parquet_write(rows)\nprint(contains(hex(bin), replace(hex(bytes(\"ARROW:schema\")), \"0x\", \"\")))\nprint(to_rows(parquet_read(bin)) == rows)");
     assert_eq!(o, vec!["true", "true"]);
 }
 
@@ -388,7 +388,7 @@ fn parquet_refuses_to_drop_nanoseconds() {
     assert!(e.contains("column \"t\" has a datetime with nanoseconds and one outside 1677-2262"), "{}", e);
     // Sin nanosegundos, lo lejano va en microsegundos como siempre; con todo en rango, en nanosegundos.
     assert_eq!(
-        out(&format!("{far}let a be [{{\"d\": far}}, {{\"d\": duration(seconds = 1)}}]\nprint(parquet_read(parquet_write(a)) == a)\nlet b be [{{\"t\": datetime(\"2026-01-03T10:00:00.000000001Z\")}}]\nprint(parquet_read(parquet_write(b)) == b)")),
+        out(&format!("{far}let a be [{{\"d\": far}}, {{\"d\": duration(seconds = 1)}}]\nprint(to_rows(parquet_read(parquet_write(a))) == a)\nlet b be [{{\"t\": datetime(\"2026-01-03T10:00:00.000000001Z\")}}]\nprint(to_rows(parquet_read(parquet_write(b))) == b)")),
         vec!["true", "true"]
     );
 }

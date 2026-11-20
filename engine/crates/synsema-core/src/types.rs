@@ -86,6 +86,12 @@ pub enum SynValue {
     /// Fecha, instante con zona o duración (v0.6.29, DATOS-13): `date`, `datetime`,
     /// `duration`. Variante aislada, inmutable; la aritmética vive en `temporal::binop`.
     Time(Obj<crate::temporal::Temporal>),
+    /// Tabla por columnas (v0.6.65): el storage físico vive en `columns.rs` (modelo Arrow
+    /// simplificado). Variante **aislada** (como `array`): detrás de un `Obj` para que
+    /// `SynValue` no cambie de tamaño. Inmutable (las transformaciones devuelven tablas
+    /// nuevas); `parquet_read`/`parquet_scan` devuelven una; `table(rows)`/`to_rows(t)`
+    /// convierten. `==` sólo contra otra tabla (G3), por valor.
+    Table(Obj<crate::columns::ColumnTable>),
 }
 
 /// Closure de paginación lazy de `paged()`: `fetch(limit, offset) → (filas, total)`.
@@ -233,6 +239,7 @@ impl SynValue {
             SynValue::Bytes(_) => "bytes",
             SynValue::Complex(_) => "complex",
             SynValue::Array(_) => "array",
+            SynValue::Table(_) => "table",
             SynValue::Time(t) => t.type_name(),
             // Sólo se ve en mensajes de error de caminos que no desenvuelven; `type_of`
             // Pasa por el despacho de builtins y reporta el tipo del valor interno.
@@ -272,6 +279,8 @@ impl SynValue {
             SynValue::Complex(z) => z.re != 0.0 || z.im != 0.0,
             // Array no-vacío = true (espeja list).
             SynValue::Array(a) => !a.is_empty(),
+            // Tabla sin filas = false (espeja list/map vacíos); con filas, true.
+            SynValue::Table(t) => t.n_rows() > 0,
             // Una fecha o un instante siempre; una duración cero es falsa (como el 0).
             SynValue::Time(t) => !matches!(&**t, crate::temporal::Temporal::Duration(d) if d.is_zero()),
             // La veracidad del valor interno (el intérprete etiqueta el flujo de control
@@ -320,6 +329,9 @@ impl SynValue {
                 }
                 _ => self.syn_equals(other),
             },
+            // Tabla por columnas (v0.6.65): por valor, con la profundidad propagada a las
+            // celdas `Value` (igual que las listas). Nunca igual a otro tipo (G3).
+            (SynValue::Table(a), SynValue::Table(b)) => a.equals(b, depth),
             _ => self.syn_equals(other),
         }
     }
@@ -330,6 +342,11 @@ impl SynValue {
         } else {
             self.equals_at(other, depth + 1)
         }
+    }
+
+    /// El mismo pase de profundidad para `columns.rs` (las celdas `Value` de una tabla).
+    pub(crate) fn equals_next_depth(&self, other: &SynValue, depth: usize) -> bool {
+        self.equals_next(other, depth)
     }
 
     /// Igualdad por valor (operador `==`/`!=`, `match`, `contains`).
@@ -408,6 +425,8 @@ impl SynValue {
             | (SynValue::Number(n), SynValue::Complex(z)) => z.im == 0.0 && z.re == n.to_f64(),
             // Array (Batch 5): misma shape Y mismos datos. Nunca igual a otro tipo.
             (SynValue::Array(a), SynValue::Array(b)) => a == b,
+            // Tabla (v0.6.65): mismo esquema Y mismas celdas. Nunca igual a otro tipo (G3).
+            (SynValue::Table(a), SynValue::Table(b)) => a.equals(b, depth),
             // El mismo día / el mismo INSTANTE (aunque se vea en otra zona) / la misma duración.
             (SynValue::Time(a), SynValue::Time(b)) => {
                 crate::temporal::cmp(a, b) == Some(std::cmp::Ordering::Equal)
@@ -441,6 +460,8 @@ impl fmt::Display for SynValue {
             // mostrando el texto tal cual.
             SynValue::List(l) => crate::value_fmt::list(l, f, 0),
             SynValue::Map(m) => crate::value_fmt::map(m, f, 0),
+            // Igual bytes que el display de sus filas (`to_rows(t)`), diseño §2.
+            SynValue::Table(t) => crate::value_fmt::table(t, f, 0),
             SynValue::Task(t) => {
                 let names: Vec<&str> = t.parameters.iter().map(|p| &*p.name).collect();
                 write!(f, "task {}({})", t.name, names.join(", "))
@@ -811,6 +832,21 @@ pub enum SendValue {
     /// Un generador de `rng()`/`rng_spawn()` (v0.6.29): cruza su ESTADO (una copia, como un
     /// generador de numpy que se pasa a otro proceso). Del otro lado vuelve a ser un generador.
     Rng(Option<Box<crate::rng::Generator>>, String),
+    /// Tabla por columnas (v0.6.65): bloques copiados de la ventana, sin offset. Es una hoja
+    /// para el recorrido (`value_send`): las celdas `Value` ya vienen convertidas.
+    Table { n_rows: usize, cols: Vec<(String, SendColumn)> },
+}
+
+/// Snapshot de una columna de tabla (v0.6.65): el bloque copiado y su bitmap de ventana.
+#[derive(Clone, Debug, PartialEq)]
+pub enum SendColumn {
+    I64(Vec<i64>, Option<crate::columns::Bitmap>),
+    F64(Vec<f64>, Option<crate::columns::Bitmap>),
+    F32(Vec<f32>, Option<crate::columns::Bitmap>),
+    Bool(Vec<bool>, Option<crate::columns::Bitmap>),
+    Text(Vec<String>, Option<crate::columns::Bitmap>),
+    /// Las celdas ya vienen como `SendValue` (convertidas por `to_send_at`).
+    Value(Vec<SendValue>),
 }
 
 /// Snapshot de un `SynValue` a `SendValue` (deep copy). Task/Builtin no cruzan: se
@@ -893,6 +929,17 @@ pub(crate) fn to_send_at(v: &SynValue, depth: usize) -> SendValue {
             p.label.iter().map(|s| s.to_string()).collect(),
             Box::new(to_send_at(&p.value, depth + 1)),
         ),
+        // Tabla por columnas (v0.6.65): bloques de la ventana copiados (columns.rs). Es una
+        // hoja para el recorrido de `value_send`: las celdas `Value` ya cruzan convertidas.
+        SynValue::Table(t) => SendValue::Table {
+            n_rows: t.n_rows(),
+            cols: t
+                .schema()
+                .iter()
+                .enumerate()
+                .map(|(ci, k)| (k.as_str().to_string(), t.send_column(ci, depth)))
+                .collect(),
+        },
     }
 }
 
@@ -927,6 +974,10 @@ pub(crate) fn from_send_at(v: &SendValue, depth: usize) -> SynValue {
         SendValue::Time(t) => SynValue::Time(crate::types::Obj::new(t.clone())),
         SendValue::Rng(Some(g), name) => crate::rng::restore((**g).clone(), name.clone()),
         SendValue::Rng(None, name) => crate::rng::top_level_stub(name),
+        // Tabla (v0.6.65): reconstruye los bloques copiados (columns.rs `from_send`).
+        SendValue::Table { n_rows, cols } => SynValue::Table(crate::types::Obj::new(
+            crate::columns::ColumnTable::from_send(*n_rows, cols.clone(), depth),
+        )),
     }
 }
 
@@ -953,5 +1004,52 @@ pub(crate) fn send_leaf_display(value: &SendValue, f: &mut fmt::Formatter<'_>) -
             SendValue::Complex(re, im) => write!(f, "{}", complex_display(*re, *im)),
             // Reconstruye el array y reusa el repr NumPy-like.
             SendValue::Array(shape, data) => write!(f, "{}", nd_display(&data.to_nd(shape))),
+            // La tabla muestra sus filas (igual que `SynValue::Table`); las celdas
+            // estructurales de `Value` pasan por el display de value_send.
+            SendValue::Table { n_rows, cols } => {
+                f.write_str("[")?;
+                for row in 0..*n_rows {
+                    if row != 0 {
+                        f.write_str(", ")?;
+                    }
+                    f.write_str("{")?;
+                    for (ci, (k, col)) in cols.iter().enumerate() {
+                        if ci != 0 {
+                            f.write_str(", ")?;
+                        }
+                        write!(f, "{k}: ")?;
+                        crate::value_send::display(&send_table_cell(col, row), f)?;
+                    }
+                    f.write_str("}")?;
+                }
+                f.write_str("]")
+            }
         }
     }
+
+/// La celda `row` de una columna snapshot, materializada (para el display de la tabla).
+pub(crate) fn send_table_cell(col: &SendColumn, row: usize) -> SendValue {
+    match col {
+        SendColumn::I64(v, nulls) => match nulls.as_ref() {
+            Some(b) if b.is_null(row) => SendValue::Nothing,
+            _ => SendValue::Number(Number::Int(v[row])),
+        },
+        SendColumn::F64(v, nulls) => match nulls.as_ref() {
+            Some(b) if b.is_null(row) => SendValue::Nothing,
+            _ => SendValue::Number(Number::Float(v[row])),
+        },
+        SendColumn::F32(v, nulls) => match nulls.as_ref() {
+            Some(b) if b.is_null(row) => SendValue::Nothing,
+            _ => SendValue::Number(Number::Float(v[row] as f64)),
+        },
+        SendColumn::Bool(v, nulls) => match nulls.as_ref() {
+            Some(b) if b.is_null(row) => SendValue::Nothing,
+            _ => SendValue::Bool(v[row]),
+        },
+        SendColumn::Text(v, nulls) => match nulls.as_ref() {
+            Some(b) if b.is_null(row) => SendValue::Nothing,
+            _ => SendValue::Text(v[row].clone()),
+        },
+        SendColumn::Value(cells) => cells[row].clone(),
+    }
+}

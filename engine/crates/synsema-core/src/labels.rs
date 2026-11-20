@@ -478,6 +478,18 @@ fn child<R>(v: &SynValue, index: usize, f: impl FnOnce(&SynValue, Option<&str>, 
         }
         SynValue::Map(m) => m.borrow().get_index(index).map(|(k, v)| f(v, Some(k.as_str()), None)),
         SynValue::Private(p) if index == 0 => Some(f(&p.value, None, None)),
+        // Tabla (v0.6.65): sólo las columnas `Value` pueden contener un `Private` (los
+        // bloques primitivos no tienen dónde colgar una etiqueta); se recorren fila por fila
+        // con el camino `.col[row]`, el mismo que arma `check_into`.
+        SynValue::Table(t) => {
+            let nv = t.value_columns().len();
+            if nv == 0 {
+                return None;
+            }
+            let (row, pos) = (index / nv, index % nv);
+            let key = format!("{}[{}]", t.value_col_name(pos)?, row);
+            t.value_cell_ref(row, pos).map(|v| f(v, Some(&key), None))
+        }
         SynValue::Server(s) => match &**s {
             ServerValue::Node(m) => m.borrow().get_index(index).map(|(k, v)| f(v, Some(k.as_str()), None)),
             ServerValue::Envelope { value, .. } if index == 0 => Some(f(value, Some("value"), None)),
@@ -637,6 +649,9 @@ fn rebuild(v: &SynValue, mut values: Vec<SynValue>, strip: bool) -> SynValue {
             };
             SynValue::Server(crate::types::Obj::new(out))
         }
+        // Tabla (v0.6.65): las columnas `Value` reconstruidas salen en un `Obj` nuevo; las
+        // primitivas se comparten (columns.rs `rebuild_values`).
+        SynValue::Table(t) => SynValue::Table(crate::types::Obj::new(t.rebuild_values(values))),
         _ => v.clone(),
     }
 }
@@ -648,7 +663,7 @@ fn copy_leaf(v: &SynValue, strip: bool) -> Option<(SynValue, bool)> {
             return Some((if strip { v.clone() } else { crate::types::syn_list_of(b.clone()) }, false));
         }
     }
-    if matches!(v, SynValue::List(_) | SynValue::Map(_) | SynValue::Private(_)) {
+    if matches!(v, SynValue::List(_) | SynValue::Map(_) | SynValue::Private(_) | SynValue::Table(_)) {
         return None;
     }
     if let SynValue::Server(s) = v {
@@ -782,6 +797,25 @@ fn check_into(v: &SynValue, accepted: &Label, path: &mut String, ctx: &Label, de
             Ok(())
         }
         SynValue::Map(m) => check_map(&m.borrow(), accepted, path, ctx, depth),
+        // Tabla (v0.6.65): recorre las columnas `Value` (las primitivas no pueden llevar un
+        // `Private`) con el camino `.col[row]`.
+        SynValue::Table(t) => {
+            let mut r = Ok(());
+            t.for_each_value_cell(|row, col, x| {
+                let n = path.len();
+                path.push('.');
+                path.push_str(col);
+                path.push_str(&format!("[{}]", row));
+                let rr = check_into(x, accepted, path, ctx, depth + 1);
+                path.truncate(n);
+                let ok = rr.is_ok();
+                if r.is_ok() {
+                    r = rr;
+                }
+                ok
+            });
+            r
+        }
         SynValue::Server(s) => match &**s {
             ServerValue::Envelope { value, .. } => {
                 let n = path.len();
@@ -1137,5 +1171,34 @@ mod tests {
         let e = check_flow(&nested, &["a"], "r").unwrap_err();
         assert_eq!(e.path, "r[0]");
         assert_eq!(label_display_raw(&e.label), "a,b");
+    }
+
+    /// v0.6.65: una tabla recorre igual que una lista de mapas — sólo las columnas `Value`
+    /// pueden contener un `Private` (los bloques primitivos no tienen dónde), y el camino
+    /// nombra la columna y la fila. `deep_copy` corta el aliasing conservando la etiqueta.
+    #[test]
+    fn a_table_cell_is_a_label_path() {
+        use crate::columns;
+        let mut r0 = SynMap::new();
+        r0.insert("k", syn_int(1));
+        r0.insert("v", mark(syn_int(5), l(&["app"])));
+        let mut r1 = SynMap::new();
+        r1.insert("k", syn_int(2));
+        r1.insert("v", syn_int(7));
+        let rows = vec![syn_map(r0), syn_map(r1)];
+        let table = SynValue::Table(crate::types::Obj::new(
+            columns::build_from_rows(&rows).expect("tabla de prueba"),
+        ));
+        // La celda privada hace la columna `Value`; el recorrido la ve.
+        assert_eq!(label_display_raw(&label_deep(&table)), "app");
+        assert!(has_label_deep(&table));
+        // El sumidero la encuentra con el camino `.v[0]`, y pasa si lo acepta.
+        let err = check_flow(&table, &[], "t").unwrap_err();
+        assert_eq!(err.path, "t.v[0]");
+        assert!(check_flow(&table, &["app"], "t").is_ok());
+        // deep_copy corta el aliasing y conserva la etiqueta.
+        let copy = deep_copy(&table);
+        assert_eq!(label_display_raw(&label_deep(&copy)), "app");
+        assert!(copy.syn_equals(&table));
     }
 }

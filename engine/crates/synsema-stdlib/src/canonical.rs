@@ -145,16 +145,20 @@ fn write(v: &SynValue, out: &mut String, depth: usize, path: &str) -> Result<(),
         SynValue::Nothing => out.push_str("null"),
         SynValue::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
         SynValue::Number(n) => out.push_str(&number_text(n, path)?),
-        SynValue::Text(s) => es_string(s, out),
+        SynValue::Text(s) => {
+            let mut quoted = String::new();
+            es_string(s, &mut quoted);
+            out.push_str(&quoted);
+        }
         SynValue::List(l) => {
-            out.push('[');
+            out.push_str("[");
             for (i, item) in list_values(&l).iter().enumerate() {
                 if i > 0 {
-                    out.push(',');
+                    out.push_str(",");
                 }
                 write(item, out, depth + 1, &format!("{}[{}]", path, i))?;
             }
-            out.push(']');
+            out.push_str("]");
         }
         SynValue::Map(m) => {
             let m = m.borrow();
@@ -165,16 +169,18 @@ fn write(v: &SynValue, out: &mut String, depth: usize, path: &str) -> Result<(),
                 let ub: Vec<u16> = b.encode_utf16().collect();
                 ua.cmp(&ub)
             });
-            out.push('{');
+            out.push_str("{");
             for (i, k) in keys.iter().enumerate() {
                 if i > 0 {
-                    out.push(',');
+                    out.push_str(",");
                 }
-                es_string(k, out);
-                out.push(':');
+                let mut quoted = String::new();
+                es_string(k.as_str(), &mut quoted);
+                out.push_str(&quoted);
+                out.push_str(":");
                 write(&m[k.as_str()], out, depth + 1, &format!("{}.{}", path, k))?;
             }
-            out.push('}');
+            out.push_str("}");
         }
         SynValue::Bytes(_) => {
             return Err(err(format!(
@@ -194,6 +200,20 @@ fn write(v: &SynValue, out: &mut String, depth: usize, path: &str) -> Result<(),
                 path,
                 synsema_core::rng::code_noun(v)
             )))
+        }
+        // Una tabla es su lista de filas (v0.6.65, diseño §2); se escriben UNA POR UNA para
+        // que el hash en streaming del linaje no arme ni la lista ni el millón de mapas.
+        // Mismos bytes que `write` de la lista de `to_rows`.
+        SynValue::Table(t) => {
+            out.push_str("[");
+            for i in 0..t.n_rows() {
+                if i > 0 {
+                    out.push_str(",");
+                }
+                let row = synsema_core::types::syn_map(t.row(i));
+                write(&row, out, depth + 1, &format!("{}[{}]", path, i))?;
+            }
+            out.push_str("]");
         }
         other => {
             return Err(err(format!(
