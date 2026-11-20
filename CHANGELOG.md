@@ -6,7 +6,7 @@ Each says what changed, why, and what to write instead.
 
 Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the release date.
 
-## v0.6.65 — tablas por columnas
+## v0.6.65 — 2026-11-19
 
 `parquet_read`, `parquet_scan`, `table(rows)` and the table operations now produce **tables**: a
 columnar layout (one typed block per column, Arrow-style validity bitmap) instead of a list of row
