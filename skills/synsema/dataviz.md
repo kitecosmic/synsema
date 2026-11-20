@@ -9,12 +9,14 @@ Everything is **data-source-agnostic**: charts and CSV consume plain values (lis
 arrays) — the same rows whether they came from `sql()` (SQLite/Postgres/MySQL),
 `mongo_find`, `csv_parse`, `parquet_read`, `jsonl_decode`, `http_get` or a literal.
 
-## Data analysis — tables are lists of maps (v0.6.29+)
+## Data analysis — rows in, results out (v0.6.29+; the `table` type v0.6.65+)
 
-The pandas/polars workflow without a DataFrame: a **table is a list of maps** (the shape `sql()`,
-`csv_parse`, `parquet_read`, `jsonl_decode` give), and every step takes rows and returns rows.
-Contracts of each builtin: [builtins.md](builtins.md) § Tables, § Reductions — the common rules,
-§ Dates, § Parquet.
+The pandas/polars workflow without a DataFrame. Two shapes, one pipeline: a **row list** is a
+list of maps (what `sql()`, `csv_parse`, `jsonl_decode` give), and since **v0.6.65** a **`table`**
+is the columnar value `parquet_read`/`parquet_scan`/`table(rows)` produce (one typed block per
+column — polars-speed reads, a fraction of pandas' memory). Every operation takes rows or a
+table and returns the same shape it got. Contracts of each builtin: [builtins.md](builtins.md)
+§ Tables, § The table value, § Reductions — the common rules, § Dates, § Parquet.
 
 ```synsema
 let raw be `order,day,region,amount
@@ -26,7 +28,8 @@ let raw be `order,day,region,amount
 
 -- 1. Load with TYPES (an empty field is nothing = missing)
 let rows be csv_parse(raw, {"types": {"order": "int", "day": "date", "amount": "float"}})
--- Parquet instead: parquet_read(read_file_bytes("sales.parquet")) comes already typed;
+-- Parquet instead: parquet_read(read_file_bytes("sales.parquet")) comes already typed, as a
+-- table (to_rows(t) gives the row list; table(rows) builds one from rows);
 -- parquet_scan("sales.parquet", {"columns": [...]}) reads only those columns from disk (v0.6.46+)
 
 -- 2. Decide what missing means: here, an order without an amount is dropped
@@ -60,13 +63,14 @@ print(csv_encode(monthly))
   `fill_missing(rows, value | {col: value})`, `fill_nan(xs, number)`. Choose on purpose — dropping and filling give different answers.
 - `std`/`var` are **sample** (`ddof = 1`, like pandas); population is `std(xs, ddof = 0)`.
 
-**pandas / polars → Synsema**, one line each: `df.groupby("r").agg(...)` → `summarize(rows, "r", {...})` ·
-`df.merge(o, on="id", how="left")` → `join(rows, o, "id", "left")` (also `"right"`/`"outer"`/`"semi"`/`"anti"`) · `pivot_table` → `pivot(rows, i, c, v, sum_of(v))` ·
-`value_counts()` → `count_by(rows, "col")` · `dropna()`/`fillna(0)` → `drop_missing(rows)`/`fill_missing(rows, 0)` ·
-`sort_values("t", ascending=False)` → `sort_by(rows, (r) => r.t, desc = true)` · `df["col"]` → `collect(rows, "col")` ·
-`df[df.x > 2]` → `where(rows, (r) => r.x > 2)` · `pd.to_datetime` → `date(x)`/`datetime(x)` · `dt.to_period("M")` →
-`truncate(d, "month")` · `read_parquet`/`to_parquet` → `parquet_read`/`parquet_write` · `read_json(lines=True)` →
-`jsonl_decode`. More in [python-diff.md](python-diff.md).
+**pandas / polars → Synsema**, one line each: `pd.read_parquet(p)` → `parquet_read(read_file_bytes(p))` (a **`table`**; `to_rows(t)` is the row list) ·
+`df.groupby("r").agg(...)` → `summarize(t_or_rows, "r", {...})` ·
+`df.merge(o, on="id", how="left")` → `join(a, o, "id", "left")` (also `"right"`/`"outer"`/`"semi"`/`"anti"`) · `pivot_table` → `pivot(a, i, c, v, sum_of(v))` ·
+`value_counts()` → `count_by(a, "col")` (also `count_by(t)` over a whole table: distinct rows) · `dropna()`/`fillna(0)` → `drop_missing(a)`/`fill_missing(a, 0)` ·
+`sort_values("t", ascending=False)` → `sort_by(a, (r) => r.t, desc = true)` · `df["col"]` → `collect(to_rows(t), "col")` ·
+`df[df.x > 2]` → `where(a, (r) => r.x > 2)` · `pd.to_datetime` → `date(x)`/`datetime(x)` · `dt.to_period("M")` →
+`truncate(d, "month")` · `df.to_parquet(p)` → `write_file(p, parquet_write(a))` · `read_json(lines=True)` →
+`jsonl_decode`. (`a`/`t_or_rows` = a row list or a table — every operation takes either and returns the shape it got.) More in [python-diff.md](python-diff.md).
 
 ## Parquet from disk — `parquet_scan` (v0.6.46+)
 
@@ -99,7 +103,7 @@ let first_group be parquet_scan("./data/events.parquet", {"row_groups": [0]})
   `max_bytes` (default the larger of 1 GiB and 64 × the file size). The caps count only what is
   read and are checked before allocating; a page that declares more than 256 MiB is refused even
   with `limit`. No `opts` → the whole file.
-- **Result** — the same typed rows as `parquet_read` (equal values for the same options).
+- **Result** — the same typed **table** as `parquet_read` (equal values for the same options).
 - **Capability** — `require file.read(<the path>)` (a folder: `file.read("./data/**")`). It is
   checked and the file opened in one step, as `read_file`. `synsema check` / `synsema code caps`
   name the missing `require`. A file bundled into a `synsema build` binary (`--include`) is read

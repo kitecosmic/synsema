@@ -101,13 +101,15 @@ Also: the LLM words **`reason` / `decide` / `analyze` / `generate`** (like every
 
 ## Data analysis — pandas / numpy / polars → Synsema (v0.6.29+)
 
-A table is a **list of maps** (no DataFrame, no index): every operation takes rows and returns
-rows. Full pipeline: [dataviz.md](dataviz.md) § Data analysis; contracts: [builtins.md](builtins.md) § Tables.
+A **row list** is a list of maps (no DataFrame, no index); since **v0.6.65** a **`table`** is the
+columnar value `parquet_read`/`table(rows)` give (one typed block per column — `to_rows(t)`
+converts back). Every operation takes either and returns the shape it got. Full pipeline:
+[dataviz.md](dataviz.md) § Data analysis; contracts: [builtins.md](builtins.md) § Tables, § The table value.
 
 | In Python | In Synsema | ⚠️ Divergence |
 |---|---|---|
-| `pd.read_csv(p, dtype={"id": str, "qty": int}, parse_dates=["day"])` | `csv_parse(read_file(p), {"types": {"qty": "int", "day": "date"}})` | untyped columns stay text (never guessed); an empty cell is `nothing` (pandas: NaN) |
-| `pd.read_parquet(p)` / `df.to_parquet(p)` | `parquet_read(read_file_bytes(p))` / `write_file(p, parquet_write(rows))` | flat columns, one type per column; not in the wasm build |
+| `pd.read_csv(p, dtype={"id": str, "qty": int}, parse_dates=["day"])` | `csv_parse(read_file(p), {"types": {"qty": "int", "day": "date"}})` | untyped columns stay text (never guessed); an empty cell is `nothing` (pandas: NaN); gives a row list, not a table |
+| `pd.read_parquet(p)` / `df.to_parquet(p)` | `parquet_read(read_file_bytes(p))` / `write_file(p, parquet_write(a))` | flat columns, one type per column; the read gives a **`table`** (`to_rows(t)` is the row list); not in the wasm build |
 | `pd.read_parquet(p, columns=["a"])` (only what you need) | `parquet_scan(p, {"columns": ["a"], "limit": n})` (v0.6.46+) | reads the footer and only those pages from disk; needs `require file.read(p)` |
 | `pd.read_json(p, lines=True)` / `df.to_json(orient="records", lines=True)` | `jsonl_decode(read_file(p))` / `jsonl_encode(rows)` | `jsonl_decode(text, default)` is the no-raise form |
 | `df.groupby("r").agg(total=("m", "sum"), n=("m", "size"))` | `summarize(rows, "r", {"total": sum_of("m"), "n": count()})` | groups in first-appearance order (pandas sorts by key); also `mean_of`/`min_of`/`max_of`/`median_of`/`quantile_of(col, q)`/`first_of`/`n_unique_of`, or any `(group) => …` |

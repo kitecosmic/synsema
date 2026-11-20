@@ -2,7 +2,8 @@
 
 Read this FIRST if something fails. Each row is a real mistake that costs hours to debug.
 
-> **Just upgraded and something that worked now fails?** Start at *Upgrading to v0.6.62* (callback arguments and deep values), then *Upgrading to v0.6.61* (package clock, entropy and stdin), then *Upgrading to v0.6.60* (regex validation, leftmost search and whole caught messages), then *v0.6.59* (SQL transactions), then *Upgrading to v0.6.58* (one SQL
+> **Just upgraded and something that worked now fails?** Start at *Upgrading to v0.6.65* (Parquet
+> reads give tables, tables are immutable), then *Upgrading to v0.6.62* (callback arguments and deep values), then *Upgrading to v0.6.61* (package clock, entropy and stdin), then *Upgrading to v0.6.60* (regex validation, leftmost search and whole caught messages), then *v0.6.59* (SQL transactions), then *Upgrading to v0.6.58* (one SQL
 > statement per call, nesting deeper than 1024 levels, recursions that stop earlier), then
 > *v0.6.57* (the last bits of `dot`, `compute` in the receipt), then *v0.6.56*
 > (`array_from_bytes(b, "f32")` gives an `f32` array, the lineage of arrays), then *v0.6.55* (`==` and
@@ -23,6 +24,20 @@ Read this FIRST if something fails. Each row is a real mistake that costs hours 
 > Behavioral surprises · Anti-patterns · Secrets & config
 > Coming from Python? The traps that LOOK like Python but aren't are also collected in
 > [python-diff.md](python-diff.md).
+
+## Upgrading to v0.6.65 — what behaves differently
+
+| You see | What changed | What to write |
+|---|---|---|
+| `parquet_read(...)` / `parquet_scan(...)` code that indexed, filtered or encoded like a list now says `expects a list, got table` (or `==` silently compares false against rows) | The readers return the new columnar **`table`** value, always (faster and a fraction of the memory; `t[i].col`, `length`, printing, JSON and hashing keep working) | `let rows be to_rows(t)` where a real list is required; or keep the table — every analysis builtin takes it |
+| `set t[0].col to x` → `a table is immutable — convert it with to_rows(t), change the rows, and rebuild with table(rows)` | Tables cannot be written (any path: `t[i]`, `t[i].col`, `t.col`) | `let rs be to_rows(t)` / change / `table(rs)` |
+| `each r in t` → `Cannot iterate over table` (same for `transform`, `append`, and other list generics) | Generic list builtins reject tables with their usual message | iterate `to_rows(t)`, or slice the table (`slice(t, a, b)` is a zero-copy view) |
+| code that did `rows == parquet_read(...)` now gives `false` | `==` only compares tables with tables (like arrays) — a table is never equal to its row list | compare `to_rows(t) == rows` |
+| the lineage of a Parquet read says encoding `"table-v1"` (old receipts said `"jcs"`) | Tables hash by their own columnar recipe (labeled, third-party recomputable; old receipts unchanged) | nothing to write; verify with `hex(sha256(canonical_json(t)))` only if you meant the row list's hash — that is a different hash now |
+| a `uint32` column with values ≥ 2³¹ now reads positive (`2147483648`) | v0.6.65 reads it right by columns (v0.6.64 already did by rows — both agree) | nothing to write |
+
+See [builtins.md](builtins.md) § The table value, [dataviz.md](dataviz.md) § Data analysis, and the
+CHANGELOG entry for the full contract.
 
 ## Upgrading to v0.6.62 — callbacks and deeply nested values
 

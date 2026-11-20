@@ -816,9 +816,12 @@ ClickHouse over HTTP) and query it with `fetch` — the index runs server-side, 
 
 ## Data analysis (v0.6.29+ — tables, file formats, dates, seeded randomness, lineage)
 
-What pandas/polars/numpy do, as plain builtins (all pure except reading the files). **A table is a
-list of maps** — the exact shape `sql()`, `mongo_find`, `csv_parse`, `parquet_read` and
-`jsonl_decode` return — so a query result goes straight into the same pipeline as a file.
+What pandas/polars/numpy do, as plain builtins (all pure except reading the files). **A row list is a
+list of maps** — the exact shape `sql()`, `mongo_find`, `csv_parse` and `jsonl_decode` return — so a
+query result goes straight into the same pipeline as a file. Since **v0.6.65** a **`table`** is the
+columnar value `parquet_read`/`parquet_scan`/`table(rows)` produce (one typed block per column;
+`to_rows(t)` converts back); every operation takes either and returns the shape it got — see
+[builtins.md](builtins.md) § The table value.
 
 ```synsema
 require db("./shop.db")
