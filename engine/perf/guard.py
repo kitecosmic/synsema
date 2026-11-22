@@ -9,18 +9,17 @@ Cuenta las instrucciones (valgrind/cachegrind, sin simular caché) de cada progr
 Por qué instrucciones y no tiempo: son deterministas (no dependen de la carga de la máquina ni del
 acomodo que deja PGO, que mueve filas ±3–5 % sin cambiar el trabajo), así que una suba chica que se
 repite versión tras versión se acumula contra el ancla y se ve. El ancla NO es la versión anterior:
-es el punto donde quedó optimizado el motor, y sólo se mueve a propósito (`--bless`) en el mismo PR
-que trae el costo, con la razón en el CHANGELOG.
+es el punto donde quedó optimizado el motor. Un costo aprobado se registra por fila en
+`approved.json` con el total exacto de instrucciones aceptadas y su razón; no reescribe el ancla.
 
 Cuando algo se pasa, imprime qué funciones crecieron (cachegrind cuenta por función).
 
     python3 engine/perf/guard.py --bin <run>                 # compara con el ancla
-    python3 engine/perf/guard.py --bin <run> --bless         # reescribe el ancla
     python3 engine/perf/guard.py --bin <run> --only fib,loop # algunos programas
-    python3 engine/perf/guard.py --bless-from perf.json      # el ancla con lo que midió el CI
+    python3 engine/perf/guard.py --bless-from perf.json      # sólo cambio de entorno de CI
 
-El ancla se escribe con lo que mide el CI (el artefacto `perf-guard` del job), no con una medición
-local: el enlazador y la libc de otra máquina cambian los números.
+Si cambia el entorno, el ancla se vuelve a medir con el artefacto `perf-guard` del CI,
+en un PR que no cambie el motor; una medición local no sirve para ese propósito.
 
 `<run>` es `cargo build --release -p synsema-jit --example run`. El ancla vale para un toolchain,
 un runner y una versión de valgrind (están en `meta`): cambiar cualquiera de los tres es volver a
@@ -38,6 +37,7 @@ import tempfile
 HERE = os.path.dirname(os.path.abspath(__file__))
 PROGS = os.path.join(HERE, "progs")
 BASELINE = os.path.join(HERE, "baseline.json")
+APPROVED = os.path.join(HERE, "approved.json")
 MODES = {"jit": [], "vm": ["--jitless"], "ref": ["--reference"]}
 # Funciones que se guardan por programa: las que pesan al menos esto del total.
 FN_SHARE = 0.0005
@@ -127,24 +127,34 @@ def write_baseline(programs, meta, budget):
     doc = {
         "budget_pct": budget,
         "meta": meta,
-        "note": "Ancla de engine/perf/guard.py. Se reescribe sólo a propósito (--bless), con la razón en el CHANGELOG.",
+        "note": "Ancla fija de engine/perf/guard.py. Sólo se remide por cambio del entorno de CI; costos aprobados van en approved.json.",
         "programs": programs,
     }
     with open(BASELINE, "w", encoding="utf-8", newline="\n") as f:
         json.dump(doc, f, indent=1, sort_keys=True)
         f.write("\n")
-    print(f"ancla escrita: {BASELINE} ({len(programs)} mediciones)")
+    print(f"ancla de entorno escrita: {BASELINE} ({len(programs)} mediciones)")
 
 
 def fmt(n):
     return f"{n:,}".replace(",", " ")
 
 
+def limit_for(key, anchor_total, budget, approved):
+    exception = approved.get(key)
+    if exception is None:
+        return anchor_total * (1 + budget / 100), budget
+    if not isinstance(exception, dict) or type(exception.get("accepted_total")) is not int \
+            or not isinstance(exception.get("reason"), str) or not exception["reason"].strip() \
+            or exception["accepted_total"] <= anchor_total * (1 + budget / 100):
+        raise SystemExit(f"aprobación inválida para {key}: requiere accepted_total sobre el presupuesto y reason")
+    return exception["accepted_total"], 100 * (exception["accepted_total"] - anchor_total) / anchor_total
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--bin")
-    ap.add_argument("--bless-from", help="escribe el ancla con un JSON de --out (el artefacto del CI)")
-    ap.add_argument("--bless", action="store_true")
+    ap.add_argument("--bless-from", help="remide el ancla sólo por cambio de entorno de CI, desde un JSON de --out")
     ap.add_argument("--only", default="")
     ap.add_argument("--budget", type=float, default=None, help="por ciento sobre el ancla (por defecto, el del ancla)")
     ap.add_argument("--out", help="escribe las mediciones en este JSON (artefacto del CI)")
@@ -152,6 +162,11 @@ def main():
     if a.bless_from:
         with open(a.bless_from, encoding="utf-8") as f:
             measured = json.load(f)
+        with open(BASELINE, encoding="utf-8") as f:
+            old = json.load(f)
+        fields = ("rustc", "valgrind", "runner")
+        if all(measured["meta"].get(field) == old["meta"].get(field) for field in fields):
+            raise SystemExit("el entorno de CI no cambió; conservar el ancla fija y registrar costos en approved.json")
         write_baseline(measured["programs"], measured["meta"], a.budget if a.budget is not None else 0.3)
         return 0
     if not a.bin:
@@ -169,10 +184,17 @@ def main():
         with open(BASELINE, encoding="utf-8") as f:
             base = json.load(f)
     budget = a.budget if a.budget is not None else (base or {}).get("budget_pct", 0.3)
+    with open(APPROVED, encoding="utf-8") as f:
+        approved = json.load(f)
+    if not isinstance(approved, dict):
+        raise SystemExit("approved.json debe ser un objeto de filas")
+    unknown = set(approved) - set((base or {}).get("programs", {}))
+    if unknown:
+        raise SystemExit(f"aprobaciones sin fila en el ancla: {', '.join(sorted(unknown))}")
 
     results = {}
     over, missing = [], []
-    print(f"{'programa':<18}{'modo':<5}{'ancla':>16}{'hoy':>16}{'cambio':>10}")
+    print(f"{'programa':<18}{'modo':<5}{'ancla fija':>16}{'hoy':>16}{'acumulado':>12}{'límite':>10}")
     for p in progs:
         for mode in MODES:
             key = f"{p}|{mode}"
@@ -181,21 +203,18 @@ def main():
             b = (base or {}).get("programs", {}).get(key)
             if b is None:
                 missing.append(key)
-                print(f"{p:<18}{mode:<5}{'—':>16}{fmt(total):>16}{'nuevo':>10}")
+                print(f"{p:<18}{mode:<5}{'—':>16}{fmt(total):>16}{'nuevo':>12}{'—':>10}")
                 continue
             pct = 100.0 * (total - b["total"]) / b["total"]
-            mark = "  <-- pasa el presupuesto" if pct > budget else ""
-            print(f"{p:<18}{mode:<5}{fmt(b['total']):>16}{fmt(total):>16}{pct:>+9.3f}%{mark}")
-            if pct > budget:
+            limit_total, limit_pct = limit_for(key, b["total"], budget, approved)
+            mark = "  <-- pasa el límite acumulado" if total > limit_total else ""
+            print(f"{p:<18}{mode:<5}{fmt(b['total']):>16}{fmt(total):>16}{pct:>+11.3f}%{limit_pct:>+9.3f}%{mark}")
+            if total > limit_total:
                 over.append((key, pct, b, per_fn))
 
     if a.out:
         with open(a.out, "w", encoding="utf-8") as f:
             json.dump({"meta": env_meta(), "programs": results}, f, indent=1, sort_keys=True)
-
-    if a.bless:
-        write_baseline(results, env_meta(), budget)
-        return 0
 
     for key, pct, b, per_fn in over:
         print(f"\n== {key}: {pct:+.3f}% sobre el ancla ({fmt(b['total'])} -> {fmt(sum(per_fn.values()))})")
@@ -215,15 +234,17 @@ def main():
                 break
             print(f"   {d:>+14,}  {n}{note}".replace(",", " "))
     if missing and base is not None:
-        print(f"\nsin ancla (programas o modos nuevos): {', '.join(missing)}; correr con --bless para sumarlos")
+        print(f"\nsin ancla (programas o modos nuevos): {', '.join(missing)}; medir en CI y agregar sólo esas filas al ancla")
     if base is None:
-        print("\nno hay ancla todavía: correr con --bless")
+        print("\nno hay ancla fija todavía; medir en CI antes de incorporarla")
         return 1
     if over:
-        print(f"\n{len(over)} medición(es) pasan el presupuesto de +{budget}% sobre el ancla.")
-        print("Si el costo es a propósito: --bless en el mismo PR y la razón en el CHANGELOG.")
+        print(f"\n{len(over)} medición(es) pasan su límite acumulado desde el ancla fija.")
+        print("Si el costo es deliberado: registrar el total exacto del CI como accepted_total y reason por fila en approved.json, antes de la release; no reescribir el ancla.")
         return 1
-    print(f"\nok: nada pasa +{budget}% sobre el ancla ({base['meta'].get('commit', '?')}).")
+    if missing:
+        return 1
+    print(f"\nok: ninguna fila pasa su límite acumulado desde el ancla fija ({base['meta'].get('commit', '?')}).")
     return 0
 
 

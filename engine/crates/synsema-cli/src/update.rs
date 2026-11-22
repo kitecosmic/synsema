@@ -226,7 +226,7 @@ pub fn cmd_update() -> ExitCode {
             // son verdad). En inglés: lo leen agentes de cualquier parte.
             println!(
                 "Using the AI skill (Claude Code, Codex, …)? Refresh it to match this version:\n  \
-                 npx skills update -g\n\
+                 npx skills add kitecosmic/synsema --skill synsema -g -y\n\
                  (installed without Node? run the installer again: curl -fsSL \
                  https://raw.githubusercontent.com/kitecosmic/synsema/main/install-skill.sh | bash, \
                  with `-s -- --agents` for ~/.agents/skills)"

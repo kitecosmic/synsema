@@ -15,6 +15,7 @@ build/
 !engine/crates/**/fixtures/**/*.json
 # El ancla del guardia de rendimiento (engine/perf/guard.py, job perf-guard): sin ella el job falla.
 !engine/perf/baseline.json
+!engine/perf/approved.json
 # v0.6.58: los `synsema.json` de los programas del guardia que usan un paquete (el proyecto y el índice
 # del paquete en su `cache/`): sin ellos la fila `p_pkg_loop` falla en el CI.
 !engine/perf/progs/**/*.json
@@ -26,6 +27,9 @@ build/
 # Rust
 target/
 **/*.rs.bk
+
+# Caché local que PowerShell puede crear al ejecutar comandos desde este directorio.
+/Microsoft/Windows/PowerShell/ModuleAnalysisCache
 
 # Estado persistente project-local (memoria/planes de remember/progress). DE-031: vive
 # junto al proyecto en `<dir>/.synsema/state/*.db` — NO se versiona.

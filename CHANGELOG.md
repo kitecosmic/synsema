@@ -6,6 +6,11 @@ Each says what changed, why, and what to write instead.
 
 Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the release date.
 
+## v0.6.67 — 2026-11-22
+
+- `synsema update` now recommends `npx skills add kitecosmic/synsema --skill synsema -g -y` to refresh the Synsema skill alone.
+- `perf-guard` retains the current CI anchor across releases. Its output reports each row's cumulative change from that fixed anchor and its allowed limit. Deliberately accepted costs are recorded per row in `engine/perf/approved.json` as the exact instruction total from CI, with a reason; one more instruction later fails instead of being absorbed by a new anchor.
+
 ## v0.6.66 — 2026-11-20
 
 Fast, composable table filtering, and a labels fix that closes a decision leak shared by every

@@ -56,9 +56,11 @@ jobs:
 
   # v0.6.46: guardia de rendimiento por instrucciones contra un ancla fija (engine/perf/guard.py).
   # Falla si un programa del corpus, en cualquiera de los tres caminos del motor (nivel nativo, VM,
-  # tree-walker), pasa +0,3 % sobre `engine/perf/baseline.json`, y dice qué funciones crecieron. El
-  # ancla no es la versión anterior: así una suba chica que se repite release tras release se suma
-  # y se ve. Runner y toolchain fijos: con otra libc u otro compilador los números cambian, y
+  # tree-walker), pasa +0,3 % sobre `engine/perf/baseline.json` (o su límite aprobado por fila), y
+  # dice qué funciones crecieron. El
+  # ancla no es la versión anterior: los costos aceptados por fila van en approved.json, sin
+  # reescribir la referencia, y una suba chica repetida sigue siendo visible. Runner y toolchain
+  # fijos: con otra libc u otro compilador los números cambian, y
   # cambiarlos es volver a medir el ancla (`--bless-from` con el artefacto, en un PR sin cambios
   # del motor). Los símbolos quedan (`STRIP=none`, no cambia el código) para nombrar funciones.
   perf-guard:
@@ -95,7 +97,7 @@ jobs:
         run: cargo build --locked --manifest-path engine/Cargo.toml -p synsema-jit --example run --release
       - name: Instructions against the anchor
         run: python3 engine/perf/guard.py --bin engine/target/release/examples/run --out perf.json
-      - name: Upload the measurements (for --bless-from)
+      - name: Upload the measurements (for review and environment re-anchoring)
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
