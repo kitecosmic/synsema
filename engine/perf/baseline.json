@@ -6,7 +6,7 @@
   "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
   "valgrind": "valgrind-3.22.0"
  },
- "note": "Ancla de engine/perf/guard.py. Se reescribe s\u00f3lo a prop\u00f3sito (--bless), con la raz\u00f3n en el CHANGELOG.",
+ "note": "Ancla fija de engine/perf/guard.py. S\u00f3lo se remide por cambio del entorno de CI; costos aprobados van en approved.json.",
  "programs": {
   "a_args0|jit": {
    "fns": {
