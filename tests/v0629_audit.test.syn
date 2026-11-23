@@ -1,0 +1,386 @@
+-- v0.6.29 audit, value-level probes. Host file setup, parse diagnostics, timing and
+-- process output remain in Rust until reviewed test by test.
+
+task expect_error(f, needle)
+    let ok be false
+    try
+        f()
+    recover e
+        set ok to true
+        assert(contains(e, needle))
+    assert(ok)
+
+test "b1_template_holes_take_any_value"
+    let xs be [1, "a"]
+    let m be {"k": nothing}
+    assert_eq(`xs={xs} m={m} n={nothing} b={bytes("01", "hex")}`, "xs=[1, \"a\"] m={k: nothing} n=nothing b=bytes(01)")
+    expect_error(() => "x" + [1], "interpolate it")
+
+test "b5_append_reads_the_list_first"
+    let xs be [1]
+    task side()
+        set xs to [9, 9]
+        give 5
+    set xs to append(xs, side())
+    assert_eq(xs, [1, 5])
+    let ys be [1]
+    task side2()
+        set ys to [9]
+        give [5]
+    set ys to ys + side2()
+    assert_eq(ys, [1, 5])
+    let zs be [1]
+    task side3()
+        set zs[0] to 7
+        give 5
+    set zs to append(zs, side3())
+    assert_eq(zs, [1, 5])
+
+test "b6_json_exact_with_limits"
+    assert_eq(text(json_decode("18446744073709551615") + 1), "18446744073709551616")
+    assert_eq(text(json_decode("[1.5, 2e3, -0]")), "[1.5, 2000.0, 0]")
+    expect_error(() => json_decode("1e400"), "out of range for a float")
+    let big be join(apply(range(4301), (i) => "9"), "")
+    expect_error(() => json_decode(big), "the limit is 4300")
+    expect_error(() => int(big), "the limit is 4300")
+    let max be join(apply(range(4300), (i) => "9"), "")
+    assert_eq(length(text(json_decode(max))), 4300)
+    assert_eq(text(jsonl_decode("{\"a\": 12345678901234567890123}\n\n[1]\n")), "[{a: 12345678901234567890123}, [1]]")
+
+test "b9_least_squares_like_numpy"
+    let x be lstsq(array([[1, 2], [2, 4], [3, 6]]), [1, 2, 3.5])
+    assert_eq(text(round_to(x[0], 8)), "0.22142857")
+    assert_eq(text(round_to(x[1], 8)), "0.44285714")
+    let y be lstsq(array([[1, 1, 1]]), [3])
+    assert_eq(text(round_to(y[0], 12)), "1.0")
+    assert_eq(text(round_to(y[2], 12)), "1.0")
+    expect_error(() => polyfit([1, 1, 1, 2], [1, 2, 3, 4], 2), "not determined by the data")
+    let c be polyfit([1, 2, 3, 4], [2.1, 3.9, 6.2, 7.8], 1)
+    assert_eq(text(round_to(c[0], 10)), "1.94")
+    assert_eq(text(round_to(c[1], 10)), "0.15")
+
+test "b10_group_keys_follow_equality"
+    let rows be [{"k": {"a": 1, "b": 2}}, {"k": {"b": 2, "a": 1}}, {"k": 1}, {"k": 1.0}, {"k": "1"}]
+    assert_eq(length(group_by(rows, "k")), 3)
+    let t1 be datetime("2024-01-01T12:00:00", "UTC")
+    assert_eq(count_by([{"t": t1}, {"t": to_timezone(t1, "America/Buenos_Aires")}], "t")[0].count, 2)
+    assert_eq(text(unique([1, 1.0, "1", nothing, nothing, float("nan"), float("nan")])), "[1, \"1\", nothing, nan]")
+
+test "b11_rng_matches_numpy"
+    let g be rng(42)
+    assert_eq(text(g()), "0.7739560485559633")
+    assert_eq(text(random(g)), "0.4388784397520523")
+    let h be rng(42)
+    assert_eq(g() != h(), true)
+    let g2 be rng(12345)
+    assert_eq([random_int(g2, 0, 9), random_int(g2, 0, 9), random_int(g2, 0, 9)], [6, 2, 7])
+    let n be rng(0)
+    assert_eq(text(random_normal(n)), "0.1257302210933933")
+    assert_eq(shuffle(rng(1), [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]), [8, 4, 7, 0, 1, 2, 5, 9, 6, 3])
+    assert_eq(sample(rng(2), range(20), 5), [5, 1, 13, 4, 8])
+    let kids be rng_spawn(rng(3), 2)
+    assert_eq(text(kids[0]()), "0.5413696492633944")
+    assert_eq(text(kids[1]()), "0.10033602866159974")
+    let g3 be rng(5)
+    let h3 be g3
+    let a be h3()
+    let b be rng(5)
+    b()
+    assert_eq(g3() == b(), true)
+
+test "b12_constructor_arity_message"
+    enum Order
+        paid(amount)
+        open
+    expect_error(() => Order.paid(1, 2), "variant Order.paid expects 1 fields, got 2")
+    type Point
+        x: number
+        y: number
+    expect_error(() => Point(1), "Type Point expects 2 fields, got 1")
+
+test "dates_across_daylight_saving"
+    assert_eq(text(truncate(datetime("2024-09-08T15:00:00", "America/Santiago"), "day")), "2024-09-08T01:00:00-03:00[America/Santiago]")
+    assert_eq(text(date_range(datetime("2024-03-09T12:00:00", "America/New_York"), datetime("2024-03-11T12:00:00", "America/New_York"), "day")), "[2024-03-09T12:00:00-05:00[America/New_York], 2024-03-10T12:00:00-04:00[America/New_York], 2024-03-11T12:00:00-04:00[America/New_York]]")
+    let a be datetime("2026-10-25T02:30:00", "Europe/Madrid")
+    assert_eq(text(truncate(a, "hour")), "2026-10-25T02:00:00+02:00[Europe/Madrid]")
+    assert_eq(text(truncate(a + duration(hours = 1), "hour")), "2026-10-25T02:00:00+01:00[Europe/Madrid]")
+
+test "csv_quoted_empty_is_text"
+    assert_eq(text(csv_parse("a,b\n\"\",\n")), "[{a: \"\", b: nothing}]")
+    let rows be [{"a": "", "b": nothing, "c": "x,y"}]
+    assert_eq(csv_encode(rows), "a,b,c\r\n\"\",,\"x,y\"\r\n")
+    assert_eq(csv_parse(csv_encode(rows)) == rows, true)
+    let one be [{"a": 1}, {"a": nothing}]
+    assert_eq(text(csv_parse(csv_encode(one), {"numbers": true})), "[{a: 1}, {a: \"\"}]")
+    assert_eq(csv_parse(csv_encode(one), {"types": {"a": "int"}}) == one, true)
+
+test "numeric_edges_and_counts"
+    assert_eq(text(-9223372036854775808 % -1), "0")
+    assert_eq(text(-9223372036854775808 // -1), "9223372036854775808")
+    assert_eq(argmin([3, nothing, 1, 2]), 2)
+    assert_eq(argmax([nothing, 5, 7]), 2)
+    assert_eq(count([1, nothing, 3]), 2)
+    assert_eq(count_missing([1, nothing, nothing]), 2)
+    assert_eq(int("ff", base = 16), 255)
+    assert_eq(int("-0x10"), -16)
+    assert_eq(int("z", nothing, base = 36), 35)
+    expect_error(() => int("ff", 16), "not the base")
+
+test "r3_summarize_ragged_rows"
+    assert_eq(text(summarize([{"k": 1, "v": 1}, {"k": 2}], "k", {"s": sum_of("v"), "m": mean_of("v")})), "[{k: 1, s: 1, m: 1.0}, {k: 2, s: 0, m: nothing}]")
+    expect_error(() => sum_of("x")([{"v": 2}]), "no row has a column \"x\"")
+
+test "r3_join_names_and_empty_left"
+    expect_error(() => join([{"k": 1, "x": 1, "x_right": 2}], [{"k": 1, "x": 3}], "k"), "already has")
+    expect_error(() => join([{"k": 1, "x": 1}], [{"k": 1, "x": 3, "x_right": 4}], "k"), "would both be named")
+    assert_eq(text(join([], [{"k": 1, "b": 1}], "k", "outer")), "[{k: 1, b: 1}]")
+
+test "r3_truncate_day_with_repeated_midnight"
+    let a be truncate(datetime("2024-11-03T12:00:00", "America/Havana"), "day")
+    let b be truncate(datetime("2024-11-03T00:30:00", "America/Havana") + duration(hours = 1), "day")
+    assert_eq(a == b, true)
+    assert_eq(text(a), "2024-11-03T00:00:00-04:00[America/Havana]")
+
+test "r3_decimal_statistics"
+    assert_eq(text(var([1000000000000000000001d, 1000000000000000000003d])), "2")
+    assert_eq(text(std([1.5d, 2.5d, 3.5d])), "1")
+    assert_eq(text(percentile([1.10d, 2.20d, 3.30d, 4.40d], 0.9)), "1.1297")
+    assert_eq(text(quantile([1d, 2d, 3d, 4d], 0.9)), "3.7")
+
+test "r3_int_fallback_and_base"
+    expect_error(() => int("abc", 10), "name it: int(x, fallback = 10)")
+    assert_eq(int("abc", fallback = 10), 10)
+    assert_eq(int("0o17"), 15)
+    assert_eq(int("0x_ff"), 255)
+    assert_eq(int("x", 100), 100)
+
+test "r3_json_round_trip_of_special_floats"
+    let t be json_encode([float("nan"), float("inf"), -float("inf")])
+    assert_eq(t, "[NaN, Infinity, -Infinity]")
+    assert_eq(text(json_decode(t, allow_nan = true)), "[nan, inf, -inf]")
+    assert_eq(text(json_decode("\uFEFF{\"a\": 1}")), "{a: 1}")
+
+test "r4_fmt_keys_and_literals"
+    assert_eq(fmt("{a.b}", {"a.b": 5}), "5")
+    assert_eq(fmt("{a.b}", {"a": {"b": 2}}), "2")
+    assert_eq(fmt("p { x } {obj.prop}", {"x": 1}), "p { x } {obj.prop}")
+
+test "r4_exact_decimal_stats"
+    assert_eq(text(median([1d, 2d, 10 ** 30])), "2")
+    assert_eq(text(median([1d, 10 ** 30])), "500000000000000000000000000000.5")
+    assert_eq(text(var([1d, 3d])), "2")
+    assert_eq(text(quantile([1d, 2d, 10 ** 30], 0.5)), "2")
+    assert_eq(std([1.000000000000001d, 1.000000000000003d]) > 0, true)
+    assert_eq(1d < 10 ** 30, true)
+    assert_eq(text(sort([10 ** 30, 1d, 0])), "[0, 1, 1000000000000000000000000000000]")
+
+test "r4_json_nan_is_opt_in"
+    expect_error(() => json_decode("[NaN]"), "allow_nan")
+    expect_error(() => jsonl_decode("-Infinity"), "allow_nan")
+    let v be json_decode("[NaN, Infinity]", allow_nan = true)
+    assert_eq(length(v), 2)
+    assert_eq(is_nan(v[0]), true)
+
+test "r4_int_positional_base_always_errors"
+    expect_error(() => int(nothing, 10), "base = 10")
+    expect_error(() => int("5", 10), "base = 10")
+    assert_eq(int(nothing, fallback = 10), 10)
+
+test "r4_decimal_float_sort_and_join"
+    expect_error(() => sort([1.5d, 1.0]), "decimal")
+    expect_error(() => sort_by([{"a": 2.0}, {"a": 1.5d}], (r) => r.a), "decimal")
+    expect_error(() => join([{"k": 1.5d}], [{"k": 1.5}], "k"), "decimal on one side")
+
+test "r4_calendar_in_repeated_hour"
+    let s be datetime("2026-10-25T02:30:00", "Europe/Madrid") + duration(hours = 1)
+    assert_eq(add_days(s, 0) == s, true)
+    assert_eq(add_months(s, 0) == s, true)
+    assert_eq(length(date_range(s, s + duration(hours = 2), "hour")), 3)
+    expect_error(() => date_range(date("2026-01-01"), date("2026-01-02"), "hour"), "a date has no hours")
+
+test "r5_decimal_arbitrary_precision"
+    assert_eq(text(1d + 10 ** 30), "1000000000000000000000000000001")
+    assert_eq(type_of(1d + 10 ** 30), "decimal")
+    assert_eq(text(123456789012345678901234567890.123456789d), "123456789012345678901234567890.123456789")
+    assert_eq(text(1d / 3d), "0.3333333333333333333333333333")
+    assert_eq(text(0.00000000000000000001d / 10000000000d), "0.000000000000000000000000000001")
+    assert_eq(text(decimal(10 ** 40) / 3d), "3333333333333333333333333333333333333333")
+    assert_eq(text(1.1d ** 30), "17.449402268886407318558803753801")
+    assert_eq(text(2d ** -2), "0.25")
+    assert_eq(text(7.5d // 2d), "3")
+    assert_eq(text(-7.5d % 2d), "0.5")
+    assert_eq(text(decimal(10 ** 40) % 7d), "4")
+    assert_eq(1d < 10 ** 30, true)
+    assert_eq(decimal(10 ** 40) == 10 ** 40, true)
+    assert_eq(json_encode([decimal(10 ** 30) + 0.5d]), "[1000000000000000000000000000000.5]")
+    assert_eq(text(decimal("123456789012345678901234567890.5")), "123456789012345678901234567890.5")
+    assert_eq(text(round_to(decimal(10 ** 30) + 0.125d, 2)), "1000000000000000000000000000000.12")
+    assert_eq(length(group_by([{"k": decimal(10 ** 30) + 0.5d}, {"k": decimal("1000000000000000000000000000000.50")}], "k")), 1)
+
+test "r5_decimal_rounding_to_integer"
+    assert_eq([text(floor(2.5d)), text(ceil(2.5d)), text(round(2.5d)), text(round(3.5d)), text(trunc(-2.5d)), text(floor(-2.5d)), type_of(floor(2.5d))], ["2", "3", "2", "4", "-2", "-3", "number"])
+
+test "r5_decimal_stats_stay_decimal"
+    let xs be [1.000000000000001d, 1.000000000000002d, 1.000000000000004d]
+    assert_eq(text(std(xs)), "0.000000000000001527525231651946668862682398")
+    assert_eq(type_of(std(xs)), "decimal")
+    assert_eq(text(var(xs)), "0.000000000000000000000000000002333333333333333333333333333")
+    assert_eq(text(median([1d, 10 ** 30])), "500000000000000000000000000000.5")
+    assert_eq(text(mean([1d, 2d, 10 ** 30])), "333333333333333333333333333334")
+    assert_eq(text(std([1d, 2d])), "0.7071067811865475244008443621")
+
+test "r5_csv_top_of_class"
+    assert_eq(text(csv_parse("a,b\nNA,1\n\"NA\",2\n", {"missing": ["NA"]})), "[{a: nothing, b: \"1\"}, {a: \"NA\", b: \"2\"}]")
+    assert_eq(text(csv_parse("x\nnan\n", {"types": {"x": "float"}})), "[{x: nan}]")
+    assert_eq(csv_encode([{"f": "=SUM(A1)", "n": -5, "g": "@cmd"}], {"escape_formulas": true, "eol": "\n"}), "f,n,g\n'=SUM(A1),-5,'@cmd\n")
+    assert_eq(text(csv_parse("x\n123456789012345678901234567890.5\n", {"types": {"x": "decimal"}})), "[{x: 123456789012345678901234567890.5}]")
+    expect_error(() => csv_parse("x\n1e400\n", {"types": {"x": "float"}}), "out of range for a float")
+    expect_error(() => csv_parse("a", {"delimiter": "\""}), "cannot be")
+    let big be join(apply(range(5000), (i) => "9"), "")
+    expect_error(() => csv_parse("x\n" + big + "\n", {"types": {"x": "int"}}), "the limit is 4300")
+
+test "r6_fmt_regex_quantifiers_are_literal"
+    assert_eq(fmt("^[0-9]{3}-{n}$", {"n": 1}), "^[0-9]{3}-1$")
+    assert_eq(fmt("{3,5}", {}), "{3,5}")
+    assert_eq(fmt("{3}{ x }{}", {"x": 1}), "{3}{ x }{}")
+    assert_eq(fmt("x{a..b}y {a.} {_k}", {"a": {"b": 1}, "_k": 2}), "x{a..b}y {a.} 2")
+    assert_eq(fmt("{{n}} {n}", {"n": 3}), "{n} 3")
+    expect_error(() => fmt("{a.b}", {"a": {"c": 1}}), "no value for {a.b}")
+
+test "r6_csv_blank_lines_are_skipped"
+    assert_eq(length(csv_parse("x\n1\n2\n\n")), 2)
+    assert_eq(length(csv_parse("x\n1\n\n2\n")), 2)
+    assert_eq(length(csv_parse("x,y\n1,2\n\n3,4\n")), 2)
+    assert_eq(csv_encode([{"a": nothing}]), "a\r\n\"\"\r\n")
+    assert_eq(csv_encode([[nothing]]), "\"\"\r\n")
+    assert_eq(text(csv_parse("x\n\"a\n\nb\"\n")), "[{x: \"a\\n\\nb\"}]")
+
+test "r6_format_time_bad_specifier_is_catchable"
+    let d be date("2026-01-02")
+    let t be datetime("2026-01-02T10:30:00Z")
+    each p in ["%Q", "%Y-%Q-%d", "abc %", "%.9"]
+        expect_error(() => format_time(t, p), when p == "abc %" then "\"%\"" otherwise "is not a strftime specifier")
+    expect_error(() => format_time(d, "%H:%M"), "a date has no time of day or zone")
+    expect_error(() => format_time(0, "%Q"), "\"%Q\" is not a strftime specifier")
+    assert_eq(format_time(t, "%Y-%m-%d %H:%M %% %-d %.3f"), "2026-01-02 10:30 % 2 .000")
+    assert_eq(format_time(d, "%d/%m/%Y"), "02/01/2026")
+    assert_eq(format_time(0, "%Y"), "1970")
+
+test "r6_join_semi_anti_no_false_collision"
+    assert_eq(text(join([{"k": 1, "x_right": 0}], [{"k": 1, "x": 2}], "k", "semi")), "[{k: 1, x_right: 0}]")
+    assert_eq(text(join([{"k": 1, "x": 1, "x_right": 0}], [{"k": 2, "x": 3}], "k", "anti")), "[{k: 1, x: 1, x_right: 0}]")
+    assert_eq(text(join([{"k": 1, "x": 1}], [{"k": 1, "x": 3, "x_right": 4}], "k", "semi")), "[{k: 1, x: 1}]")
+    expect_error(() => join([{"k": 1, "x": 1, "x_right": 2}], [{"k": 1, "x": 3}], "k", "left"), "already has")
+
+test "r6_parquet_int_beyond_2_53_in_float_column"
+    let failed be false
+    try
+        parquet_write([{"a": 1.5}, {"a": 2 ** 53 + 1}])
+    recover e
+        set failed to true
+        assert(contains(e, "column \"a\", row 2"))
+        assert(contains(e, "convert the column to decimal or to text"))
+    assert(failed)
+    let r be parquet_read(parquet_write([{"a": 1.5}, {"a": 2 ** 53}, {"b": -(2 ** 53)}]))
+    assert_eq(r[1].a == 2 ** 53, true)
+    assert_eq(text(parquet_read(parquet_write([{"a": 2 ** 53 + 1}]))[0].a), "9007199254740993")
+
+test "r6_parquet_duplicate_columns"
+    require file.read("engine/crates/synsema-runtime/tests/fixtures/parquet_dup_columns.parquet")
+    expect_error(() => parquet_read(read_file_bytes("engine/crates/synsema-runtime/tests/fixtures/parquet_dup_columns.parquet")), "two columns named \"a\"")
+
+test "r6_parquet_arrow_timezones"
+    require file.read("engine/crates/synsema-runtime/tests/fixtures/parquet_tz_polars.parquet")
+    require file.read("engine/crates/synsema-runtime/tests/fixtures/parquet_tz_arrow.parquet")
+    assert_eq(text(parquet_read(read_file_bytes("engine/crates/synsema-runtime/tests/fixtures/parquet_tz_polars.parquet"))), "[{t: 2026-01-03T10:00:00-03:00[America/Sao_Paulo], u: 2026-01-03T10:00:00Z, n: 2026-01-03T10:00:00+09:00[Asia/Tokyo], k: 1}]")
+    assert_eq(text(parquet_read(read_file_bytes("engine/crates/synsema-runtime/tests/fixtures/parquet_tz_arrow.parquet"))), "[{t: 2026-01-03T04:00:00-05:00[America/New_York], o: 2026-01-03T14:30:00+05:30, n: 2026-01-03T09:00:00Z}]")
+    assert_eq(text(parquet_read(parquet_write([{"w": datetime("2026-01-03T10:00:00", "Europe/Madrid")}]))[0].w), "2026-01-03T10:00:00+01:00[Europe/Madrid]")
+
+test "r7_fmt_exact_keys_first"
+    assert_eq(fmt("[{0}] {a-b}", {"0": "z", "a-b": 1}), "[z] 1")
+    assert_eq(fmt("^[0-9]{3}-{n}$", {"n": 1}), "^[0-9]{3}-1$")
+    assert_eq(fmt("{ x }|{3,5}|{a b}", {"x": 1}), "{ x }|{3,5}|{a b}")
+    assert_eq(fmt("{ x }", {" x ": 9}), "9")
+    expect_error(() => fmt("{n}", {}), "no value for {n}")
+
+test "r7_sort_nested_decimal_float"
+    assert_eq(text(sort([[2d, 2.5], [1d, 1.5]])), "[[1, 1.5], [2, 2.5]]")
+    assert_eq(text(sort_by([[2d, 2.5], [1d, 1.5]], (r) => r)), "[[1, 1.5], [2, 2.5]]")
+    assert_eq(text(sort([[1d, 1.5], [1d, 0.5]])), "[[1, 0.5], [1, 1.5]]")
+    expect_error(() => sort([[1.5d], [1.0]]), "cannot mix decimal and float")
+    expect_error(() => sort([1.5d, 1.0]), "cannot mix decimal and float")
+    expect_error(() => sort_by([1.5d, 1.0], (x) => x), "cannot mix decimal and float")
+    expect_error(() => sort([[1d, 1.5], [1d, 1.5d]]), "cannot mix decimal and float")
+
+test "r7_container_equality_decimal_float"
+    expect_error(() => [1d] == [1.0], "cannot mix decimal and float")
+    expect_error(() => {"a": 1d} == {"a": 1.0}, "cannot mix decimal and float")
+    expect_error(() => [[1d]] != [[1.5]], "cannot mix decimal and float")
+    expect_error(() => [1d] in [[1.0]], "cannot mix decimal and float")
+    assert_eq([1d] == [1], true)
+    assert_eq({"a": 1d} == {"a": 1}, true)
+    assert_eq([1d, "x"] == [1d, "x"], true)
+    assert_eq([1d] == [1d, 1.0], false)
+    assert_eq(contains([1d, 2d], 2), true)
+    match [1d]
+        is [1]
+            assert(true)
+        otherwise
+            assert(false)
+
+test "r7_date_range_skips_a_day_that_did_not_exist"
+    let s be datetime("2011-12-28T10:00:00", "Pacific/Apia")
+    let r be date_range(s, datetime("2012-01-01T10:00:00", "Pacific/Apia"), "day")
+    assert_eq(length(r), 4)
+    assert_eq(length(unique(r)), 4)
+    assert_eq(text(r[2]), "2011-12-31T10:00:00+14:00[Pacific/Apia]")
+    assert_eq(text(add_days(datetime("2011-12-29T10:00:00", "Pacific/Apia"), 1)), "2011-12-31T10:00:00+14:00[Pacific/Apia]")
+
+test "r8_bracketed_zone_is_local_time"
+    assert_eq(text(datetime("2026-09-24T10:00:00[Asia/Kolkata]")), "2026-09-24T10:00:00+05:30[Asia/Kolkata]")
+    assert_eq(text(datetime("2026-09-24T10:00:00[+05:30]")), "2026-09-24T10:00:00+05:30")
+    assert_eq(text(datetime("2026-09-24T10:00:00+05:30[Asia/Kolkata]")), "2026-09-24T10:00:00+05:30[Asia/Kolkata]")
+    expect_error(() => datetime("2026-03-29T02:30:00[Europe/Madrid]"), "does not exist in Europe/Madrid")
+    expect_error(() => datetime("2026-09-24T10:00:00+05:30[Europe/Madrid]"), "does not match Europe/Madrid")
+
+test "r8_csv_empty_missing_mark_is_an_error"
+    expect_error(() => csv_encode([{"a": nothing}, {"a": "x"}], {"missing": ""}), "cannot be empty")
+    assert_eq(text(csv_parse(csv_encode([{"a": nothing}, {"a": "x"}], {"missing": "NA"}), {"missing": ["NA"]})), "[{a: nothing}, {a: \"x\"}]")
+
+test "r6_decimal_float_keys_error"
+    expect_error(() => group_by([{"k": 1.5d}, {"k": 1.5}], "k"), "cannot mix decimal and float")
+    expect_error(() => count_by([1.5d, 1.5]), "cannot mix decimal and float")
+    expect_error(() => count_by([{"k": 1.5d}, {"k": 1.5}], "k"), "cannot mix decimal and float")
+    expect_error(() => summarize([{"k": 1.5d, "v": 1}, {"k": 1.5, "v": 2}], "k", {"n": count()}), "cannot mix decimal and float")
+    expect_error(() => summarize([{"a": 1, "k": 1.5d}, {"a": 1, "k": 1.5}], ["a", "k"], {"n": count()}), "cannot mix decimal and float")
+    expect_error(() => unique([1.5d, 1.5]), "cannot mix decimal and float")
+    expect_error(() => unique([[1.5d], [1.5]]), "cannot mix decimal and float")
+    expect_error(() => mode([1.5d, 1.5]), "cannot mix decimal and float")
+    expect_error(() => pivot([{"i": 1.5d, "c": "a", "v": 1}, {"i": 1.5, "c": "b", "v": 2}], "i", "c", "v"), "cannot mix decimal and float")
+    expect_error(() => pivot([{"i": 1, "c": 1.5d, "v": 1}, {"i": 2, "c": 1.5, "v": 2}], "i", "c", "v"), "cannot mix decimal and float")
+    expect_error(() => 1.5d in [1.5], "cannot mix decimal and float")
+    expect_error(() => 1.5 in [1.5d, 2], "cannot mix decimal and float")
+    expect_error(() => 1.5 not in [1.5d], "cannot mix decimal and float")
+    assert_eq(length(group_by([{"k": 1.5d}, {"k": 1.50d}], "k")), 1)
+    assert_eq(length(unique([1.5, 1.5, 2])), 2)
+    assert_eq(text(mode([1.5d, 1.5d, 2d])), "1.5")
+    assert_eq(text(count_by([1.5, 1.5, nan])), "[{key: 1.5, count: 2}, {key: nan, count: 1}]")
+    assert_eq(1.5d in [1.50d], true)
+    assert_eq(1.5 in [nan, 1.5], true)
+    assert_eq(nan in [1.5d], false)
+    assert_eq("a" in ["a", 1.5d], true)
+    assert_eq(length(summarize([{"a": 1.5d, "k": 1.5}, {"a": 1.5d, "k": 1.5}], ["a", "k"], {"n": count()})), 1)
+
+test "r8_parquet_fixed_offset_is_kept"
+    require file.read("engine/crates/synsema-runtime/tests/fixtures/parquet_tz_arrow.parquet")
+    assert_eq(text(parquet_read(read_file_bytes("engine/crates/synsema-runtime/tests/fixtures/parquet_tz_arrow.parquet"))), "[{t: 2026-01-03T04:00:00-05:00[America/New_York], o: 2026-01-03T14:30:00+05:30, n: 2026-01-03T09:00:00Z}]")
+
+test "r7_parquet_time_of_day_is_a_duration"
+    require file.read("engine/crates/synsema-runtime/tests/fixtures/parquet_time_ns_polars.parquet")
+    let r be parquet_read(read_file_bytes("engine/crates/synsema-runtime/tests/fixtures/parquet_time_ns_polars.parquet"))
+    assert_eq(type_of(r[0].t), "duration")
+    assert_eq(in_units(r[0].t, "milliseconds"), 47445123.456)
+    assert_eq(r[1].t, nothing)
+    assert_eq(r[2].t == duration(seconds = 0), true)
+    assert(r[0].t > duration(hours = 13, minutes = 10, seconds = 45))
+    assert(r[0].t < duration(hours = 13, minutes = 10, seconds = 46))
