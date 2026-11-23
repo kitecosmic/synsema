@@ -37,7 +37,6 @@ mod engine_redis;
 mod engine_security;
 mod frozen_reads;
 mod gaps_conformance;
-mod hmac_bytes;
 mod v0655_arrays;
 mod v0656_f32;
 mod v0658_attenuation;

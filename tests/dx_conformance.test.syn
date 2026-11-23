@@ -1,0 +1,178 @@
+-- Gemelo de dx_conformance.rs (v0.6.68, migas §4): dual-order de la familia intencional,
+-- unique/index_of, y los hints accionables (`request` fuera de handler, precedencia de `of`).
+-- El test que maneja el Interpreter de Rust directamente queda en Rust (migas §1).
+-- Correr con: synsema test tests/dx_conformance.test.syn
+
+task expect_error(f, needle)
+    let ok be false
+    try
+        f()
+    recover e
+        set ok to true
+        assert(contains(e, needle))
+    assert(ok)
+
+test "dual_order_apply"
+    assert_eq(text(apply((x) => x * 2, [1, 2, 3])), "[2, 4, 6]")
+    assert_eq(text(apply([1, 2, 3], (x) => x * 2)), "[2, 4, 6]")
+
+test "internal_callbacks_reject_missing_required_arguments_only_when_invoked"
+    expect_error(() => print(apply((a, b) => b, [1, 2])), "missing argument 'b'")
+    expect_error(() => print(where([1], (a, b) => true)), "missing argument 'b'")
+    expect_error(() => print(reduce([1, 2], (acc, x, extra) => extra, 0)), "missing argument 'extra'")
+    expect_error(() => print(sort_by([2, 1], (a, b) => a)), "missing argument 'b'")
+    assert_eq(text(apply(() => 7, [1, 2])), "[7, 7]")
+    task plus_default(a, b = 9)
+        give a + b
+    assert_eq(text(apply(plus_default, [1, 2])), "[10, 11]")
+    assert_eq(text(apply((a, b) => b, [])), "[]")
+
+test "dual_order_where"
+    assert_eq(text(where((x) => x > 1, [1, 2, 3])), "[2, 3]")
+    assert_eq(text(where([1, 2, 3], (x) => x > 1)), "[2, 3]")
+
+test "dual_order_transform_with_and_without_pred"
+    assert_eq(text(transform((x) => x + 10, [1, 2])), "[11, 12]")
+    assert_eq(text(transform([1, 2], (x) => x + 10)), "[11, 12]")
+    assert_eq(text(transform((x) => x + 10, [1, 2, 3], (x) => x > 1)), "[1, 12, 13]")
+    assert_eq(text(transform([1, 2, 3], (x) => x + 10, (x) => x > 1)), "[1, 12, 13]")
+
+test "dual_order_reduce_with_and_without_init"
+    assert_eq(text(reduce((acc, x) => acc + x, [1, 2, 3])), "6")
+    assert_eq(text(reduce([1, 2, 3], (acc, x) => acc + x)), "6")
+    assert_eq(text(reduce((acc, x) => acc + x, [1, 2, 3], 100)), "106")
+    assert_eq(text(reduce([1, 2, 3], (acc, x) => acc + x, 100)), "106")
+
+test "dual_order_sort_by"
+    assert_eq(sort_by((x) => 0 - x, [1, 3, 2])[0], 3)
+    assert_eq(sort_by([1, 3, 2], (x) => 0 - x)[0], 3)
+
+test "dual_order_group_by"
+    assert_eq(text(length(group_by((x) => x > 2, [1, 2, 3, 4])[1].items)), "2")
+    assert_eq(text(length(group_by([1, 2, 3, 4], (x) => x > 2)[1].items)), "2")
+
+test "dual_order_find_first"
+    assert_eq(find_first((x) => x > 1, [1, 2, 3]), 2)
+    assert_eq(find_first([1, 2, 3], (x) => x > 1), 2)
+
+test "dual_order_every_and_some"
+    assert_eq(text(every((x) => x > 0, [1, 2])), "true")
+    assert_eq(text(every([1, 2], (x) => x > 0)), "true")
+    assert_eq(text(some((x) => x > 1, [1, 2])), "true")
+    assert_eq(text(some([1, 2], (x) => x > 1)), "true")
+
+test "dual_order_count_where"
+    assert_eq(text(count_where((x) => x > 1, [1, 2, 3])), "2")
+    assert_eq(text(count_where([1, 2, 3], (x) => x > 1)), "2")
+
+test "dual_order_zip_with"
+    assert_eq(text(zip_with((a, b) => a + b, [1, 2], [10, 20])), "[11, 22]")
+    assert_eq(text(zip_with([1, 2], [10, 20], (a, b) => a + b)), "[11, 22]")
+
+test "no_breaking_todays_exact_calls"
+    assert_eq(text(apply((x) => x * 2, [1, 2])), "[2, 4]")
+    assert_eq(text(where([1, 2, 3], (x) => x != 2)), "[1, 3]")
+    assert_eq(text(reduce([1, 2, 3], (acc, x) => acc + x)), "6")
+    assert_eq(text(reduce([1, 2, 3], (acc, x) => acc + x, 10)), "16")
+    assert_eq(text(transform([1, 2], (x) => x * 3)), "[3, 6]")
+    assert_eq(text(transform([1, 2], (x) => x * 3, (x) => x > 1)), "[1, 6]")
+    assert_eq(text(zip_with([1, 2], [3, 4], (a, b) => a * b)), "[3, 8]")
+    assert_eq(text(sort_by([3, 1, 2], (x) => x)), "[1, 2, 3]")
+    assert_eq(find_first([1, 2], (x) => x > 5), nothing)
+    assert_eq(text(every([1, 2], (x) => x > 1)), "false")
+    assert_eq(text(some([1, 2], (x) => x > 5)), "false")
+    assert_eq(text(count_where([1, 2, 3], (x) => x > 0)), "3")
+
+test "ambiguity_two_tasks_and_two_lists_error"
+    let ok be false
+    try
+        where((x) => x, (y) => y)
+    recover e
+        set ok to true
+        assert(contains(e, "got two tasks"))
+        assert(contains(e, "where(fn, list, ...)"))
+        assert(contains(e, "where(list, fn, ...)"))
+    assert(ok)
+    let ok2 be false
+    try
+        apply([1], [2])
+    recover e
+        set ok2 to true
+        assert(contains(e, "got two lists"))
+        assert(contains(e, "apply(fn, list, ...)"))
+        assert(contains(e, "apply(list, fn, ...)"))
+    assert(ok2)
+    let ok3 be false
+    try
+        zip_with([1], [2], 5)
+    recover e
+        set ok3 to true
+        assert(contains(e, "as the combiner"))
+        assert(contains(e, "zip_with(fn, list_a, list_b)"))
+        assert(contains(e, "zip_with(list_a, list_b, fn)"))
+    assert(ok3)
+
+test "reduce_with_callable_init_is_valid"
+    assert_eq(text(reduce((acc, x) => 1, [9], (y) => y)), "1")
+
+test "unique_first_appearance_order_and_structural_equality"
+    assert_eq(text(unique([3, 1, 3, 2, 1])), "[3, 1, 2]")
+    assert_eq(text(unique([])), "[]")
+    assert_eq(text(unique(["a", "b", "a"])), "[\"a\", \"b\"]")
+    assert_eq(text(length(unique([1, "x", 1, "x"]))), "2")
+    assert_eq(text(length(unique([{"a": 1}, {"a": 1}, {"a": 2}]))), "2")
+    assert_eq(text(length(unique([[1, 2], [1, 2], [3]]))), "2")
+
+test "index_of_item_predicate_and_nothing"
+    assert_eq(text(index_of([10, 20, 30], 20)), "1")
+    assert_eq(text(index_of([1, 2, 3], (x) => x > 1)), "1")
+    assert_eq(index_of([1, 2], 9), nothing)
+    assert_eq(text(index_of([1, 2], 9) == nothing), "true")
+    let idx be index_of(["a", "b"], "b")
+    when idx != nothing
+        assert_eq(["a", "b"][idx], "b")
+    assert_eq(text(index_of([{"k": 1}, {"k": 2}], {"k": 2})), "1")
+
+test "request_outside_handler_gets_actionable_hint"
+    let ok be false
+    try
+        print(request)
+    recover e
+        set ok to true
+        assert(contains(e, "route handlers"))
+        assert(contains(e, "pass it as a parameter"))
+    assert(ok)
+    expect_error(() => print(t_aux()), "route handlers")
+    let ok2 be false
+    try
+        print(no_existe)
+    recover e
+        set ok2 to true
+        assert(contains(e, "Undefined variable: 'no_existe'"))
+        assert(not contains(e, "route handlers"))
+    assert(ok2)
+
+task t_aux()
+    give request
+
+test "of_precedence_hint_only_when_of_is_involved"
+    let ok be false
+    try
+        let request be {"user": "ada"}
+        let u be user of request.role
+        print(u)
+    recover e
+        set ok to true
+        assert(contains(e, "bind first"))
+        assert(contains(e, "Map has no key 'role'"))
+    assert(ok)
+    let ok2 be false
+    try
+        let m be {"a": {"b": 1}}
+        print(m.a.c)
+    recover e
+        set ok2 to true
+        assert(contains(e, "Map has no key 'c'"))
+        assert(not contains(e, "bind first"))
+    assert(ok2)
+    assert_eq(user of {"user": "ada"}, "ada")

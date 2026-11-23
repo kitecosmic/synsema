@@ -1,0 +1,140 @@
+-- Gemelo de v0665_tables.rs (core) (v0.6.68, migas §4): los casos decididos del diseño §11 de
+-- tablas por columnas. Los tests de hash/json_encode/parquet/vistas-en-parallel_map quedan en
+-- Rust (otro crate o miran por dentro del host). Correr con: synsema test tests/v0665_tables.test.syn
+
+let ROWS be [{"k": 1, "v": 1.5}, {"k": 2, "v": 2.5}, {"k": 3, "v": 3.5}]
+
+task expect_error(f, needle)
+    let ok be false
+    try
+        f()
+    recover e
+        set ok to true
+        assert(contains(e, needle))
+    assert(ok)
+
+task try_write_row(tt)
+    set tt[0] to {"k": 9, "v": 9.9}
+
+task try_write_cell(tt)
+    set tt[0].k to 9
+
+task try_write_column(tt)
+    set tt.k to 9
+
+test "a_table_reports_its_shape_and_schema"
+    let t be table(ROWS)
+    assert_eq(type_of(t), "table")
+    assert_eq(length(t), 3)
+    assert_eq(columns(t), ["k", "v"])
+
+test "to_rows_round_trip_is_identity_for_homogeneous_rows"
+    assert(to_rows(table(ROWS)) == ROWS)
+
+test "ragged_rows_get_the_full_schema_with_nothing"
+    assert(length(table([{"k": 1}, {"k": 2, "v": 3.0}])) == 2)
+    assert(to_rows(table([{"k": 1}, {"k": 2, "v": 3.0}]))[0].v == nothing)
+    assert(table([{"k": 1}, {"k": 2, "v": 3.0}])[0].v == nothing)
+    assert(contains(keys(table([{"k": 1}, {"k": 2, "v": 3.0}])[0]), "v"))
+
+test "indexing_a_table_gives_its_row"
+    let t be table(ROWS)
+    assert_eq(t[0].k, 1)
+    assert_eq(t[-1].v, 3.5)
+    assert_eq(t[1]["v"], 2.5)
+    expect_error(() => t[7], "out of bounds (table with 3 rows)")
+
+test "equality_is_within_the_type_only"
+    assert(table(ROWS) == table(ROWS))
+    assert(table(ROWS) != ROWS)
+    assert(table(ROWS) != table([{"k": 1, "v": 1.5}, {"k": 2, "v": 2.5}, {"k": 3, "v": 9.9}]))
+    assert(table([{"k": 1, "v": nothing}]) == table([{"k": 1, "v": nothing}]))
+    assert(table([{"k": 1, "v": nothing}]) != table([{"k": 1, "v": 0.0}]))
+    assert(table([{"k": 1, "v": nan}]) != table([{"k": 1, "v": nan}]))
+
+test "text_is_exactly_the_rows_one"
+    let t be table(ROWS)
+    assert(text(t) == text(to_rows(t)))
+    assert_eq(text(t), "[{k: 1, v: 1.5}, {k: 2, v: 2.5}, {k: 3, v: 3.5}]")
+
+test "slice_of_a_table_is_a_table_that_shares_the_rows"
+    let t be table(ROWS)
+    let s be slice(t, 1, 3)
+    assert_eq(type_of(s), "table")
+    assert_eq(length(s), 2)
+    assert(to_rows(s) == slice(to_rows(t), 1, 3))
+    assert(slice(table(ROWS), 0, 2) == table([{"k": 1, "v": 1.5}, {"k": 2, "v": 2.5}]))
+
+test "a_table_is_immutable_and_teaches_the_way_out"
+    let t be table(ROWS)
+    expect_error(() => try_write_row(t), "a table is immutable — convert it with to_rows(t)")
+    expect_error(() => try_write_cell(t), "a table is immutable")
+    expect_error(() => try_write_column(t), "a table is immutable")
+    let rs be to_rows(table(ROWS))
+    set rs[0].k to 9
+    assert(table(rs)[0].k == 9)
+
+test "an_empty_table_is_falsy_with_no_columns"
+    assert(length(table([])) == 0)
+    assert(columns(table([])) == [])
+    assert(table([]) or false == false)
+    assert(table([{"k": 1}]) or false == true)
+    expect_error(() => table([])[0], "out of bounds (table with 0 rows)")
+
+test "columns_stay_exact_no_matter_the_mix"
+    assert_eq(text(table([{"v": 1}, {"v": 2.5}])[0].v), "1")
+    assert_eq(text(table([{"v": 1}, {"v": 2.5}])[1].v), "2.5")
+    assert_eq(text(table([{"v": "a"}, {"v": 1}, {"v": 2.5}])[0].v), "a")
+    assert_eq(text(table([{"v": "a"}, {"v": 1}, {"v": 2.5}])[1].v), "1")
+    assert_eq(text(table([{"d": 1.50d}])[0].d), "1.50")
+    assert(table([{"s": "a", "b": true}])[0].s == "a" and table([{"s": "a", "b": true}])[0].b == true)
+    assert(table([{"k": 1}, {"k": 2}]) == table([{"k": 1}, {"k": 2}]))
+
+test "null_cells_round_trip_as_nothing"
+    assert(to_rows(table([{"k": 1, "v": nothing}, {"k": 2, "v": 5.0}]))[0].v == nothing)
+    assert(to_rows(table([{"k": 1, "v": nothing}, {"k": 2, "v": 5.0}]))[1].v == 5.0)
+    assert(to_rows(table([{"k": 1}, {"k": nothing}]))[1].k == nothing)
+
+test "table_builtin_rejects_non_maps"
+    expect_error(() => table([1, 2, 3]), "expected a list of maps")
+    expect_error(() => table(nothing), "table")
+
+test "list_generics_reject_a_table"
+    let t be table(ROWS)
+    expect_error(() => transform(t, (r) => r), "expects a list, got table")
+    expect_error(() => append(t, {"k": 4, "v": 4.5}), "must be a list")
+
+test "the_table_operations_accept_a_table"
+    assert(summarize(table(ROWS), "k", {"n": count()}) == summarize(ROWS, "k", {"n": count()}))
+    assert_eq(type_of(group_by(table(ROWS), "k")[0].items), "table")
+    assert(to_rows(group_by(table(ROWS), "k")[0].items) == group_by(ROWS, "k")[0].items)
+    assert(join(table(ROWS), table(ROWS), "k") == join(ROWS, ROWS, "k"))
+    assert(to_rows(sort_by(table(ROWS), (r) => r.k, true)) == sort_by(ROWS, (r) => r.k, true))
+    assert(drop_missing(table([{"k": 1, "v": nothing}, {"k": 2, "v": 2.5}]))[0].k == 2)
+    assert(fill_missing(table([{"k": 1, "v": nothing}]), 0.0)[0].v == 0.0)
+    assert(length(where(table(ROWS), (r) => r.v > 2.0)) == 2)
+
+test "aggregations_over_blocks_match_the_row_path_exactly"
+    assert(summarize(table(ROWS), "k", {"a": sum_of("v")}) == summarize(ROWS, "k", {"a": sum_of("v")}))
+    assert(summarize(table(ROWS), "k", {"a": mean_of("v")}) == summarize(ROWS, "k", {"a": mean_of("v")}))
+    assert(summarize(table(ROWS), "k", {"a": min_of("v")}) == summarize(ROWS, "k", {"a": min_of("v")}))
+    assert(summarize(table(ROWS), "k", {"a": max_of("v")}) == summarize(ROWS, "k", {"a": max_of("v")}))
+    assert(summarize(table(ROWS), "k", {"a": median_of("v")}) == summarize(ROWS, "k", {"a": median_of("v")}))
+    assert(summarize(table(ROWS), "k", {"n": count(), "u": n_unique_of("v")}) == summarize(ROWS, "k", {"n": count(), "u": n_unique_of("v")}))
+    assert(summarize(table(ROWS), "k", {"m": (g) => length(g)}) == summarize(ROWS, "k", {"m": (g) => length(g)}))
+    assert(count_by(table(ROWS), "k") == count_by(ROWS, "k"))
+    assert_eq(text(count_by(table([{"k": 1}, {"k": 1}, {"k": 2}]), "k")[0].count), "2")
+    assert(summarize(table([{"k": 1, "v": nothing}, {"k": 1, "v": 4.0}]), "k", {"s": sum_of("v"), "m": mean_of("v"), "n": min_of("v")}) == summarize([{"k": 1, "v": nothing}, {"k": 1, "v": 4.0}], "k", {"s": sum_of("v"), "m": mean_of("v"), "n": min_of("v")}))
+    assert(count_by(table(ROWS)) == count_by(ROWS))
+    assert(count_by(table([{"k": 1, "v": 1.5}, {"k": 1, "v": 1.5}, {"k": 2, "v": 2.5}])) == count_by([{"k": 1, "v": 1.5}, {"k": 1, "v": 1.5}, {"k": 2, "v": 2.5}]))
+    assert(summarize(table([]), "k", {"n": count()}) == summarize([], "k", {"n": count()}))
+    assert(group_by(table([]), "k") == group_by([], "k"))
+    assert(count_by(table([]), "k") == count_by([], "k"))
+    expect_error(() => summarize(table(ROWS), "k", {"a": sum_of("z")}), "no row has a column \"z\"")
+
+test "a_slice_survives_as_a_view_in_every_direction"
+    let t be table(ROWS)
+    let s be slice(t, 1, 2)
+    assert_eq(columns(s), ["k", "v"])
+    assert_eq(s[0].v, 2.5)
+    assert(s == slice(t, 1, 2))
