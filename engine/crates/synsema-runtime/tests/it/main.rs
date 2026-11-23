@@ -72,7 +72,6 @@ mod v0646_tanda_c;
 mod v0646_f1;
 mod v0651_run_scope_e2e;
 mod v0664_data;
-mod v0664_parallel;
 mod v0664_probe;
 mod webauth_e2e;
 mod webpush_e2e;

@@ -1,0 +1,33 @@
+-- Parallel worker snapshots and copy behavior.
+
+test "unused_global_tables_do_not_change_parallel_results"
+    let unused be [{"k": 1}, {"k": 2}]
+    let parts be [[1, 2], [3, 4]]
+    assert_eq(parallel_map((p) => length(p), parts, 2), [2, 2])
+
+test "direct_data_and_transitive_task_globals_still_arrive"
+    let offset be 10
+    let irrelevant be [{"k": 1}]
+    assert_eq(parallel_map((p) => length(p) + offset, [[1], [2, 3]], 2), [11, 12])
+    task helper(p)
+        give length(p) + offset
+    assert_eq(parallel_map((p) => helper(p), [[1], [2, 3]], 2), [11, 12])
+
+test "numeric_leaf_rows_copy_on_worker_write"
+    let row be {"k": 1}
+    task work(p)
+        set p["k"] to p["k"] + 1
+        give p["k"]
+    assert_eq(parallel_map(work, [row, row], 2), [2, 2])
+    assert_eq(row.k, 1)
+
+test "callback_maps_and_local_closures_keep_the_full_snapshot"
+    let base be 5
+    task helper(p)
+        give p + base
+    let config be {"f": helper}
+    assert_eq(parallel_map((p) => config.f(p), [1, 2], 2), [6, 7])
+    task outer(factor)
+        let work be (p) => p * factor
+        give parallel_map(work, [1, 2], 2)
+    assert_eq(outer(3), [3, 6])
