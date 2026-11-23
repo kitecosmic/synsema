@@ -1,0 +1,77 @@
+-- Capability isolation and expression regressions. The host-only serve, run-mode and
+-- RunResult output cases remain in Rust.
+
+test "sandbox_denies_granted_capability"
+    require random
+    let ok be false
+    try
+        sandbox
+            let x be random()
+    recover e
+        set ok to true
+        assert(contains(e, "Capability not granted"))
+    assert(ok)
+
+test "sandbox_restores_capabilities_after"
+    require random
+    assert(random() >= 0)
+    let c be 0
+    sandbox
+        set c to 2 + 3
+    assert_eq(c, 5)
+    assert(random() >= 0)
+
+test "term_write_goes_through_the_stdout_gate_inside_a_sandbox"
+    let denied be false
+    try
+        sandbox
+            term_write(1, "inside")
+    recover e
+        set denied to true
+        assert(contains(e, "Capability not granted: stdout"))
+    assert(denied)
+    let invalid be false
+    try
+        term_write(1, "x")
+    recover e
+        set invalid to true
+        assert(contains(e, "unknown or closed terminal handle"))
+    assert(invalid)
+
+test "sandbox_require_cannot_escape"
+    let denied be false
+    try
+        sandbox
+            require random
+            let x be random()
+    recover e
+        set denied to true
+        assert(contains(e, "Capability not granted"))
+    assert(denied)
+
+test "llm_op_denied_inside_sandbox"
+    let e be generate "outside"
+    let denied be false
+    try
+        sandbox
+            let f be generate "inside"
+    recover err
+        set denied to true
+        assert(contains(err, "Capability not granted: llm"))
+    assert(denied)
+
+test "when_then_inline_returns_value"
+    let a be when 5 > 0 then "pos" otherwise "neg"
+    let b be when 5 < 0 then "pos" otherwise "neg"
+    assert_eq([a, b], ["pos", "neg"])
+
+test "when_block_form_still_works"
+    let result be ""
+    when 1 > 0
+        set result to "yes"
+    assert_eq(result, "yes")
+
+test "checkpoint_accepts_expression"
+    let i be 3
+    checkpoint "step_" + text(i)
+    assert_eq(i, 3)

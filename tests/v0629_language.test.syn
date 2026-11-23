@@ -1,0 +1,177 @@
+-- v0.6.29 language compatibility. Host arity table, parser hints and elapsed-time guards
+-- remain in Rust.
+
+task expect_error(f, needle)
+    let ok be false
+    try
+        f()
+    recover e
+        set ok to true
+        assert(contains(e, needle))
+    assert(ok)
+
+test "exact_integers"
+    assert_eq(text(int("123456789012345678901")), "123456789012345678901")
+    assert_eq(int("0x1f18"), 7960)
+    assert_eq(int("-42"), -42)
+    assert_eq(int("1_000"), 1000)
+    assert_eq(int(3.0), 3)
+    assert_eq(int("x", nothing), nothing)
+    assert_eq(int("0x0000000000000000000000000000000000000000000000000000000000001f18"), 7960)
+    expect_error(() => int(1.5), "not a whole number")
+    expect_error(() => int("1.5"), "Cannot convert")
+    expect_error(() => number("123456789012345678901"), "int(x)")
+    assert_eq(number("123456789012345678901", nothing), nothing)
+
+test "floor_division_and_hex"
+    assert_eq(text((10 ** 30) // 3), "333333333333333333333333333333")
+    assert_eq(-7 // 2, -4)
+    assert_eq(7 // -2, -4)
+    assert_eq(text(7.5 // 2), "3.0")
+    each a in [7, -7, 10 ** 30, -(10 ** 30)]
+        each b in [2, -2, 3, -3]
+            assert_eq(a, b * (a // b) + a % b)
+    expect_error(() => 1 // 0, "Division by zero")
+    assert_eq(hex(7960), "0x1f18")
+    assert_eq(hex(0), "0x0")
+    assert_eq(hex(bytes([0, 255])), "0x00ff")
+    assert_eq(int(hex(2 ** 255)) == 2 ** 255, true)
+    assert_eq(bytes(hex(bytes([1, 2])), "hex") == bytes([1, 2]), true)
+    expect_error(() => hex(-1), "negative")
+    assert_eq(bytes("0x00ff", "hex") == bytes("00ff", "hex"), true)
+    expect_error(() => bytes("0x9", "hex"), "int(")
+
+test "literals_and_exact_comparison"
+    assert_eq([text(0x1f18), text(0b101), text(1e3), text(1.5e-3), text(0xFF_FF)], ["7960", "5", "1000.0", "0.0015", "65535"])
+    assert_eq([2 ** 53 + 1 == 9007199254740992.0, 2 ** 53 == 9007199254740992.0, 2 ** 53 + 1 > 9007199254740992.0], [false, true, true])
+    assert_eq([1 < 1.5, 2 > 1.5, 1 == 1.0], [true, true, true])
+
+test "indexing"
+    let xs be [1, 2, 3]
+    assert_eq(xs[-1], 3)
+    assert_eq("héllo"[1], "é")
+    assert_eq("abc"[-1], "c")
+    expect_error(() => [1, 2][1.7], "integer")
+    expect_error(() => range(0, 1, 0.25), "integer")
+    assert_eq([1, 2][1.0], 2)
+
+test "text_concat_and_display"
+    expect_error(() => "x" + nothing, "Cannot add text and nothing")
+    expect_error(() => "x" + [1], "Cannot add text and list")
+    assert_eq("n=" + 1, "n=1")
+    assert_eq("b=" + true, "b=true")
+    assert_eq(text(["1", 1, {"a": "b"}]), "[\"1\", 1, {a: \"b\"}]")
+    assert_eq(text("plain"), "plain")
+
+test "value_semantics"
+    let xs be [1, 2]
+    let ys be xs
+    set ys[0] to 9
+    assert_eq(xs, [1, 2])
+    assert_eq(ys, [9, 2])
+    let m be {"a": {"b": 1}}
+    task poke(state)
+        set state["a"]["b"] to 2
+        give state
+    let m2 be poke(m)
+    assert_eq(m, {"a": {"b": 1}})
+    assert_eq(m2, {"a": {"b": 2}})
+    let n be [[1], [2]]
+    let n2 be n
+    set n2[0][0] to 7
+    assert_eq(n, [[1], [2]])
+    assert_eq(n2, [[7], [2]])
+    let a be [1]
+    let keep be a
+    set a to append(a, 2)
+    set a to a + [3]
+    assert_eq(keep, [1])
+    assert_eq(a, [1, 2, 3])
+    let p be {"x": 1}
+    let q be p
+    set q.x to 5
+    assert_eq(p.x, 1)
+    assert_eq(q.x, 5)
+
+test "strict_arity"
+    task f(a, b)
+        give a
+    expect_error(() => f(1), "missing argument 'b'")
+    task one(a)
+        give a
+    expect_error(() => one(1, 2), "takes 1 argument, got 2")
+    expect_error(() => append([1], 2, 3), "at most 2")
+    expect_error(() => upper("a", "b"), "at most 1")
+    task defaults(a, b = 2)
+        give a + b
+    assert_eq(defaults(1), 3)
+    assert_eq(defaults(1, b = 5), 6)
+    assert_eq(apply([1, 2], (x) => x + 1), [2, 3])
+
+test "json_big_integers_are_exact"
+    assert_eq(text(json_decode("{\"id\": 12345678901234567890}")), "{id: 12345678901234567890}")
+    assert_eq(json_decode(json_encode(2 ** 255)) == 2 ** 255, true)
+    assert_eq(text(json_decode("1.5")), "1.5")
+
+test "while_has_no_iteration_cap"
+    let i be 0
+    while i < 1500000
+        set i to i + 1
+    assert_eq(i, 1500000)
+
+test "maps_api"
+    let m be {"a": 1, "b": 2}
+    assert_eq(get(m, "a"), 1)
+    assert_eq(get(m, "z"), nothing)
+    assert_eq(get(m, "z", 0), 0)
+    assert_eq(get([1, 2], -1), 2)
+    assert_eq(get([1], 5, "no"), "no")
+    assert_eq(remove(m, "a"), {"b": 2})
+    assert_eq(m, {"a": 1, "b": 2})
+    assert_eq(merge(m, {"b": 3, "c": 4}), {"a": 1, "b": 3, "c": 4})
+    assert_eq(items({"x": 1}), [{"key": "x", "value": 1}])
+
+test "total_order_and_sort"
+    assert_eq(sort([3, 1, 2]), [1, 2, 3])
+    assert_eq(sort([3, 1, 2], desc = true), [3, 2, 1])
+    assert_eq(text(sort([3, nothing, 1, nan, 2])), "[1, 2, 3, nan, nothing]")
+    assert_eq(sort(["b", "a", "C"]), ["C", "a", "b"])
+    let rows be [{"n": "a", "k": 2}, {"n": "b", "k": 1}, {"n": "c", "k": 2}]
+    assert_eq(apply(sort_by(rows, (r) => r.k, desc = true), (r) => r.n), ["a", "c", "b"])
+    assert_eq(sort([[1, 2], [1], [0, 9]]), [[0, 9], [1], [1, 2]])
+    expect_error(() => sort([1, "a"]), "cannot order number and text")
+    expect_error(() => sort_by([{"a": 1}], (x) => x), "has no order")
+
+test "each_over_maps_text_and_bytes"
+    let ks be []
+    each k in {"a": 1, "b": 2}
+        set ks to append(ks, k)
+    let cs be []
+    each c in "hé"
+        set cs to append(cs, c)
+    let bs be 0
+    each b in bytes([1, 2])
+        set bs to bs + b
+    assert_eq(ks, ["a", "b"])
+    assert_eq(cs, ["h", "é"])
+    assert_eq(bs, 3)
+
+test "text_and_regex_names"
+    assert_eq(regex_find_all("a1b2", "[0-9]"), ["1", "2"])
+    assert_eq(regex_capture("2026-09", "([0-9]+)-([0-9]+)"), ["2026", "09"])
+    assert_eq(regex_capture("x", "y"), nothing)
+    assert_eq(regex_replace("a1b2", "[0-9]", "#"), "a#b#")
+    assert_eq(fold_text("Ñandú"), "nandu")
+    assert_eq(index_of("héllo", "llo"), 2)
+    assert_eq(index_of("abc", "z"), nothing)
+    assert_eq(min(["b", "a"]), "a")
+    assert_eq(max("b", "c"), "c")
+    assert_eq(min([3, nothing, 1]), 1)
+    assert_eq(text(max([1, nan, 2])), "nan")
+
+test "fmt_is_strict"
+    assert_eq(fmt("{a}-{b} {{a}} {\"k\": 1}", {"a": 1, "b": "x"}), "1-x {a} {\"k\": 1}")
+    expect_error(() => fmt("{a}", {}), "no value for {a}")
+
+test "type_predicates"
+    assert_eq([is_integer(1), is_integer(1.0), is_text("a"), is_list([]), is_map({})], [true, false, true, true, true])

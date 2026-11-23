@@ -1,7 +1,6 @@
-//! Regresión de los gaps de la rama `gaps-fogueo-p4` (+ el fix de aislamiento de
-//! `sandbox`). Cubre lo testeable in-process: aislamiento de capabilities del sandbox
-//! (seguridad — el fix principal), `when/then` inline, `checkpoint` con expresión,
-//! agentes que ven tasks del top-level, y el estado compartido `state_*` en serve.
+//! Casos de `gaps-fogueo-p4` que siguen en Rust: salida del host, modo secure/run,
+//! `run_swarm_dump` y estado compartido entre requests de serve. Los ocho casos de
+//! comportamiento del lenguaje están en `tests/gaps_conformance.test.syn`.
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -16,38 +15,6 @@ use synsema_runtime::serve::run_serve_program;
 // =========================================================
 
 #[test]
-fn sandbox_denies_granted_capability() {
-    // `random` está concedido, pero DENTRO del sandbox debe estar denegado.
-    let r = run_source(
-        "require random\nsandbox\n    let x be random()\n",
-        "<t>",
-    );
-    assert!(!r.success, "el sandbox debería denegar random()");
-    assert!(
-        r.errors.iter().any(|e| e.contains("Capability not granted")),
-        "errs: {:?}",
-        r.errors
-    );
-}
-
-#[test]
-fn sandbox_restores_capabilities_after() {
-    // random() funciona afuera, el sandbox computa sin caps, y random() vuelve a
-    // funcionar DESPUÉS (las capabilities se restauran).
-    let r = run_source(
-        "require random\n\
-         print(text(random() >= 0))\n\
-         let c be 0\n\
-         sandbox\n    set c to 2 + 3\n\
-         print(text(c))\n\
-         print(text(random() >= 0))\n",
-        "<t>",
-    );
-    assert!(r.success, "{:?}", r.errors);
-    assert_eq!(r.output, vec!["true".to_string(), "5".to_string(), "true".to_string()]);
-}
-
-#[test]
 fn sandbox_print_is_denied_inside_and_sandbox_under_lets_it_through() {
     // v0.6.51 (N5): un `sandbox` pelado deniega toda capability, `stdout` también (antes `print`
     // pasaba); `sandbox under {}` deja pasar las del proceso dentro del techo del host.
@@ -57,33 +24,6 @@ fn sandbox_print_is_denied_inside_and_sandbox_under_lets_it_through() {
     let r = run_source("sandbox under {}\n    print(\"inside\")\n", "<t>");
     assert!(r.success, "{:?}", r.errors);
     assert_eq!(r.output, vec!["inside".to_string()]);
-}
-
-#[test]
-fn term_write_goes_through_the_stdout_gate_inside_a_sandbox() {
-    // v0.6.51 (ronda 1, B2): `term_write` escribe a stdout, como `print`: dentro de un `sandbox`
-    // pelado se niega antes de mirar el handle (un terminal abierto afuera no escribe adentro).
-    let r = run_source("sandbox\n    term_write(1, \"inside\")\n", "<t>");
-    assert!(!r.success);
-    assert!(r.errors.join("\n").contains("Capability not granted: stdout"), "{:?}", r.errors);
-    // Afuera, sin terminal abierto, el error es el del handle.
-    let r = run_source("term_write(1, \"x\")\n", "<t>");
-    assert!(r.errors.join("\n").contains("unknown or closed terminal handle"), "{:?}", r.errors);
-}
-
-#[test]
-fn sandbox_require_cannot_escape() {
-    // Un `require` dentro de un sandbox es no-op → no se puede re-grantear para escapar.
-    let r = run_source(
-        "sandbox\n    require random\n    let x be random()\n",
-        "<t>",
-    );
-    assert!(!r.success, "require no debería poder escapar del sandbox");
-    assert!(
-        r.errors.iter().any(|e| e.contains("Capability not granted")),
-        "errs: {:?}",
-        r.errors
-    );
 }
 
 // =========================================================
@@ -123,59 +63,13 @@ fn llm_op_autogranted_in_run() {
     assert_eq!(r.output, vec!["ok".to_string()]);
 }
 
-#[test]
-fn llm_op_denied_inside_sandbox() {
-    // El gate se COMPONE con el aislamiento del sandbox: aunque `llm` esté concedida
-    // afuera (auto-grant), dentro del sandbox el CapabilitySet se vacía → denegada.
-    let r = run_source(
-        "let e be generate \"outside\"\nsandbox\n    let f be generate \"inside\"\n",
-        "<t>",
-    );
-    assert!(!r.success, "el sandbox debería denegar la op LLM");
-    assert!(
-        r.errors.iter().any(|e| e.contains("Capability not granted: llm")),
-        "errs: {:?}",
-        r.errors
-    );
-}
-
 // =========================================================
 // when/then inline (gap #5) — devuelve el valor de la rama
 // =========================================================
 
-#[test]
-fn when_then_inline_returns_value() {
-    let r = run_source(
-        "let a be when 5 > 0 then \"pos\" otherwise \"neg\"\n\
-         let b be when 5 < 0 then \"pos\" otherwise \"neg\"\n\
-         print(a)\nprint(b)\n",
-        "<t>",
-    );
-    assert!(r.success, "{:?}", r.errors);
-    assert_eq!(r.output, vec!["pos".to_string(), "neg".to_string()]);
-}
-
-#[test]
-fn when_block_form_still_works() {
-    // Regresión: la forma de bloque (sin `then`) sigue funcionando.
-    let r = run_source("when 1 > 0\n    print(\"yes\")\n", "<t>");
-    assert!(r.success, "{:?}", r.errors);
-    assert_eq!(r.output, vec!["yes".to_string()]);
-}
-
 // =========================================================
 // checkpoint con expresión (gap #7) — parsea y corre (decorativo)
 // =========================================================
-
-#[test]
-fn checkpoint_accepts_expression() {
-    let r = run_source(
-        "let i be 3\ncheckpoint \"step_\" + text(i)\nprint(\"ok\")\n",
-        "<t>",
-    );
-    assert!(r.success, "checkpoint con expresión debería parsear y correr: {:?}", r.errors);
-    assert_eq!(r.output, vec!["ok".to_string()]);
-}
 
 // =========================================================
 // agentes ven tasks del top-level (gap #6)
