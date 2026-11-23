@@ -13,6 +13,7 @@
 
 mod agentauth_e2e;
 mod agentic_bus_e2e;
+mod agentic_ceiling_e2e;
 mod batch10_e2e;
 mod batch15_e2e;
 mod batch6_e2e;
@@ -62,13 +63,18 @@ mod v0629_audit;
 mod v0629_datos;
 mod v0629_language;
 mod v0630_audit;
+mod v0642_e2e;
 mod v0645_data_builtins_e2e;
 mod v0645_http_named_args_e2e;
 mod v0645_partial_write_e2e;
 mod v0645_select_reset_e2e;
+mod v0645_serve_exit_e2e;
 mod v0645_state_atomic_e2e;
 mod v0646_tanda_c;
 mod v0646_f1;
 mod v0651_run_scope_e2e;
+mod v0664_data;
+mod v0664_parallel;
+mod v0664_probe;
 mod webauth_e2e;
 mod webpush_e2e;

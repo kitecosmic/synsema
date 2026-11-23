@@ -1,0 +1,35 @@
+-- Piloto de v0.6.68 (migas §4): los tests de invariant_conformance.rs que migran con la
+-- misma fuerza. Los que afirman el mensaje decorado del host (`Runtime error: archivo:linea:col`)
+-- y los que miran el AST (`parse_source`/`summarize`) quedan en Rust (migas §1).
+-- Correr con: synsema test tests/invariant_conformance.test.syn
+
+test "described_invariant_passes_when_true"
+    let balance be 10
+    invariant "balance never negative": balance >= 0
+
+test "description_is_catchable_text_under_try_recover"
+    -- Atrapado con try/recover, el mensaje ligado no lleva categoría ni ubicación.
+    let caught be ""
+    let x be 0
+    try
+        invariant "x is positive": x > 0
+    recover e
+        set caught to e
+    assert_eq(caught, "Invariant violation: x is positive")
+
+task debit(balance, amount)
+    let after be balance - amount
+    invariant "no overdraft": after >= 0
+    give after
+
+test "description_inside_a_task_runs_per_call"
+    -- La descripción corre por llamada: la primera pasa (7), la segunda viola.
+    let first be debit(10, 3)
+    assert_eq(text(first), "7")
+    let ok be false
+    try
+        debit(1, 5)
+    recover e
+        set ok to true
+        assert_eq(e, "Invariant violation: no overdraft")
+    assert(ok)

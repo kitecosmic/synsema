@@ -1,0 +1,68 @@
+-- Gemelo de range_edges.rs (v0.6.68, migas §4): range(a, b, paso) cerca de los extremos de i64
+-- termina (el bug del vuelco en release), y la lista armada y el each dan lo mismo.
+-- IMPORTANTE (lección del lote 1): cada forma se prueba como LLAMADA directa, porque el camino
+-- bajo prueba es `each i in range(...)` (each_over_range), no el each sobre una lista de valores.
+-- Correr con: synsema test tests/range_edges.test.syn
+
+test "range_near_the_i64_edges_ends"
+    -- Subiendo hasta cerca de i64::MAX con un paso que pasaría del máximo.
+    let up be range(9223372036854775800, 9223372036854775807, 5)
+    assert_eq(up, [9223372036854775800, 9223372036854775805])
+    let seen_up be []
+    each i in range(9223372036854775800, 9223372036854775807, 5)
+        set seen_up to append(seen_up, i)
+    assert_eq(seen_up, [9223372036854775800, 9223372036854775805])
+    -- Bajando hasta cerca de i64::MIN.
+    let down be range(-9223372036854775800, -9223372036854775808, -5)
+    assert_eq(down, [-9223372036854775800, -9223372036854775805])
+    let seen_down be []
+    each i in range(-9223372036854775800, -9223372036854775808, -5)
+        set seen_down to append(seen_down, i)
+    assert_eq(seen_down, [-9223372036854775800, -9223372036854775805])
+
+test "range_forms_are_the_same_in_a_list_and_in_each"
+    let listed be range(5)
+    let seen be []
+    each i in range(5)
+        set seen to append(seen, i)
+    assert_eq(seen, listed)
+    set listed to range(0)
+    set seen to []
+    each i in range(0)
+        set seen to append(seen, i)
+    assert_eq(seen, listed)
+    set listed to range(-3)
+    set seen to []
+    each i in range(-3)
+        set seen to append(seen, i)
+    assert_eq(seen, listed)
+    set listed to range(2, 7)
+    set seen to []
+    each i in range(2, 7)
+        set seen to append(seen, i)
+    assert_eq(seen, listed)
+    set listed to range(7, 2)
+    set seen to []
+    each i in range(7, 2)
+        set seen to append(seen, i)
+    assert_eq(seen, listed)
+    set listed to range(0, 10, 3)
+    set seen to []
+    each i in range(0, 10, 3)
+        set seen to append(seen, i)
+    assert_eq(seen, listed)
+    set listed to range(10, 0, -3)
+    set seen to []
+    each i in range(10, 0, -3)
+        set seen to append(seen, i)
+    assert_eq(seen, listed)
+    set listed to range(0, 10, -1)
+    set seen to []
+    each i in range(0, 10, -1)
+        set seen to append(seen, i)
+    assert_eq(seen, listed)
+    set listed to range(5, 5, 1)
+    set seen to []
+    each i in range(5, 5, 1)
+        set seen to append(seen, i)
+    assert_eq(seen, listed)
