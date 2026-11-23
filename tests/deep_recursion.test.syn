@@ -1,0 +1,20 @@
+-- Gemelo de deep_recursion.rs (v0.6.68, migas §4): una recursión cerca del tope
+-- (MAX_RECURSION = 3000) funciona y pasarlo da el error atrapable, no un desborde de pila.
+-- Bajo `synsema test` el programa corre en el hilo del corredor (512 MB con guardian):
+-- no depende de RUST_MIN_STACK del harness de cargo. Los otros dos tests del .rs miran
+-- hilos del host (`enter_thread`, stack_size) y quedan en Rust.
+-- Correr con: synsema test tests/deep_recursion.test.syn
+
+test "recursion_near_the_cap_works_and_past_it_is_an_error"
+    task f(n)
+        when n == 0
+            give 0
+        give f(n - 1) + 1
+    assert_eq(f(2900), 2900)
+    let ok be false
+    try
+        f(3500)
+    recover e
+        set ok to true
+        assert(contains(e, "maximum recursion depth exceeded"))
+    assert(ok)

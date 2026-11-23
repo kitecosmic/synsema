@@ -1,0 +1,84 @@
+-- Gemelo de batch6_e2e.rs (v0.6.68, migas §4): Fix 2 (canales por job_id con nombres dinámicos)
+-- y Fix 3 (try/recover sin raise → el agente termina DONE), observados desde el lenguaje con
+-- `observe`/`agents()` y esperados con `wait_for` (vuelve cuando no queda ningún agente activo,
+-- el espejo del `wait_all` del host).
+-- QUEDAN en Rust: spawn_from_route_returns_200 y spawn_from_route_multiple_agents (serve/sockets
+-- reales desde el host) y agent_with_raise_ends_in_error (bajo `synsema test` un agente en ERROR
+-- hace fallar el bloque por diseño; el test afirma justamente que el agente termina en ERROR).
+-- Correr con: synsema test tests/batch6_e2e.test.syn
+
+agent Waiter
+    wait_for "go:" + text(id)
+    share "woke" as "woke:" + text(id)
+
+agent Worker
+    signal "go:" + text(id)
+
+agent Sender
+    signal "ch:" + text(1) with "payload"
+
+agent Receiver
+    wait_for "ch:" + text(1) as got
+    share got as "received"
+
+agent ReadySender
+    signal "ready"
+
+agent ReadyReceiver
+    wait_for "ready"
+    share "received" as "status"
+
+agent Safe
+    try
+        let x be (1 / 0)
+    recover err
+        share "caught" as "status"
+
+task wait_for_quiescence()
+    -- Nadie emite jamás `__quiesce__`: wait_for sale apenas no queda ningún agente
+    -- STARTING/WORKING/WAITING (productor vivo) — el `wait_all` del host desde el lenguaje.
+    wait_for "__quiesce__"
+
+task no_agent_in_error()
+    let saw_error be false
+    each a in agents()
+        when a.state == "error"
+            set saw_error to true
+    assert(not saw_error)
+
+test "dynamic_channels_route_by_job_id"
+    -- Cada Waiter espera SU canal `go:<id>`; cada Worker señaliza `go:<id>`. Ambos pares
+    -- completan vía su propio canal → los nombres dinámicos enrutan por job_id.
+    spawn Waiter with id = 1
+    spawn Waiter with id = 2
+    spawn Worker with id = 1
+    spawn Worker with id = 2
+    wait_for_quiescence()
+    observe "woke:1" as w1
+    observe "woke:2" as w2
+    assert_eq(w1, "woke")
+    assert_eq(w2, "woke")
+
+test "dynamic_signal_with_clause_and_data"
+    -- `signal <expr> with <data>` — el `with` no se traga la expresión; el dato viaja.
+    spawn Receiver
+    spawn Sender
+    wait_for_quiescence()
+    observe "received" as observed
+    assert_eq(observed, "payload")
+
+test "literal_channels_still_work_regression"
+    -- Regresión G1: signal/wait_for con literal siguen funcionando.
+    spawn ReadyReceiver
+    spawn ReadySender
+    wait_for_quiescence()
+    observe "status" as st
+    assert_eq(st, "received")
+
+test "agent_without_raise_ends_done"
+    -- Contraste: try/recover SIN raise → el error se traga → el agente termina DONE.
+    spawn Safe
+    wait_for_quiescence()
+    no_agent_in_error()
+    observe "status" as st
+    assert_eq(st, "caught")

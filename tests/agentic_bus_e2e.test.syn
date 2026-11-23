@@ -1,0 +1,61 @@
+-- Gemelo de agentic_bus_e2e.rs (v0.6.68, migas §4): el bus de eventos es UNO por programa,
+-- se mire desde donde se mire — intérprete principal, worker de `parallel_map`, tick de cron
+-- y agente `spawn`eado publican y suscriben contra el mismo bus. Un loop de agente escrito
+-- como task usa exactamente las mismas primitivas.
+-- Correr con: synsema test tests/agentic_bus_e2e.test.syn
+
+require time
+
+test "bus_works_without_a_swarm_too"
+    -- sin swarm real, pero el bus existe in-process.
+    let sub be bus_subscribe("t")
+    bus_publish("t", 1)
+    assert_eq(bus_recv(sub, 1)["data"], 1)
+
+task ping(n)
+    bus_publish("work.done", n)
+    give n * 2
+
+test "parallel_map_workers_publish_on_the_program_bus"
+    let sub be bus_subscribe("work.*")
+    let results be parallel_map(ping, [1, 2, 3])
+    assert_eq(length(results), 3)
+    let seen be 0
+    while seen < 3
+        let ev be bus_recv(sub, 5)
+        when ev == nothing
+            stop
+        set seen to seen + 1
+    assert_eq(seen, 3)
+
+task tick()
+    bus_publish("cron.tick", now())
+
+test "cron_ticks_in_run_mode_publish_on_the_program_bus"
+    let sub be bus_subscribe("cron.tick")
+    cron_every(0.2, tick)
+    let ev be bus_recv(sub, 5)
+    assert_eq(when ev == nothing then "missed" otherwise ev["topic"], "cron.tick")
+    cron_cancel("tick")
+
+agent Feeder
+    sleep(0.1)
+    bus_publish("jobs", 21)
+    bus_publish("jobs", "quit")
+
+task worker_loop()
+    let jobs be bus_subscribe("jobs")
+    let done be 0
+    while true
+        let ev be select({"jobs": jobs}, 5)
+        when ev == nothing
+            stop
+        when ev["data"] == "quit"
+            stop
+        set done to done + ev["data"] * 2
+    give done
+
+test "a_task_shaped_agent_loop_uses_select_and_the_bus_like_any_code"
+    -- El `spawn`eado real sólo alimenta el loop: mismas primitivas, sin privilegios especiales.
+    spawn Feeder
+    assert_eq(worker_loop(), 42)

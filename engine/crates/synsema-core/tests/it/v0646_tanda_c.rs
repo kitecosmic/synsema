@@ -17,7 +17,16 @@ fn error_of(source: &str) -> String {
     r.errors.join("\n")
 }
 
-/// C1: un array se enumera por su primer eje, como `length(a)` y `a[i]`.
+/// C5: `discovery off` es una cláusula del `serve`; otra palabra después de `discovery` es un error
+/// que dice la forma, y el mensaje de cláusula desconocida la lista.
+#[test]
+fn c5_discovery_takes_only_off() {
+    let e = error_of("require serve(8080)\nserve on 8080\n    discovery on\n");
+    assert!(e.contains("Expected 'off' after 'discovery' (discovery off)"), "{}", e);
+    let e = error_of("require serve(8080)\nserve on 8080\n    discovry off\n");
+    assert!(e.contains("'discovery off'"), "{}", e);
+}
+
 /// Un intérprete con un `read_file` de mentira: una fuente del linaje que siempre trae "x".
 fn with_fake_reads() -> synsema_core::interpreter::Interpreter {
     let i = synsema_core::interpreter::Interpreter::new();

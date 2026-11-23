@@ -1,0 +1,69 @@
+-- Gemelo de serve_frontend_e2e.rs (runtime) (v0.6.68, migas §4): el motor de templates.
+-- Los 3 tests de serve real quedan en Rust: levantan sockets/TcpListener, hilos y tiempos del
+-- host. Los fixtures viven en tests/fixtures/tpl/ (el Rust los lee del CWD del crate; acá, del
+-- CWD de la corrida). El archivo es CRLF a propósito: lexer_crlf_blank_line_in_block ejercita
+-- una línea en blanco CRLF dentro de un bloque indentado (bug de Windows); en LF el gemelo no
+-- vería el camino. Correr con: synsema test tests/serve_frontend_e2e.test.syn
+
+require file.read("tests/fixtures/tpl/*")
+
+-- task con línea en blanco CRLF dentro del bloque indentado (el Rust lo pasaba como string
+-- con \r\n embebidos; acá el archivo entero es CRLF y el cuerpo la ejercita igual).
+task f()
+    let a be 1
+
+    give a
+
+test "template_features_render"
+    let items be ["a", "b</script>"]
+    let out be body of render("tests/fixtures/tpl/feat.html", {"n": 2, "items": items, "vacio": []})
+    -- comentario no aparece
+    assert(contains(out, "comentario: no debe aparecer") == false)
+    -- verbatim: CSS con llaves, intacto
+    assert(contains(out, "body { margin: 0; }"))
+    assert(contains(out, ".card:hover { transform: translateY(-4px); }"))
+    -- elif encadenado
+    assert(contains(out, "dos"))
+    assert(contains(out, "uno") == false and contains(out, "otro") == false)
+    -- enumerate con índice + escape del item
+    assert(contains(out, "[0:a][1:b&lt;/script&gt;]"))
+    assert(contains(out, "SIN-ITEMS") == false)
+    -- rama vacía del each
+    assert(contains(out, "VACIO"))
+    -- include con props (aislados)
+    assert(contains(out, "<article>Props</article>"))
+    -- json_for_script: el </script> del dato NO puede cerrar el tag
+    assert(contains(out, "b\\u003c/script\\u003e"))
+    assert(contains(out, "window.__D__ = [\"a\", \"b</script>") == false)
+
+test "template_named_slots"
+    let out be body of render("tests/fixtures/tpl/page_fill.html", {"title": "Hola"})
+    assert(contains(out, "<head><meta name=\"x\" content=\"Hola\"></head>"))
+    assert(contains(out, "<h1>Hola</h1>"))
+
+test "template_each_non_list_fails_loud"
+    let ok be false
+    try
+        let b be body of render("tests/fixtures/tpl/badeach.html", {"numero": 7})
+    recover e
+        set ok to true
+        assert(contains(e, "Cannot iterate over"))
+    assert(ok)
+
+test "json_for_script_escapes_html_chars"
+    let obj be json_for_script({"x": "</script><b>&"})
+    let arr be json_for_script([1, 2])
+    assert_eq(arr, "[1, 2]")
+    assert(contains(obj, "\\u003c/script\\u003e"))
+    assert(contains(obj, "\\u0026"))
+    assert(contains(obj, "<") == false and contains(obj, ">") == false)
+
+test "enumerate_builtin"
+    let acc be []
+    each e in enumerate(["x", "y"])
+        set acc to append(acc, text(e.index) + "-" + e.item)
+    set acc to append(acc, text(length(enumerate([]))))
+    assert_eq(acc, ["0-x", "1-y", "0"])
+
+test "lexer_crlf_blank_line_in_block"
+    assert_eq(f(), 1)

@@ -1,0 +1,373 @@
+-- Conformidad directa del intérprete. Los tests que verifican el formato de errores del host,
+-- parseo del archivo, salida de log o semántica de run_source permanecen en Rust.
+
+test "arithmetic"
+    assert_eq(2 + 3, 5)
+    assert_eq(10 - 4, 6)
+    assert_eq(3 * 7, 21)
+    assert_eq(text(15 / 3), "5.0")
+    assert_eq(2 ** 10, 1024)
+    assert_eq(17 % 5, 2)
+
+test "string_concatenation"
+    assert_eq("hello" + " " + "world", "hello world")
+
+test "comparison"
+    assert_eq(5 > 3, true)
+    assert_eq(5 < 3, false)
+    assert_eq(5 == 5, true)
+    assert_eq(5 != 3, true)
+
+test "let_binding"
+    let x be 42
+    assert_eq(x, 42)
+
+test "set_mutation"
+    let x be 1
+    set x to 2
+    assert_eq(x, 2)
+
+test "when_otherwise"
+    let x be 10
+    let result be ""
+    when x > 5
+        set result to "big"
+    otherwise
+        set result to "small"
+    assert_eq(result, "big")
+
+test "when_otherwise_when"
+    let x be 5
+    let result be ""
+    when x > 10
+        set result to "big"
+    otherwise when x > 3
+        set result to "medium"
+    otherwise
+        set result to "small"
+    assert_eq(result, "medium")
+
+test "each_loop"
+    let seen be []
+    each i in [1, 2, 3]
+        set seen to append(seen, i)
+    assert_eq(seen, [1, 2, 3])
+
+test "while_loop"
+    let i be 0
+    let seen be []
+    while i < 3
+        set seen to append(seen, i)
+        set i to i + 1
+    assert_eq(seen, [0, 1, 2])
+
+test "match_statement"
+    let x be "b"
+    let result be ""
+    match x
+        is "a"
+            set result to "alpha"
+        is "b"
+            set result to "beta"
+        is "c"
+            set result to "gamma"
+    assert_eq(result, "beta")
+
+test "task_definition_and_call"
+    task add(a, b)
+        give a + b
+    assert_eq(add(3, 4), 7)
+
+test "task_recursion"
+    task factorial(n)
+        when n <= 1
+            give 1
+        otherwise
+            give n * factorial(n - 1)
+    assert_eq(factorial(5), 120)
+
+test "task_closure"
+    task make_adder(n)
+        task adder(x)
+            give x + n
+        give adder
+    let add5 be make_adder(5)
+    assert_eq(add5(10), 15)
+
+test "list_operations"
+    let lst be [1, 2, 3]
+    assert_eq(length(lst), 3)
+    let lst2 be append(lst, 4)
+    assert_eq(length(lst2), 4)
+
+test "map_operations"
+    let m be {"name": "Alice", "age": 30}
+    assert_eq(name of m, "Alice")
+    assert_eq(age of m, 30)
+
+test "pipe_operator"
+    task double(x)
+        give x * 2
+    task inc(x)
+        give x + 1
+    assert_eq(5 |> double |> inc, 11)
+
+test "type_definition"
+    type Point
+        x: number
+        y: number
+    let p be Point(3, 4)
+    assert_eq(x of p, 3)
+    assert_eq(y of p, 4)
+
+test "share_observe"
+    let data be "shared_value"
+    share data as "core_shared_value"
+    observe "core_shared_value" as retrieved
+    assert_eq(retrieved, "shared_value")
+
+test "undefined_variable"
+    assert_error(() => undefined_var)
+
+test "division_by_zero"
+    assert_error(() => 1 / 0)
+
+test "invariant_violation"
+    let x be -1
+    let ok be false
+    try
+        invariant: x > 0
+    recover e
+        set ok to true
+    assert(ok)
+
+test "invariant_pass"
+    let x be 10
+    invariant: x > 0
+
+test "builtin_range"
+    let seen be []
+    each i in range(3)
+        set seen to append(seen, i)
+    assert_eq(seen, [0, 1, 2])
+
+test "builtin_contains"
+    assert_eq(contains([1, 2, 3], 2), true)
+    assert_eq(contains("hello", "ell"), true)
+
+test "builtin_split_join"
+    assert_eq(length(split("a,b,c", ",")), 3)
+    assert_eq(join(["a", "b", "c"], "-"), "a-b-c")
+    assert_eq(join([1, -22, 9223372036854775807, -9223372036854775807 - 1, 10 ** 30], ","), "1,-22,9223372036854775807,-9223372036854775808,1000000000000000000000000000000")
+    assert_eq(join([1.5, 0.1 + 0.2, 2.0, 1.50d, true, false], " | "), "1.5 | 0.30000000000000004 | 2.0 | 1.50 | true | false")
+    assert_eq(join(["ñandú", "日本", "a"], "→"), "ñandú→日本→a")
+    assert_eq(join([], "-"), "")
+    assert_eq(join([7], "-"), "7")
+    assert_eq(join(["a", 1, "b"], ""), "a1b")
+
+test "builtin_type_of"
+    assert_eq(type_of(42), "number")
+    assert_eq(type_of("hi"), "text")
+    assert_eq(type_of([1]), "list")
+
+test "regex_matches"
+    assert_eq(matches("12345", "[0-9]+"), true)
+    assert_eq(matches("hello 5 world", "[0-9]+"), false)
+    assert_eq(matches("a@b.com", "[^@ ]+@[^@ ]+\\.[^@ ]+"), true)
+    assert_eq(matches("junk a@b.com junk", "[^@ ]+@[^@ ]+\\.[^@ ]+"), false)
+    assert_eq(matches("a@b.com", "^[^@]+@[^@]+\\.[^@]+$"), true)
+    assert_eq(matches("not-an-email", "^[^@]+@[^@]+\\.[^@]+$"), false)
+
+test "regex_find_all"
+    assert_eq(find_all("a1b2", "[0-9]"), ["1", "2"])
+    assert_eq(length(find_all("a1b2c3", "[0-9]")), 3)
+    assert_eq(find_all("ab12cd34", "[a-z]+[0-9]+"), ["ab12", "cd34"])
+
+test "regex_capture"
+    assert_eq(capture("hello world", "w[a-z]+"), "world")
+    assert_eq(capture("2026-06-19", "([0-9]+)-([0-9]+)-([0-9]+)"), ["2026", "06", "19"])
+    assert_eq(capture("zzz", "q+"), nothing)
+
+test "regex_replace_re"
+    assert_eq(replace_re("foo123bar", "[0-9]+", "#"), "foo#bar")
+    assert_eq(replace_re("John Smith", "(\\w+) (\\w+)", "\\2 \\1"), "Smith John")
+
+test "regex_invalid_pattern_errors"
+    let ok be false
+    try
+        matches("x", "[unterminated")
+    recover e
+        set ok to true
+        assert(contains(e, "invalid regex"))
+    assert(ok)
+
+test "soft_keywords_as_variables"
+    let route be "/x"
+    let auth be "tok"
+    let on be true
+    let expect be 5
+    let serve be 9
+    let requires be "yes"
+    let send be 1
+    let stream be 2
+    let static be 1
+    let from be 3
+    assert_eq([route, auth, on, expect, serve, requires, send, stream, static, from], ["/x", "tok", true, 5, 9, "yes", 1, 2, 1, 3])
+
+test "soft_keyword_auth_as_task_name"
+    task auth(x)
+        give x
+    assert_eq(auth(7), 7)
+
+test "soft_keyword_as_property_key"
+    let m be {"auth": 1, "route": 2}
+    assert_eq(m.auth, 1)
+    assert_eq(m.route, 2)
+
+test "bigint_factorial"
+    task fact(n)
+        when n <= 1
+            give 1
+        otherwise
+            give n * fact(n - 1)
+    assert_eq(text(fact(25)), "15511210043330985984000000")
+
+test "bigint_power"
+    assert_eq(text(2 ** 100), "1267650600228229401496703205376")
+
+test "float_repr_vectors"
+    assert_eq(text(15 / 3), "5.0")
+    assert_eq(text(0.1 + 0.2), "0.30000000000000004")
+    assert_eq(text(1 / 3), "0.3333333333333333")
+    assert_eq(text(2.0 ** 100), "1.2676506002282294e+30")
+    assert_eq(text(1.0), "1.0")
+    assert_eq(text(100.0), "100.0")
+    assert_eq(text(0.0001), "0.0001")
+    assert_eq(text(0.00001), "1e-05")
+    assert_eq(text(10000000000000000.0), "1e+16")
+    assert_eq(text(100000000000000000.0), "1e+17")
+    assert_eq(text(0.0000001), "1e-07")
+    assert_eq(text(2 ** -1), "0.5")
+
+test "equality_scalars"
+    assert_eq([1 == 1, 1 == 1.0, 1 == 2, "a" == "a", true == true, true == 1, 1 == "1", nothing == nothing], [true, true, false, true, true, true, false, true])
+
+test "equality_collections"
+    assert_eq([1, 2] == [1, 2], true)
+    assert_eq([1, 2] == [1, 2, 3], false)
+    assert_eq([[1], [2]] == [[1], [2]], true)
+    assert_eq({"a": 1, "b": 2} == {"a": 1, "b": 2}, true)
+    assert_eq({"a": 1, "b": 2} == {"b": 2, "a": 1}, true)
+    assert_eq({"a": 1} == {"a": 2}, false)
+
+test "zero_errors"
+    let ok be false
+    try
+        1 / 0
+    recover e
+        set ok to true
+        assert(contains(e, "Division by zero"))
+    assert(ok)
+    set ok to false
+    try
+        5 % 0
+    recover e
+        set ok to true
+        assert(contains(e, "Modulo by zero"))
+    assert(ok)
+    set ok to false
+    try
+        0 ** -1
+    recover e
+        set ok to true
+        assert(contains(e, "Zero cannot be raised to a negative power"))
+    assert(ok)
+
+test "fold_strips_accents_and_lowercases"
+    assert_eq(fold("Continúa"), "continua")
+    assert_eq(fold("ÁÉÍÓÚñ"), "aeioun")
+    assert_eq(contains(fold("Está aquí"), "esta"), true)
+    assert_eq(fold("Hello World 123"), "hello world 123")
+
+test "math_rounding_builtins"
+    assert_eq(text(floor(3.7)), "3")
+    assert_eq(text(floor(-3.7)), "-4")
+    assert_eq(text(floor(3.0)), "3")
+    assert_eq(text(ceil(3.2)), "4")
+    assert_eq(text(ceil(-3.2)), "-3")
+    assert_eq(text(ceil(0.1)), "1")
+    assert_eq(text(trunc(3.7)), "3")
+    assert_eq(text(trunc(-3.7)), "-3")
+    assert_eq(text(trunc(-0.9)), "0")
+    assert_eq(text(round(0.5)), "0")
+    assert_eq(text(round(1.5)), "2")
+    assert_eq(text(round(2.5)), "2")
+    assert_eq(text(round(3.5)), "4")
+    assert_eq(text(round(-2.5)), "-2")
+    assert_eq(text(round(2.4)), "2")
+    assert_eq(text(round(2.6)), "3")
+    assert_eq(text(floor(9.99)), "9")
+    assert_eq(text(floor(42)), "42")
+    assert_eq(text(round(-7)), "-7")
+    assert_eq(text(ceil(1000000000000)), "1000000000000")
+    let floor_failed be false
+    try
+        floor("x")
+    recover e
+        set floor_failed to true
+        assert(contains(e, "expects a number"))
+    assert(floor_failed)
+    let round_failed be false
+    try
+        round(true)
+    recover e
+        set round_failed to true
+        assert(contains(e, "expects a number"))
+    assert(round_failed)
+
+test "raise_statement_actually_raises"
+    task boom()
+        raise "explota"
+    let caught be ""
+    try
+        boom()
+    recover err
+        set caught to "atrapado: " + err
+    assert_eq(caught, "atrapado: explota")
+    let reraised be ""
+    try
+        try
+            boom()
+        recover e1
+            raise e1
+    recover e2
+        set reraised to e2
+    assert_eq(reraised, "explota")
+    task uncaught()
+        raise "boom"
+        give "no debe llegar"
+    assert_error(uncaught)
+
+test "and_or_short_circuit_and_always_yield_bool"
+    let m be {"a": 1}
+    assert_eq(contains(m, "b") and m["b"] == 1, false)
+    assert_eq(contains(m, "a") and m["a"] == 1, true)
+    assert_eq(contains(m, "a") or m["zz"] == 1, true)
+    assert_eq(1 and 0, false)
+    assert_eq(0 or 2, true)
+    assert_eq(false and m["nope"], false)
+    assert_eq(true or m["nope"], true)
+    let and_failed be false
+    try
+        true and m["b"]
+    recover e
+        set and_failed to true
+        assert(contains(e, "no key"))
+    assert(and_failed)
+    let or_failed be false
+    try
+        false or m["b"]
+    recover e
+        set or_failed to true
+        assert(contains(e, "no key"))
+    assert(or_failed)

@@ -1,0 +1,266 @@
+-- Gemelo de v0630_audit.rs (v0.6.68, migas §4): los pendientes de la auditoría de v0.6.29 que se
+-- afirman sobre VALORES y sobre el cuerpo de errores capturables con try/recover. Quedan en Rust
+-- los que miran el host: avisos de `check` (c1/c8/c9), snippets que no parsean (c3/c3b), el
+-- prefijo decorado archivo:línea en el mensaje (c4), serve real (a6), el fixture Parquet por
+-- CARGO_MANIFEST_DIR (a7), el reloj (b1) y el módulo multi-archivo en temp (c10).
+-- Correr con: synsema test tests/v0630_audit.test.syn
+
+require time
+
+task expect_error(f, needle)
+    let ok be false
+    try
+        f()
+    recover e
+        set ok to true
+        assert(contains(e, needle))
+    assert(ok)
+
+-- cron corre la task por nombre desde el top level del programa (igual que el .rs).
+task a()
+    print("a")
+
+-- A1 — `%Z` al parsear: una abreviatura no identifica una zona (IST es India, Irlanda o
+-- Israel). Es un error, salvo UTC/GMT, que no son ambiguas.
+test "a1_parse_datetime_zone_abbreviation_is_an_error"
+    let ok be false
+    try
+        parse_datetime("24/09/2026 10:00 IST", "%d/%m/%Y %H:%M %Z")
+    recover e
+        set ok to true
+        assert(contains(e, "does not identify a zone"))
+        assert(contains(e, "%z"))
+    assert(ok)
+    let ok2 be false
+    try
+        parse_datetime("24/09/2026 10:00 IST", "%d/%m/%Y %H:%M %Z", "Asia/Kolkata")
+    recover e
+        set ok2 to true
+        assert(contains(e, "%Z"))
+    assert(ok2)
+    assert_eq(text(parse_datetime("24/09/2026 10:00 UTC", "%d/%m/%Y %H:%M %Z")), "2026-09-24T10:00:00Z")
+    assert_eq(text(parse_datetime("Thu, 24 Sep 2026 10:00:00 GMT", "%a, %d %b %Y %H:%M:%S %Z", "-03:00")), "2026-09-24T07:00:00-03:00")
+    assert_eq(text(parse_datetime("24/09/2026 10:00 +05:30", "%d/%m/%Y %H:%M %z")), "2026-09-24T10:00:00+05:30")
+    assert_eq(text(parse_datetime("2026-09-24 10:00 %Z", "%Y-%m-%d %H:%M %%Z")), "2026-09-24T10:00:00Z")
+
+-- A2 — `nothing` (faltante) no es NaN (inválido): un coeficiente faltante es un error; un x
+-- faltante queda `nothing` en su lugar, como en `cumsum`.
+test "a2_polyval_keeps_missing_apart_from_nan"
+    let ok be false
+    try
+        polyval([2.0, nothing], 1)
+    recover e
+        set ok to true
+        assert(contains(e, "position 1 is nothing"))
+        assert(contains(e, "drop_missing"))
+    assert(ok)
+    assert_eq(text(polyval([2.0, 1.0], [1, nothing, 3])), "[3.0, nothing, 7.0]")
+    assert_eq(text(polyval([2.0, 1.0], nothing)), "nothing")
+    assert_eq(text(cumsum([1, nothing, 3])), "[1, nothing, 4]")
+    assert_eq(text(polyval([1, 0, -1], 3)), "8.0")
+    let ok2 be false
+    try
+        lstsq(array([[1.0], [2.0]]), [1.0, nothing])
+    recover e
+        set ok2 to true
+        assert(contains(e, "nothing"))
+    assert(ok2)
+    -- polyfit sigue salteando los pares con un faltante.
+    assert_eq(text(apply(polyfit([0, 1, nothing, 3], [1, 3, 99, 7], 1), (c) => round_to(c, 6))), "[2.0, 1.0]")
+
+-- A3 — un array 0-D es un escalar: no tiene largo.
+test "a3_length_of_0d_array_is_an_error"
+    let ok be false
+    try
+        length(array(5))
+    recover e
+        set ok to true
+        assert(contains(e, "0-d array has no length"))
+        assert(contains(e, "size(a)"))
+    assert(ok)
+    assert_eq(text(size(array(5))), "1")
+    assert_eq(text(shape(array(5))), "[]")
+    assert_eq(text(length(array([1, 2]))), "2")
+    assert_eq(text(length(zeros([3, 2]))), "3")
+
+-- A4 — un task o un generador no es un dato: json_encode lo rechaza nombrando dónde está,
+-- y canonical_json usa el sustantivo correcto.
+test "a4_json_encode_rejects_code"
+    expect_error(() => json_encode(rng(1)), "json_encode: the value is a generator")
+    expect_error(() => json_encode({"f": (x) => x}), "json_encode: the value[\"f\"] is a task")
+    expect_error(() => json_encode([1, {"g": [rng(2)]}]), "the value[1][\"g\"][0] is a generator")
+    expect_error(() => jsonl_encode([{"a": 1}, {"f": print}]), "jsonl_encode: item 1[\"f\"] is a task")
+    expect_error(() => json_for_script({"f": print}), "json_for_script")
+    expect_error(() => canonical_json(rng(1)), "canonical_json: the value is a generator")
+    expect_error(() => canonical_json({"f": (x) => x}), "the value.f is a task")
+    assert_eq(text(json_encode({"a": [1, nothing, "x"]})), "{\"a\": [1, null, \"x\"]}")
+
+-- A5 — `int(x, 2.0)` es el mismo tropiezo que `int(x, 2)`.
+test "a5_int_fallback_float_base_like_int"
+    let ok be false
+    try
+        int("abc", 2.0)
+    recover e
+        set ok to true
+        assert(contains(e, "the second argument is the fallback value, not the base"))
+        assert(contains(e, "int(x, base = 2)"))
+    assert(ok)
+    expect_error(() => int("abc", 16.0), "the second argument is the fallback value, not the base")
+    expect_error(() => int("abc", 2), "the second argument is the fallback value, not the base")
+    assert_eq(text(int("abc", 2.5)), "2.5")
+    assert_eq(text(int("abc", 40.0)), "40.0")
+    assert_eq(text(int("abc", fallback = 2.0)), "2.0")
+    assert_eq(text(int("7", 2.0 + 0.5)), "7")
+
+-- A1 (segunda vuelta) — `%Z`: UTC/GMT en cualquier caja (como Python); con `%z` en el mismo
+-- formato el offset identifica el instante y la abreviatura es texto; y si lo que no encaja es
+-- otra cosa, el error es el de siempre, no el de la abreviatura.
+test "a1b_parse_datetime_zone_abbreviation_edges"
+    assert_eq(text(parse_datetime("24/09/2026 10:00 utc", "%d/%m/%Y %H:%M %Z")), "2026-09-24T10:00:00Z")
+    assert_eq(text(parse_datetime("24/09/2026 10:00 +0530 (IST)", "%d/%m/%Y %H:%M %z %Z")), "2026-09-24T10:00:00+05:30")
+    assert_eq(text(parse_datetime("2026-09-24 GMT", "%Y-%m-%d %Z")), "2026-09-24T00:00:00Z")
+    let ok be false
+    try
+        parse_datetime("2026-13-24 10:00 UTC", "%Y-%m-%d %H:%M %Z")
+    recover e
+        set ok to true
+        assert(contains(e, "does not match"))
+        assert(not contains(e, "abbreviation"))
+    assert(ok)
+
+-- Un formato de sólo fecha es la medianoche de ese día (como `strptime` de Python y
+-- `parse_time`); con zona, la medianoche de esa zona.
+test "parse_datetime_date_only_format_is_midnight"
+    assert_eq(text(parse_datetime("03/01/2026", "%d/%m/%Y")), "2026-01-03T00:00:00Z")
+    assert_eq(text(parse_datetime("03/01/2026", "%d/%m/%Y", "Europe/Madrid")), "2026-01-03T00:00:00+01:00[Europe/Madrid]")
+
+-- C2 — el error nombra la función que el programa llamó, no la nueva.
+test "c2_old_blockchain_names_speak_for_themselves"
+    let ok be false
+    try
+        solana_message(1, 2)
+    recover e
+        set ok to true
+        assert(contains(e, "solana_message(params) takes 1 argument"))
+        assert(not contains(e, "since v0.6.29"))
+    assert(ok)
+    let ok2 be false
+    try
+        algorand_tx_encode({}, 1)
+    recover e
+        set ok2 to true
+        assert(contains(e, "algorand_tx_encode(txn) takes 1 argument"))
+        assert(not contains(e, "since v0.6.29"))
+    assert(ok2)
+    expect_error(() => solana_tx(1, 2), "since v0.6.29 solana_tx builds")
+
+-- C5 — `bytes(33)` sugiere las dos formas.
+test "c5_bytes_of_number_hints"
+    let ok be false
+    try
+        bytes(33)
+    recover e
+        set ok to true
+        assert(contains(e, "int_to_bytes(33, size)"))
+        assert(contains(e, "bytes([33])"))
+    assert(ok)
+    let ok2 be false
+    try
+        bytes(300)
+    recover e
+        set ok2 to true
+        assert(not contains(e, "bytes([300])"))
+    assert(ok2)
+
+-- C6 — `Infinityx` y `NaNa` son basura, no un NaN.
+test "c6_json_garbage_is_not_nan"
+    expect_error(() => json_decode("Infinityx"), "invalid JSON: expected value at line 1")
+    expect_error(() => json_decode("NaNa"), "invalid JSON: expected value at line 1")
+    expect_error(() => json_decode("[1, NaN_x]"), "invalid JSON: expected value at line 1")
+    let ok be false
+    try
+        json_decode("Infinityx")
+    recover e
+        set ok to true
+        assert(not contains(e, "NaN/Infinity"))
+    assert(ok)
+    expect_error(() => json_decode("NaN"), "NaN/Infinity is not JSON")
+    expect_error(() => json_decode("[Infinity]"), "NaN/Infinity is not JSON")
+    assert_eq(text(json_decode("[NaN]", allow_nan = true)), "[nan]")
+
+-- C7 — `%#z` sólo existe para parsear.
+test "c7_format_time_parse_only_specifier"
+    let ok be false
+    try
+        format_time(datetime(2026, 1, 1), "%#z")
+    recover e
+        set ok to true
+        assert(contains(e, "%#z is a parsing-only specifier"))
+        assert(contains(e, "%:z"))
+    assert(ok)
+    assert_eq(text(format_time(datetime(2026, 1, 1), "%%#z %:z")), "%#z +00:00")
+
+-- D1 — cron con zona IANA: se registra, `cron_list` muestra la zona y el próximo disparo es
+-- el de esa zona (la regla de los cambios de hora está en los tests de `cronexpr`).
+test "d1_cron_every_with_an_iana_zone"
+    cron_every("0 9 * * *", a, {"tz": "America/Santiago"})
+    let j be cron_list()[0]
+    assert_eq(j.tz, "America/Santiago")
+    let next be to_timezone(datetime(j.next_run), "America/Santiago")
+    assert_eq(text(format_time(next, "%H:%M")), "09:00")
+    cron_cancel("a")
+    expect_error(() => cron_every("0 9 * * *", a, {"tz": "Mars/Olympus"}), "unknown time zone \"Mars/Olympus\"")
+
+-- D2 — un decimal con exponente es el valor exacto (mantisa × 10^exp), como `numeric` de
+-- Postgres: `decimal()`, las columnas `decimal` de CSV y el literal `…d` van por el mismo camino.
+test "d2_decimal_accepts_an_exponent"
+    assert_eq(text(decimal("1e5")), "100000")
+    assert_eq(text(decimal("1.5E-3")), "0.0015")
+    assert_eq(text(decimal("1.50e1")), "15.0")
+    assert_eq(text(decimal("-2.5e+2")), "-250")
+    assert_eq(text(decimal(".5e1")), "5")
+    assert_eq(text(1.5e-3d), "0.0015")
+    assert_eq(text(2e3d), "2000")
+    assert_eq(decimal("1.5e-3") == decimal("0.0015"), true)
+    assert_eq(text(csv_parse("a\n1.5e2\n", {"types": {"a": "decimal"}})), "[{a: 150}]")
+    -- Un exponente que pediría más de 4300 dígitos es un error, no memoria sin tope.
+    expect_error(() => decimal("1e999999999"), "Cannot parse")
+    expect_error(() => decimal("1e4300"), "Cannot parse")
+    expect_error(() => decimal("1e-4301"), "Cannot parse")
+    expect_error(() => decimal("e5"), "Cannot parse")
+    expect_error(() => decimal("1e"), "Cannot parse")
+    expect_error(() => decimal("1e5.5"), "Cannot parse")
+    expect_error(() => decimal("1e+"), "Cannot parse")
+
+-- Parquet — el esquema Arrow va en el archivo (`ARROW:schema`), como lo escriben pyarrow,
+-- polars y arrow-rs.
+test "parquet_writes_the_arrow_schema"
+    let rows be [{"d": duration(seconds = 90), "w": datetime("2026-01-03T10:00:00", "Europe/Madrid"), "n": 1}]
+    let bin be parquet_write(rows)
+    assert_eq(contains(hex(bin), replace(hex(bytes("ARROW:schema")), "0x", "")), true)
+    assert_eq(to_rows(parquet_read(bin)) == rows, true)
+
+-- Parquet — una columna con nanosegundos y un valor que no entra en nanosegundos (±292 años) no
+-- se escribe en microsegundos perdiéndolos en silencio: es un error que nombra la columna.
+test "parquet_refuses_to_drop_nanoseconds"
+    let far be datetime("2400-01-01T00:00:00Z") - datetime("1800-01-01T00:00:00Z")
+    let ok be false
+    try
+        parquet_write([{"d": duration(seconds = 0.0000015)}, {"d": far}])
+    recover e
+        set ok to true
+        assert(contains(e, "column \"d\" has a duration with nanoseconds and one beyond ±292 years"))
+        assert(contains(e, "text(x)"))
+    assert(ok)
+    let ok2 be false
+    try
+        parquet_write([{"t": datetime("2026-01-03T10:00:00.000000001Z")}, {"t": datetime("2400-01-01T00:00:00Z")}])
+    recover e
+        set ok2 to true
+        assert(contains(e, "column \"t\" has a datetime with nanoseconds and one outside 1677-2262"))
+    assert(ok2)
+    -- Sin nanosegundos, lo lejano va en microsegundos como siempre; con todo en rango, en nanosegundos.
+    let a be [{"d": far}, {"d": duration(seconds = 1)}]
+    assert_eq(to_rows(parquet_read(parquet_write(a))) == a, true)
+    let b be [{"t": datetime("2026-01-03T10:00:00.000000001Z")}]
+    assert_eq(to_rows(parquet_read(parquet_write(b))) == b, true)

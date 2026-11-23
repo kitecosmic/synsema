@@ -1,0 +1,77 @@
+-- Gemelo de bytes_e2e.rs (v0.6.68, migas §4): hashing SHA (vectores publicados), invariante
+-- de `secret` (G6: no hay camino secret → bytes/hash) e I/O de archivos binario round-trip.
+-- Los dos tests de serve binario byte-exacto QUEDAN en Rust (serve_binary_response_byte_identical,
+-- serve_read_body_bytes_echo_byte_identical): levantan serve/sockets reales desde el host.
+-- Correr con: synsema test tests/bytes_e2e.test.syn
+
+require secret("API")
+require file("tests/_syn_bytes_roundtrip.tmp")
+
+test "sha256_known_vector"
+    -- decode(sha256(bytes("abc")), "hex") == vector NIST; bytes("abc") y "abc" hashean igual.
+    assert_eq(decode(sha256(bytes("abc")), "hex"), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+    assert_eq(decode(sha256("abc"), "hex"), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+
+test "sha512_known_vector_and_lengths"
+    assert_eq(decode(sha512("abc"), "hex"), "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f")
+    assert_eq(text(length(sha256("x"))), "32")
+    assert_eq(text(length(sha512("x"))), "64")
+
+test "sha256_to_base64"
+    -- decode(sha256(x), "base64") compone sin pre-hornear representaciones.
+    assert_eq(decode(sha256(bytes("abc")), "base64"), "ungWv48Bz+pBQUDeXa4iI7ADYaOWF3qctBD/YfIAFa0=")
+
+test "bytes_of_secret_errors"
+    let ok be false
+    try
+        let s be secret("API", "plaintext_value")
+        let b be bytes(s)
+    recover e
+        set ok to true
+        assert(contains(e, "Cannot convert secret to bytes"))
+        -- El plaintext NUNCA aparece en el error (G6).
+        assert(not contains(e, "plaintext_value"))
+    assert(ok)
+
+test "sha256_of_secret_errors"
+    let ok be false
+    try
+        let s be secret("API", "plaintext_value")
+        let h be sha256(s)
+    recover e
+        set ok to true
+        -- El mensaje nombra a `secret` ("Cannot hash a secret with sha256() ...").
+        assert(contains(e, "secret"))
+        assert(not contains(e, "plaintext_value"))
+    assert(ok)
+
+test "decode_of_secret_errors"
+    let ok be false
+    try
+        let s be secret("API", "plaintext_value")
+        let d be decode(s)
+    recover e
+        set ok to true
+        assert(contains(e, "decode expects bytes"))
+        assert(not contains(e, "plaintext_value"))
+    assert(ok)
+
+test "file_roundtrip_all_256_values"
+    -- Round-trip byte-idéntico de los 256 valores (0x00..0xFF), vía bytes(range(256)).
+    let data be bytes(range(256))
+    write_file("tests/_syn_bytes_roundtrip.tmp", data)
+    let back be read_file_bytes("tests/_syn_bytes_roundtrip.tmp")
+    delete_file("tests/_syn_bytes_roundtrip.tmp")
+    assert_eq(text(data == back), "true")
+    assert_eq(text(length(back)), "256")
+
+test "write_file_bytes_requires_capability"
+    -- Sin grant para el path: la escritura de bytes debe errorar por capability.
+    let ok be false
+    try
+        write_file("tests/_syn_bytes_nogrant.tmp", bytes([1, 2, 3]))
+    recover e
+        set ok to true
+        assert(contains(e, "Capability not granted"))
+        assert(contains(e, "file_write"))
+    assert(ok)

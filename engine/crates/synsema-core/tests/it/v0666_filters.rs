@@ -1,67 +1,4 @@
-//! v0.6.66: la API pública filtra bloques sin desplegar toda la tabla.
-
-use synsema_core::interpreter::run_source;
-
-fn out(source: &str) -> Vec<String> {
-    let r = run_source(source, "<v0666>");
-    assert!(r.success, "{:?}\n{}", r.errors, source);
-    r.output
-}
-
-fn fails(source: &str, needle: &str) {
-    let r = run_source(source, "<v0666>");
-    assert!(!r.success, "expected an error: {}", source);
-    assert!(r.errors.iter().any(|e| e.contains(needle)), "{:?}", r.errors);
-}
-
-#[test]
-fn numeric_and_text_masks_select_rows_and_keep_schema() {
-    let src = r#"let t be table([{"id": 1, "v": 1.5, "s": "a"}, {"id": 2, "v": 2.5, "s": "b"}, {"id": 3, "v": 3.5, "s": "b"}])
-let m be column_mask(t, "v", ">", 2.0)
-let r be where(t, m)
-print(m)
-print(length(r), columns(r), r[0].id, r[1].id)
-print(column_mask(r, "s", "==", "b"))"#;
-    assert_eq!(out(src), ["[false, true, true]", "2 [\"id\", \"v\", \"s\"] 2 3", "[true, true]"]);
-}
-
-#[test]
-fn exact_integers_and_nulls_do_not_turn_into_floats_or_false() {
-    let src = r#"let t be table([{"n": 9007199254740993}, {"n": nothing}, {"n": 9007199254740992}])
-print(column_mask(t, "n", ">", 9007199254740992))
-print(column_mask(t, "n", "is_missing"))
-print(column_mask(t, "n", ">", 9007199254740992, missing = "exclude"))
-let r be where(t, column_mask(t, "n", ">", 9007199254740992, missing = "exclude"))
-print(r[0].n, length(r))"#;
-    // The default comparison must reject the null exactly as its scalar equivalent does.
-    fails(src, "Unsupported operation: nothing > number");
-    let src = src.replace("print(column_mask(t, \"n\", \">\", 9007199254740992))\n", "");
-    assert_eq!(out(&src), ["[false, true, false]", "[true, false, false]", "9007199254740993 1"]);
-}
-
-#[test]
-fn callback_gets_one_cell_and_a_slice_uses_its_own_window() {
-    let src = r#"let t be table([{"v": 1}, {"v": 2}, {"v": 3}, {"v": 4}])
-let v be slice(t, 1, 4)
-let m be column_mask(v, "v", (x) => x % 2 == 0)
-print(m)
-print(where(v, m))
-print(t[0].v, length(v))"#;
-    assert_eq!(out(src), ["[true, false, true]", "[{v: 2}, {v: 4}]", "1 3"]);
-}
-
-#[test]
-fn mask_shape_and_empty_selection_have_explicit_contracts() {
-    fails("let t be table([ {\"v\": 1} ])\nwhere(t, array([1]))", "bool array");
-    fails("let t be table([ {\"v\": 1} ])\nwhere(t, array([1, 0]) > 0)", "mask must be 1-D with 1 elements");
-    fails("let t be table([ {\"v\": 1} ])\nwhere(t, array([1]) > 0, 0)", "where takes a list or array");
-    fails("column_mask(table([]), \"v\", \"==\", 1)", "no column");
-    let src = r#"let t be table([{"v": 1}, {"v": 2}])
-let r be where(t, column_mask(t, "v", ">", 9))
-print(length(r), columns(r))
-print(column_mask(r, "v", "is_present"))"#;
-    assert_eq!(out(src), ["0 [\"v\"]", "[]"]);
-}
+//! v0.6.66: tests de labels del filtro columnar; inspeccionan Interpreter y env del host.
 
 #[test]
 fn a_private_predicate_labels_both_mask_and_selected_table() {
@@ -83,30 +20,6 @@ let r be where(t, m)"#;
         assert_eq!(label_display_raw(&label_deep(&v)), "owner", "{}", name);
         if name == "r" { assert_eq!(strip_deep(&v).to_string(), "[{v: 3}]"); }
     }
-}
-
-#[test]
-fn date_and_text_columns_keep_scalar_comparison_rules() {
-    let src = r#"let t be table([{"day": date("2026-01-01"), "name": "a"}, {"day": date("2026-01-03"), "name": nothing}, {"day": date("2026-01-05"), "name": "c"}])
-print(column_mask(t, "day", ">", date("2026-01-02")))
-print(column_mask(t, "name", "==", nothing))
-print(where(t, column_mask(t, "name", "is_present"))[1].name)"#;
-    assert_eq!(out(src), ["[false, true, true]", "[false, true, false]", "c"]);
-    fails("let t be table([ {\"v\": 1} ])\ncolumn_mask(t, \"v\", \"nope\", 1)", "unknown operator");
-    fails("let t be table([ {\"v\": 1} ])\ncolumn_mask(t, \"v\", (x) => x)", "predicate must return bool");
-}
-
-#[test]
-fn nan_and_complete_masks_match_scalar_rules() {
-    let src = r#"let t be table([{"n": nan}, {"n": 1.0}, {"n": 2.0}])
-print(column_mask(t, "n", "==", nan))
-print(column_mask(t, "n", "!=", nan))
-print(column_mask(t, "n", ">", 1.0))
-let all be where(t, column_mask(t, "n", "is_present"))
-print(length(all), is_nan(all[0].n), all[1].n, all[2].n)
-let empty be where(t, array([1, 2, 3]) < 0)
-print(length(empty), columns(empty))"#;
-    assert_eq!(out(src), ["[false, false, false]", "[true, true, true]", "[false, false, true]", "3 true 1.0 2.0", "0 [\"n\"]"]);
 }
 
 #[test]

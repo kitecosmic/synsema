@@ -1,0 +1,82 @@
+-- Gemelo de v0666_filters.rs (core) (v0.6.68, migas §4): la API pública filtra bloques sin
+-- desplegar toda la tabla. Los 7 tests de labels quedan en Rust: miran el env y las etiquetas
+-- desde el host (parse_source + Interpreter + set_labels + env_get + label_deep), no corren un
+-- programa vía run_source. Correr con: synsema test tests/v0666_filters.test.syn
+
+task expect_error(f, needle)
+    let ok be false
+    try
+        f()
+    recover e
+        set ok to true
+        assert(contains(e, needle))
+    assert(ok)
+
+test "numeric_and_text_masks_select_rows_and_keep_schema"
+    let t be table([{"id": 1, "v": 1.5, "s": "a"}, {"id": 2, "v": 2.5, "s": "b"}, {"id": 3, "v": 3.5, "s": "b"}])
+    let m be column_mask(t, "v", ">", 2.0)
+    let r be where(t, m)
+    assert_eq(text(m), "[false, true, true]")
+    assert_eq(length(r), 2)
+    assert_eq(columns(r), ["id", "v", "s"])
+    assert_eq(r[0].id, 2)
+    assert_eq(r[1].id, 3)
+    assert_eq(text(column_mask(r, "s", "==", "b")), "[true, true]")
+
+test "exact_integers_and_nulls_do_not_turn_into_floats_or_false"
+    let t be table([{"n": 9007199254740993}, {"n": nothing}, {"n": 9007199254740992}])
+    -- The default comparison must reject the null exactly as its scalar equivalent does.
+    let ok be false
+    try
+        column_mask(t, "n", ">", 9007199254740992)
+    recover e
+        set ok to true
+        assert(contains(e, "Unsupported operation: nothing > number"))
+    assert(ok)
+    assert_eq(text(column_mask(t, "n", "is_missing")), "[false, true, false]")
+    assert_eq(text(column_mask(t, "n", ">", 9007199254740992, missing = "exclude")), "[true, false, false]")
+    let r be where(t, column_mask(t, "n", ">", 9007199254740992, missing = "exclude"))
+    assert_eq(text(r[0].n), "9007199254740993")
+    assert_eq(length(r), 1)
+
+test "callback_gets_one_cell_and_a_slice_uses_its_own_window"
+    let t be table([{"v": 1}, {"v": 2}, {"v": 3}, {"v": 4}])
+    let v be slice(t, 1, 4)
+    let m be column_mask(v, "v", (x) => x % 2 == 0)
+    assert_eq(text(m), "[true, false, true]")
+    assert_eq(text(where(v, m)), "[{v: 2}, {v: 4}]")
+    assert_eq(t[0].v, 1)
+    assert_eq(length(v), 3)
+
+test "mask_shape_and_empty_selection_have_explicit_contracts"
+    expect_error(() => where(table([{"v": 1}]), array([1])), "bool array")
+    expect_error(() => where(table([{"v": 1}]), array([1, 0]) > 0), "mask must be 1-D with 1 elements")
+    expect_error(() => where(table([{"v": 1}]), array([1]) > 0, 0), "where takes a list or array")
+    expect_error(() => column_mask(table([]), "v", "==", 1), "no column")
+    let t be table([{"v": 1}, {"v": 2}])
+    let r be where(t, column_mask(t, "v", ">", 9))
+    assert_eq(length(r), 0)
+    assert_eq(columns(r), ["v"])
+    assert_eq(text(column_mask(r, "v", "is_present")), "[]")
+
+test "date_and_text_columns_keep_scalar_comparison_rules"
+    let t be table([{"day": date("2026-01-01"), "name": "a"}, {"day": date("2026-01-03"), "name": nothing}, {"day": date("2026-01-05"), "name": "c"}])
+    assert_eq(text(column_mask(t, "day", ">", date("2026-01-02"))), "[false, true, true]")
+    assert_eq(text(column_mask(t, "name", "==", nothing)), "[false, true, false]")
+    assert_eq(where(t, column_mask(t, "name", "is_present"))[1].name, "c")
+    expect_error(() => column_mask(table([{"v": 1}]), "v", "nope", 1), "unknown operator")
+    expect_error(() => column_mask(table([{"v": 1}]), "v", (x) => x), "predicate must return bool")
+
+test "nan_and_complete_masks_match_scalar_rules"
+    let t be table([{"n": nan}, {"n": 1.0}, {"n": 2.0}])
+    assert_eq(text(column_mask(t, "n", "==", nan)), "[false, false, false]")
+    assert_eq(text(column_mask(t, "n", "!=", nan)), "[true, true, true]")
+    assert_eq(text(column_mask(t, "n", ">", 1.0)), "[false, false, true]")
+    let all be where(t, column_mask(t, "n", "is_present"))
+    assert_eq(length(all), 3)
+    assert_eq(is_nan(all[0].n), true)
+    assert_eq(text(all[1].n), "1.0")
+    assert_eq(text(all[2].n), "2.0")
+    let empty be where(t, array([1, 2, 3]) < 0)
+    assert_eq(length(empty), 0)
+    assert_eq(columns(empty), ["n"])

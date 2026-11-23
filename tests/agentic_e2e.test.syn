@@ -1,0 +1,34 @@
+-- Gemelo de agentic_e2e.rs (v0.6.68, migas §4): sólo los dos tests que se afirman sobre
+-- valores y errores de runtime capturables. Quedan en Rust los que levantan serve/sockets
+-- reales (las rutas `socket`/`stream`, el 504 con cancelación), el que pone
+-- SYNSEMA_SSE_KEEPALIVE, el de errores de PARSEO vía parse_source del host y el que lee el
+-- TestReport (outcomes/passed/failed) desde el host.
+-- Correr con: synsema test tests/agentic_e2e.test.syn
+
+agent Looper
+    while true
+        wait_for "job" timeout 0.2
+
+-- `timeout 30` donde no es cláusula (top-level, task, dentro de un `when`) no se ignora
+-- en silencio: el intérprete lo rechaza al ejecutarlo.
+test "timeout_clause_outside_a_route_is_a_loud_error"
+    let ok be false
+    try
+        timeout 30
+    recover e
+        set ok to true
+        assert(contains(e, "'timeout' is a clause"))
+    assert(ok)
+
+-- `agents()` / `agent_stop(id, motivo)` en el swarm real.
+test "agents_lists_live_agents_and_agent_stop_cancels_them"
+    spawn Looper
+    sleep(0.3)
+    let before be agents()
+    assert_eq(length(before), 1)
+    assert_eq(before[0]["name"], "Looper")
+    assert(before[0]["state"] == "working" or before[0]["state"] == "waiting")
+    assert_eq(agent_stop(before[0]["id"], "test"), true)
+    sleep(0.6)
+    assert_eq(agents()[0]["state"], "stopped")
+    assert_eq(agent_stop("no-such-agent"), false)

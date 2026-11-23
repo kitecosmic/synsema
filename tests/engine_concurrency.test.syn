@@ -1,0 +1,132 @@
+-- Gemelo de engine_concurrency.rs (synsema-runtime/tests/it, capa 7 — swarm) (v0.6.68, migas §4).
+-- Definición sin ejecución, spawn con/sin argumentos, blackboard (share/observe), señales
+-- (signal/wait_for) y tablero (agents()).
+-- Bajo `synsema test` el hook de swarm es REAL: spawn corre el agente en su propio hilo y el
+-- runner joinea los agentes de cada bloque al terminar (el wait_all del .rs). La espera del main
+-- es la canónica del lenguaje: el agente señaliza, el main hace wait_for y observe.
+-- Las claves y canales llevan prefijo/nombre único por test (cc_): la pizarra y las señales
+-- pendientes viven para toda la corrida del archivo (un swarm para todos los bloques).
+-- QUEDA en Rust (el .rs tiene 16 tests; migran 8):
+--   agent_define_does_not_execute: afirma la salida exacta de Engine::run; observar la
+--     pizarra desde un test .syn no prueba que el host omita la salida del agente.
+--   run_program_happy_path_blackboard_and_signal: afirma RunResult.output de run_program.
+--   run_program_without_agents_is_unaffected: afirma RunResult.output de run_program.
+--   agent_error_captured_in_swarm: pide VERDE con un agente en AgentState::Error; el runner de
+--     `synsema test` hace fallar el bloque cuyo agente termina en ERROR — el veredicto se invierte.
+--   run_program_isolates_agent_error_and_keeps_main_output: política de RunResult del host
+--     (success=false y error reportado por agente en ERROR, salida del main completa) — interno.
+--   run_program_delayed_agent_crash_does_not_abort_main: ídem, con crash tardío (sleep de pared).
+--   run_with_diagnostics_isolates_agent_error_and_keeps_main_output: run_with_diagnostics
+--     (DiagRun.diagnostics) es estructura del host.
+--   run_with_diagnostics_main_error_still_has_rich_diagnostic: el diagnóstico rico
+--     (ErrorDiagnostic.visible_variables, sin builtins) se lee desde el host.
+-- Correr con: synsema test tests/engine_concurrency.test.syn
+
+test "spawn_runs_agent_body"
+    agent Greeter
+        share "hello from agent" as "cc_greeting"
+        signal "cc_greet_done"
+    spawn Greeter
+    wait_for "cc_greet_done"
+    observe "cc_greeting" as greeting
+    assert_eq(greeting, "hello from agent")
+
+test "spawn_with_arguments"
+    agent Calculator
+        let result be x * 2
+        share result as "cc_calc_result"
+        signal "cc_calc_done"
+    spawn Calculator with x = 21
+    wait_for "cc_calc_done"
+    observe "cc_calc_result" as calc_result
+    assert_eq(calc_result, 42)
+
+test "two_agents_communicate_via_blackboard"
+    agent Producer
+        share "data_from_producer" as "shared_data"
+        signal "data_ready"
+    agent Consumer
+        wait_for "data_ready"
+        observe "shared_data" as data
+        share data as "consumed"
+        signal "cc_consumed_done"
+    spawn Producer
+    spawn Consumer
+    wait_for "cc_consumed_done"
+    observe "shared_data" as shared_data
+    observe "consumed" as consumed
+    assert_eq(shared_data, "data_from_producer")
+    assert_eq(consumed, "data_from_producer")
+
+test "signal_wakes_waiting_agent"
+    -- El último write gana: Receiver escribe "received" tras despertar.
+    agent Sender
+        share "preparing" as "status"
+        signal "ready"
+    agent Receiver
+        wait_for "ready"
+        share "received" as "status"
+        signal "cc_receiver_done"
+    spawn Receiver
+    spawn Sender
+    wait_for "cc_receiver_done"
+    observe "status" as status
+    assert_eq(status, "received")
+
+test "main_shares_agent_observes"
+    share "hello from main" as "main_data"
+    agent Reader
+        observe "main_data" as data
+        share data as "agent_read"
+        signal "cc_reader_done"
+    spawn Reader
+    wait_for "cc_reader_done"
+    observe "agent_read" as agent_read
+    assert_eq(agent_read, "hello from main")
+
+test "spawn_undefined_agent_fails"
+    let ok be false
+    try
+        spawn NonExistent
+    recover e
+        set ok to true
+        assert(contains(e, "No agent defined"))
+        assert(contains(e, "NonExistent"))
+    assert(ok)
+
+test "swarm_dashboard_shows_agents"
+    agent Worker
+        share "done" as "cc_dash_status"
+        signal "cc_dash_done"
+    spawn Worker
+    wait_for "cc_dash_done"
+    -- El tablero es observable desde el lenguaje: hay agentes y uno es Worker (el id trae el
+    -- sufijo de instancia, p.ej. Worker_0).
+    assert(length(agents()) >= 1)
+    let seen be false
+    each a in agents()
+        when contains(a["id"], "Worker")
+            set seen to true
+    assert(seen)
+
+test "multiple_spawns_of_same_agent"
+    -- Tres instancias independientes; la pizarra queda con la última escritura (101..103).
+    agent Adder
+        let result be n + 100
+        share result as "cc_sum"
+        signal "cc_adder_" + text(n)
+    spawn Adder with n = 1
+    spawn Adder with n = 2
+    spawn Adder with n = 3
+    wait_for "cc_adder_1"
+    wait_for "cc_adder_2"
+    wait_for "cc_adder_3"
+    observe "cc_sum" as got
+    assert(got >= 101 and got <= 103)
+    -- total_agents() == 3 del .rs (motor fresco): la corrida del archivo es compartida, así que
+    -- se cuentan las instancias de ESTE agente por su nombre declarado.
+    let adders be 0
+    each a in agents()
+        when a["name"] == "Adder"
+            set adders to adders + 1
+    assert_eq(adders, 3)
