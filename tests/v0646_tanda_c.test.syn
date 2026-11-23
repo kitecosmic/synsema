@@ -1,0 +1,69 @@
+-- Gemelo de v0646_tanda_c.rs (v0.6.68, migas §4): enumerate sobre arrays y las pistas del camino
+-- de error. Quedan en Rust: los dos tests de linaje (Interpreter de Rust directo) y c5
+-- (`discovery off` es error de PARSEO del programa: un .test.syn entero tiene que parsear).
+-- Correr con: synsema test tests/v0646_tanda_c.test.syn
+
+task expect_error(f, needle)
+    let ok be false
+    try
+        f()
+    recover e
+        set ok to true
+        assert(contains(e, needle))
+    assert(ok)
+
+test "c1_enumerate_walks_an_array_by_its_first_axis"
+    let e be enumerate(array([10, 20, 30]))
+    assert_eq(length(e), 3)
+    assert_eq(e[2]["index"], 2)
+    assert_eq(e[2]["item"] == 30, true)
+    -- 2-D: cada `item` es la fila, igual que `m[i]`.
+    let m be array([[1, 2], [3, 4]])
+    let e2 be enumerate(m)
+    assert_eq(length(e2), 2)
+    assert_eq(to_list(e2[1]["item"]) == to_list(m[1]), true)
+    expect_error(() => enumerate(array(5)), "0-d array")
+    expect_error(() => enumerate(5), "requires a list or an array, got number")
+
+test "c2_hints_for_log_and_in_units"
+    let ok be false
+    try
+        log(10)
+    recover e
+        set ok to true
+        assert(contains(e, "ln(x)"))
+        assert(contains(e, "log10(x)"))
+        assert(contains(e, "log \"message\""))
+    assert(ok)
+    expect_error(() => in_units(90, "minutes"), "got number")
+    expect_error(() => in_units(90, "minutes"), "duration(seconds = 90)")
+    -- La pista arma una llamada que anda.
+    assert_eq(in_units(duration(seconds = 90), "minutes"), 1.5)
+
+test "c6_unknown_parameter_names_the_valid_ones"
+    let ok be false
+    try
+        page(limt = 1, offset = 0)
+    recover e
+        set ok to true
+        assert(contains(e, "unknown parameter 'limt'"))
+        assert(contains(e, "did you mean 'limit'?"))
+        assert(contains(e, "the parameters are: limit, offset"))
+    assert(ok)
+    expect_error(() => duration(hour = 1), "did you mean 'hours'?")
+    expect_error(() => duration(hour = 1), "days, hours, minutes")
+    let ok2 be false
+    try
+        f_sin_cercano(zzzzzz = 1)
+    recover e
+        set ok2 to true
+        assert(not contains(e, "did you mean"))
+        assert(contains(e, "the parameters are: a"))
+    assert(ok2)
+
+task page(limit, offset)
+    give limit + offset
+
+task f_sin_cercano(a)
+    give a
+

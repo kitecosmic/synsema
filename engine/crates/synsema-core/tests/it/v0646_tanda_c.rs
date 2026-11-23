@@ -1,5 +1,6 @@
-//! v0.6.46, Tanda C (C1, C2, C5 y C6): `enumerate` sobre un array, las pistas del camino de error y
-//! la cláusula `discovery off`.
+//! v0.6.46, Tanda C: lo que queda en Rust (v0.6.68, migas §1) — el linaje y sus salidas vistos
+//! desde el `Interpreter` de Rust. c1/c2/c6 viven en `tests/v0646_tanda_c.test.syn` (c5 es error
+//! de parseo y también quedó en Rust).
 
 use synsema_core::interpreter::run_source;
 
@@ -17,64 +18,6 @@ fn error_of(source: &str) -> String {
 }
 
 /// C1: un array se enumera por su primer eje, como `length(a)` y `a[i]`.
-#[test]
-fn c1_enumerate_walks_an_array_by_its_first_axis() {
-    assert_output(
-        "let e be enumerate(array([10, 20, 30]))\n\
-         print(length(e))\n\
-         print(e[2][\"index\"])\n\
-         print(e[2][\"item\"] == 30)\n",
-        &["3", "2", "true"],
-    );
-    // 2-D: cada `item` es la fila, igual que `m[i]`.
-    assert_output(
-        "let m be array([[1, 2], [3, 4]])\n\
-         let e be enumerate(m)\n\
-         print(length(e))\n\
-         print(to_list(e[1][\"item\"]) == to_list(m[1]))\n",
-        &["2", "true"],
-    );
-    let e = error_of("print(enumerate(array(5)))\n");
-    assert!(e.contains("0-d array"), "{}", e);
-    let e = error_of("print(enumerate(5))\n");
-    assert!(e.contains("requires a list or an array, got number"), "{}", e);
-}
-
-/// C2: `log(x)` dice cuál logaritmo, y `in_units` con un número dice cómo armar la duración.
-#[test]
-fn c2_hints_for_log_and_in_units() {
-    let e = error_of("print(log(10))\n");
-    assert!(e.contains("ln(x)") && e.contains("log10(x)") && e.contains("log \"message\""), "{}", e);
-    let e = error_of("print(in_units(90, \"minutes\"))\n");
-    assert!(e.contains("got number") && e.contains("duration(seconds = 90)"), "{}", e);
-    // La pista arma una llamada que anda.
-    assert_output("print(in_units(duration(seconds = 90), \"minutes\"))\n", &["1.5"]);
-}
-
-/// C6: un nombre que no existe dice los parámetros que hay y el más cercano.
-#[test]
-fn c6_unknown_parameter_names_the_valid_ones() {
-    let e = error_of("task page(limit, offset)\n    give limit + offset\nprint(page(limt = 1, offset = 0))\n");
-    assert!(e.contains("unknown parameter 'limt'") && e.contains("did you mean 'limit'?"), "{}", e);
-    assert!(e.contains("the parameters are: limit, offset"), "{}", e);
-    // Un builtin con nombres (`duration`) dice los suyos.
-    let e = error_of("print(duration(hour = 1))\n");
-    assert!(e.contains("did you mean 'hours'?") && e.contains("days, hours, minutes"), "{}", e);
-    // Sin nada cercano, sólo la lista.
-    let e = error_of("task f(a)\n    give a\nprint(f(zzzzzz = 1))\n");
-    assert!(!e.contains("did you mean") && e.contains("the parameters are: a"), "{}", e);
-}
-
-/// C5: `discovery off` es una cláusula del `serve`; otra palabra después de `discovery` es un error
-/// que dice la forma, y el mensaje de cláusula desconocida la lista.
-#[test]
-fn c5_discovery_takes_only_off() {
-    let e = error_of("require serve(8080)\nserve on 8080\n    discovery on\n");
-    assert!(e.contains("Expected 'off' after 'discovery' (discovery off)"), "{}", e);
-    let e = error_of("require serve(8080)\nserve on 8080\n    discovry off\n");
-    assert!(e.contains("'discovery off'"), "{}", e);
-}
-
 /// Un intérprete con un `read_file` de mentira: una fuente del linaje que siempre trae "x".
 fn with_fake_reads() -> synsema_core::interpreter::Interpreter {
     let i = synsema_core::interpreter::Interpreter::new();

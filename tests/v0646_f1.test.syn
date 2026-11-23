@@ -1,0 +1,48 @@
+-- Gemelo de v0646_f1.rs (v0.6.68, migas §4): tipos en parámetros como metadato, validados en la
+-- frontera (`call`/`call_tool`). Quedan en Rust: el test de error de PARSEO (un .test.syn entero
+-- tiene que parsear), codeintel/outline y el valor etiquetado vía `labels` del host.
+-- Correr con: synsema test tests/v0646_f1.test.syn
+
+task g(n: number, label: text = "x", tags: list = [], opts: map = {}, on: bool = false)
+    give [type_of(n), label, length(tags), length(opts), on]
+
+task expect_error(f, needle)
+    let ok be false
+    try
+        f()
+    recover e
+        set ok to true
+        assert(contains(e, needle))
+    assert(ok)
+
+test "f1_the_signature_parses_and_a_normal_call_does_not_check"
+    assert_eq(g(1), ["number", "x", 0, 0, false])
+    assert_eq(g(2, "y", [1], {"a": 1}, true), ["number", "y", 1, 1, true])
+    -- Metadato: una llamada normal no valida (eso es F2, medido aparte).
+    assert_eq(g("tres")[0], "text")
+    -- `nothing` es el default de un parámetro opcional de cualquier tipo.
+    task h(n: number = nothing)
+        give n
+    assert_eq(h(), nothing)
+
+test "f1_call_and_call_tool_check_the_declared_types"
+    assert_eq(call(g, {"n": 3, "tags": [1, 2], "on": true}), ["number", "x", 2, 0, true])
+    assert_eq(call_tool(g, {"n": decimal("1.5")})[0], "decimal")
+    expect_error(() => call(g, {"n": "tres"}), "call(g): 'n' must be number, got text — a tool call from `llm_step`")
+    expect_error(() => call_tool(g, {"n": 1, "tags": "[1]"}), "call_tool(g): 'tags' must be list, got text")
+    let ok be false
+    try
+        call(g, {"n": 1, "on": 1})
+    recover e
+        set ok to true
+        assert(contains(e, "call(g): 'on' must be bool, got number"))
+        assert(not contains(e, "llm_step"))
+    assert(ok)
+    -- Estricto: `nothing` no es un número aunque el parámetro tenga default.
+    expect_error(() => call(g, {"n": 1, "opts": nothing}), "'opts' must be map, got nothing")
+    -- Un parámetro tipado sin default que no llegó: `call` liga a `nothing` lo que falta.
+    expect_error(() => call(g, {}), "call(g): missing 'n' (number)")
+    task u(a, b)
+        give type_of(b)
+    assert_eq(call(u, {"a": 1}), "nothing")
+    assert_eq(call((x) => x, {"x": "a"}), "a")
