@@ -1,0 +1,194 @@
+-- Array value and diagnostic regressions from v0655_arrays.rs.
+
+task expect_error(f, needle)
+    let caught be false
+    try
+        f()
+    recover e
+        set caught to true
+        assert(contains(e, needle))
+    assert(caught)
+
+test "dtype_names_the_element_type"
+    let a be array([1, 5, 2, 8])
+    let m be a > 2
+    assert_eq(dtype(a), "f64")
+    assert_eq(dtype(m), "bool")
+    expect_error(() => dtype([1, 2]), "dtype expects an array, got list")
+
+test "equal_and_not_equal_give_masks"
+    let a be array([1, 5, 2, 8])
+    let b be array([3, 3, 9, 1])
+    assert_eq(text(equal(a, 5)), "[false, true, false, false]")
+    assert_eq(text(not_equal(a, b)), "[true, true, true, true]")
+    assert_eq(equal(nan, nan), false)
+    assert_eq(type_of(equal(1, 1)), "bool")
+    assert_eq(text(equal(array([nan, 1]), array([nan, 1]))), "[false, true]")
+    expect_error(() => equal(a, [1, 5]), "equal: make the list an array first: array(xs)")
+
+test "logical_functions_combine_masks"
+    let a be array([1, 5, 2, 8])
+    let m be a > 2
+    assert_eq(text(logical_and(m, a < 8)), "[false, true, false, false]")
+    assert_eq(text(logical_or(m, a < 2)), "[true, true, false, true]")
+    assert_eq(text(logical_not(m)), "[true, false, true, false]")
+    assert_eq(sum(logical_and(m, a < 8)), 1)
+    expect_error(() => logical_and(a, m), "logical_and expects masks (bool arrays), got a f64 array")
+    expect_error(() => logical_not(true), "logical_not expects masks (bool arrays), got bool")
+
+test "if_else_is_numpys_three_argument_where"
+    let a be array([1, 5, 2, 8])
+    let m be a > 2
+    let M be array([[1, 2], [3, 4]])
+    assert_eq(text(if_else(m, a, 0)), "[0, 5, 0, 8]")
+    assert_eq(dtype(if_else(m, a, 0)), "f64")
+    assert_eq(text(if_else(M > 2, M, array([[10], [20]]))), "[[10, 10], [3, 4]]")
+    assert_eq(text(if_else(m, a > 4, a < 2)), "[true, true, false, true]")
+    expect_error(() => if_else(a, a, 0), "if_else expects masks (bool arrays), got a f64 array")
+    expect_error(() => if_else(m, [1, 2, 3, 4], 0), "if_else: make the list an array first: array(xs)")
+
+test "maximum_and_minimum_broadcast_and_propagate_nan"
+    let a be array([1, 5, 2, 8])
+    let b be array([3, 3, 9, 1])
+    let M be array([[1, 2], [3, 4]])
+    assert_eq(text(maximum(a, 3)), "[3, 5, 3, 8]")
+    assert_eq(text(minimum(a, b)), "[1, 3, 2, 1]")
+    assert_eq(text(maximum(a, array([nan, 0, 0, 0]))), "[nan, 5, 2, 8]")
+    assert_eq(text(minimum(M, array([2, 2]))), "[[1, 2], [2, 2]]")
+    expect_error(() => maximum(a, array([1, 2])), "maximum: arrays of shape [4] and [2] are not broadcastable")
+
+test "take_picks_positions_along_an_axis"
+    let a be array([1, 5, 2, 8])
+    let m be a > 2
+    let M be array([[1, 2], [3, 4]])
+    assert_eq(text(take(M, [1, 0], axis = 1)), "[[2, 1], [4, 3]]")
+    assert_eq(text(take(M, [1, 0], axis = -1)), "[[2, 1], [4, 3]]")
+    assert_eq(text(take(M, [1, 1], axis = 0)), "[[3, 4], [3, 4]]")
+    assert_eq(text(take(a, [3, 0])), "[8, 1]")
+    assert_eq(dtype(take(m, [0, 1])), "bool")
+    expect_error(() => take(M, [0], axis = 2), "take: axis 2 out of range for a 2-D array")
+    expect_error(() => take(M, [0]), "take: say which axis of the 2-D array")
+    expect_error(() => take(M, [0, 2], axis = 1), "take: Index 2 out of bounds (array axis 1 has length 2)")
+    expect_error(() => take(a, m), "take takes positions, not a mask")
+    expect_error(() => take([1, 2], [0]), "take expects an array, got list")
+
+test "index_add_accumulates_repeated_positions"
+    let a be array([1, 5, 2, 8])
+    assert_eq(text(index_add(a, [0, 0, 2], array([1, 1, 1]))), "[3, 5, 3, 8]")
+    assert_eq(text(a), "[1, 5, 2, 8]")
+    assert_eq(text(index_add(a, [0, 0, 2], 1)), "[3, 5, 3, 8]")
+    assert_eq(text(index_add(zeros([4, 2]), [0, 2, 0], array([[1, 1], [2, 2], [3, 3]]))), "[[4, 4], [0, 0], [2, 2], [0, 0]]")
+    assert_eq(text(index_add(zeros([2, 3]), [2, 2], array([[1, 2], [3, 4]]), axis = 1)), "[[0, 0, 3], [0, 0, 7]]")
+    expect_error(() => index_add(a, [0, 1], array([1, 2, 3])), "index_add: the values have shape [3] and the selection [2]")
+    expect_error(() => index_add(a, [0, 1], [1, 2]), "index_add: make the list an array first: array(xs)")
+    expect_error(() => index_add(a, [9], 1), "index_add: Index 9 out of bounds (array axis 0 has length 4)")
+
+test "elementwise_builtins_on_two_numbers_follow_the_language"
+    assert_eq(maximum(2, 3), 3)
+    assert_eq(minimum(2.5, 3), 2.5)
+    assert_eq(text(maximum(2.0, 3.0)), "3.0")
+    assert_eq(equal(9007199254740993, 9007199254740992), false)
+    assert_eq(9007199254740993 == 9007199254740992, false)
+    assert_eq(not_equal(2, 2.0), false)
+    assert_eq(equal(nan, nan), false)
+    assert_eq(text(maximum(nan, 1)), "nan")
+    expect_error(() => equal("a", "a"), "equal works on arrays (got text and text)")
+    expect_error(() => maximum(true, 1), "maximum works on arrays (got bool and number)")
+
+test "sum_of_a_mask_by_axis_counts"
+    let a be array([1, 5, 2, 8])
+    let m be a > 2
+    let M be array([[1, 2], [3, 4]])
+    assert_eq(sum(array([1, 0]) > 0, axis = 0), 1)
+    assert_eq(sum(m, axis = 0) + 0.5, 2.5)
+    assert_eq(text(sum(M > 1, axis = 0)), "[1, 2]")
+    assert_eq(text(sum(M > 1, axis = 1)), "[1, 2]")
+
+test "transpose_reorders_the_axes"
+    let T be reshape(arange(0, 24), [2, 3, 4])
+    let M be array([[1, 2], [3, 4]])
+    let r be transpose(T, [0, 2, 1])
+    assert_eq(text(shape(r)), "[2, 4, 3]")
+    assert_eq(text(r[1]), "[[12, 16, 20], [13, 17, 21], [14, 18, 22], [15, 19, 23]]")
+    let s be transpose(T, [-1, 0, 1])
+    assert_eq(text(shape(s)), "[4, 2, 3]")
+    assert_eq(text(s[3]), "[[3, 7, 11], [15, 19, 23]]")
+    assert_eq(text(transpose(M)), "[[1, 3], [2, 4]]")
+    assert_eq(text(transpose(M, [1, 0])), "[[1, 3], [2, 4]]")
+    assert_eq(dtype(transpose(M > 2, [1, 0])), "bool")
+    assert_eq(text(transpose(M > 2, [1, 0])), "[[false, true], [false, true]]")
+    expect_error(() => transpose(T, [0, 0, 1]), "axes must be a permutation of 0..2, got [0, 0, 1]")
+    expect_error(() => transpose(T, [0, 1]), "axes must be a permutation of 0..2, got [0, 1]")
+    expect_error(() => transpose(T, [0, 1, 3]), "axes must be a permutation of 0..2, got [0, 1, 3]")
+    expect_error(() => transpose(T, [0, 1, 2.5]), "axes must be a permutation of 0..2, got [0, 1, 2.5]")
+    expect_error(() => transpose(T, [0, 1, -4]), "axes must be a permutation of 0..2, got [0, 1, -4]")
+    expect_error(() => transpose(M, "10"), "axes must be a list of integers, got text")
+
+test "matmul_over_batches_broadcasts_like_numpy"
+    let A be reshape(arange(0, 24), [2, 3, 4])
+    let B be reshape(arange(0, 40), [2, 4, 5])
+    let M be array([[1, 2], [3, 4]])
+    let r be matmul(A, B)
+    assert_eq(text(shape(r)), "[2, 3, 5]")
+    assert_eq(text(r[1]), "[[1510, 1564, 1618, 1672, 1726], [1950, 2020, 2090, 2160, 2230], [2390, 2476, 2562, 2648, 2734]]")
+    let s be matmul(reshape(arange(0, 12), [1, 3, 4]), reshape(arange(0, 140), [7, 4, 5]))
+    assert_eq(text(shape(s)), "[7, 3, 5]")
+    assert_eq(text(s[6][2]), "[4870, 4908, 4946, 4984, 5022]")
+    let t be matmul(reshape(arange(0, 12), [3, 4]), B)
+    assert_eq(text(shape(t)), "[2, 3, 5]")
+    assert_eq(text(t[1][0]), "[190, 196, 202, 208, 214]")
+    assert_eq(text(shape(matmul(ones([2, 1, 3, 4]), ones([5, 4, 2])))), "[2, 5, 3, 2]")
+    let u be matmul(A, reshape(arange(0, 20), [4, 5]))
+    assert_eq(text(shape(u)), "[2, 3, 5]")
+    assert_eq(text(u[1][0]), "[430, 484, 538, 592, 646]")
+    assert_eq(text(matmul(M, M)), "[[7, 10], [15, 22]]")
+    expect_error(() => matmul(ones([2, 3, 4]), ones([2, 5, 5])), "incompatible shapes [2, 3, 4] and [2, 5, 5]")
+    expect_error(() => matmul(ones([2, 3, 4]), ones([3, 4, 5])), "batch axes of [2, 3, 4] and [3, 4, 5] are not broadcastable")
+    expect_error(() => matmul(ones([4]), ones([2, 4, 5])), "expected a 2D array (matrix), got 1-D")
+
+test "arrays_to_bytes_and_back"
+    let x be array([1.5, -2, 0.1])
+    let a be array([1, 5, 2, 8])
+    assert_eq(hex(array_to_bytes(x)), "0x000000000000f83f00000000000000c09a9999999999b93f")
+    assert_eq(hex(array_to_bytes(x, "f64")), "0x000000000000f83f00000000000000c09a9999999999b93f")
+    assert_eq(hex(array_to_bytes(x, "f32")), "0x0000c03f000000c0cdcccc3d")
+    assert_eq(hex(array_to_bytes(array([1, 0, 1]) > 0)), "0x010001")
+    assert_eq(hex(array_to_bytes(array([1, 0]) > 0, "f32")), "0x0000803f00000000")
+    assert_eq(text(array_from_bytes(array_to_bytes(x, "f32"), "f32")), "[1.5, -2, 0.1]")
+    assert_eq(text(to_list(array_from_bytes(array_to_bytes(x, "f32"), "f32"))), "[1.5, -2.0, 0.10000000149011612]")
+    assert(array_from_bytes(array_to_bytes(x), "f64") == x)
+    assert_eq(text(array_from_bytes(array_to_bytes(arange(0, 6), "f32"), "f32", shape = [2, 3])), "[[0, 1, 2], [3, 4, 5]]")
+    let m be array_from_bytes(array_to_bytes(x > 0), "bool")
+    assert_eq(dtype(m), "bool")
+    assert_eq(text(m), "[true, false, true]")
+    assert_eq(text(shape(array_from_bytes(bytes(""), "f64"))), "[0]")
+    expect_error(() => array_from_bytes(bytes("0123456789"), "f32"), "10 bytes is not a whole number of f32 values")
+    expect_error(() => array_from_bytes(bytes("0123456789abcdef"), "f32", shape = [2, 3]), "shape [2, 3] needs 24 bytes, got 16")
+    expect_error(() => array_from_bytes(bytes("a"), "bool"), "byte 97 at position 0 is not a bool")
+    expect_error(() => array_to_bytes(a, "i8"), "dtype must be \"f64\", \"f32\", \"f16\", \"bf16\" or \"bool\"")
+    expect_error(() => array_from_bytes(bytes(""), 4), "dtype must be \"f64\", \"f32\", \"f16\", \"bf16\" or \"bool\"")
+    expect_error(() => array_to_bytes(a, "bool"), "\"bool\" is for masks and this array is f64")
+    expect_error(() => array_from_bytes("abc", "f64"), "array_from_bytes expects bytes, got text")
+    expect_error(() => array_to_bytes([1, 2]), "array_to_bytes expects an array, got list")
+
+test "set_on_a_frozen_array_copies"
+    let G be array([1, 2, 3])
+    task f(i)
+        let c be G
+        set c[0] to i
+        give sum(c)
+    assert_eq(text(parallel_map(f, [10, 20, 30])), "[15.0, 25.0, 35.0]")
+    assert_eq(text(G), "[1, 2, 3]")
+
+test "set_in_a_hot_loop_through_the_engine"
+    let n be 20000
+    let z be zeros(n)
+    let Q be zeros([200, 3])
+    let i be 0
+    while i < n
+        set z[i] to i % 7
+        set Q[i % 200][i % 3] to Q[i % 200][i % 3] + 1
+        set i to i + 1
+    assert_eq(text(sum(z)), "59997.0")
+    assert_eq(text(sum(Q)), "20000.0")
+    assert_eq(text(Q[0]), "[34, 33, 33]")
