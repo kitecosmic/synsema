@@ -1,0 +1,12 @@
+-- Isolated from the other data tests: lineage and receipt accumulate at file scope.
+
+test "lineage_is_recorded_by_the_engine"
+    require file.read("tests/fixtures/lineage/in.csv")
+    let t be read_file("tests/fixtures/lineage/in.csv")
+    let l be lineage()
+    assert_eq(length(l), 1)
+    assert_eq(l[0].source, "read_file")
+    assert_eq("0x" + l[0].sha256 == hex(sha256(t)), true)
+    assert_eq(l[0].bytes, 4)
+    let r be receipt()
+    assert_eq(length(r.credentialSubject.inputs), 1)
