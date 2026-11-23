@@ -1,0 +1,64 @@
+-- Gemelo de batch7_conformance.rs (core) (v0.6.68, migas §4): la cláusula `timeout` de wait_for,
+-- `timeout` como SOFT keyword (sigue usable de identificador) y la validación del valor
+-- (no-número → error en runtime, antes del hook). El TIMING real (que el timeout se respeta) vive
+-- en los tests E2E del runtime. Queda en Rust: timeout_zero_and_negative_parse (el `timeout 99999`
+-- espera el clamp de 3600 s bajo `synsema test`, donde el hook de swarm es real).
+-- Correr con: synsema test tests/batch7_conformance.test.syn
+
+task f(timeout)
+    give timeout * 2
+
+task wait_timeout_text()
+    wait_for "x" timeout "abc"
+
+task wait_timeout_list()
+    wait_for "x" timeout [1, 2]
+
+task expect_error(f, needle)
+    let ok be false
+    try
+        f()
+    recover e
+        set ok to true
+        assert(contains(e, needle))
+    assert(ok)
+
+test "wait_for_without_timeout_still_parses"
+    -- Regresión G1: sin `timeout` sigue funcionando.
+    wait_for "x"
+    assert(true)
+    wait_for "x" as r
+    assert(r == nothing)
+
+test "wait_for_with_timeout_parses"
+    wait_for "x" timeout 1
+    assert(true)
+    -- `timeout` antes de `as`: el `as` no se traga la expresión del timeout.
+    wait_for "x" timeout 2 as r
+    assert(r == nothing)
+    -- expresión agrupada como timeout.
+    wait_for "x" timeout (1 + 1) as r
+    assert(true)
+    -- canal dinámico (Batch 6) + timeout (Batch 7).
+    let id be 7
+    wait_for "c:" + text(id) timeout 0.5 as r
+    assert(r == nothing)
+
+test "timeout_is_usable_as_identifier"
+    let timeout be 5
+    assert_eq(timeout, 5)
+    -- un timeout como param de task / en expresiones.
+    assert_eq(f(10), 20)
+
+test "channel_var_named_timeout_parses_unambiguously"
+    -- `wait_for timeout timeout 1`: canal = la var `timeout`, timeout = 1.
+    let timeout be "ch"
+    wait_for timeout timeout 1
+    assert(true)
+    -- sin la cláusula: `wait_for timeout` (canal = la var) sigue OK.
+    wait_for timeout as r
+    assert(r == nothing)
+
+test "non_numeric_timeout_errors"
+    expect_error(() => wait_timeout_text(), "wait_for timeout must be a number of seconds")
+    expect_error(() => wait_timeout_list(), "wait_for timeout must be a number of seconds")

@@ -1,0 +1,149 @@
+-- Gemelo de judge_conformance.rs (core) (v0.6.68, migas §4): primitivo `judge` (System One) en
+-- el camino OFFLINE — degradación honesta, sintaxis que sobrevive al parseo, palabra blanda
+-- afuera del bloque y validación en runtime antes de gastar la llamada. Quedan en Rust: los
+-- 8 errores de PARSEO (el .test.syn entero tiene que parsear), los caminos cableados por
+-- callback (`JudgeRequest` visto desde el host), `decide` servido por el juez (bandera
+-- SYNSEMA_JUDGE_DECIDE que `synsema test` no fija por bloque) y los 3 del check estático
+-- (`check_program_static` es del host). Correr con: synsema test tests/judge_conformance.test.syn
+
+require judge
+
+task expect_error(f, needle)
+    let ok be false
+    try
+        f()
+    recover e
+        set ok to true
+        assert(contains(e, needle))
+    assert(ok)
+
+task add(a, b)
+    give a + b
+
+-- ---- Offline: la degradación honesta ------------------------------------------------
+
+test "offline_answers_are_unavailable_with_zero_confidence_and_nothing"
+    let ticket be {"subject": "Payouts failing", "text": "I want my money back NOW"}
+    let v be judge ticket
+        refund: whether "The customer is asking for money back"
+        team:   choose "Which team should handle this?" between {
+                    "billing":   "Payments, invoicing, refunds",
+                    "technical": "Bugs, outages, integrations"
+                } or nothing
+        anger:  rate "How frustrated is the customer?" across ["Calm", "Frustrated", "Very angry"]
+    assert_eq(v.refund.kind, "whether")
+    assert(v.refund.available == false)
+    assert_eq(v.refund.probability, nothing)
+    assert_eq(v.team.kind, "choose")
+    assert_eq(v.team.choice, nothing)
+    assert(v.team.confidence == 0)
+    assert_eq(v.anger.kind, "rate")
+    assert_eq(v.anger.score, nothing)
+    assert_eq(v.anger.level, nothing)
+    assert_eq(length(v.anger.levels), 3)
+    assert_eq(v.anger.levels[2], "Very angry")
+    assert(judge_available() == false)
+    assert_eq(judge_usage(), 0)
+    assert_eq(judge_model(), nothing)
+
+test "offline_confidence_gate_routes_to_the_human_by_itself"
+    let ticket be {"subject": "Payouts failing", "text": "I want my money back NOW"}
+    let v be judge ticket
+        refund: whether "The customer is asking for money back"
+        team:   choose "Which team should handle this?" between {
+                    "billing":   "Payments, invoicing, refunds",
+                    "technical": "Bugs, outages, integrations"
+                } or nothing
+        anger:  rate "How frustrated is the customer?" across ["Calm", "Frustrated", "Very angry"]
+    let who be ""
+    when confidence of v.team < 0.8
+        set who to "human"
+    otherwise
+        set who to "auto"
+    assert_eq(who, "human")
+
+test "offline_direct_comparison_fails_loud_instead_of_branching_silently"
+    let ticket be {"subject": "Payouts failing", "text": "I want my money back NOW"}
+    let v be judge ticket
+        refund: whether "The customer is asking for money back"
+        team:   choose "Which team should handle this?" between {
+                    "billing":   "Payments, invoicing, refunds",
+                    "technical": "Bugs, outages, integrations"
+                } or nothing
+        anger:  rate "How frustrated is the customer?" across ["Calm", "Frustrated", "Very angry"]
+    let ok be false
+    try
+        when v.refund.probability > 0.5
+            set verdict to "refund"
+    recover e
+        set ok to true
+        assert(contains(e, "Unsupported operation: nothing > number"))
+    assert(ok)
+
+-- ---- Sintaxis expresable y palabra blanda -------------------------------------------
+-- (Los 8 errores de parseo de esta sección en Rust quedan en Rust: migas §4.)
+
+test "a_single_question_block_is_three_lines_and_fine"
+    let v be judge "x"
+        a: whether "Is it?"
+    assert_eq(length(keys(v)), 1)
+    assert(v.a.available == false)
+
+test "judge_is_an_ordinary_identifier_outside_its_construction"
+    let judge be 5
+    assert_eq(judge + 1, 6)
+    let judge be 1
+    assert_eq(add(judge, 2), 3)
+    let judge be {"x": 1}
+    assert_eq(judge.x, 1)
+    assert_eq(x of judge, 1)
+    let judge be [7]
+    assert_eq(judge[0], 7)
+    assert_eq(text(judge), "[7]")
+
+test "block_words_are_ordinary_identifiers_outside_the_block"
+    let rate be 2
+    let across be 3
+    let whether be 4
+    let between be 5
+    let choose be 6
+    assert_eq(rate * across + whether + between + choose, 21)
+
+-- ---- Validación en runtime (criteria dinámicas), antes de gastar la llamada ----------
+
+task choose_with_a_single_option()
+    let opts be {"only": "One"}
+    let v be judge "x"
+        a: choose "Which?" between opts
+
+test "choose_needs_two_options_even_though_the_api_accepts_one"
+    expect_error(() => choose_with_a_single_option(), "at least 2 options")
+
+task rate_with_eleven_levels()
+    let lv be ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k"]
+    let v be judge "x"
+        a: rate "How?" across lv
+
+test "rate_accepts_at_most_ten_levels"
+    expect_error(() => rate_with_eleven_levels(), "at most 10 levels")
+
+task rate_with_repeated_levels()
+    let v be judge "x"
+        a: rate "How?" across ["Calm", "Calm", "Angry"]
+
+test "duplicate_levels_are_rejected"
+    expect_error(() => rate_with_repeated_levels(), "declared twice")
+
+task judge_over_a_number()
+    let v be judge 42
+        a: whether "Is it big?"
+
+test "state_must_be_text_map_or_list"
+    expect_error(() => judge_over_a_number(), "state must be a text, a map or a list")
+
+task choose_with_an_option_named_none_and_escape()
+    let v be judge "x"
+        a: choose "Which?" between {"none": "n", "b": "B"} or nothing
+
+test "an_option_named_nothing_cannot_combine_with_or_nothing"
+    expect_error(() => choose_with_an_option_named_none_and_escape(), "rename the option")

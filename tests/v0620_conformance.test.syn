@@ -1,0 +1,58 @@
+-- Gemelo de v0620_conformance.rs (core) (v0.6.68, migas §4): `reverse` / `split(t, "")` como
+-- caracteres, y `private` por ruta y por grupo que viaja en la meta del grupo.
+-- Quedan en Rust: steps() (determinismo entre DOS corridas del mismo programa), los tests de
+-- `use` (árbol de archivos real + errores de carga), los avisos del check estático
+-- (parse_source/check del host) y el parseo de la cláusula `private`.
+-- Correr con: synsema test tests/v0620_conformance.test.syn
+
+task expect_error(f, needle)
+    let ok be false
+    try
+        f()
+    recover e
+        set ok to true
+        assert(contains(e, needle))
+    assert(ok)
+
+-- El grupo se ejecuta a un map con `_routes_meta`; `private` viaja ahí (por ruta y por grupo).
+export routes g
+    route "GET /a"
+        private
+        give 1
+    route "GET /b"
+        give 2
+
+export routes gh
+    private
+    route "GET /a"
+        give 1
+    route "GET /b"
+        give 2
+
+test "reverse_list_and_text"
+    assert_eq(reverse([1, 2, 3]), [3, 2, 1])
+    assert_eq(reverse([]), [])
+    assert_eq(reverse("abc"), "cba")
+    -- Por scalar Unicode: la ñ es un scalar, se conserva entera.
+    assert_eq(reverse("añb"), "bña")
+    -- Valor nuevo: el original no se toca.
+    let xs be [1, 2]
+    let ys be reverse(xs)
+    assert_eq(xs, [1, 2])
+    assert_eq(ys, [2, 1])
+    expect_error(() => reverse(42), "reverse")
+
+test "split_with_empty_separator_yields_characters"
+    assert_eq(split("abc", ""), ["a", "b", "c"])
+    assert_eq(length(split("añb", "")), 3)
+    assert_eq(split("", ""), [])
+    -- El separador no vacío no cambia.
+    assert_eq(split("a,b", ","), ["a", "b"])
+
+test "private_in_a_group_reaches_the_routes_meta"
+    let metas be g._routes_meta
+    assert_eq(metas[0].private, true)
+    assert_eq(metas[1].private, false)
+    assert_eq(metas[0].streaming, false)
+    assert_eq(gh._routes_meta[0].private, true)
+    assert_eq(gh._routes_meta[1].private, true)

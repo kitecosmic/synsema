@@ -42,41 +42,6 @@ fn assert_error_contains(source: &str, needle: &str) {
 
 // ---- Offline: la degradación honesta ---------------------------------------------------
 
-#[test]
-fn offline_answers_are_unavailable_with_zero_confidence_and_nothing() {
-    let src = format!(
-        "{}print(v.refund.kind)\nprint(v.refund.available)\nprint(v.refund.probability)\n\
-         print(v.team.kind)\nprint(v.team.choice)\nprint(v.team.confidence == 0)\n\
-         print(v.anger.kind)\nprint(v.anger.score)\nprint(v.anger.level)\nprint(length(v.anger.levels))\n\
-         print(v.anger.levels[2])\nprint(judge_available())\nprint(judge_usage())\nprint(judge_model())\n",
-        BLOCK
-    );
-    assert_output(
-        &src,
-        &[
-            "whether", "false", "nothing", "choose", "nothing", "true", "rate", "nothing", "nothing", "3",
-            "Very angry", "false", "0", "nothing",
-        ],
-    );
-}
-
-#[test]
-fn offline_confidence_gate_routes_to_the_human_by_itself() {
-    // El patrón insignia: `judge` mide, el humano decide. Offline la confianza es 0, así
-    // que la compuerta manda al humano sin una línea extra.
-    let src = format!(
-        "{}when confidence of v.team < 0.8\n    print(\"human\")\notherwise\n    print(\"auto\")\n",
-        BLOCK
-    );
-    assert_output(&src, &["human"]);
-}
-
-#[test]
-fn offline_direct_comparison_fails_loud_instead_of_branching_silently() {
-    let src = format!("{}when v.refund.probability > 0.5\n    print(\"refund\")\n", BLOCK);
-    assert_error_contains(&src, "Unsupported operation: nothing > number");
-}
-
 // ---- Sintaxis: preposiciones, escape, ids, verbos --------------------------------------
 
 #[test]
@@ -140,75 +105,9 @@ fn unknown_verb_inside_judge_is_a_parse_error() {
     );
 }
 
-#[test]
-fn a_single_question_block_is_three_lines_and_fine() {
-    assert_output(
-        "let v be judge \"x\"\n    a: whether \"Is it?\"\nprint(length(keys(v)))\nprint(v.a.available)\n",
-        &["1", "false"],
-    );
-}
-
 // ---- Palabra blanda: `judge` y las del bloque siguen siendo nombres afuera --------------
 
-#[test]
-fn judge_is_an_ordinary_identifier_outside_its_construction() {
-    assert_output("let judge be 5\nprint(judge + 1)\n", &["6"]);
-    assert_output("task f(a, b)\n    give a + b\nlet judge be 1\nprint(f(judge, 2))\n", &["3"]);
-    assert_output("let judge be {\"x\": 1}\nprint(judge.x)\nprint(x of judge)\n", &["1", "1"]);
-    assert_output("let judge be [7]\nprint(judge[0])\nprint(judge)\n", &["7", "[7]"]);
-}
-
-#[test]
-fn block_words_are_ordinary_identifiers_outside_the_block() {
-    assert_output(
-        "let rate be 2\nlet across be 3\nlet whether be 4\nlet between be 5\nlet choose be 6\n\
-         print(rate * across + whether + between + choose)\n",
-        &["21"],
-    );
-}
-
 // ---- Validación en runtime (criteria dinámicas), antes de gastar la llamada --------------
-
-#[test]
-fn choose_needs_two_options_even_though_the_api_accepts_one() {
-    assert_error_contains(
-        "let opts be {\"only\": \"One\"}\nlet v be judge \"x\"\n    a: choose \"Which?\" between opts\n",
-        "at least 2 options",
-    );
-}
-
-#[test]
-fn rate_accepts_at_most_ten_levels() {
-    assert_error_contains(
-        "let lv be [\"a\", \"b\", \"c\", \"d\", \"e\", \"f\", \"g\", \"h\", \"i\", \"j\", \"k\"]\n\
-         let v be judge \"x\"\n    a: rate \"How?\" across lv\n",
-        "at most 10 levels",
-    );
-}
-
-#[test]
-fn duplicate_levels_are_rejected() {
-    assert_error_contains(
-        "let v be judge \"x\"\n    a: rate \"How?\" across [\"Calm\", \"Calm\", \"Angry\"]\n",
-        "declared twice",
-    );
-}
-
-#[test]
-fn state_must_be_text_map_or_list() {
-    assert_error_contains(
-        "let v be judge 42\n    a: whether \"Is it big?\"\n",
-        "state must be a text, a map or a list",
-    );
-}
-
-#[test]
-fn an_option_named_nothing_cannot_combine_with_or_nothing() {
-    assert_error_contains(
-        "let v be judge \"x\"\n    a: choose \"Which?\" between {\"none\": \"n\", \"b\": \"B\"} or nothing\n",
-        "rename the option",
-    );
-}
 
 // ---- Cableado por callback: una llamada por bloque, pedido correcto, respuestas a ids ----
 

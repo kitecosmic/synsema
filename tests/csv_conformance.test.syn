@@ -1,0 +1,110 @@
+-- Gemelo de csv_conformance.rs (v0.6.68, migas §4): csv_parse/csv_encode con RFC 4180
+-- (quoting, escapes, CRLF/LF, BOM), round-trips, opts (headers/delimiter/numbers/eol) y los
+-- errores claros con línea (G5), atrapables con try/recover (G10). El caso `secret` → error
+-- (G8; v0.6.46 D8) vive en los unit tests de csv.rs y en los e2e del runtime (el builtin
+-- `secret()` no se registra en core).
+-- Correr con: synsema test tests/csv_conformance.test.syn
+
+task expect_error(f, needle)
+    let ok be false
+    try
+        f()
+    recover e
+        set ok to true
+        assert(contains(e, needle))
+    assert(ok)
+
+test "parse_default_headers_lossless"
+    let rows be csv_parse("a,b\r\n1,x\r\n00123,y\r\n")
+    -- Default lossless: TODO texto ("00123" no se convierte en 123).
+    assert_eq(length(rows), 2)
+    assert_eq(rows[0]["a"], "1")
+    assert_eq(type_of(rows[0]["a"]), "text")
+    assert_eq(rows[1]["a"], "00123")
+
+test "parse_numbers_opt"
+    let rows be csv_parse("n,s,z\n42,abc,00123\n", {"numbers": true})
+    -- "42" → Number; "abc" queda texto; "00123" con numbers:true parsea (123).
+    assert_eq(type_of(rows[0]["n"]), "number")
+    assert_eq(rows[0]["n"], 42)
+    assert_eq(type_of(rows[0]["s"]), "text")
+    assert_eq(rows[0]["z"], 123)
+
+test "parse_headers_false_lists"
+    let rows be csv_parse("1,2\n3,4\n", {"headers": false})
+    assert_eq(length(rows), 2)
+    assert_eq(rows[1][0], "3")
+
+test "parse_empty_text_and_lf"
+    assert(csv_parse("") == [])
+    -- LF pelado (sin CR) también es válido.
+    assert_eq(length(csv_parse("a,b\n1,2\n")), 1)
+
+test "parse_bom_tolerated"
+    -- El BOM UTF-8 de Excel al inicio no contamina la primera cabecera.
+    let bom be decode(bytes("efbbbf", "hex"))
+    let rows be csv_parse(bom + "a,b\n1,2\n")
+    assert_eq(rows[0]["a"], "1")
+
+test "parse_delimiters_semicolon_and_tab"
+    assert_eq(csv_parse("a;b\n1;2\n", {"delimiter": ";"})[0]["b"], "2")
+    assert_eq(csv_parse("a\tb\n1\t2\n", {"delimiter": "\t"})[0]["b"], "2")
+
+test "roundtrip_maps_with_embedded_specials"
+    assert(csv_parse(csv_encode([{"a": "x,y", "b": "with \"q\"", "c": "l1\nl2"}])) == [{"a": "x,y", "b": "with \"q\"", "c": "l1\nl2"}])
+
+test "roundtrip_lists_and_minimal_quoting"
+    -- Quoting mínimo: campos simples sin comillas, EOL RFC (CRLF) por default.
+    assert_eq(csv_encode([["1", "2"], ["3", "4"]]), "1,2\r\n3,4\r\n")
+    assert(csv_parse(csv_encode([["1", "2"], ["3", "4"]]), {"headers": false}) == [["1", "2"], ["3", "4"]])
+
+test "roundtrip_numbers"
+    -- Con numbers:true el round-trip reconstruye los números (enteros sin decimales).
+    assert(csv_parse(csv_encode([{"n": 42, "f": 2.5}]), {"numbers": true}) == [{"n": 42, "f": 2.5}])
+
+test "encode_headers_subset_and_order"
+    assert_eq(csv_encode([{"a": "1", "b": "2"}], {"headers": ["b"]}), "b\r\n2\r\n")
+    assert_eq(csv_encode([{"a": "1", "b": "2"}], {"headers": ["b", "a"]}), "b,a\r\n2,1\r\n")
+
+test "encode_eol_lf"
+    assert_eq(csv_encode([["1", "2"]], {"eol": "\n"}), "1,2\n")
+
+test "encode_nothing_empty_and_bool"
+    assert_eq(csv_encode([{"a": nothing, "b": true}]), "a,b\r\n,true\r\n")
+
+test "encode_integers_without_decimals"
+    -- Espeja text(42) → "42" (no "42.0"); float estilo Python.
+    assert_eq(csv_encode([[42, 2.5]]), "42,2.5\r\n")
+
+test "error_uneven_fields_reports_line"
+    expect_error(() => print(csv_parse("a,b\n1\n")), "line 2")
+
+test "error_unclosed_quote_reports_line"
+    expect_error(() => print(csv_parse("a,b\n1,\"oops\n2,3\n")), "unclosed quote")
+    expect_error(() => print(csv_parse("a,b\n1,\"oops\n2,3\n")), "line 2")
+
+test "error_duplicate_headers"
+    expect_error(() => print(csv_parse("a,a\n1,2\n")), "duplicate header")
+
+test "error_multichar_delimiter"
+    expect_error(() => print(csv_parse("a\n", {"delimiter": ";;"})), "single ASCII character")
+
+test "error_encode_mismatched_keys"
+    expect_error(() => print(csv_encode([{"a": "1"}, {"b": "2", "c": "3"}])), "row 2")
+
+test "error_encode_nested_suggests_json_encode"
+    expect_error(() => print(csv_encode([{"a": [1, 2]}])), "json_encode")
+
+test "error_unknown_option"
+    expect_error(() => print(csv_parse("a\n", {"headres": true})), "unknown option")
+
+test "errors_are_recoverable_g10"
+    -- El error de CSV es un error de runtime normal: try/recover lo atrapa y el
+    -- programa sigue (el agente decide si re-propaga con raise).
+    let msg be ""
+    try
+        csv_parse("a,b\n1\n")
+    recover err
+        set msg to err
+    -- Llegar hasta acá con el mensaje capturado ES el "sigue vivo" del .rs.
+    assert(contains(msg, "line 2"))

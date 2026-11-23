@@ -1,0 +1,381 @@
+-- Gemelo de batch2_conformance.rs (v0.6.68, migas §4): pattern matching enriquecido
+-- (listas/maps/enums, spreads, guards) + default/named params, con aserciones sobre VALORES
+-- (el .rs comparaba la salida completa de print; acá la rama elegida deja el valor en `out`).
+-- El caso "dos spreads → error de PARSEO" queda en Rust (migas §4: los errores de parseo del
+-- programa no son expresables en un .test.syn).
+-- Correr con: synsema test tests/batch2_conformance.test.syn
+
+task expect_error(f, needle)
+    let ok be false
+    try
+        f()
+    recover e
+        set ok to true
+        assert(contains(e, needle))
+    assert(ok)
+
+-- El CONNECT del .rs: defaults usados por varios tests.
+task connect(host, port = 5432, timeout = 30)
+    give host + ":" + text(port) + ":" + text(timeout)
+
+-- El ENUM del .rs: variantes con payload para binding/guard/subpatrón literal.
+enum Order
+    pending
+    paid(amount)
+    shipped(date, carrier)
+
+test "g2_top_identifier_compares_by_value"
+    -- Si `target` se ligara, SIEMPRE matchearía. Como compara por valor: 5 == 5 → hit.
+    let target be 5
+    let out be ""
+    match 5
+        is target
+            set out to "hit"
+        otherwise
+            set out to "miss"
+    assert_eq(out, "hit")
+    -- 5 != 99 → miss (prueba que NO se ligó: un binder daría siempre "hit").
+    set target to 99
+    set out to ""
+    match 5
+        is target
+            set out to "hit"
+        otherwise
+            set out to "miss"
+    assert_eq(out, "miss")
+
+test "strict_arity_replaces_g3"
+    -- v0.6.29: la aridad permisiva (G3) se fue. Un parámetro sin default que falta y un
+    -- posicional de más son error, con el nombre del task y lo que esperaba.
+    task f(a, b)
+        give a
+    expect_error(() => print(text(f(1))), "missing argument 'b'")
+    task g(a)
+        give a
+    expect_error(() => print(text(g(7, 8, 9))), "takes 1 argument, got 3")
+    -- Con default, omitirlo sigue siendo válido.
+    task h(a, b = nothing)
+        give b
+    assert(h(1) == nothing)
+
+test "defaults_used_positional_named"
+    assert_eq(connect("db"), "db:5432:30")
+    assert_eq(connect("db", 6000), "db:6000:30")
+    assert_eq(connect("db", timeout = 60), "db:5432:60")
+    assert_eq(connect("db", port = 6000, timeout = 60), "db:6000:60")
+    -- named en orden distinto.
+    assert_eq(connect("db", timeout = 60, port = 7000), "db:7000:60")
+
+test "default_reevaluated_each_call_and_overridable"
+    -- Default = llamada a un builtin puro (length): se evalúa fresco en cada llamada.
+    task f(n = length([1, 2, 3]))
+        give n
+    assert_eq(f(), 3)
+    assert_eq(f(99), 99)
+
+test "default_sees_global_not_other_params"
+    -- Default que referencia un GLOBAL: OK (closure_env, G5).
+    let base be 100
+    task g(x = base)
+        give x
+    assert_eq(g(), 100)
+    -- Default que referencia OTRO param: NO lo ve (closure_env del task, G5) → Undefined.
+    task h(a, b = a)
+        give b
+    expect_error(() => print(text(h(5))), "Undefined variable")
+
+test "named_arg_errors_only_new_syntax"
+    -- named desconocido.
+    expect_error(() => print(connect("db", bogus = 1)), "unknown parameter 'bogus'")
+    -- posicional tras named.
+    expect_error(() => print(connect("db", port = 6000, 30)), "positional argument after named argument")
+    -- duplicado: posicional + named del mismo param.
+    expect_error(() => print(connect("db", 6000, port = 7000)), "duplicate argument 'port'")
+    -- duplicado: named repetido.
+    expect_error(() => print(connect("db", port = 1, port = 2)), "duplicate argument 'port'")
+    -- named a un builtin.
+    expect_error(() => print(length(x = [1, 2])), "does not accept named arguments")
+
+test "equal_vs_assign_in_call"
+    -- f(v == 1) = arg posicional booleano; f(v = 1) = named. Token Equal vs Assign.
+    task ident(v)
+        give v
+    assert(ident(2 == 2))
+    assert_eq(ident(v = 5), 5)
+
+test "lambda_accepts_named_args"
+    -- Las lambdas no tienen sintaxis de default, pero aceptan llamadas con args nombrados.
+    let f be (a, b) => a + b
+    assert_eq(f(b = 3, a = 10), 13)
+
+test "list_patterns"
+    let out be ""
+    match [1, 2, 3]
+        is [a, b, c]
+            set out to text(a + b + c)
+    assert_eq(out, "6")
+    set out to ""
+    match []
+        is []
+            set out to "empty"
+        otherwise
+            set out to "no"
+    assert_eq(out, "empty")
+    set out to ""
+    match [1, 2, 3]
+        is [first, ...rest]
+            set out to text(first) + "/" + text(length(rest))
+    assert_eq(out, "1/2")
+    set out to ""
+    match [1, 2, 3]
+        is [...init, last]
+            set out to text(last) + "/" + text(length(init))
+    assert_eq(out, "3/2")
+    set out to ""
+    match [1, 2, 3, 4]
+        is [a, ...mid, z]
+            set out to text(a) + "," + text(z) + "," + text(length(mid))
+    assert_eq(out, "1,4,2")
+    -- anidado
+    set out to ""
+    match [[1], 2]
+        is [[a], b]
+            set out to text(a + b)
+    assert_eq(out, "3")
+    -- elemento literal + binder: 200 no matchea 10 → cae al siguiente arm
+    set out to ""
+    match [10, 20]
+        is [200, x]
+            set out to "lit"
+        is [a, x]
+            set out to text(a)
+    assert_eq(out, "10")
+    -- wildcard como elemento
+    set out to ""
+    match [1, 2]
+        is [_, x]
+            set out to text(x)
+    assert_eq(out, "2")
+    -- spread anónimo
+    set out to ""
+    match [1, 2, 3]
+        is [first, ...]
+            set out to text(first)
+    assert_eq(out, "1")
+
+test "list_patterns_no_match_cases"
+    let out be ""
+    -- longitud no coincide (sin spread)
+    match [1, 2, 3]
+        is [a, b]
+            set out to "two"
+        otherwise
+            set out to "other"
+    assert_eq(out, "other")
+    -- más corta que los fijos (con spread)
+    set out to ""
+    match [1]
+        is [a, b, ...rest]
+            set out to "ge2"
+        otherwise
+            set out to "short"
+    assert_eq(out, "short")
+    -- matchear un no-lista
+    set out to ""
+    match 5
+        is [a]
+            set out to "list"
+        otherwise
+            set out to "notlist"
+    assert_eq(out, "notlist")
+
+test "map_patterns"
+    let out be ""
+    -- subset, bindea claves (claves extra ignoradas)
+    match {"name": "Ada", "age": 36}
+        is {name, age}
+            set out to name + " " + text(age)
+    assert_eq(out, "Ada 36")
+    -- clave faltante → no matchea
+    set out to ""
+    match {"name": "Ada"}
+        is {name, age}
+            set out to "both"
+        otherwise
+            set out to "missing"
+    assert_eq(out, "missing")
+    -- valor + bind
+    set out to ""
+    match {"status": 200, "body": "ok"}
+        is {status: 200, body}
+            set out to "200 " + body
+        otherwise
+            set out to "other"
+    assert_eq(out, "200 ok")
+    -- anidado
+    set out to ""
+    match {"items": [1, 2, 3]}
+        is {items: [h, ...t]}
+            set out to text(h) + " tail " + text(length(t))
+    assert_eq(out, "1 tail 2")
+    -- {} matchea cualquier map
+    set out to ""
+    match {"a": 1}
+        is {}
+            set out to "any"
+        otherwise
+            set out to "no"
+    assert_eq(out, "any")
+    -- no-map → no matchea
+    set out to ""
+    match 5
+        is {x}
+            set out to "map"
+        otherwise
+            set out to "notmap"
+    assert_eq(out, "notmap")
+
+test "map_literal_value_pattern_preserved_g1"
+    -- `is {"k": 1}` (clave string) sigue siendo igualdad estructural de map literal.
+    let m be {"k": 1}
+    let out be ""
+    match m
+        is {"k": 1}
+            set out to "si"
+        otherwise
+            set out to "no"
+    assert_eq(out, "si")
+    set m to {"k": 2}
+    set out to ""
+    match m
+        is {"k": 1}
+            set out to "si"
+        otherwise
+            set out to "no"
+    assert_eq(out, "no")
+
+test "wildcard_top"
+    let out be ""
+    match 42
+        is _
+            set out to "any"
+    assert_eq(out, "any")
+    set out to ""
+    match "x"
+        is _
+            set out to "any"
+    assert_eq(out, "any")
+
+test "guards"
+    let out be ""
+    match [18]
+        is [age] when age >= 18
+            set out to "adult"
+        otherwise
+            set out to "minor"
+    assert_eq(out, "adult")
+    -- guard falso → otherwise
+    set out to ""
+    match [15]
+        is [age] when age >= 18
+            set out to "adult"
+        otherwise
+            set out to "minor"
+    assert_eq(out, "minor")
+    -- guard con == sobre nombre ligado de un map
+    set out to ""
+    match {"carrier": "DHL"}
+        is {carrier} when carrier == "DHL"
+            set out to "dhl"
+        otherwise
+            set out to "other"
+    assert_eq(out, "dhl")
+    -- guard falso cae al SIGUIENTE arm (no sólo a otherwise)
+    set out to ""
+    match [5]
+        is [n] when n > 10
+            set out to "big"
+        is [n]
+            set out to "small " + text(n)
+    assert_eq(out, "small 5")
+
+test "enum_payload_binding_still_works"
+    let o be Order.shipped("today", "DHL")
+    let out be ""
+    match o
+        is Order.shipped(d, c)
+            set out to d + "/" + c
+        otherwise
+            set out to "other"
+    assert_eq(out, "today/DHL")
+
+test "enum_variant_guard"
+    let o be Order.shipped("today", "DHL")
+    let out be ""
+    match o
+        is Order.shipped(d, c) when c == "DHL"
+            set out to "dhl " + d
+        otherwise
+            set out to "other"
+    assert_eq(out, "dhl today")
+    set o to Order.shipped("today", "UPS")
+    set out to ""
+    match o
+        is Order.shipped(d, c) when c == "DHL"
+            set out to "dhl"
+        otherwise
+            set out to "other"
+    assert_eq(out, "other")
+
+test "enum_literal_subpattern_value_match"
+    -- `is Order.paid(100)` destructura con subpatrón literal: matchea variante + payload == 100.
+    let o be Order.paid(100)
+    let out be ""
+    match o
+        is Order.paid(100)
+            set out to "cien"
+        otherwise
+            set out to "otro"
+    assert_eq(out, "cien")
+    set o to Order.paid(50)
+    set out to ""
+    match o
+        is Order.paid(100)
+            set out to "cien"
+        otherwise
+            set out to "otro"
+    assert_eq(out, "otro")
+
+test "deep_pattern_with_guard"
+    -- Patrón profundo del desafío adversarial: {status: 200, items: [first, ...rest]} when …
+    let resp be {"status": 200, "items": [10, 20, 30]}
+    let out be ""
+    match resp
+        is {status: 200, items: [first, ...rest]} when length(rest) > 0
+            set out to text(first) + " rest " + text(length(rest))
+        otherwise
+            set out to "no"
+    assert_eq(out, "10 rest 2")
+    -- mismo patrón, guard falso (rest vacío) → otherwise
+    set resp to {"status": 200, "items": [10]}
+    set out to ""
+    match resp
+        is {status: 200, items: [first, ...rest]} when length(rest) > 0
+            set out to "hit"
+        otherwise
+            set out to "no"
+    assert_eq(out, "no")
+
+test "recursive_sum_with_list_patterns"
+    task sum(xs)
+        match xs
+            is []
+                give 0
+            is [h, ...t]
+                give h + sum(t)
+    assert_eq(sum([1, 2, 3, 4, 5]), 15)
+
+test "property_chain_not_broken_by_spread_token"
+    -- `a.b.c` sigue siendo Dot/Dot (G6); el token `...` no lo altera.
+    let a be {"b": {"c": 42}}
+    assert_eq(a.b.c, 42)

@@ -1,0 +1,50 @@
+-- Gemelo de tool_calling_conformance.rs (core) (v0.6.68, migas §4): el builtin `call(task, args_map)`
+-- despacha una task con args NOMBRADOS tomados de un map; `apply` (map sobre lista) queda intacto.
+-- Correr con: synsema test tests/tool_calling_conformance.test.syn
+
+task greet(name, greeting)
+    give greeting + ", " + name
+
+task connect(host, port = 5432)
+    give host + ":" + text(port)
+
+task pick(a, b)
+    give b
+
+task hi()
+    give "hi"
+
+task expect_error(f, needle)
+    let ok be false
+    try
+        f()
+    recover e
+        set ok to true
+        assert(contains(e, needle))
+    assert(ok)
+
+test "call_binds_named_args_from_map"
+    -- El map lista `greeting` ANTES que `name`: si bindeara por posición daría "World, Hello".
+    assert_eq(call(greet, {"greeting": "Hello", "name": "World"}), "Hello, World")
+
+test "call_unknown_param_errors"
+    expect_error(() => call(greet, {"bogus": 1}), "unknown parameter 'bogus'")
+
+test "call_missing_param_uses_default"
+    -- El default se evalúa en call time.
+    assert_eq(call(connect, {"host": "db"}), "db:5432")
+
+test "call_missing_param_is_nothing"
+    -- Param faltante SIN default → `nothing` (aridad permisiva).
+    assert(call(pick, {"a": 1}) == nothing)
+
+test "call_with_nothing_passes_no_args"
+    assert_eq(call(hi, nothing), "hi")
+    -- Un map vacío también significa "sin args".
+    assert_eq(call(hi, {}), "hi")
+
+test "call_non_map_args_errors"
+    expect_error(() => call(greet, [1, 2]), "call expects a map of named args")
+
+test "call_builtin_with_named_errors"
+    expect_error(() => call(length, {"x": [1, 2]}), "does not accept named arguments")

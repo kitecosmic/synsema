@@ -1,0 +1,189 @@
+-- Gemelo de arrays_conformance.rs (v0.6.68, migas §4): arrays n-dimensionales + álgebra
+-- lineal (Batch 5). Igualdad exacta donde los resultados son enteros en f64 (matmul de
+-- enteros, broadcasting); tolerancia 1e-9 (vía `norm`) para solve/inv/svd/eig. Incluye
+-- G1 (listas intactas) y los casos de error (G3).
+-- Correr con: synsema test tests/arrays_conformance.test.syn
+
+let tol be 0.000000001
+
+task expect_error(f, needle)
+    let ok be false
+    try
+        f()
+    recover e
+        set ok to true
+        assert(contains(e, needle))
+    assert(ok)
+
+-- =========================================================
+-- G1 — listas/escalares intactos
+-- =========================================================
+
+test "g1_lists_unchanged"
+    assert_eq(text(sum([1, 2, 3])), "6")
+    assert_eq(text(mean([1, 2, 3])), "2.0")
+    assert_eq(text(min([3, 5, 1])), "1")
+    assert_eq(text(max([3, 5, 1])), "5")
+    assert_eq(text(product([1, 2, 3, 4])), "24")
+    -- variádico de escalares intacto
+    assert_eq(text(min(3, 5, 1)), "1")
+
+-- =========================================================
+-- Construcción / introspección / conversión
+-- =========================================================
+
+test "construction_and_introspection"
+    assert_eq(text(shape(array([[1, 2], [3, 4]]))), "[2, 2]")
+    assert_eq(text(ndim(array([[1, 2], [3, 4]]))), "2")
+    assert_eq(text(size(array([[1, 2], [3, 4]]))), "4")
+    assert_eq(type_of(array([1, 2, 3])), "array")
+    assert_eq(text(array([1, 2, 3])), "[1, 2, 3]")
+    assert_eq(text(array([[1, 2], [3, 4]])), "[[1, 2], [3, 4]]")
+    assert(is_array(array([1])))
+    -- una lista NO es un array
+    assert(not is_array([1]))
+    assert_eq(text(zeros([2, 3])), "[[0, 0, 0], [0, 0, 0]]")
+    assert_eq(text(ones(3)), "[1, 1, 1]")
+    assert_eq(text(full([2], 7)), "[7, 7]")
+    assert_eq(text(arange(0, 5)), "[0, 1, 2, 3, 4]")
+    assert_eq(text(linspace(0, 1, 5)), "[0, 0.25, 0.5, 0.75, 1]")
+    assert_eq(text(identity(3)), "[[1, 0, 0], [0, 1, 0], [0, 0, 1]]")
+
+test "to_list_round_trip"
+    assert(array(to_list(array([[1, 2], [3, 4]]))) == array([[1, 2], [3, 4]]))
+    -- los elementos son f64 → su `text()` lleva `.0` (el Display NumPy-like los recorta).
+    assert_eq(text(to_list(array([1, 2, 3]))), "[1.0, 2.0, 3.0]")
+
+test "construction_errors"
+    -- filas de distinto largo
+    expect_error(() => array([[1, 2], [3]]), "ragged")
+    -- no-numérico
+    expect_error(() => array([[1, 2], [3, "x"]]), "expects numbers")
+
+test "reshape_transpose_flatten"
+    assert(reshape(arange(0, 6), [2, 3]) == array([[0, 1, 2], [3, 4, 5]]))
+    expect_error(() => reshape(arange(0, 6), [2, 2]), "cannot reshape")
+    assert(transpose(array([[1, 2], [3, 4]])) == array([[1, 3], [2, 4]]))
+    assert(flatten(array([[1, 2], [3, 4]])) == array([1, 2, 3, 4]))
+
+-- =========================================================
+-- Indexación
+-- =========================================================
+
+test "indexing"
+    -- 1D → escalar f64
+    assert_eq(text(array([10, 20, 30])[1]), "20.0")
+    assert_eq(text(array([10, 20, 30])[1]), "20.0")
+    -- 2D → fila
+    assert(array([[1, 2], [3, 4]])[0] == array([1, 2]))
+    assert_eq(text(at(array([[1, 2], [3, 4]]), [1, 1])), "4.0")
+    expect_error(() => array([1, 2, 3])[5], "out of bounds")
+    -- v0.6.29: negativos desde el final, como listas y texto.
+    assert_eq(text(array([1, 2, 3])[-1]), "3.0")
+    expect_error(() => array([1, 2, 3])[-4], "out of bounds")
+    expect_error(() => at(array([[1, 2], [3, 4]]), [1]), "expected 2 indices")
+    expect_error(() => at(array([[1, 2], [3, 4]]), [5, 0]), "out of bounds")
+
+-- =========================================================
+-- Aritmética vectorizada
+-- =========================================================
+
+test "vectorized_arithmetic"
+    assert(array([1, 2, 3]) + array([10, 20, 30]) == array([11, 22, 33]))
+    assert(array([1, 2, 3]) - array([1, 1, 1]) == array([0, 1, 2]))
+    -- escalar
+    assert(array([1, 2, 3]) * 2 == array([2, 4, 6]))
+    assert(2 * array([1, 2, 3]) == array([2, 4, 6]))
+    -- scalar ⊕ array (orden importa)
+    assert(10 - array([1, 2, 3]) == array([9, 8, 7]))
+    -- broadcasting [2,2] + [2]
+    assert(array([[1, 2], [3, 4]]) + array([10, 20]) == array([[11, 22], [13, 24]]))
+    -- unario
+    assert(-array([1, -2, 3]) == array([-1, 2, -3]))
+
+test "star_is_elementwise_not_matmul"
+    -- `*` es ELEMENTWISE (Hadamard), NO producto matricial.
+    assert(array([[1, 2], [3, 4]]) * array([[1, 0], [0, 1]]) == array([[1, 0], [0, 4]]))
+    -- y NO es igual al producto matricial (que sería la propia A).
+    assert(array([[1, 2], [3, 4]]) * array([[1, 0], [0, 1]]) != array([[1, 2], [3, 4]]))
+    -- matmul SÍ da el producto matricial.
+    assert(matmul(array([[1, 2], [3, 4]]), array([[1, 0], [0, 1]])) == array([[1, 2], [3, 4]]))
+
+test "broadcasting_incompatible_errors"
+    expect_error(() => array([1, 2, 3]) + array([1, 2, 3, 4]), "not broadcastable")
+    expect_error(() => array([[1, 2, 3], [4, 5, 6]]) + array([1, 2, 3, 4]), "not broadcastable")
+
+-- =========================================================
+-- Reducciones (total y por eje) + std/var
+-- =========================================================
+
+test "reductions"
+    -- array → f64
+    assert_eq(text(sum(array([1, 2, 3, 4]))), "10.0")
+    assert_eq(text(mean(array([1, 2, 3, 4]))), "2.5")
+    assert_eq(text(min(array([3, 1, 2]))), "1.0")
+    assert_eq(text(max(array([3, 1, 2]))), "3.0")
+    assert_eq(text(product(array([1, 2, 3, 4]))), "24.0")
+    -- por eje (axis 0 = columnas, axis 1 = filas)
+    assert(sum(array([[1, 2], [3, 4]]), 0) == array([4, 6]))
+    assert(sum(array([[1, 2], [3, 4]]), 1) == array([3, 7]))
+    assert(mean(array([[1, 2], [3, 4]]), 0) == array([2, 3]))
+    -- std/var: MUESTRALES por defecto desde v0.6.29 (ddof = 1, como pandas); ddof = 0 poblacional.
+    assert_eq(text(var(array([1, 2, 3]))), "1.0")
+    assert_eq(text(var(array([1, 2, 3]), ddof = 0)), "0.6666666666666666")
+    assert(abs(std(array([2, 4, 4, 4, 5, 5, 7, 9]), ddof = 0) - 2) < tol)
+    -- std/var sobre lista (ergonomía)
+    assert_eq(text(var([1, 2, 3])), "1.0")
+
+-- =========================================================
+-- Álgebra lineal (vectores publicados, tol 1e-9)
+-- =========================================================
+
+test "matmul_and_dot"
+    assert(matmul(array([[1, 2], [3, 4]]), array([[5, 6], [7, 8]])) == array([[19, 22], [43, 50]]))
+    -- 1·4+2·5+3·6
+    assert_eq(text(dot(array([1, 2, 3]), array([4, 5, 6]))), "32.0")
+    expect_error(() => matmul(array([[1, 2, 3]]), array([[1, 2]])), "incompatible")
+
+test "det_inv_solve"
+    assert_eq(text(det(array([[1, 2], [3, 4]]))), "-2.0")
+    -- inv(A) · A ≈ I
+    assert(norm(matmul(inv(array([[1, 2], [3, 4]])), array([[1, 2], [3, 4]])) - identity(2)) < tol)
+    -- solve: A x = b. NOTA: el ejemplo del spec `solve([[3,2],[1,2]],[5,5])→[1,1]` es
+    -- inconsistente (matmul daría [5,3]≠[5,5]; la solución real es [0, 2.5]). Uso un
+    -- sistema con solución limpia [1,1]: [[2,1],[1,3]]·[1,1] = [3,4].
+    let a be array([[2, 1], [1, 3]])
+    let x be solve(a, array([3, 4]))
+    assert(norm(matmul(a, reshape(x, [2, 1])) - reshape(array([3, 4]), [2, 1])) < tol)
+    assert(norm(x - array([1, 1])) < tol)
+    -- El ejemplo (inconsistente) del spec igual resuelve bien por residual: A·x ≈ b.
+    let a2 be array([[3, 2], [1, 2]])
+    let x2 be solve(a2, array([5, 5]))
+    assert(norm(matmul(a2, reshape(x2, [2, 1])) - reshape(array([5, 5]), [2, 1])) < tol)
+
+test "norm_and_trace"
+    -- L2 de un vector
+    assert_eq(text(norm(array([3, 4]))), "5.0")
+    -- suma de |x|
+    assert_eq(text(norm(array([[1, 2], [3, 4]]), "l1")), "10.0")
+    assert_eq(text(trace(array([[1, 2], [3, 4]]))), "5.0")
+
+test "singular_errors"
+    expect_error(() => inv(array([[1, 2], [2, 4]])), "singular")
+    expect_error(() => solve(array([[1, 2], [2, 4]]), array([1, 2])), "singular")
+    -- LA requiere 2D
+    expect_error(() => inv(array([1, 2, 3])), "2D")
+
+test "eig_symmetric"
+    -- A = [[2,1],[1,2]] (simétrica): autovalores 1 y 3; suma = trace = 4, im ≈ 0.
+    let r be eig(array([[2, 1], [1, 2]]))
+    assert(abs((real(r.values[0]) + real(r.values[1])) - 4) < tol)
+    assert((abs(imag(r.values[0])) + abs(imag(r.values[1]))) < tol)
+    assert_eq(text(length(r.values)), "2")
+
+test "svd_reconstructs"
+    -- A = U·diag(s)·Vt → reconstruir: (U * s) ⊕ broadcast · Vt ≈ A.
+    let a be array([[1, 2], [3, 4]])
+    let r be svd(a)
+    let recon be matmul(r.u * r.s, r.vt)
+    assert(norm(recon - a) < tol)

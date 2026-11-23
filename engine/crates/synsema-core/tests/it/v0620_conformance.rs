@@ -65,27 +65,6 @@ impl Drop for Tree {
 // §3.1 reverse / split("")
 // ---------------------------------------------------------------------------------
 
-#[test]
-fn reverse_list_and_text() {
-    shows("reverse([1, 2, 3])", "[3, 2, 1]");
-    shows("reverse([])", "[]");
-    shows("reverse(\"abc\")", "cba");
-    // Por scalar Unicode: la ñ es un scalar, se conserva entera.
-    shows("reverse(\"añb\")", "bña");
-    // Valor nuevo: el original no se toca.
-    assert_eq!(out("let xs be [1, 2]\nlet ys be reverse(xs)\nprint(xs)\nprint(ys)"), vec!["[1, 2]", "[2, 1]"]);
-    fails_with("print(reverse(42))", "reverse");
-}
-
-#[test]
-fn split_with_empty_separator_yields_characters() {
-    shows("split(\"abc\", \"\")", "[\"a\", \"b\", \"c\"]");
-    shows("length(split(\"añb\", \"\"))", "3");
-    shows("split(\"\", \"\")", "[]");
-    // El separador no vacío no cambia.
-    shows("split(\"a,b\", \",\")", "[\"a\", \"b\"]");
-}
-
 // ---------------------------------------------------------------------------------
 // §3.5 steps()
 // ---------------------------------------------------------------------------------
@@ -250,11 +229,3 @@ fn private_clause_parses_in_a_route_and_in_a_group() {
     assert_eq!(out("let private be 3\nprint(private + 1)"), vec!["4"]);
 }
 
-#[test]
-fn private_in_a_group_reaches_the_routes_meta() {
-    // El grupo se ejecuta a un map con `_routes_meta`; `private` viaja ahí (por ruta y por grupo).
-    let src = "export routes g\n    route \"GET /a\"\n        private\n        give 1\n    route \"GET /b\"\n        give 2\n\nlet metas be g._routes_meta\nprint(metas[0].private)\nprint(metas[1].private)\nprint(metas[0].streaming)\n";
-    assert_eq!(out(src), vec!["true", "false", "false"]);
-    let grp = "export routes g\n    private\n    route \"GET /a\"\n        give 1\n    route \"GET /b\"\n        give 2\n\nprint(g._routes_meta[0].private)\nprint(g._routes_meta[1].private)\n";
-    assert_eq!(out(grp), vec!["true", "true"]);
-}

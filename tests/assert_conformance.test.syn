@@ -1,0 +1,169 @@
+-- Gemelo de assert_conformance.rs (v0.6.68, migas §4): los builtins assert* con su mensaje
+-- exacto vía try/recover y las aserciones sobre valores. `test_block_is_noop_in_run` queda en
+-- Rust: prueba el modo `run` del host (RunResult.output con el test como no-op); bajo
+-- `synsema test` los bloques test SÍ corren, esa aserción no es expresable (migas §1).
+-- Correr con: synsema test tests/assert_conformance.test.syn
+
+-- G3 (fuera de test): las aserciones funcionan en código normal, a nivel de archivo.
+let x be 10
+assert(x > 5)
+
+let g3_raised be false
+let g3_msg be ""
+try
+    let y be 1
+    assert(y > 5, "x too small")
+recover e
+    set g3_raised to true
+    set g3_msg to e
+assert(g3_raised)
+assert_eq(g3_msg, "x too small")
+
+test "assert_basic"
+    assert(true)
+    assert(1)
+    assert("x")
+    let ok be false
+    try
+        assert(false)
+    recover e
+        set ok to true
+        assert(contains(e, "assertion failed"))
+    assert(ok)
+    let ok2 be false
+    try
+        assert(false, "custom message")
+    recover e
+        set ok2 to true
+        assert(contains(e, "custom message"))
+    assert(ok2)
+    -- falsy: 0, "", [], nothing
+    let ok3 be false
+    try
+        assert(0)
+    recover e
+        set ok3 to true
+        assert(contains(e, "assertion failed"))
+    assert(ok3)
+    let ok4 be false
+    try
+        assert([])
+    recover e
+        set ok4 to true
+        assert(contains(e, "assertion failed"))
+    assert(ok4)
+
+test "assert_eq_basic"
+    assert_eq(2 + 3, 5)
+    assert_eq("hi", "hi")
+    assert_eq([1, 2], [1, 2])
+    let ok be false
+    try
+        assert_eq("a", "b")
+    recover e
+        set ok to true
+        assert(contains(e, "expected b, got a"))
+    assert(ok)
+    let ok2 be false
+    try
+        assert_eq(1, 2, "nums")
+    recover e
+        set ok2 to true
+        assert(contains(e, "nums: expected 2, got 1"))
+    assert(ok2)
+
+test "assert_eq_bytes_uses_hex_repr"
+    -- Batch 1: bytes igualan byte-a-byte; el mensaje usa el repr hex (Display).
+    assert_eq(bytes("Hello"), bytes("48656c6c6f", "hex"))
+    let ok be false
+    try
+        assert_eq(bytes("Hi"), bytes("Ho"))
+    recover e
+        set ok to true
+        assert(contains(e, "expected bytes(486f), got bytes(4869)"))
+    assert(ok)
+
+test "assert_ne_basic"
+    assert_ne(1, 2)
+    assert_ne(bytes("Hi"), bytes("Ho"))
+    let ok be false
+    try
+        assert_ne(1, 1)
+    recover e
+        set ok to true
+        assert(contains(e, "expected values to differ, both 1"))
+    assert(ok)
+    let ok2 be false
+    try
+        assert_ne("x", "x", "dup")
+    recover e
+        set ok2 to true
+        assert(contains(e, "dup: expected values to differ, both x"))
+    assert(ok2)
+
+test "assert_error_passes_when_fn_raises"
+    -- lambda que indexa fuera de rango → error del cuerpo.
+    assert_error(() => [1][100])
+    -- error explícito de tipo
+    assert_error(() => bytes(true))
+
+test "assert_error_fails_when_no_error"
+    let ok be false
+    try
+        assert_error(() => 1)
+    recover e
+        set ok to true
+        assert(contains(e, "expected an error, but none was raised"))
+    assert(ok)
+
+test "assert_error_give_is_not_an_error"
+    -- Una lambda hace `give` (su cuerpo SIEMPRE es un give implícito); eso NO es un error
+    -- → assert_error DEBE fallar, no pasar por accidente.
+    let f be () => 42
+    let ok be false
+    try
+        assert_error(f)
+    recover e
+        set ok to true
+        assert(contains(e, "expected an error, but none was raised"))
+    assert(ok)
+
+test "assert_error_non_invocable"
+    let ok be false
+    try
+        assert_error(5)
+    recover e
+        set ok to true
+        assert(contains(e, "assert_error expects a task or lambda"))
+    assert(ok)
+
+-- G3: la mitad que corre FUERA de cualquier bloque test quedó arriba, a nivel de archivo.
+test "assert_works_outside_test_blocks"
+    assert(g3_raised)
+    assert_eq(g3_msg, "x too small")
+
+-- G1: `test` sigue usable como identificador (3 posiciones)
+test "test_as_identifier_three_positions"
+    -- variable
+    let test be 5
+    assert_eq(test, 5)
+    -- parámetro
+    task f(test)
+        give test
+    assert_eq(f(7), 7)
+    -- clave/propiedad de map
+    let m be {"test": 1}
+    assert_eq(m.test, 1)
+
+-- assert dentro de un task llamado desde código normal: el fallo se propaga
+test "assert_inside_task_propagates"
+    task check(n)
+        assert(n > 0, "must be positive")
+        give n
+    let ok be false
+    try
+        check(-1)
+    recover e
+        set ok to true
+        assert(contains(e, "must be positive"))
+    assert(ok)

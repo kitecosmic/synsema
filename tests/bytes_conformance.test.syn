@@ -1,0 +1,140 @@
+-- Gemelo de bytes_conformance.rs (v0.6.68, migas §4): parte PURA del tipo `bytes` (Batch 1) —
+-- construcción/conversión (hex/base64/lista), decode utf8 estricto vs lossy, operaciones
+-- (length/index/slice/contains/concat), igualdad byte-a-byte, truthiness, type_of/is_bytes.
+-- Correr con: synsema test tests/bytes_conformance.test.syn
+
+task expect_error(f, needle)
+    let ok be false
+    try
+        f()
+    recover e
+        set ok to true
+        assert(contains(e, needle))
+    assert(ok)
+
+-- -- Construcción y conversión --
+
+test "construct_from_text_utf8_multibyte"
+    -- "héllo" → 6 bytes (é = 2 bytes UTF-8); decode round-trip preserva multibyte.
+    assert_eq(text(length(bytes("héllo"))), "6")
+    assert_eq(decode(bytes("héllo")), "héllo")
+    assert_eq(decode(bytes("héllo"), "utf8"), "héllo")
+
+test "construct_from_hex"
+    assert_eq(decode(bytes("48656c6c6f", "hex")), "Hello")
+    -- round-trip: decode(.., "hex") es minúsculas.
+    assert_eq(decode(bytes("48656C6C6F", "hex"), "hex"), "48656c6c6f")
+    assert_eq(text(length(bytes("", "hex"))), "0")
+
+test "construct_from_base64"
+    -- base64 de "Hello" = "SGVsbG8="
+    assert_eq(decode(bytes("Hello"), "base64"), "SGVsbG8=")
+    assert_eq(decode(bytes("SGVsbG8=", "base64")), "Hello")
+
+test "construct_from_int_list"
+    assert_eq(decode(bytes([72, 73])), "HI")
+    assert_eq(text(length(bytes([]))), "0")
+
+test "construct_identity_and_display"
+    assert_eq(decode(bytes(bytes("Hi"))), "Hi")
+    -- Display: bytes(<hexlower>)
+    assert_eq(text(bytes("Hi")), "bytes(4869)")
+    assert_eq(text(bytes("Hi")), "bytes(4869)")
+
+test "construct_display_truncates_over_32_bytes"
+    -- 40 bytes (0..39) → primeros 32 en hex + "… (40 bytes)".
+    assert_eq(text(bytes(range(40))), "bytes(" + slice(hex(bytes(range(32))), 2) + "… (40 bytes))")
+
+test "construct_errors"
+    -- longitud impar
+    expect_error(() => bytes("abc", "hex"), "hex")
+    -- no-hex
+    expect_error(() => bytes("zz", "hex"), "hex")
+    expect_error(() => bytes([256]), "0..=255")
+    expect_error(() => bytes([-1]), "0..=255")
+    expect_error(() => bytes(["x"]), "0..=255")
+    expect_error(() => bytes(true), "Cannot convert bool to bytes")
+    expect_error(() => bytes("x", "rot13"), "unsupported encoding")
+
+-- -- decode: utf8 estricto vs lossy (G4) --
+
+test "decode_utf8_strict_errors_on_invalid"
+    -- 0xFF no es UTF-8 válido → decode estricto ERRORA (no devuelve basura).
+    expect_error(() => decode(bytes("ff", "hex")), "UTF-8")
+    expect_error(() => decode(bytes("ff", "hex"), "utf8"), "UTF-8")
+
+test "decode_utf8_lossy_is_opt_in"
+    -- lossy explícito → U+FFFD.
+    assert_eq(decode(bytes("ff", "hex"), "utf8_lossy"), "�")
+
+test "decode_errors"
+    expect_error(() => decode("not bytes"), "decode expects bytes, got text")
+    expect_error(() => decode(bytes("x"), "rot13"), "unsupported encoding")
+
+test "decode_empty"
+    assert_eq("[" + decode(bytes("")) + "]", "[]")
+
+-- -- Operaciones --
+
+test "index_returns_byte_value"
+    assert_eq(bytes("Hi")[0], 72)
+    assert_eq(bytes("Hi")[1], 105)
+    assert_eq(bytes([255])[0], 255)
+
+test "index_out_of_bounds"
+    expect_error(() => bytes("Hi")[5], "out of bounds")
+    -- Negativos cuentan desde el final (v0.6.29); fuera de rango sigue siendo error.
+    assert_eq(bytes("Hi")[-1], 105)
+    expect_error(() => bytes("Hi")[-3], "out of bounds")
+
+test "slice_bytes"
+    assert_eq(decode(slice(bytes("Hello"), 1, 3)), "el")
+    assert_eq(decode(slice(bytes("Hello"), -2)), "lo")
+    -- rango invertido → vacío
+    assert_eq("[" + decode(slice(bytes("Hello"), 3, 1)) + "]", "[]")
+
+test "contains_bytes_and_byte"
+    assert_eq(contains(bytes("Hello"), bytes("ell")), true)
+    assert_eq(contains(bytes("Hello"), bytes("xyz")), false)
+    assert_eq(contains(bytes("Hello"), bytes("")), true)
+    -- 'H'
+    assert_eq(contains(bytes("Hello"), 72), true)
+    assert_eq(contains(bytes("Hello"), 99), false)
+
+test "concat_bytes"
+    assert_eq(decode(bytes("Hel") + bytes("lo")), "Hello")
+    -- bytes + text es error desde v0.6.29: el repr hex pegado a un texto no era lo que
+    -- nadie quería. La conversión se escribe: hex(b) o decode(b, "utf8").
+    expect_error(() => bytes("Hi") + "!", "Cannot add text and bytes")
+    expect_error(() => "!" + bytes("Hi"), "hex(b)")
+    assert_eq(hex(bytes("Hi")) + "!", "0x4869!")
+
+test "equality_byte_for_byte_no_cross_type"
+    assert_eq(bytes("Hi") == bytes("Hi"), true)
+    assert_eq(bytes("Hi") == bytes("Ho"), false)
+    -- bytes nunca igual a text aunque "coincidan" (G3).
+    assert_eq(bytes("Hi") == "Hi", false)
+    assert_eq(bytes("Hi") != "Hi", true)
+
+test "truthiness_empty_is_false"
+    task branch(b)
+        when b
+            give "t"
+        otherwise
+            give "f"
+    assert_eq(branch(bytes("")), "f")
+    assert_eq(branch(bytes("x")), "t")
+
+test "type_of_and_is_bytes"
+    assert_eq(type_of(bytes("x")), "bytes")
+    assert_eq(is_bytes(bytes("x")), true)
+    assert_eq(is_bytes("x"), false)
+    assert_eq(is_bytes(42), false)
+
+test "base64_round_trips_all_256_values"
+    -- bytes(range(256)) → 256 bytes; decode b64 + re-decode → idéntico (length 256).
+    let all be bytes(range(256))
+    let b64 be decode(all, "base64")
+    let back be bytes(b64, "base64")
+    assert_eq(all == back, true)
+    assert_eq(text(length(back)), "256")

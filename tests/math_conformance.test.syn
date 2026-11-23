@@ -1,0 +1,148 @@
+-- Gemelo de math_conformance.rs (v0.6.68, migas §4): los mismos 14 tests, sobre valores
+-- (assert_eq/text) y con try/recover para los mensajes de error exactos. Ninguno queda en Rust.
+-- Correr con: synsema test tests/math_conformance.test.syn
+
+task expect_error(f, needle)
+    let ok be false
+    try
+        f()
+    recover e
+        set ok to true
+        assert(contains(e, needle))
+    assert(ok)
+
+-- ===== G1: comportamiento REAL intacto =====
+
+test "g1_real_unchanged"
+    assert(is_nan(sqrt(-1)))
+    assert_eq(text(ln(0)), "-inf")
+    assert_eq(text(sqrt(4)), "2.0")
+    assert(abs(sqrt(2) - 1.4142135623730951) < 0.000000001)
+    assert_eq(text(abs(-5)), "5")
+    assert_eq(text(abs(-5)), "5")
+    assert(type_of(abs(-3)) == "number")
+    assert_eq(text(min(3, 5, 1)), "1")
+
+-- ===== Constructor / accesores =====
+
+test "complex_constructor_and_display"
+    assert_eq(text(complex(3, 2)), "3+2i")
+    assert_eq(text(complex(3, -2)), "3-2i")
+    assert_eq(text(complex(0, 1)), "0+1i")
+    assert_eq(text(complex(1.5, -2.5)), "1.5-2.5i")
+    assert_eq(type_of(complex(1, 2)), "complex")
+
+test "complex_accessors"
+    assert_eq(text(real(complex(3, 4))), "3.0")
+    assert_eq(text(imag(complex(3, 4))), "4.0")
+    assert_eq(text(abs(complex(3, 4))), "5.0")
+    assert_eq(text(conj(complex(3, 4))), "3-4i")
+    assert(abs(arg(complex(0, 1)) - 1.5707963267948966) < 0.000000001)
+    -- accesores sobre un real (ergonomía)
+    assert_eq(text(real(5)), "5.0")
+    assert_eq(text(imag(5)), "0.0")
+
+test "is_complex_and_truthy"
+    assert(is_complex(complex(1, 0)))
+    assert(not is_complex(5))
+    assert(not is_complex("x"))
+    -- complex(0,0) es falsy; cualquier parte no-cero es truthy.
+    assert(is_complex(complex(0, 0)))
+    let branch be ""
+    when complex(0, 0)
+        set branch to "t"
+    otherwise
+        set branch to "f"
+    assert_eq(branch, "f")
+    when complex(0, 1)
+        set branch to "t"
+    otherwise
+        set branch to "f"
+    assert_eq(branch, "t")
+
+-- ===== Aritmética fluida (incl. promoción real→complex) =====
+
+test "complex_arithmetic"
+    assert_eq(text(complex(1, 2) + complex(3, 4)), "4+6i")
+    assert_eq(text(complex(5, 3) - complex(2, 1)), "3+2i")
+    assert_eq(text(complex(1, 2) * complex(3, 4)), "-5+10i")
+    assert_eq(text(2 * complex(0, 1)), "0+2i")
+    assert_eq(text(3 + complex(0, 2)), "3+2i")
+    assert_eq(text(complex(0, 2) + 3), "3+2i")
+    assert_eq(text(complex(0, 1) ** 2), "-1+0i")
+    assert_eq(text(complex(2, 0) ** 3), "8+0i")
+    assert_eq(text(complex(1, 1) / complex(1, 1)), "1+0i")
+    assert_eq(text(-complex(3, 2)), "-3-2i")
+
+test "complex_division_by_zero"
+    expect_error(() => print(complex(1, 0) / complex(0, 0)), "Division by zero")
+
+test "complex_plus_text_is_concat"
+    -- G adversarial: complex + text → concatenación vía Display, NO error.
+    assert_eq(text(complex(3, 2) + " units"), "3+2i units")
+    assert_eq(text("z = " + complex(0, 1)), "z = 0+1i")
+
+-- ===== Igualdad (G4) y orden (G3) =====
+
+test "complex_equality_pythonic"
+    assert(complex(3, 0) == 3)
+    assert(3 == complex(3, 0))
+    assert(complex(3, 2) == complex(3, 2))
+    assert(complex(3, 2) != 3)
+    assert(complex(3, 2) != complex(3, 5))
+    assert(not (complex(2, 0) == 3))
+
+test "complex_not_ordered"
+    expect_error(() => print(complex(1, 0) < complex(2, 0)), "complex numbers are not ordered")
+    expect_error(() => print(complex(1, 0) > 2), "complex numbers are not ordered")
+    expect_error(() => print(5 <= complex(1, 0)), "complex numbers are not ordered")
+
+-- ===== cmath (transcendentales polimórficas) =====
+
+test "cmath_euler_and_roots"
+    -- Identidad de Euler: exp(iπ) = -1.
+    assert(abs(real(exp(complex(0, pi))) + 1) < 0.000000001)
+    assert(abs(imag(exp(complex(0, pi)))) < 0.000000001)
+    -- sqrt(-1) como complejo → i (exacto vía el fast-path real de num-complex).
+    assert_eq(text(sqrt(complex(-1, 0))), "0+1i")
+    -- ln(-1) como complejo → iπ.
+    assert(abs(real(ln(complex(-1, 0)))) < 0.000000001)
+    assert(abs(imag(ln(complex(-1, 0))) - pi) < 0.000000001)
+    -- sin/cos complejos siguen siendo complejos.
+    assert(is_complex(sin(complex(1, 1))))
+
+test "real_transcendentals_unchanged"
+    -- Las mismas funciones con arg real → resultado real (G1).
+    assert(not is_complex(sqrt(2)))
+    assert(not is_complex(exp(1)))
+    assert(not is_complex(sin(0)))
+    -- log10/log2/atan2/hypot quedan real-only (error con complex).
+    expect_error(() => print(log10(complex(1, 1))), "expects a number")
+    expect_error(() => print(hypot(complex(1, 1), 2)), "expects a number")
+
+-- ===== Funciones especiales (vectores publicados, tol 1e-9) =====
+
+test "special_functions"
+    assert(abs(gamma(5) - 24) < 0.000000001)
+    assert(abs(gamma(0.5) - 1.7724538509055159) < 0.000000001)
+    assert(abs(lgamma(10) - 12.801827480081469) < 0.000000001)
+    assert(erf(0) == 0)
+    assert(abs(erf(1) - 0.8427007929497149) < 0.000000001)
+    assert(erfc(0) == 1)
+    assert(abs(beta(2, 3) - 0.08333333333333333) < 0.000000001)
+
+test "special_functions_reject_complex"
+    expect_error(() => print(gamma(complex(1, 1))), "gamma is not defined for complex numbers")
+    expect_error(() => print(erf(complex(1, 0))), "erf is not defined for complex numbers")
+
+-- ===== Hiperbólicas (real + complejo) =====
+
+test "hyperbolics"
+    assert(sinh(0) == 0)
+    assert(cosh(0) == 1)
+    assert(tanh(0) == 0)
+    assert(abs(asinh(sinh(1)) - 1) < 0.000000001)
+    assert(abs(cosh(1) - 1.5430806348152437) < 0.000000001)
+    -- sinh(i) = i·sin(1) → parte imaginaria ≈ sin(1), real ≈ 0.
+    assert(abs(real(sinh(complex(0, 1)))) < 0.000000001)
+    assert(abs(imag(sinh(complex(0, 1))) - 0.8414709848078965) < 0.000000001)
