@@ -95,32 +95,7 @@ fn b4_log_show_print_keep_order() {
 
 
 // B7 — el linaje no publica credenciales ni registra lecturas que no llegaron.
-#[test]
-fn b7_lineage_host_without_credentials() {
-    let r = run_program(
-        "require net(\"127.0.0.1\")\nlet r be http_get(\"http://alice:pw@127.0.0.1:1/x?api_key=K\")\nprint(length(lineage()))",
-        "audit.syn",
-    );
-    assert!(r.success, "{:?}", r.errors);
-    assert_eq!(r.output, vec!["0"]);
-}
-
 // B8 — `evm_tx_raw` recalcula el digest, exige `from` en una creación y re-deriva la dirección.
-#[test]
-fn b8_evm_tx_raw_checks_what_is_signed() {
-    let pre = "require sign(\"K\")\nlet k be as_secret(bytes(\"4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318\", \"hex\"), \"K\")\nlet k2 be as_secret(bytes(\"0000000000000000000000000000000000000000000000000000000000000001\", \"hex\"), \"K\")\nlet tx be evm_tx_create({\"chain_id\": 7960, \"nonce\": 3, \"from\": evm_address(k), \"value\": 0, \"gas\": 100000, \"max_fee\": 10, \"max_priority\": 1, \"data\": bytes(\"6000\", \"hex\")})\nlet sig be secp256k1_sign(tx[\"digest\"], k)\n";
-    assert_eq!(out(&format!("{}print(length(evm_tx_raw(tx, sig)))", pre)), vec!["86"]);
-    assert!(fails(&format!("{}print(evm_tx_raw(remove(tx, \"from\"), secp256k1_sign(tx[\"digest\"], k2)))", pre)).contains("must carry \"from\""));
-    assert!(fails(&format!("{}let t be tx\nset t[\"fields\"][1] to 99\nprint(evm_tx_raw(t, sig))", pre)).contains("\"digest\" does not match"));
-    assert!(fails(&format!("{}let t be tx\nset t[\"nonce\"] to 7\nprint(evm_tx_raw(t, sig))", pre)).contains("\"nonce\" does not match"));
-    assert!(fails(&format!("{}let t be tx\nset t[\"from\"] to evm_address(k2)\nprint(evm_tx_raw(t, secp256k1_sign(tx[\"digest\"], k2)))", pre)).contains("contract_address"));
-    assert!(fails(&format!("{}let t be tx\nset t[\"digest\"] to keccak256(bytes(\"x\", \"utf8\"))\nprint(evm_tx_raw(t, secp256k1_sign(t[\"digest\"], k)))", pre)).contains("\"digest\" does not match"));
-}
-
-
-
-
-
 // Medios de datos: join por hash con todas las columnas, semi/anti/right; columnas mal
 // escritas son error; summarize/pivot no pisan ni mezclan columnas.
 #[test]
@@ -145,11 +120,6 @@ fn tables_no_silent_loss() {
 
 
 // `set f(x)[k]` escribe a través de un valor, no de una variable: error.
-#[test]
-fn set_target_must_start_from_a_variable() {
-    assert!(fails("let m be {\"a\": {\"b\": 0}}\nset get(m, \"a\")[\"b\"] to 1").contains("must start from a variable"));
-}
-
 // Reflejos de Python con su pista.
 #[test]
 fn python_reflexes_have_hints() {
@@ -216,37 +186,7 @@ fn r3_generators_in_workers() {
 }
 
 // Parquet: una página que declara 2 GiB se rechaza ANTES de reservarlos; nanosegundos exactos.
-#[test]
-fn r3_parquet_expansion_cap() {
-    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/parquet_page_bomb.parquet");
-    let dir = fixture.parent().unwrap().to_string_lossy().replace('\\', "/");
-    let e = fails(&format!(
-        "require file.read(\"{dir}/*\")\nprint(parquet_read(read_file_bytes(\"{dir}/parquet_page_bomb.parquet\")))"
-    ));
-    assert!(e.contains("refusing to allocate"), "{}", e);
-    assert_eq!(
-        out("let t be datetime(\"2023-11-14T22:13:20.123456789Z\")\nprint(parquet_read(parquet_write([{\"t\": t}]))[0].t == t)"),
-        vec!["true"]
-    );
-}
-
-
-
 // Linaje: un resultado con enteros > 2^53 se hashea como json_encode y lo dice.
-#[test]
-fn r3_lineage_encoding_for_wide_ints() {
-    let dir = std::env::temp_dir().join(format!("synsema-lin3-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let db = dir.join("t.db").to_string_lossy().replace('\\', "/");
-    let src = format!(
-        "require db(\"{db}\")\ndb_open(\"{db}\")\nsql_exec(\"CREATE TABLE t (a INTEGER)\")\nsql_exec(\"INSERT INTO t VALUES (9007199254740993)\")\nlet rows be sql(\"SELECT * FROM t\")\nlet l be lineage()[0]\nprint(l.encoding, \"0x\" + l.sha256 == hex(sha256(json_encode(rows))))"
-    );
-    let o = out(&src);
-    let _ = std::fs::remove_dir_all(&dir);
-    assert_eq!(o, vec!["json true"]);
-}
-
-
 // Números: divmod de floats como CPython/numpy; literales con `_` sólo entre dígitos; `0o`.
 #[test]
 fn r3_numbers_like_python() {
@@ -344,86 +284,10 @@ fn r4_generator_in_global_list() {
 }
 
 // parallel_map avanza los generadores del padre como `apply`; el duplicado se ve a cualquier profundidad.
-#[test]
-fn r4_parallel_map_advances_parent_generators() {
-    let o = out(r#"task w(h)
-    give h()
-let g be rng(7)
-let a be parallel_map(w, [g])
-let x be g()
-let g2 be rng(7)
-let b be apply([g2], w)
-let y be g2()
-print(a == b, x == y, a[0] == x)
-let kids be rng_spawn(rng(3), 2)
-let k1 be parallel_map(w, kids)
-let k2 be parallel_map(w, kids)
-print(k1 == k2)"#);
-    assert_eq!(o, vec!["true true false", "false"]);
-    let e = fails("let g be rng(1)\nprint(parallel_map((i) => 1, [[[[[{\"a\": g}]]]], [[[[[{\"b\": g}]]]]]]))");
-    assert!(e.contains("the same generator"), "{}", e);
-}
-
-
-
 // sql_exec: la palabra returning dentro de un texto no es RETURNING.
-#[test]
-fn r4_sql_exec_returning_inside_string() {
-    let dir = std::env::temp_dir().join(format!("synsema-ret4-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let db = dir.join("r.db").to_string_lossy().replace('\\', "/");
-    let o = out(&format!(
-        "require db(\"{db}\")\ndb_open(\"{db}\")\nsql_exec(\"CREATE TABLE t (a TEXT)\")\nsql_exec(\"INSERT INTO t VALUES ('returning soon') -- returning\")\nprint(sql(\"SELECT a FROM t\"))"
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
-    assert_eq!(o, vec!["[{a: \"returning soon\"}]"]);
-}
-
 // Detalles: nombres de evento repetidos, más de 4 topics, nonce ≥ 2^64 − 1, export que falta.
-#[test]
-fn r4_minor_messages() {
-    let e = fails(&format!(
-        r#"let ev be {{"name": "E", "inputs": [{{"name": "a", "type": "uint256", "indexed": false}}, {{"name": "a", "type": "uint256", "indexed": false}}]}}
-print(abi_decode_log(ev, {{"topics": [abi_event_topic(ev)], "data": "0x{}"}}))"#,
-        "0".repeat(128)
-    ));
-    assert!(e.contains("would both be named"), "{}", e);
-    let e = fails("print(evm_create_address(\"0x0000000000000000000000000000000000000001\", 2**64))");
-    assert!(e.contains("EIP-2681"), "{}", e);
-    let e = fails(&format!(
-        "require net(\"127.0.0.1\")\nlet z be \"0x{}\"\nprint(evm_logs(\"http://127.0.0.1:1/\", {{\"topics\": [z, z, z, z, z]}}))",
-        "0".repeat(64)
-    ));
-    assert!(e.contains("at most 4 topics"), "{}", e);
-}
-
-
-
-
 // Linaje: consultas y prompts como compromiso con sal (SD-JWT). La sal queda en `lineage()`, no en
 // el recibo; con ella y la consulta cualquiera recalcula el compromiso.
-#[test]
-fn r5_lineage_salted_commitment() {
-    let dir = std::env::temp_dir().join(format!("synsema-salt-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let db = dir.join("s.db").to_string_lossy().replace('\\', "/");
-    let o = out(&format!(
-        r#"require db("{db}")
-db_open("{db}")
-sql_exec("CREATE TABLE t (a INTEGER)")
-let q be "SELECT count(*) AS n FROM t WHERE a > ?"
-let r1 be sql(q, [5])
-let r2 be sql(q, [5])
-let l be lineage()
-print(starts_with(l[0].what, "query sha256-salted:"), l[0].what == l[1].what, l[0].committed_encoding)
-let c be hex(sha256(bytes(l[0].salt, "hex") + bytes(canonical_json([q, [5]]), "utf8")))
-print("query sha256-salted:" + slice(c, 2) == l[0].what)"#
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
-    assert_eq!(o, vec!["true false jcs", "true"]);
-}
-
-
 // Ronda 6 — B1: `--` dentro de `{`, `[` o `(` es un comentario salvo que todo apunte a restar un
 // negativo (`print(x --1)`): dígito o `(` después, un operando antes en la misma línea, y el
 // bracket más interno es un paréntesis.
@@ -471,33 +335,6 @@ print(contains(pub, "marcador"), contains(pub, "4d41524341444f52"), contains(loc
 
 // Ronda 6 — M1: el rechazo de `sql_exec` con RETURNING es sólo de SQLite (que escribe la fila y
 // después falla); ahí `\` es un carácter más dentro de un literal, así que `'a\'` cierra.
-#[test]
-fn r6_sql_exec_returning_sqlite_only() {
-    let dir = std::env::temp_dir().join(format!("synsema-ret6-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let db = dir.join("r.db").to_string_lossy().replace('\\', "/");
-    let o = out(&format!(
-        r#"require db("{db}")
-db_open("{db}")
-sql_exec("CREATE TABLE t (a TEXT, b TEXT)")
-sql_exec("INSERT INTO t VALUES ('a\\', 'returning')")
-try
-    sql_exec("INSERT INTO t VALUES ('a\\', 'x') RETURNING a")
-recover e
-    print(contains(e, "nothing was executed"))
-print(sql("SELECT a, b FROM t"))"#
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
-    assert_eq!(o, vec!["true", r#"[{a: "a\\", b: "returning"}]"#]);
-}
-
-
-
-
-
-
-
-
 // Ronda 6 — m1: el aviso de `synsema check` para `each r in rows` + `set r[…]`. Avisa cuando lo
 // escrito en `r` se pierde: leer campos de la fila para calcular (`set r["t"] to r["p"] * 2`,
 // `when r.p > 1`) no salva la escritura. No avisa si `r` sale entera del bucle (se pasa, se agrega,
@@ -608,22 +445,6 @@ fn r7_net_port_is_part_of_the_grant() {
 
 // Ronda 7 — R11: `sql_batch` con RETURNING en SQLite se rechaza ANTES de ejecutar ninguna fila (el
 // mismo pre-chequeo de `sql_exec`); antes escribía la primera y después fallaba.
-#[test]
-fn r7_sql_batch_returning_writes_nothing() {
-    let o = out(r#"require db(":memory:")
-db_open(":memory:", "memory")
-sql_exec("CREATE TABLE t (id INTEGER PRIMARY KEY, n TEXT)")
-try
-    print(sql_batch("INSERT INTO t (n) VALUES (?) RETURNING id", [["a"], ["b"]]))
-recover e
-    print(e)
-print(sql("SELECT count(*) AS c FROM t"))
-print(sql_batch("INSERT INTO t (n) VALUES (?)", [["returning"], ["b"]]))"#);
-    assert!(o[0].starts_with("sql_batch: this statement returns rows (RETURNING)") && o[0].contains("nothing was executed"), "{:?}", o);
-    assert_eq!(o[1], "[{c: 0}]");
-    assert_eq!(o[2], "{rows_affected: 2}");
-}
-
 // Ronda 7 — D1: `csv_encode(rows, {"missing": "NA"})` escribe cada `nothing` como la marca, sin
 // comillas (el `na_rep` de pandas); con `csv_parse(text, {"missing": ["NA"]})` la ida y vuelta es
 // exacta con una columna o con varias. Un texto igual a la marca va entre comillas.

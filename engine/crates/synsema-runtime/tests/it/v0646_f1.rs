@@ -22,24 +22,6 @@ fn tool(name: &str, args: &[(&str, &str)]) -> LlmStepResponse {
 
 const ADD: &str = "task add(a: number, b: number = 1, note, tags: list = [])\n    give a + b + length(tags)\n";
 
-#[test]
-fn f1_tool_spec_takes_the_catalog_from_the_signature() {
-    assert_eq!(
-        out(&format!("{ADD}print(json_encode(tool_spec(add, \"Adds two numbers\")))\n")),
-        vec![r#"{"name": "add", "describe": "Adds two numbers", "params": ["a: number", "b: number", "note", "tags: list"], "optional": ["b", "tags"]}"#]
-    );
-    assert_eq!(out(&format!("{ADD}print(tool_spec(add).describe == \"\")\n")), vec!["true"]);
-    let r = run_program("print(tool_spec((x) => x))\n", "v0646_f1.syn");
-    assert!(r.errors.join("\n").contains("tool_spec needs a named task"), "{:?}", r.errors);
-    let r = run_program("print(tool_spec(length))\n", "v0646_f1.syn");
-    assert!(r.errors.join("\n").contains("not the builtin 'length'"), "{:?}", r.errors);
-    // Un secret cuenta como texto para `call` (y sigue opaco).
-    assert_eq!(
-        out("task k(key: text)\n    give type_of(key)\nprint(call(k, {\"key\": as_secret(\"s\")}))\n"),
-        vec!["secret"]
-    );
-}
-
 /// El proveedor manda `"2"`, `"[1, 2]"`: con el catálogo tipado vuelven a número y lista, `note` (sin
 /// tipo) sigue siendo texto aunque parezca un número. Lo que no da el tipo queda como texto y
 /// `call_tool` lo rechaza diciendo por qué.

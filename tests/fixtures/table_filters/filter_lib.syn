@@ -1,0 +1,12 @@
+-- Ejemplo de una librería de filtros escrita enteramente en Synsema.
+-- No convierte la tabla a filas ni necesita acceso a los bloques internos.
+
+export task valid_trips(t)
+    let moving be column_mask(t, "distance", ">", 0)
+    let priced be column_mask(t, "fare", "<", 500, missing = "exclude")
+    give where(t, logical_and(moving, priced))
+
+export task between(t, name, low, high)
+    let from_low be column_mask(t, name, ">=", low)
+    let to_high be column_mask(t, name, "<=", high)
+    give where(t, logical_and(from_low, to_high))

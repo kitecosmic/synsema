@@ -27,33 +27,7 @@ fn mongo_url() -> Option<String> {
 
 /// `db_open("mongodb://…")` sin `require db` → violación con el scope canónico (sin
 /// credenciales/puerto/query). Tampoco se auto-otorga en run.
-#[test]
-fn mongo_db_open_deny_without_require() {
-    let r = run_source(
-        "db_open(\"mongodb://user:pw@localhost:27017/appdb?authSource=admin\")",
-        "<t>",
-    );
-    assert!(!r.success);
-    assert_eq!(
-        r.errors,
-        vec!["Runtime error: Capability not granted: db(\"mongodb://localhost/appdb\") — this is a permission, not a bug: add `require db(\"mongodb://localhost/appdb\")` to the program's preamble (or to the importing file, when this code runs in a module)".to_string()]
-    );
-}
-
 /// El scope URL es fiel: una grant a una base no cubre otra.
-#[test]
-fn mongo_scope_mismatch_deny() {
-    let r = run_source(
-        "require db(\"mongodb://localhost/appdb\")\ndb_open(\"mongodb://localhost/otra\")",
-        "<t>",
-    );
-    assert!(!r.success);
-    assert_eq!(
-        r.errors,
-        vec!["Runtime error: Capability not granted: db(\"mongodb://localhost/otra\") — this is a permission, not a bug: add `require db(\"mongodb://localhost/otra\")` to the program's preamble (or to the importing file, when this code runs in a module)".to_string()]
-    );
-}
-
 /// Con el grant adecuado el gate pasa y se rutea a Mongo; el puerto muerto (con un
 /// server-selection timeout corto) da un error de RED — no de capability — → prueba "pasó el
 /// gate + ruteo a Mongo" sin un servidor real.

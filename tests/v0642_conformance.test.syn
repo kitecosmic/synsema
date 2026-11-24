@@ -1,0 +1,9 @@
+-- Gemelo de v0642_conformance.rs (core) (v0.6.68, tanda 2): sin bloques migrables — el único
+-- candidato queda en Rust:
+--   eprint_does_not_go_to_the_program_output: afirma RunResult.output del host (que eprint no se
+--     mezcle con la salida capturada de print); el runner .syn no expone esa lista.
+-- El resto del archivo Rust (exit_code del Control, label_violation con operator_detail, y los
+-- avisos de `synsema check` sobre árboles multi-módulo que el host escribe) tampoco es
+-- afirmable dentro del lenguaje.
+-- Correr con: synsema test tests/v0642_conformance.test.syn (0 bloques: la decisión vive en el
+-- TSV y en Rust).

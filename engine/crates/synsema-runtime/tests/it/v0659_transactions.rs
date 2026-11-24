@@ -36,161 +36,17 @@ fn out(body: &str) -> Vec<String> {
 
 /// Casos 1 y 2: devuelve lo que devuelve la task y confirma; si la task da error, deshace y el
 /// error sale tal cual.
-#[test]
-fn a_transaction_commits_when_its_task_returns_and_rolls_back_when_it_fails() {
-    let o = out(r#"print(sql_transaction(() => add("a")))
-task fails()
-    add("x")
-    raise("boom")
-try
-    sql_transaction(fails)
-recover e
-    print("caught: " + e)
-print(everyone())
-"#);
-    assert_eq!(o, ["a", "caught: boom", "[a]"]);
-}
-
 /// Casos 5 y 6: adentro de otra es un savepoint. La de adentro que falla se deshace sola, y la de
 /// afuera, que atrapó el error, sigue y confirma.
-#[test]
-fn a_transaction_inside_another_is_a_savepoint() {
-    let o = out(r#"task inner_fails()
-    add("b")
-    raise("inner")
-task outer()
-    add("a")
-    try
-        sql_transaction(inner_fails)
-    recover e
-        add("after " + e)
-    give sql_transaction(() => add("c"))
-print(sql_transaction(outer))
-print(everyone())
-"#);
-    assert_eq!(o, ["c", "[a,after inner,c]"]);
-}
-
 /// Caso 7: si la de afuera falla después de que la de adentro devolvió, se deshace todo.
-#[test]
-fn an_outer_failure_undoes_the_inner_transaction_too() {
-    let o = out(r#"task outer()
-    sql_transaction(() => add("inner"))
-    raise("outer")
-try
-    sql_transaction(outer)
-recover e
-    print(e)
-print(everyone())
-"#);
-    assert_eq!(o, ["outer", "[]"]);
-}
-
 /// Caso 4 (regla 2): un statement que falla hace fallar la transacción aunque la task lo atrape y
 /// siga; el error cita el primero.
-#[test]
-fn a_statement_that_fails_inside_fails_the_transaction() {
-    let o = out(r#"task sloppy()
-    add("a")
-    try
-        sql_exec("INSERT INTO no_such_table VALUES (1)")
-    recover e
-        print("ignored")
-    try
-        add("b")
-    recover e
-        print(e)
-    give "done"
-try
-    print(sql_transaction(sloppy))
-recover e
-    print(e)
-print(everyone())
-"#);
-    assert_eq!(o.len(), 4, "{:?}", o);
-    assert_eq!(o[0], "ignored");
-    assert!(o[1].starts_with(FAILED) && o[1].contains("no_such_table"), "{:?}", o);
-    assert_eq!(o[2], o[1], "al terminar da el mismo error: {:?}", o);
-    assert_eq!(o[3], "[]");
-}
-
 /// Casos 8 y 9: el control de transacciones a mano es un error en `run` también, por los tres
 /// builtins, y no llega a la base: lo que sigue se confirma solo.
-#[test]
-fn hand_made_transaction_control_is_an_error_under_run() {
-    let o = out(r#"each stmt in ["BEGIN", "commit", "ROLLBACK", "SAVEPOINT a", "  -- nota\n begin immediate", "/* x */ END"]
-    try
-        sql_exec(stmt)
-        print("ran: " + stmt)
-    recover e
-        print(e)
-try
-    sql("BEGIN")
-recover e
-    print(e)
-try
-    sql_batch("COMMIT", [[]])
-recover e
-    print(e)
-task by_hand_inside()
-    add("in")
-    try
-        sql_exec("COMMIT")
-    recover e
-        print(e)
-    give "ok"
-print(sql_transaction(by_hand_inside))
-add("out")
-print(everyone())
-"#);
-    assert_eq!(o.len(), 11, "{:?}", o);
-    for line in &o[..9] {
-        assert!(line.starts_with(BY_HAND) && line.contains("sql_transaction(task)"), "{:?}", o);
-    }
-    assert_eq!(o[9], "ok", "adentro de una transacción el rechazo no la hace fallar");
-    assert_eq!(o[10], "[in,out]");
-}
-
 /// Caso 24: algo que no es una task, y una task o una lambda que pide argumentos (una llamada
 /// interna no chequea la aridad: sin esto corría con `nothing` y confirmaba). Nada se escribe y
 /// la conexión queda libre para lo que sigue; un parámetro con default sí se acepta.
-#[test]
-fn a_bad_argument_writes_nothing_and_leaves_the_connection_free() {
-    let o = out(r#"try
-    sql_transaction(5)
-recover e
-    print(e)
-try
-    sql_transaction(add)
-recover e
-    print(e)
-try
-    sql_transaction((who) => add(who))
-recover e
-    print(e)
-print(everyone())
-task with_default(who = "d")
-    give add(who)
-print(sql_transaction(with_default))
-add("z")
-print(everyone())
-"#);
-    assert_eq!(o.len(), 6, "{:?}", o);
-    assert!(o[0].starts_with("sql_transaction expects a task with no parameters"), "{:?}", o);
-    assert_eq!(o[1], "sql_transaction calls its task with no arguments, and task 'add' needs 'who' — pass the values in a lambda: sql_transaction(() => my_task(a, b))");
-    assert!(o[2].starts_with("sql_transaction calls its task with no arguments, and this lambda needs 'who'"), "{:?}", o);
-    assert_eq!(&o[3..], ["[]", "d", "[d,z]"]);
-}
-
 /// Caso 21: sin conexión, el error de siempre.
-#[test]
-fn a_transaction_without_a_connection_says_so() {
-    let r = run_program("sql_transaction(() => 1)", "tx.syn");
-    assert!(!r.success);
-    let e = r.errors.join("\n");
-    assert!(e.contains("No database connection"), "{}", e);
-}
-
 // ---- serve ----
 
 fn free_port() -> u16 {

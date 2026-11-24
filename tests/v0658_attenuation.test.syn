@@ -1,0 +1,18 @@
+-- Gemelo de v0658_attenuation.rs (v0.6.68): los seis candidatos de este archivo QUEDAN en Rust.
+-- Las aserciones sí son valores y errores capturables, pero el SETUP no es expresable en el
+-- lenguaje: cada uno monta un PAQUETE (`tok`) publicado a mano en el caché de módulos del
+-- proceso (SYNSEMA_MODULE_CACHE + synsema.json con sha256/tree_hash escritos por el host), y
+-- `use "nombre"` exige un proyecto synsema.json más ese caché. Un `use "./x.syn"` local es un
+-- módulo, no un paquete: no tiene dominio propio (`requires` del paquete) que estrechar, así que
+-- la denegación "the package tok does not declare it" no es reproducible sin el paquete.
+-- QUEDA en Rust (los 6 candidatos, mismo motivo: paquete publicado en el caché del proceso):
+--   k10_a_package_renders_its_own_template_without_file_read: el paquete renderiza SU plantilla.
+--   k17_a_computed_name_not_in_the_package_is_not_found: template not found sin leer el disco.
+--   k16_a_program_template_cannot_layout_a_package_template: el programa no ve archivos del paquete.
+--   k28_a_package_template_does_not_see_the_program: el entorno de plantilla es el del paquete.
+--   k29_a_package_include_does_not_reach_the_program: include del paquete no alcanza al programa.
+--   k27_a_program_callback_renders_the_program_template_with_the_intersection: intersección de dominios.
+-- (El resto del .rs —K7/K8/K12/K14/K15/K19/K23/K24/K25/K26/K3x/K4x, serve_rows y las filas
+-- repetidas por modo/VM— no era candidato y mira el host: caché de paquetes, serve real,
+-- RunResult, techo ServeOverrides, tabla de gates del proceso.)
+-- Correr con: synsema test tests/v0658_attenuation.test.syn

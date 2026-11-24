@@ -51,16 +51,6 @@ fn f3_llm_step_requires_llm_capability_in_secure_mode() {
     );
 }
 
-#[test]
-fn f3b_llm_step_ok_with_require_llm_in_secure_mode() {
-    // Con `require llm` declarado, el gate pasa; sin provider cableado cae al
-    // placeholder seguro (no inventa tool-calls).
-    let src = "require llm\nlet s be llm_step(\"hola\", [], \"\")\nprint(s[\"kind\"])\nprint(s[\"text\"])\n";
-    let r = run_source_secure(src, "<test>");
-    assert!(r.success, "{:?}", r.errors);
-    assert_eq!(r.output, vec!["final".to_string(), "[no llm provider]".to_string()]);
-}
-
 // =========================================================
 // F4 — forma exacta del map devuelto por `llm_step`
 // =========================================================
@@ -246,98 +236,17 @@ fn guardrail_text_llm_ops_still_work() {
 // =========================================================
 
 // LP1 — una tool NO puede usar una capability que el AGENTE tiene pero la tool NO declaró.
-#[test]
-fn lp_tool_cannot_use_undeclared_capability_the_agent_has() {
-    // El agente tiene `env`; `sneaky` lo USA pero NO lo declara → `call_tool` la corre
-    // con caps {} → env DENEGADO, aunque el agente lo tenga. Esta es la diferencia con
-    // el modelo viejo (caps ambientes): el least-privilege es por-tool.
-    let src = "require env\n\
-               task sneaky()\n    give env(\"PATH\")\n\
-               try\n    print(call_tool(sneaky, {}))\nrecover e\n    print(\"DENIED: \" + e)\n";
-    let r = run_source_secure(src, "<test>");
-    assert!(r.success, "{:?}", r.errors);
-    assert!(
-        has_line_containing(&r.output, "DENIED: env(\"PATH\") not permitted"),
-        "esperaba env denegado por least-privilege, got {:?}",
-        r.output
-    );
-}
-
 // LP2 — CONTRASTE: la MISMA tool vía `call` (sin scoping) SÍ hereda la cap ambiente del
 // agente → prueba que es `call_tool` (no la disciplina del loop) quien enforce-a.
-#[test]
-fn lp_plain_call_inherits_ambient_capability() {
-    let src = "require env\n\
-               task sneaky()\n    give env(\"PATH\")\n\
-               print(text(call(sneaky, {}) == nothing))\n";
-    let r = run_source_secure(src, "<test>");
-    assert!(r.success, "{:?}", r.errors);
-    // Vía `call` la tool hereda `env` y env() devuelve un valor (≠ nothing) → "false".
-    assert_eq!(r.output.last().unwrap(), "false", "{:?}", r.output);
-}
-
 // LP3 — una tool SÍ puede usar una cap que DECLARÓ y el agente tiene (no rompe el caso bueno).
-#[test]
-fn lp_tool_can_use_capability_it_declared() {
-    let src = "require env\n\
-               task readpath()\n    require env\n    give env(\"PATH\")\n\
-               print(text(call_tool(readpath, {}) == nothing))\n";
-    let r = run_source_secure(src, "<test>");
-    assert!(r.success, "{:?}", r.errors);
-    assert_eq!(r.output.last().unwrap(), "false", "{:?}", r.output);
-}
-
 // LP4 — una tool no puede EXCEDER al agente (declara una cap que el agente NO tiene → no
 // la obtiene), y tras una denegación el scope se RESTAURA + `call_tool` despacha args
 // nombrados igual que `call`.
-#[test]
-fn lp_tool_cannot_exceed_agent_and_scope_restores() {
-    // El agente NO tiene `env`. `greedy` lo declara igual; call_tool ∩ agente = {} →
-    // denegado. Después, `add` (sin caps) corre vía call_tool → 15 (scope restaurado +
-    // args nombrados).
-    let src = "task greedy()\n    require env\n    give env(\"PATH\")\n\
-               try\n    print(call_tool(greedy, {}))\nrecover e\n    print(\"DENIED\")\n\
-               task add(a, b)\n    give a + b\n\
-               print(text(call_tool(add, {\"a\": 10, \"b\": 5})))\n";
-    let r = run_source_secure(src, "<test>");
-    assert!(r.success, "{:?}", r.errors);
-    assert!(has_line_containing(&r.output, "DENIED"), "{:?}", r.output);
-    assert_eq!(r.output.last().unwrap(), "15", "{:?}", r.output);
-}
-
 // LP5 — REGRESIÓN de un escape (review adversarial): un `require` ANIDADO (bajo
 // when/if/while, NO top-level) no se extrae a `required_capabilities`, así que queda en
 // el cuerpo ejecutable. Antes corría en runtime y `grant_hook` lo concedía DENTRO del
 // scope restringido → la tool se auto-concedía una cap que el agente no tenía. El guard
 // `in_tool_scope()` lo vuelve no-op: el grant anidado no escala dentro de `call_tool`.
-#[test]
-fn lp_nested_require_inside_tool_cannot_self_grant() {
-    // El agente NO tiene `env`. La tool intenta auto-concedérselo bajo `when true` y
-    // usarlo. Debe quedar DENEGADO (el require anidado no concede dentro del scope).
-    let src = "task leaky()\n    when true\n        require env\n    give env(\"PATH\")\n\
-               try\n    print(call_tool(leaky, {}))\nrecover e\n    print(\"DENIED: \" + e)\n";
-    let r = run_source_secure(src, "<test>");
-    assert!(r.success, "{:?}", r.errors);
-    assert!(
-        has_line_containing(&r.output, "DENIED: env(\"PATH\") not permitted"),
-        "un require anidado NO debe auto-concederse dentro de call_tool, got {:?}",
-        r.output
-    );
-}
-
 // LP6 — escalada INDIRECTA: una tool que llama (plain `call`) a un helper con un
 // `require` anidado. El helper corre TAMBIÉN bajo el tool-scope (depth se mantiene >0
 // a través de llamadas anidadas) → su require anidado es no-op. No se escala indirecto.
-#[test]
-fn lp_indirect_call_inside_tool_cannot_self_grant() {
-    let src = "task helper()\n    when true\n        require env\n    give env(\"PATH\")\n\
-               task outer()\n    give call(helper, nothing)\n\
-               try\n    print(call_tool(outer, {}))\nrecover e\n    print(\"DENIED: \" + e)\n";
-    let r = run_source_secure(src, "<test>");
-    assert!(r.success, "{:?}", r.errors);
-    assert!(
-        has_line_containing(&r.output, "DENIED: env(\"PATH\") not permitted"),
-        "escalada indirecta vía call dentro de call_tool debe denegarse, got {:?}",
-        r.output
-    );
-}

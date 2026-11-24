@@ -212,28 +212,6 @@ serve on {p}
 /// `random_bytes`/`token` están gateados por `random` — la MISMA puerta
 /// deny-by-default de `random()`/`random_int()`. Sin `require random` → error de
 /// capability; con él → funcionan. Los puros (password/jwt/totp) NO llevan gate.
-#[test]
-fn random_capability_gates_token_and_random_bytes() {
-    let r = run_source("let t be token()\nprint(t)\n", "t.syn");
-    assert!(!r.success, "token() sin require random debió fallar");
-    assert!(r.errors.join(" ").contains("random"), "err: {:?}", r.errors);
-
-    let r = run_source("let b be random_bytes(8)\nprint(length(b))\n", "t.syn");
-    assert!(!r.success, "random_bytes() sin require random debió fallar");
-
-    let r = run_source("require random\nlet t be token()\nprint(length(t))\n", "t.syn");
-    assert!(r.success, "con require random debió andar: {:?}", r.errors);
-    assert_eq!(r.output.last().map(String::as_str), Some("43"));
-
-    // Los transforms puros no llevan gate (la salt interna de password_hash no
-    // cuenta como "producir aleatoriedad" — precedente redis_lock).
-    let r = run_source(
-        "let p be password_hash(\"x\")\nprint(password_verify(\"x\", p))\n",
-        "t.syn",
-    );
-    assert!(r.success, "password_hash sin capability debió andar: {:?}", r.errors);
-}
-
 /// Aridad inválida del auth task → error claro al CONSTRUIR el serve (no en runtime).
 #[test]
 fn auth_bad_arity_fails_at_build() {

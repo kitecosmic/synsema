@@ -1,0 +1,20 @@
+-- Gemelo de serve_modules.rs (v0.6.68, migas §4): el candidato de la tabla, el brazo
+-- `parallel_map` del DE-027. Una task top-level llama a m.outer, que llama a su hermana
+-- inner; antes del fix, el módulo reconstruido en el worker perdía el module_env y daba
+-- `Undefined variable`. Afirma el mismo valor exacto que el .rs vía run_source.output.
+-- El fixture vive en tests/fixtures (copia byte a byte del de runtime): el cargador
+-- resuelve `use` relativo al archivo del test y no deja salirse de ese directorio.
+-- QUEDA en Rust:
+--   serve_module_sibling_call_resolves: levanta un serve real en un socket y afirma el HTTP crudo.
+--   parallel_map_module_task_passed_directly: fija SYNSEMA_STATE_DIR del proceso (host).
+--   serve_module_selfref_map_resolves: serve real (sockets).
+--   parallel_map_module_selfref_dispatch: fija SYNSEMA_STATE_DIR del proceso (host).
+-- Correr con: synsema test tests/serve_modules.test.syn
+
+use "./fixtures/serve_mod_sibling.syn" as m
+
+task call_outer(x)
+    give m.outer(x)
+
+test "parallel_map_module_sibling_call_resolves"
+    assert_eq(text(parallel_map(call_outer, ["a", "b", "c"])), "[\"a!\", \"b!\", \"c!\"]")

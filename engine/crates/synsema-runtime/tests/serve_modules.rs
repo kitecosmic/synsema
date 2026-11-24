@@ -101,20 +101,6 @@ fn serve_module_sibling_call_resolves() {
 /// sobre el global) invoca dentro a `m.outer`, que a su vez llama a su hermana `inner`.
 /// Antes del fix, el módulo reconstruido en el worker perdía el `module_env` y `inner` no
 /// resolvía.
-#[test]
-fn parallel_map_module_sibling_call_resolves() {
-    let src = "\
-use \"./serve_mod_sibling.syn\" as m
-task call_outer(x)
-    give m.outer(x)
-let r be parallel_map(call_outer, [\"a\", \"b\", \"c\"])
-print(text(r))
-";
-    let r = run_source(src, &importer_path());
-    assert!(r.success, "errors: {:?}", r.errors);
-    assert_eq!(r.output, vec!["[\"a!\", \"b!\", \"c!\"]".to_string()]);
-}
-
 /// DE-030: pasar una task de módulo DIRECTO a `parallel_map` (sin wrapper top-level). La
 /// task aplicada viaja por `TaskSnapshot`, no por el snapshot de globales; antes perdía su
 /// `module_env` (cerraba sobre el global del worker) y una llamada a una hermana daba

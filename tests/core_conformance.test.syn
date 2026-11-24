@@ -1,5 +1,13 @@
 -- Conformidad directa del intérprete. Los tests que verifican el formato de errores del host,
 -- parseo del archivo, salida de log o semántica de run_source permanecen en Rust.
+-- v0.6.68 (los 8 candidatos del inventario): migran abajo `sandbox` (el cuerpo se observa con
+-- un set visible afuera del bloque; el print del .rs era el medio de observación) y
+-- `llm_available_false_offline` (`synsema test` no cablea provider → determinista). Quedan en
+-- Rust: trace_and_log (el contrato "[LOG] ..." es stdout decorado del runner),
+-- reserved_word_as_variable / reserved_word_as_task_name / error_category_vectors (errores de
+-- parseo/lexer y errores decorados exactos del host), zero_errors_located_and_catchable (el
+-- prefijo `Runtime error: <archivo>:` del error NO atrapado es del host; la parte atrapable ya
+-- vive en `zero_errors`) y flush_noop_when_not_live (la colección de RunResult.output).
 
 test "arithmetic"
     assert_eq(2 + 3, 5)
@@ -371,3 +379,12 @@ test "and_or_short_circuit_and_always_yield_bool"
         set or_failed to true
         assert(contains(e, "no key"))
     assert(or_failed)
+
+test "sandbox"
+    let ran be false
+    sandbox
+        set ran to true
+    assert(ran)
+
+test "llm_available_false_offline"
+    assert(llm_available() == false)

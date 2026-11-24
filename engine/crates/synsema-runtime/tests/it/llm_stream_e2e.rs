@@ -25,17 +25,6 @@ fn llm_stream_requires_llm_capability_in_secure_mode() {
 }
 
 // §4.2: sin provider cableado → placeholder y `on_chunk` NO invocada.
-#[test]
-fn llm_stream_without_provider_placeholder_no_chunks() {
-    let src = "require llm\n\
-               task on_tok(t)\n    print(\"CHUNK:\" + t)\n\
-               let full be llm_stream(\"q\", \"\", on_tok)\n\
-               print(\"FULL:\" + full)\n";
-    let r = run_source(src, "<test>");
-    assert!(r.success, "{:?}", r.errors);
-    assert_eq!(r.output, vec!["FULL:[no llm provider]".to_string()]);
-}
-
 // §4.3: mock guionado → `on_chunk` invocada por chunk EN ORDEN; retorno = concatenación.
 #[test]
 fn llm_stream_scripted_chunks_in_order() {

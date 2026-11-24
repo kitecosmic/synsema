@@ -111,41 +111,7 @@ fn bare_require_memory_is_a_parse_error() {
 
 // ── §4.7a: `sandbox` deniega la memoria (el CapabilitySet se vacía) ─────────────────
 
-#[test]
-fn sandbox_denies_declared_memory() {
-    let proj = unique_tmp("sandbox");
-    let prog = proj.join("p.syn");
-    let src = "require memory(\"brain\")\n\
-               remember(\"context\", \"fuera\")\n\
-               sandbox\n    remember(\"context\", \"dentro\")\n";
-    let r = run_source(src, prog.to_str().unwrap());
-    assert!(!r.success, "el remember dentro de sandbox debió fallar");
-    let e = r.errors.join(" ");
-    assert!(e.contains("Capability not granted: memory(\"brain\")"), "err: {}", e);
-    cleanup(&proj);
-}
-
 // ── §4.7b: `call_tool` — una tool que no declara memory no la hereda ────────────────
-
-#[test]
-fn call_tool_gates_memory_per_tool() {
-    let proj = unique_tmp("tool");
-    let prog = proj.join("p.syn");
-    let src = "require memory(\"brain\")\n\
-               task hoarder()\n    give length(recall())\n\
-               try\n    print(call_tool(hoarder, {}))\nrecover e\n    print(\"DENIED: \" + e)\n\
-               task good()\n    require memory(\"brain\")\n    give length(recall())\n\
-               print(call_tool(good, {}))\n";
-    let r = run_source(src, prog.to_str().unwrap());
-    assert!(r.success, "{:?}", r.errors);
-    assert!(
-        r.output.iter().any(|l| l.contains("DENIED") && l.contains("memory")),
-        "la tool sin declaración debe quedar denegada: {:?}",
-        r.output
-    );
-    assert_eq!(r.output.last().unwrap(), "0", "la tool que declara memory funciona: {:?}", r.output);
-    cleanup(&proj);
-}
 
 // ── §4.7c / G-2: el techo del host (--cap-set) gatea, con prefijos `memory=shop-*` ──
 
@@ -246,39 +212,6 @@ fn schema_compat_rename_db_is_the_migration() {
 
 // ── §4.10: namespaces por `source` (decisión #4) — camino in-process ────────────────
 
-#[test]
-fn namespaces_default_own_and_cross_with_from() {
-    let proj = unique_tmp("ns");
-    let prog = proj.join("p.syn");
-    let src = "require memory(\"brain\")\n\
-               remember(\"context\", \"top\")\n\
-               agent Writer\n    remember(\"context\", \"from-writer\")\n\
-               agent Analyzer\n    print(length(recall()))\n    print(length(recall(from = \"Writer\")))\n    print(length(recall(from = \"*\")))\n\
-               spawn Writer\n\
-               spawn Analyzer\n\
-               print(length(recall()))\n\
-               print(length(recall(from = \"Writer\")))\n\
-               print(length(recall(from = \"main\")))\n\
-               print(length(recall(nothing, nothing, nothing, nothing, 1)))\n";
-    let r = run_source(src, prog.to_str().unwrap());
-    assert!(r.success, "{:?}", r.errors);
-    assert_eq!(
-        r.output,
-        vec![
-            "0", // Analyzer: su namespace está vacío (no ve al Writer por defecto)
-            "1", // Analyzer: from = "Writer" cruza explícitamente
-            "2", // Analyzer: from = "*" = global (top + writer)
-            "2", // top-level: ve todo por defecto
-            "1", // top-level: from = "Writer" filtra
-            "1", // top-level: from = "main" = lo propio del top-level
-            "1", // `limit` sigue funcionando junto al resto (DE-035)
-        ],
-        "namespaces: {:?}",
-        r.output
-    );
-    cleanup(&proj);
-}
-
 // ── §4.10b: camino SWARM — el `source` es el nombre del agente, stores compartidos ──
 
 #[test]
@@ -302,39 +235,7 @@ fn swarm_agents_share_declared_store_with_their_name_as_source() {
 
 // ── workers de parallel_map comparten la memoria declarada ──────────────────────────
 
-#[test]
-fn parallel_map_workers_share_declared_store() {
-    let proj = unique_tmp("pmap");
-    let prog = proj.join("p.syn");
-    let src = "require memory(\"brain\")\n\
-               task w(i)\n    remember(\"context\", \"item-\" + text(i))\n    give i\n\
-               parallel_map(w, [1, 2, 3])\n\
-               print(length(recall()))\n";
-    let r = run_source(src, prog.to_str().unwrap());
-    assert!(r.success, "{:?}", r.errors);
-    assert_eq!(r.output, vec!["3"], "los workers escriben al MISMO store: {:?}", r.output);
-    cleanup(&proj);
-}
-
 // ── §4.12 / G-7: un secret snapshotteado a memoria queda redactado en el .db ────────
-
-#[test]
-fn secret_never_persists_plaintext() {
-    const CANARY: &str = "pLAINtext_MEMORIA_no_filtrar_77";
-    let proj = unique_tmp("secret");
-    let prog = proj.join("p.syn");
-    let src = format!(
-        "require memory(\"brain\")\nrequire secret(\"API\")\nlet s be secret(\"API\", \"{}\")\nremember(\"context\", s)\n",
-        CANARY
-    );
-    let r = run_source(&src, prog.to_str().unwrap());
-    assert!(r.success, "{:?}", r.errors);
-    let raw = std::fs::read(state_db(&proj, "brain")).unwrap();
-    let text = String::from_utf8_lossy(&raw);
-    assert!(!text.contains(CANARY), "G-7: el plaintext del secret NO debe llegar al .db");
-    assert!(text.contains("secret(API)"), "el .db guarda la forma redactada");
-    cleanup(&proj);
-}
 
 // ── round-trip básico entre procesos (dos runs) + el error incluye el nombre ────────
 

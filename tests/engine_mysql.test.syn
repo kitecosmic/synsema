@@ -1,0 +1,33 @@
+-- Gemelo de engine_mysql.rs (synsema-runtime/tests/it, conformidad MySQL M2 bajo db_open/sql).
+-- Migra los 2 tests de capability que el .rs corre SIEMPRE sin servidor: el chequeo de
+-- db(scope) precede a toda conexión, así que la violación se captura sin abrir un solo socket.
+-- QUEDA en Rust (dependen del host):
+--   mysql_gate_passes_routing_to_mysql: abre un socket real a un puerto muerto (dead_port()).
+--   mysql_types_roundtrip / mysql_last_insert_id / mysql_transactions /
+--     mysql_procedures_and_transactions / mysql_exec_without_values_prepares_only_a_text_with_a_semicolon /
+--     mysql_call_outside_a_transaction_reads_what_the_server_reports /
+--     mysql_what_the_text_of_a_statement_does_not_show /
+--     mysql_call_keeps_the_isolation_level_set_for_the_next_transaction /
+--     mysql_deadlock_fails_the_whole_transaction / mysql_tables_lists_created:
+--     requieren un MySQL real (MYSQL_URL, #[ignore] en el .rs).
+-- Correr con: synsema test tests/engine_mysql.test.syn
+
+test "mysql_db_open_deny_without_require"
+    let ok be false
+    try
+        db_open("mysql://user:pw@localhost:3306/appdb")
+    recover e
+        set ok to true
+        assert(contains(e, "Capability not granted: db(\"mysql://localhost/appdb\")"))
+        assert(contains(e, "this is a permission, not a bug"))
+    assert(ok)
+
+test "mysql_scope_mismatch_deny"
+    require db("mysql://localhost/appdb")
+    let ok be false
+    try
+        db_open("mysql://localhost/otra")
+    recover e
+        set ok to true
+        assert(contains(e, "Capability not granted: db(\"mysql://localhost/otra\")"))
+    assert(ok)

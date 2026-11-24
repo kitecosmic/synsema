@@ -1,0 +1,40 @@
+-- Gemelo de v0642_e2e.rs (runtime) (v0.6.68, tanda 2): los pipes de un mismo programa, valor a
+-- valor. Quedan en Rust del módulo — todo lo que mira el RunResult del host o levanta
+-- sockets/servidores reales:
+--   a_tunnel_written_in_synsema_carries_http_and_sse,
+--   proxy_to_with_a_per_request_destination_checks_net_per_request,
+--   an_options_without_a_declared_route_is_still_answered_by_the_server,
+--   two_host_headers_are_a_bad_request, behind_a_trusted_proxy_x_forwarded_proto_sets_the_scheme,
+--   a_destination_built_from_the_request_cannot_smuggle_another_host,
+--   a_proxy_route_that_reads_the_body_sees_it_and_still_forwards_it,
+--   a_streamed_body_cannot_be_read_around_the_static_check,
+--   the_proxy_drops_connection_named_response_headers_and_times_out_a_mute_upstream,
+--   a_proxied_body_streams_and_max_body_still_holds:
+--     sirven con run_serve_program y clientes TCP del host (status, headers, SSE sin buffer,
+--     tiempos de pared).
+--   tcp_connect_echo_close_and_select, tcp_connect_needs_the_exact_port,
+--   a_tcp_peer_that_half_closes_still_gets_the_answer:
+--     el par de eco real lo arma el host (el lenguaje no puede levantar el socket contrario).
+--   exit_sets_the_code_of_the_run, each_run_keeps_its_own_exit_code,
+--   exit_stops_live_agents_instead_of_hanging,
+--   exit_stops_its_agents_while_another_run_finishes_next_to_it,
+--   exit_keeps_the_error_of_an_agent_that_failed_before_it, a_pipe_close_is_sticky:
+--     exit_code/steps del RunResult, corridas concurrentes del host y tiempos de pared.
+-- Correr con: synsema test tests/v0642_e2e.test.syn
+
+test "a_pipe_carries_bytes_and_close_inside_one_program"
+    let p be pipe({"max_buffer": 8})
+    pipe_send(p["a"], "hola")
+    let m be pipe_recv(p["b"], 1)
+    assert_eq(decode(m["data"]), "hola")
+    pipe_close(p["a"])
+    assert_eq(pipe_recv(p["b"], 1)["type"], "close")
+
+test "a_pipe_half_close_still_lets_the_other_side_answer"
+    let p be pipe()
+    pipe_send(p["a"], "req")
+    pipe_close(p["a"], "write")
+    assert_eq(decode(pipe_recv(p["b"], 1)["data"]), "req")
+    assert_eq(pipe_recv(p["b"], 1)["type"], "close")
+    pipe_send(p["b"], "resp")
+    assert_eq(decode(pipe_recv(p["a"], 1)["data"]), "resp")

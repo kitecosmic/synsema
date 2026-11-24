@@ -1,0 +1,99 @@
+-- Gemelo de engine_db.rs (synsema-runtime/tests/it, capa 6 — base de datos embebida SQLite).
+-- Migra los 8 tests del .rs: sin conexión real, todo se afirma con :memory:, con un archivo
+-- de DB temporal y con errores de gate/conexión capturables (try/recover + contains).
+-- Diferencias de corredor, declaradas:
+--   db_file_persistence_cross_run: el .rs usa DOS engines (dos run_source) y el temp del
+--     host; el gemelo usa db_close + db_open (nueva conexión SQLite al mismo archivo) sobre
+--     tests/_syn_db_gate.db, que borra al entrar y al salir.
+--   Los tests de denegación van ANTES del primer `require db` del archivo: las capabilities
+--     otorgadas en un bloque viven para toda la corrida del archivo.
+-- QUEDA en Rust: nada (engine_db.rs tiene exactamente estos 8 tests).
+-- Correr con: synsema test tests/engine_db.test.syn
+
+test "db_no_connection_error"
+    let ok be false
+    try
+        let rows be sql("SELECT 1")
+    recover e
+        set ok to true
+        assert(contains(e, "No database connection"))
+    assert(ok)
+
+test "db_deny_by_default_in_run"
+    let ok be false
+    try
+        db_open(":memory:", "memory")
+    recover e
+        set ok to true
+        assert(contains(e, "Capability not granted: db(\":memory:\")"))
+        assert(contains(e, "this is a permission, not a bug"))
+    assert(ok)
+
+test "db_grant_works"
+    require db(":memory:")
+    db_open(":memory:", "memory")
+    sql_exec("CREATE TABLE db_grant_t (x)")
+    let rows be sql("SELECT * FROM db_grant_t")
+    assert_eq(length(rows), 0)
+    db_close()
+
+test "db_scope_mismatch_violates"
+    require db("a.db")
+    let ok be false
+    try
+        db_open("b.db", "readwrite")
+    recover e
+        set ok to true
+        assert(contains(e, "Capability not granted: db(\"b.db\")"))
+    assert(ok)
+
+test "db_sandbox_strips_capability"
+    require db(":memory:")
+    db_open(":memory:", "memory")
+    let ok be false
+    try
+        sandbox
+            let r be sql("SELECT 1")
+    recover e
+        set ok to true
+        assert(contains(e, "Capability not granted: db"))
+    assert(ok)
+    db_close()
+
+test "db_blob_bytes_roundtrip"
+    require db
+    db_open(":memory:", "memory")
+    sql_exec("CREATE TABLE db_blob_t (d BLOB)")
+    sql_exec("INSERT INTO db_blob_t VALUES (?)", [bytes("hi")])
+    let rows be sql("SELECT d FROM db_blob_t")
+    let d be rows[0]["d"]
+    assert_eq(type_of(d), "bytes")
+    assert_eq(decode(d), "hi")
+    db_close()
+
+test "db_blob_non_utf8_roundtrip"
+    require db
+    db_open(":memory:", "memory")
+    sql_exec("CREATE TABLE db_blob_nt (d BLOB)")
+    sql_exec("INSERT INTO db_blob_nt VALUES (?)", [bytes([255, 254, 0])])
+    let rows be sql("SELECT d FROM db_blob_nt")
+    let d be rows[0]["d"]
+    assert_eq(type_of(d), "bytes")
+    assert_eq(text(length(d)), "3")
+    assert_eq(text(d[0]) + "," + text(d[1]) + "," + text(d[2]), "255,254,0")
+    db_close()
+
+test "db_file_persistence_cross_run"
+    require db
+    require file("tests/_syn_db_gate.db")
+    when file_exists("tests/_syn_db_gate.db")
+        delete_file("tests/_syn_db_gate.db")
+    db_open("tests/_syn_db_gate.db")
+    sql_exec("CREATE TABLE IF NOT EXISTS test (val TEXT)")
+    sql_exec("INSERT INTO test VALUES (?)", ["hello"])
+    db_close()
+    db_open("tests/_syn_db_gate.db")
+    let rows be sql("SELECT * FROM test")
+    assert_eq(length(rows), 1)
+    db_close()
+    delete_file("tests/_syn_db_gate.db")

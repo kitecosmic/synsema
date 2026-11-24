@@ -46,21 +46,6 @@ fn a_mask_prints_as_true_false() {
     assert_eq!(dtype(&f64s(&[2], &[1.0, 2.0])), "f64");
 }
 
-#[test]
-fn to_list_of_a_mask_gives_bools() {
-    let l = ok(arrays::to_list(&[mask(&[2, 2], &[true, false, false, true])]));
-    assert_eq!(l.to_string(), "[[true, false], [false, true]]");
-    match &l {
-        SynValue::List(rows) => match &rows.borrow().to_vec()[0] {
-            SynValue::List(r) => assert!(matches!(r.borrow().to_vec()[0], SynValue::Bool(true))),
-            other => panic!("fila: {}", other.type_name()),
-        },
-        other => panic!("{}", other.type_name()),
-    }
-    // Un array `f64` sigue dando números.
-    assert_eq!(ok(arrays::to_list(&[f64s(&[2], &[1.0, 2.5])])).to_string(), "[1.0, 2.5]");
-}
-
 /// Un snapshot (`parallel_map`, globales de `serve`, agentes) lleva el tipo de elemento.
 #[test]
 fn a_mask_crosses_a_snapshot_with_its_dtype() {
@@ -97,30 +82,6 @@ fn whole_value_equality_looks_at_the_dtype() {
 
 /// Forma y orden no dependen del tipo: `reshape`, `transpose`, `flatten`, `slice`, `a[i]` y `at`
 /// devuelven una máscara (o un `bool` suelto).
-#[test]
-fn shape_operations_keep_the_mask() {
-    let m = mask(&[2, 3], &[true, false, false, false, true, true]);
-    let r = ok(arrays::reshape(&[m.clone(), syn_list(vec![syn_int(3), syn_int(2)])]));
-    assert_eq!((dtype(&r), r.to_string().as_str()), ("bool", "[[true, false], [false, false], [true, true]]"));
-    let t = ok(arrays::transpose(&[m.clone()]));
-    assert_eq!((dtype(&t), t.to_string().as_str()), ("bool", "[[true, false], [false, true], [false, true]]"));
-    let f = ok(arrays::flatten(&[m.clone()]));
-    assert_eq!((dtype(&f), f.to_string().as_str()), ("bool", "[true, false, false, false, true, true]"));
-    let SynValue::Array(a) = &m else { unreachable!() };
-    let row = ok(arrays::index_row(a, -1));
-    assert_eq!((dtype(&row), row.to_string().as_str()), ("bool", "[false, true, true]"));
-    let s = arrays::slice_rows(a, 1, 2);
-    assert_eq!((dtype(&s), s.to_string().as_str()), ("bool", "[[false, true, true]]"));
-    let SynValue::Array(f1) = &f else { unreachable!() };
-    assert!(matches!(ok(arrays::index_row(f1, 0)), SynValue::Bool(true)));
-    let at = ok(arrays::at(&[m.clone(), syn_list(vec![syn_int(1), syn_int(2)])]));
-    assert!(matches!(at, SynValue::Bool(true)));
-    // Las de introspección no convierten.
-    assert_eq!(ok(arrays::shape(&[m.clone()])).to_string(), "[2, 3]");
-    assert_eq!(ok(arrays::size(&[m.clone()])).to_string(), "6");
-    assert_eq!(ok(arrays::ndim(&[m])).to_string(), "2");
-}
-
 /// R2: en una cuenta, una máscara es 0/1 en `f64`.
 #[test]
 fn a_mask_in_arithmetic_is_zero_one() {
@@ -151,15 +112,6 @@ fn ndarray_helpers() {
 }
 
 /// `fill_nan` sobre una máscara: no tiene NaN, queda igual (y sigue siendo máscara).
-#[test]
-fn fill_nan_leaves_a_mask_alone() {
-    let m = mask(&[2], &[true, false]);
-    let r = ok(synsema_core::tabular::fill_nan(&[m.clone(), syn_int(7)]));
-    assert_eq!((dtype(&r), r.to_string().as_str()), ("bool", "[true, false]"));
-    let r = ok(synsema_core::tabular::fill_nan(&[f64s(&[2], &[f64::NAN, 1.0]), syn_int(7)]));
-    assert_eq!((dtype(&r), r.to_string().as_str()), ("f64", "[7, 1]"));
-}
-
 // =========================================================
 // 1b — `apply` sobre un array con etiquetas (diseño §4, R6)
 // =========================================================

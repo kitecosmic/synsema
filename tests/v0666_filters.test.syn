@@ -80,3 +80,29 @@ test "nan_and_complete_masks_match_scalar_rules"
     let empty be where(t, array([1, 2, 3]) < 0)
     assert_eq(length(empty), 0)
     assert_eq(columns(empty), ["n"])
+
+-- v0.6.68, tanda 2 (runtime): la máscara columnar se compone con los builtins públicos y una
+-- librería importada con `use` filtra una tabla. La librería vive en
+-- tests/fixtures/table_filters/filter_lib.syn, copia idéntica de examples/table_filters/
+-- filter_lib.syn: los módulos no pueden subir del directorio del gemelo ("escapes the importing
+-- directory") y el Rust corre el ejemplo desde su propia carpeta.
+test "an_app_can_combine_masks_without_materializing_rows"
+    let t be table([{"id": 1, "distance": 0, "fare": 10}, {"id": 2, "distance": 3, "fare": nothing}, {"id": 3, "distance": 4, "fare": 20}, {"id": 4, "distance": 2, "fare": 1000}])
+    let distance_ok be column_mask(t, "distance", ">", 0)
+    let fare_ok be column_mask(t, "fare", "<", 500, missing = "exclude")
+    let selected be where(t, logical_and(distance_ok, fare_ok))
+    assert_eq(length(selected), 1)
+    assert_eq(selected[0].id, 3)
+    assert_eq(columns(selected), ["id", "distance", "fare"])
+
+test "an_imported_library_can_filter_a_table"
+    use "./fixtures/table_filters/filter_lib.syn" as filters
+    let trips be table([
+        {"id": 1, "distance": 0, "fare": 10},
+        {"id": 2, "distance": 3, "fare": nothing},
+        {"id": 3, "distance": 4, "fare": 20},
+        {"id": 4, "distance": 2, "fare": 1000}
+    ])
+    let selected be filters.valid_trips(trips)
+    assert_eq(length(selected), 1)
+    assert_eq(selected[0].id, 3)

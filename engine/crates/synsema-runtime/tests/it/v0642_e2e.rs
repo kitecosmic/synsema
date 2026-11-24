@@ -313,14 +313,6 @@ fn tcp_connect_needs_the_exact_port() {
 }
 
 #[test]
-fn a_pipe_carries_bytes_and_close_inside_one_program() {
-    let _g = RUN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let r = run("let p be pipe({\"max_buffer\": 8})\npipe_send(p[\"a\"], \"hola\")\nlet m be pipe_recv(p[\"b\"], 1)\nprint(decode(m[\"data\"]))\npipe_close(p[\"a\"])\nprint(pipe_recv(p[\"b\"], 1)[\"type\"])\n");
-    assert!(r.success, "{:?}", r.errors);
-    assert_eq!(r.output, vec!["hola", "close"]);
-}
-
-#[test]
 fn exit_sets_the_code_of_the_run() {
     let _g = RUN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let r = run("print(\"antes\")\nexit(7)\nprint(\"después\")\n");
@@ -617,14 +609,6 @@ fn two_host_headers_are_a_bad_request() {
     start(format!("require serve({p})\nserve on {p}\n    route \"GET /\"\n        give 1\n", p = port), port);
     let (status, _, _) = get(port, "/", "Host: other.example\r\n");
     assert_eq!(status, 400);
-}
-
-#[test]
-fn a_pipe_half_close_still_lets_the_other_side_answer() {
-    let _g = RUN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let r = run("let p be pipe()\npipe_send(p[\"a\"], \"req\")\npipe_close(p[\"a\"], \"write\")\nprint(decode(pipe_recv(p[\"b\"], 1)[\"data\"]))\nprint(pipe_recv(p[\"b\"], 1)[\"type\"])\npipe_send(p[\"b\"], \"resp\")\nprint(decode(pipe_recv(p[\"a\"], 1)[\"data\"]))\n");
-    assert!(r.success, "{:?}", r.errors);
-    assert_eq!(r.output, vec!["req", "close", "resp"]);
 }
 
 /// Auditoría ronda 2 (R7): un par que hace `SHUT_WR` y espera la respuesta la recibe (al

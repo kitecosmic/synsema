@@ -1,0 +1,20 @@
+-- Módulo de prueba para DE-027: una task exportada llama a una hermana por nombre
+-- simple. Bajo `run` siempre funcionó; este fixture verifica que también funcione bajo
+-- `serve` y `parallel_map` (que snapshotean/reconstruyen el módulo para cruzar hilos).
+
+-- 'inner' es exportada y no llama a nadie.
+export task inner(x)
+    give x + "!"
+
+-- 'outer' (EXPORTADA) llama a 'inner' (hermana EXPORTADA) por su nombre simple.
+export task outer(x)
+    give inner(x)
+
+-- 'helper' NO está exportada (no aparece en el alias del módulo).
+task helper(x)
+    give "h:" + x
+
+-- 'via_internal' (EXPORTADA) llama a 'helper' (hermana NO exportada) — el caso real
+-- de Alfred: una task exportada que invoca una interna del módulo.
+export task via_internal(x)
+    give helper(x)

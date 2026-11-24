@@ -1,0 +1,30 @@
+-- Gemelo de webauth_e2e.rs (v0.6.68, migas §4): la MISMA puerta deny-by-default de
+-- `random` para token() y random_bytes() — sin `require random` → error de capability;
+-- con él → funcionan (token() de 32 bytes → 43 chars base64url). Los transforms puros
+-- (password_hash/password_verify) NO llevan gate: la salt interna no cuenta como
+-- "producir aleatoriedad" (precedente redis_lock).
+-- QUEDAN en Rust: session_login_cookie_me_logout_e2e y auth_one_param_bearer_regression
+-- (serve/sockets reales desde el host) y auth_bad_arity_fails_at_build (error de
+-- construcción del serve vía run_serve_program del host).
+-- Correr con: synsema test tests/webauth_e2e.test.syn
+
+test "random_capability_gates_token_and_random_bytes"
+    let ok be false
+    try
+        let t be token()
+    recover e
+        set ok to true
+        assert(contains(e, "random"))
+    assert(ok)
+    let ok2 be false
+    try
+        let b be random_bytes(8)
+    recover e
+        set ok2 to true
+        assert(contains(e, "random"))
+    assert(ok2)
+    let p be password_hash("x")
+    assert(password_verify("x", p))
+    require random
+    let t be token()
+    assert_eq(length(t), 43)

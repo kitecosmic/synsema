@@ -46,3 +46,21 @@ test "f1_call_and_call_tool_check_the_declared_types"
         give type_of(b)
     assert_eq(call(u, {"a": 1}), "nothing")
     assert_eq(call((x) => x, {"x": "a"}), "a")
+
+-- v0.6.68, tanda 2 (runtime): la firma de una task como catálogo de herramienta. Quedan en Rust
+-- del lote:
+--   f1_a_wrong_type_is_a_parse_error: error de PARSEO de la firma (un .test.syn entero tiene que
+--     parsear).
+--   f1_negative_and_nothing_defaults: el outline de codeintel es una API del host (Root/outline).
+test "f1_tool_spec_takes_the_catalog_from_the_signature"
+    require secret("S")
+    task add(a: number, b: number = 1, note, tags: list = [])
+        give a + b + length(tags)
+    assert_eq(json_encode(tool_spec(add, "Adds two numbers")), "{\"name\": \"add\", \"describe\": \"Adds two numbers\", \"params\": [\"a: number\", \"b: number\", \"note\", \"tags: list\"], \"optional\": [\"b\", \"tags\"]}")
+    assert_eq(tool_spec(add).describe == "", true)
+    expect_error(() => tool_spec((x) => x), "tool_spec needs a named task")
+    expect_error(() => tool_spec(length), "not the builtin 'length'")
+    -- un secret cuenta como texto para `call` (y sigue opaco)
+    task k(key: text)
+        give type_of(key)
+    assert_eq(call(k, {"key": secret("S", "s")}), "secret")

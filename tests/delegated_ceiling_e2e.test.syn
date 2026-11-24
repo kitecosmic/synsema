@@ -1,0 +1,53 @@
+-- Gemelo de delegated_ceiling_e2e.rs (v0.6.68, migas §4): el candidato `sandbox under`
+-- (el tercer punto de aplicación del techo delegado, in-process). Con try/recover afirma
+-- los mismos errores capturables que el .rs sacaba por la salida: lo que el bloque lista
+-- pasa (sigue gateado por el require del programa), lo que no lista se deniega aunque el
+-- programa lo declare, un `require` adentro es no-op (no re-concede para escapar), y las
+-- capabilities locales al proceso no son delegables (el texto trae "process-local").
+-- El file.read de prueba usa el fixture lineage; las rutas son relativas al CWD de la
+-- corrida, como en los demás gemelos.
+-- QUEDA en Rust:
+--   token_is_the_ceiling_and_the_refusal_is_generic: sirve HTTP real (sockets), fija
+--     SYNSEMA_SERVE_WORKERS del proceso y arma un scratch dir con note.txt en el host.
+-- Correr con: synsema test tests/delegated_ceiling_e2e.test.syn
+
+require file.read("tests/fixtures/lineage/*")
+
+test "sandbox_under_is_a_least_privilege_block"
+    -- Lo que el bloque lista, pasa.
+    let content be ""
+    sandbox under {"file.read": ["tests/fixtures/lineage/*"]}
+        set content to read_file("tests/fixtures/lineage/in.csv")
+    assert_eq(content, "a\n1\n")
+
+    -- Lo que el bloque no lista, se deniega aunque el programa lo declare; es atrapable
+    -- y el error nombra el bloque (el .rs afirmaba "denied: " + "sandbox under").
+    let denied be false
+    try
+        sandbox under {"net": "api.example.com"}
+            read_file("tests/fixtures/lineage/in.csv")
+    recover e
+        set denied to true
+        assert(contains(e, "sandbox under"))
+    assert(denied)
+
+    -- Un `require` adentro es no-op: no se puede re-conceder para escapar del bloque.
+    let still be false
+    try
+        sandbox under {"net": "api.example.com"}
+            require file.read("tests/fixtures/lineage/in.csv")
+            read_file("tests/fixtures/lineage/in.csv")
+    recover e
+        set still to true
+        assert(contains(e, "sandbox under"))
+    assert(still)
+
+    -- Lo local al proceso no es delegable ni por bloque: el techo se rechaza al entrar.
+    let rejected be false
+    try
+        sandbox under {"stdout": nothing}
+            print("never")
+    recover e
+        set rejected to true
+        assert(contains(e, "process-local"))
+    assert(rejected)

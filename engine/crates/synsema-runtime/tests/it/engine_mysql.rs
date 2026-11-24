@@ -28,30 +28,7 @@ fn mysql_url() -> Option<String> {
 
 /// `db_open("mysql://…")` sin `require db` → violación con el scope canónico (sin
 /// credenciales/puerto). Tampoco se auto-otorga en run.
-#[test]
-fn mysql_db_open_deny_without_require() {
-    let r = run_source("db_open(\"mysql://user:pw@localhost:3306/appdb\")", "<t>");
-    assert!(!r.success);
-    assert_eq!(
-        r.errors,
-        vec!["Runtime error: Capability not granted: db(\"mysql://localhost/appdb\") — this is a permission, not a bug: add `require db(\"mysql://localhost/appdb\")` to the program's preamble (or to the importing file, when this code runs in a module)".to_string()]
-    );
-}
-
 /// El scope URL es fiel: una grant a una base no cubre otra.
-#[test]
-fn mysql_scope_mismatch_deny() {
-    let r = run_source(
-        "require db(\"mysql://localhost/appdb\")\ndb_open(\"mysql://localhost/otra\")",
-        "<t>",
-    );
-    assert!(!r.success);
-    assert_eq!(
-        r.errors,
-        vec!["Runtime error: Capability not granted: db(\"mysql://localhost/otra\") — this is a permission, not a bug: add `require db(\"mysql://localhost/otra\")` to the program's preamble (or to the importing file, when this code runs in a module)".to_string()]
-    );
-}
-
 /// Con el grant adecuado el gate pasa y se rutea a MySQL; el puerto muerto da un error de
 /// RED (no de capability) → prueba "pasó el gate + ruteo a MySQL" sin un servidor real.
 #[test]

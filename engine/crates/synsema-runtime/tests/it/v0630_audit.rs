@@ -98,30 +98,6 @@ fn a6_request_json_matches_json_decode() {
 
 // A7 — Parquet: una duration se escribe (INT64 con su unidad en `synsema.durations`) y vuelve
 // igual; la duration de Arrow (pyarrow, polars) se lee como duration, no como un entero sin unidad.
-#[test]
-fn a7_parquet_durations_round_trip() {
-    assert_eq!(
-        out("let rows be [{\"d\": duration(seconds = 5), \"n\": 1}, {\"d\": nothing, \"n\": 2}, {\"d\": duration(days = -2, seconds = 0.000007), \"n\": 3}]\nlet back be parquet_read(parquet_write(rows))\nprint(to_rows(back) == rows)\nprint(back[2][\"d\"])\nlet fine be [{\"d\": duration(seconds = 0.0000015)}]\nprint(to_rows(parquet_read(parquet_write(fine))) == fine)\nprint(parquet_read(parquet_write([{\"n\": 7}])))"),
-        vec!["true", "-P1DT23H59M59.999993S", "true", "[{n: 7}]"]
-    );
-    // Escrito con pyarrow 25: columnas duration[s], [ms], [us], [ns] y un int64 común.
-    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures").to_string_lossy().replace('\\', "/");
-    let r = run_program(
-        &format!("require file.read(\"{dir}/*\")\nlet rows be parquet_read(read_file_bytes(\"{dir}/parquet_duration_arrow.parquet\"))\neach r in to_rows(rows)\n    print(r)\nprint(parquet_read(parquet_write(rows)) == rows)\n"),
-        "audit.syn",
-    );
-    assert!(r.success, "{:?}", r.errors);
-    assert_eq!(
-        r.output,
-        vec![
-            "{s: PT5S, ms: PT1.5S, us: PT1H0.000007S, ns: PT0.000000001S, n: 1}",
-            "{s: nothing, ms: PT0S, us: nothing, ns: PT2.000000001S, n: 2}",
-            "{s: -PT2S, ms: nothing, us: PT0S, ns: nothing, n: 3}",
-            "true",
-        ]
-    );
-}
-
 // B1 — index_of no copia la lista: un acierto temprano es O(1), como `in` y `contains`.
 #[test]
 fn b1_index_of_early_hit_is_constant() {

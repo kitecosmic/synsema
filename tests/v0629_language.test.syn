@@ -1,5 +1,7 @@
 -- v0.6.29 language compatibility. Host arity table, parser hints and elapsed-time guards
 -- remain in Rust.
+-- v0.6.68: syntax_fixes also remains in Rust (mezcla `let y be 5--1`, un error de PARSEO no
+-- expresable en un .test.syn; reflex_hints queda por los hints de parseo ya nombrados arriba).
 
 task expect_error(f, needle)
     let ok be false

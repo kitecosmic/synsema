@@ -23,78 +23,13 @@ fn out(source: &str) -> Vec<String> {
 // Disponibles en `run` + composición con charts (Batch 8)
 // =========================================================
 
-#[test]
-fn png_and_pdf_from_chart_in_run_mode() {
-    let o = out(
-        r#"let svg be chart_svg("bar", {"ene": 10, "feb": 25}, {"title": "Ventas"})
-let png be svg_to_png(svg, {"scale": 2})
-let pdf be svg_to_pdf(svg)
-print(type_of(png))
-print(contains(decode(png, "hex"), "89504e470d0a1a0a"))
-print(type_of(pdf))
-print(contains(decode(pdf, "hex"), "255044462d"))"#,
-    );
-    // magic PNG (89 50 4E 47 0D 0A 1A 0A) y magic PDF ("%PDF-" = 25 50 44 46 2d).
-    assert_eq!(o, vec!["bytes", "true", "bytes", "true"]);
-}
-
 // =========================================================
 // G8 — sandbox: convertir adentro funciona; write_file sigue denegado
 // =========================================================
 
-#[test]
-fn raster_works_inside_sandbox() {
-    let o = out(
-        r#"let png be bytes("", "hex")
-sandbox
-    let svg be chart_svg("line", [1, 2, 3])
-    set png to svg_to_png(svg)
-print(type_of(png))
-print(contains(decode(png, "hex"), "89504e470d0a1a0a"))"#,
-    );
-    assert_eq!(o, vec!["bytes", "true"]);
-}
-
-#[test]
-fn sandbox_still_denies_write_file() {
-    let r = run_source(
-        r#"require file
-let svg be chart_svg("bar", [1])
-sandbox
-    write_file("no-deberia-escribirse.png", svg_to_png(svg))"#,
-        "<test>",
-    );
-    assert!(!r.success, "write_file dentro de sandbox debería fallar");
-    assert!(
-        r.errors.iter().any(|e| e.contains("Capability not granted")),
-        "esperaba violación de capability, got {:?}",
-        r.errors
-    );
-}
-
 // =========================================================
 // G9 — try/recover atrapa SVG inválido
 // =========================================================
-
-#[test]
-fn invalid_svg_recoverable() {
-    let o = out(
-        r#"let msg be ""
-try
-    svg_to_png("<not-svg")
-recover err
-    set msg to err
-print(contains(msg, "invalid SVG"))
-let msg2 be ""
-try
-    svg_to_png(chart_svg("bar", [1]), {"width": 10000000})
-recover err
-    set msg2 to err
-print(contains(msg2, "max_pixels"))
-print("sigue vivo")"#,
-    );
-    assert_eq!(o, vec!["true", "true", "sigue vivo"]);
-}
 
 // =========================================================
 // Dogfood §3.4 completo vía `synsema test`: chart → png → file → bytes

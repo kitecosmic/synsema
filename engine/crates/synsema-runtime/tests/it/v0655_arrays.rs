@@ -136,35 +136,6 @@ fn set_into_an_array_respects_labels() {
 
 /// N3: `matmul` y `dot` con una matriz y un vector dicen la forma Synsema (antes se mandaban uno al
 /// otro), con el largo del vector; y la forma que dicen anda.
-#[test]
-fn matmul_and_dot_with_a_vector_name_the_shape() {
-    let v = "let v be array([1, 1])\n";
-    let t = |rest: &str| with_a(&format!("{}{}", v, rest));
-    assert_eq!(
-        t("print(matmul(M, v))"),
-        "ERR: Runtime error: matmul: expected a 2D array (matrix), got 1-D — for a matrix times a vector: matmul(M, reshape(v, [2, 1])); for two vectors: dot(a, b)"
-    );
-    assert_eq!(
-        t("print(matmul(v, M))"),
-        "ERR: Runtime error: matmul: expected a 2D array (matrix), got 1-D — for a vector times a matrix: matmul(reshape(v, [1, 2]), M); for two vectors: dot(a, b)"
-    );
-    assert_eq!(t("print(matmul(v, v))"), "ERR: Runtime error: matmul: expected a 2D array (matrix), got 1-D — for two vectors: dot(a, b)");
-    assert_eq!(
-        t("print(dot(M, v))"),
-        "ERR: Runtime error: dot is the inner product of two 1-D vectors (got 2-D and 1-D) — for a matrix times a vector: matmul(M, reshape(v, [2, 1]))"
-    );
-    assert_eq!(
-        t("print(dot(v, M))"),
-        "ERR: Runtime error: dot is the inner product of two 1-D vectors (got 1-D and 2-D) — for a vector times a matrix: matmul(reshape(v, [1, 2]), M)"
-    );
-    assert_eq!(
-        t("print(dot(M, M))"),
-        "ERR: Runtime error: dot is the inner product of two 1-D vectors (got 2-D and 2-D) — for matrices use matmul(a, b)"
-    );
-    // Lo que el mensaje propone (numpy: M @ v = [3, 7], v @ M = [4, 6]).
-    assert_eq!(t("print(matmul(M, reshape(v, [2, 1])))\nprint(matmul(reshape(v, [1, 2]), M))"), "[[3], [7]]\n[[4, 6]]");
-}
-
 /// M28 (ronda 6): el REPL atrapa el error de cada línea y sigue en el mismo hilo; un `set` que falló a
 /// mitad de camino no le deja a la línea siguiente una copia del array retenida.
 #[test]

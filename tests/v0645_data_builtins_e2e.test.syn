@@ -1,0 +1,40 @@
+-- Gemelo de v0645_data_builtins_e2e.rs (runtime) (v0.6.68, tanda 2): x_axis de charts y HTML
+-- real desde un programa, valor a valor. Queda en Rust del lote:
+--   gzip_url_and_header_from_a_program: necesita un servidor HTTP real (un 429 con Retry-After
+--     con capitalización propia y un .gz servido por el host); header(r, nombre) sólo existe
+--     sobre una respuesta viva.
+-- Correr con: synsema test tests/v0645_data_builtins_e2e.test.syn
+
+test "chart_x_axis_from_a_program"
+    let rows be apply(range(0, 30), (i) => {"dia": add_days(date(2026, 1, 1), i), "n": i})
+    let svg be chart_svg("bar", rows, {"x": "dia", "y": "n", "x_axis": {"angle": 30, "every": 7, "format": "%d/%m"}})
+    assert_eq(contains(svg, ">08/01<"), true)
+    assert_eq(contains(svg, ">02/01<"), false)
+    assert_eq(contains(svg, "rotate(-30 "), true)
+    let e1 be "ok"
+    try
+        chart_svg("pie", {"a": 1}, {"x_axis": {"angle": 45}})
+    recover e
+        set e1 to e
+    assert_eq(contains(e1, "x_axis"), true)
+    let e2 be "ok"
+    try
+        chart_svg("bar", rows, {"x": "dia", "y": "n", "x_axis": {"rotate": 45}})
+    recover e
+        set e2 to e
+    assert_eq(contains(e2, "unknown x_axis key"), true)
+    let e3 be "ok"
+    try
+        chart_svg("bar", rows, {"x": "dia", "y": "n", "x_axis": {"format": "%Q"}})
+    recover e
+        set e3 to e
+    assert_eq(contains(e3, "not a strftime specifier"), true)
+
+test "html_from_a_program"
+    let page be "<ul><li class=item><a href=/a>Uno &amp; dos</a><li class=item><a href=/b>Dos</a></ul><script>x()</script>"
+    let links be html_select(page, "li.item > a")
+    assert_eq(length(links), 2)
+    assert_eq(links[0]["attrs"]["href"], "/a")
+    assert_eq(links[0]["text"], "Uno & dos")
+    assert_eq(html_text(page), "Uno & dos\nDos")
+    assert_eq(html_unescape("&lt;b&gt; &eacute;"), "<b> é")

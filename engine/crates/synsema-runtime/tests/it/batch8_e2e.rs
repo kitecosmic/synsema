@@ -27,16 +27,6 @@ fn out(source: &str) -> Vec<String> {
 // =========================================================
 
 #[test]
-fn chart_svg_available_in_run_mode() {
-    let o = out(
-        "let svg be chart_svg(\"bar\", {\"ene\": 10, \"feb\": 25})\n\
-         print(contains(svg, \"<svg\"))\n\
-         print(contains(svg, \"viewBox\"))",
-    );
-    assert_eq!(o, vec!["true", "true"]);
-}
-
-#[test]
 fn chart_svg_available_in_synsema_test_mode() {
     // El MISMO builtin bajo el runner de `synsema test` (G9).
     let src = "test \"chart en test mode\"\n    assert(contains(chart_svg(\"line\", [1, 2, 3]), \"<svg\"))\n";
@@ -48,69 +38,9 @@ fn chart_svg_available_in_synsema_test_mode() {
 // G2 — agnóstico de fuente: literal / csv_parse / sql → mismo SVG
 // =========================================================
 
-#[test]
-fn same_svg_from_literal_csv_and_sql() {
-    let o = out(
-        "require db(\":memory:\")\n\
-         db_open(\":memory:\", \"memory\")\n\
-         sql_exec(\"CREATE TABLE ventas (mes TEXT, total REAL)\")\n\
-         sql_exec(\"INSERT INTO ventas VALUES ('ene', 10.5), ('feb', 25.0)\")\n\
-         let de_sql be sql(\"SELECT mes, total FROM ventas ORDER BY mes\")\n\
-         let literal be [{\"mes\": \"ene\", \"total\": 10.5}, {\"mes\": \"feb\", \"total\": 25.0}]\n\
-         let de_csv be csv_parse(\"mes,total\\nene,10.5\\nfeb,25.0\\n\", {\"numbers\": true})\n\
-         let opts be {\"x\": \"mes\", \"y\": \"total\", \"title\": \"Ventas\"}\n\
-         let s1 be chart_svg(\"bar\", literal, opts)\n\
-         let s2 be chart_svg(\"bar\", de_csv, opts)\n\
-         let s3 be chart_svg(\"bar\", de_sql, opts)\n\
-         print(s1 == s2)\n\
-         print(s2 == s3)\n\
-         print(contains(s1, \"<svg\"))",
-    );
-    assert_eq!(o, vec!["true", "true", "true"], "el chart no debe saber de dónde vienen los datos");
-}
-
 // =========================================================
 // G9 — sandbox: lo puro adentro funciona; sql sigue denegado
 // =========================================================
-
-#[test]
-fn pure_builtins_work_inside_sandbox() {
-    let o = out(
-        r#"let med be 0
-let p95 be 0
-let svg be ""
-let filas be []
-sandbox
-    set filas to csv_parse("v\n1\n2\n3\n4\n", {"numbers": true})
-    set med to median([1, 2, 3, 4])
-    set p95 to percentile([1, 2, 3, 4], 95)
-    set svg to chart_svg("bar", [1, 2])
-print(text(med))
-print(length(filas))
-print(contains(svg, "<svg"))
-print(text(p95 > 3))"#,
-    );
-    assert_eq!(o, vec!["2.5", "4", "true", "true"]);
-}
-
-#[test]
-fn sandbox_still_denies_capabilities() {
-    // El sandbox no se abrió de más: sql adentro sigue denegado aunque el programa
-    // tenga la capability afuera.
-    let r = run_source(
-        r#"require db(":memory:")
-db_open(":memory:", "memory")
-sandbox
-    let x be sql("SELECT 1")"#,
-        "<test>",
-    );
-    assert!(!r.success, "sql dentro de sandbox debería fallar");
-    assert!(
-        r.errors.iter().any(|e| e.contains("Capability not granted")),
-        "esperaba violación de capability, got {:?}",
-        r.errors
-    );
-}
 
 // =========================================================
 // G10 — try/recover atrapa los errores de chart
@@ -142,30 +72,6 @@ print("sigue vivo")"#,
 // =========================================================
 // G8 — secret jamás se filtra (csv_encode y chart)
 // =========================================================
-
-#[test]
-fn secret_never_leaks_in_csv_or_chart() {
-    let o = out(
-        r#"let s be as_secret("hunter2", "API_KEY")
-let enc be ""
-try
-    set enc to csv_encode([{"k": s, "v": "x"}])
-recover err
-    set enc to err
-print(contains(enc, "secret(API_KEY)"))
-print(contains(enc, "hunter2"))
-let svg be chart_svg("bar", [{"k": s, "v": 1}], {"x": "k", "y": "v"})
-print(contains(svg, "hunter2"))
-let msg be ""
-try
-    chart_svg("bar", [{"k": "a", "v": s}], {"x": "k", "y": "v"})
-recover err
-    set msg to err
-print(contains(msg, "secret"))
-print(contains(msg, "hunter2"))"#,
-    );
-    assert_eq!(o, vec!["true", "false", "false", "true", "false"]);
-}
 
 // =========================================================
 // Dogfood (§7.5): pipeline completo EN EL LENGUAJE, vía `synsema test`

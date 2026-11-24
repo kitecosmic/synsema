@@ -1,0 +1,7 @@
+-- Gemelo de v0664_probe.rs (runtime) (v0.6.68, tanda 2): sin bloques migrables — el único
+-- candidato queda en Rust:
+--   local_parallel_probe: sonda de performance manual (#\[ignore\]; release con --ignored
+--     --nocapture): 1M de filas y tiempos de pared comparados; nada de eso es afirmable en el
+--     runner .syn.
+-- Correr con: synsema test tests/v0664_probe.test.syn (0 bloques: la decisión vive en el TSV y
+-- en Rust).

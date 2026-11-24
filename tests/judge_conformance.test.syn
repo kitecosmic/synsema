@@ -5,6 +5,12 @@
 -- callback (`JudgeRequest` visto desde el host), `decide` servido por el juez (bandera
 -- SYNSEMA_JUDGE_DECIDE que `synsema test` no fija por bloque) y los 3 del check estático
 -- (`check_program_static` es del host). Correr con: synsema test tests/judge_conformance.test.syn
+-- v0.6.68 (los 8 candidatos del inventario): TODOS quedan en Rust, son errores de PARSEO
+-- (migas §4, en parser.rs): rate_with_between_is_a_parse_error_with_the_fix,
+-- choose_with_across_is_a_parse_error_with_the_fix, or_must_be_followed_by_nothing,
+-- rate_has_no_escape_level, whether_takes_no_options, duplicate_question_ids_are_rejected
+-- (id de pregunta repetido), judge_without_block_is_a_parse_error,
+-- unknown_verb_inside_judge_is_a_parse_error.
 
 require judge
 

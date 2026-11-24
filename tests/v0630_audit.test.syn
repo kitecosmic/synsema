@@ -264,3 +264,22 @@ test "parquet_refuses_to_drop_nanoseconds"
     assert_eq(to_rows(parquet_read(parquet_write(a))) == a, true)
     let b be [{"t": datetime("2026-01-03T10:00:00.000000001Z")}]
     assert_eq(to_rows(parquet_read(parquet_write(b))) == b, true)
+
+-- v0.6.68 (segunda pasada): A7 migra acá abajo. La nota de la cabecera sobre a7 queda para el
+-- .rs original: allá la ruta del fixture sale de CARGO_MANIFEST_DIR; acá se lee por ruta
+-- relativa a la raíz del repo (el mismo patrón de v0629_audit), con el grant del bloque. Las
+-- decisiones QUEDA de la cabecera siguen vigentes para c1/c3/c3b/c4/c9/c10.
+test "a7_parquet_durations_round_trip"
+    let rows be [{"d": duration(seconds = 5), "n": 1}, {"d": nothing, "n": 2}, {"d": duration(days = -2, seconds = 0.000007), "n": 3}]
+    let back be parquet_read(parquet_write(rows))
+    assert_eq(to_rows(back) == rows, true)
+    assert_eq(text(back[2]["d"]), "-P1DT23H59M59.999993S")
+    let fine be [{"d": duration(seconds = 0.0000015)}]
+    assert_eq(to_rows(parquet_read(parquet_write(fine))) == fine, true)
+    assert_eq(text(parquet_read(parquet_write([{"n": 7}]))), "[{n: 7}]")
+    require file.read("engine/crates/synsema-runtime/tests/fixtures/parquet_duration_arrow.parquet")
+    let rows2 be parquet_read(read_file_bytes("engine/crates/synsema-runtime/tests/fixtures/parquet_duration_arrow.parquet"))
+    assert_eq(text(rows2[0]), "{s: PT5S, ms: PT1.5S, us: PT1H0.000007S, ns: PT0.000000001S, n: 1}")
+    assert_eq(text(rows2[1]), "{s: nothing, ms: PT0S, us: nothing, ns: PT2.000000001S, n: 2}")
+    assert_eq(text(rows2[2]), "{s: -PT2S, ms: nothing, us: PT0S, ns: nothing, n: 3}")
+    assert_eq(parquet_read(parquet_write(rows2)) == rows2, true)

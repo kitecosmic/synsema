@@ -1,0 +1,20 @@
+-- Gemelo de llm_stream_e2e.rs (v0.6.68, migas §4): §4.2 — sin provider cableado,
+-- llm_stream devuelve el placeholder y `on_chunk` NO se invoca (contador en cero), bajo
+-- `synsema test` (sin provider, igual que run_source del .rs).
+-- QUEDAN en Rust:
+--   llm_stream_requires_llm_capability_in_secure_mode: `llm` es auto-concedida en el
+--     wiring no-secure — el MISMO de `run` y `synsema test` — así que la negación
+--     "Capability not granted: llm" sólo existe en secure, que el runner .syn no expone.
+--   llm_stream_scripted_chunks_in_order, llm_stream_on_chunk_error_propagates_and_stops
+--     y llm_stream_on_chunk_error_is_recoverable: piden el provider GUIONADO del host
+--     (run_with_llm_stream): los chunks no son observables desde el lenguaje.
+-- Correr con: synsema test tests/llm_stream_e2e.test.syn
+
+test "llm_stream_without_provider_placeholder_no_chunks"
+    require llm
+    let calls be 0
+    task on_tok(t)
+        set calls to calls + 1
+    let full be llm_stream("q", "", on_tok)
+    assert_eq(full, "[no llm provider]")
+    assert_eq(calls, 0)

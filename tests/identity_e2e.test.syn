@@ -1,0 +1,86 @@
+-- Gemelo de identity_e2e.rs (v0.6.68, migas §4): los tres candidatos, T3/T4/T2 puros por
+-- programa .syn. Las claves son DETERMINISTICAS (P-256 escalares 7 y 11, semilla ed25519
+-- 0x03*32, reto WebAuthn fijo) y la firma de aserción es RFC6979: las constantes en hex
+-- adentro derivan de la misma matemática que el fixture del host (p256 crate), y el verde
+-- de este archivo las revalida (webauthn_verify/document_verify las aceptan).
+-- QUEDA en Rust:
+--   a_receipt_is_a_verifiable_credential_derived_from_the_audit: afirma el audit del host
+--     del recibo (program_sha/engine/capabilities) contra el fuente desde Rust.
+--   the_agent_card_is_derived_signed_with_the_server_did_and_verifiable_offline: sirve
+--     HTTP real (sockets) y fija SYNSEMA_IDENTITY_KEY del proceso.
+-- Correr con: synsema test tests/identity_e2e.test.syn
+
+require sign("DOC_KEY")
+
+-- T3/T4 puros: canonical_json (RFC 8785) exacto y did:key de ida y vuelta.
+test "canonical_json_and_did_key_are_exact_and_pure"
+    let c be canonical_json({"b": 1, "a": [true, nothing, "é", 1.5], "n": 100})
+    assert_eq(c, "{\"a\":[true,null,\"é\",1.5],\"b\":1,\"n\":100}")
+    let pk be bytes("d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a", "hex")
+    let did be did_key_encode(pk)
+    assert(starts_with(did, "did:key:z6Mk"))
+    let back be did_key_decode(did)
+    assert_eq(back["alg"], "ed25519")
+    assert_eq(decode(back["public_key"], "hex"), "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a")
+    assert_eq(back["did"], did)
+    let doc be did_key_document(did)
+    assert_eq(doc["id"], did)
+    assert_eq(length(doc["verificationMethod"]), 2)
+    assert(contains(json_encode(doc["keyAgreement"]), "z6LS"))
+    assert_eq(did_key_encode(bytes("028e533b6fa0bf7b4625bb30667c01fb607ef9f8b8a80fef5b300628703187b2a3", "hex"), "p256"), "did:key:zDnaea1YYsBzZWoeVithwzqjHjCSSJXg7QBULsYdoNtQoFu8E")
+
+-- T4: document_sign/document_verify W3C Data Integrity (ed25519 + P-256 por PEM), con
+-- alteración, clave equivocada y verificación por JWK. Los PEM salen de los DER fijos
+-- (misma construcción que p256_fixture del .rs) con decode(bytes, "base64").
+test "document_sign_and_verify_are_w3c_data_integrity"
+    let k be as_secret(bytes("0303030303030303030303030303030303030303030303030303030303030303", "hex"), "DOC_KEY")
+    let did be did_key_encode(ed25519_pubkey(k))
+    let mb be did_key_decode(did)["multibase"]
+    let doc be {"hello": "world", "n": [1, 2, 3], "nested": {"z": true, "a": nothing}}
+    let signed be document_sign(doc, k, {"verification_method": did + "#" + mb, "created": "2026-09-22T00:00:00Z"})
+    assert_eq(signed["proof"]["type"] + " " + signed["proof"]["cryptosuite"] + " " + signed["proof"]["proofPurpose"], "DataIntegrityProof eddsa-jcs-2022 assertionMethod")
+    assert_eq(starts_with(signed["proof"]["proofValue"], "z"), true)
+    let v be document_verify(signed, did)
+    assert_eq(v["verified"], true)
+    assert(contains(v["verification_method"], "did:key:z6Mk"))
+    assert_eq(document_verify(signed, {"kty": "OKP", "crv": "Ed25519", "x": decode(ed25519_pubkey(k), "base64url")})["verified"], true)
+    assert_eq(document_verify(signed, "did:key:zDnaea1YYsBzZWoeVithwzqjHjCSSJXg7QBULsYdoNtQoFu8E") == nothing, true)
+    set signed["hello"] to "tampered"
+    assert_eq(document_verify(signed, did) == nothing, true)
+
+    -- P-256 por PEM (texto) con la suite ECDSA; se verifica por PEM público y por did:key.
+    let sec1 be "-----BEGIN EC PRIVATE KEY-----\nMCUCAQEEIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAH\n-----END EC PRIVATE KEY-----\n"
+    let spki be "-----BEGIN PUBLIC KEY-----\nMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEjlM7b6C/e0YluzBmfAH7YH75+LioD+9bMAYocDGHsqNz6x294DMYNm0Gn4Om9ZAAU8c2M8sEGyHFXhqGwfQAtA==\n-----END PUBLIC KEY-----\n"
+    let did_p256 be "did:key:zDnaea1YYsBzZWoeVithwzqjHjCSSJXg7QBULsYdoNtQoFu8E"
+    let pdoc be document_sign({"amount": 10, "unit": "credits"}, sec1, {"cryptosuite": "ecdsa-jcs-2019", "verification_method": did_p256 + "#zDnaea1YYsBzZWoeVithwzqjHjCSSJXg7QBULsYdoNtQoFu8E"})
+    assert_eq(pdoc["proof"]["cryptosuite"], "ecdsa-jcs-2019")
+    assert_eq(document_verify(pdoc, spki)["verified"], true)
+    assert_eq(document_verify(pdoc, did_p256)["verified"], true)
+    assert_eq(document_verify(pdoc, did) == nothing, true)
+
+-- T2: webauthn_register + webauthn_verify con un authenticator P-256 emulado (los mismos
+-- bytes que manda un browser: clientDataJSON, attestationObject CBOR, authenticatorData,
+-- firma ECDSA-RFC6979 en DER). El .rs armaba los JSON en el host y los leía de disco; los
+-- mismos mapas van acá en línea.
+test "webauthn_register_then_verify_from_a_program"
+    let opts be {"rp_id": "app.example", "origin": "https://app.example", "challenge": "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY"}
+    let reg be {"id": "Y3JlZGVudGlhbC1lMmU", "rawId": "Y3JlZGVudGlhbC1lMmU", "type": "public-key", "response": {"clientDataJSON": "eyJ0eXBlIjoid2ViYXV0aG4uY3JlYXRlIiwiY2hhbGxlbmdlIjoiTURFeU16UTFOamM0T1dGaVkyUmxaakF4TWpNME5UWTNPRGxoWW1Oa1pXWSIsIm9yaWdpbiI6Imh0dHBzOi8vYXBwLmV4YW1wbGUiLCJjcm9zc09yaWdpbiI6ZmFsc2V9", "attestationObject": "o2NmbXRkbm9uZWdhdHRTdG10oGhhdXRoRGF0YViSVtmCAS3hjt8Iz1fY2UtegalxmdPrFPI7fCt1xcdfVG1FAAAAAAAAAAAAAAAAAAAAAAAAAAAADmNyZWRlbnRpYWwtZTJlpQECAyYgASFYID7RE7eIO0xZBjg3nbDCHNoWdC7QJVBIv0MzkdN0vCHRIlggkJkgmszEyKIkyEOvpPTGigkNBNpemIna4vju_OgqN0A"}}
+    let r1 be webauthn_register(reg, opts)
+    assert_eq(r1["alg"] + " " + r1["public_key"]["kty"] + " fmt " + r1["fmt"] + " uv " + text(r1["user_verified"]), "ES256 EC fmt none uv true")
+    let asr be {"id": "Y3JlZGVudGlhbC1lMmU", "rawId": "Y3JlZGVudGlhbC1lMmU", "type": "public-key", "response": {"clientDataJSON": "eyJ0eXBlIjoid2ViYXV0aG4uZ2V0IiwiY2hhbGxlbmdlIjoiTURFeU16UTFOamM0T1dGaVkyUmxaakF4TWpNME5UWTNPRGxoWW1Oa1pXWSIsIm9yaWdpbiI6Imh0dHBzOi8vYXBwLmV4YW1wbGUiLCJjcm9zc09yaWdpbiI6ZmFsc2V9", "authenticatorData": "VtmCAS3hjt8Iz1fY2UtegalxmdPrFPI7fCt1xcdfVG0FAAAABw", "signature": "MEQCIBCcikUbU0jeDmt0x_ocd_2yvoNBGQV2AFtUdYrb1CF0AiB2HUsdoZzsmG9_C-IzLidEW2rHoHuF4p447xn3nQGxEg", "userHandle": "dXNlci00Mg"}}
+    set r1["user_handle"] to "user-42"
+    let v be webauthn_verify(asr, r1, {"rp_id": "app.example", "origin": "https://app.example", "challenge": "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY", "sign_count": 3})
+    assert_eq(text(v["sign_count"]) + " handle " + v["user_handle"] + " alg " + v["alg"] + " id ok " + text(v["id"] == r1["id"]), "7 handle user-42 alg ES256 id ok true")
+    assert_eq(webauthn_verify(asr, r1, {"rp_id": "app.example", "origin": "https://app.example", "challenge": "ZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmY"}) == nothing, true)
+    assert_eq(webauthn_verify(asr, r1, {"rp_id": "app.example", "origin": "https://evil.example", "challenge": "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY"}) == nothing, true)
+    assert_eq(webauthn_verify(asr, r1, {"rp_id": "app.example", "origin": "https://app.example", "challenge": "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY", "sign_count": 7}) == nothing, true)
+    -- la clave sola no alcanza: el id de la credencial ata la clave (error con el arreglo)
+    let key_alone be "accepted"
+    try
+        webauthn_verify(asr, r1["public_key"], {"rp_id": "app.example", "origin": "https://app.example", "challenge": "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY"})
+    recover e
+        set key_alone to "error"
+    assert_eq(key_alone, "error")
+    -- otra credencial (otro id) con esta misma clave: nothing
+    set r1["id"] to "b3RoZXItY3JlZA"
+    assert_eq(webauthn_verify(asr, r1, {"rp_id": "app.example", "origin": "https://app.example", "challenge": "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY"}) == nothing, true)

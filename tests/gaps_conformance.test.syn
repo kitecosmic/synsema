@@ -1,5 +1,8 @@
 -- Capability isolation and expression regressions. The host-only serve, run-mode and
 -- RunResult output cases remain in Rust.
+-- v0.6.68: the sandbox stdout deny/allow pair and the run-mode llm autogrant migrate below;
+-- the secure-mode llm gate (run_source_secure without/with `require llm`) remains in Rust:
+-- the twin runner has no secure mode, so that deny/grant is not observable here.
 
 test "sandbox_denies_granted_capability"
     require random
@@ -75,3 +78,26 @@ test "checkpoint_accepts_expression"
     let i be 3
     checkpoint "step_" + text(i)
     assert_eq(i, 3)
+
+test "sandbox_print_is_denied_inside_and_sandbox_under_lets_it_through"
+    -- v0.6.51 (N5): un `sandbox` pelado deniega toda capability, `stdout` también (antes `print`
+    -- pasaba); `sandbox under {}` deja pasar las del proceso dentro del techo del host.
+    let denied be false
+    try
+        sandbox
+            print("inside")
+    recover e
+        set denied to true
+        assert(contains(e, "Capability not granted: stdout"))
+    assert(denied)
+    let through be false
+    sandbox under {}
+        print("inside")
+        set through to true
+    assert(through)
+
+test "llm_op_autogranted_in_run"
+    -- Retrocompat: en no-secure (`run`/`conform`) `llm` se auto-concede como stdout/time →
+    -- la op corre sin `require llm` y da el placeholder, sin error de capability.
+    let e be generate "x" given "y"
+    assert_eq(type_of(e), "text")

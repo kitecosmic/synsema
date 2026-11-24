@@ -1,0 +1,24 @@
+-- Gemelo de v0645_partial_write_e2e.rs (runtime) (v0.6.68, tanda 2): pipe_write acepta lo que
+-- entra y dice cuánto; pipe_stats y el cierre son observables con los builtins del lenguaje.
+-- Queda en Rust del módulo (no es candidato del TSV, y por el mismo motivo):
+--   tcp_write_never_waits_on_a_peer_that_does_not_read: par TCP real que no lee nunca + tiempo de
+--     pared del host.
+-- Correr con: synsema test tests/v0645_partial_write_e2e.test.syn
+
+test "pipe_write_takes_what_fits_and_says_how_much"
+    let p be pipe({"max_buffer": 10})
+    assert_eq(pipe_write(p["a"], "0123456789ABCDEF"), 10)
+    assert_eq(pipe_write(p["a"], "mas"), 0)
+    assert_eq(pipe_stats(p["a"])["queued_out"], 10)
+    assert_eq(pipe_stats(p["b"])["queued_in"], 10)
+    assert_eq(pipe_stats(p["b"])["status"], "open")
+    let got be pipe_recv(p["b"], 1)
+    assert_eq(got["type"], "data")
+    assert(pipe_write(p["a"], "mas") > 0)
+    pipe_close(p["b"])
+    let failed be "no"
+    try
+        pipe_write(p["a"], "x")
+    recover e
+        set failed to "si"
+    assert_eq(failed, "si")

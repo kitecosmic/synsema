@@ -30,11 +30,6 @@ fn trace_and_log() {
 }
 
 #[test]
-fn sandbox() {
-    assert_output("sandbox\n    print(\"sandboxed\")\n", &["sandboxed"]);
-}
-
-#[test]
 fn reserved_word_as_variable() {
     assert_error_contains("let task be 1", "reserved word");
 }
@@ -92,11 +87,6 @@ fn error_category_vectors() {
         "let x be @",
         &["Lexer error: <archivo>:1:10: Unexpected character: '@'"],
     );
-}
-
-#[test]
-fn llm_available_false_offline() {
-    assert_output("print(text(llm_available()))", &["false"]);
 }
 
 #[test]

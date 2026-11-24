@@ -1,0 +1,42 @@
+-- Gemelo de mtls_e2e.rs (v0.6.68, migas §4): el GATE de mtls_identity (file.read sobre
+-- AMBOS PEM) y el PEM inválido (error claro, sin ecoar el contenido). Los PEM del gate
+-- existen de verdad pero se escriben con grant de SÓLO ESCRITURA (require file.write no
+-- concede file.read) — así el gate niega con archivos reales en disco, como el .rs.
+-- QUEDA en Rust: mtls_identity_accepts_a_valid_pair — el par cert/key válido lo acuña
+-- rcgen en el host; el lenguaje no tiene builtin que genere un par X.509 y un fixture
+-- comiteado sería archivo nuevo de host.
+-- Los tres archivos _syn_mtls_* son scratch de corrida (convención de tests/_syn_* en
+-- bytes_e2e.test.syn): se escriben y se borran en cada test.
+-- Correr con: synsema test tests/mtls_e2e.test.syn
+
+require file.write("tests/_syn_mtls_gate_cert.pem")
+require file.write("tests/_syn_mtls_gate_key.pem")
+require file("tests/_syn_mtls_bad_pem.tmp")
+
+test "mtls_identity_requires_file_read_capability"
+    write_file("tests/_syn_mtls_gate_cert.pem", "sólo para el gate, no para parsear")
+    write_file("tests/_syn_mtls_gate_key.pem", "sólo para el gate, no para parsear")
+    let ok be false
+    try
+        let granted be mtls_identity("tests/_syn_mtls_gate_cert.pem", "tests/_syn_mtls_gate_key.pem")
+    recover e
+        set ok to true
+        -- El error nombra la capability de lectura de archivos.
+        assert(contains(e, "file"))
+        assert(contains(e, "read"))
+    assert(ok)
+    delete_file("tests/_syn_mtls_gate_cert.pem")
+    delete_file("tests/_syn_mtls_gate_key.pem")
+
+test "mtls_identity_reports_bad_pem_clearly"
+    write_file("tests/_syn_mtls_bad_pem.tmp", "esto no es un PEM secreto")
+    let ok be false
+    try
+        let granted be mtls_identity("tests/_syn_mtls_bad_pem.tmp", "tests/_syn_mtls_bad_pem.tmp")
+    recover e
+        set ok to true
+        assert(contains(e, "certificate") or contains(e, "PEM"))
+        -- Y el contenido del archivo NUNCA aparece en el mensaje (podría ser la clave).
+        assert(not contains(e, "esto no es un PEM secreto"))
+    assert(ok)
+    delete_file("tests/_syn_mtls_bad_pem.tmp")

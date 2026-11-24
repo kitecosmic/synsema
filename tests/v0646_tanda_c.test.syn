@@ -67,3 +67,139 @@ task page(limit, offset)
 task f_sin_cercano(a)
     give a
 
+-- v0.6.68, tanda 2 (runtime): C3/C4 del crate runtime — el recibo nombra lo que la corrida
+-- escribió, zip_extract anota cada archivo, parquet_scan lee del disco como parquet_read y los
+-- workers de parallel_map alcanzan el recibo del llamador. Queda en Rust del lote:
+--   c5_discovery_takes_only_off: `discovery on` es error de PARSEO del bloque serve (un .test.syn
+--     entero tiene que parsear).
+-- Estos tests usan bases relativas de receipt()/lineage(): acumulan a lo largo del archivo.
+require file.write("tests/_syn_v0646_c3/*")
+require file.read("tests/_syn_v0646_c3/*")
+require file.write("tests/_syn_v0646_zip/**")
+
+test "c3_the_receipt_names_what_the_run_wrote"
+    let d be "tests/_syn_v0646_c3"
+    let base be length(receipt().credentialSubject.outputs)
+    let basei be length(receipt().credentialSubject.inputs)
+    let model be json_encode({"coef": polyfit([1, 2, 3], [2, 4, 6], 1)})
+    write_file(d + "/model.json", model)
+    append_file(d + "/log.txt", "uno\n")
+    edit_file(d + "/model.json", "coef", "w")
+    let o be receipt().credentialSubject.outputs
+    assert_eq(length(o) - base, 3)
+    assert_eq(o[base].source, "write_file")
+    assert_eq(o[base + 1].source, "append_file")
+    assert_eq(o[base + 2].source, "edit_file")
+    assert_eq(o[base].what, d + "/model.json")
+    assert_eq("0x" + o[base].sha256 == hex(sha256(model)), true)
+    assert_eq(o[base].bytes, length(model))
+    assert_eq(o[base].encoding, "text")
+    assert_eq("0x" + o[base + 1].sha256 == hex(sha256("uno\n")), true)
+    assert_eq(o[base + 1].bytes, 4)
+    assert_eq("0x" + o[base + 2].sha256 == hex(sha256(read_file(d + "/model.json"))), true)
+    -- dos entradas: lo que leyó edit_file y el read_file de arriba
+    assert_eq(length(receipt().credentialSubject.inputs) - basei, 2)
+    -- una escritura de bytes queda con su encoding; una negada, no
+    write_file(d + "/b.bin", bytes([1, 2, 3]))
+    let o2 be receipt().credentialSubject.outputs
+    assert_eq(length(o2) - (base + 3), 1)
+    assert_eq(o2[base + 3].encoding, "bytes")
+    assert_eq(o2[base + 3].bytes, 3)
+    delete_file(d + "/model.json")
+    delete_file(d + "/log.txt")
+    delete_file(d + "/b.bin")
+    expect_error(() => write_file("tests/_syn_v0646_denied/x.txt", "x"), "file.write")
+
+test "c3_an_extraction_names_each_file"
+    let d be "tests/_syn_v0646_zip"
+    let base be length(receipt().credentialSubject.outputs)
+    let z be zip_create([{"path": "a.txt", "bytes": bytes("AA")}, {"path": "s/b.txt", "bytes": bytes("BBB")}])
+    zip_extract(z, d + "/x/./")
+    let o be receipt().credentialSubject.outputs
+    assert_eq(length(o) - base, 2)
+    assert_eq(o[base].source, "zip_extract")
+    assert_eq(o[base].what, d + "/x/./a.txt")
+    assert_eq(o[base + 1].bytes, 3)
+    assert_eq("0x" + o[base + 1].sha256 == hex(sha256("BBB")), true)
+    delete_file(d + "/x/a.txt")
+    delete_file(d + "/x/s/b.txt")
+
+test "c4_parquet_scan_reads_from_disk_like_parquet_read"
+    let d be "tests/_syn_v0646_c3"
+    let rows be apply(range(0, 500), (i) => {"id": i, "name": "n" + text(i), "x": i * 0.5})
+    write_file(d + "/t.parquet", parquet_write(rows))
+    let base1 be length(lineage())
+    let opts be {"columns": ["id", "x"], "limit": 7}
+    let a be parquet_scan(d + "/t.parquet", opts)
+    let b be parquet_read(read_file_bytes(d + "/t.parquet"), opts)
+    assert_eq(a == b, true)
+    assert_eq(length(a), 7)
+    assert_eq(keys(a[0]), ["id", "x"])
+    assert_eq(to_rows(parquet_scan(d + "/t.parquet")) == rows, true)
+    let l1 be lineage()
+    assert_eq(l1[base1].source, "parquet_scan")
+    assert_eq(l1[base1].what, d + "/t.parquet")
+    -- v0.6.65: el hash de tabla es la receta columnar "table-v1", ya no canonical_json
+    assert_eq("0x" + l1[base1].sha256 == hex(sha256(canonical_json(a))), false)
+    -- la misma lectura dos veces da el mismo hash de tabla
+    let base2 be length(lineage())
+    let raw be read_file_bytes(d + "/t.parquet")
+    let a2 be parquet_scan(d + "/t.parquet", {"columns": ["id", "x"], "limit": 7})
+    let b2 be parquet_read(raw, {"columns": ["id", "x"], "limit": 7})
+    let l2 be lineage()
+    assert_eq(l2[base2].encoding, "bytes")
+    assert_eq(l2[base2 + 1].encoding == l2[base2 + 2].encoding, true)
+    assert_eq(l2[base2 + 1].sha256 == l2[base2 + 2].sha256, true)
+    assert_eq(length(l2[base2 + 1].sha256), 64)
+    -- un valor más grande que la ventana con la que se leen los encabezados (8 KiB)
+    let big be join(apply(range(0, 20000), (i) => "x"), "")
+    let rows2 be [{"s": big}, {"s": "a"}]
+    write_file(d + "/big.parquet", parquet_write(rows2))
+    assert_eq(to_rows(parquet_scan(d + "/big.parquet")) == rows2, true)
+    assert_eq(parquet_read(read_file_bytes(d + "/big.parquet")) == parquet_scan(d + "/big.parquet"), true)
+    delete_file(d + "/t.parquet")
+    delete_file(d + "/big.parquet")
+    -- sin el grant de lectura del path, el gate nombra file.read
+    expect_error(() => parquet_scan("tests/_syn_v0646_denied/x.parquet"), "file.read")
+    expect_error(() => parquet_scan(bytes([1, 2])), "expected a path")
+    expect_error(() => parquet_scan(bytes([1, 2])), "parquet_read(bytes)")
+    write_file(d + "/no.parquet", "hola")
+    expect_error(() => parquet_scan(d + "/no.parquet"), "not a Parquet file")
+    delete_file(d + "/no.parquet")
+
+test "c3_parallel_map_workers_reach_the_receipt"
+    let d be "tests/_syn_v0646_c3"
+    let base be length(receipt().credentialSubject.outputs)
+    let basei be length(receipt().credentialSubject.inputs)
+    task w(n)
+        write_file(d + "/p" + text(n) + ".txt", text(n))
+        give read_file(d + "/p" + text(n) + ".txt")
+    assert_eq(parallel_map(w, [1, 2, 3]), ["1", "2", "3"])
+    let s be receipt().credentialSubject
+    assert_eq(length(s.outputs) - base, 3)
+    assert_eq(length(s.inputs) - basei, 3)
+    assert_eq(s.outputs[base + 2].what, d + "/p3.txt")
+    delete_file(d + "/p1.txt")
+    delete_file(d + "/p2.txt")
+    delete_file(d + "/p3.txt")
+
+test "c3_a_failed_parallel_map_keeps_what_was_written"
+    let d be "tests/_syn_v0646_c3"
+    let base be length(receipt().credentialSubject.outputs)
+    task f(n)
+        write_file(d + "/e" + text(n) + ".txt", text(n))
+        when n == 3
+            raise("falla")
+        give n
+    let said be ""
+    try
+        parallel_map(f, [1, 2, 3, 4], 1)
+    recover e
+        set said to "recover"
+    assert_eq(said, "recover")
+    -- con un hilo, el 4 no llega a correr: el 1, el 2 y el 3 (que escribió antes del raise)
+    assert_eq(length(receipt().credentialSubject.outputs) - base, 3)
+    delete_file(d + "/e1.txt")
+    delete_file(d + "/e2.txt")
+    delete_file(d + "/e3.txt")
+

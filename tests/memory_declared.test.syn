@@ -1,0 +1,118 @@
+-- Gemelo de memory_declared.rs (synsema-runtime/tests/it, DB-M1 — memoria declarada
+-- `require memory("<nombre>")`) (v0.6.68).
+-- La declaración ES la identidad y toda la familia (remember/recall, rules, progress)
+-- queda detrás del gate. Bajo `synsema test` el archivo entero es UN programa: cabe una
+-- sola declaración (preámbulo) y todos los bloques comparten un store
+-- (tests/.synsema/state/brain.db, cubierto por .gitignore). El .rs usa un temp dir por
+-- test; acá la limpieza es del lenguaje: cada escritor borra SUS entradas con
+-- forget_memory(id) — el id que devuelve remember — para que los conteos sean exactos y
+-- rerun tras rerun quede verde. Si un bloque falla a mitad de camino, borrar
+-- tests/.synsema antes de reintentar (quedó una entrada activa sin dueño).
+-- El orden de los agentes se hace determinista con la canónica del lenguaje
+-- (signal/wait_for); lo que el .rs leía de RunResult.output se afirma con share/observe
+-- + assert_eq con los mismos valores. El gate SIN declaración se sonda acá con el error
+-- capturable y su fix usa el stem de ESTE archivo (memory_declared-test), igual que el
+-- .rs espera el de su entrada (myprog).
+-- SQLite (engine/crates/synsema-runtime/src/persistence.rs) abre en WAL: con la conexión
+-- del runner abierta lo nuevo está en brain.db-wal, no en brain.db (el .rs lee después
+-- de cerrada) — el bloque secret lee ambos y compara byte a byte vía hex.
+-- Los require file.read asumen corrida desde la raíz del repo (convención de los
+-- gemelos, cf. tests/v0629_audit.test.syn).
+-- QUEDA en Rust (el .rs tiene 14 tests; migran 5; host_ceiling_gates_memory_with_prefix_scopes
+-- no es candidato del TSV: techo del host vía run_program_ceiled):
+--   no_declaration_denies_whole_family_and_creates_nothing: además de los errores afirma
+--     G-1 (cero archivos en el temp dir del host); el gemelo comparte tests/.synsema y no
+--     puede afirmar ausencia de archivos.
+--   two_distinct_declarations_is_startup_error: error de arranque del programa entero,
+--     antes de la primera sentencia; un .test.syn con dos declaraciones no arranca.
+--   invalid_names_error_at_declaration_time: ídem — la validación G-6 corre al iniciar el
+--     archivo, no dentro de un bloque.
+--   bare_require_memory_is_a_parse_error: error de parseo; el gemelo entero tiene que
+--     parsear.
+--   transition_old_db_without_declaration_is_untouched: pre-crea un .db legacy en el disco
+--     del host y son DOS corridas (warning a stderr + bytes del archivo intactos).
+--   schema_compat_rename_db_is_the_migration: DOS corridas + renombrar el .db en el disco
+--     del host.
+--   swarm_agents_share_declared_store_with_their_name_as_source: la aserción es
+--     persistencia ENTRE procesos (un segundo run lee lo que escribió el agente).
+--   declared_roundtrip_and_progress_survive_runs: memoria Y progress sobreviven entre
+--     procesos; un bloque .syn es un solo proceso.
+-- Correr con: synsema test tests/memory_declared.test.syn
+
+require memory("brain")
+require secret("API")
+require file.read("tests/.synsema/state/brain.db")
+require file.read("tests/.synsema/state/brain.db-wal")
+
+test "sandbox_denies_declared_memory"
+    let id be remember("context", "fuera")
+    let denied be false
+    try
+        sandbox
+            remember("context", "dentro")
+    recover e
+        set denied to true
+        assert(contains(e, `Capability not granted: memory("brain")`))
+    assert(denied)
+    forget_memory(id)
+
+test "call_tool_gates_memory_per_tool"
+    task hoarder()
+        give length(recall())
+    let denied be false
+    try
+        call_tool(hoarder, {})
+    recover e
+        set denied to true
+        assert(contains(e, `Capability not granted: memory("brain")`))
+    assert(denied)
+    task good()
+        require memory("brain")
+        give length(recall())
+    assert_eq(call_tool(good, {}), 0)
+
+test "namespaces_default_own_and_cross_with_from"
+    let id_top be remember("context", "top")
+    agent Writer
+        let id be remember("context", "from-writer")
+        share id as "md_writer_id"
+        signal "md_writer_done"
+    agent Analyzer
+        wait_for "md_writer_done"
+        let own be length(recall())
+        let cross be length(recall(from = "Writer"))
+        let global be length(recall(from = "*"))
+        let xs be [own, cross, global]
+        share xs as "md_analyzer_counts"
+        signal "md_analyzer_done"
+    spawn Writer
+    spawn Analyzer
+    wait_for "md_analyzer_done"
+    observe "md_analyzer_counts" as analyzer_counts
+    assert_eq(analyzer_counts, [0, 1, 2])
+    assert_eq(length(recall()), 2)
+    assert_eq(length(recall(from = "Writer")), 1)
+    assert_eq(length(recall(from = "main")), 1)
+    assert_eq(length(recall(nothing, nothing, nothing, nothing, 1)), 1)
+    observe "md_writer_id" as writer_id
+    forget_memory(writer_id)
+    forget_memory(id_top)
+
+test "parallel_map_workers_share_declared_store"
+    task w(i)
+        let id be remember("context", "item-" + text(i))
+        give [i, id]
+    let rs be parallel_map(w, [1, 2, 3])
+    assert_eq(length(recall()), 3)
+    each r in rs
+        forget_memory(r[1])
+
+test "secret_never_persists_plaintext"
+    let s be secret("API", "pLAINtext_MEMORIA_no_filtrar_77")
+    let id be remember("context", s)
+    let main_hex be decode(read_file_bytes("tests/.synsema/state/brain.db"), "hex")
+    let wal_hex be decode(read_file_bytes("tests/.synsema/state/brain.db-wal"), "hex")
+    let raw be main_hex + wal_hex
+    assert(not contains(raw, decode(bytes("pLAINtext_MEMORIA_no_filtrar_77"), "hex")))
+    assert(contains(raw, decode(bytes("secret(API)"), "hex")))
+    forget_memory(id)

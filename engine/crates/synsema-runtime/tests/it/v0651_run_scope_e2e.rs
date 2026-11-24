@@ -259,18 +259,6 @@ fn b1_the_pool_lets_go_of_a_finished_run() {
 
 /// Ronda 1, N4: lo que limita al llamador viaja al hijo de `run_program` en una variable de entorno;
 /// si no entra, el error es del motor (antes, en Windows, fallaba el `spawn` con uno del sistema).
-#[test]
-fn n4_a_caller_whose_capabilities_do_not_fit_gets_an_engine_error() {
-    let mut src = String::from("require sandbox_run\n");
-    for i in 0..400 {
-        src.push_str(&format!("require file.read(\"/var/lib/synsema/a/rather/long/folder/for/the/grant/number/{i}/data.csv\")\n"));
-    }
-    src.push_str("let r be run_program(\"print(1)\", {\"timeout\": 5})\nprint(r)\n");
-    let r = run_source(&src, "n4.syn");
-    assert!(!r.success);
-    assert!(r.errors.join("\n").contains("too many to pass to the child"), "{:?}", r.errors);
-}
-
 /// Ronda 2, B1: un preámbulo que falla después de un `serve on` que ya escucha cierra igual su
 /// corrida. `run_serve_program` vuelve con el error y el server deja de atender y suelta su puerto;
 /// antes seguía sirviendo en un embebedor, sin nada que lo parara salvo una señal.
@@ -291,13 +279,3 @@ fn b1_a_failed_preamble_lets_go_of_its_server() {
     assert!(free, "el server de una corrida que volvió con error sigue escuchando");
 }
 
-/// Ronda 2, N2: lo que se mide es la línea de comandos entera del hijo, no sólo su techo. Un
-/// `filename` largo la pasaba y el `spawn` fallaba en Windows con `os error 206`.
-#[test]
-fn n2_a_child_command_line_that_does_not_fit_gets_an_engine_error() {
-    let label = "a".repeat(31_000);
-    let src = format!("require sandbox_run\nlet r be run_program(\"print(1)\", {{\"timeout\": 5, \"filename\": \"{label}\"}})\nprint(r)\n");
-    let r = run_source(&src, "n2.syn");
-    assert!(!r.success);
-    assert!(r.errors.join("\n").contains("the child's command line would be"), "{:?}", r.errors);
-}

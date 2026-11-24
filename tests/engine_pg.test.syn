@@ -1,0 +1,28 @@
+-- Gemelo de engine_pg.rs (synsema-runtime/tests/it, conformidad Postgres M1 bajo db_open/sql).
+-- Migra los 2 tests de capability que el .rs corre SIEMPRE sin servidor: el chequeo de
+-- db(scope) precede a toda conexión, así que la violación se captura sin abrir un solo socket.
+-- QUEDA en Rust (dependen del host):
+--   pg_gate_passes_routing_to_postgres: abre un socket real a un puerto muerto (dead_port()).
+--   pg_transactions / pg_procedures_and_transactions / pg_types_roundtrip / pg_pgvector_knn:
+--     requieren un Postgres real (DATABASE_URL, #[ignore] en el .rs).
+-- Correr con: synsema test tests/engine_pg.test.syn
+
+test "pg_db_open_deny_without_require"
+    let ok be false
+    try
+        db_open("postgres://user:pw@localhost:5432/appdb")
+    recover e
+        set ok to true
+        assert(contains(e, "Capability not granted: db(\"postgres://localhost/appdb\")"))
+        assert(contains(e, "this is a permission, not a bug"))
+    assert(ok)
+
+test "pg_scope_mismatch_deny"
+    require db("postgres://localhost/appdb")
+    let ok be false
+    try
+        db_open("postgres://localhost/otra")
+    recover e
+        set ok to true
+        assert(contains(e, "Capability not granted: db(\"postgres://localhost/otra\")"))
+    assert(ok)

@@ -9,30 +9,6 @@ use std::time::Duration;
 use synsema_runtime::engine::run_program;
 
 #[test]
-fn pipe_write_takes_what_fits_and_says_how_much() {
-    let src = r#"let p be pipe({"max_buffer": 10})
-print(pipe_write(p["a"], "0123456789ABCDEF"))
-print(pipe_write(p["a"], "mas"))
-print(pipe_stats(p["a"])["queued_out"])
-print(pipe_stats(p["b"])["queued_in"])
-print(pipe_stats(p["b"])["status"])
-let got be pipe_recv(p["b"], 1)
-print(got["type"])
-print(pipe_write(p["a"], "mas") > 0)
-pipe_close(p["b"])
-let failed be "no"
-try
-    pipe_write(p["a"], "x")
-recover e
-    set failed to "si"
-print(failed)
-"#;
-    let r = run_program(src, "<a4-pipe>");
-    assert!(r.success, "{:?}", r.errors);
-    assert_eq!(r.output, ["10", "0", "10", "10", "open", "data", "true", "si"], "{:?}", r.output);
-}
-
-#[test]
 fn tcp_write_never_waits_on_a_peer_that_does_not_read() {
     // Un par que acepta y nunca lee: el kernel y el buffer de salida se llenan, y `tcp_write`
     // sigue volviendo enseguida con lo que entró (al final, 0) en vez de esperar.

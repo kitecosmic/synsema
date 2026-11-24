@@ -120,22 +120,6 @@ print(`m={m}`)
     assert_eq!(out, ["m={a: [1, 2]}"]);
 }
 
-#[test]
-fn d8_json_and_csv_encode_of_a_secret_are_errors() {
-    for (src, who) in [
-        ("json_encode(as_secret(\"abc\", \"K\"))", "json_encode"),
-        ("json_encode({\"a\": [as_secret(\"abc\", \"K\")]})", "json_encode"),
-        ("jsonl_encode([{\"a\": as_secret(\"abc\", \"K\")}])", "jsonl_encode"),
-        ("json_for_script({\"a\": as_secret(\"abc\", \"K\")})", "json_for_script"),
-        ("csv_encode([{\"a\": as_secret(\"abc\", \"K\")}])", "csv_encode"),
-    ] {
-        let e = errors_of(&format!("print({src})
-"));
-        assert!(e.contains(who) && e.contains("secret(K)"), "{src}: {e}");
-        assert!(!e.contains("abc"), "el error filtra el material: {e}");
-    }
-}
-
 // =========================================================
 // E1 — un secret atado a un host (HB5)
 // =========================================================

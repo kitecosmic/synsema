@@ -1,0 +1,28 @@
+-- Gemelo de engine_mongo.rs (synsema-runtime/tests/it, conformidad MongoDB M3 bajo db_open/mongo_*).
+-- Migra los 2 tests de capability que el .rs corre SIEMPRE sin servidor: el chequeo de
+-- db(scope) precede a toda conexión, así que la violación se captura sin abrir un solo socket.
+-- QUEDA en Rust (dependen del host):
+--   mongo_gate_passes_routing_to_mongo: abre un socket real a un puerto muerto (dead_port()).
+--   mongo_crud_and_types / mongo_query_opts_and_aggregate / mongo_collections_lists_created /
+--     sql_over_mongo_errors: requieren un MongoDB real (MONGO_URL, #[ignore] en el .rs).
+-- Correr con: synsema test tests/engine_mongo.test.syn
+
+test "mongo_db_open_deny_without_require"
+    let ok be false
+    try
+        db_open("mongodb://user:pw@localhost:27017/appdb?authSource=admin")
+    recover e
+        set ok to true
+        assert(contains(e, "Capability not granted: db(\"mongodb://localhost/appdb\")"))
+        assert(contains(e, "this is a permission, not a bug"))
+    assert(ok)
+
+test "mongo_scope_mismatch_deny"
+    require db("mongodb://localhost/appdb")
+    let ok be false
+    try
+        db_open("mongodb://localhost/otra")
+    recover e
+        set ok to true
+        assert(contains(e, "Capability not granted: db(\"mongodb://localhost/otra\")"))
+    assert(ok)

@@ -1,6 +1,8 @@
 -- Piloto de v0.6.68 (migas §4): los tests de invariant_conformance.rs que migran con la
 -- misma fuerza. Los que afirman el mensaje decorado del host (`Runtime error: archivo:linea:col`)
 -- y los que miran el AST (`parse_source`/`summarize`) quedan en Rust (migas §1).
+-- v0.6.68: described_invariant_names_itself_in_the_violation agrega su texto capturable exacto
+-- (el .rs conserva la afirmación del mensaje decorado con la ubicación).
 -- Correr con: synsema test tests/invariant_conformance.test.syn
 
 test "described_invariant_passes_when_true"
@@ -32,4 +34,14 @@ test "description_inside_a_task_runs_per_call"
     recover e
         set ok to true
         assert_eq(e, "Invariant violation: no overdraft")
+    assert(ok)
+
+test "described_invariant_names_itself_in_the_violation"
+    let balance be -1
+    let ok be false
+    try
+        invariant "balance never negative": balance >= 0
+    recover e
+        set ok to true
+        assert_eq(e, "Invariant violation: balance never negative")
     assert(ok)

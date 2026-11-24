@@ -39,68 +39,9 @@ fn prog(src: &str, port: u16) -> String {
 // #1 print/console + #9 text() + #10 taint en '+'
 // =========================================================
 
-#[test]
-fn surface1_print_text_and_taint_redacted() {
-    let src = r#"require secret("API")
-let s be secret("API", "__CANARY__")
-print(s)
-print(text(s))
-let pre be "tok-" + s
-let post be s + "-end"
-let withnum be 200 + s
-print(pre)
-print(type_of(pre))
-print(type_of(post))
-print(type_of(withnum))
-"#;
-    let r = run_source(&prog(src, 0), "t.syn");
-    assert!(r.success, "errs: {:?}", r.errors);
-    let out = r.output.join("\n");
-    no_canary(&out, "stdout");
-    assert!(r.output.contains(&"secret(API)".to_string()), "out: {:?}", r.output);
-    // taint propagado: "x"+s, s+"x", num+s → todos `secret`.
-    let n = r.output.iter().filter(|l| l.as_str() == "secret").count();
-    assert_eq!(n, 3, "taint no propagado en '+': {:?}", r.output);
-}
-
 // =========================================================
 // Capabilities (§10.2)
 // =========================================================
-
-#[test]
-fn cap_secret_undeclared_errors() {
-    let r = run_source("let s be secret(\"NOPE\", \"x\")\nprint(s)\n", "t.syn");
-    assert!(!r.success, "debió fallar por capability");
-    let e = r.errors.join(" ");
-    assert!(e.contains("not permitted") && e.contains("secret(\"NOPE\")"), "err: {}", e);
-}
-
-#[test]
-fn cap_env_undeclared_errors() {
-    let r = run_source("let p be env(\"PORT\", 8080)\nprint(p)\n", "t.syn");
-    assert!(!r.success, "debió fallar por capability");
-    assert!(r.errors.join(" ").contains("not permitted"), "err: {:?}", r.errors);
-}
-
-#[test]
-fn reveal_without_capability_errors() {
-    let src = "require secret(\"K\")\nlet s be secret(\"K\", \"v\")\nlet p be reveal(s)\nprint(p)\n";
-    let r = run_source(src, "t.syn");
-    assert!(!r.success, "reveal sin require reveal debió fallar");
-    assert!(r.errors.join(" ").contains("reveal() not permitted"), "err: {:?}", r.errors);
-}
-
-#[test]
-fn prefix_capability_authorizes_only_matching() {
-    // require secret("APP_*") autoriza APP_KEY...
-    let ok = run_source("require secret(\"APP_*\")\nprint(secret(\"APP_KEY\", \"v\"))\n", "t.syn");
-    assert!(ok.success, "APP_* debió autorizar APP_KEY: {:?}", ok.errors);
-    assert!(ok.output.contains(&"secret(APP_KEY)".to_string()), "out: {:?}", ok.output);
-    // ...pero NO OTHER_X.
-    let bad = run_source("require secret(\"APP_*\")\nprint(secret(\"OTHER_X\", \"v\"))\n", "t.syn");
-    assert!(!bad.success, "APP_* NO debió autorizar OTHER_X");
-    assert!(bad.errors.join(" ").contains("not permitted"), "err: {:?}", bad.errors);
-}
 
 // =========================================================
 // reveal() — devuelve plaintext + audita sin el valor (§7/§10.7)
@@ -138,57 +79,6 @@ print(reveal(s))
 // =========================================================
 // as_secret() — sella un valor de runtime como secret (taint en el borde de entrada)
 // =========================================================
-
-#[test]
-fn as_secret_seals_and_propagates_taint() {
-    let src = r#"let s be as_secret("__CANARY__")
-print(s)
-print(text(s))
-print(type_of(s))
-let pre be "tok-" + s
-print(type_of(pre))
-print(pre)
-"#;
-    let r = run_source(&prog(src, 0), "t.syn");
-    assert!(r.success, "errs: {:?}", r.errors);
-    let out = r.output.join("\n");
-    no_canary(&out, "as_secret stdout");
-    // Redacción con label default `sealed` (s, text(s), pre).
-    assert_eq!(
-        r.output.iter().filter(|l| l.as_str() == "secret(sealed)").count(),
-        3,
-        "out: {:?}",
-        r.output
-    );
-    // type_of(secret) == "secret"; el taint propaga en "+" (pre sigue secret).
-    assert_eq!(r.output.iter().filter(|l| l.as_str() == "secret").count(), 2, "out: {:?}", r.output);
-}
-
-#[test]
-fn as_secret_label_idempotent_and_type_errors() {
-    // Label custom en la redacción.
-    let r = run_source("print(as_secret(\"x\", \"user_key\"))\n", "t.syn");
-    assert!(r.success, "{:?}", r.errors);
-    assert!(r.output.contains(&"secret(user_key)".to_string()), "out: {:?}", r.output);
-
-    // Idempotente: sellar dos veces no re-anida ni cambia el label.
-    let r2 = run_source("print(as_secret(as_secret(\"x\", \"user_key\")))\n", "t.syn");
-    assert!(r2.success, "{:?}", r2.errors);
-    assert!(r2.output.contains(&"secret(user_key)".to_string()), "out: {:?}", r2.output);
-
-    // Tipos no text/bytes → error claro (Opción A: sellá el campo, no la estructura).
-    let bad = run_source("print(as_secret(123))\n", "t.syn");
-    assert!(!bad.success, "as_secret(number) debió fallar");
-    assert!(bad.errors.join(" ").contains("expects text or bytes"), "err: {:?}", bad.errors);
-}
-
-#[test]
-fn as_secret_needs_no_capability() {
-    // as_secret es puro y FORTALECE → NO exige `require` (a diferencia de secret()).
-    let r = run_source("let k be as_secret(\"__CANARY__\")\nprint(k)\n".replace("__CANARY__", CANARY).as_str(), "t.syn");
-    assert!(r.success, "as_secret no debe exigir require: {:?}", r.errors);
-    no_canary(&r.output.join("\n"), "as_secret stdout");
-}
 
 // =========================================================
 // reveal() SCOPED por nombre/label (§6.5) — cubre secret() y as_secret()

@@ -9,3 +9,57 @@ test "public_hash_obeys_grouping"
     assert(hash("x") >= 0)
     assert(hash("x") % 8 >= 0)
     assert(hash("") == 17544574437371136113)
+
+-- v0.6.68, tanda 2 (runtime): rangos de bytes exactos con su capability, y parquet_info_file que
+-- coincide con parquet_info sobre los bytes. Queda en Rust del lote:
+--   a_small_range_near_the_end_of_a_large_file: el archivo de 64 MB lo arma el host con set_len
+--     (sparse); reproducirlo desde el lenguaje sería escribir 64 MB reales.
+-- Estos tests usan base relativa de lineage(): acumula a lo largo del archivo.
+require file.write("tests/_syn_v0664_data/*")
+require file.read("tests/_syn_v0664_data/*")
+require file.write("tests/_syn_v0664_data_denied/*")
+
+task expect_error(f, needle)
+    let ok be false
+    try
+        f()
+    recover e
+        set ok to true
+        assert(contains(e, needle))
+    assert(ok)
+
+test "byte_ranges_are_exact_and_capability_checked"
+    let name be "tests/_syn_v0664_data/range.bin"
+    let base be length(lineage())
+    write_file(name, "abcdef")
+    assert_eq(decode(read_file_bytes(name, {"offset": 2, "length": 3})), "cde")
+    assert_eq(length(read_file_bytes(name, {"offset": 6, "length": 100})), 0)
+    assert_eq(length(read_file_bytes(name, {"offset": 999, "length": 1})), 0)
+    assert_eq(length(read_file_bytes(name, {"offset": 0, "length": 0})), 0)
+    assert_eq(decode(read_file_bytes(name)), "abcdef")
+    let l be lineage()
+    assert_eq(l[base].what, name + " [offset=2 length=3]")
+    -- sin grant de lectura para ese path (sólo escritura), la capability no está
+    expect_error(() => read_file_bytes("tests/_syn_v0664_data_denied/range.bin", {"offset": 0, "length": 1}), "Capability not granted")
+    expect_error(() => read_file_bytes(name, {"offset": 1.5, "length": 1}), "non-negative integer")
+    expect_error(() => read_file_bytes(name, {"offset": 0}), "offset and length")
+    expect_error(() => read_file_bytes(name, {"offset": -1, "length": 1}), "non-negative integer")
+    expect_error(() => read_file_bytes(name, {"offset": 0, "length": 1, "bogus": 1}), "unknown option")
+    delete_file(name)
+
+test "parquet_info_from_file_matches_bytes_and_has_statistics"
+    let name be "tests/_syn_v0664_data/stats.parquet"
+    let base be length(lineage())
+    let b be parquet_write([{"k": 1, "v": 2.0}, {"k": 3, "v": nothing}, {"k": 2, "v": 4.0}])
+    write_file(name, b)
+    let a be parquet_info(b)
+    let d be parquet_info_file(name)
+    assert_eq(a == d, true)
+    assert_eq(a.row_groups[0].columns[0].name, "k")
+    assert_eq(a.row_groups[0].columns[0].min, 1)
+    assert_eq(a.row_groups[0].columns[0].max, 3)
+    assert_eq(a.row_groups[0].columns[0].null_count, 0)
+    assert_eq(a.row_groups[0].columns[1].null_count, 1)
+    let l be lineage()
+    assert_eq(l[base].source, "parquet_info_file")
+    delete_file(name)

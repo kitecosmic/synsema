@@ -1,0 +1,27 @@
+-- Gemelo de v0658_project.rs (synsema-core/tests/it — el proyecto de un programa) (v0.6.68).
+-- La raíz es la carpeta del `synsema.json` más cercano hacia arriba; su mínimo y sus claves
+-- se revisan ANTES de la primera sentencia. Los 9 candidatos del TSV quedan en Rust: el
+-- contrato observado es del host — el manifiesto se resuelve al arrancar el proceso (un
+-- .test.syn no puede crear ni variar su propio synsema.json ni su punto de entrada), las
+-- aserciones leen estructuras del host (Project/manifest/warnings de project::resolve,
+-- preflight vs check) o el árbol de archivos alrededor de la entrada, y varios casos
+-- corren la entrada desde otra carpeta (scripts/x.syn, sub/x.syn) mirando el RunResult.
+-- QUEDA en Rust (los 9 del TSV; los otros 2 tests del .rs — b11_an_unreadable_synsema_json_is_ignored_with_a_warning
+-- y the_loader_reuses_the_ast_of_the_table — no son candidatos):
+--   p2_the_root_is_the_folder_of_the_nearest_synsema_json: árbol de archivos del host +
+--     raíz resuelta al arrancar; "escapes the importing directory" es error de carga del
+--     módulo, no afirmable dentro del gemelo.
+--   p3_p6_a_newer_minimum_stops_before_the_first_statement: el mínimo del manifiesto se
+--     revisa antes de correr nada; el gemelo no puede traer su propio manifiesto.
+--   p4_the_same_version_runs: ídem (compara contra DEV_VERSION del binario de test).
+--   p5_the_minimum_is_three_numbers: ídem (diagnóstico del manifiesto al arranque).
+--   p7_p8_unknown_key_and_broken_json: parseo del synsema.json con línea y columna,
+--     antes de la primera sentencia.
+--   p9_a_synsema_json_of_another_user_is_ignored: hook de dueño registrado por el binario
+--     de test + warnings de project::resolve (estructura del host).
+--   p10_a_program_without_a_file_has_no_project: entrada "<stdin>" y Project::default()
+--     del host; el lenguaje no evalúa sin archivo.
+--   the_nearest_synsema_json_wins: Project.root del host con dos manifiestos anidados.
+--   b14_the_run_uses_the_project_the_preflight_resolved: preflight/check/resolve del host
+--     y mutación del manifiesto entre corridas.
+-- Correr con: synsema test tests/v0658_project.test.syn (sin bloques test: 0 tests, verde).

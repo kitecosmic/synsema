@@ -1,0 +1,43 @@
+-- Gemelo de engine_parallel.rs (v0.6.68, migas §4): parallel_map ≡ apply (invariante),
+-- orden de resultados con limit bajo, chunk/flatten y el fail-fast que se propaga como
+-- error recuperable (try/recover).
+-- QUEDAN en Rust: parallel_is_actually_concurrent y parallel_map_scales_many_tasks —
+-- afirman wall-clock (concurrente < secuencial): tiempos de pared del host, no valores
+-- del lenguaje.
+-- Correr con: synsema test tests/engine_parallel.test.syn
+
+task double(x)
+    give x * 2
+
+task inc(x)
+    give x + 100
+
+test "parallel_map_equals_apply"
+    let nums be [1, 2, 3, 4, 5]
+    let a be apply(double, nums)
+    let b be parallel_map(double, nums)
+    assert_eq(a, b)
+    assert_eq(b, [2, 4, 6, 8, 10])
+
+test "parallel_map_preserves_order_with_limit"
+    -- Con limit bajo y muchos items, el resultado sigue en orden de entrada.
+    let nums be [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+    assert_eq(parallel_map(inc, nums, 3), apply(inc, nums))
+
+test "chunk_correct"
+    assert_eq(chunk([1, 2, 3, 4, 5], 2), [[1, 2], [3, 4], [5]])
+    assert_eq(chunk([1, 2, 3], 3), [[1, 2, 3]])
+    assert_eq(flatten(chunk([1, 2, 3, 4, 5, 6], 2)), [1, 2, 3, 4, 5, 6])
+
+test "parallel_map_fail_fast_propagates"
+    -- Una task que falla en un item → el error se propaga (no cuelga) y es
+    -- recuperable con try/recover como cualquier error de runtime.
+    task risky(x)
+        give 10 / x
+    let ok be false
+    try
+        let r be parallel_map(risky, [1, 2, 0, 4])
+    recover e
+        set ok to true
+        assert(contains(e, "Division by zero"))
+    assert(ok)

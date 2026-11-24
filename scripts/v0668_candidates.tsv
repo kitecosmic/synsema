@@ -1,250 +1,107 @@
 crate	archivo	test	techo	pista	decision	nota
-synsema-core	engine/crates/synsema-core/tests/alloc_counts.rs	heap_allocations_per_construct	default	-	PENDIENTE	-
-synsema-core	engine/crates/synsema-core/tests/v0658_packages.rs	n2_without_synsema_json	default	-	PENDIENTE	-
-synsema-core	engine/crates/synsema-core/tests/v0658_packages.rs	n3_n4_n5_missing_name_hash_or_download	default	-	PENDIENTE	-
-synsema-core	engine/crates/synsema-core/tests/v0658_packages.rs	n6_n7_not_a_name	default	-	PENDIENTE	-
-synsema-core	engine/crates/synsema-core/tests/v0658_packages.rs	n10_checked_before_the_first_statement	default	afirma errors (validar patrón); afirma output (traduce a valores)	PENDIENTE	-
-synsema-core	engine/crates/synsema-core/tests/it/assert_conformance.rs	test_block_is_noop_in_run	default	-	PENDIENTE	-
-synsema-core	engine/crates/synsema-core/tests/it/batch2_conformance.rs	two_spreads_is_parse_error	default	-	PENDIENTE	-
-synsema-core	engine/crates/synsema-core/tests/it/batch7_conformance.rs	timeout_zero_and_negative_parse	default	-	PENDIENTE	-
-synsema-core	engine/crates/synsema-core/tests/it/core_conformance.rs	trace_and_log	default	el archivo contiene literales de mensaje decorado (revisar test por test); afirma output (traduce a valores)	PENDIENTE	-
-synsema-core	engine/crates/synsema-core/tests/it/core_conformance.rs	sandbox	default	el archivo contiene literales de mensaje decorado (revisar test por test); afirma output (traduce a valores)	PENDIENTE	-
-synsema-core	engine/crates/synsema-core/tests/it/core_conformance.rs	reserved_word_as_variable	default	el archivo contiene literales de mensaje decorado (revisar test por test)	PENDIENTE	-
-synsema-core	engine/crates/synsema-core/tests/it/core_conformance.rs	reserved_word_as_task_name	default	el archivo contiene literales de mensaje decorado (revisar test por test)	PENDIENTE	-
-synsema-core	engine/crates/synsema-core/tests/it/core_conformance.rs	zero_errors_located_and_catchable	default	el archivo contiene literales de mensaje decorado (revisar test por test); afirma errors (validar patrón); afirma output (traduce a valores)	PENDIENTE	-
-synsema-core	engine/crates/synsema-core/tests/it/core_conformance.rs	error_category_vectors	default	el archivo contiene literales de mensaje decorado (revisar test por test)	PENDIENTE	-
-synsema-core	engine/crates/synsema-core/tests/it/core_conformance.rs	llm_available_false_offline	default	el archivo contiene literales de mensaje decorado (revisar test por test); afirma output (traduce a valores)	PENDIENTE	-
-synsema-core	engine/crates/synsema-core/tests/it/core_conformance.rs	flush_noop_when_not_live	default	el archivo contiene literales de mensaje decorado (revisar test por test); afirma output (traduce a valores)	PENDIENTE	-
-synsema-core	engine/crates/synsema-core/tests/it/frozen_threads.rs	many_threads_read_and_copy_a_frozen_value	especial	-	PENDIENTE	-
-synsema-core	engine/crates/synsema-core/tests/it/invariant_conformance.rs	bare_invariant_still_parses_and_runs	default	el archivo contiene literales de mensaje decorado (revisar test por test)	PENDIENTE	-
-synsema-core	engine/crates/synsema-core/tests/it/invariant_conformance.rs	described_invariant_names_itself_in_the_violation	default	el archivo contiene literales de mensaje decorado (revisar test por test)	PENDIENTE	-
-synsema-core	engine/crates/synsema-core/tests/it/invariant_conformance.rs	described_invariant_accepts_a_backtick_template	default	el archivo contiene literales de mensaje decorado (revisar test por test)	PENDIENTE	-
-synsema-core	engine/crates/synsema-core/tests/it/judge_conformance.rs	rate_with_between_is_a_parse_error_with_the_fix	default	-	PENDIENTE	-
-synsema-core	engine/crates/synsema-core/tests/it/judge_conformance.rs	choose_with_across_is_a_parse_error_with_the_fix	default	-	PENDIENTE	-
-synsema-core	engine/crates/synsema-core/tests/it/judge_conformance.rs	or_must_be_followed_by_nothing	default	-	PENDIENTE	-
-synsema-core	engine/crates/synsema-core/tests/it/judge_conformance.rs	rate_has_no_escape_level	default	-	PENDIENTE	-
-synsema-core	engine/crates/synsema-core/tests/it/judge_conformance.rs	whether_takes_no_options	default	-	PENDIENTE	-
-synsema-core	engine/crates/synsema-core/tests/it/judge_conformance.rs	duplicate_question_ids_are_rejected	default	-	PENDIENTE	-
-synsema-core	engine/crates/synsema-core/tests/it/judge_conformance.rs	judge_without_block_is_a_parse_error	default	-	PENDIENTE	-
-synsema-core	engine/crates/synsema-core/tests/it/judge_conformance.rs	unknown_verb_inside_judge_is_a_parse_error	default	-	PENDIENTE	-
-synsema-core	engine/crates/synsema-core/tests/it/merge_error_location.rs	merge_errors_carry_the_call_location	default	-	PENDIENTE	-
-synsema-core	engine/crates/synsema-core/tests/it/skill_snippets.rs	every_tagged_snippet_in_the_skill_loads	default	-	PENDIENTE	-
-synsema-core	engine/crates/synsema-core/tests/it/v0620_conformance.rs	steps_is_deterministic_and_counts_work	default	-	PENDIENTE	-
-synsema-core	engine/crates/synsema-core/tests/it/v0620_conformance.rs	use_can_climb_inside_the_project_root	default	afirma errors (validar patrón); afirma output (traduce a valores)	PENDIENTE	-
-synsema-core	engine/crates/synsema-core/tests/it/v0620_conformance.rs	use_cannot_escape_the_project_root	default	afirma errors (validar patrón); afirma output (traduce a valores)	PENDIENTE	-
-synsema-core	engine/crates/synsema-core/tests/it/v0620_conformance.rs	private_clause_parses_in_a_route_and_in_a_group	default	-	PENDIENTE	-
-synsema-core	engine/crates/synsema-core/tests/it/v0642_conformance.rs	eprint_does_not_go_to_the_program_output	default	afirma errors (validar patrón); afirma output (traduce a valores)	PENDIENTE	-
-synsema-core	engine/crates/synsema-core/tests/it/v0646_f1.rs	f1_a_wrong_type_is_a_parse_error	default	-	PENDIENTE	-
-synsema-core	engine/crates/synsema-core/tests/it/v0646_f1.rs	f1_negative_and_nothing_defaults	default	-	PENDIENTE	-
-synsema-core	engine/crates/synsema-core/tests/it/v0646_tanda_c.rs	c5_discovery_takes_only_off	default	-	PENDIENTE	-
-synsema-core	engine/crates/synsema-core/tests/it/v0655_arrays.rs	to_list_of_a_mask_gives_bools	default	-	PENDIENTE	-
-synsema-core	engine/crates/synsema-core/tests/it/v0655_arrays.rs	shape_operations_keep_the_mask	default	-	PENDIENTE	-
-synsema-core	engine/crates/synsema-core/tests/it/v0655_arrays.rs	a_mask_in_arithmetic_is_zero_one	default	-	PENDIENTE	-
-synsema-core	engine/crates/synsema-core/tests/it/v0655_arrays.rs	fill_nan_leaves_a_mask_alone	default	-	PENDIENTE	-
-synsema-core	engine/crates/synsema-core/tests/it/v0658_project.rs	p2_the_root_is_the_folder_of_the_nearest_synsema_json	default	-	PENDIENTE	-
-synsema-core	engine/crates/synsema-core/tests/it/v0658_project.rs	p3_p6_a_newer_minimum_stops_before_the_first_statement	default	-	PENDIENTE	-
-synsema-core	engine/crates/synsema-core/tests/it/v0658_project.rs	p4_the_same_version_runs	default	-	PENDIENTE	-
-synsema-core	engine/crates/synsema-core/tests/it/v0658_project.rs	p5_the_minimum_is_three_numbers	default	-	PENDIENTE	-
-synsema-core	engine/crates/synsema-core/tests/it/v0658_project.rs	p7_p8_unknown_key_and_broken_json	default	-	PENDIENTE	-
-synsema-core	engine/crates/synsema-core/tests/it/v0658_project.rs	p9_a_synsema_json_of_another_user_is_ignored	default	-	PENDIENTE	-
-synsema-core	engine/crates/synsema-core/tests/it/v0658_project.rs	p10_a_program_without_a_file_has_no_project	default	-	PENDIENTE	-
-synsema-core	engine/crates/synsema-core/tests/it/v0658_project.rs	the_nearest_synsema_json_wins	default	-	PENDIENTE	-
-synsema-core	engine/crates/synsema-core/tests/it/v0658_project.rs	b14_the_run_uses_the_project_the_preflight_resolved	default	-	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/agentic_e2e.rs	socket_and_timeout_parse_errors_are_loud	default	afirma errors (validar patrón); afirma output (traduce a valores)	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/delegated_ceiling_e2e.rs	sandbox_under_is_a_least_privilege_block	default	afirma errors (validar patrón); afirma output (traduce a valores)	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/engine_secrets.rs	surface1_print_text_and_taint_redacted	default	el archivo contiene literales de mensaje decorado (revisar test por test); afirma errors (validar patrón); afirma output (traduce a valores)	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/engine_secrets.rs	cap_secret_undeclared_errors	default	el archivo contiene literales de mensaje decorado (revisar test por test); afirma errors (validar patrón)	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/engine_secrets.rs	cap_env_undeclared_errors	default	el archivo contiene literales de mensaje decorado (revisar test por test); afirma errors (validar patrón)	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/engine_secrets.rs	reveal_without_capability_errors	default	el archivo contiene literales de mensaje decorado (revisar test por test); afirma errors (validar patrón)	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/engine_secrets.rs	prefix_capability_authorizes_only_matching	default	el archivo contiene literales de mensaje decorado (revisar test por test); afirma errors (validar patrón); afirma output (traduce a valores)	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/engine_secrets.rs	as_secret_seals_and_propagates_taint	default	el archivo contiene literales de mensaje decorado (revisar test por test); afirma errors (validar patrón); afirma output (traduce a valores)	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/engine_secrets.rs	as_secret_label_idempotent_and_type_errors	default	el archivo contiene literales de mensaje decorado (revisar test por test); afirma errors (validar patrón); afirma output (traduce a valores)	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/engine_secrets.rs	as_secret_needs_no_capability	default	el archivo contiene literales de mensaje decorado (revisar test por test); afirma errors (validar patrón); afirma output (traduce a valores)	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/identity_e2e.rs	canonical_json_and_did_key_are_exact_and_pure	default	afirma errors (validar patrón); afirma output (traduce a valores)	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/identity_e2e.rs	document_sign_and_verify_are_w3c_data_integrity	default	afirma errors (validar patrón); afirma output (traduce a valores)	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/identity_e2e.rs	webauthn_register_then_verify_from_a_program	default	afirma errors (validar patrón); afirma output (traduce a valores)	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/labels_sinks_e2e.rs	every_label_sink_name_is_a_real_builtin_and_the_families_are_covered	default	afirma errors (validar patrón)	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/serve_modules.rs	parallel_map_module_sibling_call_resolves	default	afirma errors (validar patrón); afirma output (traduce a valores)	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/v0646_tanda_e.rs	d8_json_and_csv_encode_of_a_secret_are_errors	default	-	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/v0646_tanda_e.rs	e1_require_for_grammar	default	-	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/v0646_tanda_e.rs	d4_unknown_require_is_a_load_error_with_a_suggestion	default	afirma errors (validar patrón); afirma output (traduce a valores)	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/batch6_e2e.rs	agent_with_raise_ends_in_error	default	afirma errors (validar patrón)	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/batch8_e2e.rs	chart_svg_available_in_run_mode	default	-	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/batch8_e2e.rs	same_svg_from_literal_csv_and_sql	default	-	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/batch8_e2e.rs	pure_builtins_work_inside_sandbox	default	-	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/batch8_e2e.rs	sandbox_still_denies_capabilities	default	afirma errors (validar patrón)	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/batch8_e2e.rs	secret_never_leaks_in_csv_or_chart	default	-	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/batch9_e2e.rs	png_and_pdf_from_chart_in_run_mode	default	-	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/batch9_e2e.rs	raster_works_inside_sandbox	default	-	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/batch9_e2e.rs	sandbox_still_denies_write_file	default	afirma errors (validar patrón)	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/batch9_e2e.rs	invalid_svg_recoverable	default	-	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/engine_concurrency.rs	agent_define_does_not_execute	default	afirma errors (validar patrón); afirma output (traduce a valores)	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/engine_concurrency.rs	agent_error_captured_in_swarm	default	afirma errors (validar patrón)	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/engine_concurrency.rs	run_program_isolates_agent_error_and_keeps_main_output	default	afirma errors (validar patrón); afirma output (traduce a valores)	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/engine_concurrency.rs	run_program_delayed_agent_crash_does_not_abort_main	default	afirma errors (validar patrón); afirma output (traduce a valores)	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/engine_concurrency.rs	run_program_happy_path_blackboard_and_signal	default	afirma errors (validar patrón); afirma output (traduce a valores)	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/engine_concurrency.rs	run_program_without_agents_is_unaffected	default	afirma errors (validar patrón); afirma output (traduce a valores)	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/engine_db.rs	db_file_persistence_cross_run	default	el archivo contiene literales de mensaje decorado (revisar test por test); afirma errors (validar patrón); afirma output (traduce a valores)	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/engine_db.rs	db_no_connection_error	default	el archivo contiene literales de mensaje decorado (revisar test por test); afirma errors (validar patrón)	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/engine_db.rs	db_deny_by_default_in_run	default	el archivo contiene literales de mensaje decorado (revisar test por test); afirma errors (validar patrón)	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/engine_db.rs	db_grant_works	default	el archivo contiene literales de mensaje decorado (revisar test por test); afirma errors (validar patrón); afirma output (traduce a valores)	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/engine_db.rs	db_scope_mismatch_violates	default	el archivo contiene literales de mensaje decorado (revisar test por test); afirma errors (validar patrón)	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/engine_db.rs	db_sandbox_strips_capability	default	el archivo contiene literales de mensaje decorado (revisar test por test); afirma errors (validar patrón)	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/engine_db.rs	db_blob_bytes_roundtrip	default	el archivo contiene literales de mensaje decorado (revisar test por test); afirma errors (validar patrón); afirma output (traduce a valores)	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/engine_db.rs	db_blob_non_utf8_roundtrip	default	el archivo contiene literales de mensaje decorado (revisar test por test); afirma errors (validar patrón); afirma output (traduce a valores)	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/engine_http.rs	fetch_deny_by_default_in_run	default	el archivo contiene literales de mensaje decorado (revisar test por test); afirma errors (validar patrón)	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/engine_http.rs	http_get_deny_by_default_in_run	default	el archivo contiene literales de mensaje decorado (revisar test por test); afirma errors (validar patrón)	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/engine_http.rs	http_post_put_delete_deny_by_default	default	el archivo contiene literales de mensaje decorado (revisar test por test); afirma errors (validar patrón)	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/engine_http.rs	grant_passes_the_gate	default	el archivo contiene literales de mensaje decorado (revisar test por test); afirma errors (validar patrón); afirma output (traduce a valores)	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/engine_http.rs	wildcard_and_host_glob_cover	default	el archivo contiene literales de mensaje decorado (revisar test por test); afirma errors (validar patrón); afirma output (traduce a valores)	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/engine_http.rs	scope_mismatch_violates	default	el archivo contiene literales de mensaje decorado (revisar test por test); afirma errors (validar patrón)	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/engine_http.rs	sandbox_strips_net	default	el archivo contiene literales de mensaje decorado (revisar test por test); afirma errors (validar patrón)	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/engine_io.rs	io_builtins_deny_by_default	default	el archivo contiene literales de mensaje decorado (revisar test por test); afirma errors (validar patrón)	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/engine_io.rs	fix5_scope_is_faithful_no_traversal_bypass	default	el archivo contiene literales de mensaje decorado (revisar test por test); afirma errors (validar patrón); afirma output (traduce a valores)	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/engine_io.rs	list_dir_enumerates_sorted_with_metadata	default	el archivo contiene literales de mensaje decorado (revisar test por test); afirma errors (validar patrón); afirma output (traduce a valores)	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/engine_io.rs	list_dir_errors_on_file_or_missing	default	el archivo contiene literales de mensaje decorado (revisar test por test); afirma errors (validar patrón)	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/engine_io.rs	file_info_and_exists	default	el archivo contiene literales de mensaje decorado (revisar test por test); afirma errors (validar patrón); afirma output (traduce a valores)	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/engine_io.rs	read_file_line_ranges	default	el archivo contiene literales de mensaje decorado (revisar test por test); afirma errors (validar patrón); afirma output (traduce a valores)	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/engine_io.rs	read_file_preserves_crlf	default	el archivo contiene literales de mensaje decorado (revisar test por test); afirma errors (validar patrón); afirma output (traduce a valores)	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/engine_io.rs	write_file_atomic_roundtrip	default	el archivo contiene literales de mensaje decorado (revisar test por test); afirma errors (validar patrón); afirma output (traduce a valores)	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/engine_io.rs	dotted_capability_grants_least_privilege	default	el archivo contiene literales de mensaje decorado (revisar test por test); afirma errors (validar patrón); afirma output (traduce a valores)	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/engine_io.rs	iop2_builtins_deny_by_default	default	el archivo contiene literales de mensaje decorado (revisar test por test); afirma errors (validar patrón)	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/engine_io.rs	grep_searches_dir_recursively_sorted	default	el archivo contiene literales de mensaje decorado (revisar test por test); afirma errors (validar patrón); afirma output (traduce a valores)	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/engine_io.rs	grep_literal_vs_regex	default	el archivo contiene literales de mensaje decorado (revisar test por test); afirma errors (validar patrón); afirma output (traduce a valores)	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/engine_io.rs	grep_ignore_case	default	el archivo contiene literales de mensaje decorado (revisar test por test); afirma errors (validar patrón); afirma output (traduce a valores)	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/engine_io.rs	grep_glob_and_max_results	default	el archivo contiene literales de mensaje decorado (revisar test por test); afirma errors (validar patrón); afirma output (traduce a valores)	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/engine_io.rs	grep_errors	default	el archivo contiene literales de mensaje decorado (revisar test por test); afirma errors (validar patrón)	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/engine_io.rs	grep_respects_target_scope	default	el archivo contiene literales de mensaje decorado (revisar test por test); afirma errors (validar patrón); afirma output (traduce a valores)	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/engine_io.rs	edit_file_unique_and_replace_all	default	el archivo contiene literales de mensaje decorado (revisar test por test); afirma errors (validar patrón); afirma output (traduce a valores)	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/engine_io.rs	append_file_creates_and_appends	default	el archivo contiene literales de mensaje decorado (revisar test por test); afirma errors (validar patrón); afirma output (traduce a valores)	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/engine_io.rs	run_deny_by_default	default	el archivo contiene literales de mensaje decorado (revisar test por test); afirma errors (validar patrón)	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/engine_io.rs	run_args_must_be_a_list	default	el archivo contiene literales de mensaje decorado (revisar test por test); afirma errors (validar patrón)	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/engine_mongo.rs	mongo_db_open_deny_without_require	default	el archivo contiene literales de mensaje decorado (revisar test por test); afirma errors (validar patrón)	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/engine_mongo.rs	mongo_scope_mismatch_deny	default	el archivo contiene literales de mensaje decorado (revisar test por test); afirma errors (validar patrón)	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/engine_mysql.rs	mysql_db_open_deny_without_require	default	el archivo contiene literales de mensaje decorado (revisar test por test); afirma errors (validar patrón)	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/engine_mysql.rs	mysql_scope_mismatch_deny	default	el archivo contiene literales de mensaje decorado (revisar test por test); afirma errors (validar patrón)	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/engine_parallel.rs	parallel_map_equals_apply	default	afirma errors (validar patrón); afirma output (traduce a valores)	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/engine_parallel.rs	parallel_map_preserves_order_with_limit	default	afirma errors (validar patrón); afirma output (traduce a valores)	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/engine_parallel.rs	chunk_correct	default	afirma errors (validar patrón); afirma output (traduce a valores)	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/engine_parallel.rs	parallel_map_fail_fast_propagates	default	afirma errors (validar patrón)	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/engine_pg.rs	pg_db_open_deny_without_require	default	el archivo contiene literales de mensaje decorado (revisar test por test); afirma errors (validar patrón)	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/engine_pg.rs	pg_scope_mismatch_deny	default	el archivo contiene literales de mensaje decorado (revisar test por test); afirma errors (validar patrón)	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/engine_redis.rs	redis_db_open_deny_without_require	default	el archivo contiene literales de mensaje decorado (revisar test por test); afirma errors (validar patrón)	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/engine_redis.rs	redis_db_open_scope_without_db_index	default	el archivo contiene literales de mensaje decorado (revisar test por test); afirma errors (validar patrón)	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/engine_redis.rs	redis_scope_mismatch_deny	default	el archivo contiene literales de mensaje decorado (revisar test por test); afirma errors (validar patrón)	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/engine_redis.rs	redis_sandbox_strips_db	default	el archivo contiene literales de mensaje decorado (revisar test por test); afirma errors (validar patrón)	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/engine_redis.rs	json_encode_decode_roundtrip	default	el archivo contiene literales de mensaje decorado (revisar test por test); afirma errors (validar patrón); afirma output (traduce a valores)	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/engine_redis.rs	json_decode_invalid_errors	default	el archivo contiene literales de mensaje decorado (revisar test por test); afirma errors (validar patrón)	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/engine_security.rs	secure_read_file_without_capability_is_violation	default	el archivo contiene literales de mensaje decorado (revisar test por test); afirma errors (validar patrón)	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/engine_security.rs	capability_violations_exact_strings	default	el archivo contiene literales de mensaje decorado (revisar test por test); afirma errors (validar patrón)	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/engine_security.rs	require_net_does_not_cover_file	default	el archivo contiene literales de mensaje decorado (revisar test por test); afirma errors (validar patrón)	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/engine_security.rs	intent_freeze_blocks_redeclaration	default	el archivo contiene literales de mensaje decorado (revisar test por test); afirma errors (validar patrón)	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/engine_security.rs	time_builtins_require_time_capability	default	el archivo contiene literales de mensaje decorado (revisar test por test); afirma errors (validar patrón)	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/engine_security.rs	intent_does_not_authorize_anything	default	el archivo contiene literales de mensaje decorado (revisar test por test); afirma errors (validar patrón)	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/gaps_conformance.rs	sandbox_print_is_denied_inside_and_sandbox_under_lets_it_through	default	el archivo contiene literales de mensaje decorado (revisar test por test); afirma errors (validar patrón); afirma output (traduce a valores)	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/gaps_conformance.rs	llm_op_denied_in_secure_without_require	especial	el archivo contiene literales de mensaje decorado (revisar test por test); afirma errors (validar patrón)	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/gaps_conformance.rs	llm_op_allowed_in_secure_with_require	especial	el archivo contiene literales de mensaje decorado (revisar test por test); afirma errors (validar patrón); afirma output (traduce a valores)	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/gaps_conformance.rs	llm_op_autogranted_in_run	default	el archivo contiene literales de mensaje decorado (revisar test por test); afirma errors (validar patrón); afirma output (traduce a valores)	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/llm_stream_e2e.rs	llm_stream_requires_llm_capability_in_secure_mode	especial	el archivo contiene literales de mensaje decorado (revisar test por test); afirma errors (validar patrón); afirma output (traduce a valores)	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/llm_stream_e2e.rs	llm_stream_without_provider_placeholder_no_chunks	default	el archivo contiene literales de mensaje decorado (revisar test por test); afirma errors (validar patrón); afirma output (traduce a valores)	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/memory_declared.rs	no_declaration_denies_whole_family_and_creates_nothing	default	el archivo contiene literales de mensaje decorado (revisar test por test); afirma errors (validar patrón)	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/memory_declared.rs	two_distinct_declarations_is_startup_error	default	el archivo contiene literales de mensaje decorado (revisar test por test); afirma errors (validar patrón); afirma output (traduce a valores)	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/memory_declared.rs	invalid_names_error_at_declaration_time	default	el archivo contiene literales de mensaje decorado (revisar test por test); afirma errors (validar patrón); afirma output (traduce a valores)	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/memory_declared.rs	bare_require_memory_is_a_parse_error	default	el archivo contiene literales de mensaje decorado (revisar test por test); afirma errors (validar patrón)	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/memory_declared.rs	sandbox_denies_declared_memory	default	el archivo contiene literales de mensaje decorado (revisar test por test); afirma errors (validar patrón)	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/memory_declared.rs	call_tool_gates_memory_per_tool	default	el archivo contiene literales de mensaje decorado (revisar test por test); afirma errors (validar patrón); afirma output (traduce a valores)	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/memory_declared.rs	transition_old_db_without_declaration_is_untouched	default	el archivo contiene literales de mensaje decorado (revisar test por test); afirma errors (validar patrón); afirma output (traduce a valores)	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/memory_declared.rs	schema_compat_rename_db_is_the_migration	default	el archivo contiene literales de mensaje decorado (revisar test por test); afirma errors (validar patrón); afirma output (traduce a valores)	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/memory_declared.rs	namespaces_default_own_and_cross_with_from	default	el archivo contiene literales de mensaje decorado (revisar test por test); afirma errors (validar patrón); afirma output (traduce a valores)	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/memory_declared.rs	swarm_agents_share_declared_store_with_their_name_as_source	default	el archivo contiene literales de mensaje decorado (revisar test por test); afirma errors (validar patrón); afirma output (traduce a valores)	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/memory_declared.rs	parallel_map_workers_share_declared_store	default	el archivo contiene literales de mensaje decorado (revisar test por test); afirma errors (validar patrón); afirma output (traduce a valores)	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/memory_declared.rs	secret_never_persists_plaintext	default	el archivo contiene literales de mensaje decorado (revisar test por test); afirma errors (validar patrón)	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/memory_declared.rs	declared_roundtrip_and_progress_survive_runs	default	el archivo contiene literales de mensaje decorado (revisar test por test); afirma errors (validar patrón); afirma output (traduce a valores)	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/mtls_e2e.rs	mtls_identity_requires_file_read_capability	default	afirma errors (validar patrón)	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/mtls_e2e.rs	mtls_identity_accepts_a_valid_pair	default	afirma errors (validar patrón); afirma output (traduce a valores)	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/mtls_e2e.rs	mtls_identity_reports_bad_pem_clearly	default	afirma errors (validar patrón)	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/tool_calling_e2e.rs	f3_llm_step_requires_llm_capability_in_secure_mode	especial	el archivo contiene literales de mensaje decorado (revisar test por test); afirma errors (validar patrón); afirma output (traduce a valores)	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/tool_calling_e2e.rs	f3b_llm_step_ok_with_require_llm_in_secure_mode	especial	el archivo contiene literales de mensaje decorado (revisar test por test); afirma errors (validar patrón); afirma output (traduce a valores)	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/tool_calling_e2e.rs	lp_tool_cannot_use_undeclared_capability_the_agent_has	especial	el archivo contiene literales de mensaje decorado (revisar test por test); afirma errors (validar patrón); afirma output (traduce a valores)	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/tool_calling_e2e.rs	lp_plain_call_inherits_ambient_capability	especial	el archivo contiene literales de mensaje decorado (revisar test por test); afirma errors (validar patrón); afirma output (traduce a valores)	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/tool_calling_e2e.rs	lp_tool_can_use_capability_it_declared	especial	el archivo contiene literales de mensaje decorado (revisar test por test); afirma errors (validar patrón); afirma output (traduce a valores)	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/tool_calling_e2e.rs	lp_tool_cannot_exceed_agent_and_scope_restores	especial	el archivo contiene literales de mensaje decorado (revisar test por test); afirma errors (validar patrón); afirma output (traduce a valores)	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/tool_calling_e2e.rs	lp_nested_require_inside_tool_cannot_self_grant	especial	el archivo contiene literales de mensaje decorado (revisar test por test); afirma errors (validar patrón); afirma output (traduce a valores)	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/tool_calling_e2e.rs	lp_indirect_call_inside_tool_cannot_self_grant	especial	el archivo contiene literales de mensaje decorado (revisar test por test); afirma errors (validar patrón); afirma output (traduce a valores)	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/v0629_audit.rs	b2_module_state_is_coherent	default	-	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/v0629_audit.rs	b2_module_names_are_its_exports	default	-	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/v0629_audit.rs	b4_log_show_print_keep_order	default	-	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/v0629_audit.rs	b7_lineage_host_without_credentials	default	afirma errors (validar patrón); afirma output (traduce a valores)	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/v0629_audit.rs	b8_evm_tx_raw_checks_what_is_signed	default	-	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/v0629_audit.rs	set_target_must_start_from_a_variable	default	-	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/v0629_audit.rs	python_reflexes_have_hints	default	-	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/v0629_audit.rs	r3_module_aliases_everywhere	default	-	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/v0629_audit.rs	r3_urls_with_odd_userinfo	default	-	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/v0629_audit.rs	r3_parquet_expansion_cap	default	-	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/v0629_audit.rs	r3_lineage_encoding_for_wide_ints	default	-	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/v0629_audit.rs	r3_numbers_like_python	default	-	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/v0629_audit.rs	r3_minor_edges	default	-	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/v0629_audit.rs	r3_global_generator_in_workers	default	-	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/v0629_audit.rs	r3_try_reflexes_and_returning	default	-	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/v0629_audit.rs	r4_generator_in_global_list	default	-	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/v0629_audit.rs	r4_parallel_map_advances_parent_generators	default	-	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/v0629_audit.rs	r4_sql_exec_returning_inside_string	default	-	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/v0629_audit.rs	r4_minor_messages	default	-	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/v0629_audit.rs	r5_lineage_salted_commitment	default	-	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/v0629_audit.rs	r6_comment_inside_brackets	default	-	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/v0629_audit.rs	r6_lineage_publishes_no_data	default	-	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/v0629_audit.rs	r6_sql_exec_returning_sqlite_only	default	-	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/v0629_audit.rs	r6_confusing_messages	default	-	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/v0629_audit.rs	r7_comment_in_multiline_call	default	-	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/v0629_audit.rs	r7_net_port_is_part_of_the_grant	default	afirma errors (validar patrón); afirma output (traduce a valores)	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/v0629_audit.rs	r7_sql_batch_returning_writes_nothing	default	-	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/v0629_audit.rs	r7_csv_encode_missing_marker	default	-	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/v0629_audit.rs	r7_glued_dashes_only_before_a_number	default	-	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/v0629_language.rs	syntax_fixes	default	-	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/v0629_language.rs	reflex_hints	default	-	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/v0630_audit.rs	a7_parquet_durations_round_trip	default	afirma errors (validar patrón); afirma output (traduce a valores)	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/v0630_audit.rs	c1_deprecated_alias_in_imported_module_warns	default	afirma errors (validar patrón)	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/v0630_audit.rs	c3_c_style_comment_gets_a_hint	default	-	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/v0630_audit.rs	c4_set_index_out_of_range_says_where	default	-	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/v0630_audit.rs	c9_check_task_param_write_lost	default	-	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/v0630_audit.rs	c10_module_hint_for_enum	default	afirma errors (validar patrón)	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/v0630_audit.rs	c3b_c_style_comment_hint_on_parse_and_lex_errors	default	-	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/v0642_e2e.rs	a_pipe_carries_bytes_and_close_inside_one_program	default	afirma errors (validar patrón); afirma output (traduce a valores)	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/v0642_e2e.rs	a_pipe_half_close_still_lets_the_other_side_answer	default	afirma errors (validar patrón); afirma output (traduce a valores)	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/v0645_data_builtins_e2e.rs	gzip_url_and_header_from_a_program	default	afirma errors (validar patrón); afirma output (traduce a valores)	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/v0645_data_builtins_e2e.rs	chart_x_axis_from_a_program	default	afirma errors (validar patrón); afirma output (traduce a valores)	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/v0645_data_builtins_e2e.rs	html_from_a_program	default	afirma errors (validar patrón); afirma output (traduce a valores)	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/v0645_partial_write_e2e.rs	pipe_write_takes_what_fits_and_says_how_much	default	afirma errors (validar patrón); afirma output (traduce a valores)	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/v0646_f1.rs	f1_tool_spec_takes_the_catalog_from_the_signature	default	afirma errors (validar patrón)	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/v0646_tanda_c.rs	c3_the_receipt_names_what_the_run_wrote	default	-	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/v0646_tanda_c.rs	c3_an_extraction_names_each_file	default	-	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/v0646_tanda_c.rs	c4_parquet_scan_reads_from_disk_like_parquet_read	default	-	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/v0646_tanda_c.rs	c3_parallel_map_workers_reach_the_receipt	default	-	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/v0646_tanda_c.rs	c3_a_failed_parallel_map_keeps_what_was_written	default	-	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/v0651_run_scope_e2e.rs	n4_a_caller_whose_capabilities_do_not_fit_gets_an_engine_error	default	afirma errors (validar patrón)	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/v0651_run_scope_e2e.rs	n2_a_child_command_line_that_does_not_fit_gets_an_engine_error	default	afirma errors (validar patrón)	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/v0655_arrays.rs	matmul_and_dot_with_a_vector_name_the_shape	default	el archivo contiene literales de mensaje decorado (revisar test por test)	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/v0658_attenuation.rs	k10_a_package_renders_its_own_template_without_file_read	default	el archivo contiene literales de mensaje decorado (revisar test por test); afirma output (traduce a valores)	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/v0658_attenuation.rs	k17_a_computed_name_not_in_the_package_is_not_found	default	el archivo contiene literales de mensaje decorado (revisar test por test); afirma output (traduce a valores)	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/v0658_attenuation.rs	k16_a_program_template_cannot_layout_a_package_template	default	el archivo contiene literales de mensaje decorado (revisar test por test); afirma output (traduce a valores)	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/v0658_attenuation.rs	k28_a_package_template_does_not_see_the_program	default	el archivo contiene literales de mensaje decorado (revisar test por test); afirma output (traduce a valores)	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/v0658_attenuation.rs	k29_a_package_include_does_not_reach_the_program	default	el archivo contiene literales de mensaje decorado (revisar test por test); afirma output (traduce a valores)	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/v0658_attenuation.rs	k27_a_program_callback_renders_the_program_template_with_the_intersection	default	el archivo contiene literales de mensaje decorado (revisar test por test); afirma output (traduce a valores)	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/v0659_transactions.rs	a_transaction_commits_when_its_task_returns_and_rolls_back_when_it_fails	default	-	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/v0659_transactions.rs	a_transaction_inside_another_is_a_savepoint	default	-	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/v0659_transactions.rs	an_outer_failure_undoes_the_inner_transaction_too	default	-	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/v0659_transactions.rs	a_statement_that_fails_inside_fails_the_transaction	default	-	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/v0659_transactions.rs	hand_made_transaction_control_is_an_error_under_run	default	-	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/v0659_transactions.rs	a_bad_argument_writes_nothing_and_leaves_the_connection_free	default	-	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/v0659_transactions.rs	a_transaction_without_a_connection_says_so	default	afirma errors (validar patrón)	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/v0664_data.rs	byte_ranges_are_exact_and_capability_checked	default	afirma errors (validar patrón)	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/v0664_data.rs	a_small_range_near_the_end_of_a_large_file	default	-	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/v0664_data.rs	parquet_info_from_file_matches_bytes_and_has_statistics	default	-	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/v0664_probe.rs	local_parallel_probe	default	afirma errors (validar patrón); afirma output (traduce a valores)	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/v0666_filters.rs	an_app_can_combine_masks_without_materializing_rows	default	afirma errors (validar patrón); afirma output (traduce a valores)	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/v0666_filters.rs	an_imported_library_can_filter_a_table	default	afirma errors (validar patrón); afirma output (traduce a valores)	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/webauth_e2e.rs	random_capability_gates_token_and_random_bytes	default	afirma errors (validar patrón); afirma output (traduce a valores)	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/webpush_e2e.rs	push_send_is_gated_by_net_of_the_endpoint_host	default	afirma errors (validar patrón)	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/webpush_e2e.rs	push_send_refuses_plaintext_endpoints_off_loopback	default	afirma errors (validar patrón)	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/webpush_e2e.rs	push_send_refuses_a_plain_text_private_key	default	afirma errors (validar patrón)	PENDIENTE	-
-synsema-runtime	engine/crates/synsema-runtime/tests/it/webpush_e2e.rs	push_vapid_keys_needs_random_and_seals_the_private_key	default	afirma errors (validar patrón); afirma output (traduce a valores)	PENDIENTE	-
+synsema-core	engine/crates/synsema-core/tests/alloc_counts.rs	heap_allocations_per_construct	default	-	QUEDA	mallocs del allocator del host
+synsema-core	engine/crates/synsema-core/tests/v0658_packages.rs	n2_without_synsema_json	default	-	QUEDA	caché en disco: tree_hash + SYNSEMA_MODULE_CACHE del proceso
+synsema-core	engine/crates/synsema-core/tests/v0658_packages.rs	n3_n4_n5_missing_name_hash_or_download	default	-	QUEDA	caché en disco: tree_hash + SYNSEMA_MODULE_CACHE del proceso
+synsema-core	engine/crates/synsema-core/tests/v0658_packages.rs	n6_n7_not_a_name	default	-	QUEDA	error de CARGA del use, mata el archivo entero
+synsema-core	engine/crates/synsema-core/tests/v0658_packages.rs	n10_checked_before_the_first_statement	default	afirma errors (validar patrón); afirma output (traduce a valores)	QUEDA	caché en disco: tree_hash + SYNSEMA_MODULE_CACHE del proceso
+synsema-core	engine/crates/synsema-core/tests/it/assert_conformance.rs	test_block_is_noop_in_run	default	-	QUEDA	modo run del host
+synsema-core	engine/crates/synsema-core/tests/it/batch2_conformance.rs	two_spreads_is_parse_error	default	-	QUEDA	error de parseo (el gemelo entero tiene que parsear)
+synsema-core	engine/crates/synsema-core/tests/it/batch7_conformance.rs	timeout_zero_and_negative_parse	default	-	QUEDA	timeout clampea a 3600 s bajo test
+synsema-core	engine/crates/synsema-core/tests/it/core_conformance.rs	trace_and_log	default	el archivo contiene literales de mensaje decorado (revisar test por test); afirma output (traduce a valores)	QUEDA	contrato [LOG] es stdout decorado del runner
+synsema-core	engine/crates/synsema-core/tests/it/core_conformance.rs	reserved_word_as_variable	default	el archivo contiene literales de mensaje decorado (revisar test por test)	QUEDA	error de parseo (el gemelo entero tiene que parsear)
+synsema-core	engine/crates/synsema-core/tests/it/core_conformance.rs	reserved_word_as_task_name	default	el archivo contiene literales de mensaje decorado (revisar test por test)	QUEDA	error de parseo (el gemelo entero tiene que parsear)
+synsema-core	engine/crates/synsema-core/tests/it/core_conformance.rs	zero_errors_located_and_catchable	default	el archivo contiene literales de mensaje decorado (revisar test por test); afirma errors (validar patrón); afirma output (traduce a valores)	QUEDA	prefijo decorado del host; lo atrapable ya vive en zero_errors
+synsema-core	engine/crates/synsema-core/tests/it/core_conformance.rs	error_category_vectors	default	el archivo contiene literales de mensaje decorado (revisar test por test)	QUEDA	errores decorados exactos del host + parseo
+synsema-core	engine/crates/synsema-core/tests/it/core_conformance.rs	flush_noop_when_not_live	default	el archivo contiene literales de mensaje decorado (revisar test por test); afirma output (traduce a valores)	QUEDA	RunResult.output del host
+synsema-core	engine/crates/synsema-core/tests/it/frozen_threads.rs	many_threads_read_and_copy_a_frozen_value	especial	-	QUEDA	hilos del host + refcounts de FrozenValue
+synsema-core	engine/crates/synsema-core/tests/it/invariant_conformance.rs	bare_invariant_still_parses_and_runs	default	el archivo contiene literales de mensaje decorado (revisar test por test)	QUEDA	introspección AST summarize
+synsema-core	engine/crates/synsema-core/tests/it/invariant_conformance.rs	described_invariant_accepts_a_backtick_template	default	el archivo contiene literales de mensaje decorado (revisar test por test)	QUEDA	introspección AST summarize
+synsema-core	engine/crates/synsema-core/tests/it/judge_conformance.rs	rate_with_between_is_a_parse_error_with_the_fix	default	-	QUEDA	error de parseo (el gemelo entero tiene que parsear)
+synsema-core	engine/crates/synsema-core/tests/it/judge_conformance.rs	choose_with_across_is_a_parse_error_with_the_fix	default	-	QUEDA	error de parseo (el gemelo entero tiene que parsear)
+synsema-core	engine/crates/synsema-core/tests/it/judge_conformance.rs	or_must_be_followed_by_nothing	default	-	QUEDA	error de parseo (el gemelo entero tiene que parsear)
+synsema-core	engine/crates/synsema-core/tests/it/judge_conformance.rs	rate_has_no_escape_level	default	-	QUEDA	error de parseo (el gemelo entero tiene que parsear)
+synsema-core	engine/crates/synsema-core/tests/it/judge_conformance.rs	whether_takes_no_options	default	-	QUEDA	error de parseo (el gemelo entero tiene que parsear)
+synsema-core	engine/crates/synsema-core/tests/it/judge_conformance.rs	duplicate_question_ids_are_rejected	default	-	QUEDA	error de parseo (el gemelo entero tiene que parsear)
+synsema-core	engine/crates/synsema-core/tests/it/judge_conformance.rs	judge_without_block_is_a_parse_error	default	-	QUEDA	error de parseo (el gemelo entero tiene que parsear)
+synsema-core	engine/crates/synsema-core/tests/it/judge_conformance.rs	unknown_verb_inside_judge_is_a_parse_error	default	-	QUEDA	error de parseo (el gemelo entero tiene que parsear)
+synsema-core	engine/crates/synsema-core/tests/it/merge_error_location.rs	merge_errors_carry_the_call_location	default	-	QUEDA	la ubicación archivo:línea no la expone recover
+synsema-core	engine/crates/synsema-core/tests/it/skill_snippets.rs	every_tagged_snippet_in_the_skill_loads	default	-	QUEDA	parse_source/check del host sobre skills/ del repo
+synsema-core	engine/crates/synsema-core/tests/it/v0620_conformance.rs	steps_is_deterministic_and_counts_work	default	-	QUEDA	determinismo entre dos corridas del host
+synsema-core	engine/crates/synsema-core/tests/it/v0620_conformance.rs	use_can_climb_inside_the_project_root	default	afirma errors (validar patrón); afirma output (traduce a valores)	QUEDA	árbol de archivos real + carga de módulos
+synsema-core	engine/crates/synsema-core/tests/it/v0620_conformance.rs	use_cannot_escape_the_project_root	default	afirma errors (validar patrón); afirma output (traduce a valores)	QUEDA	árbol de archivos real + carga de módulos
+synsema-core	engine/crates/synsema-core/tests/it/v0620_conformance.rs	private_clause_parses_in_a_route_and_in_a_group	default	-	QUEDA	mezcla parseo
+synsema-core	engine/crates/synsema-core/tests/it/v0642_conformance.rs	eprint_does_not_go_to_the_program_output	default	afirma errors (validar patrón); afirma output (traduce a valores)	QUEDA	RunResult.output del host
+synsema-core	engine/crates/synsema-core/tests/it/v0646_f1.rs	f1_a_wrong_type_is_a_parse_error	default	-	QUEDA	error de parseo
+synsema-core	engine/crates/synsema-core/tests/it/v0646_f1.rs	f1_negative_and_nothing_defaults	default	-	QUEDA	outline de codeintel es API del host
+synsema-core	engine/crates/synsema-core/tests/it/v0646_tanda_c.rs	c5_discovery_takes_only_off	default	-	QUEDA	error de parseo del bloque serve
+synsema-core	engine/crates/synsema-core/tests/it/v0655_arrays.rs	a_mask_in_arithmetic_is_zero_one	default	-	QUEDA	afirma arrays::negate interno; -m es error del lenguaje
+synsema-core	engine/crates/synsema-core/tests/it/v0658_project.rs	p2_the_root_is_the_folder_of_the_nearest_synsema_json	default	-	QUEDA	manifiesto/preflight del host al arrancar el archivo
+synsema-core	engine/crates/synsema-core/tests/it/v0658_project.rs	p3_p6_a_newer_minimum_stops_before_the_first_statement	default	-	QUEDA	manifiesto/preflight del host al arrancar el archivo
+synsema-core	engine/crates/synsema-core/tests/it/v0658_project.rs	p4_the_same_version_runs	default	-	QUEDA	manifiesto/preflight del host al arrancar el archivo
+synsema-core	engine/crates/synsema-core/tests/it/v0658_project.rs	p5_the_minimum_is_three_numbers	default	-	QUEDA	manifiesto/preflight del host al arrancar el archivo
+synsema-core	engine/crates/synsema-core/tests/it/v0658_project.rs	p7_p8_unknown_key_and_broken_json	default	-	QUEDA	manifiesto/preflight del host al arrancar el archivo
+synsema-core	engine/crates/synsema-core/tests/it/v0658_project.rs	p9_a_synsema_json_of_another_user_is_ignored	default	-	QUEDA	manifiesto/preflight del host al arrancar el archivo
+synsema-core	engine/crates/synsema-core/tests/it/v0658_project.rs	p10_a_program_without_a_file_has_no_project	default	-	QUEDA	manifiesto/preflight del host al arrancar el archivo
+synsema-core	engine/crates/synsema-core/tests/it/v0658_project.rs	the_nearest_synsema_json_wins	default	-	QUEDA	manifiesto/preflight del host al arrancar el archivo
+synsema-core	engine/crates/synsema-core/tests/it/v0658_project.rs	b14_the_run_uses_the_project_the_preflight_resolved	default	-	QUEDA	manifiesto/preflight del host al arrancar el archivo
+synsema-runtime	engine/crates/synsema-runtime/tests/agentic_e2e.rs	socket_and_timeout_parse_errors_are_loud	default	afirma errors (validar patrón); afirma output (traduce a valores)	QUEDA	parse_source del host
+synsema-runtime	engine/crates/synsema-runtime/tests/labels_sinks_e2e.rs	every_label_sink_name_is_a_real_builtin_and_the_families_are_covered	default	afirma errors (validar patrón)	QUEDA	tablas internas del host (LABEL_SINK_BUILTINS)
+synsema-runtime	engine/crates/synsema-runtime/tests/v0646_tanda_e.rs	e1_require_for_grammar	default	-	QUEDA	errores de carga, sin try/recover de load
+synsema-runtime	engine/crates/synsema-runtime/tests/v0646_tanda_e.rs	d4_unknown_require_is_a_load_error_with_a_suggestion	default	afirma errors (validar patrón); afirma output (traduce a valores)	QUEDA	errores de carga, sin try/recover de load
+synsema-runtime	engine/crates/synsema-runtime/tests/it/batch6_e2e.rs	agent_with_raise_ends_in_error	default	afirma errors (validar patrón)	QUEDA	agente en ERROR hace fallar el bloque; veredicto invertido
+synsema-runtime	engine/crates/synsema-runtime/tests/it/engine_concurrency.rs	agent_define_does_not_execute	default	afirma errors (validar patrón); afirma output (traduce a valores)	QUEDA	afirma RunResult.output / política del host
+synsema-runtime	engine/crates/synsema-runtime/tests/it/engine_concurrency.rs	agent_error_captured_in_swarm	default	afirma errors (validar patrón)	QUEDA	afirma RunResult.output / política del host
+synsema-runtime	engine/crates/synsema-runtime/tests/it/engine_concurrency.rs	run_program_isolates_agent_error_and_keeps_main_output	default	afirma errors (validar patrón); afirma output (traduce a valores)	QUEDA	afirma RunResult.output / política del host
+synsema-runtime	engine/crates/synsema-runtime/tests/it/engine_concurrency.rs	run_program_delayed_agent_crash_does_not_abort_main	default	afirma errors (validar patrón); afirma output (traduce a valores)	QUEDA	afirma RunResult.output / política del host
+synsema-runtime	engine/crates/synsema-runtime/tests/it/engine_concurrency.rs	run_program_happy_path_blackboard_and_signal	default	afirma errors (validar patrón); afirma output (traduce a valores)	QUEDA	afirma RunResult.output / política del host
+synsema-runtime	engine/crates/synsema-runtime/tests/it/engine_concurrency.rs	run_program_without_agents_is_unaffected	default	afirma errors (validar patrón); afirma output (traduce a valores)	QUEDA	afirma RunResult.output / política del host
+synsema-runtime	engine/crates/synsema-runtime/tests/it/engine_security.rs	intent_freeze_blocks_redeclaration	default	el archivo contiene literales de mensaje decorado (revisar test por test); afirma errors (validar patrón)	QUEDA	el freeze sólo dispara a nivel de archivo
+synsema-runtime	engine/crates/synsema-runtime/tests/it/engine_security.rs	time_builtins_require_time_capability	default	el archivo contiene literales de mensaje decorado (revisar test por test); afirma errors (validar patrón)	QUEDA	el runner auto-concede time
+synsema-runtime	engine/crates/synsema-runtime/tests/it/gaps_conformance.rs	llm_op_denied_in_secure_without_require	especial	el archivo contiene literales de mensaje decorado (revisar test por test); afirma errors (validar patrón)	QUEDA	el runner no tiene modo secure
+synsema-runtime	engine/crates/synsema-runtime/tests/it/gaps_conformance.rs	llm_op_allowed_in_secure_with_require	especial	el archivo contiene literales de mensaje decorado (revisar test por test); afirma errors (validar patrón); afirma output (traduce a valores)	QUEDA	el runner no tiene modo secure
+synsema-runtime	engine/crates/synsema-runtime/tests/it/llm_stream_e2e.rs	llm_stream_requires_llm_capability_in_secure_mode	especial	el archivo contiene literales de mensaje decorado (revisar test por test); afirma errors (validar patrón); afirma output (traduce a valores)	QUEDA	llm auto-concedida en el wiring no-secure
+synsema-runtime	engine/crates/synsema-runtime/tests/it/memory_declared.rs	no_declaration_denies_whole_family_and_creates_nothing	default	el archivo contiene literales de mensaje decorado (revisar test por test); afirma errors (validar patrón)	QUEDA	afirma cero archivos en disco del host
+synsema-runtime	engine/crates/synsema-runtime/tests/it/memory_declared.rs	two_distinct_declarations_is_startup_error	default	el archivo contiene literales de mensaje decorado (revisar test por test); afirma errors (validar patrón); afirma output (traduce a valores)	QUEDA	error de arranque del archivo entero
+synsema-runtime	engine/crates/synsema-runtime/tests/it/memory_declared.rs	invalid_names_error_at_declaration_time	default	el archivo contiene literales de mensaje decorado (revisar test por test); afirma errors (validar patrón); afirma output (traduce a valores)	QUEDA	error de arranque del archivo entero
+synsema-runtime	engine/crates/synsema-runtime/tests/it/memory_declared.rs	bare_require_memory_is_a_parse_error	default	el archivo contiene literales de mensaje decorado (revisar test por test); afirma errors (validar patrón)	QUEDA	error de parseo
+synsema-runtime	engine/crates/synsema-runtime/tests/it/memory_declared.rs	transition_old_db_without_declaration_is_untouched	default	el archivo contiene literales de mensaje decorado (revisar test por test); afirma errors (validar patrón); afirma output (traduce a valores)	QUEDA	dos corridas + bytes del .db legacy en disco
+synsema-runtime	engine/crates/synsema-runtime/tests/it/memory_declared.rs	schema_compat_rename_db_is_the_migration	default	el archivo contiene literales de mensaje decorado (revisar test por test); afirma errors (validar patrón); afirma output (traduce a valores)	QUEDA	dos corridas + bytes del .db legacy en disco
+synsema-runtime	engine/crates/synsema-runtime/tests/it/memory_declared.rs	swarm_agents_share_declared_store_with_their_name_as_source	default	el archivo contiene literales de mensaje decorado (revisar test por test); afirma errors (validar patrón); afirma output (traduce a valores)	QUEDA	persistencia entre procesos
+synsema-runtime	engine/crates/synsema-runtime/tests/it/memory_declared.rs	declared_roundtrip_and_progress_survive_runs	default	el archivo contiene literales de mensaje decorado (revisar test por test); afirma errors (validar patrón); afirma output (traduce a valores)	QUEDA	dos corridas + bytes del .db legacy en disco
+synsema-runtime	engine/crates/synsema-runtime/tests/it/mtls_e2e.rs	mtls_identity_accepts_a_valid_pair	default	afirma errors (validar patrón); afirma output (traduce a valores)	QUEDA	el par cert/key lo acuña rcgen en el host
+synsema-runtime	engine/crates/synsema-runtime/tests/it/tool_calling_e2e.rs	f3_llm_step_requires_llm_capability_in_secure_mode	especial	el archivo contiene literales de mensaje decorado (revisar test por test); afirma errors (validar patrón); afirma output (traduce a valores)	QUEDA	gate secure-mode no observable bajo el runner
+synsema-runtime	engine/crates/synsema-runtime/tests/it/v0629_audit.rs	b2_module_state_is_coherent	default	-	QUEDA	módulos multi-archivo con archivos reales del host
+synsema-runtime	engine/crates/synsema-runtime/tests/it/v0629_audit.rs	b2_module_names_are_its_exports	default	-	QUEDA	módulos multi-archivo con archivos reales del host
+synsema-runtime	engine/crates/synsema-runtime/tests/it/v0629_audit.rs	b4_log_show_print_keep_order	default	-	QUEDA	afirma el orden de RunResult.output del host
+synsema-runtime	engine/crates/synsema-runtime/tests/it/v0629_audit.rs	python_reflexes_have_hints	default	-	QUEDA	diagnósticos de parser/lexer
+synsema-runtime	engine/crates/synsema-runtime/tests/it/v0629_audit.rs	r3_module_aliases_everywhere	default	-	QUEDA	módulos multi-archivo con archivos reales del host
+synsema-runtime	engine/crates/synsema-runtime/tests/it/v0629_audit.rs	r3_urls_with_odd_userinfo	default	-	QUEDA	el claim muere al cargar el require net
+synsema-runtime	engine/crates/synsema-runtime/tests/it/v0629_audit.rs	r3_numbers_like_python	default	-	QUEDA	diagnósticos de parser/lexer
+synsema-runtime	engine/crates/synsema-runtime/tests/it/v0629_audit.rs	r3_minor_edges	default	-	QUEDA	diagnósticos de parser/lexer
+synsema-runtime	engine/crates/synsema-runtime/tests/it/v0629_audit.rs	r3_global_generator_in_workers	default	-	QUEDA	bajo el runner el gate rng toma la rama de task
+synsema-runtime	engine/crates/synsema-runtime/tests/it/v0629_audit.rs	r3_try_reflexes_and_returning	default	-	QUEDA	diagnósticos de parser/lexer
+synsema-runtime	engine/crates/synsema-runtime/tests/it/v0629_audit.rs	r4_generator_in_global_list	default	-	QUEDA	bajo el runner el gate rng toma la rama de task
+synsema-runtime	engine/crates/synsema-runtime/tests/it/v0629_audit.rs	r6_comment_inside_brackets	default	-	QUEDA	diagnósticos de parser/lexer
+synsema-runtime	engine/crates/synsema-runtime/tests/it/v0629_audit.rs	r6_lineage_publishes_no_data	default	-	QUEDA	necesita archivo temporal para grep + recibo del host
+synsema-runtime	engine/crates/synsema-runtime/tests/it/v0629_audit.rs	r6_confusing_messages	default	-	QUEDA	diagnósticos de parser/lexer
+synsema-runtime	engine/crates/synsema-runtime/tests/it/v0629_audit.rs	r7_comment_in_multiline_call	default	-	QUEDA	diagnósticos de parser/lexer
+synsema-runtime	engine/crates/synsema-runtime/tests/it/v0629_audit.rs	r7_net_port_is_part_of_the_grant	default	afirma errors (validar patrón); afirma output (traduce a valores)	QUEDA	un programa por grant: 10 grants de red excluyentes
+synsema-runtime	engine/crates/synsema-runtime/tests/it/v0629_audit.rs	r7_csv_encode_missing_marker	default	-	QUEDA	el último assert lee una constante de Rust
+synsema-runtime	engine/crates/synsema-runtime/tests/it/v0629_audit.rs	r7_glued_dashes_only_before_a_number	default	-	QUEDA	diagnósticos de parser/lexer
+synsema-runtime	engine/crates/synsema-runtime/tests/it/v0629_language.rs	syntax_fixes	default	-	QUEDA	mezcla parseo
+synsema-runtime	engine/crates/synsema-runtime/tests/it/v0629_language.rs	reflex_hints	default	-	QUEDA	hints de parseo/carga
+synsema-runtime	engine/crates/synsema-runtime/tests/it/v0630_audit.rs	c1_deprecated_alias_in_imported_module_warns	default	afirma errors (validar patrón)	QUEDA	warned_at_load es registro del proceso host
+synsema-runtime	engine/crates/synsema-runtime/tests/it/v0630_audit.rs	c3_c_style_comment_gets_a_hint	default	-	QUEDA	diagnósticos de parser/lexer
+synsema-runtime	engine/crates/synsema-runtime/tests/it/v0630_audit.rs	c4_set_index_out_of_range_says_where	default	-	QUEDA	afirma el prefijo decorado archivo:línea
+synsema-runtime	engine/crates/synsema-runtime/tests/it/v0630_audit.rs	c9_check_task_param_write_lost	default	-	QUEDA	check_warnings es diagnóstico estático
+synsema-runtime	engine/crates/synsema-runtime/tests/it/v0630_audit.rs	c10_module_hint_for_enum	default	afirma errors (validar patrón)	QUEDA	módulos multi-archivo con archivos reales del host
+synsema-runtime	engine/crates/synsema-runtime/tests/it/v0630_audit.rs	c3b_c_style_comment_hint_on_parse_and_lex_errors	default	-	QUEDA	diagnósticos de parser/lexer
+synsema-runtime	engine/crates/synsema-runtime/tests/it/v0645_data_builtins_e2e.rs	gzip_url_and_header_from_a_program	default	afirma errors (validar patrón); afirma output (traduce a valores)	QUEDA	servidor HTTP real + header sobre respuesta viva
+synsema-runtime	engine/crates/synsema-runtime/tests/it/v0658_attenuation.rs	k10_a_package_renders_its_own_template_without_file_read	default	el archivo contiene literales de mensaje decorado (revisar test por test); afirma output (traduce a valores)	QUEDA	paquete publicado en el caché del proceso
+synsema-runtime	engine/crates/synsema-runtime/tests/it/v0658_attenuation.rs	k17_a_computed_name_not_in_the_package_is_not_found	default	el archivo contiene literales de mensaje decorado (revisar test por test); afirma output (traduce a valores)	QUEDA	paquete publicado en el caché del proceso
+synsema-runtime	engine/crates/synsema-runtime/tests/it/v0658_attenuation.rs	k16_a_program_template_cannot_layout_a_package_template	default	el archivo contiene literales de mensaje decorado (revisar test por test); afirma output (traduce a valores)	QUEDA	paquete publicado en el caché del proceso
+synsema-runtime	engine/crates/synsema-runtime/tests/it/v0658_attenuation.rs	k28_a_package_template_does_not_see_the_program	default	el archivo contiene literales de mensaje decorado (revisar test por test); afirma output (traduce a valores)	QUEDA	paquete publicado en el caché del proceso
+synsema-runtime	engine/crates/synsema-runtime/tests/it/v0658_attenuation.rs	k29_a_package_include_does_not_reach_the_program	default	el archivo contiene literales de mensaje decorado (revisar test por test); afirma output (traduce a valores)	QUEDA	paquete publicado en el caché del proceso
+synsema-runtime	engine/crates/synsema-runtime/tests/it/v0658_attenuation.rs	k27_a_program_callback_renders_the_program_template_with_the_intersection	default	el archivo contiene literales de mensaje decorado (revisar test por test); afirma output (traduce a valores)	QUEDA	paquete publicado en el caché del proceso
+synsema-runtime	engine/crates/synsema-runtime/tests/it/v0664_data.rs	a_small_range_near_the_end_of_a_large_file	default	-	QUEDA	sparse 64 MB vía set_len del host
+synsema-runtime	engine/crates/synsema-runtime/tests/it/v0664_probe.rs	local_parallel_probe	default	afirma errors (validar patrón); afirma output (traduce a valores)	QUEDA	sonda manual #[ignore]: 1M filas y tiempos de pared

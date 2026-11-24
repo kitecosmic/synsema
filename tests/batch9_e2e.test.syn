@@ -1,0 +1,53 @@
+-- Gemelo de batch9_e2e.rs (v0.6.68, migas §4): export PNG/PDF por valores del lenguaje.
+-- svg_to_png/svg_to_pdf devuelven bytes con los magics correctos, la conversión funciona
+-- DENTRO de `sandbox` (G8), write_file adentro sigue denegado, y el SVG malformado y el
+-- límite de píxeles se atrapan con try/recover (G9).
+-- QUEDAN en Rust: dogfood_chart_to_png_to_file (setup y verificación byte a byte de
+-- archivos del host en %TEMP%) y serve_png_pdf_and_survives_invalid_svg (serve/sockets
+-- reales desde el host).
+-- Correr con: synsema test tests/batch9_e2e.test.syn
+
+test "png_and_pdf_from_chart_in_run_mode"
+    let svg be chart_svg("bar", {"ene": 10, "feb": 25}, {"title": "Ventas"})
+    let png be svg_to_png(svg, {"scale": 2})
+    let pdf be svg_to_pdf(svg)
+    -- magic PNG (89 50 4E 47 0D 0A 1A 0A) y magic PDF ("%PDF-" = 25 50 44 46 2d).
+    assert_eq(type_of(png), "bytes")
+    assert(contains(decode(png, "hex"), "89504e470d0a1a0a"))
+    assert_eq(type_of(pdf), "bytes")
+    assert(contains(decode(pdf, "hex"), "255044462d"))
+
+test "raster_works_inside_sandbox"
+    let png be bytes("", "hex")
+    sandbox
+        set png to svg_to_png(chart_svg("line", [1, 2, 3]))
+    assert_eq(type_of(png), "bytes")
+    assert(contains(decode(png, "hex"), "89504e470d0a1a0a"))
+
+test "sandbox_still_denies_write_file"
+    require file("syn_batch9_should_not_be_written.png")
+    let svg be chart_svg("bar", [1])
+    let denied be false
+    try
+        sandbox
+            write_file("syn_batch9_should_not_be_written.png", svg_to_png(svg))
+    recover e
+        set denied to true
+        assert(contains(e, "Capability not granted"))
+    assert(denied)
+    -- y de verdad no se escribió nada.
+    assert(not file_exists("syn_batch9_should_not_be_written.png"))
+
+test "invalid_svg_recoverable"
+    let msg be ""
+    try
+        svg_to_png("<not-svg")
+    recover err
+        set msg to err
+    assert(contains(msg, "invalid SVG"))
+    let msg2 be ""
+    try
+        svg_to_png(chart_svg("bar", [1]), {"width": 10000000})
+    recover err
+        set msg2 to err
+    assert(contains(msg2, "max_pixels"))

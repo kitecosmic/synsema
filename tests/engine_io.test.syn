@@ -1,0 +1,329 @@
+-- Gemelo de engine_io.rs (synsema-runtime/tests/it, capa I/O: IO-P1/P2/P3) (v0.6.68).
+-- Migran los 20 candidatos del TSV: deny-by-default de file (string exacto sin el prefijo
+-- `Runtime error: ` que sólo existe en el canal de errores del host; el texto capturado por
+-- recover es idéntico al resto del mensaje), fidelidad del scope de ruta (fix #5, `covers()`
+-- normaliza y cierra el bypass `..`), list_dir ordenado con metadata y errores, file_info/
+-- file_exists (incluida la forma estable del inexistente), read_file por rango de líneas y
+-- CRLF preservado, write_file atómico (el residual `.synsema.tmp` se observa con file_exists),
+-- least-privilege de capacidades punteadas (file.read / file.write / file coarse), grep
+-- (recursivo ordenado, literal vs regex, ignore_case, glob/max_results, errores, scope del
+-- target), edit_file (único/ambiguo/replace_all/errores/sin residual), append_file (crea y
+-- agrega, texto y bytes crudos), y run (deny-by-default + validación de args, portable).
+-- No hay tests QUEDA de los 20 candidatos. El .rs conserva los módulos cfg-gateados
+-- run_windows/run_unix (ejecución real de `run` por SO), que no son candidatos del TSV.
+--
+-- Dos hallazgos del piloto (verificados con probes descartables) moldean este archivo:
+--   1) En `synsema test` los grants SE ACUMULAN entre bloques: un `require` de un bloque
+--      anterior sigue vigente en los siguientes. Por eso: toda aserción de violación se
+--      afirma ANTES de conceder un grant más amplio sobre la misma ruta (el gate dispara
+--      antes del I/O, así que el archivo objetivo no necesita existir para violar), los
+--      bloques con violaciones preceden a los que amplían grants, `run_deny_by_default`
+--      precede a `run_args_must_be_a_list` (exec("echo")) y `fix5_...` — que usa el
+--      `require file` pelado (poder total) — es el ÚLTIMO bloque del archivo.
+--   2) make_dir es idempotente (no raising sobre existente) y delete_dir exige
+--      {"recursive": true} para borrar con contenido; la limpieza de fixtures es en-lenguaje.
+-- Fixtures bajo tests/_syn_io_<tag>/ (nombres fijos): el setup los (re)crea y cada bloque
+-- borra su directorio al final, así que una corrida deja el árbol limpio y los reruns son
+-- idempotentes incluso tras una corrida abortada.
+-- Correr con: synsema test tests/engine_io.test.syn
+
+task expect_error(f, needle)
+    let ok be false
+    try
+        f()
+    recover e
+        set ok to true
+        assert(contains(e, needle))
+    assert(ok)
+
+test "io_builtins_deny_by_default"
+    -- Las 4 primitivas exigen file.read; sin grant violan con el string exacto
+    -- (la ruta "X" normaliza a "X").
+    let needle be "Capability not granted: file_read(\"X\") — this is a permission, not a bug: add `require file.read(\"X\")` to the program's preamble (or to the importing file, when this code runs in a module)"
+    expect_error(() => list_dir("X"), needle)
+    expect_error(() => file_info("X"), needle)
+    expect_error(() => file_exists("X"), needle)
+    expect_error(() => read_file("X", 1, 5), needle)
+
+test "iop2_builtins_deny_by_default"
+    let needle_r be "Capability not granted: file_read(\"X\") — this is a permission, not a bug: add `require file.read(\"X\")` to the program's preamble (or to the importing file, when this code runs in a module)"
+    let needle_w be "Capability not granted: file_write(\"X\") — this is a permission, not a bug: add `require file.write(\"X\")` to the program's preamble (or to the importing file, when this code runs in a module)"
+    expect_error(() => grep("X", "y"), needle_r)
+    expect_error(() => edit_file("X", "a", "b"), needle_w)
+    expect_error(() => append_file("X", "y"), needle_w)
+
+test "list_dir_enumerates_sorted_with_metadata"
+    require file("tests/_syn_io_listdir/**")
+    make_dir("tests/_syn_io_listdir")
+    write_file("tests/_syn_io_listdir/b.txt", "bb")
+    write_file("tests/_syn_io_listdir/a.txt", "hello")
+    make_dir("tests/_syn_io_listdir/d")
+    let e be list_dir("tests/_syn_io_listdir")
+    assert_eq(length(e), 3)
+    let a be e[0]
+    let bb be e[1]
+    let dd be e[2]
+    assert_eq(a["name"], "a.txt")
+    assert_eq(text(a["is_dir"]), "false")
+    assert_eq(text(a["size"]), "5")
+    assert_eq(bb["name"], "b.txt")
+    assert_eq(dd["name"], "d")
+    assert_eq(text(dd["is_dir"]), "true")
+    assert_eq(text(dd["size"]), "0")
+    delete_dir("tests/_syn_io_listdir", {"recursive": true})
+
+test "list_dir_errors_on_file_or_missing"
+    require file("tests/_syn_io_listdir_err/**")
+    make_dir("tests/_syn_io_listdir_err")
+    write_file("tests/_syn_io_listdir_err/file.txt", "x")
+    expect_error(() => list_dir("tests/_syn_io_listdir_err/file.txt"), "Not a directory")
+    expect_error(() => list_dir("tests/_syn_io_listdir_err/nope"), "Not a directory")
+    delete_dir("tests/_syn_io_listdir_err", {"recursive": true})
+
+test "file_info_and_exists"
+    require file("tests/_syn_io_fileinfo/**")
+    make_dir("tests/_syn_io_fileinfo")
+    write_file("tests/_syn_io_fileinfo/data.txt", "hello")
+    -- existente: exists/is_dir/size correctos, modified entero (type_of "number")
+    let i be file_info("tests/_syn_io_fileinfo/data.txt")
+    assert_eq(text(i["exists"]), "true")
+    assert_eq(text(i["is_dir"]), "false")
+    assert_eq(text(i["size"]), "5")
+    assert_eq(type_of(i["modified"]), "number")
+    assert_eq(text(file_exists("tests/_syn_io_fileinfo/data.txt")), "true")
+    -- inexistente: forma estable, SIN error; modified = nothing; file_exists coherente
+    let m be file_info("tests/_syn_io_fileinfo/nope.txt")
+    assert_eq(text(m["exists"]), "false")
+    assert_eq(text(m["is_dir"]), "false")
+    assert_eq(text(m["size"]), "0")
+    assert_eq(type_of(m["modified"]), "nothing")
+    assert_eq(text(file_exists("tests/_syn_io_fileinfo/nope.txt")), "false")
+    delete_dir("tests/_syn_io_fileinfo", {"recursive": true})
+
+test "read_file_line_ranges"
+    require file("tests/_syn_io_readrange/**")
+    make_dir("tests/_syn_io_readrange")
+    write_file("tests/_syn_io_readrange/five.txt", "L1\nL2\nL3\nL4\nL5\n")
+    -- [1,2): líneas 1-2
+    assert_eq(read_file("tests/_syn_io_readrange/five.txt", 1, 2), "L1\nL2\n")
+    -- desde 4 al final
+    assert_eq(read_file("tests/_syn_io_readrange/five.txt", 4), "L4\nL5\n")
+    -- limit mayor que las líneas restantes → fin observable (solo 2 líneas)
+    assert_eq(read_file("tests/_syn_io_readrange/five.txt", 4, 10), "L4\nL5\n")
+    -- 1 arg → archivo completo
+    assert_eq(read_file("tests/_syn_io_readrange/five.txt"), "L1\nL2\nL3\nL4\nL5\n")
+    -- offset < 1 → error
+    expect_error(() => read_file("tests/_syn_io_readrange/five.txt", 0), "offset must be >= 1")
+    -- limit < 0 → error
+    expect_error(() => read_file("tests/_syn_io_readrange/five.txt", 1, -1), "limit must be >= 0")
+    delete_dir("tests/_syn_io_readrange", {"recursive": true})
+
+test "read_file_preserves_crlf"
+    require file("tests/_syn_io_crlf/**")
+    make_dir("tests/_syn_io_crlf")
+    write_file("tests/_syn_io_crlf/crlf.txt", "X\r\nY\r\n")
+    assert_eq(read_file("tests/_syn_io_crlf/crlf.txt", 1, 1), "X\r\n")
+    delete_dir("tests/_syn_io_crlf", {"recursive": true})
+
+test "write_file_atomic_roundtrip"
+    require file("tests/_syn_io_write/**")
+    make_dir("tests/_syn_io_write")
+    write_file("tests/_syn_io_write/out.txt", "hello world")
+    assert_eq(read_file("tests/_syn_io_write/out.txt"), "hello world")
+    -- el destino existe y NO quedó el temporal (observable con file_exists)
+    assert_eq(text(file_exists("tests/_syn_io_write/out.txt")), "true")
+    assert_eq(text(file_exists("tests/_syn_io_write/out.txt.synsema.tmp")), "false")
+    delete_dir("tests/_syn_io_write", {"recursive": true})
+
+test "dotted_capability_grants_least_privilege"
+    -- Reordenado respecto al .rs (grants acumulativos): cada violación se afirma antes de
+    -- conceder un grant más amplio sobre la misma ruta. El gate dispara antes del I/O.
+    require file.read("tests/_syn_io_lp/x.txt")
+    -- file.read NO concede escritura (x aún no existe; el gate no la necesita)
+    expect_error(() => write_file("tests/_syn_io_lp/x.txt", "no"), "Capability not granted: file_write")
+    -- x se crea con un grant de escritura mínimo; como file.write no cubre lectura
+    -- (se afirma abajo), la lectura exitosa sale de file.read
+    require file.write("tests/_syn_io_lp/x.txt")
+    write_file("tests/_syn_io_lp/x.txt", "X")
+    assert_eq(read_file("tests/_syn_io_lp/x.txt"), "X")
+    -- file.write concede SOLO escritura
+    require file.write("tests/_syn_io_lp/y.txt")
+    write_file("tests/_syn_io_lp/y.txt", "ok")
+    expect_error(() => read_file("tests/_syn_io_lp/y.txt"), "Capability not granted: file_read")
+    -- file (coarse) sigue cubriendo AMBAS (back-compat)
+    require file("tests/_syn_io_lp/z.txt")
+    write_file("tests/_syn_io_lp/z.txt", "ok")
+    assert_eq(read_file("tests/_syn_io_lp/z.txt"), "ok")
+    require file("tests/_syn_io_lp/**")
+    delete_dir("tests/_syn_io_lp", {"recursive": true})
+
+test "grep_searches_dir_recursively_sorted"
+    require file("tests/_syn_io_grep_dir/**")
+    make_dir("tests/_syn_io_grep_dir")
+    write_file("tests/_syn_io_grep_dir/a.txt", "alpha\nhello\n")
+    write_file("tests/_syn_io_grep_dir/b.txt", "say hello now\n")
+    make_dir("tests/_syn_io_grep_dir/sub")
+    write_file("tests/_syn_io_grep_dir/sub/c.txt", "nope\n")
+    let r be grep("tests/_syn_io_grep_dir", "hello")
+    let ms be r["matches"]
+    assert_eq(length(ms), 2)
+    assert_eq(text(r["truncated"]), "false")
+    let m0 be ms[0]
+    assert_eq(m0["file"], "tests/_syn_io_grep_dir/a.txt")
+    assert_eq(m0["line"], 2)
+    assert_eq(m0["col"], 1)
+    assert_eq(m0["text"], "hello")
+    let m1 be ms[1]
+    assert_eq(m1["file"], "tests/_syn_io_grep_dir/b.txt")
+    assert_eq(m1["line"], 1)
+    assert_eq(m1["col"], 5)
+    assert_eq(m1["text"], "say hello now")
+    delete_dir("tests/_syn_io_grep_dir", {"recursive": true})
+
+test "grep_literal_vs_regex"
+    require file("tests/_syn_io_grep_re/**")
+    make_dir("tests/_syn_io_grep_re")
+    write_file("tests/_syn_io_grep_re/x.txt", "abc123\n")
+    -- literal: "[0-9]+" como texto crudo no aparece → 0 matches
+    let rl be grep("tests/_syn_io_grep_re/x.txt", "[0-9]+")
+    assert_eq(length(rl["matches"]), 0)
+    -- regex: matchea "123" en col 4
+    let rr be grep("tests/_syn_io_grep_re/x.txt", "[0-9]+", {"regex": true})
+    let ms be rr["matches"]
+    assert_eq(length(ms), 1)
+    assert_eq(ms[0]["line"], 1)
+    assert_eq(ms[0]["col"], 4)
+    assert_eq(ms[0]["text"], "abc123")
+    delete_dir("tests/_syn_io_grep_re", {"recursive": true})
+
+test "grep_ignore_case"
+    require file("tests/_syn_io_grep_ic/**")
+    make_dir("tests/_syn_io_grep_ic")
+    write_file("tests/_syn_io_grep_ic/x.txt", "Hello\n")
+    -- sensible a may/min → 0
+    let rs be grep("tests/_syn_io_grep_ic/x.txt", "hello")
+    assert_eq(length(rs["matches"]), 0)
+    -- ignore_case → 1, text conserva el casing original
+    let ri be grep("tests/_syn_io_grep_ic/x.txt", "hello", {"ignore_case": true})
+    assert_eq(length(ri["matches"]), 1)
+    assert_eq(ri["matches"][0]["text"], "Hello")
+    delete_dir("tests/_syn_io_grep_ic", {"recursive": true})
+
+test "grep_glob_and_max_results"
+    require file("tests/_syn_io_grep_glob/**")
+    make_dir("tests/_syn_io_grep_glob")
+    write_file("tests/_syn_io_grep_glob/a.syn", "match\n")
+    write_file("tests/_syn_io_grep_glob/b.txt", "match\n")
+    write_file("tests/_syn_io_grep_glob/c.syn", "match\n")
+    -- glob "*.syn" → solo a.syn y c.syn (2 matches)
+    let rg be grep("tests/_syn_io_grep_glob", "match", {"glob": "*.syn"})
+    assert_eq(length(rg["matches"]), 2)
+    -- max_results 1 → 1 match + truncated true
+    let rm be grep("tests/_syn_io_grep_glob", "match", {"max_results": 1})
+    assert_eq(length(rm["matches"]), 1)
+    assert_eq(text(rm["truncated"]), "true")
+    delete_dir("tests/_syn_io_grep_glob", {"recursive": true})
+
+test "grep_errors"
+    require file("tests/_syn_io_grep_err/**")
+    make_dir("tests/_syn_io_grep_err")
+    write_file("tests/_syn_io_grep_err/x.txt", "data\n")
+    expect_error(() => grep("tests/_syn_io_grep_err/x.txt", ""), "grep: empty pattern")
+    expect_error(() => grep("tests/_syn_io_grep_err/nope", "x"), "grep: path not found")
+    delete_dir("tests/_syn_io_grep_err", {"recursive": true})
+
+test "grep_respects_target_scope"
+    -- Reordenado (grants acumulativos): la violación se afirma antes de conceder el scope
+    -- amplio; el gate dispara antes del I/O (los fixtures no existen todavía).
+    require file("tests/_syn_io_grep_scope/sub")
+    -- un scope acotado a sub/ no autoriza grepear el padre
+    expect_error(() => grep("tests/_syn_io_grep_scope", "hello"), "Capability not granted: file_read")
+    -- scope al árbol del target (v0.6.45: <carpeta>/** también cubre la carpeta misma)
+    require file("tests/_syn_io_grep_scope/**")
+    write_file("tests/_syn_io_grep_scope/a.txt", "hello\n")
+    make_dir("tests/_syn_io_grep_scope/sub")
+    write_file("tests/_syn_io_grep_scope/sub/c.txt", "hello\n")
+    let r be grep("tests/_syn_io_grep_scope", "hello")
+    assert_eq(length(r["matches"]), 2)
+    delete_dir("tests/_syn_io_grep_scope", {"recursive": true})
+
+test "edit_file_unique_and_replace_all"
+    require file("tests/_syn_io_edit/**")
+    make_dir("tests/_syn_io_edit")
+    write_file("tests/_syn_io_edit/uniq.txt", "foo bar baz\n")
+    write_file("tests/_syn_io_edit/ambig.txt", "a a a\n")
+    write_file("tests/_syn_io_edit/notf.txt", "xyz\n")
+    -- match único → replaced 1 + round-trip
+    let r1 be edit_file("tests/_syn_io_edit/uniq.txt", "bar", "QUX")
+    assert_eq(r1["replaced"], 1)
+    assert_eq(read_file("tests/_syn_io_edit/uniq.txt"), "foo QUX baz\n")
+    -- 0 ocurrencias → pattern not found
+    expect_error(() => edit_file("tests/_syn_io_edit/notf.txt", "nope", "x"), "edit_file: pattern not found")
+    -- >1 sin replace_all → ambiguo
+    expect_error(() => edit_file("tests/_syn_io_edit/ambig.txt", "a", "b"), "edit_file: ambiguous, 3 occurrences")
+    -- replace_all → reemplaza las 3
+    let r2 be edit_file("tests/_syn_io_edit/ambig.txt", "a", "b", true)
+    assert_eq(r2["replaced"], 3)
+    assert_eq(read_file("tests/_syn_io_edit/ambig.txt"), "b b b\n")
+    -- old vacío → empty pattern
+    expect_error(() => edit_file("tests/_syn_io_edit/uniq.txt", "", "x"), "edit_file: empty pattern")
+    -- inexistente → File not found
+    expect_error(() => edit_file("tests/_syn_io_edit/missing.txt", "a", "b"), "File not found")
+    -- sin .synsema.tmp residual
+    assert_eq(text(file_exists("tests/_syn_io_edit/uniq.txt.synsema.tmp")), "false")
+    assert_eq(text(file_exists("tests/_syn_io_edit/ambig.txt.synsema.tmp")), "false")
+    delete_dir("tests/_syn_io_edit", {"recursive": true})
+
+test "append_file_creates_and_appends"
+    require file("tests/_syn_io_append/**")
+    make_dir("tests/_syn_io_append")
+    -- crea si no existe, luego agrega al final
+    append_file("tests/_syn_io_append/log.txt", "line1\n")
+    append_file("tests/_syn_io_append/log.txt", "line2\n")
+    assert_eq(read_file("tests/_syn_io_append/log.txt"), "line1\nline2\n")
+    -- bytes crudos
+    append_file("tests/_syn_io_append/raw.bin", bytes("AB"))
+    append_file("tests/_syn_io_append/raw.bin", bytes("CD"))
+    assert_eq(read_file("tests/_syn_io_append/raw.bin"), "ABCD")
+    delete_dir("tests/_syn_io_append", {"recursive": true})
+
+test "run_deny_by_default"
+    -- Sin require exec → violación con el string exacto (sin el prefijo del host).
+    -- Va ANTES de run_args_must_be_a_list: los grants se acumulan entre bloques.
+    let needle be "Capability not granted: exec(\"echo\") — this is a permission, not a bug: add `require exec(\"echo\")` to the program's preamble (or to the importing file, when this code runs in a module)"
+    expect_error(() => run("echo", []), needle)
+
+test "run_args_must_be_a_list"
+    require exec("echo")
+    -- El 2º arg, si está, debe ser lista (la validación precede al spawn)
+    expect_error(() => run("echo", "notalist"), "run: args must be a list")
+
+test "fix5_scope_is_faithful_no_traversal_bypass"
+    -- ÚLTIMO bloque del archivo: el `require file` pelado (poder total) queda acumulado
+    -- para todo lo que siga. Reordenado respecto al .rs por la misma razón (grants
+    -- acumulativos): la violación se afirma antes de concedir grant alguno que cubra
+    -- secret.txt; el gate dispara antes del I/O (secret.txt aún no existe).
+    require file("tests/_syn_io_fix5/sandbox/*")
+    expect_error(() => read_file("tests/_syn_io_fix5/sandbox/../secret.txt"), "Capability not granted")
+    -- el tagdir, el sandbox y ok.txt se crean con grants mínimos: un grant de dir sin
+    -- wildcard cubre SÓLO la ruta exacta (no los hijos), así que cada nivel lleva su
+    -- grant propio; ninguno cubre secret.txt (un `**` del tagdir sí lo cubriría)
+    require file("tests/_syn_io_fix5")
+    make_dir("tests/_syn_io_fix5")
+    require file("tests/_syn_io_fix5/sandbox")
+    make_dir("tests/_syn_io_fix5/sandbox")
+    require file("tests/_syn_io_fix5/sandbox/ok.txt")
+    write_file("tests/_syn_io_fix5/sandbox/ok.txt", "OK")
+    -- dentro del scope → OK (File cubre FileRead por la misma rama is_file normalizada de
+    -- covers()): deep.txt se crea y se lee autorizado SÓLO por el scope sandbox/* — ni el
+    -- grant del dir sin wildcard ni el exacto de ok.txt cubren hijos ajenos
+    require file("tests/_syn_io_fix5/sandbox/*")
+    write_file("tests/_syn_io_fix5/sandbox/deep.txt", "D")
+    assert_eq(read_file("tests/_syn_io_fix5/sandbox/deep.txt"), "D")
+    assert_eq(read_file("tests/_syn_io_fix5/sandbox/ok.txt"), "OK")
+    -- poder total intacto: `require file` pelado cubre cualquier ruta, incluso vía `..`
+    -- (v0.6.45: `file("*")` ya no es poder total; son los archivos del cwd)
+    require file
+    write_file("tests/_syn_io_fix5/secret.txt", "SECRET")
+    assert_eq(read_file("tests/_syn_io_fix5/sandbox/../secret.txt"), "SECRET")
+    delete_dir("tests/_syn_io_fix5", {"recursive": true})

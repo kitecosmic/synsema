@@ -1,5 +1,33 @@
 -- v0.6.29 audit, value-level probes. Host file setup, parse diagnostics, timing and
 -- process output remain in Rust until reviewed test by test.
+--
+-- v0.6.68 migration decisions (QUEDA in Rust, with the reason):
+--   b2_module_state_is_coherent / b2_module_names_are_its_exports /
+--   r3_module_aliases_everywhere: multi-file module setup (run_with_files); `use` resolves at
+--     load time, so the twin cannot create the module files it imports.
+--   b4_log_show_print_keep_order: asserts RunResult.output order; the .syn runner does not
+--     expose captured print/log/show output.
+--   python_reflexes_have_hints: most hints are parser/lexer diagnostics (`+=`, `lambda`,
+--     f-strings, slices, `%`), and a .test.syn must parse, so they cannot be asserted inside.
+--   r3_urls_with_odd_userinfo: the no-host claim fails inside the `require net` grant at load
+--     time (a require inside a task is a no-op), so half the test stays host-side.
+--   r3_numbers_like_python / r3_minor_edges / r3_try_reflexes_and_returning /
+--   r6_comment_inside_brackets / r7_comment_in_multiline_call /
+--   r7_glued_dashes_only_before_a_number: mixed — half the assertions are parse/lexer errors
+--     (bad literals, `else`/`except`/`finally`, comprehensions, `--` hints), unassertable here.
+--   r3_global_generator_in_workers / r4_generator_in_global_list: under `synsema test` the
+--     block runs wrapped in a task, so the rng gate fires its "local of the task that made
+--     this lambda" branch; the Rust needle "was created at the top level" is unreachable.
+--   r6_lineage_publishes_no_data: needs a disposable file next to the test for grep plus the
+--     receipt blob check; the language cannot create a clean temp path for it.
+--   r6_confusing_messages: parse errors carrying file:line:col locations (`if (`, template
+--     holes pointing into the hole).
+--   r7_net_port_is_part_of_the_grant: ten mutually exclusive net grants, one program each in
+--     Rust; one test block is one program with one cumulative grant set.
+--   r7_csv_encode_missing_marker: its last assert reads a Rust warning constant
+--     (ONE_COLUMN_NOTHING_WARNING), host-side.
+-- Migrated blocks use unique table names per test (`:memory:` is one shared db for the whole
+-- file run) and lineage deltas/base indexes (lineage accumulates at file scope).
 
 task expect_error(f, needle)
     let ok be false
@@ -460,3 +488,145 @@ test "r8_offsets_seconds_z_zone_and_long_durations"
     assert_eq(text(d), "P146097D")
     assert_eq(in_units(d, "days"), 146097.0)
     assert_eq(text(date(2000, 1, 1) + d), "2400-01-01")
+
+test "b7_lineage_host_without_credentials"
+    require net("127.0.0.1")
+    let before be length(lineage())
+    let r be http_get("http://alice:pw@127.0.0.1:1/x?api_key=K")
+    assert_eq(length(lineage()), before)
+
+test "b8_evm_tx_raw_checks_what_is_signed"
+    require sign("K")
+    let k be as_secret(bytes("4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318", "hex"), "K")
+    let k2 be as_secret(bytes("0000000000000000000000000000000000000000000000000000000000000001", "hex"), "K")
+    let tx be evm_tx_create({"chain_id": 7960, "nonce": 3, "from": evm_address(k), "value": 0, "gas": 100000, "max_fee": 10, "max_priority": 1, "data": bytes("6000", "hex")})
+    let sig be secp256k1_sign(tx["digest"], k)
+    assert_eq(length(evm_tx_raw(tx, sig)), 86)
+    task no_from()
+        give evm_tx_raw(remove(tx, "from"), secp256k1_sign(tx["digest"], k2))
+    expect_error(no_from, "must carry \"from\"")
+    task bad_field()
+        let t be tx
+        set t["fields"][1] to 99
+        give evm_tx_raw(t, sig)
+    expect_error(bad_field, "\"digest\" does not match")
+    task bad_nonce()
+        let t be tx
+        set t["nonce"] to 7
+        give evm_tx_raw(t, sig)
+    expect_error(bad_nonce, "\"nonce\" does not match")
+    task bad_from()
+        let t be tx
+        set t["from"] to evm_address(k2)
+        give evm_tx_raw(t, secp256k1_sign(tx["digest"], k2))
+    expect_error(bad_from, "contract_address")
+    task bad_digest()
+        let t be tx
+        set t["digest"] to keccak256(bytes("x", "utf8"))
+        give evm_tx_raw(t, secp256k1_sign(t["digest"], k))
+    expect_error(bad_digest, "\"digest\" does not match")
+
+test "set_target_must_start_from_a_variable"
+    let m be {"a": {"b": 0}}
+    task do()
+        set get(m, "a")["b"] to 1
+    expect_error(do, "must start from a variable")
+
+test "r3_parquet_expansion_cap"
+    require file.read("engine/crates/synsema-runtime/tests/fixtures/parquet_page_bomb.parquet")
+    expect_error(() => parquet_read(read_file_bytes("engine/crates/synsema-runtime/tests/fixtures/parquet_page_bomb.parquet")), "refusing to allocate")
+    let t be datetime("2023-11-14T22:13:20.123456789Z")
+    assert_eq(parquet_read(parquet_write([{"t": t}]))[0].t == t, true)
+
+test "r3_lineage_encoding_for_wide_ints"
+    require db(":memory:")
+    db_open(":memory:", "memory")
+    sql_exec("CREATE TABLE v629_wide (a INTEGER)")
+    sql_exec("INSERT INTO v629_wide VALUES (9007199254740993)")
+    let base be length(lineage())
+    let rows be sql("SELECT * FROM v629_wide")
+    let l be lineage()[base]
+    assert_eq(text(l.encoding), "json")
+    assert_eq("0x" + l.sha256 == hex(sha256(json_encode(rows))), true)
+
+test "r4_parallel_map_advances_parent_generators"
+    task w(h)
+        give h()
+    let g be rng(7)
+    let a be parallel_map(w, [g])
+    let x be g()
+    let g2 be rng(7)
+    let b be apply([g2], w)
+    let y be g2()
+    assert_eq(a == b, true)
+    assert_eq(x == y, true)
+    assert_eq(a[0] == x, false)
+    let kids be rng_spawn(rng(3), 2)
+    let k1 be parallel_map(w, kids)
+    let k2 be parallel_map(w, kids)
+    assert_eq(k1 == k2, false)
+    let g3 be rng(1)
+    expect_error(() => parallel_map((i) => 1, [[[[[{"a": g3}]]]], [[[[[{"b": g3}]]]]]]), "the same generator")
+
+test "r4_sql_exec_returning_inside_string"
+    require db(":memory:")
+    db_open(":memory:", "memory")
+    sql_exec("CREATE TABLE v629_retstr (a TEXT)")
+    sql_exec("INSERT INTO v629_retstr VALUES ('returning soon') -- returning")
+    assert_eq(text(sql("SELECT a FROM v629_retstr")), "[{a: \"returning soon\"}]")
+
+test "r4_minor_messages"
+    require net("127.0.0.1")
+    let ev be {"name": "E", "inputs": [{"name": "a", "type": "uint256", "indexed": false}, {"name": "a", "type": "uint256", "indexed": false}]}
+    expect_error(() => abi_decode_log(ev, {"topics": [abi_event_topic(ev)], "data": "0x" + join(apply(range(128), (i) => "0"), "")}), "would both be named")
+    expect_error(() => evm_create_address("0x0000000000000000000000000000000000000001", 2 ** 64), "EIP-2681")
+    let z be "0x" + join(apply(range(64), (i) => "0"), "")
+    expect_error(() => evm_logs("http://127.0.0.1:1/", {"topics": [z, z, z, z, z]}), "at most 4 topics")
+
+test "r5_lineage_salted_commitment"
+    require db(":memory:")
+    db_open(":memory:", "memory")
+    sql_exec("CREATE TABLE v629_salt (a INTEGER)")
+    let q be "SELECT count(*) AS n FROM v629_salt WHERE a > ?"
+    let base be length(lineage())
+    let i0 be base
+    let i1 be base + 1
+    let r1 be sql(q, [5])
+    let r2 be sql(q, [5])
+    let l be lineage()
+    assert_eq(starts_with(l[i0].what, "query sha256-salted:"), true)
+    assert_eq(l[i0].what == l[i1].what, false)
+    assert_eq(text(l[i0].committed_encoding), "jcs")
+    let c be hex(sha256(bytes(l[i0].salt, "hex") + bytes(canonical_json([q, [5]]), "utf8")))
+    assert_eq("query sha256-salted:" + slice(c, 2) == l[i0].what, true)
+
+test "r6_sql_exec_returning_sqlite_only"
+    require db(":memory:")
+    db_open(":memory:", "memory")
+    sql_exec("CREATE TABLE v629_bsl (a TEXT, b TEXT)")
+    sql_exec("INSERT INTO v629_bsl VALUES ('a\\', 'returning')")
+    let ok be false
+    try
+        sql_exec("INSERT INTO v629_bsl VALUES ('a\\', 'x') RETURNING a")
+    recover e
+        set ok to true
+        assert(contains(e, "nothing was executed"))
+    assert(ok)
+    let rows be sql("SELECT a, b FROM v629_bsl")
+    assert_eq(rows[0].a, "a\\")
+    assert_eq(rows[0].b, "returning")
+
+test "r7_sql_batch_returning_writes_nothing"
+    require db(":memory:")
+    db_open(":memory:", "memory")
+    sql_exec("CREATE TABLE v629_batch (id INTEGER PRIMARY KEY, n TEXT)")
+    let ok be false
+    try
+        sql_batch("INSERT INTO v629_batch (n) VALUES (?) RETURNING id", [["a"], ["b"]])
+    recover e
+        set ok to true
+        assert(contains(e, "sql_batch: this statement returns rows (RETURNING)"))
+        assert(contains(e, "nothing was executed"))
+    assert(ok)
+    assert_eq(text(sql("SELECT count(*) AS c FROM v629_batch")), "[{c: 0}]")
+    assert_eq(text(sql_batch("INSERT INTO v629_batch (n) VALUES (?)", [["returning"], ["b"]])), "{rows_affected: 2}")

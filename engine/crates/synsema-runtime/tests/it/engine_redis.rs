@@ -29,41 +29,8 @@ fn redis_url() -> Option<String> {
 /// `db_open("redis://…")` sin `require db` → violación con el scope canónico (sin
 /// credenciales/puerto/query). Tampoco se auto-otorga en run. Gotcha del db-index: con `/0` el
 /// scope trae el db (`redis://localhost/0`).
-#[test]
-fn redis_db_open_deny_without_require() {
-    let r = run_source("db_open(\"redis://user:pw@localhost:6379/0\")", "<t>");
-    assert!(!r.success);
-    assert_eq!(
-        r.errors,
-        vec!["Runtime error: Capability not granted: db(\"redis://localhost/0\") — this is a permission, not a bug: add `require db(\"redis://localhost/0\")` to the program's preamble (or to the importing file, when this code runs in a module)".to_string()]
-    );
-}
-
 /// Gotcha del db-index: SIN `/N` el scope NO trae db (`redis://localhost`), distinto de `/0`.
-#[test]
-fn redis_db_open_scope_without_db_index() {
-    let r = run_source("db_open(\"redis://localhost:6379\")", "<t>");
-    assert!(!r.success);
-    assert_eq!(
-        r.errors,
-        vec!["Runtime error: Capability not granted: db(\"redis://localhost\") — this is a permission, not a bug: add `require db(\"redis://localhost\")` to the program's preamble (or to the importing file, when this code runs in a module)".to_string()]
-    );
-}
-
 /// El scope URL es fiel: una grant a un db-index no cubre otro.
-#[test]
-fn redis_scope_mismatch_deny() {
-    let r = run_source(
-        "require db(\"redis://localhost/0\")\ndb_open(\"redis://localhost:6379/1\")",
-        "<t>",
-    );
-    assert!(!r.success);
-    assert_eq!(
-        r.errors,
-        vec!["Runtime error: Capability not granted: db(\"redis://localhost/1\") — this is a permission, not a bug: add `require db(\"redis://localhost/1\")` to the program's preamble (or to the importing file, when this code runs in a module)".to_string()]
-    );
-}
-
 /// Con el grant adecuado el gate pasa y se rutea a Redis; el puerto muerto da un error de RED —
 /// no de capability — → prueba "pasó el gate + ruteo a Redis" sin un servidor real.
 #[test]
@@ -79,50 +46,9 @@ fn redis_gate_passes_routing_to_redis() {
 
 /// `sandbox` despoja la capability `db`: un `db_open` adentro queda denegado (el gate falla antes
 /// de conectar → sin servidor).
-#[test]
-fn redis_sandbox_strips_db() {
-    let r = run_source(
-        "require db(\"redis://localhost/0\")\nsandbox\n    db_open(\"redis://localhost:6379/0\")",
-        "<t>",
-    );
-    assert!(!r.success, "el sandbox debería denegar db");
-    assert!(
-        r.errors.iter().any(|e| e.contains("Capability not granted")),
-        "debe ser violación de capability: {:?}",
-        r.errors
-    );
-}
-
 /// `json_encode`/`json_decode` (compañeros de la API de DB para datos estructurados — builtins
 /// generales, sin servidor): round-trip de un map anidado.
-#[test]
-fn json_encode_decode_roundtrip() {
-    let r = run_source(
-        "let m be json_decode(json_encode({\"a\": 1, \"b\": [2, 3], \"c\": \"x\"}))\n\
-         print(text(m[\"a\"]))\n\
-         print(text(length(m[\"b\"])))\n\
-         print(m[\"c\"])\n",
-        "<t>",
-    );
-    assert!(r.success, "{:?}", r.errors);
-    assert_eq!(
-        r.output,
-        vec!["1", "2", "x"].into_iter().map(String::from).collect::<Vec<_>>()
-    );
-}
-
 /// `json_decode` de un JSON inválido → error claro.
-#[test]
-fn json_decode_invalid_errors() {
-    let r = run_source("let x be json_decode(\"{not json\")\n", "<t>");
-    assert!(!r.success, "json_decode de JSON inválido debe fallar");
-    assert!(
-        r.errors.iter().any(|e| e.contains("json_decode") && e.contains("invalid")),
-        "el error debe mencionar json_decode/invalid: {:?}",
-        r.errors
-    );
-}
-
 // =========================================================
 // KV / TTL / contadores / estructuras / lock / binario (requieren Redis real → #[ignore])
 // =========================================================

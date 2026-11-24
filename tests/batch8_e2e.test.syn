@@ -1,0 +1,81 @@
+-- Gemelo de batch8_e2e.rs (v0.6.68, migas §4): dataviz de negocio por valores del
+-- lenguaje. G2: mismos datos vía literal / csv_parse / sql (SQLite :memory:) → MISMO SVG.
+-- G9: los builtins puros (csv_parse/median/percentile/chart_svg) funcionan DENTRO de
+-- `sandbox`; sql adentro sigue denegado ("Capability not granted"). G8: un secret jamás
+-- se filtra por csv_encode ni por chart_svg (etiquetas y eje).
+-- QUEDAN en Rust: chart_svg_available_in_synsema_test_mode (es el runner mismo, corrido
+-- desde Rust), chart_errors_recoverable (fija la lista LITERAL completa de kinds; fuera
+-- de los candidatos del TSV — los needles de errores de kinds nuevos viven en el gemelo
+-- tests/batch10_e2e.test.syn), dogfood_pipeline_via_synsema_test y
+-- chart_negotiated_three_ways_and_server_survives_errors (serve/sockets reales del host).
+-- Correr con: synsema test tests/batch8_e2e.test.syn
+
+test "chart_svg_available_in_run_mode"
+    let svg be chart_svg("bar", {"ene": 10, "feb": 25})
+    assert(contains(svg, "<svg"))
+    assert(contains(svg, "viewBox"))
+
+test "same_svg_from_literal_csv_and_sql"
+    require db(":memory:")
+    db_open(":memory:", "memory")
+    sql_exec("CREATE TABLE ventas (mes TEXT, total REAL)")
+    sql_exec("INSERT INTO ventas VALUES ('ene', 10.5), ('feb', 25.0)")
+    let de_sql be sql("SELECT mes, total FROM ventas ORDER BY mes")
+    let literal be [{"mes": "ene", "total": 10.5}, {"mes": "feb", "total": 25.0}]
+    let de_csv be csv_parse("mes,total\nene,10.5\nfeb,25.0\n", {"numbers": true})
+    let opts be {"x": "mes", "y": "total", "title": "Ventas"}
+    let s1 be chart_svg("bar", literal, opts)
+    let s2 be chart_svg("bar", de_csv, opts)
+    let s3 be chart_svg("bar", de_sql, opts)
+    -- el chart no debe saber de dónde vienen los datos
+    assert(s1 == s2)
+    assert(s2 == s3)
+    assert(contains(s1, "<svg"))
+
+test "pure_builtins_work_inside_sandbox"
+    let med be 0
+    let p95 be 0
+    let svg be ""
+    let filas be []
+    sandbox
+        set filas to csv_parse("v\n1\n2\n3\n4\n", {"numbers": true})
+        set med to median([1, 2, 3, 4])
+        set p95 to percentile([1, 2, 3, 4], 95)
+        set svg to chart_svg("bar", [1, 2])
+    assert_eq(med, 2.5)
+    assert_eq(length(filas), 4)
+    assert(contains(svg, "<svg"))
+    assert(p95 > 3)
+
+test "sandbox_still_denies_capabilities"
+    -- El sandbox no se abrió de más: sql adentro sigue denegado aunque el programa
+    -- tenga la capability afuera.
+    require db(":memory:")
+    db_open(":memory:", "memory")
+    let denied be false
+    try
+        sandbox
+            let x be sql("SELECT 1")
+    recover e
+        set denied to true
+        assert(contains(e, "Capability not granted"))
+    assert(denied)
+
+test "secret_never_leaks_in_csv_or_chart"
+    let s be as_secret("hunter2", "API_KEY")
+    let enc be ""
+    try
+        set enc to csv_encode([{"k": s, "v": "x"}])
+    recover err
+        set enc to err
+    assert(contains(enc, "secret(API_KEY)"))
+    assert(not contains(enc, "hunter2"))
+    let svg be chart_svg("bar", [{"k": s, "v": 1}], {"x": "k", "y": "v"})
+    assert(not contains(svg, "hunter2"))
+    let msg be ""
+    try
+        chart_svg("bar", [{"k": "a", "v": s}], {"x": "k", "y": "v"})
+    recover err
+        set msg to err
+    assert(contains(msg, "secret"))
+    assert(not contains(msg, "hunter2"))

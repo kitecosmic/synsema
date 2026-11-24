@@ -1,0 +1,185 @@
+-- Gemelo de v0659_transactions.rs (v0.6.68): las transacciones del lenguaje (`sql_transaction`)
+-- afirmadas por VALOR y por el cuerpo exacto de los errores capturables con try/recover.
+-- QUEDA en Rust (el .rs tiene 9 tests; migran 7):
+--   a_routes_write_survives_another_routes_rollback: serve real en un socket con dos rutas
+--     concurrentes y esperas de pared (700 ms) entre pedidos.
+--   waiting_for_another_routes_transaction_has_a_limit: serve real y la espera de 5 s medida
+--     con el reloj (Instant).
+-- La conexión ":memory:" es una sola para toda la corrida del archivo: el bloque sin conexión va
+-- PRIMERO (antes del primer db_open) y cada bloque usa su propia tabla (v659_*) y sus propias
+-- tasks add_*/everyone_*. Los grants (`require db`) viven toda la corrida.
+-- Correr con: synsema test tests/v0659_transactions.test.syn
+
+require db(":memory:")
+
+task expect_error(f, needle)
+    let ok be false
+    try
+        f()
+    recover e
+        set ok to true
+        assert(contains(e, needle))
+    assert(ok)
+
+task expect_two(f, n1, n2)
+    let ok be false
+    try
+        f()
+    recover e
+        set ok to true
+        assert(contains(e, n1))
+        assert(contains(e, n2))
+    assert(ok)
+
+test "a_transaction_without_a_connection_says_so"
+    expect_error(() => sql_transaction(() => 1), "No database connection")
+
+test "a_transaction_commits_when_its_task_returns_and_rolls_back_when_it_fails"
+    db_open(":memory:", "memory")
+    sql_exec("CREATE TABLE v659_tx (who TEXT)")
+    task add_a(who)
+        sql_exec("INSERT INTO v659_tx VALUES (?)", [who])
+        give who
+    assert_eq(sql_transaction(() => add_a("a")), "a")
+    task fails()
+        add_a("x")
+        raise("boom")
+    let ok be false
+    try
+        sql_transaction(fails)
+    recover e
+        set ok to true
+        assert_eq(e, "boom")
+    assert(ok)
+    task everyone_a()
+        give "[" + join(collect(sql("SELECT who FROM v659_tx ORDER BY rowid"), "who"), ",") + "]"
+    assert_eq(everyone_a(), "[a]")
+
+test "a_transaction_inside_another_is_a_savepoint"
+    db_open(":memory:", "memory")
+    sql_exec("CREATE TABLE v659_save (who TEXT)")
+    task add_b(who)
+        sql_exec("INSERT INTO v659_save VALUES (?)", [who])
+        give who
+    task inner_fails()
+        add_b("b")
+        raise("inner")
+    task outer()
+        add_b("a")
+        try
+            sql_transaction(inner_fails)
+        recover e
+            add_b("after " + e)
+        give sql_transaction(() => add_b("c"))
+    assert_eq(sql_transaction(outer), "c")
+    task everyone_b()
+        give "[" + join(collect(sql("SELECT who FROM v659_save ORDER BY rowid"), "who"), ",") + "]"
+    assert_eq(everyone_b(), "[a,after inner,c]")
+
+test "an_outer_failure_undoes_the_inner_transaction_too"
+    db_open(":memory:", "memory")
+    sql_exec("CREATE TABLE v659_outer (who TEXT)")
+    task add_c(who)
+        sql_exec("INSERT INTO v659_outer VALUES (?)", [who])
+        give who
+    task outer_deep()
+        sql_transaction(() => add_c("inner"))
+        raise("outer")
+    let ok be false
+    try
+        sql_transaction(outer_deep)
+    recover e
+        set ok to true
+        assert_eq(e, "outer")
+    assert(ok)
+    task everyone_c()
+        give "[" + join(collect(sql("SELECT who FROM v659_outer ORDER BY rowid"), "who"), ",") + "]"
+    assert_eq(everyone_c(), "[]")
+
+test "a_statement_that_fails_inside_fails_the_transaction"
+    db_open(":memory:", "memory")
+    sql_exec("CREATE TABLE v659_stmt (who TEXT)")
+    task add_d(who)
+        sql_exec("INSERT INTO v659_stmt VALUES (?)", [who])
+        give who
+    let caught_stmt be false
+    let inner_err be ""
+    task sloppy()
+        add_d("a")
+        try
+            sql_exec("INSERT INTO no_such_table VALUES (1)")
+        recover e
+            set caught_stmt to true
+        try
+            add_d("b")
+        recover e
+            set inner_err to e
+        give "done"
+    let ok be false
+    let tx_err be ""
+    try
+        sql_transaction(sloppy)
+    recover e
+        set ok to true
+        set tx_err to e
+    assert(ok)
+    assert(caught_stmt)
+    assert(contains(tx_err, "sql_transaction: a statement failed inside this transaction"))
+    assert(contains(tx_err, "no_such_table"))
+    assert_eq(inner_err, tx_err)
+    task everyone_d()
+        give "[" + join(collect(sql("SELECT who FROM v659_stmt ORDER BY rowid"), "who"), ",") + "]"
+    assert_eq(everyone_d(), "[]")
+
+test "hand_made_transaction_control_is_an_error_under_run"
+    db_open(":memory:", "memory")
+    sql_exec("CREATE TABLE v659_hand (who TEXT)")
+    task add_e(who)
+        sql_exec("INSERT INTO v659_hand VALUES (?)", [who])
+        give who
+    each stmt in ["BEGIN", "commit", "ROLLBACK", "SAVEPOINT a", "  -- nota\n begin immediate", "/* x */ END"]
+        expect_two(() => sql_exec(stmt), "BEGIN, COMMIT, ROLLBACK and SAVEPOINT are not run by hand", "sql_transaction(task)")
+    expect_error(() => sql("BEGIN"), "BEGIN, COMMIT, ROLLBACK and SAVEPOINT are not run by hand")
+    expect_error(() => sql_batch("COMMIT", [[]]), "BEGIN, COMMIT, ROLLBACK and SAVEPOINT are not run by hand")
+    let hand_err be ""
+    task by_hand_inside()
+        add_e("in")
+        try
+            sql_exec("COMMIT")
+        recover e
+            set hand_err to e
+        give "ok"
+    assert_eq(sql_transaction(by_hand_inside), "ok")
+    assert(contains(hand_err, "BEGIN, COMMIT, ROLLBACK and SAVEPOINT are not run by hand"))
+    add_e("out")
+    task everyone_e()
+        give "[" + join(collect(sql("SELECT who FROM v659_hand ORDER BY rowid"), "who"), ",") + "]"
+    assert_eq(everyone_e(), "[in,out]")
+
+test "a_bad_argument_writes_nothing_and_leaves_the_connection_free"
+    db_open(":memory:", "memory")
+    sql_exec("CREATE TABLE v659_arg (who TEXT)")
+    task add(who)
+        sql_exec("INSERT INTO v659_arg VALUES (?)", [who])
+        give who
+    expect_error(() => sql_transaction(5), "sql_transaction expects a task with no parameters")
+    let err_add be ""
+    try
+        sql_transaction(add)
+    recover e
+        set err_add to e
+    assert_eq(err_add, "sql_transaction calls its task with no arguments, and task 'add' needs 'who' — pass the values in a lambda: sql_transaction(() => my_task(a, b))")
+    let err_lambda be ""
+    try
+        sql_transaction((who) => add(who))
+    recover e
+        set err_lambda to e
+    assert(contains(err_lambda, "sql_transaction calls its task with no arguments, and this lambda needs 'who'"))
+    task everyone()
+        give "[" + join(collect(sql("SELECT who FROM v659_arg ORDER BY rowid"), "who"), ",") + "]"
+    assert_eq(everyone(), "[]")
+    task with_default(who = "d")
+        give add(who)
+    assert_eq(sql_transaction(with_default), "d")
+    add("z")
+    assert_eq(everyone(), "[d,z]")

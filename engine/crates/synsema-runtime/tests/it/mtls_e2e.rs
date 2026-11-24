@@ -36,26 +36,6 @@ fn syn_path(p: &std::path::Path) -> String {
 }
 
 #[test]
-fn mtls_identity_requires_file_read_capability() {
-    let (cert_pem, key_pem) = make_client_pair();
-    let (cert, key) = write_pems("gate", &cert_pem, &key_pem);
-    // Sin `require file.read(...)` de los PEM → denegado, con el fix en el mensaje.
-    let prog = format!(
-        "let ok be mtls_identity(\"{}\", \"{}\")\nprint(ok)\n",
-        syn_path(&cert),
-        syn_path(&key)
-    );
-    let res = run_source(&prog, "mtls_gate.syn");
-    assert!(!res.success, "sin file.read debe denegarse");
-    let errs = res.errors.join("\n");
-    assert!(
-        errs.contains("file") && errs.contains("read"),
-        "el error nombra la capability: {}",
-        errs
-    );
-}
-
-#[test]
 fn mtls_identity_accepts_a_valid_pair() {
     let (cert_pem, key_pem) = make_client_pair();
     let (cert, key) = write_pems("ok", &cert_pem, &key_pem);
@@ -75,29 +55,3 @@ fn mtls_identity_accepts_a_valid_pair() {
     );
 }
 
-#[test]
-fn mtls_identity_reports_bad_pem_clearly() {
-    let dir = std::env::temp_dir().join("syn_mtls_bad");
-    std::fs::create_dir_all(&dir).unwrap();
-    let bad = dir.join("no-es-pem.txt");
-    std::fs::write(&bad, b"esto no es un PEM secreto").unwrap();
-    let prog = format!(
-        "require file.read(\"{d}/*\")\nlet ok be mtls_identity(\"{p}\", \"{p}\")\n",
-        d = syn_path(&dir),
-        p = syn_path(&bad)
-    );
-    let res = run_source(&prog, "mtls_bad.syn");
-    assert!(!res.success, "un PEM inválido debe fallar");
-    let errs = res.errors.join("\n");
-    assert!(
-        errs.contains("certificate") || errs.contains("PEM"),
-        "el error describe el problema: {}",
-        errs
-    );
-    // Y el contenido del archivo NUNCA aparece en el mensaje (podría ser la clave).
-    assert!(
-        !errs.contains("esto no es un PEM secreto"),
-        "el error no ecoa el archivo: {}",
-        errs
-    );
-}

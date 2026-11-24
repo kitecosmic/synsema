@@ -1,0 +1,40 @@
+-- Gemelo de v0646_tanda_e.rs (runtime) (v0.6.68, tanda 2): D8 — un secret anidado no sale por los
+-- encoders de texto; el error nombra el secret (secret(K)) y nunca filtra el material.
+-- Quedan en Rust del lote:
+--   e1_require_for_grammar: los cuatro errores son de CARGA (require mal formado); un .test.syn
+--     entero tiene que cargar, no hay try/recover para el load.
+--   d4_unknown_require_is_a_load_error_with_a_suggestion: error de carga (`unknown capability`,
+--     con sugerencia y lista Known:) — el twin no puede cargar un programa que no carga.
+-- (steps/declassified/e1*/e3*/e4* no son candidatos: diagnóstico de etiquetas con detalle al
+-- programa, stdin/servidores reales y techos de capability del host.)
+-- Correr con: synsema test tests/v0646_tanda_e.test.syn
+
+task expect_error(f, needle)
+    let ok be false
+    try
+        f()
+    recover e
+        set ok to true
+        assert(contains(e, needle))
+    assert(ok)
+
+test "d8_json_and_csv_encode_of_a_secret_are_errors"
+    require secret("K")
+    let cases be [
+        {"who": "json_encode", "f": () => json_encode(secret("K", "abc"))},
+        {"who": "json_encode", "f": () => json_encode({"a": [secret("K", "abc")]})},
+        {"who": "jsonl_encode", "f": () => jsonl_encode([{"a": secret("K", "abc")}])},
+        {"who": "json_for_script", "f": () => json_for_script({"a": secret("K", "abc")})},
+        {"who": "csv_encode", "f": () => csv_encode([{"a": secret("K", "abc")}])}
+    ]
+    each c in cases
+        let ok be false
+        try
+            c["f"]()
+        recover e
+            set ok to true
+            assert(contains(e, c["who"]))
+            assert(contains(e, "secret(K)"))
+            -- el error nunca filtra el material
+            assert(not contains(e, "abc"))
+        assert(ok)
