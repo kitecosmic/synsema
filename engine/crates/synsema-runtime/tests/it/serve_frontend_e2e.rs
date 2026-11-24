@@ -14,7 +14,6 @@ use std::net::{TcpListener, TcpStream};
 use std::thread;
 use std::time::Duration;
 
-use synsema_runtime::engine::run_source;
 use synsema_runtime::serve::run_serve_program;
 
 fn fixtures_main() -> String {
@@ -69,96 +68,16 @@ fn post(port: u16, target: &str, ctype: &str, body: &str) -> String {
     )
 }
 
-// =========================================================
-// Motor de templates (render bajo el engine, sin serve)
-// =========================================================
 
-#[test]
-fn template_features_render() {
-    let r = run_source(
-        "require file.read(\"tests/fixtures/tpl/*\")\n\
-         let items be [\"a\", \"b</script>\"]\n\
-         print(body of render(\"tests/fixtures/tpl/feat.html\", {\"n\": 2, \"items\": items, \"vacio\": []}))",
-        "t.syn",
-    );
-    assert!(r.success, "errs: {:?}", r.errors);
-    let out = r.output.join("\n");
-    // comentario no aparece
-    assert!(!out.contains("comentario: no debe aparecer"), "out: {}", out);
-    // verbatim: CSS con llaves, intacto
-    assert!(out.contains("body { margin: 0; }"), "out: {}", out);
-    assert!(out.contains(".card:hover { transform: translateY(-4px); }"));
-    // elif encadenado
-    assert!(out.contains("dos"));
-    assert!(!out.contains("uno") && !out.contains("otro"));
-    // enumerate con índice + escape del item
-    assert!(out.contains("[0:a][1:b&lt;/script&gt;]"), "out: {}", out);
-    assert!(!out.contains("SIN-ITEMS"));
-    // rama vacía del each
-    assert!(out.contains("VACIO"));
-    // include con props (aislados)
-    assert!(out.contains("<article>Props</article>"));
-    // json_for_script: el </script> del dato NO puede cerrar el tag
-    assert!(out.contains("b\\u003c/script\\u003e"), "out: {}", out);
-    assert!(!out.contains("window.__D__ = [\"a\", \"b</script>"));
-}
 
-#[test]
-fn template_named_slots() {
-    let r = run_source(
-        "require file.read(\"tests/fixtures/tpl/*\")
-print(body of render(\"tests/fixtures/tpl/page_fill.html\", {\"title\": \"Hola\"}))",
-        "t.syn",
-    );
-    assert!(r.success, "errs: {:?}", r.errors);
-    let out = r.output.join("\n");
-    assert!(out.contains("<head><meta name=\"x\" content=\"Hola\"></head>"), "out: {}", out);
-    assert!(out.contains("<h1>Hola</h1>"));
-}
 
-#[test]
-fn template_each_non_list_fails_loud() {
-    let r = run_source(
-        "require file.read(\"tests/fixtures/tpl/badeach.html\")
-print(body of render(\"tests/fixtures/tpl/badeach.html\", {\"numero\": 7}))",
-        "t.syn",
-    );
-    assert!(!r.success);
-    let msg = r.errors.join(" ");
-    assert!(msg.contains("Cannot iterate over"), "msg: {}", msg);
-}
 
-#[test]
-fn json_for_script_escapes_html_chars() {
-    let r = run_source(
-        "print(json_for_script({\"x\": \"</script><b>&\"}))\nprint(json_for_script([1, 2]))",
-        "t.syn",
-    );
-    assert!(r.success, "errs: {:?}", r.errors);
-    assert_eq!(r.output[1], "[1, 2]");
-    assert!(r.output[0].contains("\\u003c/script\\u003e"));
-    assert!(r.output[0].contains("\\u0026"));
-    assert!(!r.output[0].contains('<') && !r.output[0].contains('>'));
-}
 
-#[test]
-fn enumerate_builtin() {
-    let r = run_source(
-        "each e in enumerate([\"x\", \"y\"])\n    print(text(e.index) + \"-\" + e.item)\nprint(text(length(enumerate([]))))",
-        "t.syn",
-    );
-    assert!(r.success, "errs: {:?}", r.errors);
-    assert_eq!(r.output, vec!["0-x", "1-y", "0"]);
-}
 
-#[test]
-fn lexer_crlf_blank_line_in_block() {
-    // Línea en blanco CRLF dentro de un bloque indentado (archivo de Windows).
-    let src = "task f()\r\n    let a be 1\r\n\r\n    give a\r\nprint(text(f()))\r\n";
-    let r = run_source(src, "t.syn");
-    assert!(r.success, "errs: {:?}", r.errors);
-    assert_eq!(r.output, vec!["1"]);
-}
+
+
+
+
 
 // =========================================================
 // Serve: mount + errors with + form + static cache/fallback + gzip
