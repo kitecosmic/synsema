@@ -58,6 +58,7 @@ test "decode_of_secret_errors"
 
 test "file_roundtrip_all_256_values"
     -- Round-trip byte-idéntico de los 256 valores (0x00..0xFF), vía bytes(range(256)).
+    assert(not file_exists("tests/_syn_bytes_roundtrip.tmp"))
     let data be bytes(range(256))
     write_file("tests/_syn_bytes_roundtrip.tmp", data)
     let back be read_file_bytes("tests/_syn_bytes_roundtrip.tmp")
