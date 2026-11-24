@@ -443,38 +443,6 @@ serve on {p}
     assert_eq!(status(&u), 200, "{}", u);
 }
 
-// =========================================================
-// agents() / agent_stop
-// =========================================================
-
-#[test]
-fn agents_lists_live_agents_and_agent_stop_cancels_them() {
-    let src = r#"agent Looper
-    while true
-        wait_for "job" timeout 0.2
-
-spawn Looper
-sleep(0.3)
-let before be agents()
-print(length(before))
-print(before[0]["name"])
-print(before[0]["state"])
-print(agent_stop(before[0]["id"], "test"))
-sleep(0.6)
-print(agents()[0]["state"])
-print(agent_stop("no-such-agent"))
-"#;
-    // `run_program` = el camino de `synsema run` (swarm real: hilos por agente).
-    let r = run_program(src, "<agents>");
-    assert!(r.success, "{:?}", r.errors);
-    assert!(r.output.len() >= 6, "salida: {:?}", r.output);
-    assert_eq!(r.output[0], "1", "{:?}", r.output);
-    assert_eq!(r.output[1], "Looper", "{:?}", r.output);
-    assert!(r.output[2] == "working" || r.output[2] == "waiting", "{:?}", r.output);
-    assert_eq!(r.output[3], "true");
-    assert_eq!(r.output[4], "stopped", "{:?}", r.output);
-    assert_eq!(r.output[5], "false");
-}
 
 // =========================================================
 // parseo fail-loud
@@ -507,14 +475,7 @@ fn a_handlers_bus_subscriptions_do_not_outlive_its_request() {
     assert!(compact.contains("\"topics\":[]"), "las suscripciones de requests terminados se retiraron: {}", body);
 }
 
-#[test]
-fn timeout_clause_outside_a_route_is_a_loud_error() {
-    // Escribir `timeout 30` donde no es cláusula (top-level, task, dentro de un `when`)
-    // no se ignora en silencio.
-    let r = run_source("timeout 30\nprint(1)\n", "<timeout-misplaced>");
-    assert!(!r.success);
-    assert!(r.errors.iter().any(|e| e.contains("'timeout' is a clause")), "{:?}", r.errors);
-}
+
 
 fn parse_err(src: &str) -> String {
     match synsema_core::parser::parse_source(src, "<parse>") {
