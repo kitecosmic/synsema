@@ -1,0 +1,11 @@
+-- Public hash grouping across value types.
+
+test "public_hash_obeys_grouping"
+    assert(hash(true) == hash(1))
+    assert(hash(1) == hash(1.0))
+    assert(hash(1d) == hash(1))
+    assert(hash(-0.0) == hash(0))
+    assert(hash({"b": 2, "a": 1}) == hash({"a": 1, "b": 2}))
+    assert(hash("x") >= 0)
+    assert(hash("x") % 8 >= 0)
+    assert(hash("") == 17544574437371136113)

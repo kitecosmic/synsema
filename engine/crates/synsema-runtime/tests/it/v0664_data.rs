@@ -81,8 +81,3 @@ print(lineage()[0].source)
     assert_eq!(out[3], "parquet_info_file");
     std::fs::remove_file(file).unwrap();
 }
-
-#[test]
-fn public_hash_obeys_grouping() {
-    assert_eq!(output("print(hash(true) == hash(1), hash(1) == hash(1.0), hash(1d) == hash(1), hash(-0.0) == hash(0))\nprint(hash({\"b\": 2, \"a\": 1}) == hash({\"a\": 1, \"b\": 2}))\nprint(hash(\"x\") >= 0, hash(\"x\") % 8 >= 0)\nprint(hash(\"\") == 17544574437371136113)"), ["true true true true", "true", "true true", "true"]);
-}
