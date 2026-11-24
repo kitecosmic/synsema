@@ -46,8 +46,6 @@ fn fast(label: &str, limit: Duration, src: &str) {
     assert!(e < limit, "{} tardó {:?} (límite {:?}): ¿volvió a ser cuadrático?", label, e, limit);
 }
 
-// B1 — un hueco `{x}` de un template pega el texto de cualquier valor; `+` sigue estricto.
-
 
 // B2 — el estado de un módulo es uno: lo que escribe un task se ve por el campo y al revés,
 // y una foto (`let s be m.STATE`) es un valor.
@@ -94,10 +92,6 @@ fn b4_log_show_print_keep_order() {
     assert_eq!(out("log \"one\"\nprint(\"two\")\nshow \"three\"\nprint(\"four\")"), vec!["[LOG] one", "two", "three", "four"]);
 }
 
-// B5 — `set xs to append(xs, f())` lee `xs` antes de evaluar `f()`, como el camino normal.
-
-
-// B6 — JSON: enteros exactos de cualquier tamaño hasta 4300 dígitos, `1e400` es error.
 
 
 // B7 — el linaje no publica credenciales ni registra lecturas que no llegaron.
@@ -123,17 +117,8 @@ fn b8_evm_tx_raw_checks_what_is_signed() {
     assert!(fails(&format!("{}let t be tx\nset t[\"digest\"] to keccak256(bytes(\"x\", \"utf8\"))\nprint(evm_tx_raw(t, secp256k1_sign(t[\"digest\"], k)))", pre)).contains("\"digest\" does not match"));
 }
 
-// B9 — `lstsq` es el de numpy (SVD, norma mínima); `polyfit` sin datos suficientes es error.
 
 
-// B10 — lo que `==` iguala es un solo grupo (mapas en otro orden, el mismo instante en otra
-// zona, 1 y 1.0); el texto "1" es otro. Los NaN, un grupo.
-
-
-// B11 — `rng(seed)` da la secuencia de `numpy.random.default_rng(seed)` (numpy 2.2.1).
-
-
-// B12 — el constructor de una variante cuenta sus campos con su propio mensaje.
 
 
 // Medios de datos: join por hash con todas las columnas, semi/anti/right; columnas mal
@@ -156,17 +141,7 @@ fn tables_no_silent_loss() {
     fast("join", Duration::from_secs(20), "let a be apply(range(0, 20000), (i) => {\"id\": i, \"x\": i})\nlet b be apply(range(0, 20000), (i) => {\"id\": i, \"y\": i})\nprint(length(join(a, b, \"id\")))");
 }
 
-// Fechas: un día sin medianoche empieza cuando empieza; la serie diaria es de calendario;
-// truncar en la hora repetida conserva cuál de las dos es.
 
-
-// CSV: `""` es texto vacío, un campo vacío es `nothing`, y la ida y vuelta es exacta — salvo en
-// una tabla de UNA columna (ronda 6, B3): ahí `nothing` se escribe `""` para no escribir una línea
-// en blanco (que al leer se ignora siempre), y vuelve como texto vacío, o `nothing` si la columna
-// tiene tipo.
-
-
-// Números y conteos.
 
 
 // `set f(x)[k]` escribe a través de un valor, no de una variable: error.
@@ -225,10 +200,6 @@ fn r3_urls_with_odd_userinfo() {
     assert!(e.contains("the URL has no host") && !e.contains("hunter2"), "{}", e);
 }
 
-// `summarize` sobre filas desparejas: la columna existe en la tabla aunque falte en un grupo.
-
-
-// `join`: un `x_right` que ya existe es error; un outer con la izquierda vacía conserva la clave.
 
 
 // Generadores: cruzan a los workers (numpy `spawn` exacto) y el mismo generador en dos items
@@ -259,10 +230,6 @@ fn r3_parquet_expansion_cap() {
     );
 }
 
-// Fechas: un día con la medianoche repetida (Havana) no se parte en dos.
-
-
-// Decimales: var, std, quantile y percentile en decimal (como `statistics` de Python).
 
 
 // Linaje: un resultado con enteros > 2^53 se hashea como json_encode y lo dice.
@@ -279,8 +246,6 @@ fn r3_lineage_encoding_for_wide_ints() {
     assert_eq!(o, vec!["json true"]);
 }
 
-// `int`: el 2º posicional es el fallback; una base (2..36) ahí es error; `fallback =` por nombre.
-
 
 // Números: divmod de floats como CPython/numpy; literales con `_` sólo entre dígitos; `0o`.
 #[test]
@@ -294,8 +259,6 @@ fn r3_numbers_like_python() {
         assert!(!r.success, "{} tenía que ser error", lit);
     }
 }
-
-// JSON: `NaN`/`Infinity` (lo que escribe json_encode) se leen con allow_nan; un BOM al principio se ignora.
 
 
 // Menores: fmt con `{a.b}` y espacios, join y `+` estrictos, chunk entero, pistas.
@@ -379,16 +342,8 @@ print("\u00e9" == "é", length("a\x2eb"), length("\uD83D\uDE00"))"#);
     assert_eq!(o, vec![r"C:\build\x64\Release", r"x\u1y", "true 6 1"]);
 }
 
-// `fmt`: la clave exacta "a.b" gana; `{ x }` y `{obj.prop}` sin `obj` quedan literales.
 
 
-// Estadísticas exactas con decimales y enteros de cualquier tamaño.
-
-
-// JSON estricto: NaN/Infinity sólo con allow_nan.
-
-
-// `int(x, 10)` es error sea cual sea `x` (no depende del dato).
 
 
 // Un generador dentro de una LISTA global tampoco llega a un worker como copia.
@@ -419,10 +374,6 @@ print(k1 == k2)"#);
     assert!(e.contains("the same generator"), "{}", e);
 }
 
-// Decimal con float: `sort` y `join` son error en cualquier orden.
-
-
-// `add_days(t, 0)` en la hora repetida es `t`; `date_range` con "hour".
 
 
 // sql_exec: la palabra returning dentro de un texto no es RETURNING.
@@ -456,15 +407,7 @@ print(abi_decode_log(ev, {{"topics": [abi_event_topic(ev)], "data": "0x{}"}}))"#
     assert!(e.contains("at most 4 topics"), "{}", e);
 }
 
-// Ronda 5 — el decimal es de precisión arbitraria y de tipo estable: `+ - *` exactos a cualquier
-// tamaño (Java/Postgres), `/` con 28 cifras significativas sin truncar la parte entera
-// (Python/Postgres), y un decimal nunca pasa a float ni a entero en silencio.
 
-
-// `floor`/`ceil`/`round`/`trunc` de un decimal dan el entero exacto (antes lo devolvían igual).
-
-
-// Las estadísticas de decimales son SIEMPRE decimales: una varianza de 1e-30 no da 0 ni float.
 
 
 // Linaje: consultas y prompts como compromiso con sal (SD-JWT). La sal queda en `lineage()`, no en
@@ -490,8 +433,6 @@ print("query sha256-salted:" + slice(c, 2) == l[0].what)"#
     assert_eq!(o, vec!["true false jcs", "true"]);
 }
 
-// CSV: marcas de faltante, float fuera de rango, delimitador inválido, fórmulas y decimales largos.
-
 
 // Ronda 6 — B1: `--` dentro de `{`, `[` o `(` es un comentario salvo que todo apunte a restar un
 // negativo (`print(x --1)`): dígito o `(` después, un operando antes en la misma línea, y el
@@ -508,13 +449,6 @@ fn r6_comment_inside_brackets() {
     assert!(fails("print(5--1)").contains("right after a value"));
 }
 
-// Ronda 6 — B2: un hueco de `fmt` es un nombre (`letra|_` y después alfanuméricos), con `.` entre
-// nombres. Los cuantificadores de regex (`{3}`, `{3,5}`) y lo mal formado (`{a..b}`, `{a.}`) quedan
-// literales.
-
-
-// Ronda 6 — B3: una línea en blanco se ignora SIEMPRE al leer (Python `csv`, pandas), también en un
-// CSV de una columna; al escribir, una fila de un solo campo `nothing` se escribe `""`.
 
 
 // Ronda 6 — B4: el `what` del linaje (que el recibo firmado publica) sólo lleva una ruta que el
@@ -567,42 +501,11 @@ print(sql("SELECT a, b FROM t"))"#
     assert_eq!(o, vec!["true", r#"[{a: "a\\", b: "returning"}]"#]);
 }
 
-// Ronda 6 — M2: un especificador strftime inválido (`%Q`), o uno que pide lo que el valor no tiene
-// (`%H` de una fecha), es un error atrapable que lo nombra; antes chrono entraba en pánico.
 
 
-// Ronda 6 — M3: `1.5d == 1.5` es error, así que una clave (o una lista) que mezcla decimal y float
-// no puede separar `1.5d` de `1.5` en silencio: `group_by`, `count_by`, `summarize`, `unique`,
-// `mode`, `pivot` e `in` dan el mismo error que `==`. Sólo decimales o sólo floats funcionan; un
-// NaN no cuenta como float.
 
 
-// Ronda 6 — M4: `semi` y `anti` no emiten columnas de la derecha, así que no hay colisión de
-// nombres (`x_right`) que chequear.
 
-
-/// Lee un fixture de `tests/fixtures` con `parquet_read`; `Ok(salida)` o `Err(error)`.
-fn read_parquet_fixture(name: &str) -> Result<Vec<String>, String> {
-    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures").join(name);
-    let dir = fixture.parent().unwrap().to_string_lossy().replace('\\', "/");
-    let r = run_program(
-        &format!("require file.read(\"{dir}/*\")\nprint(parquet_read(read_file_bytes(\"{dir}/{name}\")))"),
-        "audit.syn",
-    );
-    if r.success { Ok(r.output) } else { Err(r.errors.join("\n")) }
-}
-
-// Ronda 6 — M5: un entero más allá de 2^53 en una columna que mezcla enteros y floats (se escribe
-// DOUBLE) es error con la columna y la fila; antes se redondeaba sin aviso.
-
-
-// Ronda 6 — M5: dos columnas con el mismo nombre (fixture del auditor, ronda 4) son
-// un error con el nombre; antes una se perdía sin aviso.
-
-
-// Ronda 6 — M5: sin `synsema.timezones`, la zona sale del esquema Arrow (`ARROW:schema`) que
-// escriben polars y pyarrow; un offset fijo (`+05:30`) se conserva (ronda 8) y una columna sin
-// zona es UTC.
 
 
 // Ronda 6 — m1: el aviso de `synsema check` para `each r in rows` + `set r[…]`. Avisa cuando lo
@@ -684,9 +587,6 @@ fn r7_comment_in_multiline_call() {
     assert!(fails("let x be 1\nprint(max(x --1, 2))").contains("`--` starts a comment"));
 }
 
-// Ronda 7 — R2: en `fmt`, un texto entre llaves que es EXACTAMENTE una clave del mapa se sustituye
-// siempre, tenga la forma que tenga; recién después vale la regla de forma de B2.
-
 
 // Ronda 7 — R3: el error decimal/float sale sólo en una comparación real. `in` compara elemento
 // por elemento (sin recorrer antes la lista); `unique`/`group_by`/… sólo cuando dos claves caen en el
@@ -718,10 +618,6 @@ print(length(join([{"k": 1.5}], [{"k": 2d}], "k", "left")))"#);
     assert!(fails("print(join([{\"k\": 1.5}], [{\"k\": 1.5d}], \"k\"))").contains("decimal on one side and float on the other"));
 }
 
-// Ronda 7 — R4: `sort`/`sort_by` dan el error decimal/float sólo si una comparación real junta un
-// decimal y un float en la misma posición; listas anidadas con los dos tipos en lugares distintos
-// ordenan.
-
 
 // Ronda 7 — R5: `require net(...)` con un puerto EXPLÍCITO concede sólo ese puerto; sin puerto,
 // el host entero (como en v0.6.28). IPv6 con puerto también.
@@ -747,14 +643,6 @@ fn r7_net_port_is_part_of_the_grant() {
     assert!(probe("[::1]", "http://[::1]:2/x").starts_with("allowed 0"));
 }
 
-// Ronda 7 — R6: `==` de listas y mapas compara elemento a elemento; un decimal contra un float en
-// la misma posición (o clave) da el mismo error que `1d == 1.0`; `in` también. `match` y
-// `contains` quedaron como estaban (sin error): los fija un unit test del core — ver Dudas.
-
-
-// Ronda 8 — una columna Parquet con zona de offset fijo en el esquema Arrow (`+05:30`, que escriben
-// pyarrow y pandas) se lee CON su offset, como en Arrow, pandas, Python y Temporal: el mismo instante
-// y la misma hora local, sin aviso. (polars no escribe offsets fijos: el fixture es del auditor.)
 
 
 // Ronda 7 — R8: una comilla sin cerrar en un CSV con fin de línea `\r` (o mezclado) se detecta y el
@@ -774,14 +662,6 @@ fn r7_csv_unclosed_quote_cr_lines() {
     assert_eq!(out(r#"print(csv_parse("a,b\r1,2\r\"x\ry\",3\r"))"#), vec![r#"[{a: "1", b: "2"}, {a: "x\ry", b: "3"}]"#]);
 }
 
-// Ronda 7 — R9: `date_range` con pasos de calendario en Pacific/Apia no repite el 31/12/2011 (el
-// 30/12 no existió): un paso que cae en el mismo instante que el anterior se saltea. `add_days`
-// solo queda como está.
-
-
-// Ronda 7 — R10: una columna Parquet `TIME` (hora del día) se lee como `duration` desde medianoche,
-// en nanosegundos (lo que escribe polars), microsegundos o milisegundos; Synsema no tiene un tipo
-// "hora del día". (Antes: ns → entero, ms/µs → texto.)
 
 
 // Ronda 7 — R11: `sql_batch` con RETURNING en SQLite se rechaza ANTES de ejecutar ninguna fila (el
@@ -874,10 +754,6 @@ fn r8_fixed_offset_is_kept() {
     assert!(fails("print(datetime(\"x\", \"+25:00\"))").contains("unknown time zone"));
 }
 
-// Ronda 8 — RFC 9557 con el criterio de Temporal: `[Zona]` sin offset es la hora LOCAL en esa zona
-// (antes se leía como UTC: 10:00[Asia/Kolkata] daba 15:30); un hueco de horario de verano es error;
-// un offset que no coincide con la zona es error.
-
 
 // Ronda 8 — `==` corta en la primera diferencia (una lista de 100k que difiere en [0] es O(1)) y
 // `match`/`contains`/`index_of` dan el mismo error decimal/float que `==` (antes: "distinto" en
@@ -921,6 +797,3 @@ fn r8_offsets_seconds_z_zone_and_long_durations() {
         vec!["P146097D 146097.0 2400-01-01"]
     );
 }
-
-// Ronda 8 — `csv_encode(…, {"missing": ""})` escribía líneas en blanco en una tabla de una columna
-// y la lectura las salteaba: se perdían filas. Una marca vacía es error.

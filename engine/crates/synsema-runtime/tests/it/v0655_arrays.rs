@@ -18,10 +18,6 @@ fn with_a(rest: &str) -> String {
     }
 }
 
-fn err_has(rest: &str, want: &str) {
-    let out = with_a(rest);
-    assert!(out.starts_with("ERR: ") && out.contains(want), "{}\n→ {}", rest, out);
-}
 
 
 

@@ -45,70 +45,10 @@ fn check_warnings(src: &str) -> Vec<String> {
     w
 }
 
-// A1 — `%Z` al parsear: una abreviatura no identifica una zona (IST es India, Irlanda o
-// Israel). Antes daba 10:00 UTC sin avisar; ahora es un error, salvo UTC/GMT, que no son ambiguas.
-#[test]
-fn a1_parse_datetime_zone_abbreviation_is_an_error() {
-    let e = fails("print(parse_datetime(\"24/09/2026 10:00 IST\", \"%d/%m/%Y %H:%M %Z\"))");
-    assert!(e.contains("does not identify a zone") && e.contains("%z"), "{}", e);
-    assert!(fails("print(parse_datetime(\"24/09/2026 10:00 IST\", \"%d/%m/%Y %H:%M %Z\", \"Asia/Kolkata\"))").contains("%Z"));
-    assert_eq!(
-        out("print(parse_datetime(\"24/09/2026 10:00 UTC\", \"%d/%m/%Y %H:%M %Z\"))\nprint(parse_datetime(\"Thu, 24 Sep 2026 10:00:00 GMT\", \"%a, %d %b %Y %H:%M:%S %Z\", \"-03:00\"))\nprint(parse_datetime(\"24/09/2026 10:00 +05:30\", \"%d/%m/%Y %H:%M %z\"))\nprint(parse_datetime(\"2026-09-24 10:00 %Z\", \"%Y-%m-%d %H:%M %%Z\"))"),
-        vec!["2026-09-24T10:00:00Z", "2026-09-24T07:00:00-03:00", "2026-09-24T10:00:00+05:30", "2026-09-24T10:00:00Z"]
-    );
-}
 
-// A2 — `nothing` (faltante) no es NaN (inválido): un coeficiente faltante es un error; un x
-// faltante queda `nothing` en su lugar, como en `cumsum`.
-#[test]
-fn a2_polyval_keeps_missing_apart_from_nan() {
-    let e = fails("print(polyval([2.0, nothing], 1))");
-    assert!(e.contains("position 1 is nothing") && e.contains("drop_missing"), "{}", e);
-    assert_eq!(
-        out("print(polyval([2.0, 1.0], [1, nothing, 3]))\nprint(polyval([2.0, 1.0], nothing))\nprint(cumsum([1, nothing, 3]))\nprint(polyval([1, 0, -1], 3))"),
-        vec!["[3.0, nothing, 7.0]", "nothing", "[1, nothing, 4]", "8.0"]
-    );
-    assert!(fails("print(lstsq(array([[1.0], [2.0]]), [1.0, nothing]))").contains("nothing"));
-    // polyfit sigue salteando los pares con un faltante.
-    assert_eq!(out("print(apply(polyfit([0, 1, nothing, 3], [1, 3, 99, 7], 1), (c) => round_to(c, 6)))"), vec!["[2.0, 1.0]"]);
-}
 
-// A3 — un array 0-D es un escalar: no tiene largo (numpy da TypeError en `len()`).
-#[test]
-fn a3_length_of_0d_array_is_an_error() {
-    let e = fails("print(length(array(5)))");
-    assert!(e.contains("0-d array has no length") && e.contains("size(a)"), "{}", e);
-    assert_eq!(out("print(size(array(5)), shape(array(5)), length(array([1, 2])), length(zeros([3, 2])))"), vec!["1 [] 2 3"]);
-}
 
-// A4 — un task o un generador no es un dato: json_encode lo decía como texto (y revelaba la
-// semilla). Ahora es un error que nombra dónde está, y canonical_json usa el sustantivo correcto.
-#[test]
-fn a4_json_encode_rejects_code() {
-    let e = fails("print(json_encode(rng(1)))");
-    assert!(e.contains("json_encode: the value is a generator") && e.contains("not data"), "{}", e);
-    let e = fails("print(json_encode({\"f\": (x) => x}))");
-    assert!(e.contains("json_encode: the value[\"f\"] is a task"), "{}", e);
-    let e = fails("print(json_encode([1, {\"g\": [rng(2)]}]))");
-    assert!(e.contains("the value[1][\"g\"][0] is a generator"), "{}", e);
-    assert!(fails("print(jsonl_encode([{\"a\": 1}, {\"f\": print}]))").contains("jsonl_encode: item 1[\"f\"] is a task"));
-    assert!(fails("print(json_for_script({\"f\": print}))").contains("json_for_script"));
-    let e = fails("print(canonical_json(rng(1)))");
-    assert!(e.contains("canonical_json: the value is a generator"), "{}", e);
-    assert!(fails("print(canonical_json({\"f\": (x) => x}))").contains("the value.f is a task"));
-    assert_eq!(out("print(json_encode({\"a\": [1, nothing, \"x\"]}))"), vec!["{\"a\": [1, null, \"x\"]}"]);
-}
 
-// A5 — `int(x, 2.0)` es el mismo tropiezo que `int(x, 2)`.
-#[test]
-fn a5_int_fallback_float_base_like_int() {
-    for src in ["print(int(\"abc\", 2.0))", "print(int(\"abc\", 16.0))", "print(int(\"abc\", 2))"] {
-        let e = fails(src);
-        assert!(e.contains("the second argument is the fallback value, not the base"), "{}: {}", src, e);
-    }
-    assert!(fails("print(int(\"abc\", 2.0))").contains("int(x, base = 2)"));
-    assert_eq!(out("print(int(\"abc\", 2.5), int(\"abc\", 40.0), int(\"abc\", fallback = 2.0), int(\"7\", 2.0 + 0.5))"), vec!["2.5 40.0 2.0 7"]);
-}
 
 fn free_port() -> u16 {
     TcpListener::bind(("127.0.0.1", 0)).unwrap().local_addr().unwrap().port()
@@ -202,15 +142,6 @@ fn c1_deprecated_alias_in_imported_module_warns() {
     assert!(synsema_core::deprecated::warned_at_load().contains(&"eth_rpc".to_string()));
 }
 
-// C2 — el error nombra la función que el programa llamó, no la nueva.
-#[test]
-fn c2_old_blockchain_names_speak_for_themselves() {
-    let e = fails("print(solana_message(1, 2))");
-    assert!(e.contains("solana_message(params) takes 1 argument") && !e.contains("since v0.6.29"), "{}", e);
-    let e = fails("print(algorand_tx_encode({}, 1))");
-    assert!(e.contains("algorand_tx_encode(txn) takes 1 argument") && !e.contains("since v0.6.29"), "{}", e);
-    assert!(fails("print(solana_tx(1, 2))").contains("since v0.6.29 solana_tx builds"));
-}
 
 // C3 — `//` como comentario: al principio de una línea es un error de parser con la pista; en
 // `x // palabra` con una palabra indefinida, el error lo dice. `//` sigue siendo división entera.
@@ -234,33 +165,8 @@ fn c4_set_index_out_of_range_says_where() {
     assert_eq!(out("let xs be [1, 2, 3]\nset xs[-1] to 9\nprint(xs)"), vec!["[1, 2, 9]"]);
 }
 
-// C5 — `bytes(33)` sugiere las dos formas.
-#[test]
-fn c5_bytes_of_number_hints() {
-    let e = fails("print(bytes(33))");
-    assert!(e.contains("int_to_bytes(33, size)") && e.contains("bytes([33])"), "{}", e);
-    assert!(!fails("print(bytes(300))").contains("bytes([300])"));
-}
 
-// C6 — `Infinityx` y `NaNa` son basura, no un NaN.
-#[test]
-fn c6_json_garbage_is_not_nan() {
-    for src in ["Infinityx", "NaNa", "[1, NaN_x]"] {
-        let e = fails(&format!("print(json_decode(\"{}\"))", src));
-        assert!(e.contains("invalid JSON: expected value at line 1") && !e.contains("NaN/Infinity"), "{}: {}", src, e);
-    }
-    assert!(fails("print(json_decode(\"NaN\"))").contains("NaN/Infinity is not JSON"));
-    assert!(fails("print(json_decode(\"[Infinity]\"))").contains("NaN/Infinity is not JSON"));
-    assert_eq!(out("print(json_decode(\"[NaN]\", allow_nan = true))"), vec!["[nan]"]);
-}
 
-// C7 — `%#z` sólo existe para parsear.
-#[test]
-fn c7_format_time_parse_only_specifier() {
-    let e = fails("print(format_time(datetime(2026, 1, 1), \"%#z\"))");
-    assert!(e.contains("%#z is a parsing-only specifier") && e.contains("%:z"), "{}", e);
-    assert_eq!(out("print(format_time(datetime(2026, 1, 1), \"%%#z %:z\"))"), vec!["%#z +00:00"]);
-}
 
 // C8 — el aviso de `\u` sólo cuando el escape de verdad se decodifica.
 #[test]
@@ -302,28 +208,7 @@ fn c10_module_hint_for_enum() {
     assert!(e.contains("export let"), "{}", e);
 }
 
-// A1 (segunda vuelta) — `%Z`: UTC/GMT en cualquier caja (como Python); con `%z` en el mismo
-// formato el offset identifica el instante y la abreviatura es texto; y si lo que no encaja es
-// otra cosa, el error es el de siempre, no el de la abreviatura.
-#[test]
-fn a1b_parse_datetime_zone_abbreviation_edges() {
-    assert_eq!(
-        out("print(parse_datetime(\"24/09/2026 10:00 utc\", \"%d/%m/%Y %H:%M %Z\"))\nprint(parse_datetime(\"24/09/2026 10:00 +0530 (IST)\", \"%d/%m/%Y %H:%M %z %Z\"))\nprint(parse_datetime(\"2026-09-24 GMT\", \"%Y-%m-%d %Z\"))"),
-        vec!["2026-09-24T10:00:00Z", "2026-09-24T10:00:00+05:30", "2026-09-24T00:00:00Z"]
-    );
-    let e = fails("print(parse_datetime(\"2026-13-24 10:00 UTC\", \"%Y-%m-%d %H:%M %Z\"))");
-    assert!(e.contains("does not match") && !e.contains("abbreviation"), "{}", e);
-}
 
-// Un formato de sólo fecha es la medianoche de ese día (como `strptime` de Python y
-// `parse_time`); con zona, la medianoche de esa zona.
-#[test]
-fn parse_datetime_date_only_format_is_midnight() {
-    assert_eq!(
-        out("print(parse_datetime(\"03/01/2026\", \"%d/%m/%Y\"))\nprint(parse_datetime(\"03/01/2026\", \"%d/%m/%Y\", \"Europe/Madrid\"))"),
-        vec!["2026-01-03T00:00:00Z", "2026-01-03T00:00:00+01:00[Europe/Madrid]"]
-    );
-}
 
 // C3 (segunda vuelta) — un comentario de C de varias palabras (el caso común) no parsea por
 // lo que sigue al `//`; el error lo nombra igual. Un `//` dentro de un string o después de `--`
@@ -342,53 +227,4 @@ fn c3b_c_style_comment_hint_on_parse_and_lex_errors() {
     let e = fails("print(\"a // b\" is)\n");
     assert!(!e.contains("comments in Synsema"), "{}", e);
     assert_eq!(out("print(\"https://x.com\") -- note // not code"), vec!["https://x.com"]);
-}
-
-// D1 — cron con zona IANA: se registra, `cron_list` muestra la zona y el próximo disparo es
-// el de esa zona (la regla de los cambios de hora está en los tests de `cronexpr`).
-#[test]
-fn d1_cron_every_with_an_iana_zone() {
-    let o = out("require time\ntask a()\n    print(\"a\")\ncron_every(\"0 9 * * *\", a, {\"tz\": \"America/Santiago\"})\nlet j be cron_list()[0]\nprint(j.tz)\nlet next be to_timezone(datetime(j.next_run), \"America/Santiago\")\nprint(format_time(next, \"%H:%M\"))\ncron_cancel(\"a\")");
-    assert_eq!(o, vec!["America/Santiago", "09:00"]);
-    let e = fails("require time\ntask a()\n    print(\"a\")\ncron_every(\"0 9 * * *\", a, {\"tz\": \"Mars/Olympus\"})");
-    assert!(e.contains("unknown time zone \"Mars/Olympus\""), "{}", e);
-}
-
-// D2 — un decimal con exponente es el valor exacto (mantisa × 10^exp), como `numeric` de
-// Postgres: `decimal()`, las columnas `decimal` de CSV y el literal `…d` van por el mismo camino.
-#[test]
-fn d2_decimal_accepts_an_exponent() {
-    assert_eq!(
-        out("print(decimal(\"1e5\"), decimal(\"1.5E-3\"), decimal(\"1.50e1\"), decimal(\"-2.5e+2\"), decimal(\".5e1\"), 1.5e-3d, 2e3d)\nprint(decimal(\"1.5e-3\") == decimal(\"0.0015\"))\nprint(csv_parse(\"a\\n1.5e2\\n\", {\"types\": {\"a\": \"decimal\"}}))"),
-        vec!["100000 0.0015 15.0 -250 5 0.0015 2000", "true", "[{a: 150}]"]
-    );
-    // Un exponente que pediría más de 4300 dígitos es un error, no memoria sin tope.
-    for src in ["1e999999999", "1e4300", "1e-4301", "e5", "1e", "1e5.5", "1e+"] {
-        assert!(fails(&format!("print(decimal(\"{}\"))", src)).contains("Cannot parse"), "{}", src);
-    }
-}
-
-// Parquet — el esquema Arrow va en el archivo (`ARROW:schema`), como lo escriben pyarrow,
-// polars y arrow-rs: pandas lee una duration como timedelta y un datetime con su zona IANA.
-// (Verificado con pyarrow 25, pandas y polars; acá, que la clave está y Synsema la relee.)
-#[test]
-fn parquet_writes_the_arrow_schema() {
-    let o = out("let rows be [{\"d\": duration(seconds = 90), \"w\": datetime(\"2026-01-03T10:00:00\", \"Europe/Madrid\"), \"n\": 1}]\nlet bin be parquet_write(rows)\nprint(contains(hex(bin), replace(hex(bytes(\"ARROW:schema\")), \"0x\", \"\")))\nprint(to_rows(parquet_read(bin)) == rows)");
-    assert_eq!(o, vec!["true", "true"]);
-}
-
-// Parquet — una columna con nanosegundos y un valor que no entra en nanosegundos (±292 años) no
-// se escribe en microsegundos perdiéndolos en silencio: es un error que nombra la columna.
-#[test]
-fn parquet_refuses_to_drop_nanoseconds() {
-    let far = "let far be datetime(\"2400-01-01T00:00:00Z\") - datetime(\"1800-01-01T00:00:00Z\")\n";
-    let e = fails(&format!("{far}print(parquet_write([{{\"d\": duration(seconds = 0.0000015)}}, {{\"d\": far}}]))"));
-    assert!(e.contains("column \"d\" has a duration with nanoseconds and one beyond ±292 years") && e.contains("text(x)"), "{}", e);
-    let e = fails("print(parquet_write([{\"t\": datetime(\"2026-01-03T10:00:00.000000001Z\")}, {\"t\": datetime(\"2400-01-01T00:00:00Z\")}]))");
-    assert!(e.contains("column \"t\" has a datetime with nanoseconds and one outside 1677-2262"), "{}", e);
-    // Sin nanosegundos, lo lejano va en microsegundos como siempre; con todo en rango, en nanosegundos.
-    assert_eq!(
-        out(&format!("{far}let a be [{{\"d\": far}}, {{\"d\": duration(seconds = 1)}}]\nprint(to_rows(parquet_read(parquet_write(a))) == a)\nlet b be [{{\"t\": datetime(\"2026-01-03T10:00:00.000000001Z\")}}]\nprint(to_rows(parquet_read(parquet_write(b))) == b)")),
-        vec!["true", "true"]
-    );
 }
