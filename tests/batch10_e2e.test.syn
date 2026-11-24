@@ -1,0 +1,89 @@
+-- Business chart kinds from the runtime, checked through Synsema values.
+
+test "new_kinds_available_in_run_mode"
+    assert(contains(chart_svg("area", [1, 2, 3]), "<svg"))
+    assert(contains(chart_svg("donut", {"a": 4, "b": 2}), "<svg"))
+    assert(contains(chart_svg("histogram", [1, 2, 2, 3]), "<svg"))
+    assert(contains(chart_svg("boxplot", [1, 2, 3, 4]), "<svg"))
+    assert(contains(chart_svg("waterfall", {"alta": 5, "baja": -2}), "<svg"))
+    assert(contains(chart_svg("heatmap", [[1, 2], [3, 4]]), "<svg"))
+
+test "same_svg_from_literal_csv_and_sql_for_new_kinds"
+    require db(":memory:")
+    db_open(":memory:", "memory")
+    sql_exec("CREATE TABLE t (dia TEXT, hora TEXT, v REAL)")
+    sql_exec("INSERT INTO t VALUES ('lun', '9', 5.0), ('lun', '10', 8.0), ('mar', '9', 3.0), ('mar', '10', 4.0)")
+    let de_sql be sql("SELECT dia, hora, v FROM t")
+    let literal be [{"dia": "lun", "hora": "9", "v": 5.0}, {"dia": "lun", "hora": "10", "v": 8.0}, {"dia": "mar", "hora": "9", "v": 3.0}, {"dia": "mar", "hora": "10", "v": 4.0}]
+    let de_csv be csv_parse("dia,hora,v\nlun,9,5.0\nlun,10,8.0\nmar,9,3.0\nmar,10,4.0\n", {"numbers": true})
+    let hm be {"x": "hora", "y": "dia", "value": "v"}
+    assert(chart_svg("heatmap", literal, hm) == chart_svg("heatmap", de_csv, hm))
+    assert(chart_svg("heatmap", de_csv, hm) == chart_svg("heatmap", de_sql, hm))
+    let bx be {"x": "dia", "y": "v"}
+    assert(chart_svg("boxplot", literal, bx) == chart_svg("boxplot", de_sql, bx))
+    let wf be {"x": "dia", "y": "v"}
+    assert(chart_svg("waterfall", literal, wf) == chart_svg("waterfall", de_sql, wf))
+
+test "new_kinds_work_inside_sandbox"
+    let svg be ""
+    let caja be ""
+    sandbox
+        set svg to chart_svg("heatmap", [[1, 2], [3, 4]], {"legend": false})
+        set caja to chart_svg("boxplot", [1, 2, 3, 4, 5])
+    assert(contains(svg, "<svg"))
+    assert(contains(caja, "<svg"))
+
+test "sandbox_still_denies_sql_with_new_kinds_around"
+    require db(":memory:")
+    db_open(":memory:", "memory")
+    let denied be false
+    try
+        sandbox
+            let filas be sql("SELECT 1")
+            let svg be chart_svg("heatmap", [[1]], {})
+    recover e
+        set denied to true
+        assert(contains(e, "Capability not granted"))
+    assert(denied)
+
+test "new_kind_errors_recoverable"
+    let m1 be ""
+    try
+        chart_svg("boxplot", [])
+    recover err
+        set m1 to err
+    assert(contains(m1, "data is empty"))
+    let m2 be ""
+    try
+        chart_svg("pie", {"a": 1}, {"stack": true})
+    recover err
+        set m2 to err
+    assert(contains(m2, "stack"))
+    let m3 be ""
+    try
+        chart_svg("treemap", {"a": 1})
+    recover err
+        set m3 to err
+    assert(contains(m3, "valid kinds"))
+    let m4 be ""
+    try
+        chart_svg("boxplot", {"solo": [7]})
+    recover err
+        set m4 to err
+    assert(contains(m4, "at least 2"))
+    assert(true)
+
+test "secret_never_leaks_in_new_kinds"
+    let s be as_secret("hunter2", "API_KEY")
+    let svg be chart_svg("boxplot", [{"g": s, "v": 1}, {"g": s, "v": 2}], {"x": "g", "y": "v"})
+    assert(not contains(svg, "hunter2"))
+    assert(contains(svg, "[redacted]"))
+    let wfv be chart_svg("waterfall", [{"c": s, "d": 5}], {"x": "c", "y": "d"})
+    assert(not contains(wfv, "hunter2"))
+    let msg be ""
+    try
+        chart_svg("waterfall", [{"c": "a", "d": s}], {"x": "c", "y": "d"})
+    recover err
+        set msg to err
+    assert(contains(msg, "secret"))
+    assert(not contains(msg, "hunter2"))
