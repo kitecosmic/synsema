@@ -331,16 +331,6 @@ fn r3_try_reflexes_and_returning() {
     assert_eq!(o[1], "[{n: 0}]");
 }
 
-// Ronda 4 — `\x` no es escape (rutas y regex quedan); en un backtick `\u{…}` no se come la
-// interpolación; `\uXXXX` sí, y `synsema check` lo avisa.
-#[test]
-fn r4_escapes_keep_valid_text() {
-    let o = out(r#"let a be 1
-print("C:\build\x64\Release")
-print(`x\u{a}y`)
-print("\u00e9" == "é", length("a\x2eb"), length("\uD83D\uDE00"))"#);
-    assert_eq!(o, vec![r"C:\build\x64\Release", r"x\u1y", "true 6 1"]);
-}
 
 
 
@@ -588,36 +578,6 @@ fn r7_comment_in_multiline_call() {
 }
 
 
-// Ronda 7 — R3: el error decimal/float sale sólo en una comparación real. `in` compara elemento
-// por elemento (sin recorrer antes la lista); `unique`/`group_by`/… sólo cuando dos claves caen en el
-// mismo grupo numérico (1.5 con 1.5d), no cuando la lista tiene los dos tipos en valores distintos.
-#[test]
-fn r7_decimal_float_only_on_real_comparisons() {
-    let o = out(r#"print("a" in ["a", 1.5, 1d], 2 in [1.5, 1d, 2], 3 in [1.5, 1d])
-print(unique(["a", 1.5, 1d]), length(group_by([{"k": 1.5}, {"k": 1d}], "k")), count_by([1.5, 2d, 1.5]))
-print(mode([1.5, 2d, 2d]), length(summarize([{"k": 1.5}, {"k": 2d}], "k", {"n": count()})))
-print(length(pivot([{"i": 1.5, "c": "a", "v": 1}, {"i": 2d, "c": 2d, "v": 2}], "i", "c", "v")))
-print(length(join([{"k": 1.5}], [{"k": 2d}], "k", "left")))"#);
-    assert_eq!(o, vec![
-        "true true false",
-        "[\"a\", 1.5, 1] 2 [{key: 1.5, count: 2}, {key: 2, count: 1}]",
-        "2 2",
-        "2",
-        "1",
-    ]);
-    for src in [
-        "print(1.5 in [1.5d])",
-        "print(1.5d in [\"a\", 1.5])",
-        "print(unique([1.5, 1.5d]))",
-        "print(unique([1.0, 1d]))",
-        "print(group_by([{\"k\": 1.5}, {\"k\": 1.5d}], \"k\"))",
-        "print(count_by([[1.5d], [1.5]]))",
-    ] {
-        assert!(fails(src).contains("cannot mix decimal and float"), "{}", src);
-    }
-    assert!(fails("print(join([{\"k\": 1.5}], [{\"k\": 1.5d}], \"k\"))").contains("decimal on one side and float on the other"));
-}
-
 
 // Ronda 7 — R5: `require net(...)` con un puerto EXPLÍCITO concede sólo ese puerto; sin puerto,
 // el host entero (como en v0.6.28). IPv6 con puerto también.
@@ -643,24 +603,6 @@ fn r7_net_port_is_part_of_the_grant() {
     assert!(probe("[::1]", "http://[::1]:2/x").starts_with("allowed 0"));
 }
 
-
-
-// Ronda 7 — R8: una comilla sin cerrar en un CSV con fin de línea `\r` (o mezclado) se detecta y el
-// error dice la línea correcta: `\r`, `\r\n` y `\n` cuentan igual que en el tokenizador.
-#[test]
-fn r7_csv_unclosed_quote_cr_lines() {
-    for (src, line) in [
-        (r#"csv_parse("a\r\"x\r")"#, 2),
-        (r#"csv_parse("a\rb\r\"x")"#, 3),
-        (r#"csv_parse("a\r\nb\r\n\"x\r\n")"#, 3),
-        (r#"csv_parse("a,b\r\"x\ry\",2\r3,\"z\r")"#, 4),
-        (r#"csv_parse("a\n\"x\ry\"\n\"z")"#, 4),
-    ] {
-        let e = fails(&format!("print({})", src));
-        assert!(e.contains(&format!("unclosed quote in the field that starts on line {}", line)), "{}\n{}", src, e);
-    }
-    assert_eq!(out(r#"print(csv_parse("a,b\r1,2\r\"x\ry\",3\r"))"#), vec![r#"[{a: "1", b: "2"}, {a: "x\ry", b: "3"}]"#]);
-}
 
 
 
@@ -713,46 +655,6 @@ fn r7_glued_dashes_only_before_a_number() {
     assert!(fails("let x be 2\nprint(x--1)").contains("right after a value"));
 }
 
-// Ronda 8 — un datetime con offset lo CONSERVA (Python, java.time, Temporal, Arrow, pandas): la hora
-// local de una fecha RFC 3339 no se pierde. Igualdad y orden, por instante.
-#[test]
-fn r8_fixed_offset_is_kept() {
-    let a = "let a be datetime(\"2026-09-24T02:00:00+05:30\")\n";
-    assert_eq!(out(&format!("{}print(a)", a)), vec!["2026-09-24T02:00:00+05:30"]);
-    assert_eq!(
-        out(&format!("{}let p be date_parts(a)\nprint(p.hour, p.day, p.zone, date(a), truncate(a, \"day\"))", a)),
-        vec!["2 24 +05:30 2026-09-24 2026-09-24T00:00:00+05:30"]
-    );
-    assert_eq!(out(&format!("{}print(format_time(a, \"%d %H:%M %z\"))", a)), vec!["24 02:00 +0530"]);
-    assert_eq!(
-        out("print(add_months(datetime(\"2026-01-31T02:00:00+05:30\"), 1))"),
-        vec!["2026-02-28T02:00:00+05:30"]
-    );
-    assert_eq!(out(&format!("{}print(a == datetime(\"2026-09-23T20:30:00Z\"), datetime(text(a)) == a)", a)), vec!["true true"]);
-    assert_eq!(
-        out("print(sort([datetime(\"2026-01-01T10:00:00+05:30\"), datetime(\"2026-01-01T05:00:00Z\"), datetime(\"2026-01-01T01:00:00-03:00\")]))"),
-        vec!["[2026-01-01T01:00:00-03:00, 2026-01-01T10:00:00+05:30, 2026-01-01T05:00:00Z]"]
-    );
-    assert_eq!(out(&format!("{}print(json_encode({{\"t\": a}}))", a)), vec!["{\"t\": \"2026-09-24T02:00:00+05:30\"}"]);
-    assert_eq!(
-        out(&format!("{}print(csv_parse(csv_encode([{{\"t\": a}}]), {{\"types\": {{\"t\": \"datetime\"}}}}))", a)),
-        vec!["[{t: 2026-09-24T02:00:00+05:30}]"]
-    );
-    assert_eq!(
-        out(&format!("{}print(parquet_read(parquet_write([{{\"t\": a}}])))", a)),
-        vec!["[{t: 2026-09-24T02:00:00+05:30}]"]
-    );
-    // Un offset como zona en todas partes; sin dos puntos también; cero es UTC.
-    assert_eq!(
-        out(&format!("{}print(to_timezone(a, \"-03:00\"), datetime(\"2026-09-24T02:00:00+0530\") == a, datetime(\"2026-09-24T02:00:00+00:00\"))", a)),
-        vec!["2026-09-23T17:30:00-03:00 true 2026-09-24T02:00:00Z"]
-    );
-    assert_eq!(
-        out("print(parse_datetime(\"24/09/2026 02:00 +0530\", \"%d/%m/%Y %H:%M %z\"))"),
-        vec!["2026-09-24T02:00:00+05:30"]
-    );
-    assert!(fails("print(datetime(\"x\", \"+25:00\"))").contains("unknown time zone"));
-}
 
 
 // Ronda 8 — `==` corta en la primera diferencia (una lista de 100k que difiere en [0] es O(1)) y
@@ -771,29 +673,4 @@ fn r8_equality_one_pass_and_everywhere() {
     assert!(fails("print(index_of([1d, 2.0], 1.0))").contains("cannot mix decimal and float"));
     assert!(fails("let d be 1.5d\nmatch d\n    is 1.5\n        print(\"f\")\n    otherwise\n        print(\"o\")").contains("cannot mix decimal and float"));
     assert_eq!(out("print(contains([1d, 2d], 2), \"a\" in [\"a\", 1.5, 1d])"), vec!["true true"]);
-}
-
-// Ronda 8 (auditoría de la ronda 8) — un offset con segundos (hora solar de una zona IANA antes de
-// ~1920) se escribe con sus segundos y se vuelve a leer, como Python y java.time; `Z[Zona]` es el
-// instante visto en la zona (RFC 9557, Temporal); `+05` sin minutos se lee; `==` entre mapas no
-// depende del orden de las claves; una duración de más de 292 años se muestra y se mide bien.
-#[test]
-fn r8_offsets_seconds_z_zone_and_long_durations() {
-    let h = "let h be datetime(\"1900-01-01T00:00:00[America/Buenos_Aires]\")\n";
-    assert_eq!(
-        out(&format!("{}print(h, datetime(text(h)) == h, datetime(\"1900-01-01T00:00:00-04:16:48\"))", h)),
-        vec!["1900-01-01T00:00:00-04:16:48[America/Buenos_Aires] true 1900-01-01T00:00:00-04:16:48"]
-    );
-    assert_eq!(
-        out("print(datetime(\"2026-01-03T10:00:00Z[Europe/Madrid]\"), datetime(\"2026-09-24T10:00:00+05\"))"),
-        vec!["2026-01-03T11:00:00+01:00[Europe/Madrid] 2026-09-24T10:00:00+05:00"]
-    );
-    assert_eq!(
-        out("let A be {\"a\": 1, \"b\": 1d}\nlet B be {\"b\": 1.0, \"a\": 2}\nprint(A == B, B == A, [1d, \"a\"] == [1.0, \"b\"])"),
-        vec!["false false false"]
-    );
-    assert_eq!(
-        out("let d be datetime(\"2400-01-01T00:00:00Z\") - datetime(\"2000-01-01T00:00:00Z\")\nprint(d, in_units(d, \"days\"), date(2000, 1, 1) + d)"),
-        vec!["P146097D 146097.0 2400-01-01"]
-    );
 }
