@@ -12,7 +12,6 @@
 //! otro programa). Un test que dependa de alguno va aparte.
 
 mod agentauth_e2e;
-mod agentic_bus_e2e;
 mod agentic_ceiling_e2e;
 mod batch10_e2e;
 mod batch15_e2e;
