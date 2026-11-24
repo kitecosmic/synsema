@@ -27,6 +27,15 @@
 -- idempotentes incluso tras una corrida abortada.
 -- Correr con: synsema test tests/engine_io.test.syn
 
+task expect_exact_error(f, expected)
+    let ok be false
+    try
+        f()
+    recover e
+        set ok to true
+        assert_eq(e, expected)
+    assert(ok)
+
 task expect_error(f, needle)
     let ok be false
     try
@@ -40,17 +49,17 @@ test "io_builtins_deny_by_default"
     -- Las 4 primitivas exigen file.read; sin grant violan con el string exacto
     -- (la ruta "X" normaliza a "X").
     let needle be "Capability not granted: file_read(\"X\") — this is a permission, not a bug: add `require file.read(\"X\")` to the program's preamble (or to the importing file, when this code runs in a module)"
-    expect_error(() => list_dir("X"), needle)
-    expect_error(() => file_info("X"), needle)
-    expect_error(() => file_exists("X"), needle)
-    expect_error(() => read_file("X", 1, 5), needle)
+    expect_exact_error(() => list_dir("X"), needle)
+    expect_exact_error(() => file_info("X"), needle)
+    expect_exact_error(() => file_exists("X"), needle)
+    expect_exact_error(() => read_file("X", 1, 5), needle)
 
 test "iop2_builtins_deny_by_default"
     let needle_r be "Capability not granted: file_read(\"X\") — this is a permission, not a bug: add `require file.read(\"X\")` to the program's preamble (or to the importing file, when this code runs in a module)"
     let needle_w be "Capability not granted: file_write(\"X\") — this is a permission, not a bug: add `require file.write(\"X\")` to the program's preamble (or to the importing file, when this code runs in a module)"
-    expect_error(() => grep("X", "y"), needle_r)
-    expect_error(() => edit_file("X", "a", "b"), needle_w)
-    expect_error(() => append_file("X", "y"), needle_w)
+    expect_exact_error(() => grep("X", "y"), needle_r)
+    expect_exact_error(() => edit_file("X", "a", "b"), needle_w)
+    expect_exact_error(() => append_file("X", "y"), needle_w)
 
 test "list_dir_enumerates_sorted_with_metadata"
     require file("tests/_syn_io_listdir/**")
@@ -291,7 +300,7 @@ test "run_deny_by_default"
     -- Sin require exec → violación con el string exacto (sin el prefijo del host).
     -- Va ANTES de run_args_must_be_a_list: los grants se acumulan entre bloques.
     let needle be "Capability not granted: exec(\"echo\") — this is a permission, not a bug: add `require exec(\"echo\")` to the program's preamble (or to the importing file, when this code runs in a module)"
-    expect_error(() => run("echo", []), needle)
+    expect_exact_error(() => run("echo", []), needle)
 
 test "run_args_must_be_a_list"
     require exec("echo")

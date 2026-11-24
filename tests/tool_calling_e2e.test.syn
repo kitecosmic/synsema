@@ -4,7 +4,9 @@
 -- placeholder de `llm_step` sin provider.
 -- ORDEN: los requires otorgados viven para toda la corrida del archivo, así que los tests que
 -- necesitan el agente SIN `env` van primero y el `require env` vive dentro del bloque de LP1.
--- QUEDA en Rust:
+-- QUEDA en Rust: los 7 casos LP/F3b originales usan run_source_secure; los
+-- casos con sufijo _runner aquí sólo cubren el corredor Synsema normal.
+-- Además:
 --   f3_llm_step_requires_llm_capability_in_secure_mode: el gate es del modo SECURE
 --     (run_source_secure); `synsema test` corre no-secure y auto-concede `llm` como
 --     stdout/time → la denegación no es observable acá (migas: gaps_conformance).
@@ -50,39 +52,39 @@ task readpath()
 
 -- LP4 — una tool no puede EXCEDER al agente (declara una cap que el agente NO tiene) y,
 -- tras una denegación, el scope se RESTAURA + `call_tool` despacha args nombrados igual que `call`.
-test "lp_tool_cannot_exceed_agent_and_scope_restores"
+test "lp_tool_cannot_exceed_agent_and_scope_restores_runner"
     expect_error(() => call_tool(greedy, {}), "not permitted")
     assert_eq(call_tool(add, {"a": 10, "b": 5}), 15)
 
 -- LP5 — un `require` ANIDADO (bajo when/if/while) no se extrae a required_capabilities y el
 -- guard `in_tool_scope()` lo vuelve no-op: la tool no se auto-concede la cap dentro del scope.
-test "lp_nested_require_inside_tool_cannot_self_grant"
+test "lp_nested_require_inside_tool_cannot_self_grant_runner"
     expect_error(() => call_tool(leaky, {}), "env(\"PATH\") not permitted")
 
 -- LP6 — escalada INDIRECTA vía `call` a un helper con require anidado: el helper corre también
 -- bajo el tool-scope (depth > 0 a través de llamadas anidadas) → su require anidado es no-op.
-test "lp_indirect_call_inside_tool_cannot_self_grant"
+test "lp_indirect_call_inside_tool_cannot_self_grant_runner"
     expect_error(() => call_tool(outer, {}), "env(\"PATH\") not permitted")
 
 -- LP1 — una tool NO puede usar una capability que el AGENTE tiene pero la tool NO declaró.
 -- El `require env` otorgado vive para toda la corrida: desde acá el agente tiene `env`.
-test "lp_tool_cannot_use_undeclared_capability_the_agent_has"
+test "lp_tool_cannot_use_undeclared_capability_the_agent_has_runner"
     require env
     assert(not (env("PATH") == nothing))
     expect_error(() => call_tool(sneaky, {}), "env(\"PATH\") not permitted")
 
 -- LP2 — CONTRASTE: la MISMA tool vía `call` (sin scoping) SÍ hereda la cap ambiente del agente
 -- → prueba que es `call_tool` (no la disciplina del loop) quien enforce-a.
-test "lp_plain_call_inherits_ambient_capability"
+test "lp_plain_call_inherits_ambient_capability_runner"
     assert(not (call(sneaky, {}) == nothing))
 
 -- LP3 — una tool SÍ puede usar una cap que DECLARÓ y el agente tiene (no rompe el caso bueno).
-test "lp_tool_can_use_capability_it_declared"
+test "lp_tool_can_use_capability_it_declared_runner"
     assert(not (call_tool(readpath, {}) == nothing))
 
 -- F3b — con `require llm` el gate pasa; sin provider cableado cae al placeholder seguro
 -- (no inventa tool-calls): {kind: "final", text: "[no llm provider]"}.
-test "f3b_llm_step_ok_with_require_llm_in_secure_mode"
+test "f3b_llm_step_ok_with_require_llm_in_secure_mode_runner"
     require llm
     let s be llm_step("hola", [], "")
     assert_eq(s["kind"], "final")

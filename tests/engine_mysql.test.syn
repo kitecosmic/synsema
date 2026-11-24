@@ -18,8 +18,7 @@ test "mysql_db_open_deny_without_require"
         db_open("mysql://user:pw@localhost:3306/appdb")
     recover e
         set ok to true
-        assert(contains(e, "Capability not granted: db(\"mysql://localhost/appdb\")"))
-        assert(contains(e, "this is a permission, not a bug"))
+        assert_eq(e, "Capability not granted: db(\"mysql://localhost/appdb\") — this is a permission, not a bug: add `require db(\"mysql://localhost/appdb\")` to the program's preamble (or to the importing file, when this code runs in a module)")
     assert(ok)
 
 test "mysql_scope_mismatch_deny"
@@ -29,5 +28,5 @@ test "mysql_scope_mismatch_deny"
         db_open("mysql://localhost/otra")
     recover e
         set ok to true
-        assert(contains(e, "Capability not granted: db(\"mysql://localhost/otra\")"))
+        assert_eq(e, "Capability not granted: db(\"mysql://localhost/otra\") — this is a permission, not a bug: add `require db(\"mysql://localhost/otra\")` to the program's preamble (or to the importing file, when this code runs in a module)")
     assert(ok)

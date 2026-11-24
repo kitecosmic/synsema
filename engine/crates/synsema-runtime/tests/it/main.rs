@@ -23,6 +23,7 @@ mod bytes_e2e;
 mod decide_contract;
 mod discovery_e2e;
 mod engine_concurrency;
+mod engine_db;
 mod engine_io;
 mod engine_human_llm;
 mod engine_mongo;
