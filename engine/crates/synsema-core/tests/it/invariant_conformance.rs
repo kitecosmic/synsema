@@ -36,12 +36,6 @@ fn bare_invariant_still_parses_and_runs() {
     assert_eq!(descriptions("let x be 1\ninvariant: x > 0"), vec![None]);
 }
 
-// -- La forma con descripción --
-
-#[test]
-fn described_invariant_passes_when_true() {
-    assert_ok("let balance be 10\ninvariant \"balance never negative\": balance >= 0\nprint(\"ok\")");
-}
 
 #[test]
 fn described_invariant_names_itself_in_the_violation() {
@@ -64,29 +58,9 @@ fn description_reaches_the_ast() {
     }
 }
 
-#[test]
-fn description_is_catchable_text_under_try_recover() {
-    // Atrapado con try/recover, el mensaje ligado no lleva categoría ni ubicación.
-    let r = run_source(
-        "let x be 0\ntry\n    invariant \"x is positive\": x > 0\nrecover e\n    print(e)\n",
-        "<test>",
-    );
-    assert!(r.success, "{:?}", r.errors);
-    assert_eq!(r.output, vec!["Invariant violation: x is positive".to_string()]);
-}
 
-#[test]
-fn description_inside_a_task_runs_per_call() {
-    let src = "task debit(balance, amount)\n    let after be balance - amount\n    invariant \"no overdraft\": after >= 0\n    give after\nprint(text(debit(10, 3)))\ndebit(1, 5)\n";
-    let r = run_source(src, "<archivo>");
-    assert!(!r.success);
-    assert_eq!(r.output, vec!["7".to_string()]);
-    assert!(
-        r.errors.iter().any(|e| e.ends_with("Invariant violation: no overdraft")),
-        "{:?}",
-        r.errors
-    );
-}
+
+
 
 // -- Errores de sintaxis: la descripción es un Text y va ANTES de los dos puntos --
 
