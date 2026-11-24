@@ -36,6 +36,14 @@ fn bare_invariant_still_parses_and_runs() {
     assert_eq!(descriptions("let x be 1\ninvariant: x > 0"), vec![None]);
 }
 
+#[test]
+fn described_invariant_names_itself_in_the_violation() {
+    assert_error_eq(
+        "let balance be -1\ninvariant \"balance never negative\": balance >= 0",
+        "Runtime error: <archivo>:2:1: Invariant violation: balance never negative",
+    );
+}
+
 
 #[test]
 fn description_reaches_the_ast() {

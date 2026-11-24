@@ -174,16 +174,15 @@ test "c5_bytes_of_number_hints"
 
 -- C6 — `Infinityx` y `NaNa` son basura, no un NaN.
 test "c6_json_garbage_is_not_nan"
-    expect_error(() => json_decode("Infinityx"), "invalid JSON: expected value at line 1")
-    expect_error(() => json_decode("NaNa"), "invalid JSON: expected value at line 1")
-    expect_error(() => json_decode("[1, NaN_x]"), "invalid JSON: expected value at line 1")
-    let ok be false
-    try
-        json_decode("Infinityx")
-    recover e
-        set ok to true
-        assert(not contains(e, "NaN/Infinity"))
-    assert(ok)
+    each raw in ["Infinityx", "NaNa", "[1, NaN_x]"]
+        let ok be false
+        try
+            json_decode(raw)
+        recover e
+            set ok to true
+            assert(contains(e, "invalid JSON: expected value at line 1"))
+            assert(not contains(e, "NaN/Infinity"))
+        assert(ok)
     expect_error(() => json_decode("NaN"), "NaN/Infinity is not JSON")
     expect_error(() => json_decode("[Infinity]"), "NaN/Infinity is not JSON")
     assert_eq(text(json_decode("[NaN]", allow_nan = true)), "[nan]")

@@ -36,7 +36,7 @@ test "description_inside_a_task_runs_per_call"
         assert_eq(e, "Invariant violation: no overdraft")
     assert(ok)
 
-test "described_invariant_names_itself_in_the_violation"
+test "described_invariant_recover_text"
     let balance be -1
     let ok be false
     try

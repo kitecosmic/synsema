@@ -131,11 +131,11 @@ test "transpose_reorders_the_axes"
     assert_eq(text(transpose(M, [1, 0])), "[[1, 3], [2, 4]]")
     assert_eq(dtype(transpose(M > 2, [1, 0])), "bool")
     assert_eq(text(transpose(M > 2, [1, 0])), "[[false, true], [false, true]]")
-    expect_error(() => transpose(T, [0, 0, 1]), "axes must be a permutation of 0..2, got [0, 0, 1]")
-    expect_error(() => transpose(T, [0, 1]), "axes must be a permutation of 0..2, got [0, 1]")
-    expect_error(() => transpose(T, [0, 1, 3]), "axes must be a permutation of 0..2, got [0, 1, 3]")
-    expect_error(() => transpose(T, [0, 1, 2.5]), "axes must be a permutation of 0..2, got [0, 1, 2.5]")
-    expect_error(() => transpose(T, [0, 1, -4]), "axes must be a permutation of 0..2, got [0, 1, -4]")
+    expect_exact_error(() => transpose(T, [0, 0, 1]), "transpose: axes must be a permutation of 0..2, got [0, 0, 1]")
+    expect_exact_error(() => transpose(T, [0, 1]), "transpose: axes must be a permutation of 0..2, got [0, 1]")
+    expect_exact_error(() => transpose(T, [0, 1, 3]), "transpose: axes must be a permutation of 0..2, got [0, 1, 3]")
+    expect_exact_error(() => transpose(T, [0, 1, 2.5]), "transpose: axes must be a permutation of 0..2, got [0, 1, 2.5]")
+    expect_exact_error(() => transpose(T, [0, 1, -4]), "transpose: axes must be a permutation of 0..2, got [0, 1, -4]")
     expect_error(() => transpose(M, "10"), "axes must be a list of integers, got text")
 
 test "matmul_over_batches_broadcasts_like_numpy"

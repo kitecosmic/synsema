@@ -6,6 +6,7 @@
 
 mod assert_conformance;
 mod batch2_conformance;
+mod batch6_conformance;
 mod batch7_conformance;
 mod builtin_meta;
 mod core_conformance;
@@ -19,6 +20,7 @@ mod merge_error_location;
 mod resolver;
 mod skill_snippets;
 mod type_sizes;
+mod unboxed_lists;
 mod v0620_conformance;
 mod v0642_conformance;
 mod v0646_tanda_c;

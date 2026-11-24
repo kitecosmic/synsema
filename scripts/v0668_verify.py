@@ -37,6 +37,8 @@ def main():
                         help="patrón de archivos .test.syn dentro de tests/; repetible")
     parser.add_argument("--rust", choices=["core", "runtime"], action="append", default=[],
                         help="corre la suite it completa del crate; repetible")
+    parser.add_argument("--labels", action="store_true",
+                        help="ejecuta los gemelos con el mismo modo --labels que usa CI")
     args = parser.parse_args()
     paths = {Path(p).resolve() for p in args.syn}
     for pattern in args.glob:
@@ -52,7 +54,11 @@ def main():
     print(f"logs: {logs}")
     results = []
     for path in sorted(paths):
-        results.append(run(path.name, [str(SYN), "test", str(path)], ROOT, logs))
+        command = [str(SYN), "test"]
+        if args.labels:
+            command.append("--labels")
+        command.append(str(path))
+        results.append(run(path.name, command, ROOT, logs))
     for crate in dict.fromkeys(args.rust):
         results.append(run(f"rust-{crate}", ["cargo", "test", "-p", f"synsema-{crate}",
                                              "--test", "it", "-j", "2"], ROOT / "engine", logs))
