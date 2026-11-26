@@ -927,7 +927,7 @@ pub fn v0661_process_local_package_table() {
     // An initializer cannot borrow its tasks' declared domain.
     let t = tok_tree("v0661-top", "export task f()\n    require time\n    give now()\nexport let X be now()\n");
     let r = t.run("use \"tok\" as tok\n");
-    assert!(!r.success && errors(&r).contains("the package tok does not declare it"), "{}", errors(&r));
+    assert!(!r.success && errors(&r).contains("the package tok is running at top level; move this operation into a task that declares `require time`"), "{}", errors(&r));
     // A callback and a parallel worker keep the package on their effective stack.
     for body in ["give cb()", "give parallel_map((x) => cb(), [1])"] {
         let t = tok_tree("v0661-callback", &format!("export task f(cb)\n    {body}\n"));
