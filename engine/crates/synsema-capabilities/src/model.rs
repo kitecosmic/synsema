@@ -187,25 +187,26 @@ pub struct Delegation {
     pub earlier: Vec<Vec<Capability>>,
     pub source: DelegationSource,
     pub deterministic: bool,
+    pub package_top_level: bool,
 }
 
 impl Delegation {
     pub fn token(id: impl Into<String>, caps: Vec<Capability>, deterministic: bool) -> Self {
-        Delegation { caps, earlier: Vec::new(), source: DelegationSource::Token(id.into()), deterministic }
+        Delegation { caps, earlier: Vec::new(), source: DelegationSource::Token(id.into()), deterministic, package_top_level: false }
     }
 
     pub fn block(caps: Vec<Capability>) -> Self {
-        Delegation { caps, earlier: Vec::new(), source: DelegationSource::Block, deterministic: false }
+        Delegation { caps, earlier: Vec::new(), source: DelegationSource::Block, deterministic: false, package_top_level: false }
     }
 
     /// v0.6.51 (C1): lo que limitaba al programa que llamó a `run_program`, como capa del hijo.
     pub fn caller(caps: Vec<Capability>) -> Self {
-        Delegation { caps, earlier: Vec::new(), source: DelegationSource::Caller, deterministic: false }
+        Delegation { caps, earlier: Vec::new(), source: DelegationSource::Caller, deterministic: false, package_top_level: false }
     }
 
     /// v0.6.58 (§6.1): el dominio del paquete `name` (lo que declaran sus `require`).
     pub fn package(name: impl Into<String>, caps: Vec<Capability>) -> Self {
-        Delegation { caps, earlier: Vec::new(), source: DelegationSource::Package(name.into()), deterministic: false }
+        Delegation { caps, earlier: Vec::new(), source: DelegationSource::Package(name.into()), deterministic: false, package_top_level: false }
     }
 
     /// Los bloques anteriores de la cadena (raíz primero), cada uno una capa más.
@@ -1853,6 +1854,10 @@ impl CapabilitySet {
                 DelegationSource::Caller => format!(
                     "Capability not granted: {} — outside what the program that started this one with run_program could do; that program has to be able to do it first",
                     requested
+                ),
+                DelegationSource::Package(name) if d.package_top_level => format!(
+                    "Capability not granted: {} — the package {} is running at top level; move this operation into a task that declares `{}`",
+                    requested, name, Self::require_line(requested)
                 ),
                 DelegationSource::Package(name) => {
                     format!(
