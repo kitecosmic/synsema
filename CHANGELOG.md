@@ -26,11 +26,20 @@ Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the rele
 - Not changed: the host ceiling (`--sandbox`, `--cap-set`) still rules over the declaration, a
   plain `sandbox` block still denies output, tokens and `sandbox under` still leave the
   process's `stdout` alone, labels rule as before, and the wasm host applies the same rule.
-  There is no compatibility flag.
-- A package that only exports `routes` has nowhere to put the `require`: `require` is refused
-  inside a `route`, inside the `routes` block and at the top level of a package (the same since
-  v0.6.61 for `time`, `random` and `stdin`). Until that gets its own release, declare what its
-  routes use in any task of the package.
+- **What this breaks.** A dependency that writes output without the declaration fails at its
+  first `print`, `log` or `eprint` as soon as you upgrade, even when it only writes to stderr.
+  Nothing in your program can allow it: there is no compatibility flag and no grant that reaches
+  a package that does not declare. Its author adds `require stdout` to any task and publishes;
+  you then take that version with the hash-bound `--accept` that `get --update` prints.
+- **Limit: a package that only exports `routes` cannot write output.** It has nowhere to put the
+  `require`: `require` is refused inside a `route`, inside the `routes` block and at the top level
+  of a package (the same since v0.6.61 for `time`, `random` and `stdin`), until that gets its own
+  release. Give the package any task that declares what its routes use: the declaration is the
+  whole package's.
+- **Limit: a program launched by a package with `run_program` prints only if the launching
+  package declares `stdout`.** When it does not, the child's error reads ``add `require stdout` to
+  the program's preamble`` and, once the child declares it, ``declared but above the host
+  ceiling``: neither names the package. Declare it in the package's task that calls `run_program`.
 - Cost, measured with cachegrind on the engine's gate code (release profile without cross-crate
   LTO), per operation: a call into a package that does not print adds 5 instructions; a call that
   prints one line adds 81; a line printed inside a package adds 10; a line the program prints

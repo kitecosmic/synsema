@@ -627,6 +627,23 @@ under `run`) does not reach a package that does not declare it; the host ceiling
 the declaration. The gate is asked once per package chain per interpreter, so the audit shows one
 `stdout` entry per chain, not one per call.
 
+**Three limits of that rule, so nobody has to guess:**
+
+1. **You cannot allow it from your program.** A dependency that writes output without the
+   declaration fails at its first `print`, `log` or `eprint` as soon as you upgrade Synsema, even
+   when it only writes to stderr. There is no flag and no grant that reaches it: its author adds
+   `require stdout` to any task and publishes, and you take that version with the hash-bound
+   `--accept` that `get --update` prints.
+2. **A package that only exports `routes` has nowhere to declare**, so its routes cannot write
+   output until that gets its own release. Give the package any task that declares what its
+   routes use (the example below): the domain is the whole package.
+3. **A program launched by a package with `run_program` prints only if the launching package
+   declares `stdout`.** When it does not, neither of the child's two errors names the package:
+   they read ``add `require stdout` to the program's preamble`` and then ``declared but above the
+   host ceiling``. Declare it in the package's task that calls `run_program`.
+
+The three errors, with their fix, are in the table of pitfalls.md.
+
 A package that only exports `routes` has no task to put the `require` in: `require` is refused
 inside a `route`, inside the `routes` block and at the top level of a package (the same since
 v0.6.61 for `time`, `random` and `stdin`). Declare what its routes use in any task of the package —
