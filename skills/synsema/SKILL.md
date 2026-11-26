@@ -133,7 +133,7 @@ This skill is an **indexed folder**: read ONLY the section(s) you need for the t
 | **Install** | `curl -fsSL https://synsema.com/install.sh \| sh`, `irm https://synsema.com/install.ps1 \| iex`, or `npm i -g synsema` / `npx synsema …` (same native binary via npm, v0.6.3+) |
 | **Update** binary + this skill | `synsema update` (installed by npm → `npm i -g synsema@latest`), then `npx skills update -g` (see below) |
 | **Diagnose LLM config** | `synsema llm status` (resolved config with sources; names the missing variable when offline) |
-| **Use or publish a library** | `synsema.json` + `synsema get`, then `use "name"`. v0.6.61 packages declare time/random/stdin inside tasks; local `use "./file.syn"` has a different boundary. Read [modules.md](modules.md) before authoring or debugging one. |
+| **Use or publish a library** | `synsema.json` + `synsema get`, then `use "name"`. v0.6.61/v0.6.68 packages declare time/random/stdin/stdout inside tasks; local `use "./file.syn"` has a different boundary. Read [modules.md](modules.md) before authoring or debugging one. |
 
 | **Start a new project** | `synsema init [dir]` (hello.syn tour + commented .env.example + .gitignore). Add `--synfide` (engine v0.5.3+) to also install the **Synfide framework** — durable workflows, approval inbox, persistent kv — version-pinned from its latest release (per-file sha256; `synfide/VERSION` records it; re-run to upgrade). **Re-running is safe and repairs:** every file is classified by
 PROVENANCE — matching any past release means it came from the factory, so it gets the new
@@ -193,7 +193,7 @@ usually version skew, not a bug.
 - [builtins.md](builtins.md) — All built-in tasks + signatures (incl. `int`/`hex`, maps `get`/`items`/`merge`, `sort`, bytes, math, numeric arrays/linear algebra) and the **v0.6.29 rename table** (old names = deprecated aliases until v1.0)
 - [text-patterns.md](text-patterns.md) — v0.6.60+: Unicode normalization, bytes to integers, choosing linear or backtracking regex, all four call contracts, pattern syntax, replacement escaping, work/memory limits and migration. Read before writing tokenizer or look-around patterns.
 - [types.md](types.md) — Type system, property access, values (lists/maps have value semantics — copy-on-write — since v0.6.29)
-- [modules.md](modules.md) — Read before writing or publishing a library: file modules vs packages vs trusted tools, `synsema.json`, `get`/`--update`/`--accept`, package declarations (including time/random/stdin in v0.6.61), empty initialization domain, callbacks and a library-author checklist.
+- [modules.md](modules.md) — Read before writing or publishing a library: file modules vs packages vs trusted tools, `synsema.json`, `get`/`--update`/`--accept`, package declarations (including time/random/stdin in v0.6.61 and stdout in v0.6.68), empty initialization domain, callbacks and a library-author checklist.
 
 - [testing.md](testing.md) — Native test framework: `assert`/`assert_eq`/`assert_error`, `test "..."`
 - [code.md](code.md) — `synsema code`: outline/refs/routes/caps/check/search over a repo without reading whole files (CLI `--json` + the `synsema-code` MCP server)

@@ -930,11 +930,14 @@ pub(crate) fn wire_common_with_state(
     // sigue libre como siempre (secure incluido); con techo, un `--cap-set` sin `stdout`
     // deniega la salida en el primer `print` — si no, el audit diría "stdout rechazado por el
     // techo" mientras la salida aparece.
+    // v0.6.68: también con el dominio de un paquete apilado: la salida del paquete necesita que él
+    // lo declare, aunque el programa y el host la concedan. Lo decide el CapabilitySet, no el
+    // intérprete: así ven lo mismo un cruce y el dominio que un worker de `parallel_map` heredó.
     {
         let caps_out = caps.clone();
         interp.set_stdout_hook(Rc::new(move || {
             let mut cs = caps_out.borrow_mut();
-            if cs.ceiling.is_none() && cs.sandbox_depth == 0 {
+            if cs.ceiling.is_none() && cs.sandbox_depth == 0 && !cs.in_package() {
                 return Ok(());
             }
             cs.require(&Capability::new(CapabilityType::Stdout, None), "print()")

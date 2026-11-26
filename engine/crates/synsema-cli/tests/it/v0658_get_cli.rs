@@ -1457,7 +1457,7 @@ fn m_r3_3_nested_template_blocks_count_toward_the_limit_in_a_program() {
 
 #[test]
 fn v0661_process_local_requires_are_written_checked_and_guard_updates() {
-    for cap in ["time", "random", "stdin"] {
+    for cap in ["time", "random", "stdin", "stdout"] {
         let reg = Reg::start();
         let id = format!("{}/tok", reg.base());
         let v1 = says(&id, "0.1.0", "one");
@@ -1506,7 +1506,8 @@ fn v0661_stdin_is_denied_before_prompt_or_consumption_and_declared_reads_work() 
     let reg = Reg::start();
     let id = format!("{}/tok", reg.base());
     for declared in [false, true] {
-        let declaration = if declared { "    require stdin\n" } else { "" };
+        // v0.6.68: el prompt de `read_line` es salida, así que el paquete declara `stdout` además de `stdin`.
+        let declaration = if declared { "    require stdin\n    require stdout\n" } else { "" };
         let pkg = Pkg::new(&id, "0.1.0", &format!("export task leer()\n{declaration}    give read_line(\"pkg>\")\n"));
         let u = reg.publish("/tok/current", &pkg);
         let p = Proj::new("v0661-stdin", modules(&[("tok", url(&u))]));
@@ -1532,7 +1533,7 @@ fn v0661_stdin_is_denied_before_prompt_or_consumption_and_declared_reads_work() 
 }
 
 #[test]
-fn v0661_introspection_bus_stdout_and_exit_keep_their_documented_contract() {
+fn v0661_introspection_bus_and_exit_keep_their_contract_and_stdout_no_longer_does() {
     let reg = Reg::start();
     let id = format!("{}/tok", reg.base());
     let pkg = Pkg::new(&id, "0.1.0", "export task argumentos()\n    give args()\nexport task recibo()\n    give receipt()\nexport task linaje()\n    give lineage()\nexport task bus()\n    give bus_publish(\"v0661-test\", 1)\nexport task imprime()\n    print(\"package-output\")\nexport task sale()\n    exit(9)\n");
@@ -1540,9 +1541,12 @@ fn v0661_introspection_bus_stdout_and_exit_keep_their_documented_contract() {
     let p = Proj::new("v0661-existing", modules(&[("tok", url(&u))]));
     p.ok(&[]);
     assert_eq!(p.json()["modules"]["tok"]["requires"], json!([]));
-    std::fs::write(p.dir.join("p.syn"), "use \"tok\" as tok\nprint(tok.argumentos())\nassert_eq(get(tok.recibo(), \"validFrom\"), nothing)\nassert_eq(type_of(tok.linaje()), \"list\")\ntok.bus()\ntok.imprime()\ntok.sale()\nprint(\"after-exit\")\n").unwrap();
+    // v0.6.68: `stdout` dejó de ser la excepción del dominio de paquete. Un paquete que imprime sin
+    // declararlo no sale: el error nombra `stdout` y al paquete, es atrapable, y lo que sigue corre.
+    std::fs::write(p.dir.join("p.syn"), "use \"tok\" as tok\nprint(tok.argumentos())\nassert_eq(get(tok.recibo(), \"validFrom\"), nothing)\nassert_eq(type_of(tok.linaje()), \"list\")\ntok.bus()\ntry\n    tok.imprime()\nrecover e\n    print(\"atrapado: \" + text(e))\ntok.sale()\nprint(\"after-exit\")\n").unwrap();
     let cache = p.cache.to_string_lossy().into_owned();
     let (code, out, err) = synsema_env(&p.dir, &["run", "p.syn", "--", "v0661-sentinel"], None, &[("SYNSEMA_MODULE_CACHE", &cache)]);
     assert_eq!(code, 9, "{out}\n{err}");
-    assert!(out.contains("v0661-sentinel") && out.contains("package-output") && !out.contains("after-exit"), "{out}");
+    assert!(out.contains("v0661-sentinel") && !out.contains("package-output") && !out.contains("after-exit"), "{out}\n{err}");
+    assert!(out.contains("atrapado: Capability not granted: stdout — the package tok does not declare it; add `require stdout` inside its tasks"), "{out}\n{err}");
 }

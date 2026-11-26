@@ -153,7 +153,7 @@ Plain `call`/normal invocation does NOT isolate — use `call_tool` for untruste
 
 ## Packages run attenuated (v0.6.58+)
 
-**v0.6.61:** packages must declare `time`, `random` and `stdin` inside their tasks, including when the program already has them. Seeded generators and explicit timestamps remain pure. `stdout` keeps its previous behavior; `requires nothing` does not certify purity or silence. `get` also rejects agent definitions and `spawn` in every packaged `.syn`, including unused code and extra files. The entry program keeps its historical `read_line()` behavior; the package check happens before the prompt or input consumption.
+**v0.6.61 / v0.6.68:** packages must declare `time`, `random`, `stdin` and `stdout` inside their tasks, including when the program already has them. `stdout` covers `print`, `show`, `log`, `eprint`, `term_write` and the prompt of `read_line("…")`: a task that reads with a prompt declares both `stdin` and `stdout`. Seeded generators and explicit timestamps remain pure. `requires nothing` does not certify purity or silence. `get` also rejects agent definitions and `spawn` in every packaged `.syn`, including unused code and extra files. The entry program keeps its historical `read_line()` behavior; the package check happens before the prompt or input consumption.
 
 Code from a **package** (`use "name"`, declared in `synsema.json` — see [modules.md](modules.md)
 § Packages) runs with **the package's `requires` ∩ what is in force**: every task and lambda written

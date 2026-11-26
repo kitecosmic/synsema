@@ -251,6 +251,9 @@ struct TaintFrame {
 pub(crate) struct PkgSaved {
     prev: u32,
     pushed: bool,
+    /// v0.6.68: el nivel superior de un paquete al cargarlo (dominio vacío, con la misma pila que
+    /// una task: su veredicto de `stdout` no se guarda, ver `stdout_of_layer`).
+    top: bool,
 }
 
 /// Flujo no-lineal: error, `give` (return) o `stop` (break). Mapea las
@@ -2427,6 +2430,19 @@ pub struct Interpreter {
     /// encoding). Al final del struct a propósito (regla de migas §6: la tanda agrega una
     /// variante a `SynValue`).
     pub lineage_canonical_sha256: Option<Rc<dyn Fn(&SynValue) -> Option<(String, usize, &'static str)>>>,
+    /// v0.6.68: el veredicto de `stdout` de cada cadena de paquetes que ya le preguntó al gate, la
+    /// más reciente primero (hasta `CHAINS`): la cadena identifica el dominio, así que el gate y el
+    /// audit se ven una vez por cadena y no en cada llamada. `stdout_verdict` sigue siendo el del
+    /// programa y ningún cruce lo toca. Al final del struct a propósito.
+    stdout_chains: Vec<(SmallVec<[u32; 4]>, Result<(), Rc<str>>)>,
+    /// v0.6.68: `Some(at)` mientras `stdout_chains[at]` es el veredicto de la cadena que está en la
+    /// pila, así una segunda salida en la misma capa no vuelve a mirar la cadena. Los cruces y
+    /// lo que olvida lo ponen en `None`.
+    stdout_live: Option<u8>,
+    /// v0.6.68: cuántos niveles superiores de paquete hay abiertos (cargas en curso). La misma
+    /// pila de paquetes es el dominio vacío de una carga o el dominio de una task según cuál sea,
+    /// así que bajo una carga `stdout` se pregunta cada vez y no se guarda.
+    pkg_tops: u32,
 }
 
 /// v0.6.58 (§6.1): el dominio de un paquete al cruzar: `Some((marca, nombre, dominio))` lo apila
@@ -2698,6 +2714,9 @@ impl Interpreter {
             project_root: None,
             stdout_hook: None,
             stdout_verdict: None,
+            stdout_chains: Vec::new(),
+            stdout_live: None,
+            pkg_tops: 0,
             template_read_hook: None,
             sensitive_env: HashSet::new(),
             labels: false,
@@ -3600,7 +3619,7 @@ impl Interpreter {
     /// Instala el gate de `stdout` (el motor lo cablea al CapabilitySet).
     pub fn set_stdout_hook(&mut self, hook: Rc<dyn Fn() -> Result<(), String>>) {
         self.stdout_hook = Some(hook);
-        self.stdout_verdict = None;
+        self.forget_stdout_verdict();
     }
 
     /// Instala el gate de lectura de templates a disco (`render`/`include`/`layout`).
@@ -3828,23 +3847,83 @@ impl Interpreter {
     /// Primer `print`/`show`/`log`: consulta el gate una vez y memoiza el veredicto
     /// (un chequeo por intérprete; el audit lo ve una vez, no por línea). Público para los caminos
     /// a stdout que viven en otro crate (`term_write`, v0.6.51 ronda 1 B2).
+    /// v0.6.68: adentro de un paquete el veredicto es el de su cadena de paquetes
+    /// (`stdout_of_layer`); el del programa no vale adentro y el del paquete no vale afuera.
     pub fn ensure_stdout(&mut self) -> Result<(), Control> {
         // v0.6.51: dentro de un `sandbox` se pregunta cada vez y no se guarda: el veredicto de
         // afuera (memoizado en un `print` anterior) no vale adentro, y el de adentro no vale afuera.
         if self.sandbox_depth > 0 {
             return self.stdout_in_sandbox();
         }
-        if self.stdout_verdict.is_none() {
-            let verdict = match self.stdout_hook.clone() {
-                Some(h) => h(),
+        // v0.6.68: con un paquete en la pila el veredicto es el de su cadena; el del programa no se
+        // toca y sigue esperándolo afuera.
+        if !self.pkg_stack.is_empty() {
+            if let Some(at) = self.stdout_live {
+                return match &self.stdout_chains[usize::from(at)].1 {
+                    Ok(()) => Ok(()),
+                    Err(m) => Err(Control::Error(RuntimeError::new(m.to_string()))),
+                };
+            }
+            return match self.stdout_of_layer() {
                 None => Ok(()),
+                Some(m) => Err(Control::Error(RuntimeError::new(m.to_string()))),
             };
-            self.stdout_verdict = Some(verdict);
+        }
+        if self.stdout_verdict.is_none() {
+            self.stdout_verdict = Some(self.ask_stdout());
         }
         match self.stdout_verdict.as_ref().unwrap() {
             Ok(()) => Ok(()),
             Err(m) => Err(Control::Error(RuntimeError::new(m.clone()))),
         }
+    }
+
+    fn ask_stdout(&self) -> Result<(), String> {
+        match self.stdout_hook.clone() {
+            Some(h) => h(),
+            None => Ok(()),
+        }
+    }
+
+    /// v0.6.68: la primera salida de una capa de paquetes desde el último cruce. La cadena de
+    /// paquetes (la pila entera) identifica su dominio: si ya le preguntó al gate, vale lo que
+    /// decidió entonces; si no, el gate, y queda para la próxima vez (las `CHAINS` últimas). Bajo
+    /// el nivel superior de una carga la misma pila es otro dominio: se pregunta y no se guarda.
+    /// `Some(mensaje)` es el rechazo.
+    #[cold]
+    #[inline(never)]
+    fn stdout_of_layer(&mut self) -> Option<Rc<str>> {
+        let chain = self.pkg_stack.as_slice();
+        if self.pkg_tops == 0 {
+            let same = |c: &SmallVec<[u32; 4]>| c.len() == chain.len() && c.iter().zip(chain).all(|(a, b)| a == b);
+            if let Some(at) = self.stdout_chains.iter().position(|(c, _)| same(c)) {
+                self.stdout_live = Some(at as u8);
+                return self.stdout_chains[at].1.as_ref().err().cloned();
+            }
+        }
+        let verdict = self.ask_stdout().map_err(|m| Rc::from(m.as_str()));
+        if self.pkg_tops == 0 {
+            const CHAINS: usize = 8;
+            if self.stdout_chains.len() >= CHAINS {
+                self.stdout_chains.pop();
+            }
+            self.stdout_chains.insert(0, (SmallVec::from_slice(chain), verdict.clone()));
+            self.stdout_live = Some(0);
+        }
+        verdict.err()
+    }
+
+    /// v0.6.68: el gate de `stdout` se vuelve a consultar: cambió lo que decide (el set de
+    /// capabilities del scope que abre o cierra) o es otra unidad de trabajo.
+    fn forget_stdout_verdict(&mut self) {
+        self.stdout_verdict = None;
+        self.forget_stdout_chains();
+    }
+
+    /// v0.6.68: lo que decidió el gate para las cadenas de paquetes ya no vale.
+    fn forget_stdout_chains(&mut self) {
+        self.stdout_chains.clear();
+        self.stdout_live = None;
     }
 
     #[cold]
@@ -5066,8 +5145,9 @@ impl Interpreter {
         // patrón —armado quizá con un dato privado— por lo que tarda la primera llamada.
         crate::pattern_cache::clear_thread_caches();
         // El gate de stdout se re-consulta por request (el set de capabilities se
-        // reconstruye afuera; el veredicto memoizado sería del request anterior).
-        self.stdout_verdict = None;
+        // reconstruye afuera; el veredicto memoizado sería del request anterior). v0.6.68: también
+        // el de cada cadena de paquetes.
+        self.forget_stdout_verdict();
         // El contexto de PC es por request (un handler cortado por timeout dentro de
         // Un `when` privado no debe etiquetar al siguiente). El registro de declassify lo
         // drena el host (`take_declassify_log`).
@@ -5339,7 +5419,7 @@ impl Interpreter {
         let base = self.trusted_base();
         let module_env = Environment::child(&base, &format!("module:{}", shown));
         self.exports_collector.push(Vec::new());
-        self.stdout_verdict = None;
+        self.forget_stdout_verdict();
         hook(Some((name, &[])));
         debug_assert!(!self.shortcuts, "a trusted scope opened with the VM on (it has no origin check)");
         self.trusted_depth += 1;
@@ -5350,7 +5430,7 @@ impl Interpreter {
         self.trusted_depth -= 1;
         self.call_guard -= 1;
         hook(None);
-        self.stdout_verdict = None;
+        self.forget_stdout_verdict();
         let names = self.exports_collector.pop().unwrap_or_default();
         self.loading_modules.remove(&key);
         exec_res?;
@@ -9948,8 +10028,16 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
     #[cold]
     #[inline(never)]
     fn cross_into_with(&mut self, mark: u32, top_level: bool) -> PkgSaved {
-        let saved = PkgSaved { prev: self.cur_pkg, pushed: mark != 0 };
+        let mut saved = PkgSaved { prev: self.cur_pkg, pushed: mark != 0, top: false };
         if saved.pushed {
+            // v0.6.68: la pila de paquetes cambia y con ella la cadena cuyo veredicto de `stdout`
+            // vale: el de afuera no vale adentro. Es una bandera; el veredicto se consulta recién
+            // en la primera salida de la capa (`stdout_of_layer`).
+            self.stdout_live = None;
+            if top_level {
+                saved.top = true;
+                self.pkg_tops += 1;
+            }
             self.call_guard += 1;
             self.pkg_stack.push(mark);
             if let Some(hook) = self.pkg_scope_hook.clone() {
@@ -9974,6 +10062,11 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
     #[inline(never)]
     pub(crate) fn cross_leave(&mut self, saved: PkgSaved) {
         if saved.pushed {
+            // v0.6.68: la pila vuelve a cambiar (ver `cross_into_with`).
+            self.stdout_live = None;
+            if saved.top {
+                self.pkg_tops -= 1;
+            }
             self.call_guard -= 1;
             self.pkg_stack.pop();
             if let Some(hook) = self.pkg_scope_hook.clone() {
@@ -12073,6 +12166,9 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
         if let Some(hook) = self.tool_scope_hook.clone() {
             hook(true, &declared);
         }
+        // v0.6.68: adentro, un paquete se juzga con lo que la tool declaró: lo que decidieron las
+        // cadenas afuera no vale, y lo que decidan adentro no queda para afuera.
+        self.forget_stdout_chains();
         // Marca el scope para que un `require` ANIDADO en el cuerpo (no extraído a
         // required_capabilities) sea no-op y no pueda auto-concederse caps (espejo del
         // sandbox). Decremento garantizado (también si el cuerpo falla).
@@ -12082,6 +12178,7 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
         if let Some(hook) = self.tool_scope_hook.clone() {
             hook(false, &[]);
         }
+        self.forget_stdout_chains();
         result
     }
 
@@ -13692,7 +13789,7 @@ fn call_trusted(i: &mut Interpreter, tool: &TrustedTool, args: &mut CallArgs, lo
             loc,
         ));
     }
-    i.stdout_verdict = None;
+    i.forget_stdout_verdict();
     (tool.hook)(Some((&tool.module, &tool.task.required_capabilities)));
     debug_assert!(!i.shortcuts, "a trusted scope opened with the VM on (it has no origin check)");
     i.trusted_depth += 1;
@@ -13703,7 +13800,7 @@ fn call_trusted(i: &mut Interpreter, tool: &TrustedTool, args: &mut CallArgs, lo
     i.trusted_depth -= 1;
     i.call_guard -= 1;
     (tool.hook)(None);
-    i.stdout_verdict = None;
+    i.forget_stdout_verdict();
     r
 }
 
@@ -16616,5 +16713,182 @@ mod stack_weight_tests {
             interpreter.with_stack_weight(2, |i| Ok(i.recursion_depth)).ok().expect("registered stack has room")
         }).unwrap().join().unwrap();
         assert_eq!(registered, MAX_RECURSION - 1);
+    }
+}
+
+/// v0.6.68: el veredicto de `stdout` es de cada cadena de paquetes: sin paquetes se pregunta una
+/// vez por intérprete y ningún cruce lo toca; cada cadena pregunta una vez (no en cada llamada) y
+/// lo recuerda aunque entres otras; bajo el nivel superior de una carga la pila no identifica el
+/// dominio, así que se pregunta siempre y no se guarda. El gate es un contador.
+#[cfg(test)]
+mod v0668_stdout_layer_tests {
+    use super::*;
+
+    fn wired(deny: Rc<Cell<bool>>) -> (Interpreter, Rc<Cell<u32>>) {
+        let asked = Rc::new(Cell::new(0u32));
+        let (count, no) = (asked.clone(), deny);
+        let mut i = Interpreter::new();
+        i.set_stdout_hook(Rc::new(move || {
+            count.set(count.get() + 1);
+            if no.get() {
+                Err("denied".to_string())
+            } else {
+                Ok(())
+            }
+        }));
+        (i, asked)
+    }
+
+    #[test]
+    fn the_verdict_is_per_layer_and_once_per_chain() {
+        let (mut i, asked) = wired(Rc::new(Cell::new(false)));
+        // Sin paquetes: una sola vez, aunque haya cruces en el medio.
+        assert!(i.ensure_stdout().is_ok() && i.ensure_stdout().is_ok());
+        assert_eq!(asked.get(), 1);
+        // La task de un paquete no hereda el permiso del programa: pregunta. Al volver, el programa
+        // conserva lo suyo y no vuelve a preguntar.
+        let saved = i.cross_into(1);
+        assert!(i.ensure_stdout().is_ok() && i.ensure_stdout().is_ok());
+        // Y la capa queda marcada: la segunda salida no volvió a mirar la cadena.
+        assert_eq!(i.stdout_live, Some(0));
+        assert_eq!(asked.get(), 2);
+        i.cross_leave(saved);
+        assert!(i.ensure_stdout().is_ok());
+        assert_eq!(asked.get(), 2);
+        // La misma cadena en otra llamada no vuelve a preguntar.
+        let saved = i.cross_into(1);
+        assert!(i.ensure_stdout().is_ok());
+        assert_eq!(asked.get(), 2);
+        i.cross_leave(saved);
+        // Otra cadena, sí; y la de adentro no se apoya en la de afuera, ni al revés.
+        let saved = i.cross_into(2);
+        assert!(i.ensure_stdout().is_ok());
+        assert_eq!(asked.get(), 3);
+        let inner = i.cross_into(1);
+        assert!(i.ensure_stdout().is_ok());
+        assert_eq!(asked.get(), 4);
+        i.cross_leave(inner);
+        assert!(i.ensure_stdout().is_ok());
+        assert_eq!(asked.get(), 4);
+        i.cross_leave(saved);
+        assert!(i.ensure_stdout().is_ok());
+        assert_eq!(asked.get(), 4);
+        // Las tres quedaron: volver a cualquiera no pregunta.
+        for mark in [1, 2, 1] {
+            let saved = i.cross_into(mark);
+            assert!(i.ensure_stdout().is_ok());
+            i.cross_leave(saved);
+        }
+        assert_eq!(asked.get(), 4);
+    }
+
+    #[test]
+    fn a_denial_stays_with_its_chain_and_the_load_level_takes_nothing_from_it() {
+        let no = Rc::new(Cell::new(false));
+        let (mut i, asked) = wired(no.clone());
+        assert!(i.ensure_stdout().is_ok());
+        assert_eq!(asked.get(), 1);
+        no.set(true);
+        let saved = i.cross_into(1);
+        assert!(i.ensure_stdout().is_err());
+        assert_eq!(asked.get(), 2);
+        // El programa no hereda el rechazo del paquete…
+        i.cross_leave(saved);
+        assert!(i.ensure_stdout().is_ok());
+        assert_eq!(asked.get(), 2);
+        // …y la cadena recuerda el suyo.
+        let saved = i.cross_into(1);
+        assert!(i.ensure_stdout().is_err());
+        assert_eq!(asked.get(), 2);
+        i.cross_leave(saved);
+        // Lo que decide cambió (otro request, otro scope): se olvida y se vuelve a preguntar.
+        no.set(false);
+        i.forget_stdout_verdict();
+        assert!(i.ensure_stdout().is_ok());
+        assert_eq!(asked.get(), 3);
+        let saved = i.cross_into(1);
+        assert!(i.ensure_stdout().is_ok());
+        assert_eq!(asked.get(), 4);
+        i.cross_leave(saved);
+        // El nivel superior de una carga tiene otro dominio con la misma pila: pregunta en cada
+        // salida suya (no guarda)…
+        no.set(true);
+        let load = i.cross_into_top_level(1);
+        assert!(i.ensure_stdout().is_err());
+        assert_eq!(asked.get(), 5);
+        assert!(i.ensure_stdout().is_err());
+        assert_eq!(asked.get(), 6);
+        // …ni lo que se decida bajo la carga queda para las cadenas de task.
+        let saved = i.cross_into(2);
+        assert!(i.ensure_stdout().is_err());
+        assert_eq!(asked.get(), 7);
+        i.cross_leave(saved);
+        assert!(i.ensure_stdout().is_err());
+        assert_eq!(asked.get(), 8);
+        i.cross_leave(load);
+        let saved = i.cross_into(1);
+        assert!(i.ensure_stdout().is_ok());
+        assert_eq!(asked.get(), 8);
+        let inner = i.cross_into(2);
+        assert!(i.ensure_stdout().is_err());
+        assert_eq!(asked.get(), 9);
+        i.cross_leave(inner);
+        assert!(i.ensure_stdout().is_ok());
+        assert_eq!(asked.get(), 9);
+        // Otra vez en la misma capa: sale por la marca, que tiene que apuntar a ESTA cadena y no a
+        // la primera de la lista (la de `bpe`, negada, quedó por delante).
+        assert!(i.ensure_stdout().is_ok());
+        assert_eq!(asked.get(), 9);
+        i.cross_leave(saved);
+        assert!(i.ensure_stdout().is_ok());
+        assert_eq!(asked.get(), 9);
+    }
+
+    /// Se recuerdan las ocho cadenas últimas: la novena saca a la más vieja. Reencontrar una no
+    /// vuelve a preguntar y la marca apunta a donde esa cadena quedó.
+    #[test]
+    fn the_chains_remember_the_most_recent_ones() {
+        let (mut i, asked) = wired(Rc::new(Cell::new(false)));
+        assert!(i.ensure_stdout().is_ok());
+        for mark in 1..=8 {
+            let saved = i.cross_into(mark);
+            assert!(i.ensure_stdout().is_ok());
+            i.cross_leave(saved);
+        }
+        assert_eq!(asked.get(), 9);
+        // La primera que entró quedó última.
+        let saved = i.cross_into(1);
+        assert!(i.ensure_stdout().is_ok());
+        assert_eq!((asked.get(), i.stdout_live), (9, Some(7)));
+        i.cross_leave(saved);
+        for mark in 9..=10 {
+            let saved = i.cross_into(mark);
+            assert!(i.ensure_stdout().is_ok());
+            i.cross_leave(saved);
+        }
+        // Entraron la 9 y la 10: salieron la 1 y la 2.
+        assert_eq!(asked.get(), 11);
+        for (mark, asks) in [(5, 11), (10, 11), (1, 12), (2, 13)] {
+            let saved = i.cross_into(mark);
+            assert!(i.ensure_stdout().is_ok());
+            i.cross_leave(saved);
+            assert_eq!(asked.get(), asks, "cadena {mark}");
+        }
+    }
+
+    /// Olvidar (otro request, otro scope) apaga también la marca de la capa viva: si quedara
+    /// encendida con la caché vacía, la salida siguiente leería una cadena que no existe.
+    #[test]
+    fn forgetting_turns_off_the_live_mark() {
+        let (mut i, asked) = wired(Rc::new(Cell::new(false)));
+        let saved = i.cross_into(1);
+        assert!(i.ensure_stdout().is_ok() && i.stdout_live == Some(0));
+        i.forget_stdout_verdict();
+        assert!(i.stdout_live.is_none() && i.stdout_chains.is_empty());
+        assert!(i.ensure_stdout().is_ok() && i.stdout_live == Some(0));
+        assert_eq!(asked.get(), 2);
+        i.forget_stdout_chains();
+        assert!(i.stdout_live.is_none() && i.stdout_chains.is_empty());
+        i.cross_leave(saved);
     }
 }

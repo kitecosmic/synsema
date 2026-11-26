@@ -464,13 +464,14 @@ pub fn wire_pure(interp: &mut Interpreter, caps: &Rc<RefCell<CapabilitySet>>, ct
     synsema_stdlib::captoken::install_llm_data_hook(interp, caps.clone(), Rc::new(|_| "embedder".to_string()));
 
     register_secure_builtins(interp, caps.clone());
-    // Gate de stdout bajo techo o dentro de un `sandbox` pelado (paridad con el nativo):
-    // `ceiling` sin `stdout` deniega el primer `print` en vez de imprimir igual.
+    // Gate de stdout bajo techo, dentro de un `sandbox` pelado o con el dominio de un paquete
+    // apilado (paridad con el nativo): `ceiling` sin `stdout` deniega el primer `print` en vez de
+    // imprimir igual; v0.6.68, un paquete sólo imprime si declara `stdout`.
     {
         let caps_out = caps.clone();
         interp.set_stdout_hook(Rc::new(move || {
             let mut cs = caps_out.borrow_mut();
-            if cs.ceiling.is_none() && cs.sandbox_depth == 0 {
+            if cs.ceiling.is_none() && cs.sandbox_depth == 0 && !cs.in_package() {
                 return Ok(());
             }
             cs.require(&Capability::new(CapabilityType::Stdout, None), "print()").map_err(|v| v.message)

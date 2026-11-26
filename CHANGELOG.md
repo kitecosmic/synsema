@@ -6,6 +6,37 @@ Each says what changed, why, and what to write instead.
 
 Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the release date.
 
+## Unreleased (target v0.6.68)
+
+- **Breaking: packages must declare `stdout`.** `print`, `show`, `log`, `eprint`, `term_write`
+  and the prompt of `read_line("…")` written in a package need `require stdout` inside its
+  tasks, like `time`, `random` and `stdin` since v0.6.61 — in addition to the program's grant
+  and the host's ceiling. Put the `require` inside any task: the declaration is the whole
+  package's, so it also covers its lambdas, the program callbacks it calls, the workers of its
+  `parallel_map`, its mounted routes and a program it launches with `run_program`. The program's
+  own grant (and the ambient one under `run`) no longer reaches a package that does not declare
+  it. `get` records the declaration and an update that adds it needs the hash-bound `--accept`.
+- The denial comes before the first byte and says what to add:
+  ``Capability not granted: stdout — the package mudo does not declare it; add `require stdout`
+  inside its tasks``. It is a catchable error: the program keeps its own output before and after.
+  Under `serve` the route answers 500 with that text and the console logs only what was allowed.
+- A package's top level never prints: its initialization runs with an empty domain, also when
+  one of its tasks declares `stdout`. A task that reads with a prompt declares `stdin` **and**
+  `stdout`; reading without a prompt needs only `stdin`.
+- Not changed: the host ceiling (`--sandbox`, `--cap-set`) still rules over the declaration, a
+  plain `sandbox` block still denies output, tokens and `sandbox under` still leave the
+  process's `stdout` alone, labels rule as before, and the wasm host applies the same rule.
+  There is no compatibility flag.
+- A package that only exports `routes` has nowhere to put the `require`: `require` is refused
+  inside a `route`, inside the `routes` block and at the top level of a package (the same since
+  v0.6.61 for `time`, `random` and `stdin`). Until that gets its own release, declare what its
+  routes use in any task of the package.
+- Cost, measured with cachegrind on the engine's gate code (release profile without cross-crate
+  LTO), per operation: a call into a package that does not print adds 5 instructions; a call that
+  prints one line adds 81; a line printed inside a package adds 10; a line the program prints
+  adds 4. The gate is consulted once per package chain, not once per call, and the audit shows
+  one entry per chain.
+
 ## v0.6.67 — 2026-11-22
 
 - `synsema update` now recommends `npx skills add kitecosmic/synsema --skill synsema -g -y` to refresh the Synsema skill alone.

@@ -18,11 +18,13 @@ fn p17_run_program_from_a_package_does_not_reach_past_its_domain() {
     let d = p.dir.to_string_lossy().replace('\\', "/");
     std::fs::write(p.dir.join("a.txt"), "de a").unwrap();
     std::fs::write(p.dir.join("b.txt"), "de b").unwrap();
+    // v0.6.68: el dominio del paquete gobierna `stdout`, y el hijo lo hereda: como el hijo imprime,
+    // la task del paquete lo declara.
     let tok = Pkg::new(
         &format!("{}/tok", reg.base()),
         "0.1.0",
         &format!(
-            "export task lanza(child, techo)\n    require file.read(\"{d}/a.txt\")\n    require net(\"a.example\")\n    require sandbox_run\n    give run_program(child, {{\"ceiling\": techo, \"profile\": \"native\", \"timeout\": 20}})\n"
+            "export task lanza(child, techo)\n    require file.read(\"{d}/a.txt\")\n    require net(\"a.example\")\n    require sandbox_run\n    require stdout\n    give run_program(child, {{\"ceiling\": techo, \"profile\": \"native\", \"timeout\": 20}})\n"
         ),
     );
     let u = reg.publish("/tok/0.1.0", &tok);
