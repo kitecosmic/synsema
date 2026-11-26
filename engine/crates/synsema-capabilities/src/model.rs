@@ -132,8 +132,8 @@ pub const KNOWN_CAPABILITY_NAMES: &str = synsema_core::capscope::KNOWN_CAPABILIT
 /// HOST (`--cap-set`, `--deterministic`) y el programa (`require random`). Lo único que un
 /// emisor puede pedir sobre ellas es el caveat `deterministic` (sin reloj ni entropía), que
 /// es una restricción de ejecución, no autoridad — y va en `Delegation::deterministic`.
-/// El dominio de paquete gobierna time/random/stdin (v0.6.61); stdout conserva su contrato
-/// previo hasta la revisión separada de su gate memoizado.
+/// El dominio de un paquete sí las gobierna: sólo lo que el paquete declaró (time/random/stdin
+/// desde v0.6.61, stdout desde v0.6.68); ver `Delegation::covers`.
 pub const PROCESS_LOCAL: &[CapabilityType] =
     &[CapabilityType::Stdout, CapabilityType::Stdin, CapabilityType::Time, CapabilityType::Random];
 
@@ -222,9 +222,10 @@ impl Delegation {
     /// ¿Este techo delegado cubre la capability? Mismo `covers()` que gatea los `require`
     /// (misma canonización, mismo glob): no hay una segunda lógica de scopes.
     pub fn covers(&self, cap: &Capability) -> bool {
-        if is_process_local(cap.ty)
-            && (!matches!(self.source, DelegationSource::Package(_)) || cap.ty == CapabilityType::Stdout)
-        {
+        // Lo local al proceso (`PROCESS_LOCAL`) lo gobiernan el host y el programa: un token, un
+        // `sandbox under` y el techo del que llamó lo dejan pasar. El dominio de un paquete no:
+        // sólo lo que el paquete declaró (v0.6.61, time/random/stdin; v0.6.68, stdout).
+        if is_process_local(cap.ty) && !matches!(self.source, DelegationSource::Package(_)) {
             return !(self.deterministic && matches!(cap.ty, CapabilityType::Time | CapabilityType::Random));
         }
         if self.deterministic && matches!(cap.ty, CapabilityType::Time | CapabilityType::Random) {
@@ -1285,6 +1286,13 @@ impl CapabilitySet {
     /// Instala techos delegados heredados de la unidad de trabajo que creó ésta.
     pub fn set_delegations(&mut self, delegations: Vec<Delegation>) {
         self.delegated = delegations.into_iter().map(Rc::new).collect();
+    }
+
+    /// v0.6.68: ¿hay un dominio de paquete entre los techos delegados? Entonces `stdout` necesita
+    /// la declaración del paquete, además del permiso del programa y del techo del host. Es el que
+    /// apiló un cruce o el que un worker de `parallel_map` heredó al nacer.
+    pub fn in_package(&self) -> bool {
+        self.delegated.iter().any(|d| matches!(d.source, DelegationSource::Package(_)))
     }
 
     /// Un grant del PROGRAMA (`require …`).
@@ -3111,15 +3119,13 @@ mod tee_tests {
 mod delegated_ceiling_tests {
     use super::*;
 
+    /// v0.6.61 (time/random/stdin) y v0.6.68 (stdout): ningún tipo local al proceso escapa al
+    /// dominio de un paquete.
     #[test]
     fn v0661_package_has_no_process_local_exception() {
         for ty in PROCESS_LOCAL {
             let requested = Capability::new(*ty, None);
             let empty = Delegation::package("pure", vec![]);
-            if *ty == CapabilityType::Stdout {
-                assert!(empty.covers(&requested));
-                continue;
-            }
             assert!(!empty.covers(&requested), "{:?}", ty);
             assert!(Delegation::package("declared", vec![requested.clone()]).covers(&requested));
             for d in [Delegation::block(vec![]), Delegation::token("t", vec![], false), Delegation::caller(vec![])] {
@@ -3128,12 +3134,105 @@ mod delegated_ceiling_tests {
             let mut cs = CapabilitySet::new("program");
             cs.grant(requested.clone());
             cs.push_delegation(empty);
+            assert!(cs.in_package());
             let cause = cs.check_cause(&requested, "probe").unwrap_err();
             assert!(matches!(&cause, DenyCause::Delegated(d) if matches!(&d.source, DelegationSource::Package(n) if n == "pure")));
             let message = CapabilitySet::denial_message(&requested, &cause);
             assert!(message.contains("the package pure does not declare it"), "{}", message);
             assert!(message.contains(&format!("`require {}` inside its tasks", ty.wire_name())), "{}", message);
+            cs.pop_delegation();
+            assert!(!cs.in_package() && cs.check(&requested, "probe"), "{:?}", ty);
         }
+    }
+
+    /// v0.6.68: `stdout` bajo el dominio de paquetes, como `time`/`random`/`stdin` desde v0.6.61.
+    /// Dos capas se intersecan, y un token, un `sandbox under` y el techo del que llamó conservan
+    /// la excepción: sin `stdout` no lo quitan, y con `stdout` no lo conceden.
+    #[test]
+    fn v0668_package_stdout_is_governed_by_the_package_domain() {
+        let stdout = Capability::new(CapabilityType::Stdout, None);
+        let quiet = Delegation::package("pure", vec![]);
+        let loud = Delegation::package("loud", vec![stdout.clone()]);
+        assert!(!quiet.covers(&stdout));
+        assert!(loud.covers(&stdout));
+        assert_eq!(quiet.reason_for(&stdout), "the package pure does not declare it");
+        assert_eq!(loud.reason_for(&stdout), "the package loud does not declare it");
+        // Declarar `stdout` no declara otra cosa local al proceso.
+        assert!(!loud.covers(&Capability::new(CapabilityType::Time, None)));
+        assert!(!loud.covers(&Capability::new(CapabilityType::Stdin, None)));
+        // Dos capas de paquetes se intersecan: la de abajo manda aunque la de arriba lo declare,
+        // y la de arriba no se apoya en la de abajo.
+        assert!(!loud.clone().with_earlier(vec![vec![]]).covers(&stdout));
+        assert!(!quiet.clone().with_earlier(vec![vec![stdout.clone()]]).covers(&stdout));
+        assert!(loud.clone().with_earlier(vec![vec![stdout.clone()]]).covers(&stdout));
+
+        // Sin `stdout` en sus capas, un token (determinista o no), un bloque y el techo del que
+        // llamó dejan pasar el stdout del proceso receptor.
+        for d in [Delegation::token("t", vec![], false), Delegation::token("t", vec![], true), Delegation::block(vec![]), Delegation::caller(vec![])] {
+            assert!(d.covers(&stdout), "{:?}", d.source);
+        }
+        // Con `stdout`, no lo conceden: sigue haciendo falta el grant del programa.
+        let mut cs = CapabilitySet::new("request");
+        cs.push_delegation(Delegation::token("t", vec![stdout.clone()], false));
+        assert!(!cs.in_package());
+        assert_eq!(cs.check_cause(&stdout, "print()").unwrap_err(), DenyCause::NoGrant);
+        let e = cs.require(&stdout, "print()").unwrap_err();
+        assert!(e.message.starts_with("Capability not granted: stdout") && !e.message.contains("package"), "{}", e.message);
+        // La cláusula `deterministic` de un token sigue sin tocar `stdout`.
+        let mut cs = CapabilitySet::new("request");
+        cs.grant_ambient(stdout.clone());
+        cs.push_delegation(Delegation::token("t", vec![], true));
+        assert!(cs.check(&stdout, "print()") && !cs.check(&Capability::new(CapabilityType::Time, None), "now()"));
+    }
+
+    /// v0.6.68: con el grant del programa, el paquete que no declara `stdout` lo niega con su
+    /// causa, su texto y una entrada de audit; y un `require stdout` que corre con el paquete en
+    /// la pila (un callback del programa) no se concede.
+    #[test]
+    fn v0668_package_stdout_denial_names_the_package() {
+        let stdout = Capability::new(CapabilityType::Stdout, None);
+        let mut cs = CapabilitySet::new("program");
+        cs.grant_ambient(stdout.clone());
+        let before = cs.audit_log.len();
+        cs.push_delegation(Delegation::package("pure", vec![]));
+        let cause = cs.check_cause(&stdout, "print()").unwrap_err();
+        assert!(matches!(&cause, DenyCause::Delegated(d) if d.source == DelegationSource::Package("pure".into())));
+        let message = CapabilitySet::denial_message(&stdout, &cause);
+        assert!(message.contains("Capability not granted: stdout"), "{}", message);
+        assert!(message.contains("the package pure does not declare it") && message.contains("`require stdout` inside its tasks"), "{}", message);
+        assert_eq!(cs.audit_log.len(), before + 1);
+        let e = cs.audit_log.last().unwrap();
+        assert!(!e.granted && e.source == "print()" && e.reason == "the package pure does not declare it", "{} {} {}", e.granted, e.source, e.reason);
+        // La capa de arriba no levanta la de abajo.
+        cs.push_delegation(Delegation::package("loud", vec![stdout.clone()]));
+        let cause = cs.check_cause(&stdout, "print()").unwrap_err();
+        assert!(matches!(&cause, DenyCause::Delegated(d) if d.source == DelegationSource::Package("pure".into())));
+        assert_eq!(cs.audit_log.len(), before + 2);
+        cs.pop_delegation();
+        cs.pop_delegation();
+        assert!(cs.check(&stdout, "print()") && !cs.in_package());
+        assert_eq!(cs.audit_log.last().unwrap().granted, true);
+        assert_eq!(cs.audit_log.last().unwrap().reason, "Granted by stdout");
+
+        // Un `require stdout` de un callback del programa, con el paquete en la pila: declarado,
+        // auditado como del paquete y no concedido.
+        let mut cs = CapabilitySet::new("program");
+        cs.push_delegation(Delegation::package("pure", vec![]));
+        cs.grant(stdout.clone());
+        assert!(cs.granted.is_empty());
+        assert_eq!(cs.rejected_by_ceiling, vec![stdout.clone()]);
+        let e = cs.audit_log.last().unwrap();
+        assert!(!e.granted && e.source == "package" && e.reason == "the package pure does not declare it", "{} {}", e.source, e.reason);
+        // El uso dice que es el paquete, no que falta el `require` del programa.
+        assert!(matches!(cs.check_cause(&stdout, "print()").unwrap_err(), DenyCause::Delegated(d) if d.source == DelegationSource::Package("pure".into())));
+        // El paquete que declara, con el mismo grant: pasa y audita el permiso del programa.
+        let mut cs = CapabilitySet::new("program");
+        cs.grant_ambient(stdout.clone());
+        let before = cs.audit_log.len();
+        cs.push_delegation(Delegation::package("loud", vec![stdout.clone()]));
+        assert!(cs.check(&stdout, "print()"));
+        let e = cs.audit_log.last().unwrap();
+        assert!(cs.audit_log.len() == before + 1 && e.granted && e.source == "print()" && e.reason == "Granted by stdout" && e.origin == "program");
     }
 
     #[test]

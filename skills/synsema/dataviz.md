@@ -5,9 +5,9 @@ external libraries. All builtins on this page are **pure** (no capability): they
 `run`/`test`/`conform`/`serve` and **inside `sandbox`** (bring data in with capabilities
 outside, transform inside).
 
-Everything is **data-source-agnostic**: charts and CSV consume plain values (lists, maps,
-arrays) — the same rows whether they came from `sql()` (SQLite/Postgres/MySQL),
-`mongo_find`, `csv_parse`, `parquet_read`, `jsonl_decode`, `http_get` or a literal.
+Everything is **data-source-agnostic**: charts and CSV accept row lists from `sql()`
+(SQLite/Postgres/MySQL), `mongo_find`, `csv_parse`, `jsonl_decode`, `http_get` or a
+literal, and columnar tables from `parquet_read`/`parquet_scan` (v0.6.65+).
 
 ## Data analysis — rows in, results out (v0.6.29+; the `table` type v0.6.65+)
 

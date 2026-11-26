@@ -2,11 +2,15 @@
 //! dan lo mismo en la VM, en el tree-walker de referencia, con el nivel nativo y con etiquetas (K30).
 //! Es un binario aparte porque el modo referencia, el JIT y las etiquetas son del proceso: las
 //! pasadas van en orden, en un solo test; las etiquetas al final (no se apagan).
+//! v0.6.68: lo mismo para la tabla de `stdout` de paquetes (`it/v0668_package_stdout.rs`).
 
 #[path = "it/v0658_attenuation.rs"]
 mod table;
+use table as v0658_attenuation;
+#[path = "it/v0668_package_stdout.rs"]
+mod stdout;
 
-fn pass(mode: &str) {
+fn pass(mode: &str, labels: bool) {
     table::v0661_process_local_package_table();
     for (name, row) in table::MODES {
         if let Err(e) = std::panic::catch_unwind(row) {
@@ -18,24 +22,39 @@ fn pass(mode: &str) {
             panic!("{} en {}: {}", name, mode, msg);
         }
     }
+    for (name, row) in stdout::TABLE {
+        if let Err(e) = std::panic::catch_unwind(row) {
+            let msg = e
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string()))
+                .unwrap_or_default();
+            panic!("stdout {name} en {mode}: {msg}");
+        }
+    }
+    // El audit de `receipt()` mira el contrato sin etiquetas.
+    if !labels {
+        stdout::v0668_stdout_audit_table();
+    }
 }
 
 #[test]
 fn the_attenuation_holds_in_every_mode() {
-    pass("vm");
+    pass("vm", false);
     synsema_core::interpreter::set_reference_mode(true);
-    pass("ref");
+    pass("ref", false);
     synsema_core::interpreter::set_reference_mode(false);
     synsema_jit::install();
     synsema_core::native_tier::set_eager(true);
-    pass("jit");
+    pass("jit", false);
     k36_the_program_loop_calls_the_package_as_foreign();
     k36b_the_program_site_never_goes_native();
     k36c_a_loop_inside_the_package_goes_native();
     a1_a_native_loop_of_the_package_crosses_back_to_the_program();
     assert!(synsema_runtime::host::set_labels(true) || synsema_runtime::host::labels());
-    pass("labels");
+    pass("labels", true);
     k30_labels_flow_through_a_package_task();
+    stdout::v0668_stdout_under_labels();
 }
 
 /// K36: un bucle del programa que llama a `enc` (un alias de una task del paquete) pasa a nativo,

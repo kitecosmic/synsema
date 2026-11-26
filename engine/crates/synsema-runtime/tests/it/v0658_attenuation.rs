@@ -7,8 +7,9 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
+use synsema_capabilities::model::Capability;
 use synsema_core::modtable::{sha256_hex, tree_hash};
-use synsema_runtime::engine::run_source;
+use synsema_runtime::engine::{run_source, run_source_ceiled, run_source_secure};
 
 fn cache() -> &'static Path {
     static C: OnceLock<PathBuf> = OnceLock::new();
@@ -21,7 +22,7 @@ fn cache() -> &'static Path {
 }
 
 /// Un paquete en el caché; devuelve su hash. `deps` es el objeto `modules` del índice (o vacío).
-fn publish(id: &str, version: &str, main: &str, files: &[(&str, &str)], deps: &str) -> String {
+pub(crate) fn publish(id: &str, version: &str, main: &str, files: &[(&str, &str)], deps: &str) -> String {
     static PUBLISH_LOCK: Mutex<()> = Mutex::new(());
     let cache = cache();
     let entries: Vec<String> =
@@ -53,7 +54,7 @@ fn publish(id: &str, version: &str, main: &str, files: &[(&str, &str)], deps: &s
     hash
 }
 
-fn entry(name: &str, id: &str, version: &str, hash: &str) -> String {
+pub(crate) fn entry(name: &str, id: &str, version: &str, hash: &str) -> String {
     format!("\"{}\": {{\"url\": \"{}/{}/synsema.json\", \"id\": \"{}\", \"version\": \"{}\", \"hash\": \"{}\"}}", name, id, version, id, version, hash)
 }
 
@@ -62,7 +63,7 @@ pub struct Tree {
 }
 
 impl Tree {
-    fn new(tag: &str, modules: &[String], indirect: &[String]) -> Tree {
+    pub(crate) fn new(tag: &str, modules: &[String], indirect: &[String]) -> Tree {
         cache();
         let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.subsec_nanos()).unwrap_or(0);
         let root = std::env::temp_dir().join(format!("synsema-v0658a-{}-{}-{}", std::process::id(), tag, nanos));
@@ -85,6 +86,18 @@ impl Tree {
         std::fs::write(&entry, src).unwrap();
         run_source(src, &entry.to_string_lossy())
     }
+    /// v0.6.68: el mismo programa bajo un techo del host (`--cap-set`).
+    pub(crate) fn run_ceiled(&self, src: &str, ceiling: Vec<Capability>) -> synsema_core::interpreter::RunResult {
+        let entry = self.root.join("main.syn");
+        std::fs::write(&entry, src).unwrap();
+        run_source_ceiled(src, &entry.to_string_lossy(), Some(ceiling))
+    }
+    /// v0.6.68: sin grants de ambiente (el modo seguro: el programa concede con sus `require`).
+    pub(crate) fn run_secure(&self, src: &str) -> synsema_core::interpreter::RunResult {
+        let entry = self.root.join("main.syn");
+        std::fs::write(&entry, src).unwrap();
+        run_source_secure(src, &entry.to_string_lossy())
+    }
 }
 
 impl Drop for Tree {
@@ -93,14 +106,14 @@ impl Drop for Tree {
     }
 }
 
-const TOK: &str = "https://reg.example/tok";
+pub(crate) const TOK: &str = "https://reg.example/tok";
 
-fn errors(r: &synsema_core::interpreter::RunResult) -> String {
+pub(crate) fn errors(r: &synsema_core::interpreter::RunResult) -> String {
     r.errors.join("\n")
 }
 
 /// Un paquete `tok` con estas fuentes en `m.syn` (y el `main` en `m.syn`).
-fn tok_tree(tag: &str, src: &str) -> Tree {
+pub(crate) fn tok_tree(tag: &str, src: &str) -> Tree {
     let h = publish(TOK, "0.1.0", "m.syn", &[("m.syn", src)], "");
     Tree::new(tag, &[entry("tok", TOK, "0.1.0", &h)], &[])
 }
@@ -505,7 +518,7 @@ fn k40_tree(tag: &str) -> (Tree, String) {
         "export task t(cb)\n    cb()\n    give () => read_file(\"{d}/dato.txt\")\n\
          export task t_req(cb)\n    cb()\n    task otra()\n        require file.read(\"{d}/otro/**\")\n        give read_file(\"{d}/dato.txt\")\n    give otra\n\
          export task t_tpl(cb)\n    cb()\n    give () => body of render(\"v0658-k40-vista.html\")\n\
-         export task t_rec(cb)\n    try\n        cb()\n    recover e\n        print(\"atrapado\")\n    give () => read_file(\"{d}/dato.txt\")\n\
+         export task t_rec(cb)\n    require stdout\n    try\n        cb()\n    recover e\n        print(\"atrapado\")\n    give () => read_file(\"{d}/dato.txt\")\n\
          export task primero(xs)\n    each x in xs\n        give x\n    give nothing\n\
          export task fib(n)\n    when n < 2\n        give n\n    give fib(n - 1) + fib(n - 2)\n"
     );
@@ -572,23 +585,24 @@ pub const MODES: &[(&str, fn())] = &[
     ("k41_unwind", k41_a_package_frame_that_leaves_without_leave_pkg_is_undone),
 ];
 
-/// El paquete de K30 (la corre `tests/v0658_attenuation_modes.rs`, con etiquetas).
+/// El paquete de K30 (la corre `tests/v0658_attenuation_modes.rs`, con etiquetas). Desde v0.6.68 la
+/// task que imprime declara `stdout`.
 #[allow(dead_code)]
 pub fn k30_tree() -> Tree {
-    tok_tree_files("k30", &[("m.syn", "export task largo(x)\n    give length(x)\nexport task decir()\n    print(\"x\")\n")])
+    tok_tree_files("k30", &[("m.syn", "export task largo(x)\n    give length(x)\nexport task decir()\n    require stdout\n    print(\"x\")\n")])
 }
 
-mod serve_rows {
+pub(crate) mod serve_rows {
     use super::*;
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
     use std::time::Duration;
 
-    fn free_port() -> u16 {
+    pub(crate) fn free_port() -> u16 {
         TcpListener::bind(("127.0.0.1", 0)).unwrap().local_addr().unwrap().port()
     }
 
-    fn wait_ready(port: u16) {
+    pub(crate) fn wait_ready(port: u16) {
         for _ in 0..120 {
             if TcpStream::connect(("127.0.0.1", port)).is_ok() {
                 std::thread::sleep(Duration::from_millis(150));
@@ -599,7 +613,7 @@ mod serve_rows {
         panic!("el server no quedó listo en :{}", port);
     }
 
-    fn get(port: u16, target: &str, headers: &str) -> String {
+    pub(crate) fn get(port: u16, target: &str, headers: &str) -> String {
         let mut sock = TcpStream::connect(("127.0.0.1", port)).unwrap();
         sock.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
         sock.write_all(format!("GET {} HTTP/1.1\r\nHost: 127.0.0.1\r\n{}Connection: close\r\n\r\n", target, headers).as_bytes()).unwrap();
@@ -609,7 +623,7 @@ mod serve_rows {
     }
 
     /// Arranca el `serve` del árbol (el programa en `main.syn`) en un hilo.
-    fn serve(t: &Tree, port: u16, src: String) {
+    pub(crate) fn serve(t: &Tree, port: u16, src: String) {
         let entry = t.root.join("main.syn");
         std::fs::write(&entry, &src).unwrap();
         let entry = entry.to_string_lossy().into_owned();

@@ -618,8 +618,49 @@ Seeded generators and explicit timestamps do not read the host clock or entropy.
 `read_line()` from a package is checked before the prompt or input consumption, including
 callbacks and workers. A declaration still needs the program's grant and the host's ceiling.
 
-`stdout` keeps its previous behavior pending its own version: package printing is still
-allowed. `requires nothing` lists capability declarations; it is **not a certificate of
+**v0.6.68 (breaking):** a package declares `require stdout` to write output: `print`, `show`,
+`log`, `eprint`, `term_write` and the prompt of `read_line("…")`. A task that reads with a prompt
+declares `stdin` **and** `stdout`. The denial comes before the first byte, is a catchable error,
+and says what to add: ``Capability not granted: stdout — the package mudo does not declare it;
+add `require stdout` inside its tasks``. The program's grant for `stdout` (and the ambient one
+under `run`) does not reach a package that does not declare it; the host ceiling still rules over
+the declaration. The gate is asked once per package chain per interpreter, so the audit shows one
+`stdout` entry per chain, not one per call.
+
+**Three limits of that rule, so nobody has to guess:**
+
+1. **You cannot allow it from your program.** A dependency that writes output without the
+   declaration fails at its first `print`, `log` or `eprint` as soon as you upgrade Synsema, even
+   when it only writes to stderr. There is no flag and no grant that reaches it: its author adds
+   `require stdout` to any task and publishes, and you take that version with the hash-bound
+   `--accept` that `get --update` prints.
+2. **A package that only exports `routes` has nowhere to declare**, so its routes cannot write
+   output until that gets its own release. Give the package any task that declares what its
+   routes use (the example below): the domain is the whole package.
+3. **A program launched by a package with `run_program` prints only if the launching package
+   declares `stdout`.** When it does not, neither of the child's two errors names the package:
+   they read ``add `require stdout` to the program's preamble`` and then ``declared but above the
+   host ceiling``. Declare it in the package's task that calls `run_program`.
+
+The three errors, with their fix, are in the table of pitfalls.md.
+
+A package that only exports `routes` has no task to put the `require` in: `require` is refused
+inside a `route`, inside the `routes` block and at the top level of a package (the same since
+v0.6.61 for `time`, `random` and `stdin`). Declare what its routes use in any task of the package —
+the domain is the whole package:
+
+```synsema
+export task declares()
+    require stdout
+    give 1
+
+export routes rutas
+    route "GET /health"
+        print("health")
+        give {"ok": true}
+```
+
+`requires nothing` lists capability declarations; it is **not a certificate of
 purity, silence or full process isolation**. Existing introspection (`args`, `lineage`,
 `receipt`), event-bus operations and `exit` keep their contracts. `receipt` omits its time
 when the package cannot read the clock. Captokens and `sandbox under` retain their
@@ -632,13 +673,15 @@ to spawn an agent while a package is on the stack.
 Every task and lambda written in a package runs with **the package's `requires` (the union of every
 `require` in it) ∩ what is in force** — the program's grants, the host ceiling, a `sandbox`, a
 captoken — by any path: a direct call, a callback, a lambda it returned and the program calls later,
-a `parallel_map` worker. Entering a package only subtracts.
+a `parallel_map` worker, a program it launches with `run_program`. Entering a package only subtracts.
 
 The table shows error prefixes; package denials also say which `require` to add inside its tasks.
 
 | the package | the program | result |
 |---|---|---|
 | declares nothing, calls `http_get` | `require net("127.0.0.1:19010")` | `Capability not granted: net("127.0.0.1:19010") — the package pure does not declare it` |
+| declares nothing, calls `print("x")` (v0.6.68) | `require stdout`, or the ambient grant under `run` | `Capability not granted: stdout — the package pure does not declare it` |
+| `require stdout` in **any** of its tasks (v0.6.68) | nothing, under `--cap-set time` | `Capability not granted: stdout — this is a permission, not a bug: add `require stdout` to the program's preamble …` (a declaration never grants) |
 | `require net("127.0.0.1:19010")` in a task | nothing | `Capability not granted: net("127.0.0.1:19010") — this is a permission, not a bug: add `require net("127.0.0.1:19010")` to the program's preamble …` |
 | `require net(…)` in **any** of its tasks | the same grant | works — in **every** task and lambda of the package (the domain is the whole package, not each task) |
 | declares nothing; the program passes `() => read_file("data.txt")` as a callback | `require file.read("./**")` | `Capability not granted: file_read("data.txt") — the package pure does not declare it` (the callback runs with the intersection) |
@@ -694,7 +737,7 @@ The import form determines the boundary:
 | `use "layers"` through `synsema.json` | Package tasks/lambdas are restricted by the package declaration as well as the program and host. |
 | `use "trusted:tools"` | Host-loaded policy, with its own declared permissions and trusted ceiling. It can have more authority than its caller; it is not a package installed by `get`. |
 
-**Initialization has an empty package domain.** A `require time` in a task does not permit `export let started be now()` at the top level. Move the read into a task and call it from the application, or receive the timestamp as an argument. `stdout` and the introspection limits described above still apply; this is not a promise of a completely silent import.
+**Initialization has an empty package domain.** A `require time` in a task does not permit `export let started be now()` at the top level, and (v0.6.68) a `require stdout` in a task does not permit a `print` there: an import writes nothing. Move the read or the message into a task and call it from the application, or receive the value as an argument. The introspection limits described above still apply; this is not a promise of a completely silent import.
 
 For numerical libraries, receive a generator instead of reading ambient entropy:
 

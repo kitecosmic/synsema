@@ -44,6 +44,7 @@ mod v0659_transactions;
 mod v0660_text;
 mod v0665_tables;
 mod v0666_filters;
+mod v0668_package_stdout;
 mod llm_stream_e2e;
 mod llm_text_prompt;
 mod memory_declared;
