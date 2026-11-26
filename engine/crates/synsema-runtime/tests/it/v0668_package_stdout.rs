@@ -147,7 +147,8 @@ fn row_the_top_level_of_a_package_is_denied() {
     for src in ["print(\"PKG-INIT\")\n", "export task f()\n    require stdout\n    give 1\nprint(\"PKG-INIT\")\n"] {
         let t = tok_tree("v0668-nivel-superior", src);
         let r = t.run("use \"tok\" as tok\nprint(\"cargo\")\n");
-        denied(&r, "tok");
+        assert!(!r.success);
+        assert!(errors(&r).contains("the package tok is running at top level; move this operation into a task that declares `require stdout`"), "{}", errors(&r));
         assert!(r.output.is_empty(), "{src:?}: {:?}", r.output);
     }
 }

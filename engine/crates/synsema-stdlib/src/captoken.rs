@@ -1415,7 +1415,9 @@ pub fn install_package_hook(interp: &mut Interpreter, caps: Rc<RefCell<Capabilit
                     .iter()
                     .filter_map(|(n, s)| capability_type_from_name(n).map(|ty| Capability::new(ty, s.clone())))
                     .collect();
-                Rc::new(Delegation::package(name, caps_of))
+                let mut d = Delegation::package(name, caps_of);
+                d.package_top_level = mark == 0;
+                Rc::new(d)
             };
             let d = if mark == 0 {
                 make()

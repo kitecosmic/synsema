@@ -1,5 +1,7 @@
 # Changelog
 
+- Package top-level capability errors now explain that the operation must move into a task declaring the capability, even if another task already declares it.
+
 Notable changes to the Synsema language, engine and tooling. The entries that matter most are the
 **breaking** ones: a program that used to load and no longer does, or that behaves differently.
 Each says what changed, why, and what to write instead.

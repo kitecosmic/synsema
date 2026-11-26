@@ -155,7 +155,7 @@ fn k8c_the_top_level_of_a_package_has_an_empty_domain() {
     let h = publish(TOK, "0.1.2", "m.syn", &[("m.syn", &format!("export let V be read_file(\"{d}/dato.txt\")\n"))], "");
     std::fs::write(t.root.join("synsema.json"), format!("{{\"modules\": {{{}}}}}", entry("tok", TOK, "0.1.2", &h))).unwrap();
     let r = t.run(&format!("require file.read(\"{d}/**\")\nuse \"tok\" as tok\nprint(tok.V)\n"));
-    assert!(!r.success && errors(&r).contains("the package tok does not declare it"), "{}", errors(&r));
+    assert!(!r.success && errors(&r).contains("the package tok is running at top level; move this operation into a task that declares `require file.read"), "{}", errors(&r));
 }
 
 /// K8c con `require`: el paquete declara `file.read` en una task. La task lee (su dominio es el
@@ -174,7 +174,7 @@ fn k8c_the_top_level_does_not_take_the_package_domain() {
     let h = publish(TOK, "0.8.1", "m.syn", &[("m.syn", &top)], "");
     std::fs::write(t.root.join("synsema.json"), format!("{{\"modules\": {{{}}}}}", entry("tok", TOK, "0.8.1", &h))).unwrap();
     let r = t.run(&format!("require file.read(\"{d}/**\")\nuse \"tok\" as tok\nprint(tok.V)\n"));
-    assert!(!r.success && errors(&r).contains("the package tok does not declare it"), "{} {:?}", errors(&r), r.output);
+    assert!(!r.success && errors(&r).contains("the package tok is running at top level; move this operation into a task that declares `require file.read"), "{} {:?}", errors(&r), r.output);
 }
 
 /// K12: una lambda del programa que el paquete llama corre con la intersección.
@@ -927,7 +927,7 @@ pub fn v0661_process_local_package_table() {
     // An initializer cannot borrow its tasks' declared domain.
     let t = tok_tree("v0661-top", "export task f()\n    require time\n    give now()\nexport let X be now()\n");
     let r = t.run("use \"tok\" as tok\n");
-    assert!(!r.success && errors(&r).contains("the package tok does not declare it"), "{}", errors(&r));
+    assert!(!r.success && errors(&r).contains("the package tok is running at top level; move this operation into a task that declares `require time`"), "{}", errors(&r));
     // A callback and a parallel worker keep the package on their effective stack.
     for body in ["give cb()", "give parallel_map((x) => cb(), [1])"] {
         let t = tok_tree("v0661-callback", &format!("export task f(cb)\n    {body}\n"));
