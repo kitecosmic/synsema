@@ -6,7 +6,7 @@ Each says what changed, why, and what to write instead.
 
 Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the release date.
 
-## Unreleased (target v0.6.68)
+## v0.6.68 — 2026-11-26
 
 - **Breaking: packages must declare `stdout`.** `print`, `show`, `log`, `eprint`, `term_write`
   and the prompt of `read_line("…")` written in a package need `require stdout` inside its
